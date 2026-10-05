@@ -1,0 +1,134 @@
+From ff365995b0c6baae8ebd3d8b1cd0c8f480efd60b Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 6 Oct 2026 01:23:00 +0000
+Subject: [PATCH 3/9] ggml-cuda: recapture graphs after the memory they
+ captured was freed
+
+A captured graph bakes in the addresses of the pool temporaries its kernels
+used and of per-context scratch buffers, none of which are graph tensors, so
+neither the graph key nor the property check sees them change.  Two of those
+buffers grow by free + malloc: the FA prefill staging arena
+(fattn_stage_try_get) and the H2D staging ring, and the legacy pool returns
+memory on clear_pool / a full pool.  A graph captured before such a free and
+replayed after it reads freed memory.
+
+Keep a per-device generation, bumped by every one of those frees; a graph
+records it at capture and is recaptured when it changed.
+
+Repro (2 x R9700, qwen4exp + MTP, -sm tensor -ub 1024, data-pointer graph
+key, LLAMA_KV_N_PAD_MIN=1024): server warm-up then a request on a fresh slot
+faulted 5/5 inside the freed FA staging arena (checked against a
+hipMalloc/hipFree log); with this change 4/4 survive.
+GGML_CUDA_GRAPH_MEM_GEN=0 disables the check for A/B.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh   | 12 ++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 19 ++++++++++++++++++-
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 8019092eb..6ff0dd791 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1263,6 +1263,12 @@ const ggml_cuda_device_info & ggml_cuda_info();
+ void ggml_cuda_set_device(int device);
+ int ggml_cuda_get_device();
+ 
++// Incremented whenever memory that captured graphs may reference is returned to the driver: the pools'
++// cached temporaries and the per-context scratch buffers that grow by free + malloc (FA prefill staging,
++// the H2D staging ring).  Graphs captured under an older generation are recaptured before their next replay.
++uint64_t ggml_cuda_graph_mem_gen(int device);
++void     ggml_cuda_graph_mem_freed(int device);
++
+ struct ggml_cuda_pool {
+     virtual ~ggml_cuda_pool() = default;
+ 
+@@ -1345,6 +1351,10 @@ struct ggml_cuda_graph {
+     bool warmup_complete = false;
+     uint64_t uid = 0;
+     int64_t last_used_time = 0;
++    // ggml_cuda_graph_mem_gen() of the graph's device when it was captured: a captured graph bakes in
++    // the addresses of pool temporaries and per-context scratch buffers, so it is recaptured once any
++    // of that memory has been freed (see ggml_cuda_graph_mem_freed)
++    uint64_t mem_gen = 0;
+     struct node_properties {
+         ggml_tensor node;
+         void *   node_src_data_ptrs[GGML_MAX_SRC];
+@@ -1756,6 +1766,7 @@ struct ggml_backend_cuda_context {
+                 return nullptr;
+             }
+             if (fattn_stage[stream_no] != nullptr) {
++                ggml_cuda_graph_mem_freed(device);   // captured graphs may read the old arena
+                 CUDA_CHECK(cudaFree(fattn_stage[stream_no]));
+             }
+             fattn_stage[stream_no]      = new_arena;
+@@ -1842,6 +1853,7 @@ struct ggml_backend_cuda_context {
+                 return nullptr;
+             }
+             if (h2d_stage[slot] != nullptr) {
++                ggml_cuda_graph_mem_freed(device);   // captured graphs may read the old slot
+                 CUDA_CHECK(cudaFree(h2d_stage[slot]));
+                 h2d_stage[slot]      = nullptr;
+                 h2d_stage_size[slot] = 0;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c622be9be..336f1461e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -443,6 +443,16 @@ const ggml_cuda_device_info & ggml_cuda_info() {
+ // TEMP INSTRUMENT (exp7): pool alloc/free cost (cudaMalloc/cudaFree on this path are synchronizing).
+ static int64_t g_pool_us = 0, g_pool_n = 0, g_pool_free_us = 0, g_pool_free_n = 0, g_pool_oom_n = 0;
+ 
++static std::atomic<uint64_t> g_cuda_graph_mem_gen[GGML_CUDA_MAX_DEVICES];
++
++uint64_t ggml_cuda_graph_mem_gen(int device) {
++    return g_cuda_graph_mem_gen[device].load(std::memory_order_relaxed);
++}
++
++void ggml_cuda_graph_mem_freed(int device) {
++    g_cuda_graph_mem_gen[device]++;
++}
++
+ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+     static const int MAX_BUFFERS = 256;
+ 
+@@ -466,6 +476,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+ 
+     void clear_pool() {
+         ggml_cuda_set_device(device);
++        ggml_cuda_graph_mem_freed(device);
+         for (int i = 0; i < MAX_BUFFERS; ++i) {
+             ggml_cuda_buffer & b = buffer_pool[i];
+             if (b.ptr != nullptr) {
+@@ -559,6 +570,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+         ggml_cuda_set_device(device);
+         static const bool gc_dbg = getenv("GGML_CUDA_GCDBG") != nullptr;
+         const int64_t t_pf = gc_dbg ? ggml_time_us() : 0;
++        ggml_cuda_graph_mem_freed(device);
+         CUDA_CHECK(cudaFree(ptr));
+         if (t_pf) { g_pool_free_us += ggml_time_us() - t_pf; g_pool_free_n++; }
+         pool_size -= size;
+@@ -7340,7 +7352,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                 } else {
+                     use_cuda_graph = true;
+-                    cuda_graph_update_required = graph->instance == nullptr;
++                    // recapture a graph whose pool temporaries or scratch buffers were freed since its capture
++                    // (GGML_CUDA_GRAPH_MEM_GEN=0 disables the check, A/B only)
++                    static const bool mem_gen_check = !getenv("GGML_CUDA_GRAPH_MEM_GEN") || atoi(getenv("GGML_CUDA_GRAPH_MEM_GEN")) != 0;
++                    cuda_graph_update_required = graph->instance == nullptr ||
++                        (mem_gen_check && graph->mem_gen != ggml_cuda_graph_mem_gen(cuda_ctx->device));
+                 }
+             }
+             } // else: not prefill
+@@ -7355,6 +7371,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+         }
+ 
++        cuda_ctx->cuda_graph(graph_key)->mem_gen = ggml_cuda_graph_mem_gen(cuda_ctx->device);
+         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+     }
+ 
+-- 
+2.53.0
+

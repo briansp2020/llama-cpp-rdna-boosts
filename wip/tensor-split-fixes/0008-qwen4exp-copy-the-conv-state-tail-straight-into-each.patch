@@ -1,0 +1,44 @@
+From 80a467f105358abd03b227b1886107e153ad2daf Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Tue, 6 Oct 2026 07:16:03 +0000
+Subject: [PATCH 8/9] qwen4exp: copy the conv-state tail straight into each
+ rollback slot
+
+For every linear-attention layer and every rollback slot the graph copied the
+strided conv-state tail into a contiguous temporary and then into the slot:
+two copy kernels where one does (ggml_cpy accepts the strided view; on CUDA it
+becomes one 2D memcpy).  With MTP n-max 3 that is ~4 slots x 36 layers = ~144
+kernels per verify graph removed, each costing the ~3 us dependent-dispatch
+gap that dominates decode.  LLAMA_CONV_TAIL_CONT=1 restores the old graph for
+A/B.
+
+2 x R9700, qwen4exp + MTP (n-max 3, p-min 0), -sm tensor -ub 2048, greedy
+300-token requests, warm: 110.8-111.9 -> 113.6-114.4 t/s on one prompt,
+100.4-102.3 -> 102.9-104.4 on another; greedy output unchanged;
+GGML_META_SS_VERIFY=1 clean; KL divergence vs the old graph (wikitext 16 x
+2048): 0.000000 mean.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/qwen4exp.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 2ff812462..ef9159969 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -2845,7 +2845,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+                 conv_states_all->nb[1],
+                 (slot * mem_size + kv_head) * row_size);
+ 
+-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
++        // copy the strided tail straight into the slot (one copy, a 2D memcpy on CUDA) instead of cont + cpy;
++        // LLAMA_CONV_TAIL_CONT=1 restores the intermediate contiguous copy for A/B
++        static const bool tail_cont = getenv("LLAMA_CONV_TAIL_CONT") != nullptr && atoi(getenv("LLAMA_CONV_TAIL_CONT")) != 0;
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail_cont ? ggml_cont(ctx0, tail) : tail, dst));
+     }
+ 
+     return conv_input;
+-- 
+2.53.0
+

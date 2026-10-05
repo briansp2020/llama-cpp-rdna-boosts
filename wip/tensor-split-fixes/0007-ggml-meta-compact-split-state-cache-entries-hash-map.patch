@@ -1,0 +1,141 @@
+From f5788edbec746cc9e1d7a8c993db14f837ad1785 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Tue, 6 Oct 2026 06:08:52 +0000
+Subject: [PATCH 7/9] ggml-meta: compact split-state cache entries, hash maps
+ for the tensor caches
+
+Under -sm tensor every graph allocation looks up the split state of each
+tensor and its sources (~10k lookups per decode step with MTP) and the
+per-device tensors of each source.  Both caches were std::maps, and a split
+state is ~2.2 KiB (ne has room for 16 segments x 16 devices), so each split
+state entry was ~2.5 KiB and every hit copied the whole struct: the lookups
+alone were ~11 % of the main thread.
+
+Store only the n_segments x n_bufs entries of ne that are in use and expand
+them into a zeroed split state on a hit; key both caches with
+std::unordered_map.  The validity rule is unchanged (a hit still requires
+identical tensor bytes).
+
+2 x R9700, qwen4exp + MTP, -sm tensor -ub 2048, greedy 300-token requests,
+warm: 91.0-91.9 -> 94.2-94.9 t/s on one prompt, 80.2-81.4 -> 83.6-85.4 on
+another; greedy output unchanged; GGML_META_SS_VERIFY=1 finds no stale entry.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend-meta.cpp | 48 +++++++++++++++++++++++++++-------
+ 1 file changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 7f39f9b0a..9f90a9fab 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -17,6 +17,7 @@
+ #include <set>
+ #include <string>
+ #include <tuple>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+@@ -426,7 +427,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
+ // Container to hold the tensor slices per simple ggml backend buffer.
+ struct ggml_backend_meta_simple_tensor_container {
+     std::vector<ggml_context_ptr> ctxs;
+-    std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
++    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
+ 
+     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
+         ctxs.reserve(n_simple);
+@@ -458,7 +459,36 @@ struct ggml_backend_meta_buffer_context {
+     // cache was cleared on every alternation; keep a few versions and switch to the one the changed tensor matches.
+     static constexpr size_t nbtc = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
+     static constexpr int n_split_state_caches = 8;
+-    std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache[n_split_state_caches];
++    // A split state is ~2.2 KiB (ne has room for 16 segments x 16 devices); the cache keeps only the n_segments x n_bufs
++    // entries in use, so that a lookup (~10k per decode step) touches a few cache lines instead of the whole struct.
++    struct split_state_entry {
++        ggml_backend_meta_split_axis axis;
++        uint32_t n_segments;
++        uint32_t nr[16];
++        std::vector<int64_t> ne;
++        char bytes[nbtc];   // the tensor as it was when the state was computed; a hit requires identical bytes
++
++        void set(const ggml_backend_meta_split_state & ss, size_t n_bufs) {
++            axis       = ss.axis;
++            n_segments = ss.n_segments;
++            memcpy(nr, ss.nr, sizeof(nr));
++            ne.assign(ss.ne, ss.ne + std::max<size_t>(n_segments, 1)*n_bufs);
++        }
++        ggml_backend_meta_split_state get() const {
++            ggml_backend_meta_split_state ss = {};
++            ss.axis       = axis;
++            ss.n_segments = n_segments;
++            memcpy(ss.nr, nr, sizeof(nr));
++            std::copy(ne.begin(), ne.end(), ss.ne);
++            return ss;
++        }
++    };
++    struct split_state_key_hash {
++        size_t operator()(const std::pair<const ggml_tensor *, bool> & k) const {
++            return std::hash<const void *>()(k.first) ^ (size_t) k.second;
++        }
++    };
++    std::unordered_map<std::pair<const ggml_tensor *, bool>, split_state_entry, split_state_key_hash> split_state_cache[n_split_state_caches];
+     int      split_state_cache_cur = 0;
+     uint64_t split_state_cache_used[n_split_state_caches] = {0};
+     uint64_t split_state_cache_tick = 0;
+@@ -1228,7 +1258,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     const std::pair key = std::make_pair(tensor, assume_sync);
+     auto * cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
+     auto it = cache->find(key);
+-    if (it != cache->end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
++    if (it != cache->end() && memcmp(it->second.bytes, (const char *) tensor, sizeof(it->second.bytes)) != 0) {
+         // the tensor changed: switch to the cache version in which it is unchanged, else recycle the least recently used one
+         int k_new = -1;
+         for (int k = 0; k < buf_ctx->n_split_state_caches && k_new < 0; k++) {
+@@ -1236,7 +1266,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+                 continue;
+             }
+             auto it_k = buf_ctx->split_state_cache[k].find(key);
+-            if (it_k != buf_ctx->split_state_cache[k].end() && memcmp(it_k->second.second, (const char *) tensor, sizeof(it_k->second.second)) == 0) {
++            if (it_k != buf_ctx->split_state_cache[k].end() && memcmp(it_k->second.bytes, (const char *) tensor, sizeof(it_k->second.bytes)) == 0) {
+                 k_new = k;
+             }
+         }
+@@ -1261,7 +1291,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     const bool verify_hit = it != cache->end() && ss_verify && !ss_verify_active;
+     if (it == cache->end() || verify_hit) {
+         ss_verify_active = ss_verify_active || verify_hit;   // the recomputation's own source lookups are not verified
+-        const ggml_backend_meta_split_state c = verify_hit ? it->second.first : ggml_backend_meta_split_state{};   // copy: the recursion may recycle this version
++        const ggml_backend_meta_split_state c = verify_hit ? it->second.get() : ggml_backend_meta_split_state{};   // copy: the recursion may recycle this version
+         const ggml_backend_meta_split_state ss = calculate_split_state();
+         if (verify_hit) {
+             bool same = ss.axis == c.axis && ss.n_segments == c.n_segments;
+@@ -1279,12 +1309,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+         // the calculation recurses into the sources and may have switched the current version
+         cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
+         auto & entry = (*cache)[key];
+-        entry.first = ss;
+-        memcpy(entry.second, tensor, sizeof(entry.second));
++        entry.set(ss, n_bufs);
++        memcpy(entry.bytes, tensor, sizeof(entry.bytes));
+         it = cache->find(key);
+     }
+ 
+-    ggml_backend_meta_split_state ret = it->second.first;
++    ggml_backend_meta_split_state ret = it->second.get();
+     GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
+ #ifndef NDEBUG
+     if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
+@@ -1447,7 +1477,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+         }
+     }
+ 
+-    stc.simple_tensors[tensor] = simple_tensors;
++    stc.simple_tensors[tensor] = std::move(simple_tensors);
+ 
+     return GGML_STATUS_SUCCESS;
+ }
+-- 
+2.53.0
+

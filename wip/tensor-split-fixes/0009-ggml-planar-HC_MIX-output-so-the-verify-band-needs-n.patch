@@ -1,0 +1,158 @@
+From cc606ff5cd3c719f93fa843bd359d203595c333b Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Tue, 6 Oct 2026 07:28:14 +0000
+Subject: [PATCH 9/9] ggml: planar HC_MIX output so the verify band needs no
+ copy of the mixed head
+
+The fused HC_MIX op writes one [n_embd + hc] row per token (the mixed head,
+then the inject tail), so for a verify batch the mixed head is a strided view
+and qwen4exp copies it with ggml_cont before the batched consumers: two copy
+kernels per layer (attention and FFN mixer), ~96 per verify graph.
+
+ggml_hc_mix_set_planar() selects a planar layout of the same bytes: the
+n_tokens mixed rows first, then the n_tokens inject rows, so both outputs are
+contiguous views.  At n_tokens == 1 the layout is byte-identical.  Only the
+CUDA BF16 kernels take it (they already address the output through a base
+pointer and a row stride); the Q8_0 and CPU paths assert it is off, and
+qwen4exp sets it only on the BF16 fused path.  LLAMA_HC_MIX_PLANAR=0 restores
+the old graph.
+
+2 x R9700, qwen4exp + MTP (n-max 3, p-min 0), -sm tensor -ub 2048, greedy
+300-token requests, warm, two A/B rounds: ~113.3 -> ~115.0 t/s on one prompt,
+~102.1 -> ~104.1 on another; greedy output unchanged; GGML_META_SS_VERIFY=1
+clean.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h          |  5 +++++
+ ggml/src/ggml-cpu/ops.cpp    |  2 ++
+ ggml/src/ggml-cuda/hc-mix.cu | 10 ++++++++--
+ ggml/src/ggml.c              |  6 ++++++
+ src/models/qwen4exp.cpp      | 15 +++++++++++++--
+ 5 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index ef24629ce..8cec0d7f7 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2552,6 +2552,11 @@ extern "C" {
+     // attach the packed-block K/V layouts the qsa3 (packed-block WMMA) prefill kernel reads.
+     // Both must be the F16 tensors built by the reshape/permute/cont pack helpers; passing
+     // NULL,NULL restores the VEC kernel (the packed srcs are optional).
++    // HC_MIX output layout: planar stores the n_tokens mixed rows first, then the n_tokens inject rows
++    // ([n_embd, T] then [hc, T]) instead of one [n_embd + hc] row per token, so both outputs are
++    // contiguous views (no copy before batched consumers).  Same bytes; identical at T == 1.
++    GGML_API void ggml_hc_mix_set_planar(struct ggml_tensor * a);
++
+     GGML_API void ggml_flash_attn_qsa_set_packed(
+             struct ggml_tensor * a,
+             struct ggml_tensor * packed_keys,
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 4e7ae3f79..c2a4dad7d 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12655,6 +12655,8 @@ void ggml_compute_forward_lightning_indexer(
+ static void ggml_compute_forward_hc_mix_f32(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
++    GGML_ASSERT(ggml_get_op_params_i32(dst, 2) == 0);   // planar layout: CUDA BF16 path only
++
+     const ggml_tensor * x         = dst->src[0];
+     const ggml_tensor * w_norm    = dst->src[1];
+     const ggml_tensor * w_down    = dst->src[2];
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 6f9ce2552..5c471ac4d 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -731,6 +731,11 @@ static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tenso
+     float * xn    = xn_alloc.get();
+     float * lo    = lo_alloc.get();
+     float * dst_d = (float *) dst->data;
++    // planar (ggml_hc_mix_set_planar): mixed rows [n_embd, T], then inject rows [hc, T]
++    const bool    planar          = ggml_get_op_params_i32(dst, 2) != 0;
++    float *       inject_d        = w_inject ? (planar ? dst_d + n_embd*n_tokens : dst_d + n_embd) : nullptr;
++    const int64_t inject_stride_t = planar ? hc     : out_n;
++    const int64_t mixed_stride_t  = planar ? n_embd : out_n;
+ 
+     {
+         const ggml_cuda_kernel_launch_params launch_params = {dim3(hc, n_tokens), dim3(1024), 0, stream};
+@@ -743,7 +748,7 @@ static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tenso
+         const ggml_cuda_kernel_launch_params launch_params = {dim3(hc_lr + nrows_inject), dim3(256), 0, stream};
+ #define HC_BF16_DOWN(NT) ggml_cuda_kernel_launch(hc_mix_bf16_down_inject<NT>, launch_params, \
+         (const nv_bfloat16 *) w_down->data, w_inject ? (const nv_bfloat16 *) w_inject->data : nullptr, xn, lo, \
+-        w_inject ? dst_d + n_embd : nullptr, (int) (hc_dim/2), (int) hc_lr, hc_dim, hc_lr, out_n)
++        inject_d, (int) (hc_dim/2), (int) hc_lr, hc_dim, hc_lr, inject_stride_t)
+         switch (n_tokens) {
+             case 1: HC_BF16_DOWN(1); break;
+             case 2: HC_BF16_DOWN(2); break;
+@@ -762,7 +767,7 @@ static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tenso
+         const int nblk = (int) std::min<int64_t>(n_embd, 448);
+         const ggml_cuda_kernel_launch_params launch_params = {dim3(nblk), dim3(hc*32), 0, stream};
+ #define HC_BF16_UP(NT) ggml_cuda_kernel_launch(hc_mix_bf16_up_collapse<NT>, launch_params, \
+-        (const nv_bfloat16 *) w_up->data, lo, xn, dst_d, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, out_n)
++        (const nv_bfloat16 *) w_up->data, lo, xn, dst_d, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, mixed_stride_t)
+         switch (n_tokens) {
+             case 1: HC_BF16_UP(1); break;
+             case 2: HC_BF16_UP(2); break;
+@@ -795,6 +800,7 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
+     GGML_ASSERT(w_inject == nullptr || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0);
+     GGML_ASSERT(dst->type      == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_get_op_params_i32(dst, 2) == 0);   // planar layout: BF16 path only
+ 
+     const int   hc  = ggml_get_op_params_i32(dst, 0);
+     const float eps = ggml_get_op_params_f32(dst, 1);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index c39d98643..7620d1e7c 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5707,6 +5707,12 @@ struct ggml_tensor * ggml_flash_attn_qsa(
+ 
+ // attach (or clear) the natural contiguous F16 K/V views the qsa3 prefill launcher packs into the
+ // packed-block layouts it consumes (ggml/src/ggml-cuda/fattn-qsa3.cu)
++void ggml_hc_mix_set_planar(struct ggml_tensor * a) {
++    GGML_ASSERT(a->op == GGML_OP_HC_MIX);
++    GGML_ASSERT(a->src[4] != NULL);   // only the mixer with an inject tail has two outputs
++    ggml_set_op_params_i32(a, 2, 1);
++}
++
+ void ggml_flash_attn_qsa_set_packed(
+         struct ggml_tensor * a,
+         struct ggml_tensor * packed_keys,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index ef9159969..661aa43f7 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -694,8 +694,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+         ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up, w_inject,
+                 hc, hparams.f_norm_rms_eps);
+         const int64_t out_n = n_embd + (w_inject ? hc : 0);
++        // planar output (BF16 path): mixed [n_embd, nt] then inject [hc, nt], both contiguous, so the verify band
++        // needs no ggml_cont of the mixed head; byte-identical at nt == 1.  LLAMA_HC_MIX_PLANAR=0 disables it.
++        static const bool planar_env = !getenv("LLAMA_HC_MIX_PLANAR") || atoi(getenv("LLAMA_HC_MIX_PLANAR")) != 0;
++        const bool planar = planar_env && fused_bf16 && w_inject != nullptr;
++        if (planar) {
++            ggml_hc_mix_set_planar(dst_t);
++        }
+         ggml_tensor * mixed;
+-        if (w_inject) {
++        if (planar) {
++            mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt, ggml_row_size(GGML_TYPE_F32, n_embd), 0);
++        } else if (w_inject) {
+             // mixed = the head of dst [n_embd]; inject = the tail [hc]
+             mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt,
+                     ggml_row_size(GGML_TYPE_F32, out_n), 0);
+@@ -712,7 +721,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+         }
+         cb(mixed, "hc_mixed", il);
+         if (inject && w_inject) {
+-            *inject = ggml_view_2d(ctx0, dst_t, hc, nt,
++            *inject = planar
++                ? ggml_view_2d(ctx0, dst_t, hc, nt, ggml_row_size(GGML_TYPE_F32, hc), ggml_row_size(GGML_TYPE_F32, n_embd*nt))
++                : ggml_view_2d(ctx0, dst_t, hc, nt,
+                     ggml_row_size(GGML_TYPE_F32, out_n), ggml_row_size(GGML_TYPE_F32, n_embd));
+             cb(*inject, "hc_inject", il);
+         } else if (inject) {
+-- 
+2.53.0
+

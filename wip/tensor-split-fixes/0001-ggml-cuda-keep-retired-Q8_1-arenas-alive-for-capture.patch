@@ -1,0 +1,67 @@
+From 98258f6d2012163f046dd0e53709f1e97e1cd620 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Mon, 5 Oct 2026 06:02:39 +0000
+Subject: [PATCH 1/9] ggml-cuda: keep retired Q8_1 arenas alive for captured
+ graphs
+
+The per-context Q8_1 input arena grows by allocating a larger buffer and
+freeing the old one.  Captured CUDA/HIP graphs (decode, spec-verify) keep
+pointers into the old arena, and the multi-token graph that grows it is
+never captured, so the next replay wrote to freed memory: a page fault in
+quantize_q8_1 on both GPUs under -sm tensor -ub 2048 (two decodes, then a
+~1.8k-token prompt).  Keep retired arenas until the context is destroyed.
+GGML_CUDA_Q8_1_ARENA_FREE_OLD=1 restores the immediate free (A/B only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh   | 12 +++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu |  3 +++
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index b5bc8a3a7..b86f4ef70 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1641,6 +1641,7 @@ struct ggml_backend_cuda_context {
+     };
+     char * q8_1_arena = nullptr;
+     size_t q8_1_arena_size = 0;
++    std::vector<char *> q8_1_arena_retired;
+ 
+     // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
+     // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
+@@ -1676,7 +1677,16 @@ struct ggml_backend_cuda_context {
+             CUDA_CHECK(cudaMalloc(&new_arena, new_size));
+             if (q8_1_arena != nullptr) {
+                 CUDA_CHECK(cudaMemcpy(new_arena, q8_1_arena, q8_1_arena_pos, cudaMemcpyDeviceToDevice));
+-                CUDA_CHECK(cudaFree(q8_1_arena));
++                // Captured CUDA/HIP graphs keep pointers into the old arena, and the multi-token graph that
++                // grows it is never captured, so the next decode replay would write to freed memory (page fault
++                // in quantize_q8_1 under -sm tensor -ub 2048).  Keep it until the context is destroyed.
++                // GGML_CUDA_Q8_1_ARENA_FREE_OLD=1 restores the immediate free (A/B / bisect only).
++                static const bool free_old = getenv("GGML_CUDA_Q8_1_ARENA_FREE_OLD") != nullptr;
++                if (free_old) {
++                    CUDA_CHECK(cudaFree(q8_1_arena));
++                } else {
++                    q8_1_arena_retired.push_back(q8_1_arena);
++                }
+             }
+             q8_1_arena = new_arena;
+             q8_1_arena_size = new_size;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 762ddad50..641c54391 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -741,6 +741,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (q8_1_arena != nullptr) {
+         CUDA_CHECK(cudaFree(q8_1_arena));
+     }
++    for (char * p : q8_1_arena_retired) {
++        CUDA_CHECK(cudaFree(p));
++    }
+     h2d_stage_free();
+ 
+     for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+-- 
+2.53.0
+

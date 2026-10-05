@@ -1,0 +1,80 @@
+From 44a187b5099d741d0fadd01fe74b86ace3ee0772 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Mon, 5 Oct 2026 12:04:26 +0000
+Subject: [PATCH 2/9] ggml-cuda: key captured graphs by their data pointers as
+ well
+
+The graph cache keeps one graph per (first node, token count).  Under
+-sm tensor with speculative decoding the per-device allocations alternate
+between a few layouts for the same key, so every switch invalidated the
+warm graph (an eager run, then a recapture after the next stable call).
+Hash the node and source data pointers into the key so each layout keeps
+its own captured graph; the existing 10 s idle eviction bounds the cache.
+GGML_CUDA_GRAPH_KEY_NO_DATA=1 restores the old key for A/B.
+
+2 x R9700, qwen4exp + MTP: -sm tensor decode 71.1 -> 75.9 t/s (2nd
+request), -sm layer unchanged; greedy output identical in both modes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh   |  7 ++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu | 13 ++++++++++++-
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index b86f4ef70..8019092eb 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1515,12 +1515,16 @@ struct ggml_cuda_stream_context {
+ // (first graph node, token count).  Decode (1 token) and the speculative verify
+ // widths (2..MMVQ_MAX_BATCH_SIZE) therefore each keep their own captured graph
+ // instead of invalidating one another's warmup when the batch width changes.
++// data_hash covers the node and source data pointers: when the allocator alternates between a few
++// layouts for the same graph (speculative decoding under -sm tensor), each layout keeps its own
++// captured graph instead of invalidating one shared entry on every switch (eager run + recapture).
+ struct ggml_cuda_graph_key {
+     const void * first_node_ptr;
+     int64_t      n_tokens;
++    uint64_t     data_hash;
+ 
+     bool operator==(const ggml_cuda_graph_key & other) const {
+-        return first_node_ptr == other.first_node_ptr && n_tokens == other.n_tokens;
++        return first_node_ptr == other.first_node_ptr && n_tokens == other.n_tokens && data_hash == other.data_hash;
+     }
+ };
+ 
+@@ -1528,6 +1532,7 @@ struct ggml_cuda_graph_key_hash {
+     size_t operator()(const ggml_cuda_graph_key & k) const {
+         size_t h = std::hash<const void *>()(k.first_node_ptr);
+         h ^= std::hash<int64_t>()(k.n_tokens) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
++        h ^= std::hash<uint64_t>()(k.data_hash) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+         return h;
+     }
+ };
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 641c54391..c622be9be 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3555,7 +3555,18 @@ static int64_t ggml_cuda_graph_n_tokens(const ggml_cgraph * cgraph) {
+ // One graph per (first node, token count): decode and each speculative verify width keep
+ // their own captured graph instead of invalidating one another's warmup.
+ static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+-    return ggml_cuda_graph_key { cgraph->nodes[0], ggml_cuda_graph_n_tokens(cgraph) };
++    static const bool no_data_hash = getenv("GGML_CUDA_GRAPH_KEY_NO_DATA") != nullptr;   // A/B: the old key
++    uint64_t h = 0xcbf29ce484222325ULL;
++    if (!no_data_hash) {
++        for (int i = 0; i < cgraph->n_nodes; i++) {
++            const ggml_tensor * n = cgraph->nodes[i];
++            h = (h ^ (uint64_t) (uintptr_t) n->data) * 0x100000001b3ULL;
++            for (int j = 0; j < GGML_MAX_SRC && n->src[j]; j++) {
++                h = (h ^ (uint64_t) (uintptr_t) n->src[j]->data) * 0x100000001b3ULL;
++            }
++        }
++    }
++    return ggml_cuda_graph_key { cgraph->nodes[0], ggml_cuda_graph_n_tokens(cgraph), h };
+ }
+ 
+ // Whether a CUDA/HIP graph should skip the graph-capture path.  Only a true PRE-FILL (a
+-- 
+2.53.0
+

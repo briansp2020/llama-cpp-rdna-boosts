@@ -1,0 +1,39 @@
+From 038ad3bf7def5db6a0d6dacdd1707c60a80204cf Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 6 Oct 2026 01:24:00 +0000
+Subject: [PATCH 5/9] llama: LLAMA_KV_N_PAD_MIN raises the n_kv padding floor
+
+n_kv is padded to 256 cells, so every 256 tokens of context the KV views
+change size and the allocator shifts the layout of the whole decode graph.
+Under -sm tensor each token runs as ~100 per-device graphs, and every one of
+them is invalidated and recaptured at each shift.  A larger floor keeps n_kv
+(and the captured graphs) constant for longer.  Default unchanged (256).
+
+2 x R9700, qwen4exp + MTP, -sm tensor, fresh prompts: greedy decode
+77.7 -> 83.3 t/s with LLAMA_KV_N_PAD_MIN=1024, greedy output identical;
+-sm layer unaffected.  4096 gives no further gain.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-kv-cache.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 38a80e0f3..44ae21dff 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1263,7 +1263,10 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+ 
+     // pad the n_kv value so that the graph remains constant across batches and can be reused
+     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
+-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
++    // LLAMA_KV_N_PAD_MIN raises the 256-cell floor: n_kv - and with it the graph layout - then stays constant for longer,
++    // so fewer captured graphs are invalidated as the context grows (-sm tensor splits each token into ~100 graphs)
++    static const uint32_t n_pad_min = getenv("LLAMA_KV_N_PAD_MIN") ? (uint32_t) atoi(getenv("LLAMA_KV_N_PAD_MIN")) : 256u;
++    const uint32_t n_pad_cur = std::max(n_pad, n_pad_min);
+ 
+     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+         const auto & cells = v_cells[sinfo.strm[s]];
+-- 
+2.53.0
+

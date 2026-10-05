@@ -1,0 +1,114 @@
+From 19cec73eb0f1d858de45dc796c7156a875add187 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Tue, 6 Oct 2026 04:57:50 +0000
+Subject: [PATCH 6/9] qwen4exp: stop pinning block_out for the whole graph in
+ prefill
+
+build_hc_combine marks every layer's block output as a graph output so that
+the fused CUDA combine+norm kernel never sees it aliased.  Graph outputs are
+never freed by the allocator, so every layer's block output (attention,
+linear-attention and MoE outputs, 20 MiB each at -ub 2048) stays allocated
+until the end of the graph: ~1.9 GiB of the 3.5 GiB prefill compute buffer
+per device under -sm tensor at -ub 2048.
+
+Drop the pin (LLAMA_HC_PIN_BLOCK_OUT=1 restores it).  In the repeat-anchored
+CUDA matcher the window nodes are skipped when fused, so only add and mulg
+are written; when either reuses the freed block_out buffer, copy block_out
+to pool memory first (20 MiB D2D) and run the fused kernel on the copy, so
+the fusion is still taken.  The BLK16 identify path keeps requiring the pin
+(it is off by default).
+
+2 x R9700, qwen4exp + MTP, -sm tensor -c 262144 -ub 2048: prefill compute
+buffer 3509 -> 1573 MiB per device, load VRAM 31.6/32.1 -> 29.7/30.2 GB; the
+259.6k prompt that ran out of memory now prefills at 1752 t/s (1533 at
+-ub 1024).  KL divergence against the pinned build, wikitext 16 x 2048, same
+split and -ub: 0.000000 mean for -sm tensor and -sm layer (max 6.5e-5, the
+same floor as two identical runs); greedy output unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 31 ++++++++++++++++++++++++-------
+ src/models/qwen4exp.cpp         | 10 +++++++++-
+ 2 files changed, 33 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 336f1461e..dde194b6c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6530,9 +6530,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     // the fuse check, so anchor the window AT the repeat: [repeat, mul, add, rms, (view,) mul(gamma)].
+     // The SCALE/SIGMOID/SCALE nodes dispatch standalone (tiny) and their op params feed the kernel.
+     // The kernel broadcasts the NARROW base (block_out_hc=false), so the ~80MB materialization never
+-    // dispatches. Safe to read the base at the window: the model pins block_out as a graph output
+-    // (GGML_TENSOR_FLAG_OUTPUT), keeping its buffer alive (a standalone repeat would let the allocator
+-    // reuse it - the 2026-09-06 class of bug).
++    // dispatches. Reading the base at the window is safe without pinning it: the nodes between the
++    // repeat and mul(gamma) are skipped when fused, so only add and mulg are written, and when
++    // either of them reuses the freed base the kernel reads the base from a pool copy (below).
+     if (node->op == GGML_OP_REPEAT && node->type == GGML_TYPE_F32 && i + 1 < cgraph->n_nodes) {
+         const ggml_tensor * rep = node;
+         const int64_t n_embd = rep->ne[0];
+@@ -6557,8 +6557,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                     base_root ? ggml_type_name(base_root->type) : "null",
+                     base_root ? (int) (base_root->flags & GGML_TENSOR_FLAG_OUTPUT) : -1);
+             }
+-            if (base_root != nullptr && base_root->type == GGML_TYPE_F32 &&
+-                    (base_root->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++            if (base_root != nullptr && base_root->type == GGML_TYPE_F32) {
+                 const int limit = std::min(cgraph->n_nodes, i + 24);
+                 // the consuming mul, then the chain: add(residual, mul) -> rms -> (view) -> mul(gamma)
+                 int k = i + 1;
+@@ -6660,9 +6659,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                                         return p0 < q1 && q0 < p1;
+                                     };
+                                     const bool res_inplace = res->data == add->data && ggml_are_same_layout(res, add);
+-                                    bool alias_ok = !overlap(add, base_root) && !overlap(add, inject) && (res_inplace || !overlap(add, res)) &&
+-                                        !overlap(mulg, base_root) && !overlap(mulg, inject) && !overlap(mulg, res) && !overlap(mulg, add) &&
++                                    const bool alias_ok_but_base = !overlap(add, inject) && (res_inplace || !overlap(add, res)) &&
++                                        !overlap(mulg, inject) && !overlap(mulg, res) && !overlap(mulg, add) &&
+                                         !overlap(add, gamma) && !overlap(mulg, gamma);
++                                    bool alias_ok = alias_ok_but_base && !overlap(add, base_root) && !overlap(mulg, base_root);
++                                    // block_out is not pinned: it dies at the repeat, so add or mulg may reuse its buffer.
++                                    // Nothing in the window runs before the fused kernel, so the base is still intact here:
++                                    // read it from a pool copy instead of falling back to the unfused nodes.
++                                    ggml_cuda_pool_alloc<char> base_copy_buf(cuda_ctx->pool());
++                                    ggml_tensor base_copy;
++                                    if (!alias_ok && alias_ok_but_base && n_tok > 1 && ggml_is_contiguous(base_root)) {
++                                        base_copy = *base_root;
++                                        base_copy.data = base_copy_buf.alloc(ggml_nbytes(base_root));
++                                        CUDA_CHECK(cudaMemcpyAsync(base_copy.data, base_root->data, ggml_nbytes(base_root),
++                                            cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
++                                        args.block_out = &base_copy;
++                                        alias_ok = true;
++                                        if (hc_cn_dbg) {
++                                            static unsigned d3 = 0;
++                                            if (d3++ < 24) fprintf(stderr, "HC_CN[repeat] base copy n_tok=%lld\n", (long long) n_tok);
++                                        }
++                                    }
+                                     if (!alias_ok && n_tok == 1 && hc <= 4) {
+                                         args.single_block = true;
+                                         alias_ok = true;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 343159605..2ff812462 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -793,7 +793,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+     // kernel can read the NARROW block_out base directly (block_out_hc=false) and the standalone
+     // hc-wide REPEAT materialization (a ~80MB tensor per combine at pp2048) is absorbed into the
+     // fusion window instead of dispatching.
+-    ggml_set_output(block_out);
++    // Pinning block_out as a graph output keeps every layer's block output allocated until the end
++    // of the graph (~20 MiB per layer at -ub 2048, ~1.9 GiB in all), which is what limited -ub at
++    // 256K.  The CUDA combine+norm matcher checks the fused outputs against block_out at run time
++    // and reads block_out from a copy when one of them reuses its buffer, so the pin is not needed.
++    // LLAMA_HC_PIN_BLOCK_OUT=1 restores it for A/B.  inject is tiny and stays pinned.
++    static const bool pin_block_out = getenv("LLAMA_HC_PIN_BLOCK_OUT") != nullptr && atoi(getenv("LLAMA_HC_PIN_BLOCK_OUT")) != 0;
++    if (pin_block_out) {
++        ggml_set_output(block_out);
++    }
+     ggml_set_output(inject);
+ 
+     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
+-- 
+2.53.0
+
