@@ -1,0 +1,816 @@
+From bee382099af0d3733432f7aebe48185a98f53aed Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Thu, 8 Oct 2026 21:43:10 +0000
+Subject: [PATCH] moe-cache: in-place prefill expert reads for a pinned host
+ master (no whole-table staging above the band)
+
+With host experts (-ncmoe) and the MoE expert cache, every prefill ubatch above the band copied each routed
+expert table whole: from the host into the scheduler ring slot, then (-sm tensor) stage_d2d into the tensor.
+The cache's arena already holds the hot experts on the device, and a pinned host master is GPU-readable.
+
+- Cache-aware staging (moe_cache_stage_table): when a whole-table staging copy is exactly a registered table's
+  slice, fill it with one kernel instead - resident experts from the arena, the rest from the pinned host alias.
+- In-place reads: the staging is deferred instead.  stage_d2d hands the record from the ring slot to the tensor
+  and skips the copy, and the tensor's consumer either reads the table in place (the routed-compact MMQ kernel
+  takes an arena / slot map / host alias source per expert) or fills it first (any other consumer, the fused gate
+  stream), so every other path still sees the original bytes.  The geometry is read live at the consumer.
+- Tail guard: MMQ reads one K tile past an expert's last row.  For the table's last expert read from the host that
+  runs off the end of the host table, so a routed, non-resident last expert is copied to a zero-padded scratch.
+- Below the staging width gate (17-63 tokens) a split still stages when every host weight in it is served in place
+  (staging copies nothing), via a new moe_cache_inplace backend hook (CUDA per device, meta = all devices).
+- offload_op sends a routed op to the GPU above the band when its table is served in place: 17-31-token routed
+  batches were running on the CPU (the 32-token offload minimum).
+
+Pinned host master only (cudaHostGetDevicePointer succeeded); otherwise everything stays as before.
+GGML_MOE_CACHE_INPLACE=0 keeps the cache-aware staging copy, GGML_MOE_CACHE_STAGE=0 restores the plain upload.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend-impl.h           |   4 +
+ ggml/src/ggml-backend-meta.cpp         |  13 ++
+ ggml/src/ggml-backend.cpp              |  28 ++-
+ ggml/src/ggml-cpu/ggml-cpu.cpp         |   1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu        |  58 ++++++
+ ggml/src/ggml-cuda/mmq.cuh             |  63 +++++-
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 278 +++++++++++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.h  |  43 ++++
+ ggml/src/ggml-rpc/ggml-rpc.cpp         |   1 +
+ 9 files changed, 483 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 52b8f37f6..48ec479a5 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -278,6 +278,10 @@ extern "C" {
+         // (its decode/verify band).  The scheduler keys its band decisions (the take-over before the ids
+         // readback, the per-layer split grouping and rebalance) off it.  NULL = the historical 8.
+         int64_t (*moe_cache_band)(ggml_backend_t backend);
++        // MoE expert cache: true when a whole-table staging of this host weight would be served in place (the
++        // consumer reads the cache's arena / pinned host alias and nothing is copied), so the scheduler can
++        // stage it below the width gate.  NULL = never.
++        bool (*moe_cache_inplace)(ggml_backend_t backend, const struct ggml_tensor * weight);
+         bool (*moe_cache_gather)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, size_t slice_off, int split_axis);
+     };
+ 
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index ec06b0196..2d1f10a12 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -3303,6 +3303,18 @@ static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend) {
+     return n_backends > 0 ? band : 8;
+ }
+ 
++// A host weight is served in place only if every device holding a slice serves it in place.
++static bool ggml_backend_meta_moe_cache_inplace(ggml_backend_t backend, const struct ggml_tensor * weight) {
++    const size_t n_backends = ggml_backend_meta_n_backends(backend);
++    for (size_t j = 0; j < n_backends; j++) {
++        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
++        if (simple_backend->iface.moe_cache_inplace == nullptr || !simple_backend->iface.moe_cache_inplace(simple_backend, weight)) {
++            return false;
++        }
++    }
++    return n_backends > 0;
++}
++
+ static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const struct ggml_tensor * weight,
+         const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids,
+         size_t slice_off, int split_axis) {
+@@ -3374,6 +3386,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .moe_cache_take_over     = */ ggml_backend_meta_moe_cache_take_over,
+     /* .moe_cache_promote       = */ ggml_backend_meta_moe_cache_promote,
+     /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
++    /* .moe_cache_inplace       = */ ggml_backend_meta_moe_cache_inplace,
+     /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
+ };
+ 
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index fc6ce6901..0543a3676 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2354,6 +2354,31 @@ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backe
+ // whole-tensor staging moves the device's entire shard every ubatch.  The ring path already prefers the
+ // gather for a routed expert table (`sched_input_gatherable` in `sched_stage_issue`); the meta
+ // backend's `stage_input` path defers routed expert tables to the gather there too.
++// wip/moe-expert-cache: below the staging width gate a split still stages when every host weight in it is a
++// routed table its backend serves in place (staging then copies nothing, so the gate's whole-table cost does not
++// apply), its batch is above the cache band (the band is the cache's take-over), and its staging is deferred to the
++// consumer (the meta backend's, or the scheduler's ring in stage-then-D2D mode).
++static bool sched_stage_inplace_ok(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split) {
++    ggml_backend_t backend = sched->backends[split->backend_id];
++    // a backend-owned staging (meta) or the scheduler's ring in stage-then-D2D mode (the redirect mode never D2Ds)
++    const bool defers = backend->iface.stage_input != NULL || (backend->iface.stage_buffer != NULL && sched->stage_mode == 0);
++    if (!defers || backend->iface.moe_cache_inplace == NULL ||
++        sched_stage_batch_tokens(split) <= sched_moe_cache_band(backend)) {
++        return false;
++    }
++    int n = 0;
++    for (int i = 0; i < split->n_inputs; i++) {
++        if (!sched_stage_is_host_weight(split->inputs[i])) {
++            continue;
++        }
++        if (!backend->iface.moe_cache_inplace(backend, split->inputs[i])) {
++            return false;
++        }
++        n++;
++    }
++    return n > 0;
++}
++
+ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
+     sched_stage_restore(sched);
+     sched->stage_consumed_n = 0;
+@@ -2362,7 +2387,8 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+         return;
+     }
+     if (sched_stage_min_tokens_for(sched, split) > 0 &&
+-        sched_stage_batch_tokens(split) < sched_stage_min_tokens_for(sched, split)) {
++        sched_stage_batch_tokens(split) < sched_stage_min_tokens_for(sched, split) &&
++        !sched_stage_inplace_ok(sched, split)) {
+         return;
+     }
+     // A large expert table is always gathered (see `sched_input_gatherable`), so it must not be
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 75f8483af..6ca01fd80 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -392,6 +392,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
+     /* .moe_cache_take_over     = */ NULL,
+     /* .moe_cache_promote       = */ NULL,
+     /* .moe_cache_band          = */ NULL,
++    /* .moe_cache_inplace       = */ NULL,
+     /* .moe_cache_gather        = */ NULL,
+ };
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 67debf913..365821192 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3458,6 +3458,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     // same compute stream and the first decode flush reads it after the inter-token synchronize.
+     if (moe_cache_enabled() && ids->ne[1] > MOE_EXPERT_CACHE_MAX_TOK) {
+         moe_cache_tally_prefill(dst, src0, ids, ctx.device, ctx.stream());
++        // in-place prefill reads: only the MMQ kernel reads a deferred table in place (mirrors the dispatch below)
++        const int cc_ip = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++        const bool to_mmq = ggml_is_quantized(src0->type) && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc_ip) &&
++            !ggml_cuda_mmb_supported_mmid(src0, src1, ids, dst) &&
++            ggml_cuda_should_use_mmq(src0->type, cc_ip, src1->ne[2], src0->ne[2]);
++        moe_cache_inplace_src ip;
++        if (!to_mmq && moe_cache_inplace_take(ctx.device, src0->data, &ip)) {
++            moe_cache_inplace_fill(ctx.device, ip, src0->data, ctx.stream());
++        }
+     }
+ 
+     // wip/moe-expert-cache slot-remap consumer: if the scheduler handed this expert table to the
+@@ -8925,9 +8934,38 @@ static void * ggml_backend_cuda_stage_buffer(ggml_backend_t backend, int slot, s
+     return cuda_ctx->h2d_stage_buffer(slot, size);
+ }
+ 
++// MoE expert cache: a routed expert table's staging copy takes its arena-resident experts from the arena
++// (moe_cache_stage_table) instead of re-uploading the whole table from the host.
++static bool ggml_backend_cuda_stage_from_cache(ggml_backend_cuda_context * cuda_ctx, const void * src, size_t offset,
++        size_t width, size_t stride_src, size_t n_copies, void * dst, ggml_backend_event_t ev, bool defer) {
++    if (!moe_cache_enabled()) {
++        return false;
++    }
++    static cudaEvent_t order_ev[GGML_CUDA_MAX_DEVICES] = {};
++    const int dev = cuda_ctx->device;
++    if (order_ev[dev] == nullptr && cudaEventCreateWithFlags(&order_ev[dev], cudaEventDisableTiming) != cudaSuccess) {
++        (void) cudaGetLastError();
++        order_ev[dev] = nullptr;
++        return false;
++    }
++    cudaStream_t s = cuda_ctx->copy_stream();
++    if (!moe_cache_stage_table(dev, src, offset, width, stride_src, n_copies, dst, cuda_ctx->stream(), s, order_ev[dev], defer)) {
++        return false;
++    }
++    CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
++    return true;
++}
++
+ static void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_cuda_set_device(cuda_ctx->device);
++    // Deferred unless the scheduler's redirect mode (GGML_SCHED_STAGE_MODE=1) points the input at the slot: every
++    // other caller (the scheduler's ring in its default mode, the meta backend's mirrored upload) copies the slot
++    // into the input with stage_d2d, where the deferral is resolved.
++    static const bool redirect = getenv("GGML_SCHED_STAGE_MODE") != nullptr && atoi(getenv("GGML_SCHED_STAGE_MODE")) != 0;
++    if (ggml_backend_cuda_stage_from_cache(cuda_ctx, data, 0, size, size, 1, dst, ev, /*defer =*/ !redirect)) {
++        return;
++    }
+     cudaStream_t s = cuda_ctx->copy_stream();
+     CUDA_CHECK(cudaMemcpyAsync(dst, data, size, cudaMemcpyHostToDevice, s));
+     CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
+@@ -8950,6 +8988,9 @@ static bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, con
+     if (dst == nullptr) {
+         return false;
+     }
++    if (ggml_backend_cuda_stage_from_cache(cuda_ctx, src, offset, width, stride_src, n_copies, dst, ev, /*defer =*/ true)) {
++        return true;
++    }
+     cudaStream_t s = cuda_ctx->copy_stream();
+     // WIP r42 (stage-1 item 2): a pinned source lets the compacted slice be copied straight with one
+     // 2-D H2D, moving only `total` bytes instead of the whole contiguous range.  The pageable 2-D H2D
+@@ -9001,6 +9042,10 @@ static void ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_ev
+ static void ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, const void * src, size_t size) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_cuda_set_device(cuda_ctx->device);
++    // a deferred cache staging: the slot was never filled, the tensor's consumer reads the table in place
++    if (moe_cache_enabled() && moe_cache_stage_d2d_take(cuda_ctx->device, dst, src)) {
++        return;
++    }
+     CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+ }
+ 
+@@ -9073,6 +9118,12 @@ static bool ggml_backend_cuda_moe_cache_promote(ggml_backend_t backend, const gg
+     return moe_cache_promote_host(weight, weight_cpy, ids, n_used, n_tok, ids_nb0, ids_nb1, ctx->stream(), ctx->device);
+ }
+ 
++// MoE expert cache: true when a whole-table staging of `weight` would be served in place (see the iface comment).
++static bool ggml_backend_cuda_moe_cache_inplace(ggml_backend_t backend, const ggml_tensor * weight) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    return weight != nullptr && moe_cache_enabled() && moe_cache_inplace_ready(cuda_ctx->device, weight->data);
++}
++
+ // B2: device-side host-weight expert gather for an offloaded `MUL_MAT_ID` prefill (see the iface comment).
+ static int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
+     const ggml_backend_cuda_context * cuda_ctx = (const ggml_backend_cuda_context *) backend->context;
+@@ -9112,6 +9163,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .moe_cache_take_over     = */ ggml_backend_cuda_moe_cache_take_over,
+     /* .moe_cache_promote       = */ ggml_backend_cuda_moe_cache_promote,
+     /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
++    /* .moe_cache_inplace       = */ ggml_backend_cuda_moe_cache_inplace,
+     /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
+ };
+ 
+@@ -9938,6 +9990,12 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
+         op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
+         return true;
+     }
++    // Above the band, a table the cache reads in place (nothing is copied) is cheaper on the device at any width:
++    // without this, 17..31-token routed batches (3 MTP streams at n-max 7, short prompts) run on the CPU.
++    if (moe_cache_enabled() && op->op == GGML_OP_MUL_MAT_ID && op->src[0] != nullptr &&
++        moe_cache_inplace_ready(dev_ctx->device, op->src[0]->data)) {
++        return true;
++    }
+ 
+     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
+ }
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 89b35cff0..ed20df29a 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "common.cuh"
++#include "moe-expert-cache.h"
+ #include "unary.cuh"
+ 
+ #include <climits>
+@@ -1620,6 +1621,23 @@ static __global__ void build_mmq_routed_descriptors(
+     }
+ }
+ 
++// In-place expert source for the routed-compact kernel (MoE expert cache, prefill): `on` reads expert `e` from its
++// arena slot when resident and from the pinned host alias otherwise, instead of from the staged table `x`.  Byte
++// offsets are 64-bit; row strides are in type blocks (0 = the staged table's own).
++struct mmq_routed_src {
++    const char *    arena;
++    const int32_t * slot_dev;
++    const char *    cold;
++    int64_t         arena_bytes;
++    int64_t         cold_bytes;
++    int             cold_row_stride;
++    int             slots;
++    int             identity;
++    int             on;
++    const char *    tail;        // the last expert's zero-padded copy, read when it is cold (nullptr: none needed)
++    int             last;        // n_experts - 1
++};
++
+ template <ggml_type type, int J, bool fallback>
+ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+ static __global__ void mul_mat_q_routed_compact(
+@@ -1628,7 +1646,7 @@ static __global__ void mul_mat_q_routed_compact(
+         const int max_descriptors, float * __restrict__ dst, const float * __restrict__ y_scale,
+         const uint3 blocks_per_ne00, const int nrows_x, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const uint3 channel_ratio, const int stride_channel_x,
+-        const uint3 sample_ratio, const int stride_sample_x) {
++        const uint3 sample_ratio, const int stride_sample_x, const mmq_routed_src src) {
+     // Skip unused template specializations for faster compilation:
+     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
+         NO_DEVICE_CODE;
+@@ -1668,8 +1686,24 @@ static __global__ void mul_mat_q_routed_compact(
+         }
+         __syncthreads();
+ 
+-        const int offset_x = fastdiv(wt, sample_ratio) * stride_sample_x +
++        const char * x_use = x;
++        int stride_row_use = stride_row_x;
++        int offset_x = fastdiv(wt, sample_ratio) * stride_sample_x +
+             fastdiv(zt, channel_ratio) * stride_channel_x + it * I * stride_row_x;
++        if (src.on) {
++            const int slot = src.identity ? zt : (src.slot_dev != nullptr ? src.slot_dev[zt] : -1);
++            if (slot >= 0 && slot < src.slots) {
++                x_use = src.arena + (int64_t) slot * src.arena_bytes;
++            } else if (zt == src.last && src.tail != nullptr) {
++                x_use = src.tail;   // arena layout, so the staged row stride
++            } else {
++                x_use = src.cold + (int64_t) zt * src.cold_bytes;
++                if (src.cold_row_stride != 0) {
++                    stride_row_use = src.cold_row_stride;
++                }
++            }
++            offset_x = it * I * stride_row_use;
++        }
+         const int offset_y = (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
+         const int tile_x_max_i = nrows_x - it * I - 1;
+         const int tile_y_max_j = col_diff - jt * J - 1;
+@@ -1677,8 +1711,8 @@ static __global__ void mul_mat_q_routed_compact(
+ 
+         constexpr bool fixup = false;
+         mul_mat_q_process_tile<type, J, fallback, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + it * I, nullptr, y_scale_tile,
+-             stride_row_x, ncols_y, stride_col_dst,
++            (x_use, offset_x, y + offset_y, ids_dst_shared, dst + it * I, nullptr, y_scale_tile,
++             stride_row_use, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+     }
+ }
+@@ -1727,6 +1761,25 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     const bool use_compact_routed = args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && mmq_routed_compact_arch_ok(cc) &&
+         !has_gate && !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc) && mmq_rdna3_5_id_use_compact(type, J, GGML_CUDA_CC_IS_RDNA4(cc)) &&
+         !routed_disabled;
++    // MoE expert cache, in-place prefill reads: a deferred table is read in place by the compact kernel; any other
++    // path (and the fused gate stream) gets the staged bytes written first.
++    mmq_routed_src routed_src = {};
++    if (moe_cache_enabled() && args.ids_dst != nullptr) {
++        moe_cache_inplace_src ip;
++        if (moe_cache_inplace_take(id, args.x, &ip)) {
++            const size_t ts = ggml_type_size(type);
++            if (use_compact_routed && ip.arena_bytes % ts == 0 && ip.cold_bytes % ts == 0 && ip.cold_row_bytes % ts == 0 &&
++                moe_cache_inplace_tail(id, ip, args.expert_bounds, stream)) {
++                routed_src = {ip.arena, ip.slot_dev, ip.cold, ip.arena_bytes, ip.cold_bytes,
++                              (int) (ip.cold_row_bytes / ts), ip.slots, ip.identity, 1, ip.tail, ip.n_experts - 1};
++            } else {
++                moe_cache_inplace_fill(id, ip, (void *) args.x, stream);
++            }
++        }
++        if (args.x_gate != nullptr && moe_cache_inplace_take(id, args.x_gate, &ip)) {
++            moe_cache_inplace_fill(id, ip, (void *) args.x_gate, stream);
++        }
++    }
+     if (use_compact_routed) {
+         const int max_descriptors = (args.ncols_dst + J - 1) / J + args.nchannels_y;
+         ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
+@@ -1738,7 +1791,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+         mul_mat_q_routed_compact<type, J, fallback><<<block_nums_compact, block_dims, nbytes_shared, stream>>>
+             (args.x, args.y, args.ids_dst, args.expert_bounds, descriptors.get(), max_descriptors, args.dst, args.y_scale,
+              blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
+-             channel_ratio_fd, args.stride_channel_x, sample_ratio_fd, args.stride_sample_x);
++             channel_ratio_fd, args.stride_channel_x, sample_ratio_fd, args.stride_sample_x, routed_src);
+         return;
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index cfc40e596..217c5421f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -7,6 +7,7 @@
+ #include "mmvq.cuh"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdio>
+ #include <cstring>
+ #include <map>
+@@ -75,6 +76,7 @@ struct table_t {
+     const void * host       = nullptr;
+     void *      host_dev    = nullptr;  // device-accessible alias of `host` (UVA), Phase 1b cold reads
+     bool        host_dev_bound = false; // the alias was resolved (or ruled out) once
++    bool        host_pinned = false;    // `host` is pinned (cudaHostGetDevicePointer succeeded): the in-place reads need it
+     int         device      = -1;       // CUDA ordinal that owns (allocates and reads) this table's arena
+ 
+     int         slots       = 0;        // 0 => disabled (no budget / alloc failed)
+@@ -244,6 +246,10 @@ int                                 g_uniform_slots = -1;       // the decided p
+ // it after a compute-buffer drop returned the VRAM.  -1 = the layer was not cacheable at sizing time.
+ int                                 g_rearm_slots[512];
+ bool                                g_sized           = false;  // the deferred sizing has run
++// Bumped by every entry point that can write an arena or a device slot map (the decode-band hooks, sizing, re-arm,
++// eviction).  The cache-aware staging orders its copy stream after the compute stream only when this moved since its
++// last staging on that device: during a prefill nothing writes, so the staging keeps overlapping the compute.
++std::atomic<uint64_t>               g_write_seq{1};
+ bool                                g_cold_uva        = false;  // MOE_EXPERT_CACHE_COLD=uva: serve rejected misses from the host alias
+ bool                                g_devmap          = false;  // MOE_EXPERT_CACHE_DEVMAP (default ON): build the remap on the device
+ bool                                g_devpolicy       = false;  // MOE_EXPERT_CACHE_DEVPOLICY=1: LFRU admission on the device
+@@ -351,6 +357,7 @@ void bind_host_dev_locked(table_t & t) {
+     void * dev = nullptr;
+     if (cudaHostGetDevicePointer(&dev, (void *) t.host, 0) == cudaSuccess && dev != nullptr) {
+         t.host_dev = dev;
++        t.host_pinned = true;
+         return;
+     }
+     (void) cudaGetLastError();
+@@ -869,6 +876,64 @@ static __global__ void moe_cache_seed_fill_kernel(char * __restrict__ arena, con
+     }
+ }
+ 
++// In-place tail guard: when the table's last expert `last` is routed this op and not resident, copy its slice into
++// the zero-padded scratch (arena layout).  Grid-stride over rows (2-D) or over 4 KiB chunks (contiguous).
++static __global__ void moe_cache_tail_kernel(char * __restrict__ dst, const char * __restrict__ host_dev,
++                                             const int32_t * __restrict__ slot_dev, int slots, int identity,
++                                             const int32_t * __restrict__ expert_bounds, int last,
++                                             int64_t expert_bytes, int64_t host_bytes, int64_t src_off,
++                                             int64_t rows, int64_t row_bytes, int64_t host_pitch, int do2d) {
++    if (expert_bounds[last + 1] - expert_bounds[last] <= 0) {
++        return;   // not routed
++    }
++    const int s = identity ? last : (slot_dev != nullptr ? slot_dev[last] : -1);
++    if (s >= 0 && s < slots) {
++        return;   // resident: the arena's own zero tail guards it
++    }
++    const char * src = host_dev + (int64_t) last * host_bytes + src_off;
++    if (do2d) {
++        for (int64_t r = blockIdx.x; r < rows; r += gridDim.x) {
++            moe_cache_policy_copy(dst + (size_t) r * (size_t) row_bytes, src + (size_t) r * (size_t) host_pitch,
++                                  (size_t) row_bytes, threadIdx.x, blockDim.x);
++        }
++    } else {
++        const int64_t chunk = 4096;
++        for (int64_t o = (int64_t) blockIdx.x * chunk; o < expert_bytes; o += (int64_t) gridDim.x * chunk) {
++            const int64_t n = expert_bytes - o < chunk ? expert_bytes - o : chunk;
++            moe_cache_policy_copy(dst + o, src + o, (size_t) n, threadIdx.x, blockDim.x);
++        }
++    }
++}
++
++// Cache-aware whole-table staging: one block per expert.  A resident expert (`slot_dev[e]` a valid slot, or every
++// expert of an identity table) is copied from its arena slot; any other expert from the pinned host alias, as a
++// strided 2-D copy for an axis-0 slice.  The destination is the staged table in expert order, so the bytes are
++// exactly what the plain whole-table upload would have written.
++static __global__ void moe_cache_stage_kernel(char * __restrict__ dst, const char * __restrict__ arena,
++                                              const char * __restrict__ host_dev, const int32_t * __restrict__ slot_dev,
++                                              int slots, int identity, int64_t expert_bytes, int64_t host_bytes,
++                                              int64_t src_off, int64_t rows, int64_t row_bytes, int64_t host_pitch,
++                                              int do2d) {
++    const int e   = blockIdx.x;
++    const int tid = threadIdx.x;
++    const int nt  = blockDim.x;
++    char *    d   = dst + (int64_t) e * expert_bytes;
++    const int s   = identity ? e : slot_dev[e];
++    if (s >= 0 && s < slots) {
++        moe_cache_policy_copy(d, arena + (int64_t) s * expert_bytes, (size_t) expert_bytes, tid, nt);
++        return;
++    }
++    const char * src = host_dev + (int64_t) e * host_bytes + src_off;
++    if (!do2d) {
++        moe_cache_policy_copy(d, src, (size_t) expert_bytes, tid, nt);
++        return;
++    }
++    for (int64_t r = 0; r < rows; r++) {
++        moe_cache_policy_copy(d + (size_t) r * (size_t) row_bytes, src + (size_t) r * (size_t) host_pitch,
++                              (size_t) row_bytes, tid, nt);
++    }
++}
++
+ // Host-weight expert gather (B2, session 15): for an offloaded `MUL_MAT_ID` expert upload, copy only the
+ // experts the routing selects, straight from the host master into the scheduler's device `input_cpy`,
+ // ON DEVICE.  This replaces the non-staging path's host ids readback (`ggml_backend_tensor_get_async` +
+@@ -1511,6 +1576,7 @@ void alloc_table_locked(table_t & t, int slots) {
+ // `total_expert_bytes` is known once the first decode pass has registered every table; that first
+ // pass runs uncached (the scheduler copies the full experts), the second sizes and starts filling.
+ void alloc_all_locked() {
++    g_write_seq++;
+     if (g_sized) {
+         return;
+     }
+@@ -2502,6 +2568,7 @@ void moe_cache_disable_streaming(const char * why) {
+ // is in flight and the compute buffer has already been dropped (the drop site re-reserves the narrow
+ // layout first), so the CPU-side take-over decisions of the next graph all see the same residency.
+ bool moe_cache_rearm() {
++    g_write_seq++;
+     if (!g_enabled) {
+         return false;   // released wholesale, or never sized: nothing to re-arm against
+     }
+@@ -2587,6 +2654,7 @@ bool moe_cache_rearm() {
+ // Called with `g_slab_mutex` NOT held (the slab releases it around this call) but WITH the cache lock, so
+ // the slab's own lock is taken here -- ordering is always cache -> slab.
+ size_t moe_cache_evict_slab_range(int device, void * lo, void * hi) {
++    g_write_seq++;
+     if (!g_enabled) {
+         return 0;
+     }
+@@ -2963,6 +3031,212 @@ static __global__ void moe_cache_gather_zero_heads_kernel(char * __restrict__ ds
+     }
+ }
+ 
++// in-place prefill reads: (device, ring slot) -> table between the staging and the meta backend's D2D, then
++// (device, tensor data) -> table until the consumer takes it
++static std::map<std::pair<int, const void *>, int> g_stage_defer;
++static std::map<std::pair<int, const void *>, int> g_inplace;
++static char *  g_tail_scratch[GGML_CUDA_MAX_DEVICES]      = {};
++static size_t  g_tail_scratch_size[GGML_CUDA_MAX_DEVICES] = {};
++static const int64_t TAIL_PAD = 8192;   // > one MMQ K tile of any expert type
++
++bool moe_cache_stage_table(int device, const void * host_src, size_t offset, size_t width, size_t stride_src,
++                           size_t n_copies, void * dst, void * compute_stream, void * copy_stream, void * order_event,
++                           bool defer) {
++    static const bool inplace = env_int("GGML_MOE_CACHE_INPLACE", 1) != 0;
++    static const bool on      = env_int("GGML_MOE_CACHE_STAGE", 1) != 0;
++    static uint64_t ordered_seq[GGML_CUDA_MAX_DEVICES] = {};
++    if (!on || !g_enabled || host_src == nullptr || dst == nullptr || width == 0 || n_copies == 0) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (!g_sized) {
++        return false;
++    }
++    for (table_t & t : g_tables) {
++        if (t.device != device || t.host != host_src || t.src_off != offset) {
++            continue;
++        }
++        // a usable arena and a device-readable host alias for the non-resident experts
++        if (t.arena == nullptr || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe || t.n_experts <= 0) {
++            return false;
++        }
++        // in-place reads (and the cold half of this copy) read the host master from the GPU: pinned only - a
++        // pageable master is not GPU-readable without XNACK
++        if (!t.host_pinned) {
++            return false;
++        }
++        // the device slot map must be current: the device policy keeps it authoritative on the device; under the
++        // host policy it lags while a host change is waiting to be uploaded
++        if (!t.identity && (!t.devmap || t.slot_dev == nullptr || (!t.policy && t.slot_dirty))) {
++            return false;
++        }
++        // the requested copy must be exactly this table's slice of every expert
++        if ((size_t) t.n_experts * t.expert_bytes != width * n_copies) {
++            return false;
++        }
++        const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
++        int64_t rows = 0;
++        int64_t row_bytes = 0;
++        if (do2d) {
++            rows      = (int64_t) (t.host_bytes / t.host_pitch);
++            row_bytes = rows > 0 ? (int64_t) (t.expert_bytes / (size_t) rows) : 0;
++            if (rows <= 0 || (size_t) row_bytes != width || stride_src != t.host_pitch ||
++                    (size_t) (rows * row_bytes) != t.expert_bytes) {
++                return false;
++            }
++        } else if (n_copies == 1) {
++            if (t.host_bytes != t.expert_bytes || offset != 0) {
++                return false;   // a single contiguous copy can only be an unsplit table
++            }
++        } else if (width != t.expert_bytes || stride_src != t.host_bytes || n_copies != (size_t) t.n_experts) {
++            return false;
++        }
++        if (defer && inplace) {
++            g_stage_defer[std::make_pair(device, (const void *) dst)] = (int) (&t - g_tables.data());
++            return true;
++        }
++        device_guard dg(device);
++        const uint64_t seq = g_write_seq.load();
++        if (ordered_seq[device] != seq) {
++            if (cudaEventRecord((cudaEvent_t) order_event, (cudaStream_t) compute_stream) != cudaSuccess ||
++                cudaStreamWaitEvent((cudaStream_t) copy_stream, (cudaEvent_t) order_event, 0) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return false;
++            }
++            ordered_seq[device] = seq;
++        }
++        moe_cache_stage_kernel<<<t.n_experts, 256, 0, (cudaStream_t) copy_stream>>>(
++            (char *) dst, (const char *) t.arena, (const char *) t.host_dev, t.identity ? nullptr : t.slot_dev,
++            t.slots, t.identity ? 1 : 0, (int64_t) t.expert_bytes, (int64_t) t.host_bytes, (int64_t) t.src_off,
++            rows, row_bytes, (int64_t) t.host_pitch, do2d ? 1 : 0);
++        return cudaGetLastError() == cudaSuccess;
++    }
++    return false;
++}
++
++bool moe_cache_inplace_ready(int device, const void * host) {
++    static const bool on = env_int("GGML_MOE_CACHE_STAGE", 1) != 0 && env_int("GGML_MOE_CACHE_INPLACE", 1) != 0;
++    if (!on || !g_enabled || host == nullptr) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (!g_sized) {
++        return false;
++    }
++    bool found = false;
++    for (const table_t & t : g_tables) {
++        if (t.device != device || t.host != host) {
++            continue;
++        }
++        if (t.arena == nullptr || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe || t.n_experts <= 0 || !t.host_pinned) {
++            return false;
++        }
++        if (!t.identity && (!t.devmap || t.slot_dev == nullptr || (!t.policy && t.slot_dirty))) {
++            return false;
++        }
++        found = true;
++    }
++    return found;
++}
++
++bool moe_cache_stage_d2d_take(int device, void * dst, const void * slot) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const auto it = g_stage_defer.find(std::make_pair(device, slot));
++    if (it == g_stage_defer.end()) {
++        return false;
++    }
++    const auto key = std::make_pair(device, (const void *) dst);
++    if (g_inplace.count(key) != 0) {
++        // the previous deferral of this tensor was never read or filled by a consumer
++        GGML_LOG_ERROR("moe_cache_inplace: deferred table %d (device %d) was never consumed\n", g_inplace[key], device);
++    }
++    g_inplace[key] = it->second;
++    g_stage_defer.erase(it);
++    return true;
++}
++
++// the live read geometry of table `id` (g_mutex held)
++static void inplace_src_locked(int id, moe_cache_inplace_src * out) {
++    const table_t & t = g_tables[(size_t) id];
++    *out = moe_cache_inplace_src{};
++    out->table       = id;
++    out->cold        = (const char *) t.host_dev + t.src_off;
++    out->arena_bytes = (int64_t) t.expert_bytes;
++    out->cold_bytes  = (int64_t) t.host_bytes;
++    out->cold_row_bytes = (t.split_axis == 0 && t.host_pitch != 0) ? (int64_t) t.host_pitch : 0;
++    out->n_experts   = t.n_experts;
++    if (t.arena != nullptr && t.slots > 0) {
++        if (t.identity) {
++            out->arena = (const char *) t.arena; out->slots = t.slots; out->identity = 1;
++        } else if (t.devmap && t.slot_dev != nullptr && (t.policy || !t.slot_dirty)) {
++            out->arena = (const char *) t.arena; out->slots = t.slots; out->slot_dev = t.slot_dev;
++        }
++    }
++}
++
++bool moe_cache_inplace_take(int device, const void * data, moe_cache_inplace_src * out) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const auto it = g_inplace.find(std::make_pair(device, data));
++    if (it == g_inplace.end()) {
++        return false;
++    }
++    inplace_src_locked(it->second, out);
++    g_inplace.erase(it);
++    return true;
++}
++
++bool moe_cache_inplace_tail(int device, moe_cache_inplace_src & src, const int32_t * expert_bounds, void * stream) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const table_t & t = g_tables[(size_t) src.table];
++    if (t.identity || t.n_experts <= 0) {
++        src.tail = nullptr;   // every expert resident: nothing is read cold
++        return true;
++    }
++    device_guard dg(device);
++    const size_t need = t.expert_bytes + (size_t) TAIL_PAD;
++    if (g_tail_scratch_size[device] < need) {
++        if (g_tail_scratch[device] != nullptr) {
++            (void) cudaStreamSynchronize((cudaStream_t) stream);   // the previous scratch may still be read
++            (void) cudaFree(g_tail_scratch[device]);
++            g_tail_scratch[device] = nullptr;
++            g_tail_scratch_size[device] = 0;
++        }
++        const size_t sz = need < ((size_t) 4 << 20) ? ((size_t) 4 << 20) : need;
++        if (cudaMalloc((void **) &g_tail_scratch[device], sz) != cudaSuccess) {
++            (void) cudaGetLastError();
++            g_tail_scratch[device] = nullptr;
++            return false;
++        }
++        g_tail_scratch_size[device] = sz;
++    }
++    // zero the pad behind this table's slice (the slice itself is overwritten when the tail is copied)
++    CUDA_CHECK(cudaMemsetAsync(g_tail_scratch[device] + t.expert_bytes, 0, (size_t) TAIL_PAD, (cudaStream_t) stream));
++    const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
++    const int64_t rows      = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++    const int64_t row_bytes = rows > 0 ? (int64_t) (t.expert_bytes / (size_t) rows) : 0;
++    moe_cache_tail_kernel<<<64, 256, 0, (cudaStream_t) stream>>>(
++        g_tail_scratch[device], (const char *) t.host_dev, src.slot_dev, src.arena != nullptr ? src.slots : 0,
++        src.identity, expert_bounds, t.n_experts - 1, (int64_t) t.expert_bytes, (int64_t) t.host_bytes,
++        (int64_t) t.src_off, rows, row_bytes, (int64_t) t.host_pitch, do2d ? 1 : 0);
++    CUDA_CHECK(cudaGetLastError());
++    src.tail = g_tail_scratch[device];
++    return true;
++}
++
++void moe_cache_inplace_fill(int device, const moe_cache_inplace_src & src, void * dst, void * stream) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const table_t & t = g_tables[(size_t) src.table];
++    const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
++    const int64_t rows      = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++    const int64_t row_bytes = rows > 0 ? (int64_t) (t.expert_bytes / (size_t) rows) : 0;
++    device_guard dg(device);
++    moe_cache_stage_kernel<<<t.n_experts, 256, 0, (cudaStream_t) stream>>>(
++        (char *) dst, src.arena, (const char *) t.host_dev, src.slot_dev, src.arena != nullptr ? src.slots : 0,
++        src.identity, (int64_t) t.expert_bytes, (int64_t) t.host_bytes, (int64_t) t.src_off,
++        rows, row_bytes, (int64_t) t.host_pitch, do2d ? 1 : 0);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
+                            const ggml_tensor * ids, void * stream, int device,
+                            size_t slice_off, int split_axis) {
+@@ -3073,6 +3347,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+                            const int32_t * ids, int64_t n_used, int64_t n_tok,
+                            size_t ids_nb0, size_t ids_nb1, void * stream,
+                            int device, size_t slice_off, int split_axis) {
++    g_write_seq++;
+     if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
+         return false;
+     }
+@@ -3483,6 +3758,7 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+ 
+ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_cpy, int device,
+                          bool * need_promote) {
++    g_write_seq++;
+     if (need_promote != nullptr) {
+         *need_promote = false;
+     }
+@@ -3529,6 +3805,7 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+ bool moe_cache_promote_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
+                             const int32_t * ids, int64_t n_used, int64_t n_tok,
+                             size_t ids_nb0, size_t ids_nb1, void * stream, int device) {
++    g_write_seq++;
+     if (!g_enabled || !g_devmap || weight == nullptr || weight->ne[2] < 1) {
+         return false;
+     }
+@@ -3807,6 +4084,7 @@ static void moe_cache_progress_locked(int device, policy_dev_t & pd, int64_t now
+ }
+ 
+ bool moe_cache_policy_flush(int device, void * stream) {
++    g_write_seq++;
+     if (!g_enabled || device < 0) {
+         return false;
+     }
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 130c5fc77..7b1e12c12 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -204,6 +204,49 @@ bool moe_cache_update_host(const struct ggml_tensor * weight, const struct ggml_
+ bool moe_cache_tally_prefill(const struct ggml_tensor * op, const struct ggml_tensor * weight,
+                              const struct ggml_tensor * ids, int device, void * stream);
+ 
++// Cache-aware staging for a routed expert table's whole-table upload (the prefill widths, >= the staging gate).
++// The caller is about to copy `n_copies` blocks of `width` bytes, `stride_src` apart, from `host_src + offset` into
++// `dst` (this device's slice of every expert, in expert order).  If that is exactly a registered table's slice on
++// `device` with a usable arena, a current device slot map and a device-readable host alias, fill `dst` instead with
++// one kernel on `copy_stream`: resident experts come from the arena (device-to-device), the rest from the pinned host
++// alias - the same bytes, so the op's result is unchanged.  `copy_stream` is first ordered after everything already
++// queued on `compute_stream` (the arena and the slot map are written there) through `order_event`.  Returns false
++// without touching any stream when the table does not qualify; the caller then does its plain upload.
++// GGML_MOE_CACHE_STAGE=0 disables it.
++bool moe_cache_stage_table(int device, const void * host_src, size_t offset, size_t width, size_t stride_src,
++                           size_t n_copies, void * dst, void * compute_stream, void * copy_stream, void * order_event,
++                           bool defer);
++
++// In-place prefill reads (with `defer`, GGML_MOE_CACHE_INPLACE != 0).  A deferred staging fills nothing: it records
++// that the ring slot `dst` stands for the table, `moe_cache_stage_d2d_take` moves that record to the tensor the meta
++// backend would have copied the slot into (and the copy is skipped), and the tensor's consumer either reads the
++// table in place (`moe_cache_inplace_take`: the routed-compact MMQ kernel) or fills the tensor first
++// (`moe_cache_inplace_fill`: the bytes the staging copy would have written).  The geometry is read live at the
++// consumer, so an arena evicted in between only turns the reads cold.
++struct moe_cache_inplace_src {
++    const char *    arena          = nullptr;  // the table's arena (nullptr: every expert is read cold)
++    const int32_t * slot_dev       = nullptr;  // expert -> slot (-1 cold); nullptr with identity == 0: all cold
++    const char *    cold           = nullptr;  // pinned host alias of expert 0's slice (src_off folded in)
++    int64_t         arena_bytes    = 0;        // bytes per arena slot (this device's expert slice)
++    int64_t         cold_bytes     = 0;        // bytes between host experts
++    int64_t         cold_row_bytes = 0;        // host row pitch of a strided axis-0 slice; 0 = the slice's own rows
++    int             slots          = 0;
++    int             identity       = 0;
++    int             table          = -1;
++    int             n_experts      = 0;
++    const char *    tail           = nullptr;  // zero-padded copy of the last expert (see moe_cache_inplace_tail)
++};
++bool moe_cache_stage_d2d_take(int device, void * dst, const void * slot);
++// true when every table of `host` on `device` would be staged deferred (in place) right now
++bool moe_cache_inplace_ready(int device, const void * host);
++bool moe_cache_inplace_take(int device, const void * data, moe_cache_inplace_src * out);
++void moe_cache_inplace_fill(int device, const moe_cache_inplace_src & src, void * dst, void * stream);
++// The MMQ K tile over-reads past an expert's last row; for the table's LAST expert read cold that runs past the host
++// table.  Copy the last expert into this device's zero-padded scratch (`src.tail`) on `stream` when it is routed
++// (`expert_bounds`, device) and not resident; the in-place kernel then reads it from there.  False: no scratch (the
++// caller must not read in place).
++bool moe_cache_inplace_tail(int device, moe_cache_inplace_src & src, const int32_t * expert_bounds, void * stream);
++
+ // Host-weight expert gather (B2, session 15).  For a `-ncmoe` `MUL_MAT_ID` prefill whose expert upload is
+ // NOT staged, copy only the routed experts from the host master into the scheduler's device `input_cpy`,
+ // on the device, instead of reading the routing back to the host and copying per-run.  Independent of the
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index caf910a61..01e38999e 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1100,6 +1100,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+     /* .moe_cache_take_over     = */ NULL,
+     /* .moe_cache_promote       = */ NULL,
+     /* .moe_cache_band          = */ NULL,
++    /* .moe_cache_inplace       = */ NULL,
+     /* .moe_cache_gather        = */ NULL,
+ };
+ 
+-- 
+2.53.0
+
