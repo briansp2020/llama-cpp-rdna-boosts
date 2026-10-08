@@ -4,9 +4,11 @@ Status: **root-caused + fixed + DELIVERED in r34 (2026-10-08)**.  The fix is a *
 change** (`ggml/src/ggml-cuda/ggml-cuda.cu`); it is folded into **block 12** and shipped as the release
 `v16-a55e952b8-r34` (canonical tip `40ce2ab86`, net tree `a253691093acbd96`); the personal fork's
 `rdna-boosts` branch now carries the same tree.  The `wip/host-expert-pool` branch still has it as a wip
-commit as well (the campaign tree).  **Next session:** re-base the campaign onto r34 (`40ce2ab86` /
-tree `a2536910`) and drop the wip `lazy NCCL init` commit — it is already in block 12, so the campaign
-diff (`changes.patch`, generated against `6e567349c`) must not re-introduce it.
+commit as well (the campaign tree).  **RE-BASED onto r34 2026-10-08 (done):** the campaign branch is now
+`40ce2ab86` (r34 tip / tree `a2536910`) + the 6 campaign commits, with the wip `lazy NCCL init` commit
+dropped — it is already in block 12.  The rebased tree is bit-identical to the pre-rebase campaign tree
+(`dd987030`), so the delivery already carries the fix and `changes.patch` (regenerated with
+`git -C ~/llama.cpp diff 40ce2ab86`) does not re-introduce it.
 
 Model: 35B-A3B Q4_K_M, 3×R9700 (gfx1201), ROCm 7.14, `-ngl 99 -fa 1 -t 8 -n 128`, greedy.
 
