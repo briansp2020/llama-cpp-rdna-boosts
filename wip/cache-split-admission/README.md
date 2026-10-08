@@ -22,6 +22,12 @@ all-reduce with the lazy-NCCL fix:
 | cache on, **`MOE_EXPERT_CACHE_DEVPOLICY_SPLIT=1`** | **36.5** | 1.6x faster than off |
 | cache on, `MOE_EXPERT_CACHE_DEVMAP=0` (eager host path) | 25.9 | |
 
+These are **bounded-arena** (`MOE_EXPERT_CACHE_MIB=2048`) numbers.  At the **default** (unset = AUTO) the
+arena sizes to free VRAM and reaches **100 % residency** on this model, so every table takes the
+`identity` fast path and the split-admission-engine choice is moot (both arms equal, ~60 t/s).  The
+engine choice (and this whole campaign) only matters when the arena is deliberately bounded below the
+host expert set.
+
 So the cache *can* be a clear win on `-sm tensor`; the default merely picks the wrong admission engine
 for split tables.  `DEVPOLICY_SPLIT=1` is output-preserving (coherence `359ff4337837` == cache-off).
 

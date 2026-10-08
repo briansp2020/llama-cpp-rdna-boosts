@@ -75,3 +75,12 @@ Independent of the AR bug: with the fix in place, the expert cache **halves** `-
 tables use the host-promotion path (the device policy is off for split tables), and the per-device pool
 thrashes (see `PHASE2B-FINDINGS.md`).  For `-sm tensor` today, `MOE_EXPERT_CACHE_MIB=0` is the faster
 configuration; making the cache/split-table path win is the campaign's remaining work.
+
+**Correction 2026-10-08 (re-measure):** the "net loss" is a **starved-arena artifact**.  Every number
+above set `MOE_EXPERT_CACHE_MIB=2048`, which leaves the `-sm tensor` arena mostly non-resident.  The
+**default** (unset = AUTO) sizes the arena from free VRAM and reaches **100 % residency** on this model:
+35B-A3B Q4_K_M `-sm tensor -ncmoe 40 -n 128` measures cache-off **23.1** t/s, `MIB=2048` **18.9**,
+`MIB=16384` **61.0**, and unset/AUTO **60.6**.  The AUTO log shows `arena 37324.0 MiB of 37324.0 MiB host
+experts (100.0 % residency)` and the FULLY RESIDENT identity fast path.  So the cache is a large win on
+`-sm tensor` at its default sizing; the split-admission and bounded-pool work only matter when the arena
+is deliberately bounded below the host expert set.
