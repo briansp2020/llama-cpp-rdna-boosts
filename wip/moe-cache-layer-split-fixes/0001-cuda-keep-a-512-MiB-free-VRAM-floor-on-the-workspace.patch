@@ -1,0 +1,119 @@
+From 334765414c8e3c808ea43f8733a4406d4925852f Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Thu, 8 Oct 2026 22:15:19 +0000
+Subject: [PATCH 1/2] cuda: keep a 512 MiB free-VRAM floor on the workspace
+ pool's first attempt while the MoE cache holds host experts
+
+With host-expert tables in the expert cache, the workspace pool could take a device down to ~40 MiB free.  In
+that state the arena tables in the slab extension were overwritten with live data: pinned -sm layer -ts 59,41
+--n-cpu-moe 48 gives a broken greedy decode right after a 61k-token prefill (MTP draft 0/1191).  What writes
+there is not understood; this only keeps the device out of that state.
+
+The pool's first attempt now fails like a real OOM when it would leave less than 512 MiB free, so its existing
+flush + retry runs instead; the retry has no floor, so this never turns into an abort.  Active only once the
+cache is sized with host-expert tables (moe_cache_floor_active), so -ncmoe 0 and cache-off runs are unchanged.
+GGML_CUDA_POOL_MIN_FREE_MIB sets the floor (0 = off).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 27 +++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/moe-expert-cache.cu |  9 +++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.h  |  3 +++
+ 3 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 67debf913..019d7ab44 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1117,6 +1117,25 @@ void ggml_cuda_graph_mem_freed(int device) {
+     g_cuda_graph_mem_gen[device]++;
+ }
+ 
++// Free-VRAM floor for the workspace pool's first attempt (the current device).  With host-expert tables in the
++// MoE expert cache, letting the pool take a device down to ~40 MiB free left the slab extension's arena tables
++// overwritten with live data (pinned -sm layer, the greedy decode right after a 61k prefill).  We have not found
++// what writes there; keeping 512 MiB free avoids the state.  GGML_CUDA_POOL_MIN_FREE_MIB sets the floor (0 = off).
++static bool ggml_cuda_pool_floor_refuses(size_t size) {
++    static const char * env = getenv("GGML_CUDA_POOL_MIN_FREE_MIB");
++    const size_t floor = env != nullptr ? (size_t) atoll(env) << 20 : (moe_cache_floor_active() ? (size_t) 512 << 20 : 0);
++    if (floor == 0 || size < ((size_t) 1 << 20)) {
++        return false;
++    }
++    size_t f = 0;
++    size_t t = 0;
++    if (cudaMemGetInfo(&f, &t) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    return f < size + floor;
++}
++
+ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+     static const int MAX_BUFFERS = 256;
+ 
+@@ -1196,7 +1215,13 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+         ggml_cuda_set_device(device);
+         static const bool gc_dbg = getenv("GGML_CUDA_GCDBG") != nullptr;
+         const int64_t t_pl = gc_dbg ? ggml_time_us() : 0;
+-        cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
++        // With the MoE expert cache holding host-expert tables, the first attempt keeps a free-VRAM floor and the
++        // flush + retry below runs instead (see ggml_cuda_pool_floor_refuses).  The retry has no floor, so this
++        // never turns into an abort.
++        cudaError_t err = cudaErrorMemoryAllocation;
++        if (!ggml_cuda_pool_floor_refuses(look_ahead_size)) {
++            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
++        }
+         if (t_pl) { g_pool_us += ggml_time_us() - t_pl; g_pool_n++; }
+         if (err == cudaErrorMemoryAllocation) {
+             g_pool_oom_n++;
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index cfc40e596..92d2424c8 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1505,6 +1505,10 @@ void alloc_table_locked(table_t & t, int slots) {
+     g_arena_bytes += (int64_t) slots * t.expert_bytes;
+ }
+ 
++// Set when the sizing runs with host-expert tables: the workspace pool then keeps a free-VRAM floor
++// (moe_cache_floor_active).
++bool g_floor_active = false;
++
+ // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
+ // `budget / total_expert_bytes`, so an expert resident for gate is resident for up and down too and
+ // the effective (all-roles) hit rate is set by the shared slot count, not by the smallest table.
+@@ -1515,6 +1519,7 @@ void alloc_all_locked() {
+         return;
+     }
+     g_sized = true;
++    g_floor_active = g_enabled && !g_tables.empty();
+     // Already disabled before the first graph (the slab could not give the cache a usable arena, or an
+     // explicit `MOE_EXPERT_CACHE_MIB=0`): nothing to size.  See `moe_cache_disable_streaming` for why the
+     // decision has to be made that early.
+@@ -2110,6 +2115,10 @@ bool moe_cache_enabled() {
+     return g_enabled;
+ }
+ 
++bool moe_cache_floor_active() {
++    return g_floor_active;
++}
++
+ bool moe_cache_cold_active() {
+     return g_enabled && g_cold_uva;
+ }
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 130c5fc77..167ab4d87 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -71,6 +71,9 @@ struct moe_cache_devmap {
+ };
+ 
+ bool moe_cache_enabled();
++// true once the cache is sized with host-expert tables: the workspace pool then keeps a free-VRAM floor on its
++// first attempt (ggml_cuda_pool_leg::alloc)
++bool moe_cache_floor_active();
+ 
+ // Early auto-sizing decision (wip/moe-cache-autosize): called once by the model layer, after the target
+ // context's memory is allocated and before any auxiliary (MTP draft) context is created, with the
+-- 
+2.53.0
+

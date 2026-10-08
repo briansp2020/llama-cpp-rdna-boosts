@@ -1,0 +1,92 @@
+From 36d22e9f530a02a76e4a1a7ee1c9f578e48a6d88 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Thu, 8 Oct 2026 22:15:30 +0000
+Subject: [PATCH 2/2] moe-cache: under -sm layer, leave 6 GiB free after the
+ slab extension (was 4 GiB)
+
+Under -sm layer every expert table is unsplit and each device runs its layers' attention over the whole context,
+so the later-layer device needs more workspace at long context: a 255k-token prompt with pinned host experts
+(-sm layer -ts 59,41 --n-cpu-moe 48) ran device 1 out of VRAM (pool OOM after flush + retry) with the default
+4 GiB of headroom, and passes with 6 GiB.
+
+When every cache table is unsplit and the tables span more than one device, the sizing asks the slab for at least
+6 GiB of headroom before extending (ggml_cuda_slab_headroom_at_least_mib).  An explicit
+GGML_CUDA_SLAB_HEADROOM_MIB still wins; -sm tensor and single-device runs are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda-vmm.h     |  2 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 11 +++++++++--
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 16 ++++++++++++++++
+ 3 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index 7c22446de..948165269 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -42,6 +42,8 @@ size_t ggml_cuda_slab_arena_total (int device);
+ // correction once the weights / KV / draft are resident.  Safe to call repeatedly (a no-op when there is
+ // nothing to gain); moves no address, so every work view and arena table keeps its base.
+ void   ggml_cuda_slab_extend_all();
++// raise the free VRAM the slab extension leaves (never lowers an explicit GGML_CUDA_SLAB_HEADROOM_MIB)
++void   ggml_cuda_slab_headroom_at_least_mib(size_t mib);
+ // The arena's allocation unit (fine: the slab is one mapping, so this is bookkeeping only).
+ size_t ggml_cuda_slab_arena_unit  (int device);
+ // Base of the work region for a `need`-byte compute buffer, moving the boundary up (evicting the arena
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 019d7ab44..0f0f8b1cc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -659,13 +659,20 @@ static size_t ggml_cuda_slab_min_arena_bytes() {
+ // Session 5), which would allow this default to go back down.
+ #define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 4096
+ 
++static size_t g_slab_headroom_min_mib = 0;
++void ggml_cuda_slab_headroom_at_least_mib(size_t mib) {
++    g_slab_headroom_min_mib = mib;
++}
+ static size_t ggml_cuda_slab_headroom_bytes() {
+     static size_t mib = SIZE_MAX;
++    static bool   env_set = false;
+     if (mib == SIZE_MAX) {
+         const char * env = getenv("GGML_CUDA_SLAB_HEADROOM_MIB");
+-        mib = env != NULL ? (size_t) atoll(env) : GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT;
++        env_set = env != NULL;
++        mib = env_set ? (size_t) atoll(env) : GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT;
+     }
+-    return mib * 1024 * 1024;
++    const size_t eff = (!env_set && g_slab_headroom_min_mib > mib) ? g_slab_headroom_min_mib : mib;
++    return eff * 1024 * 1024;
+ }
+ 
+ // Public MiB form, for the cache's own fallback message.
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 92d2424c8..1e8500314 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1530,6 +1530,22 @@ void alloc_all_locked() {
+     // the first moment the weights / KV / draft are all resident, so measure what they did NOT need and
+     // hand it to the arena before sizing.  Without it that VRAM sits idle (~1.9 GiB/card measured) even
+     // though the cache is capped by its region.
++    // -sm layer (every table unsplit, tables on more than one device): each device runs its layers' attention over
++    // the whole context, so leave 6 GiB, not the default, free after the extension (255k needle: the later-layer
++    // device ran out of VRAM with 4 GiB of headroom).
++    {
++        bool all_unsplit = !g_tables.empty();
++        int  dev_mask = 0;
++        for (const table_t & t : g_tables) {
++            all_unsplit = all_unsplit && t.split_axis < 0;
++            if (t.device >= 0 && t.device < 31) {
++                dev_mask |= 1 << t.device;
++            }
++        }
++        if (all_unsplit && (dev_mask & (dev_mask - 1)) != 0) {
++            ggml_cuda_slab_headroom_at_least_mib(6144);
++        }
++    }
+     ggml_cuda_slab_extend_all();
+     // Fail-soft / --fit (§3.1 #5, issue #33): the arena is the LOWEST-priority VRAM consumer.  Size it
+     // from what is actually free NOW - after --fit, the compute-graph reserve and the KV cache have all
+-- 
+2.53.0
+
