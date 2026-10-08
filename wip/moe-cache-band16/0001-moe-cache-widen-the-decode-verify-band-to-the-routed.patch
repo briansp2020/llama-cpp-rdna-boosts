@@ -1,0 +1,306 @@
+From 8e9fc4b2ae322ae3e547b2383eb58556608fe014 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Thu, 8 Oct 2026 01:31:04 +0000
+Subject: [PATCH] moe-cache: widen the decode/verify band to the routed-expert
+ MMVQ band (16 on RDNA4)
+
+The expert cache only takes over routed MUL_MAT_ID batches of <= 8 tokens.  With MTP each active
+stream verifies n_max+1 tokens per step, so 3+ concurrent streams at n-max 3 (12-16 tokens) fall
+to the host path: ids readback + full device synchronize + H2D copy of every used expert, with the
+arena unused.  Measured on 2 x R9700 (-sm tensor --n-cpu-moe 48, IQ3_XXS): 2 streams 164 t/s total,
+3 streams 46, 4 streams 53 (all-VRAM: 185 / 193 / 201).
+
+The cache serves a batch only through the routed-expert MMVQ kernel (it reads the arena through the
+slot remap; MMQ/MMF do not), and the arena redirect already runs before kernel selection, so the band
+can follow that kernel's band on the device:
+
+- MOE_EXPERT_CACHE_MAX_TOK becomes moe_cache_max_tok() / moe_cache_max_tok_dev(device): the narrowest
+  get_mmvq_mmid_max_batch over the quantized types on the device (16 on RDNA4, CDNA, GCN, RDNA1/2;
+  8 on RDNA3 - where the 16-wide MoE MMVQ band is off because it is incorrect on gfx1100 - and on
+  NVIDIA), never below the historical 8.  GGML_MOE_CACHE_MAX_TOK lowers it (8 = the old band).
+- New backend iface hook moe_cache_band: the CUDA backend reports its device's band, the meta backend
+  the narrowest over its devices; the scheduler's four literal 8s (take-over before the ids readback,
+  per-layer split grouping, decode-band rebalance, device-gather gate) ask the backend instead.
+  A backend without the hook keeps 8; the meta backend's moe_cache_update follows its band too.
+  CPU / RPC get explicit NULL entries.
+- The device-side admission policy kernel stages a pass's admitted experts in a fixed shared-memory
+  list (MOE_CACHE_POLICY_MAX_FILL, was 64): past it, an expert was still marked resident but its fill
+  was never staged, so the next pass read a stale arena slot.  The list is now 256 (16 tokens x 16
+  experts) and the loop stops admitting when it is full (the expert stays cold, served from the host
+  alias).  64 was already below n_used * 8 = 80 for a 10-expert model at the old band.
+
+Same 2 x R9700 setup with the band at 16: 3 streams 175 t/s total, 4 streams 191; 1-2 streams
+unchanged; greedy output equals the all-VRAM output (the 9-16 token prompt now takes the same MoE
+MMVQ kernel), plain == MTP; 0 faults.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend-impl.h           |  4 ++++
+ ggml/src/ggml-backend-meta.cpp         | 20 ++++++++++++++--
+ ggml/src/ggml-backend.cpp              | 16 +++++++++----
+ ggml/src/ggml-cpu/ggml-cpu.cpp         |  1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu        |  6 +++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 33 +++++++++++++++++++++++---
+ ggml/src/ggml-cuda/moe-expert-cache.h  | 11 +++++++--
+ ggml/src/ggml-rpc/ggml-rpc.cpp         |  1 +
+ 8 files changed, 81 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 435979b24..52b8f37f6 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -274,6 +274,10 @@ extern "C" {
+         // the scheduler skip the per-op ids readback + full device synchronize it forces.  `slice_off`/
+         // `split_axis` are the per-device slice geometry (0/-1 for an unsplit table).  The Meta backend
+         // forwards to each simple backend and returns true only if every device took it.
++        // MoE expert cache: the widest routed `MUL_MAT_ID` batch (in tokens) this backend's cache takes over
++        // (its decode/verify band).  The scheduler keys its band decisions (the take-over before the ids
++        // readback, the per-layer split grouping and rebalance) off it.  NULL = the historical 8.
++        int64_t (*moe_cache_band)(ggml_backend_t backend);
+         bool (*moe_cache_gather)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, size_t slice_off, int split_axis);
+     };
+ 
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 8120ecbf7..db0f29929 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -3111,14 +3111,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+ // host expert.  Returns true only when EVERY device took the input over, so the scheduler's skip-copy
+ // decision stays all-or-nothing (a mixed outcome would leave some devices reading a buffer nobody
+ // filled).
++static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend);
++
+ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const struct ggml_tensor * weight,
+         const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok,
+         size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis) {
+     GGML_UNUSED(slice_off);
+     GGML_UNUSED(split_axis);
+     // Only a routed expert table (a `MUL_MAT_ID` weight with an expert axis) is cacheable, and only the
+-    // decode/verify band (the band constant is shared with the CUDA module).
+-    if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2 || n_tok > 8) {
++    // decode/verify band (the narrowest band of the simple backends, see ggml_backend_meta_moe_cache_band).
++    if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2 || n_tok > ggml_backend_meta_moe_cache_band(backend)) {
+         return false;
+     }
+     if (!ggml_backend_buffer_is_meta(weight_cpy->buffer)) {
+@@ -3242,6 +3244,19 @@ static bool ggml_backend_meta_moe_cache_promote(ggml_backend_t backend, const st
+ // expert-table tail over-read with the reused `input_cpy`'s stale/NaN bytes.  The CUDA gather now
+ // reproduces the host path's tail guard (see `moe_cache_gather_host`); the geometry was verified
+ // byte-exact for every routed expert on all three devices before the re-enable.
++// The narrowest MoE cache band over the simple backends (a batch the meta backend forwards must be in every
++// device's band); a simple backend without the hook counts as the historical 8.
++static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend) {
++    int64_t band = INT64_MAX;
++    const size_t n_backends = ggml_backend_meta_n_backends(backend);
++    for (size_t j = 0; j < n_backends; j++) {
++        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
++        const int64_t b = simple_backend->iface.moe_cache_band != nullptr ? simple_backend->iface.moe_cache_band(simple_backend) : 8;
++        band = std::min(band, b);
++    }
++    return n_backends > 0 ? band : 8;
++}
++
+ static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const struct ggml_tensor * weight,
+         const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids,
+         size_t slice_off, int split_axis) {
+@@ -3312,6 +3327,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .moe_cache_update        = */ ggml_backend_meta_moe_cache_update,
+     /* .moe_cache_take_over     = */ ggml_backend_meta_moe_cache_take_over,
+     /* .moe_cache_promote       = */ ggml_backend_meta_moe_cache_promote,
++    /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
+     /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
+ };
+ 
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index dd83bdf29..fc6ce6901 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1370,6 +1370,14 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
+ // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+ // wip/moe-expert-cache: the layer index a weight tensor belongs to, parsed from its `blk.<N>.` name.
+ // Used only to find which device OWNS a layer when deciding where a host-weight op should run.
++
++// The MoE expert cache's decode/verify band on `backend`: routed MUL_MAT_ID batches up to this many tokens are
++// taken over by the cache instead of the ids readback + used-expert copy.  The backend owns the value (the CUDA
++// cache clamps it to its routed-expert MMVQ band per device); a backend without the hook keeps the historical 8.
++static int64_t sched_moe_cache_band(ggml_backend_t backend) {
++    return backend->iface.moe_cache_band != NULL ? backend->iface.moe_cache_band(backend) : 8;
++}
++
+ static int moe_name_layer(const struct ggml_tensor * t) {
+     if (t->name[0] == '\0') {
+         return -1;
+@@ -1647,7 +1655,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         // offloaded expert uploads across devices and breaks the staging pipeline: measured -42 % on
+         // `-sm layer` ncmoe 40 ub8192 (4511 -> 2625) and -15..-24 % on `-sm tensor`, against pass 1's
+         // all-on-device-0 assignment.  Leave prefill on the pass-1 choice.
+-        if (node->op == GGML_OP_MUL_MAT_ID && node->ne[2] > 8) {
++        if (node->op == GGML_OP_MUL_MAT_ID && node->ne[2] > sched_moe_cache_band(sched->backends[*node_backend_id])) {
+             continue;
+         }
+         const int dst = layer_dev[layer];
+@@ -1747,7 +1755,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                             // layer change still lets the input copies be reused across layers).
+                             // `ggml_backend_offload_op` is true for a decode `MUL_MAT_ID` exactly when the
+                             // cache is enabled (the CUDA offload relaxation), so it is the cache-active test.
+-                            const bool cache_op = node->op == GGML_OP_MUL_MAT_ID && node->ne[2] <= 8 &&
++                            const bool cache_op = node->op == GGML_OP_MUL_MAT_ID && node->ne[2] <= sched_moe_cache_band(sched->backends[cur_backend_id]) &&
+                                 ggml_backend_offload_op(sched->backends[cur_backend_id], node);
+                             if (cache_op) {
+                                 const int L = moe_name_layer(src);
+@@ -2335,7 +2343,7 @@ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backe
+     for (int ni = 0; ni < split->graph.n_nodes; ni++) {
+         const struct ggml_tensor * cand = split->graph.nodes[ni];
+         if (cand->op == GGML_OP_MUL_MAT_ID && cand->src[0] == input_cpy && cand->src[2] != NULL &&
+-            cand->src[2]->ne[1] > 8) {
++            cand->src[2]->ne[1] > sched_moe_cache_band(sched->backends[split->backend_id])) {
+             return true;
+         }
+     }
+@@ -2635,7 +2643,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 // decode/verify band: prefill keeps the staged upload and its direct-reading MMQ
+                 // fusions (which are not cache-aware).  A device-remap takeover records the pair for
+                 // the deferred promotion pass below.
+-                if (node != nullptr && node->ne[2] <= 8 &&
++                if (node != nullptr && node->ne[2] <= sched_moe_cache_band(split_backend) &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                     ggml_backend_buffer_is_host(input->buffer) &&
+                     split_backend->iface.moe_cache_take_over != NULL) {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 224e1b334..75f8483af 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -391,6 +391,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
+     /* .moe_cache_update        = */ NULL,
+     /* .moe_cache_take_over     = */ NULL,
+     /* .moe_cache_promote       = */ NULL,
++    /* .moe_cache_band          = */ NULL,
+     /* .moe_cache_gather        = */ NULL,
+ };
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f4e3671dc..67debf913 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9074,6 +9074,11 @@ static bool ggml_backend_cuda_moe_cache_promote(ggml_backend_t backend, const gg
+ }
+ 
+ // B2: device-side host-weight expert gather for an offloaded `MUL_MAT_ID` prefill (see the iface comment).
++static int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
++    const ggml_backend_cuda_context * cuda_ctx = (const ggml_backend_cuda_context *) backend->context;
++    return moe_cache_max_tok_dev(cuda_ctx->device);
++}
++
+ static bool ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, size_t slice_off, int split_axis) {
+     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+     return moe_cache_gather_host(weight, weight_cpy, ids, ctx->stream(), ctx->device, slice_off, split_axis);
+@@ -9106,6 +9111,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .moe_cache_update        = */ ggml_backend_cuda_moe_cache_update,
+     /* .moe_cache_take_over     = */ ggml_backend_cuda_moe_cache_take_over,
+     /* .moe_cache_promote       = */ ggml_backend_cuda_moe_cache_promote,
++    /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
+     /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
+ };
+ 
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index fcd774f11..8be9fa075 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -4,6 +4,7 @@
+ #include "ggml-cuda-vmm.h"
+ 
+ #include "common.cuh"
++#include "mmvq.cuh"
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -53,9 +54,11 @@ struct moe_cache_policy_desc {
+     int64_t         pad1;
+ };
+ 
+-// A table can admit at most `n_used * n_tok <= 8*8 = 64` experts in one token (all its routing); the
+-// kernel stages them in shared memory before the block cooperatively copies them into the arena.
+-#define MOE_CACHE_POLICY_MAX_FILL 64
++// The kernel stages a token's admitted experts in shared memory before the block cooperatively copies them
++// into the arena.  A table can see up to `n_used * n_tok` routed experts in one pass (16 x 16 = 256 at the
++// widened band); the admission loop stops admitting once the list is full, so an expert is never marked
++// resident without its fill (it stays cold and is served from the host alias instead).
++#define MOE_CACHE_POLICY_MAX_FILL 256
+ 
+ namespace {
+ 
+@@ -1941,6 +1944,9 @@ __global__ void moe_cache_policy_kernel(
+                 if (noevict && occupied >= slots) {
+                     continue;
+                 }
++                if (do_fill && fill_n >= MOE_CACHE_POLICY_MAX_FILL) {
++                    continue;   // fill list full: admitting would mark the expert resident with no fill staged
++                }
+                 int slot = -1;
+                 if (occupied < slots) {
+                     for (int s = 0; s < slots; s++) {
+@@ -2051,6 +2057,27 @@ __global__ void moe_cache_policy_kernel(
+ // public API
+ // ---------------------------------------------------------------------------------------------
+ 
++int moe_cache_max_tok_dev(int device) {
++    static int band[GGML_CUDA_MAX_DEVICES] = {};   // 0 = not computed yet (idempotent, so a racy init is benign)
++    if (band[device] == 0) {
++        const char * e    = getenv("GGML_MOE_CACHE_MAX_TOK");
++        const int    want = e != nullptr ? atoi(e) : MMVQ_MOE_MAX_BATCH_SIZE;
++        const int    cc   = ggml_cuda_info().devices[device].cc;
++        int kband = MMVQ_MOE_MAX_BATCH_SIZE;
++        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
++            if (ggml_is_quantized((ggml_type) t)) {
++                kband = std::min(kband, get_mmvq_mmid_max_batch((ggml_type) t, cc));
++            }
++        }
++        band[device] = std::max(1, std::min(want, std::max(MMVQ_MAX_BATCH_SIZE, kband)));
++    }
++    return band[device];
++}
++
++int moe_cache_max_tok() {
++    return moe_cache_max_tok_dev(ggml_cuda_get_device());
++}
++
+ bool moe_cache_enabled() {
+     return g_enabled;
+ }
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 1ac092165..130c5fc77 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -42,8 +42,15 @@
+ struct ggml_tensor;
+ 
+ // The decode/verify band the cache serves.  Prefill (n_tokens > this) keeps the full-table path
+-// and its MoE fusions; the offload relaxation and the fusion guard both key off this constant.
+-#define MOE_EXPERT_CACHE_MAX_TOK 8
++// and its MoE fusions; the offload relaxation and the fusion guard both key off this value.
++// The cache serves a routed MUL_MAT_ID only through the routed-expert MMVQ kernel (it reads the arena
++// through the slot remap; MMQ/MMF do not), so the band is that kernel's band on the device: the narrowest
++// get_mmvq_mmid_max_batch over the quantized types (16 on RDNA4, 8 on RDNA3 / NVIDIA), never below the
++// historical 8.  GGML_MOE_CACHE_MAX_TOK lowers it (e.g. 8 = the pre-extension band).  This is the single
++// source: the scheduler asks the backend through the `moe_cache_band` iface hook.
++int moe_cache_max_tok_dev(int device);
++int moe_cache_max_tok();   // the current device's band
++#define MOE_EXPERT_CACHE_MAX_TOK (moe_cache_max_tok())
+ 
+ struct moe_cache_alias {
+     void * ptr;        // device-usable address; nullptr if unknown
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index f3ad96606..caf910a61 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1099,6 +1099,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+     /* .moe_cache_update        = */ NULL,
+     /* .moe_cache_take_over     = */ NULL,
+     /* .moe_cache_promote       = */ NULL,
++    /* .moe_cache_band          = */ NULL,
+     /* .moe_cache_gather        = */ NULL,
+ };
+ 
+-- 
+2.53.0
+
