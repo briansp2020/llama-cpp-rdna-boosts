@@ -81,11 +81,12 @@ is a 2x win on `-sm layer`, and the prefill seed/tally is dead under the pool.
    the record: remove the full pinned master and the scheduler `tensor->data` fallback for pooled tables,
    so the non-swappable bound is the pool alone -- the `get_cold`/remap re-architecture the README's "hard
    constraint" describes.
-7. **The pool's AUTO budget comes from the preflight.**  **DONE (2026-10-08):**  `MOE_HOST_POOL_MIB=auto`
-   sizes the process-wide pool to `MOE_HOST_POOL_FRAC` (default 25) % of the MoE host
+7. **The pool's AUTO budget comes from the preflight.**  **DONE (2026-10-08):**  `--host-experts pool`
+   selects the pool, and `MOE_HOST_POOL_MIB` (default `auto`) sizes it to `MOE_HOST_POOL_FRAC` (25) % of
+   the MoE host
    expert bytes (`moe_host_expert_bytes`, the preflight accumulation -- not the whole model, so qwen4exp's
-   PLE is excluded); 4645 MiB pinned for the 35B `-ncmoe 40`.  Unset stays **off** (the pool is an
-   option); an explicit MiB wins.  See
+   PLE is excluded); 4645 MiB pinned for the 35B `-ncmoe 40`.  `pinned` stays the default (no pool); an
+   explicit MiB wins.  See
    the long-prompt sweep in `PHASE2B-FINDINGS.md`.
 8. **`-sm tensor` slowness** (found while answering the maintainer, 2026-10-08).  Two separate items: a
    **block-12 all-reduce bug** (the default hybrid eagerly calls `ncclCommInitAll`, degrading the internal
@@ -114,8 +115,9 @@ HIP_VISIBLE_DEVICES=0,1 MOE_HOST_POOL_MIB=20000 \
 
 | var | default | meaning |
 |---|---|---|
-| `MOE_HOST_POOL_MIB` | **off (unset)** | opt-in bounded host pool: unset/`0` = off; `auto` = `MOE_HOST_POOL_FRAC` % of the MoE host expert bytes; `N` = explicit MiB |
-| `MOE_HOST_POOL_FRAC` | **25** | AUTO budget as a percentage of the MoE host expert bytes (`moe_host_expert_bytes`) |
+| `--host-experts pool` | (option; default `pinned`) | enable the bounded pinned host pool.  `pinned`/`auto` = no pool; `pool` = on |
+| `MOE_HOST_POOL_MIB` | **auto (25 %)** | pool size when enabled: unset/`auto` = `MOE_HOST_POOL_FRAC` % of the MoE host expert bytes; `N` = explicit MiB; `0` disables even with `--host-experts pool` |
+| `MOE_HOST_POOL_FRAC` | **25** | auto size as a percentage of the MoE host expert bytes (`moe_host_expert_bytes`) |
 | `MOE_HOST_POOL_POLICY` | **1** | pooled tables on the device policy: `1` = pool-aware fill (default), `0` = host promotion (original), `2` = device policy filling from the master (1b probe) |
 | `MOE_HOST_POOL_PREFETCH` | **0** | `1` = routing-driven speculative prefill (a net loss unless the pool nears full residency; long-prompt sweep in `PHASE2B-FINDINGS.md`) |
 | `MOE_HOST_POOL_PREWARM` | 1 | fill every slot when a pool is built (one-shot, from the prefill tally / arena residents) |

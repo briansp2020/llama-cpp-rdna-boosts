@@ -32,9 +32,9 @@ prose), pool-aware sits ~2 t/s under pool-off and the routing prefill is the cau
 The prefill hurts until the pool nears full residency, then is neutral; it never beats the master in
 Phase 2.  So `MOE_HOST_POOL_PREFETCH` now defaults **off**.  At 2 GiB the pool hit rate is 5.2 %
 (433/8391, 861 929 fills / 856 886 evictions): the async one-token prefill never reaches the critical
-path.  Item 7 landed: `MOE_HOST_POOL_MIB=auto` sizes the pool to `MOE_HOST_POOL_FRAC` (25) % of the
-**MoE host expert bytes** (not the whole model -- qwen4exp's PLE excluded); 4645 MiB pinned for the 35B,
-unset stays off, an explicit MiB wins.
+path.  Item 7 landed: `--host-experts pool` selects the pool, and `MOE_HOST_POOL_MIB` (default `auto`)
+sizes it to `MOE_HOST_POOL_FRAC` (25) % of the **MoE host expert bytes** (not the whole model -- qwen4exp's
+PLE excluded); 4645 MiB pinned for the 35B, `pinned` stays the default, an explicit MiB wins.
 
 **Update 2026-10-08 (target 3 landed).**  The prefill tally now drives both the arena seed and the pool
 ranking, independent of the device-policy gate (`seed_prefill_lazy_locked` iterates the device's tables
