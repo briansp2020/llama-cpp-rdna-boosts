@@ -74,15 +74,18 @@ is a 2x win on `-sm layer`, and the prefill seed/tally is dead under the pool.
    `GGML_LOG_WARN`; `tools/cli/cli.cpp:36` pins llama-cli's default to `LOG_LEVEL_ERROR`, so the correct
    flags are `-lv 2` (the pool summary) and `-lv 4`/`-v` (the full `moe_cache_report`) — the earlier
    `-lv 1` note was wrong (level 1 is *error*).
-6. **Phase 3** (the reason for all of this): remove the full pinned master and the scheduler
-   `tensor->data` fallback for pooled tables, so the non-swappable bound is the pool alone.  This is the
-   `get_cold`/remap re-architecture the README's "hard constraint" describes; the "invisible L2" route
-   chose it deliberately (every pooled access stays cache-owned; `get_cold` would have to return false
-   and every used expert must be admitted).
-7. **The pool budget now defaults from the preflight.**  **DONE (2026-10-08):** `MOE_HOST_POOL_MIB`
-   unset/`auto` sizes the process-wide pool to `MOE_HOST_POOL_FRAC` (default 25) % of the MoE host
+6. **Phase 3 (master removal) -- WITHDRAWN, not a goal.**  The maintainer confirmed 2026-10-08 that the
+   host pool is an **option** for systems that cannot hold the weights resident; where they can be held
+   resident, the usual (fully-resident / pinned-master) behaviour stays.  Do **not** remove the full
+   pinned master or the scheduler `tensor->data` fallback.  The original (now moot) plan is kept below for
+   the record: remove the full pinned master and the scheduler `tensor->data` fallback for pooled tables,
+   so the non-swappable bound is the pool alone -- the `get_cold`/remap re-architecture the README's "hard
+   constraint" describes.
+7. **The pool's AUTO budget comes from the preflight.**  **DONE (2026-10-08):**  `MOE_HOST_POOL_MIB=auto`
+   sizes the process-wide pool to `MOE_HOST_POOL_FRAC` (default 25) % of the MoE host
    expert bytes (`moe_host_expert_bytes`, the preflight accumulation -- not the whole model, so qwen4exp's
-   PLE is excluded); 4645 MiB pinned for the 35B `-ncmoe 40`.  `0` disables, an explicit MiB wins.  See
+   PLE is excluded); 4645 MiB pinned for the 35B `-ncmoe 40`.  Unset stays **off** (the pool is an
+   option); an explicit MiB wins.  See
    the long-prompt sweep in `PHASE2B-FINDINGS.md`.
 8. **`-sm tensor` slowness** (found while answering the maintainer, 2026-10-08).  Two separate items: a
    **block-12 all-reduce bug** (the default hybrid eagerly calls `ncclCommInitAll`, degrading the internal
@@ -111,7 +114,7 @@ HIP_VISIBLE_DEVICES=0,1 MOE_HOST_POOL_MIB=20000 \
 
 | var | default | meaning |
 |---|---|---|
-| `MOE_HOST_POOL_MIB` | **auto (25 %)** | process-wide pinned pool budget: unset/`auto` = `MOE_HOST_POOL_FRAC` % of the MoE host expert bytes; `0` = off; `N` = explicit MiB |
+| `MOE_HOST_POOL_MIB` | **off (unset)** | opt-in bounded host pool: unset/`0` = off; `auto` = `MOE_HOST_POOL_FRAC` % of the MoE host expert bytes; `N` = explicit MiB |
 | `MOE_HOST_POOL_FRAC` | **25** | AUTO budget as a percentage of the MoE host expert bytes (`moe_host_expert_bytes`) |
 | `MOE_HOST_POOL_POLICY` | **1** | pooled tables on the device policy: `1` = pool-aware fill (default), `0` = host promotion (original), `2` = device policy filling from the master (1b probe) |
 | `MOE_HOST_POOL_PREFETCH` | **0** | `1` = routing-driven speculative prefill (a net loss unless the pool nears full residency; long-prompt sweep in `PHASE2B-FINDINGS.md`) |

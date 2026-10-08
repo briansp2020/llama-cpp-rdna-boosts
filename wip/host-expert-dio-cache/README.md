@@ -3,10 +3,12 @@
 Status: **Phase 2 + 2b targets 1-5 + item 7 done** (bounded, **process-wide, additive** pinned host pool
 landed + validated; it is a page-cache-backed bounce buffer, DIO is a debug fallback; low-priority
 background eviction prefetch; **pool-aware device policy**, target 1; **AUTO pool = 25 % of the MoE host
-expert bytes**, item 7).  **Re-based onto r34
+expert bytes**, item 7).  **The pool is an opt-in option** (unset = off) for systems that cannot hold the
+weights resident; where they can, the usual fully-resident behaviour stays, and Phase 3 (master removal)
+is **withdrawn** (maintainer, 2026-10-08).  **Re-based onto r34
 (2026-10-08, done)** -- the branch is `40ce2ab86` (r34 tip) + the campaign, the wip lazy-NCCL commit
-dropped; `changes.patch` regenerated against `40ce2ab86`.  **Open:** **Phase 3** (remove the pinned
-master).  A **block-12 all-reduce bug** was root-caused en route ([`SM-TENSOR-AR.md`](SM-TENSOR-AR.md)),
+dropped; `changes.patch` regenerated against `40ce2ab86`.  A **block-12 all-reduce bug** was root-caused
+en route ([`SM-TENSOR-AR.md`](SM-TENSOR-AR.md)),
 and the split-table admission-policy choice became the followup campaign [`../cache-split-admission/`](../cache-split-admission/README.md).
 Nothing here is part of the delivery.  A fresh session should read [`HANDOVER.md`](HANDOVER.md) for the code
 seams and the Phase plan, [`PARKED-BUG.md`](PARKED-BUG.md) for the partial-arena fault fixed before the

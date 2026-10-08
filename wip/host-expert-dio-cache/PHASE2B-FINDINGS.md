@@ -1,7 +1,9 @@
 # Phase 2b — where the pool's CPU goes, and a plan
 
-Status: **targets 1-5 implemented + landed (2026-10-08)**; Phase 3 remains the open item.
-Nothing in `patches/`/`release.json` was touched and nothing was pushed.
+Status: **targets 1-5 + item 7 implemented + landed (2026-10-08)**.  The pool is an **opt-in option**
+(unset = off); the full pinned master stays for the common case, and Phase 3 (master removal) is
+**withdrawn** (maintainer, 2026-10-08).  Nothing in `patches/`/`release.json` was touched and nothing was
+pushed.
 
 **Update 2026-10-08 (target 1 landed -- pool-aware device policy).**  Pooled tables now use the
 device-side admission policy (the `!g_pool_enabled` gate is removed), and the kernel's fill sources the
@@ -30,9 +32,9 @@ prose), pool-aware sits ~2 t/s under pool-off and the routing prefill is the cau
 The prefill hurts until the pool nears full residency, then is neutral; it never beats the master in
 Phase 2.  So `MOE_HOST_POOL_PREFETCH` now defaults **off**.  At 2 GiB the pool hit rate is 5.2 %
 (433/8391, 861 929 fills / 856 886 evictions): the async one-token prefill never reaches the critical
-path.  Item 7 landed: `MOE_HOST_POOL_MIB` unset/`auto` now defaults to `MOE_HOST_POOL_FRAC` (25) % of the
+path.  Item 7 landed: `MOE_HOST_POOL_MIB=auto` sizes the pool to `MOE_HOST_POOL_FRAC` (25) % of the
 **MoE host expert bytes** (not the whole model -- qwen4exp's PLE excluded); 4645 MiB pinned for the 35B,
-`0` disables, an explicit MiB wins.
+unset stays off, an explicit MiB wins.
 
 **Update 2026-10-08 (target 3 landed).**  The prefill tally now drives both the arena seed and the pool
 ranking, independent of the device-policy gate (`seed_prefill_lazy_locked` iterates the device's tables

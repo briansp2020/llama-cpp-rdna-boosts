@@ -74,7 +74,7 @@ index 853ca23bd..f2abd281e 100644
      const int kqs      = vdr * (threadIdx.x % (qi/vdr));
      // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index cfc40e596..30d9039a1 100644
+index cfc40e596..87c69950f 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -8,10 +8,20 @@
@@ -236,13 +236,13 @@ index cfc40e596..30d9039a1 100644
 +    static const int64_t v = [] {
 +        const char * e = getenv("MOE_HOST_POOL_MIB");
 +        if (e == nullptr || e[0] == '\0') {
-+            return (int64_t) -1;   // unset = AUTO: MOE_HOST_POOL_FRAC %% of the MoE host expert bytes
++            return (int64_t) 0;   // unset = OFF: the host pool is an option, not the default
 +        }
 +        if (e[0] == 'a' || e[0] == 'A') {
-+            return (int64_t) -1;   // "auto"
++            return (int64_t) -1;  // "auto" = MOE_HOST_POOL_FRAC % of the MoE host expert bytes
 +        }
 +        const long long n = atoll(e);
-+        return (int64_t) (n > 0 ? n : 0);   // 0 = explicitly disabled
++        return (int64_t) (n > 0 ? n : 0);   // 0 = disabled
 +    }();
 +    return v;
 +}
