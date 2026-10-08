@@ -82,6 +82,12 @@ all four coherence arms, dense 4B, `MUL_MAT_ID`, prefill-logit as above.
 **Remaining:** target 1 (pool-aware device policy) is now a residual; otherwise the campaign's open item
 is Phase 3 (remove the pinned master and the scheduler fallback).
 
+**Separate block-12 bug found while answering "why is `-sm tensor` so slow?":** the default hybrid
+all-reduce eagerly initializes NCCL, and that alone makes the internal pipeline ~3x slower for
+`-sm tensor` decode (3x R9700 `-ncmoe 0`: 21.6 -> 69.6 t/s after deferring NCCL to the first large
+tensor).  Full analysis, the fix and validation: [`SM-TENSOR-AR.md`](SM-TENSOR-AR.md).  It is a block-12
+change and needs the maintainer's sign-off before any delivery fold.
+
 Read with [`PHASE2B-HANDOVER.md`](PHASE2B-HANDOVER.md) (targets), [`PHASE2.md`](PHASE2.md) (the pool
 design / the page-cache finding) and the repo [`AGENTS.md`](../../AGENTS.md).
 
