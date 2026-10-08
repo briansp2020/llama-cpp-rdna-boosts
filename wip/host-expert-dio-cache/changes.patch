@@ -74,7 +74,7 @@ index 853ca23bd..f2abd281e 100644
      const int kqs      = vdr * (threadIdx.x % (qi/vdr));
      // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index cfc40e596..466373275 100644
+index cfc40e596..5e68b3f96 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -8,8 +8,14 @@
@@ -606,7 +606,7 @@ index cfc40e596..466373275 100644
              if (old_remap != nullptr) { (void) cudaFree(old_remap); }
              (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
          }
-@@ -4099,6 +4493,21 @@ void moe_cache_report() {
+@@ -4099,6 +4493,23 @@ void moe_cache_report() {
      GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), budget_desc());
@@ -619,8 +619,10 @@ index cfc40e596..466373275 100644
 +            p_bytes += (int64_t) p.slots * (int64_t) p.host_bytes;
 +        }
 +        const int64_t ptot = p_hits + p_misses;
-+        GGML_LOG_INFO("%s: host pool (L2): %zu tensors, %lld slots, %.1f MiB pinned; h=%.4f (%lld/%lld), "
-+                      "DIO fills=%lld evictions=%lld\n",
++        // WARN, not INFO: llama-cli's default threshold filters INFO, so the pool summary was invisible on a
++        // plain run (it needs `-lv 4`/`-v`).  The pool is a tuning surface, so its summary must be visible.
++        GGML_LOG_WARN("%s: host pool (L2): %zu tensors, %lld slots, %.1f MiB pinned; h=%.4f (%lld/%lld), "
++                      "fills=%lld evictions=%lld\n",
 +                      __func__, g_host_pools.size(), (long long) p_slots, (double) p_bytes / (1024 * 1024),
 +                      ptot > 0 ? (double) p_hits / (double) ptot : 0.0, (long long) p_hits, (long long) ptot,
 +                      (long long) p_fills, (long long) p_evict);

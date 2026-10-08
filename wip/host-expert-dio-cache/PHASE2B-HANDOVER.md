@@ -1,7 +1,9 @@
 # HANDOVER — Phase 2b tuning of the host-expert pool
 
 Read first: [`README.md`](README.md), [`PARKED-BUG.md`](PARKED-BUG.md), [`PHASE2.md`](PHASE2.md), and the
-repo [`AGENTS.md`](../../AGENTS.md).
+repo [`AGENTS.md`](../../AGENTS.md).  **Profiling results and the target-by-target design/plan are now
+in [`PHASE2B-FINDINGS.md`](PHASE2B-FINDINGS.md)** (2026-10-08): the pool hit rate is 3.8-20 %, target 1
+is a 2x win on `-sm layer`, and the prefill seed/tally is dead under the pool.
 
 ## Where the work lives
 
@@ -53,10 +55,10 @@ repo [`AGENTS.md`](../../AGENTS.md).
 4. **Per-device pools duplicate the cache.**  Under `-sm layer`/`-sm tensor` each device caches the same
    or its own experts; the budget is per device, so `MOE_HOST_POOL_MIB=20000` is 40 GiB total.  Decide
    whether the budget should be process-wide (a shared pool needs per-device in-flight tracking).
-5. **Pool stats are not visible from `llama-cli`.**  `moe_cache_report`'s `GGML_LOG_INFO` lines are
-   filtered at llama-cli's default log level (a plain run shows only WARN/ERROR).  Either raise the
-   report to WARN for the pool summary, or document `-lv 1`.  A temporary `fprintf` probe was used
-   during this session (removed).
+5. **Pool stats are not visible from `llama-cli`.**  **DONE (2026-10-08):** the pool summary is now
+   `GGML_LOG_WARN`; `tools/cli/cli.cpp:36` pins llama-cli's default to `LOG_LEVEL_ERROR`, so the correct
+   flags are `-lv 2` (the pool summary) and `-lv 4`/`-v` (the full `moe_cache_report`) — the earlier
+   `-lv 1` note was wrong (level 1 is *error*).
 6. **Phase 3** (the reason for all of this): remove the full pinned master and the scheduler
    `tensor->data` fallback for pooled tables, so the non-swappable bound is the pool alone.  This is the
    `get_cold`/remap re-architecture the README's "hard constraint" describes; the "invisible L2" route

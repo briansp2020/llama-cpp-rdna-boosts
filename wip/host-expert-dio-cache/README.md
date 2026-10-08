@@ -7,6 +7,9 @@ seams and the Phase plan, [`PARKED-BUG.md`](PARKED-BUG.md) for the partial-arena
 pool (the handover's "host over-read" diagnosis was wrong — it was a slab access bug),
 [`PHASE2.md`](PHASE2.md) for the L2 pool design, validation and the perf finding, and
 [`PHASE2B-HANDOVER.md`](PHASE2B-HANDOVER.md) to pick up Phase 2b tuning.
+[`PHASE2B-FINDINGS.md`](PHASE2B-FINDINGS.md) holds the Phase 2b profiling (the pool misses ~96 % of the
+time, `-sm layer` loses 2x to the disabled device policy, the prefill seed is dead under the pool) and
+the per-target design/plan awaiting go-ahead.
 
 ## Why
 
