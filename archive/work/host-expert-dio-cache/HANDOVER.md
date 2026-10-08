@@ -1,6 +1,6 @@
 # HANDOVER — host 2nd-level expert cache (pinned, DIO-filled)
 
-For a fresh session picking up `wip/host-expert-dio-cache/`.  Read
+For a fresh session picking up `archive/work/host-expert-dio-cache/`.  Read
 [`README.md`](README.md) first for the motivation and design; this file is the
 "where the code is and what to do next" layer.
 

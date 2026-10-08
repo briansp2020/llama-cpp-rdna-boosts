@@ -2,7 +2,7 @@
 
 Scope: everything **this repo adds or repurposes**, plus the upstream variables and the non-ggml
 runtime variables (HIP/ROCm) that materially affect how this delivery behaves.  Defaults are taken from
-the `rdna-boosts` tree at release `v16-a55e952b8-r27`; the table was generated from the code, not from
+the `rdna-boosts` tree at release `v16-a55e952b8-r35`; the table was generated from the code, not from
 memory (see [Maintaining this file](#maintaining-this-file)).
 
 ## How to read this
@@ -89,6 +89,24 @@ the slack up front moves the cost to before the arena is sized.
 > allocation instead fails with a message naming `GGML_CUDA_SLAB_RESERVE_MIB`.  There is no variable for the
 > yield behaviour, and it should stay that way.  See `ARENA-UB-TENSION.md` §13/§14.
 
+### 1.2.1 Optional host-expert pool (`--host-experts pool`, block 06)
+
+The pool is an **option** for systems that cannot hold the weights resident; the default `--host-experts
+pinned` (and `auto`) keeps the usual behaviour and allocates **no** pool.  When enabled, it is a bounded
+pinned bounce buffer over the page cache, one per host tensor, process-wide budget, and it serves the MoE
+expert-cache fills.  r35.
+
+| variable / flag | default | class | notes |
+|---|---|---|---|
+| `--host-experts pool` | `pinned` | option | select the bounded host pool.  `pinned`/`auto` = no pool; `mmap` was removed in r33. |
+| `MOE_HOST_POOL_MIB` | `auto` | tuning | pool size when enabled: unset/`auto` = `MOE_HOST_POOL_FRAC` % of the MoE host expert bytes (`moe_host_expert_bytes`); `N` = explicit MiB; `0` = disable even with `--host-experts pool`. |
+| `MOE_HOST_POOL_FRAC` | `25` | tuning | the auto percentage (1–100). |
+| `MOE_HOST_POOL_POLICY` | `1` | kill-switch | pooled tables on the device policy: `1` pool-aware fill, `0` host promotion (pre-r35), `2` master fill (A/B). |
+| `MOE_HOST_POOL_PREFETCH` | `0` | opt-in | routing-driven speculative pool prefill; **off** because a long-prompt sweep showed it hurts until the pool nears full residency (`1` enables). |
+| `MOE_HOST_POOL_PREWARM` | `1` | kill-switch | one-shot slot fill when a pool is built (ranked by the prefill tally / arena residents). |
+| `MOE_HOST_POOL_BGFETCH` | `1` | kill-switch | low-priority background eviction prefetch; `0` is the synchronous path. |
+| `MOE_HOST_POOL_DIO` | `0` | diagnostic | `1` = O_DIRECT fill (bypasses the page cache). |
+
 ### 1.3 The movable-boundary slab (block 06) — `GGML_CUDA_SLAB`, default **on**
 
 **This is the delivery's central allocator.**  ONE slab per device is reserved and mapped **exactly once**
@@ -167,7 +185,7 @@ an environment variable).  Plain `--spec-type draft-mtp` does not use it.
 
 | variable | default | class | notes |
 |---|---|---|---|
-| `LLAMA_MMAP_HOST_EXPERTS` | — | **removed (r33)** | the legacy alias for `--host-experts`.  The pageable `--host-experts mmap` mode was dropped in r33 (issue #116): a no-XNACK GPU (gfx1201 reports `XNACK enabled: NO`) cannot read a pageable host master in a kernel, so `-ncmoe`/`-cmoe` experts are always pinned (`ROCm_Host`).  The variable is now ignored.  The bounded pinned DIO host tier that replaces the reclaimable-page-cache idea is the `wip/host-expert-dio-cache/` campaign. |
+| `LLAMA_MMAP_HOST_EXPERTS` | — | **removed (r33)** | the legacy alias for `--host-experts`.  The pageable `--host-experts mmap` mode was dropped in r33 (issue #116): a no-XNACK GPU (gfx1201 reports `XNACK enabled: NO`) cannot read a pageable host master in a kernel, so `-ncmoe`/`-cmoe` experts are always pinned (`ROCm_Host`).  The variable is now ignored.  The bounded pinned DIO host tier that replaces the reclaimable-page-cache idea is the `archive/work/host-expert-dio-cache/` campaign. |
 | `LLAMA_TENSOR_HOST_BUFT` | unset | tuning | host buffer type for overridden tensors. |
 | `LLAMA_DEVICE_INPUT` | off | **opt-in** | device-side input handling. |
 | `LLAMA_DROP_COMPUTE_BUFFERS` | **on** (every tool) | tuning / kill-switch | drop the wide-prefill compute layout at the prefill→decode transition so a wide `-ub` and a large arena coexist (`-ub 8192` cache-auto cli decode 45.6 → 78.7 t/s).  Follows `common_params::drop_compute_buffers`; set the env to `0`/`1` to override.  **A server may drop too** (this was cli-only until r22): the movable-boundary slab reclaims a later wide layout with a boundary move, which is verified on `wide1 → short → wide2` at `-ub 8192` (0 aborts, all coherent).  `0` is only needed where the compute layout CANNOT be reclaimed — i.e. with `GGML_CUDA_SLAB=0`. |

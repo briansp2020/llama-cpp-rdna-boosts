@@ -92,7 +92,7 @@ is a 2x win on `-sm layer`, and the prefill seed/tally is dead under the pool.
    **block-12 all-reduce bug** (the default hybrid eagerly calls `ncclCommInitAll`, degrading the internal
    pipeline ~3x; fixed on the wip branch, needs sign-off — [`SM-TENSOR-AR.md`](SM-TENSOR-AR.md)) and the
    **split-table admission-policy choice** (the cache's device policy is hard-disabled for split tables;
-   followup campaign [`../cache-split-admission/`](../cache-split-admission/README.md)).
+   followup campaign [`../cache-split-admission/`](../../wip/cache-split-admission/README.md)).
 
 ## Reproduce
 

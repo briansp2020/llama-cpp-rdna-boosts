@@ -3,7 +3,24 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r33` (2026-10-08) -- the pageable host-expert master is removed (issue #116):**
+> **Current release `v16-a55e952b8-r35` (2026-10-08) -- the bounded pinned host-expert pool is folded into block 06:**
+> `--host-experts pool` adds an **optional** pinned host pool over the page cache for systems that cannot
+> hold the weights resident; the default stays `pinned` (no pool).  The pool is sized to
+> `MOE_HOST_POOL_MIB`, default `MOE_HOST_POOL_FRAC` (25) % of the MoE host expert bytes
+> (`moe_host_expert_bytes`; the preflight estimate, so qwen4exp's PLE is excluded).  Pooled tables run the
+> device admission policy and the in-kernel fill sources the pool (`MOE_HOST_POOL_POLICY`); the routing
+> prefill is default-off (`MOE_HOST_POOL_PREFETCH=1` opts in).  Also: the parked slab-access fix
+> (`ggml_cuda_vmm_map_phys` grants `cuMemSetAccess` to every peer device) and the `mul_mat_vec_q_moe`
+> row-tail clamp (**block 13**).  Canonical block-15 tip `645fd4989e542d93`, net tree
+> `b2ba2bb32c76e857399be224ba8e303db172c8f7`; strict **16/16** `git am` (`validate-set.sh` green).  Full
+> record: `WORKLOG.md` r35; campaign: `archive/work/host-expert-dio-cache/`.
+>
+> **Previous release `v16-a55e952b8-r34` (2026-10-08) -- block 12's NCCL init is deferred** to the first
+> large tensor (an eager `ncclCommInitAll` degraded the internal all-reduce ~3x, `-sm tensor -ncmoe 0`
+> decode 21.6 -> 69.5 t/s, output unchanged); same block-15 tip family as r33 with block 12 amended.
+> Full record: `WORKLOG.md` r34.
+>
+> **Previous release `v16-a55e952b8-r33` (2026-10-08) -- the pageable host-expert master is removed (issue #116):**
 > `--host-experts mmap` and the legacy `LLAMA_MMAP_HOST_EXPERTS` are dropped -- a no-XNACK GPU (gfx1201
 > reports `XNACK enabled: NO`) cannot read a pageable address in a kernel, so `-ncmoe`/`-cmoe` experts are
 > always pinned (`ROCm_Host`).  The cache gains the matching safety rails (the in-place alias requires a
@@ -12,7 +29,7 @@
 > hard-aborts (`0` disables).  Canonical block-15 tip `6e567349cfb237f9887a3a55c45cbff874909c2e`, net tree
 > `13479e6ae709ce53a29c67f24e2c9cb8b16a95f2`; strict **16/16** `git am` (`validate-set.sh` green).  Full
 > record: `WORKLOG.md` r33; the bounded pinned DIO host tier that replaces the reclaimable-page-cache idea
-> is opened as `wip/host-expert-dio-cache/`.
+> is opened as `archive/work/host-expert-dio-cache/`.
 >
 > **Previous release `v16-a55e952b8-r32` (2026-10-08) -- issues #48 and #49 fixed:** the multi-sequence
 > post-prefill re-reserve no longer aborts (block 06: the TODO #42 drop re-reserves with the current

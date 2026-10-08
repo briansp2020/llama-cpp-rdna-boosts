@@ -19,11 +19,12 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r33`** (the pageable host-expert master is removed -- **issue #116**: `--host-experts
-mmap` and `LLAMA_MMAP_HOST_EXPERTS` are dropped because a no-XNACK GPU cannot read a pageable address in
-a kernel, `-ncmoe`/`-cmoe` experts are always pinned, and `MOE_EXPERT_CACHE_MIB` below 2048 now errors;
-the bounded pinned DIO host tier that replaces the reclaimable-page-cache idea is the
-`wip/host-expert-dio-cache/` campaign).  Before it, **`v16-a55e952b8-r32`** fixed the two crashes found
+**`v16-a55e952b8-r35`** (the bounded pinned host-expert pool is folded into block 06: `--host-experts
+pool` adds an **optional** host pool over the page cache, sized to `MOE_HOST_POOL_MIB` (auto = 25 % of the
+MoE host expert bytes); the default stays `pinned`, and the `mul_mat_vec_q_moe` row-tail clamp is in block
+13).  Before it, **`v16-a55e952b8-r33`** removed the pageable host-expert master (**issue #116**:
+`--host-experts mmap` and `LLAMA_MMAP_HOST_EXPERTS` are dropped, `-ncmoe`/`-cmoe` experts are always
+pinned, and `MOE_EXPERT_CACHE_MIB` below 2048 errors).  Before that, **`v16-a55e952b8-r32`** fixed the two crashes found
 during the PR #115 review (the multi-sequence post-prefill re-reserve, **issue #48** in block 06, and the
 meta split-state stack overflow, **issue #49** in block 15).  Before that, **`v16-a55e952b8-r31`** (PR #115 folded into block 06: the MoE
 expert-cache decode/verify band follows the routed-expert MMVQ band -- **16 tokens on RDNA4** -- so

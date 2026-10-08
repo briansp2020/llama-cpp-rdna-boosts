@@ -5,8 +5,12 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r34`** (canonical block-15 tip `40ce2ab86`, net tree
-`a253691093acbd96`): **block 12's NCCL init is deferred to the first large tensor.**  The hybrid
+**`a55e952b8`**, released as **`v16-a55e952b8-r35`** (canonical block-15 tip `645fd4989`, net tree
+`b2ba2bb32c76e857`): **the bounded pinned host-expert pool (`--host-experts pool`) is folded into block
+06** (plus the `mul_mat_vec_q_moe` row-tail clamp in block 13).  The pool is an **option** (the default
+stays `pinned`); it sizes to `MOE_HOST_POOL_MIB`, auto = 25 % of the MoE host expert bytes.  Before it,
+**`v16-a55e952b8-r34`** (tip `40ce2ab86`, tree `a253691093acbd96`) deferred block 12's NCCL init to the
+first large tensor: the hybrid
 all-reduce already served every decode-sized reduce through the internal pipeline, but an eager
 `ncclCommInitAll` degraded it ~3x (`-sm tensor -ncmoe 0` decode 21.6 -> **69.5 t/s**, output unchanged),
 so NCCL now comes up lazily on the first prefill tensor.  Before it, **`v16-a55e952b8-r33`** (tip
@@ -17,7 +21,7 @@ NO`) cannot read a pageable address in a kernel, so `-ncmoe`/`-cmoe` experts are
 (`ROCm_Host`).  The cache gains the matching safety rails (the in-place alias requires a successful
 `cudaHostGetDevicePointer`; the device gather declines a master with no device mapping; a partial
 pageable axis-0 `-sm tensor` split declines) and `MOE_EXPERT_CACHE_MIB` in `(0, 2048)` now hard-aborts
-(`0` disables); the bounded pinned DIO host tier is opened as `wip/host-expert-dio-cache/`.  Strict 16/16
+(`0` disables); the bounded pinned DIO host tier is opened as `archive/work/host-expert-dio-cache/`.  Strict 16/16
 `git am`, `validate-set.sh` green.  Before it, **`v16-a55e952b8-r32`** fixed the two crashes found during
 the PR #115 review (issue #48 in block 06, issue #49 in block 15).  Before that,
 **`v16-a55e952b8-r31`** folded

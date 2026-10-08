@@ -2,9 +2,12 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r32`** (canonical block-15
-tip `6a443a1b50f29e32`, net tree `8798d38b8e2c649d`), which fixes the two bugs found during the PR #115
-review: **issue #48** (the post-prefill re-reserve uses the current ubatch's sequence count, so a
+point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r35`** (canonical block-15
+tip `645fd4989e542d93`, net tree `b2ba2bb32c76e857`), which folds the bounded pinned host-expert pool
+(`--host-experts pool`, an option; the default stays `pinned`) into block 06 and the `mul_mat_vec_q_moe`
+row-tail clamp into block 13.  Before it, **`v16-a55e952b8-r34`** deferred block 12's `ncclCommInitAll`
+to the first large tensor, and **`v16-a55e952b8-r33`** removed the pageable host-expert master (issue
+#116).  Before that, the r32 state fixed the two bugs found during the PR #115 review: **issue #48** (the post-prefill re-reserve uses the current ubatch's sequence count, so a
 multi-sequence decode no longer builds a zero-token attention graph; `llama-batched-bench -npl 4`
 aborted) and **issue #49** (the meta split-state computation is pre-warmed bottom-up, so a >1200-node
 `src` chain no longer overflows the stack; `llama-cli --spec-type draft-mtp --spec-draft-n-max 3`

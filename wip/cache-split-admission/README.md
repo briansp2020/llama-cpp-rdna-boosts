@@ -9,7 +9,7 @@ delivery.  Do not fold without the maintainer's go-ahead.
 ## The problem
 
 For a MoE decode, `-sm tensor` is slower than `-sm layer` (the per-layer cross-device reduction; see
-[`../host-expert-dio-cache/SM-TENSOR-AR.md`](../host-expert-dio-cache/SM-TENSOR-AR.md) for the separate
+[`../../archive/work/host-expert-dio-cache/SM-TENSOR-AR.md`](../../archive/work/host-expert-dio-cache/SM-TENSOR-AR.md) for the separate
 all-reduce bug).  Turning the expert cache **on** makes `-sm tensor` *worse*:
 
 35B-A3B Q4_K_M, 3×R9700 (gfx1201), ROCm 7.14, `-sm tensor -ncmoe 40 -fa 1 -t 8 -n 128`, greedy, hybrid

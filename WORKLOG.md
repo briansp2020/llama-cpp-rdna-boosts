@@ -1,5 +1,53 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-08 (r35) -- the bounded pinned host-expert pool (`--host-experts pool`); block 06
+
+**Release** `v16-a55e952b8-r35`, same fork point `a55e952b8`; canonical block-15 tip
+**`645fd4989e542d93`**, net tree **`b2ba2bb32c76e857399be224ba8e303db172c8f7`** (strict **16/16**
+`git am`, `validate-set.sh` green).  Block count stays **16**: the `archive/work/host-expert-dio-cache` campaign is
+folded into **block 06** (the MoE expert cache / `--host-experts` block), plus the `mul_mat_vec_q_moe`
+row-tail clamp into **block 13**.  The folded tree is bit-identical to the campaign tip (`b2ba2bb32`), so
+the code was not re-validated from scratch -- the campaign's gate matrix is the release's.
+
+### Why
+
+`-ncmoe`/`-cmoe` host experts are backed by a full pinned (`ROCm_Host`) master.  For systems that cannot
+hold the weights resident, the campaign adds a **bounded, optional** pinned host pool as a bounce buffer
+over the page cache: `--host-experts pool` (a new member of `pinned|auto`; `mmap` is gone) sizes it to
+`MOE_HOST_POOL_MIB`, default `MOE_HOST_POOL_FRAC` (25) % of the MoE host expert bytes
+(`moe_host_expert_bytes`, the preflight estimate, so qwen4exp's PLE is excluded).  The pool is an
+**option**: the default stays `pinned` (no pool), so the common fully-resident behaviour is unchanged.
+
+### What landed (block 06)
+
+* host-source registry (`moe_cache_set_host_source`, keyed by the host tensor) + `llama_file::path()` so
+  the pool can reopen the GGUF after the loader is gone;
+* the bounded, pinned, page-cache-filled pool (per host tensor, process-wide budget, LRU, per-`(slot,
+  device)` in-flight events, one-shot prewarm);
+* a **pool-aware device admission policy**: pooled tables run the device policy, and the in-kernel fill
+  sources the pool when the expert is resident (`MOE_HOST_POOL_POLICY`), falling back to the master;
+* the prefill-tally seed + pool rerank, a low-priority background eviction prefetch
+  (`MOE_HOST_POOL_BGFETCH`), and the `MOE_HOST_POOL_*` tuning/disable knobs;
+* the parked-bug fix: `ggml_cuda_vmm_map_phys` grants `cuMemSetAccess` to every peer device (a
+  cross-device `hipMemcpyPeerAsync` into the slab work region faulted `Page not present`);
+* the `mul_mat_vec_q_moe` row-tail clamp (**block 13**): the last row-block no longer reads dead rows past
+  the expert into the next expert / off the tensor (a cold read sources the pinned master in place).
+
+### Validation
+
+`validate-set.sh` green (fresh-tarball strict 16/16 apply, applied tree == `release.json`).  3x R9700
+(gfx1201), 35B-A3B Q4_K_M `-sm layer` and `-sm tensor` `-ncmoe 40`: short `359ff4337837`, long-prefill
+`12d4fcd10886` (both `pinned` and `--host-experts pool`); dense 4B `1c5d32ac537d`; `MUL_MAT_ID` 931/931;
+prefill-logit KLD **0.000707** / **98.755 %** PASS.  Long-prompt (`-n 3000`) default stays ~44.7 t/s
+pool-off and 43.9 with the 25 % auto pool; the routing prefill is default-**off**
+(`MOE_HOST_POOL_PREFETCH=1` opts in) because a sweep showed it hurts until the pool nears full residency.
+
+### Env
+
+`--host-experts pool`; `MOE_HOST_POOL_MIB` (unset/`auto` = 25 %), `MOE_HOST_POOL_FRAC`,
+`MOE_HOST_POOL_POLICY`, `MOE_HOST_POOL_PREFETCH`, `MOE_HOST_POOL_PREWARM`, `MOE_HOST_POOL_BGFETCH`,
+`MOE_HOST_POOL_DIO`.  See `ENVIRONMENT.md`.
+
 ## 2026-10-08 (r34) -- block 12's NCCL init is deferred to the first large tensor (`-sm tensor` decode 3x)
 
 **Release** `v16-a55e952b8-r34`, same fork point `a55e952b8`; canonical block-15 tip **`40ce2ab86`**,
@@ -88,7 +136,7 @@ matrix on the 3x R9700 / gfx1201 box (ROCm 7.14):
 ### Follow-on
 
 The bounded, pinned, DIO-filled host tier that replaces the reclaimable-page-cache idea is opened as
-`wip/host-expert-dio-cache/`.  **Known separate bug:** `--host-experts pinned` + `-sm tensor` + a partial
+`archive/work/host-expert-dio-cache/`.  **Known separate bug:** `--host-experts pinned` + `-sm tensor` + a partial
 arena still faults (1024 and 2048 MiB/device) at a host address with no pageable warning -- a host
 over-read, parked in that campaign.
 
