@@ -40,21 +40,25 @@ is a 2x win on `-sm layer`, and the prefill seed/tally is dead under the pool.
 
 ## Open work (Phase 2b tuning targets)
 
-1. **The miss path costs ~0.8–0.9 t/s** (35B: pool 2048 MiB/device buffered 6.1 vs pool-off 6.9).  The
-   pool lookup + `cudaMemcpyAsync` from a slot vs the master.  Profile it (the fill is under `g_mutex`).
+1. **The miss path costs ~0.8–0.9 t/s.**  **DONE (2026-10-08, target 2):** the eviction fetch moved to a
+   low-priority background worker (nice 19; reserve/publish under `g_mutex`, the `pread` outside it;
+   bidirectional dedupe with the critical path).  `MOE_HOST_POOL_BGFETCH=0` restores the synchronous
+   path.  Root cause of the cost (a 3.8–20 % pool hit rate → a `pread` per fill) and the numbers are in
+   `PHASE2B-FINDINGS.md`.
 2. **The device-side admission policy is disabled for pooled tables** (`t.policy = g_devpolicy &&
    !g_pool_enabled && …`): the in-kernel policy fill reads the full master and cannot refill the pool.
    Making the policy kernel pool-aware (a device `expert -> pool_slot` map, host pre-fills the pool for
    the token's used experts before the flush) would keep the fast path.  This is likely the single
    biggest win on the reporter model.
-3. **Prewarm ranking.**  `pool_prepopulate_locked` ranks by the arena's hot set (`t.slot_expert`), then
-   the host prefill tally (`t.prefill_count`), then id order.  Under `-sm tensor` the host tally is
-   **empty** (the device tally `prefill_count_dev` is consumed by `apply_prefill_seed_rank_locked`), so
-   the prewarm is only as good as the arena's seeded residents.  Feed the device tally (or the prefill
-   routing) into the prewarm.
-4. **Per-device pools duplicate the cache.**  Under `-sm layer`/`-sm tensor` each device caches the same
-   or its own experts; the budget is per device, so `MOE_HOST_POOL_MIB=20000` is 40 GiB total.  Decide
-   whether the budget should be process-wide (a shared pool needs per-device in-flight tracking).
+3. **Prewarm ranking.**  **DONE (2026-10-08, target 3):** the device prefill tally now drives both the
+   arena seed and `pool_rerank_from_tally_locked` (which excludes arena residents — additive), and the
+   seed runs outside `if (g_devpolicy)` so it works for the host-promotion/pool path.  `-sm layer`
+   pool-on 36.3 -> 41.1 t/s.
+4. **Per-device pools duplicate the cache.**  **DONE (2026-10-08, targets 4a+4b):** one pool per host
+   tensor with a **process-wide** budget, per-`(slot, device)` in-flight events, `cudaHostAlloc(Portable|
+   Mapped)` + a D2D UVA fill, a degenerate-geometry guard, and the **additive** lifecycle (fetch on
+   arena eviction, retire on admission once the copy drains).  Note the semantics change:
+   `MOE_HOST_POOL_MIB` is now the process-wide TOTAL, not per device.
 5. **Pool stats are not visible from `llama-cli`.**  **DONE (2026-10-08):** the pool summary is now
    `GGML_LOG_WARN`; `tools/cli/cli.cpp:36` pins llama-cli's default to `LOG_LEVEL_ERROR`, so the correct
    flags are `-lv 2` (the pool summary) and `-lv 4`/`-v` (the full `moe_cache_report`) — the earlier
@@ -65,7 +69,12 @@ is a 2x win on `-sm layer`, and the prefill seed/tally is dead under the pool.
    chose it deliberately (every pooled access stays cache-owned; `get_cold` would have to return false
    and every used expert must be admitted).
 7. The `moe_host_expert_bytes` / `MOE_EXPERT_CACHE_*` sizing and the pool budget are independent today;
-   consider whether `MOE_HOST_POOL_MIB` should default from the preflight estimate.
+   consider whether `MOE_HOST_POOL_MIB` should default from the preflight estimate.  **OPEN.**
+8. **`-sm tensor` slowness** (found while answering the maintainer, 2026-10-08).  Two separate items: a
+   **block-12 all-reduce bug** (the default hybrid eagerly calls `ncclCommInitAll`, degrading the internal
+   pipeline ~3x; fixed on the wip branch, needs sign-off — [`SM-TENSOR-AR.md`](SM-TENSOR-AR.md)) and the
+   **split-table admission-policy choice** (the cache's device policy is hard-disabled for split tables;
+   followup campaign [`../cache-split-admission/`](../cache-split-admission/README.md)).
 
 ## Reproduce
 
