@@ -60,6 +60,28 @@ point may show only a residual benefit.  Gates green at 4b: short `359ff4337837`
 (all four pool/split arms), dense 4B `1c5d32ac537d`, `MUL_MAT_ID` 931/931, prefill-logit KLD 0.000707 /
 98.755 % PASS.
 
+**Update 2026-10-08 (target 2 landed — background prefetch).**  The eviction fetch now runs on a
+detached **nice-19** worker: the eviction enqueues the expert, the worker reserves a slot and opens the
+fd under `g_mutex`, reads the GGUF **without** it, then publishes.  Dedupe both ways — the worker drops
+an expert the critical path already populated (state 1) or reserved (3/4); the critical path treats a
+state-3/4 entry as a miss, reads the master, and cancels the reservation (3 → 4) so the pool never keeps
+a duplicate.  `MOE_HOST_POOL_BGFETCH=0` restores the synchronous 4b path.
+
+| arm | 4a | 4b (sync) | 2 (background) | pool h |
+|---|---:|---:|---:|---:|
+| `-sm layer` | 41.1 | 39.1 | **41.9** | 0.29 |
+| `-sm tensor` | 18.7 | 17.1 | **18.7** | 0.46 |
+
+The background queue recovers the 4b regression *and* keeps the additive hit rate, i.e. the pool is now
+net-neutral-to-positive rather than a wash.  A deadlock found and fixed en route: the main thread's
+`__cxa_finalize` destroyed the static `condition_variable` while the detached worker was still waiting
+on it (`pthread_cond_destroy` hang, seen as a stray 27 GiB/GPU process that starved the next runs) — the
+queue/cv/mutex are now deliberately heap-leaked, process-lifetime primitives.  Gates green at target 2:
+all four coherence arms, dense 4B, `MUL_MAT_ID`, prefill-logit as above.
+
+**Remaining:** target 1 (pool-aware device policy) is now a residual; otherwise the campaign's open item
+is Phase 3 (remove the pinned master and the scheduler fallback).
+
 Read with [`PHASE2B-HANDOVER.md`](PHASE2B-HANDOVER.md) (targets), [`PHASE2.md`](PHASE2.md) (the pool
 design / the page-cache finding) and the repo [`AGENTS.md`](../../AGENTS.md).
 
