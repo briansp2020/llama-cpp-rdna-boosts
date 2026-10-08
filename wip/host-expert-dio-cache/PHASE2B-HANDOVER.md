@@ -49,11 +49,18 @@ is a 2x win on `-sm layer`, and the prefill seed/tally is dead under the pool.
    bidirectional dedupe with the critical path).  `MOE_HOST_POOL_BGFETCH=0` restores the synchronous
    path.  Root cause of the cost (a 3.8–20 % pool hit rate → a `pread` per fill) and the numbers are in
    `PHASE2B-FINDINGS.md`.
-2. **The device-side admission policy is disabled for pooled tables** (`t.policy = g_devpolicy &&
-   !g_pool_enabled && …`): the in-kernel policy fill reads the full master and cannot refill the pool.
-   Making the policy kernel pool-aware (a device `expert -> pool_slot` map, host pre-fills the pool for
-   the token's used experts before the flush) would keep the fast path.  This is likely the single
-   biggest win on the reporter model.
+2. **The device-side admission policy is disabled for pooled tables.**  **DONE (2026-10-08, target 1):**
+   pooled tables now use the device policy (the `!g_pool_enabled` gate is gone) and the in-kernel fill
+   sources the bounded host pool: a device `expert -> pool_slot` map is snapshotted from the pool LRU
+   each flush, with a master fallback for non-resident experts.  The per-table promote keeps the pool
+   warm for the routed experts through the target-2 background worker.  `MOE_HOST_POOL_POLICY` is the
+   kill-switch: `0` = original host promotion for pooled tables, `1` = pool-aware (default), `2` =
+   device policy filling from the master (the 1b probe).  35B-A3B Q4_K_M `-sm layer -ncmoe 40`,
+   `MOE_EXPERT_CACHE_MIB=2048` + `MOE_HOST_POOL_MIB=2048`, prose `-n 128`: host promotion **41.0** ->
+   pool-aware device policy **43.1** t/s (pool off device policy **45.4**).  Mode 1 ~= mode 2, i.e. the
+   pool-sourced fill is not faster than the master fill -- the win is enabling the policy engine for
+   pooled tables.  This is a `-sm layer` change; split tables keep host promotion unless
+   `DEVPOLICY_SPLIT=1` (the followup campaign).
 3. **Prewarm ranking.**  **DONE (2026-10-08, target 3):** the device prefill tally now drives both the
    arena seed and `pool_rerank_from_tally_locked` (which excludes arena residents — additive), and the
    seed runs outside `if (g_devpolicy)` so it works for the host-promotion/pool path.  `-sm layer`
@@ -102,6 +109,7 @@ HIP_VISIBLE_DEVICES=0,1 MOE_HOST_POOL_MIB=20000 \
 | var | default | meaning |
 |---|---|---|
 | `MOE_HOST_POOL_MIB` | unset/0 = off | pool size in **MiB per device** |
+| `MOE_HOST_POOL_POLICY` | **1** | pooled tables on the device policy: `1` = pool-aware fill (default), `0` = host promotion (original), `2` = device policy filling from the master (1b probe) |
 | `MOE_HOST_POOL_PREWARM` | 1 | fill every slot when a pool is built |
 | `MOE_HOST_POOL_DIO` | **0** | `1` = O_DIRECT fill (debug; bypasses the page cache) |
 

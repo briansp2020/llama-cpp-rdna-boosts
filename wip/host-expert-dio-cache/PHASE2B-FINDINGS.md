@@ -1,7 +1,19 @@
 # Phase 2b — where the pool's CPU goes, and a plan
 
-Status: **target 3 implemented + target 5 landed (2026-10-08)**; targets 1, 2 and 4 remain designs.
+Status: **targets 1-5 implemented + landed (2026-10-08)**; Phase 3 remains the open item.
 Nothing in `patches/`/`release.json` was touched and nothing was pushed.
+
+**Update 2026-10-08 (target 1 landed -- pool-aware device policy).**  Pooled tables now use the
+device-side admission policy (the `!g_pool_enabled` gate is removed), and the kernel's fill sources the
+bounded host pool when the expert is pool-resident (a device `expert -> pool_slot` map snapshotted from
+the pool LRU each flush) and falls back to the master otherwise.  The per-table promote keeps the pool
+warm through the target-2 background worker (a synchronous pre-fill measured far slower: 26.3 vs 43.1).
+`MOE_HOST_POOL_POLICY` selects `1` pool-aware (default), `0` host promotion (original), `2` master fill
+(1b). 35B-A3B Q4_K_M `-sm layer -ncmoe 40`, `MOE_EXPERT_CACHE_MIB=2048` + `MOE_HOST_POOL_MIB=2048`,
+prose `-n 128`: host promotion **41.0** -> pool-aware **43.1** t/s (pool off **45.4**).  A bring-up
+kernel page fault was a bug in this work (the fill added `e*host_bytes` on top of the slot base), not a
+pool/virtual-memory limit.  Gates green: short `359ff4337837`, long-prefill `12d4fcd10886` (both
+splits), dense 4B `1c5d32ac537d`, `MUL_MAT_ID` 931/931, prefill-logit KLD 0.000707 / 98.755 %.
 
 **Update 2026-10-08 (target 3 landed).**  The prefill tally now drives both the arena seed and the pool
 ranking, independent of the device-policy gate (`seed_prefill_lazy_locked` iterates the device's tables
