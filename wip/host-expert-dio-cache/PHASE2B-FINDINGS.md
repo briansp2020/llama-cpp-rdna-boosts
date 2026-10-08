@@ -1,9 +1,33 @@
 # Phase 2b — where the pool's CPU goes, and a plan
 
-Status: **profiling + plan (2026-10-08)**.  No non-trivial code change yet: targets 1, 3 and 4 below are
-designs awaiting the maintainer's go-ahead (per the campaign's report-before-implementing rule).  The
-only landed change in this pass is target 5 (the pool summary is now `WARN`, so it is visible with
-`-lv 2`); nothing in `patches/`/`release.json` was touched and nothing was pushed.
+Status: **target 3 implemented + target 5 landed (2026-10-08)**; targets 1, 2 and 4 remain designs.
+Nothing in `patches/`/`release.json` was touched and nothing was pushed.
+
+**Update 2026-10-08 (target 3 landed).**  The prefill tally now drives both the arena seed and the pool
+ranking, independent of the device-policy gate (`seed_prefill_lazy_locked` iterates the device's tables
+and runs outside `if (g_devpolicy)`; `pool_rerank_from_tally_locked` is new and excludes arena residents,
+i.e. the pool is the additive complement).  35B-A3B Q4_K_M, prose prompt (5258 tokens), `-n 128`,
+`MOE_HOST_POOL_MIB=2048`:
+
+| arm | gen t/s |
+|---|---:|
+| `-sm layer` pool on, seed **on** | **41.1** |
+| `-sm layer` pool on, seed off | 36.3 |
+| `-sm layer` pool off (device policy) | 42.0* / 41.5† |
+| `-sm tensor` pool on, seed on | 17.3 |
+| `-sm tensor` pool on, seed off | 17.5 |
+
+`*` short prompt; `†` `-sm layer` host promotion with `DEVPOLICY=0` (master source) at `-n 64`.  The
+seed closes most of the pool penalty on `-sm layer` (the reporter's mode); `-sm tensor` is unaffected.
+Gates: short `359ff4337837`, long-prefill `12d4fcd10886` (all four pool/split arms), dense 4B
+`1c5d32ac537d`, `MUL_MAT_ID` 931/931, prefill-logit KLD 0.000707 / 98.755 % PASS.
+
+**Maintainer's direction (2026-10-08):** the pool must be **additive** — once the GPU has a weight block
+(its arena copy has drained) the pool releases that entry, and when the GPU evicts a block the pool
+fetches it from disk so it is resident for re-use.  The only in-transit exception is a pinned block
+whose arena copy has not drained.  Budget is **process-wide**, and the implication is a **host-wanted
+active prefetch/streaming** pattern that keeps the pool ready with what the devices need next.  Question
+3 is answered: the pool need not be ≥ the arena hot set; it is the complement of the arena.
 
 Read with [`PHASE2B-HANDOVER.md`](PHASE2B-HANDOVER.md) (targets), [`PHASE2.md`](PHASE2.md) (the pool
 design / the page-cache finding) and the repo [`AGENTS.md`](../../AGENTS.md).
@@ -114,10 +138,22 @@ smaller than the arena's for the same byte budget.
 ## Proposed designs and order
 
 Recommended order: **3 → 4 → 1 → 2** (make the pool useful first, then the policy, then the residual
-micro-optimisation).  If the immediate reporter `-sm layer` win is the priority, 1 can move first; the
-table above says it is 2x on its own, but the pool-aware form (1a) only pays off once 3+4 give it a hit
-rate.  Each step is independently gated (coherence, `MUL_MAT_ID`, prefill-logit KLD); per repo policy
-every new beneficial path ships default-on with a kill-switch and must clear the full gate matrix first.
+micro-optimisation); approved by the maintainer.  **Target 3 is done.**  Each step is independently
+gated (coherence, `MUL_MAT_ID`, prefill-logit KLD); per repo policy every new beneficial path ships
+default-on with a kill-switch and must clear the full gate matrix first.
+
+### Target 4 — additive, process-wide pool (maintainer's contract)
+The pool becomes the **complement of the arena**, not a duplicate:
+* On an arena admission of expert `e`, `e` is released from the pool once its arena copy has drained
+  (`slot_ev`); until then it is the in-transit exception and stays pinned.
+* On an arena eviction of `e`, `e` is fetched into the pool (buffered `pread`), ready for re-use.
+* One pool per host tensor (keyed `t.host`, not `(t.host, t.device)`) with a **process-wide** budget, so
+  a whole expert is stored once and every device copies its slice from it; per-slot in-flight tracking
+  must be per device (a shared pool + one cross-device event fails `invalid resource handle`).
+* A **host-wanted streaming** worker keeps the pool ready with the next-needed experts (the recent
+  device routing + the prefill tally are the predictor), shielding the devices from storage latency.
+* `seed_prefill_lazy_locked` already produces the wanted order for the seed; the streaming worker is the
+  steady-state extension of the same ranking.
 
 ### Target 3 — feed the device prefill tally into the seed *and* the pool prewarm (cheap, high leverage)
 * Decouple the seed from `g_devpolicy`: call `seed_prefill_lazy_locked` from `moe_cache_policy_flush`
