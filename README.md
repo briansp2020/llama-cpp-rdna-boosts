@@ -484,10 +484,18 @@ for per-block verification and `BASELINE.md` for provenance.
 
 The delivery is the **16-patch set** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork
 point recorded in [`release.json`](release.json) (**`a55e952b8`**, upstream master, 2026-10-03 re-base); the
-**current release is `v16-a55e952b8-r32`** (both crashes found during the PR #115 review are fixed:
-issue #48, the post-prefill re-reserve no longer builds a zero-token attention graph for a
-multi-sequence decode, block 06; issue #49, the meta split-state computation no longer overflows the
-stack on a deep `src` chain, block 15).  Before it, **`v16-a55e952b8-r31`** was: PR #115 folded into
+**current release is `v16-a55e952b8-r34`**: block 12's hybrid all-reduce no longer initialises NCCL
+eagerly -- NCCL comes up lazily on the first tensor too large for the internal pipeline (prefill), so a
+decode-only `-sm tensor` run never pays for it.  Eager `ncclCommInitAll` measurably degraded the
+internal pipeline ~3x even when no collective used it, which kept `-sm tensor` MoE decode at ~22 t/s
+instead of ~67 (now 69.5 t/s at `-ncmoe 0` on 3x R9700, output unchanged).  Before it,
+**`v16-a55e952b8-r33`** removed the pageable `--host-experts mmap` host master (issue #116: an RDNA part
+without XNACK cannot read a pageable address in a kernel), dropped `--host-experts mmap` /
+`LLAMA_MMAP_HOST_EXPERTS`, made the `-ncmoe`/`-cmoe` master always pinned and added the
+`MOE_EXPERT_CACHE_MIB >= 2048` floor.  Before it, **`v16-a55e952b8-r32`** was (both crashes found during
+the PR #115 review are fixed: issue #48, the post-prefill re-reserve no longer builds a zero-token
+attention graph for a multi-sequence decode, block 06; issue #49, the meta split-state computation no
+longer overflows the stack on a deep `src` chain, block 15).  Before it, **`v16-a55e952b8-r31`** was: PR #115 folded into
 block 06, the MoE expert-cache decode/verify band follows the routed-expert MMVQ band -- 16 tokens on
 RDNA4 -- so 12-16-token MTP verify batches stay on the arena; 16-token MoE batch +5.7x, `draft-mtp
 n-max 12` +3.3x, `n_max <= 7` pure, `GGML_MOE_CACHE_MAX_TOK=8` restores the old band.  Before it,

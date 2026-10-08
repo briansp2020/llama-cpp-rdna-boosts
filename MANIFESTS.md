@@ -5,8 +5,13 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r33`** (canonical block-15 tip `6e567349cfb237f9`, net tree
-`13479e6ae709ce53`): **the pageable host-expert master is removed (issue #116).**  `--host-experts mmap`
+**`a55e952b8`**, released as **`v16-a55e952b8-r34`** (canonical block-15 tip `40ce2ab86`, net tree
+`a253691093acbd96`): **block 12's NCCL init is deferred to the first large tensor.**  The hybrid
+all-reduce already served every decode-sized reduce through the internal pipeline, but an eager
+`ncclCommInitAll` degraded it ~3x (`-sm tensor -ncmoe 0` decode 21.6 -> **69.5 t/s**, output unchanged),
+so NCCL now comes up lazily on the first prefill tensor.  Before it, **`v16-a55e952b8-r33`** (tip
+`6e567349cfb237f9`, tree `13479e6ae709ce53`) removed the pageable host-expert master (issue #116);
+`--host-experts mmap`
 and the legacy `LLAMA_MMAP_HOST_EXPERTS` are dropped -- a no-XNACK GPU (gfx1201 reports `XNACK enabled:
 NO`) cannot read a pageable address in a kernel, so `-ncmoe`/`-cmoe` experts are always pinned
 (`ROCm_Host`).  The cache gains the matching safety rails (the in-place alias requires a successful

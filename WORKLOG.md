@@ -1,5 +1,43 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-08 (r34) -- block 12's NCCL init is deferred to the first large tensor (`-sm tensor` decode 3x)
+
+**Release** `v16-a55e952b8-r34`, same fork point `a55e952b8`; canonical block-15 tip **`40ce2ab86`**,
+net tree **`a253691093acbd965f0cb8978a19c03997ba3bfb`** (strict **16/16** `git am`, `validate-set.sh`
+green).  Block count stays **16**: the fix is folded into **block 12**, which owns the hybrid all-reduce.
+
+### Why
+
+`-sm tensor` MoE decode was far slower than `-sm layer` -- and slower than a single GPU -- even though
+single-GPU `-sm tensor` and `-sm layer` are identical (81.6 vs 81.4 t/s).  The delta is the per-layer
+cross-device reduction of the split expert partials.  The default hybrid all-reduce already routed every
+decode-sized tensor to the internal pipeline (a temporary dispatch probe showed hybrid and
+`GGML_CUDA_ALLREDUCE=internal` take the identical branch: every reduce `small`, `large=0`), but
+`ggml_backend_cuda_comm_init_hybrid` called `ncclCommInitAll` eagerly, and **NCCL's presence alone
+degraded the internal pipeline ~3x**.  Measured 3x R9700 (gfx1201), 35B-A3B Q4_K_M, `-sm tensor -ncmoe 0`:
+hybrid 21.6 / nccl 21.7 / `ce` 45.9 (2 GPU) / internal 66.8-69.6 t/s.
+
+### What landed
+
+`init_hybrid` brings up only the internal pipeline and defers NCCL to the first tensor too large for it
+(a prefill), via `nccl_lazy`/`nccl_tried` on the comm context; `init_ce` clears the flag.  A decode-only
+run never pays the eager cost; a prefill still gets NCCL for the bandwidth-bound large tensors.
+
+### Validation
+
+`validate-set.sh` green (fresh-tarball strict 16/16 apply, applied tree == `release.json`).  GPU matrix on
+3x R9700 / gfx1201 (ROCm 7.14):
+
+* `-sm tensor` and `-sm layer` same-seed `359ff4337837`; long-prefill (prose prompt) `-sm tensor` ==
+  `-sm layer` == `12d4fcd10886`;
+* dense `Qwen3.5-4B-Q8_0` `-sm tensor` same-seed `1c5d32ac537d`;
+* `test-backend-ops -o MUL_MAT_ID` ROCm0 931/931;
+* prefill-logit KLD **0.000707** mean / **98.755 %** same-top-p, PASS;
+* `-sm tensor -ncmoe 0` decode **69.5 t/s** (was 21.6), `-ncmoe 40` 22.0 (was 12.7); prefill unchanged.
+
+Output is bit-identical: the decode band's reduce path was already the internal pipeline, so only the
+eager NCCL initialisation is removed.
+
 ## 2026-10-08 (r33) -- the pageable host-expert master is removed (issue #116); `--host-experts mmap` dropped
 
 **Release** `v16-a55e952b8-r33`, same fork point `a55e952b8`; canonical block-15 tip
