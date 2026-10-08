@@ -7,9 +7,11 @@ is a 2x win on `-sm layer`, and the prefill seed/tally is dead under the pool.
 
 ## Where the work lives
 
-* All code lives as **uncommitted changes in `~/llama.cpp`** (working tree = r33 `6e567349c` + the
-  campaign changes).  Full diff: [`changes.patch`](changes.patch) (≈760 lines).  Nothing is in
-  `patches/`/`release.json` and nothing was pushed.  Build:
+* All campaign code lives on the **`wip/host-expert-pool` branch in `~/llama.cpp`** (base r33
+  `6e567349c` + the campaign + a lazy-NCCL AR commit).  Full diff: [`changes.patch`](changes.patch).
+  **r34 has shipped** (`v16-a55e952b8-r34`, tip `40ce2ab86` / tree `a2536910`): the campaign must re-base
+  onto r34 and **drop the wip lazy-NCCL commit** (it is already in block 12) before folding.  Nothing of
+  the campaign is in `patches/`/`release.json`.  Build:
   `cd ~/llama.cpp && BUILD_DIR=build-rocm-hybrid EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714`
   (or the fast loop `cmake --build build-rocm-hybrid --target llama-cli -j 16`).
 * `sudo /usr/local/sbin/reset-amd-gpus` (installed, works) recovers a wedged GPU.  Wrap runs in `timeout`,
