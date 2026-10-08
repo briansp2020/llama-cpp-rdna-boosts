@@ -11,7 +11,26 @@ For a fresh session picking up `wip/host-expert-dio-cache/`.  Read
   `--host-experts mmap` / `LLAMA_MMAP_HOST_EXPERTS` and makes host experts always
   pinned, plus the cache safety rails and the `MOE_EXPERT_CACHE_MIB >= 2048` floor.
   See `WORKLOG.md` "2026-10-08 (r33)".
-* **Nothing of the pool exists yet** — this campaign is Phase 0 only (the removal).
+* **Parked bug FIXED (2026-10-08, wip).**  `--host-experts pinned` + `-sm tensor` + a partial arena
+  no longer faults.  The handover's "host over-read" diagnosis was **wrong**: the movable-boundary
+  slab granted `cuMemSetAccess` only to the owning device, so the scheduler's cross-device
+  `hipMemcpyPeerAsync` into the slab work region faulted `Page not present or supervisor privilege`.
+  Fixed in `ggml_cuda_vmm_map_phys` (grant every peer device), plus two latent `cudaFree`-of-a-slab
+  routes in the cache.  Root cause, controls and validation: [`PARKED-BUG.md`](PARKED-BUG.md).
+* **Phase 1 plumbing landed (2026-10-08, wip).**  `MOE_HOST_POOL_MIB` env parse + a host-source
+  registry keyed by the host tensor pointer (`moe_cache_set_host_source`, populated from
+  `load_all_data` with the GGUF path + offset + geometry via the new `llama_file::path()`).  Inert:
+  with the env unset/0 no state is created and behaviour is byte-identical.  Working-tree diff:
+  [`changes.patch`](changes.patch) (the isolated bug fix is [`parked-bug-fix.patch`](parked-bug-fix.patch)).
+* **Phase 2 landed (2026-10-08, wip).**  A bounded, pinned host pool (one per `(host tensor, device)`,
+  whole experts, LRU, per-slot in-flight event, prewarm) now sources the arena fill on the host
+  promotion path.  It is a page-cache-backed **bounce buffer**: fills are buffered by default, so a miss
+  is a RAM read, not disk; `MOE_HOST_POOL_DIO=1` is a debug fallback.  Validated output-preserving
+  (`-sm tensor` and `-sm layer`) and green on the gates.  Perf (`-n 256`): pool off 7.0 t/s, bounded
+  pool 2048 MiB/device **6.1** t/s (buffered) vs 2.4 with DIO.  Reporter model (Flash-Next IQ4_NL,
+  2 GPUs, `-ncmoe 48`, 40 GiB pool, 5246-tok prefill + `-n 1000`): `-sm layer` 137.1/18.8 t/s, `-sm
+  tensor` 182.2/16.3 t/s, no faults.  Design/results: [`PHASE2.md`](PHASE2.md); **Phase 2b tuning
+  starts at [`PHASE2B-HANDOVER.md`](PHASE2B-HANDOVER.md)**.
 * Canonical worktree used to cut r33: `/tmp/llama-canon` (branch `canon-r32`,
   16 blocks, tip `6e567349c`).  Ephemeral; recreate with
   `git worktree add /tmp/llama-canon a55e952b8` + `RDNA_BRANCH=... scripts/apply-all.sh`.

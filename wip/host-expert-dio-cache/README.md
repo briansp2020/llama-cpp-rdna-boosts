@@ -1,8 +1,12 @@
 # `host-expert-dio-cache` — a bounded, pinned, DIO-filled host tier for the MoE expert cache
 
-Status: **OPEN / Phase 0** (design + mmap removal).  Nothing here is part of the delivery.  A fresh
-session should read [`HANDOVER.md`](HANDOVER.md) for the code seams, the Phase plan and the parked
-over-read bug.
+Status: **Phase 2 done** (bounded pinned host pool landed + validated; it is a page-cache-backed bounce
+buffer, DIO is a debug fallback).  Nothing
+here is part of the delivery.  A fresh session should read [`HANDOVER.md`](HANDOVER.md) for the code
+seams and the Phase plan, [`PARKED-BUG.md`](PARKED-BUG.md) for the partial-arena fault fixed before the
+pool (the handover's "host over-read" diagnosis was wrong — it was a slab access bug),
+[`PHASE2.md`](PHASE2.md) for the L2 pool design, validation and the perf finding, and
+[`PHASE2B-HANDOVER.md`](PHASE2B-HANDOVER.md) to pick up Phase 2b tuning.
 
 ## Why
 
