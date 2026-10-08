@@ -48,6 +48,22 @@ Flash-Next IQ4_NL reporter (2×R9700, `-ncmoe 48 -sm layer -c 16384`, `MOE_HOST_
 read from disk during the run; the handover's 18.8 t/s was a warm-cache measurement.  Warm-cache
 re-measure pending.)
 
+Pool-size curve (same 35B run, `-v` report; the pool `h` includes the prewarm fills, so the decode hit
+rate is `pool_fills - pool_evictions` over the arena fills):
+
+| config | gen t/s | pool slots/pool | pool fills | pool evictions | decode pool hits / arena fills |
+|---|---:|---:|---:|---:|---:|
+| `-sm layer` 2048 | 17.4 | ~85 | 15018 | 4873 | 10145 / 6495 (miss) |
+| `-sm layer` 8192 (= **full residency**, 256/256) | 20.9 | 256 | 30720 | 0 | 6495 / 6495 (**100 %**) |
+| `-sm tensor` 2048 | 6.3 | ~28 | 21242 | 11198 | 847 / 12045 (**7 %**) |
+| `-sm tensor` 8192 | 6.4 | ~113 (of 256) | 48253 | 7477 | 4580 / 12057 (**38 %**) |
+
+Two things fall out.  First, **when the pool hits, the pool source is neutral**: `-sm layer` 8192 is a
+full-residency pool and it lands at 20.9 t/s, i.e. on top of the host-promotion pool-off arm (21.1) —
+the copy is the same H2D either way.  So the entire pool penalty is misses, not the lookup/copy.
+Second, a *partial* pool with an id-order prewarm still misses 62 % of fills (`-sm tensor` 8192), which
+is exactly target 3: the ranking, not the size alone, decides whether a bounded pool is useful.
+
 `strace -c -f -e trace=pread64` on the 35B `-sm tensor`, `-n 16`:
 
 | arm | pread64 calls | pread64 sys time |
