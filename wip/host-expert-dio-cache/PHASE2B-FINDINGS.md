@@ -15,6 +15,25 @@ kernel page fault was a bug in this work (the fill added `e*host_bytes` on top o
 pool/virtual-memory limit.  Gates green: short `359ff4337837`, long-prefill `12d4fcd10886` (both
 splits), dense 4B `1c5d32ac537d`, `MUL_MAT_ID` 931/931, prefill-logit KLD 0.000707 / 98.755 %.
 
+**Update 2026-10-08 (long-prompt sweep + item 7).**  `-n 128` measures the transient; the stable state
+needs ~3000 tokens.  At `-n 3000` (35B-A3B Q4_K_M `-sm layer -ncmoe 40`, `MOE_EXPERT_CACHE_MIB=2048`,
+prose), pool-aware sits ~2 t/s under pool-off and the routing prefill is the cause:
+
+| `MOE_HOST_POOL_MIB` (~% of the 18.6 GB host set) | prefill on | prefill off |
+|---:|---:|---:|
+| 2048 (11 %) | 42.5 | 44.0 |
+| 4096 (22 %) | 42.5 | 44.0 |
+| 8192 (44 %) | 43.3 | 43.9 |
+| 16384 (88 %) | 43.9 | 43.9 |
+| pool off (master) | 44.7 | — |
+
+The prefill hurts until the pool nears full residency, then is neutral; it never beats the master in
+Phase 2.  So `MOE_HOST_POOL_PREFETCH` now defaults **off**.  At 2 GiB the pool hit rate is 5.2 %
+(433/8391, 861 929 fills / 856 886 evictions): the async one-token prefill never reaches the critical
+path.  Item 7 landed: `MOE_HOST_POOL_MIB` unset/`auto` now defaults to `MOE_HOST_POOL_FRAC` (25) % of the
+**MoE host expert bytes** (not the whole model -- qwen4exp's PLE excluded); 4645 MiB pinned for the 35B,
+`0` disables, an explicit MiB wins.
+
 **Update 2026-10-08 (target 3 landed).**  The prefill tally now drives both the arena seed and the pool
 ranking, independent of the device-policy gate (`seed_prefill_lazy_locked` iterates the device's tables
 and runs outside `if (g_devpolicy)`; `pool_rerank_from_tally_locked` is new and excludes arena residents,

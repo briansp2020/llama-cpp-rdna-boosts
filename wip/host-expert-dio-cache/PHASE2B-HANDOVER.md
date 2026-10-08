@@ -79,8 +79,11 @@ is a 2x win on `-sm layer`, and the prefill seed/tally is dead under the pool.
    `get_cold`/remap re-architecture the README's "hard constraint" describes; the "invisible L2" route
    chose it deliberately (every pooled access stays cache-owned; `get_cold` would have to return false
    and every used expert must be admitted).
-7. The `moe_host_expert_bytes` / `MOE_EXPERT_CACHE_*` sizing and the pool budget are independent today;
-   consider whether `MOE_HOST_POOL_MIB` should default from the preflight estimate.  **OPEN.**
+7. **The pool budget now defaults from the preflight.**  **DONE (2026-10-08):** `MOE_HOST_POOL_MIB`
+   unset/`auto` sizes the process-wide pool to `MOE_HOST_POOL_FRAC` (default 25) % of the MoE host
+   expert bytes (`moe_host_expert_bytes`, the preflight accumulation -- not the whole model, so qwen4exp's
+   PLE is excluded); 4645 MiB pinned for the 35B `-ncmoe 40`.  `0` disables, an explicit MiB wins.  See
+   the long-prompt sweep in `PHASE2B-FINDINGS.md`.
 8. **`-sm tensor` slowness** (found while answering the maintainer, 2026-10-08).  Two separate items: a
    **block-12 all-reduce bug** (the default hybrid eagerly calls `ncclCommInitAll`, degrading the internal
    pipeline ~3x; fixed on the wip branch, needs sign-off — [`SM-TENSOR-AR.md`](SM-TENSOR-AR.md)) and the
@@ -108,9 +111,12 @@ HIP_VISIBLE_DEVICES=0,1 MOE_HOST_POOL_MIB=20000 \
 
 | var | default | meaning |
 |---|---|---|
-| `MOE_HOST_POOL_MIB` | unset/0 = off | pool size in **MiB per device** |
+| `MOE_HOST_POOL_MIB` | **auto (25 %)** | process-wide pinned pool budget: unset/`auto` = `MOE_HOST_POOL_FRAC` % of the MoE host expert bytes; `0` = off; `N` = explicit MiB |
+| `MOE_HOST_POOL_FRAC` | **25** | AUTO budget as a percentage of the MoE host expert bytes (`moe_host_expert_bytes`) |
 | `MOE_HOST_POOL_POLICY` | **1** | pooled tables on the device policy: `1` = pool-aware fill (default), `0` = host promotion (original), `2` = device policy filling from the master (1b probe) |
-| `MOE_HOST_POOL_PREWARM` | 1 | fill every slot when a pool is built |
+| `MOE_HOST_POOL_PREFETCH` | **0** | `1` = routing-driven speculative prefill (a net loss unless the pool nears full residency; long-prompt sweep in `PHASE2B-FINDINGS.md`) |
+| `MOE_HOST_POOL_PREWARM` | 1 | fill every slot when a pool is built (one-shot, from the prefill tally / arena residents) |
+| `MOE_HOST_POOL_BGFETCH` | 1 | `0` = synchronous eviction prefetch (no low-priority worker) |
 | `MOE_HOST_POOL_DIO` | **0** | `1` = O_DIRECT fill (debug; bypasses the page cache) |
 
 Cache env (`MOE_EXPERT_CACHE_MIB` etc.) is unchanged; see the cache header.

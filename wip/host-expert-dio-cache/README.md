@@ -1,8 +1,9 @@
 # `host-expert-dio-cache` — a bounded, pinned, DIO-filled host tier for the MoE expert cache
 
-Status: **Phase 2 + Phase 2b targets 1-5 done** (bounded, **process-wide, additive** pinned host pool
+Status: **Phase 2 + 2b targets 1-5 + item 7 done** (bounded, **process-wide, additive** pinned host pool
 landed + validated; it is a page-cache-backed bounce buffer, DIO is a debug fallback; low-priority
-background eviction prefetch; **pool-aware device policy**, target 1).  **Re-based onto r34
+background eviction prefetch; **pool-aware device policy**, target 1; **AUTO pool = 25 % of the MoE host
+expert bytes**, item 7).  **Re-based onto r34
 (2026-10-08, done)** -- the branch is `40ce2ab86` (r34 tip) + the campaign, the wip lazy-NCCL commit
 dropped; `changes.patch` regenerated against `40ce2ab86`.  **Open:** **Phase 3** (remove the pinned
 master).  A **block-12 all-reduce bug** was root-caused en route ([`SM-TENSOR-AR.md`](SM-TENSOR-AR.md)),
