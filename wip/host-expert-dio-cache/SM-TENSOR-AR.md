@@ -1,8 +1,10 @@
 # Why `-sm tensor` is much slower than `-sm layer` (and the block-12 all-reduce bug)
 
-Status: **root-caused + fixed (wip, 2026-10-08)**.  The fix is a **block-12 all-reduce-init change**
-(`ggml/src/ggml-cuda/ggml-cuda.cu`); it needs the maintainer's sign-off before any delivery fold.  The
-fix lives in `changes.patch` on the `wip/host-expert-pool` branch only.
+Status: **root-caused + fixed + DELIVERED in r34 (2026-10-08)**.  The fix is a **block-12 all-reduce-init
+change** (`ggml/src/ggml-cuda/ggml-cuda.cu`); it is folded into **block 12** and shipped as the release
+`v16-a55e952b8-r34` (canonical tip `40ce2ab86`, net tree `a253691093acbd96`); the personal fork's
+`rdna-boosts` branch now carries the same tree.  The `wip/host-expert-pool` branch still has it as a wip
+commit as well (the campaign tree).
 
 Model: 35B-A3B Q4_K_M, 3×R9700 (gfx1201), ROCm 7.14, `-ngl 99 -fa 1 -t 8 -n 128`, greedy.
 
