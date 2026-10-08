@@ -74,7 +74,7 @@ index 853ca23bd..f2abd281e 100644
      const int kqs      = vdr * (threadIdx.x % (qi/vdr));
      // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index cfc40e596..e53cf6adf 100644
+index cfc40e596..442b838a5 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -8,8 +8,14 @@
@@ -104,7 +104,7 @@ index cfc40e596..e53cf6adf 100644
      const void * host       = nullptr;
      void *      host_dev    = nullptr;  // device-accessible alias of `host` (UVA), Phase 1b cold reads
      bool        host_dev_bound = false; // the alias was resolved (or ruled out) once
-@@ -196,6 +207,50 @@ std::set<std::pair<const void*, long long>> g_heads_zeroed;   // (buffer, expert
+@@ -196,6 +207,61 @@ std::set<std::pair<const void*, long long>> g_heads_zeroed;   // (buffer, expert
  // per-device simple tensor a hook saw may be a different pointer than the one the op reads after a meta
  // graph rebuild: the consumer falls back to this when the pointer alias misses.
  std::map<std::tuple<int, std::string, int>, int> g_sem_to_id;
@@ -126,7 +126,10 @@ index cfc40e596..e53cf6adf 100644
 +// The arena fill in `access_locked` sources a pool slot and the GPU never reads the pool (invisible L2);
 +// the full pinned master stays for now (Phase 3 removes it).
 +struct host_pool_t {
-+    char *      base        = nullptr;   // cudaMallocHost, slots * host_bytes
++    char *      base        = nullptr;   // cudaHostAlloc(portable|mapped), slots * host_bytes
++    void *      base_dev    = nullptr;   // UVA device alias of `base` (== base under UVA); the cross-device
++                                         // fill source (a plain H2D from `base` on another ROCm context is
++                                         // treated as pageable and crashes in the runtime's staging memmove)
 +    int         slots       = 0;
 +    size_t      host_bytes  = 0;
 +    int         n_experts   = 0;
@@ -136,7 +139,14 @@ index cfc40e596..e53cf6adf 100644
 +    size_t      align       = 4096;
 +    std::vector<int32_t>                 slot_expert;   // slot -> expert, -1 empty
 +    std::unordered_map<int32_t, int32_t> expert_slot;
-+    std::vector<cudaEvent_t>             slot_ev;       // one per slot: the last async arena fill copy out of it
++    // ADDITIVE lifecycle per slot: 0 = free, 1 = the pool holds it (the arena does not), 2 = retiring
++    // (the arena admitted it; the entry is freed once every in-flight copy drains).
++    std::vector<uint8_t>                 slot_state;
++    // Per (slot, device) in-flight events.  The pool is PROCESS-WIDE, so the same slot can be copied to
++    // several devices and every copy must drain before the slot is reused or retired.  Indexed
++    // `slot * GGML_CUDA_MAX_DEVICES + device`, nullptr = never used; created lazily on the recording
++    // device (a single event per slot + a cross-device record/sync fails with `invalid resource handle`).
++    std::vector<cudaEvent_t>             slot_ev;
 +    std::vector<int64_t>                 last;          // per expert, last use
 +    int64_t     clock       = 0;
 +    int64_t     hits        = 0;
@@ -145,17 +155,18 @@ index cfc40e596..e53cf6adf 100644
 +    int64_t     evictions   = 0;
 +    bool        failed      = false;
 +};
-+// Keyed by (host tensor, device): the pool is PER DEVICE (the budget is per-device, per the campaign),
-+// so every slot's async fill copy is on one device's stream and its `slot_ev` is valid on that device.
-+std::map<std::pair<const void *, int>, host_pool_t> g_host_pools;   // node-based: pointers stay valid
++// Keyed by the host tensor only: the pool is PROCESS-WIDE (one copy of each whole expert for every
++// device), and `MOE_HOST_POOL_MIB` is the total non-swappable budget, split equally over the registered
++// host tensors.  Per-(slot, device) events make a shared slot safe to copy to several devices.
++std::map<const void *, host_pool_t> g_host_pools;   // node-based: pointers stay valid
 +bool    g_pool_enabled     = false;
 +bool    g_pool_prewarm     = true;   // MOE_HOST_POOL_PREWARM: fill every pool slot when it is built
 +bool    g_pool_dio         = false;  // MOE_HOST_POOL_DIO=1: O_DIRECT fill (debug fallback; bypasses the page cache)
-+int64_t g_pool_total_bytes = 0;   // per device
++int64_t g_pool_total_bytes = 0;   // PROCESS-WIDE total budget (split over all registered host tensors)
  
  // An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
  // several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
-@@ -305,6 +360,18 @@ int env_int(const char * name, int dflt) {
+@@ -305,6 +371,18 @@ int env_int(const char * name, int dflt) {
      return atoi(e);
  }
  
@@ -174,25 +185,26 @@ index cfc40e596..e53cf6adf 100644
  // Scope guard: make `device` current for the allocations/computes inside, restore on exit.  Every
  // cudaMalloc/cudaFree/cudaHostGetDevicePointer in this module is device-scoped, so with more than one
  // GPU each table's arena must be created while its OWN device is current (otherwise a device-1 kernel
-@@ -409,6 +476,17 @@ void parse_env() {
+@@ -409,6 +487,18 @@ void parse_env() {
          g_auto    = true;
          g_budget  = (size_t) -1;
      }
-+    // Phase 2: the bounded, pinned, O_DIRECT-filled host tier (L2).  `g_pool_total_bytes` is split over
-+    // the registered host tensors when the first pool is created; the full pinned master is KEPT for now
-+    // (Phase 3 removes it and the scheduler fallback).
++    // Phase 2b: the bounded, pinned host tier (L2).  PROCESS-WIDE: `g_pool_total_bytes` is the TOTAL
++    // budget, split over all registered host tensors when a pool is created; one copy of each whole
++    // expert serves every device.  Fills are buffered through the page cache by default.  The full
++    // pinned master is KEPT for now (Phase 3 removes it and the scheduler fallback).
 +    g_pool_enabled     = moe_host_pool_mib() > 0;
 +    g_pool_prewarm     = env_int("MOE_HOST_POOL_PREWARM", 1) != 0;
 +    g_pool_dio         = env_int("MOE_HOST_POOL_DIO", 0) != 0;
 +    g_pool_total_bytes = g_pool_enabled ? moe_host_pool_mib() * 1024 * 1024 : 0;
 +    if (g_pool_enabled) {
-+        GGML_LOG_INFO("%s: MoE host expert pool: %lld MiB total, pinned, O_DIRECT-filled (Phase 2; "
-+                      "full pinned master kept)\n", __func__, (long long) moe_host_pool_mib());
++        GGML_LOG_INFO("%s: MoE host expert pool: %lld MiB PROCESS-WIDE, pinned, page-cache-filled "
++                      "(Phase 2b; full pinned master kept)\n", __func__, (long long) moe_host_pool_mib());
 +    }
      g_slots_hint  = env_int("MOE_EXPERT_CACHE_SLOTS",   0);
      g_period      = env_int("MOE_EXPERT_CACHE_PERIOD",  32);
      g_fill        = env_int("MOE_EXPERT_CACHE_FILL",     1) != 0;
-@@ -571,6 +649,311 @@ void check_invariant(const table_t & t) {
+@@ -571,6 +661,391 @@ void check_invariant(const table_t & t) {
      }
  }
  
@@ -236,6 +248,44 @@ index cfc40e596..e53cf6adf 100644
 +static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool sync_on_evict);
 +static void   pool_prepopulate_locked(host_pool_t & p, const table_t & t);
 +
++// The (slot, device) in-flight event, created lazily on `device` (the device whose stream will record
++// it).  Returns nullptr when the index is invalid or the event cannot be created (the caller then just
++// skips the drain marker; the slot is conservatively left reusable only after a full sync).
++static cudaEvent_t pool_slot_event(host_pool_t & p, int slot, int device) {
++    if (slot < 0 || slot >= p.slots || device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return nullptr;
++    }
++    const size_t idx = (size_t) slot * GGML_CUDA_MAX_DEVICES + (size_t) device;
++    if (idx >= p.slot_ev.size()) {
++        return nullptr;
++    }
++    if (p.slot_ev[idx] == nullptr) {
++        device_guard dg(device);
++        cudaEvent_t ev = nullptr;
++        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return nullptr;
++        }
++        p.slot_ev[idx] = ev;
++    }
++    return p.slot_ev[idx];
++}
++
++// Drain every device's copy out of `slot` before the slot is overwritten or retired.
++static void pool_slot_sync(host_pool_t & p, int slot) {
++    if (slot < 0 || slot >= p.slots) {
++        return;
++    }
++    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
++        const size_t idx = (size_t) slot * GGML_CUDA_MAX_DEVICES + (size_t) d;
++        if (idx < p.slot_ev.size() && p.slot_ev[idx] != nullptr) {
++            if (cudaEventSynchronize(p.slot_ev[idx]) != cudaSuccess) {
++                (void) cudaGetLastError();
++            }
++        }
++    }
++}
++
 +// The pool for `t`'s host tensor, created lazily and shared by every per-device table of that tensor.
 +// Caller holds `g_mutex`.  Returns null (and every fill falls back to the full master) when the pool is
 +// off, the source is unknown, or the budget is too small for one expert.
@@ -243,14 +293,16 @@ index cfc40e596..e53cf6adf 100644
 +    if (!g_pool_enabled || !t.src_known || t.host == nullptr || t.host_bytes == 0 || t.n_experts <= 0) {
 +        return nullptr;
 +    }
-+    const std::pair<const void *, int> key = { t.host, t.device };
++    const void * key = t.host;
 +    const auto it = g_host_pools.find(key);
 +    if (it != g_host_pools.end()) {
 +        return it->second.failed ? nullptr : &it->second;
 +    }
++    // Process-wide: every distinct host tensor shares the one budget, regardless of which device owns
++    // its table(s).
 +    std::set<const void *> hosts;
 +    for (const table_t & tt : g_tables) {
-+        if (tt.src_known && tt.host != nullptr && tt.device == t.device) {
++        if (tt.src_known && tt.host != nullptr) {
 +            hosts.insert(tt.host);
 +        }
 +    }
@@ -264,24 +316,27 @@ index cfc40e596..e53cf6adf 100644
 +    host_pool_t p;
 +    if (slots >= 1) {
 +        void * mem = nullptr;
-+        if (cudaMallocHost(&mem, (size_t) slots * t.host_bytes) == cudaSuccess) {
++        // PORTABLE + MAPPED pinned memory: the pool is process-wide, so a device other than the one that
++        // allocated the pool copies out of it.  Plain `cudaMallocHost` is tied to the allocating ROCm
++        // context; a cross-device H2D from it falls back to a pageable staging memmove that crashes on a
++        // 2-D strided copy.  The mapped UVA alias is copied from with cudaMemcpyDeviceToDevice instead.
++        if (cudaHostAlloc(&mem, (size_t) slots * t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess) {
 +            p.base        = (char *) mem;
++            void * dev    = nullptr;
++            if (cudaHostGetDevicePointer(&dev, mem, 0) != cudaSuccess) {
++                (void) cudaGetLastError();
++                dev = mem;
++            }
++            p.base_dev    = dev;
 +            p.slots       = slots;
 +            p.host_bytes  = t.host_bytes;
 +            p.n_experts   = t.n_experts;
 +            p.path        = t.src_path;
 +            p.file_offs   = t.src_offs;
 +            p.slot_expert.assign((size_t) slots, -1);
++            p.slot_state.assign((size_t) slots, 0);
 +            p.last.assign((size_t) t.n_experts, 0);
-+            p.slot_ev.assign((size_t) slots, nullptr);
-+            for (int s = 0; s < slots; s++) {
-+                cudaEvent_t ev = nullptr;
-+                if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
-+                    (void) cudaGetLastError();
-+                    ev = nullptr;
-+                }
-+                p.slot_ev[(size_t) s] = ev;
-+            }
++            p.slot_ev.assign((size_t) slots * GGML_CUDA_MAX_DEVICES, nullptr);   // lazily created per device
 +        } else {
 +            (void) cudaGetLastError();
 +            p.failed = true;
@@ -296,14 +351,52 @@ index cfc40e596..e53cf6adf 100644
 +    return res.first->second.failed ? nullptr : &res.first->second;
 +}
 +
-+// Ensure `expert` is in the pool (O_DIRECT fill on a miss, LRU eviction) and return its slot base (and
-+// the slot index), or null when the pool is unusable (the caller then reads the full master).  A slot's
-+// arena fill is an async copy, so before a slot is REUSED its previous copy is drained via `slot_ev`
-+// (a per-slot event; waits only for that copy, not the whole stream).  Caller holds `g_mutex`.
++// ADDITIVE lifecycle: free every pool slot whose arena copy has drained.  The pool holds the experts the
++// arena does NOT, so once a block has been copied into the arena its pool entry is dead weight.  Slots
++// still in transit (state 2) are skipped; non-blocking.  Caller holds `g_mutex`.
++static void pool_reap_locked(host_pool_t & p) {
++    for (int s = 0; s < p.slots; s++) {
++        if (p.slot_state[(size_t) s] != 2) {
++            continue;
++        }
++        bool drained = true;
++        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
++            const size_t idx = (size_t) s * GGML_CUDA_MAX_DEVICES + (size_t) d;
++            if (idx >= p.slot_ev.size() || p.slot_ev[idx] == nullptr) {
++                continue;
++            }
++#if defined(GGML_USE_HIP)
++            const bool ready = hipEventQuery((hipEvent_t) p.slot_ev[idx]) != hipErrorNotReady;
++#else
++            const bool ready = cudaEventQuery(p.slot_ev[idx]) != cudaErrorNotReady;
++#endif
++            if (!ready) {
++                drained = false;
++                break;
++            }
++            (void) cudaGetLastError();
++        }
++        if (!drained) {
++            continue;
++        }
++        const int32_t e = p.slot_expert[(size_t) s];
++        if (e >= 0) {
++            p.expert_slot.erase(e);
++        }
++        p.slot_expert[(size_t) s] = -1;
++        p.slot_state[(size_t) s]  = 0;
++    }
++}
++
++// Ensure `expert` is in the pool and return its slot base (and the slot index), or null when the pool is
++// unusable (the caller then reads the full master / disk directly).  A miss reads the GGUF (buffered
++// through the page cache by default).  Retiring slots (state 2, their arena copy is still in flight) are
++// never reused or evicted.  Caller holds `g_mutex`.
 +static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool sync_on_evict) {
 +    if (expert < 0 || expert >= p.n_experts) {
 +        return nullptr;
 +    }
++    pool_reap_locked(p);
 +    const auto hit = p.expert_slot.find(expert);
 +    if (hit != p.expert_slot.end()) {
 +        p.hits++;
@@ -326,8 +419,8 @@ index cfc40e596..e53cf6adf 100644
 +        int     victim = -1;
 +        for (int s = 0; s < p.slots; s++) {
 +            const int32_t e = p.slot_expert[(size_t) s];
-+            if (e < 0) {
-+                continue;
++            if (e < 0 || p.slot_state[(size_t) s] != 1) {
++                continue;   // free, or retiring (its arena copy may still be reading it)
 +            }
 +            if (victim < 0 || p.last[(size_t) e] < best) {
 +                best   = p.last[(size_t) e];
@@ -340,10 +433,8 @@ index cfc40e596..e53cf6adf 100644
 +            // could have enqueued that copy itself (a pass that fills more experts than the pool holds).
 +            // The scheduler synchronises the backend between tokens, so a slot whose last copy was a
 +            // previous token's is already drained; syncing here would wait for THIS token's graph too.
-+            if (sync_on_evict && p.slot_ev[(size_t) slot] != nullptr) {
-+                if (cudaEventSynchronize(p.slot_ev[(size_t) slot]) != cudaSuccess) {
-+                    (void) cudaGetLastError();
-+                }
++            if (sync_on_evict) {
++                pool_slot_sync(p, slot);
 +            }
 +            p.expert_slot.erase(victim);
 +            p.slot_expert[(size_t) slot] = -1;
@@ -374,6 +465,7 @@ index cfc40e596..e53cf6adf 100644
 +    }
 +    p.slot_expert[(size_t) slot] = expert;
 +    p.expert_slot[expert]        = slot;
++    p.slot_state[(size_t) slot]  = 1;
 +    p.last[(size_t) expert]      = ++p.clock;
 +    p.fills++;
 +    if (out_slot != nullptr) {
@@ -504,7 +596,25 @@ index cfc40e596..e53cf6adf 100644
  // `protect`/`n_protect`: experts that belong to the token currently being staged and must NOT be chosen as
  // an eviction victim.  Without this, an expert admitted earlier in the same token can be evicted by a later
  // one (its freshly-seeded count is the smallest), which is what made the hook's `all` flag flip from token
-@@ -701,7 +1084,24 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -622,7 +1097,8 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+         }
+         return { nullptr, false };
+     }
+-    int slot = -1;
++    int     slot   = -1;
++    int32_t victim = -1;   // arena resident evicted by this miss (also fetched into the pool: additive)
+     if ((int) t.expert_slot.size() < t.slots) {
+         for (int s = 0; s < t.slots; s++) {
+             if (t.slot_expert[s] < 0) { slot = s; break; }
+@@ -630,7 +1106,6 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+     }
+     if (slot < 0) {
+         // evict the resident with the smallest decaying count; tie -> oldest use.
+-        int32_t victim = -1;
+         for (int s = 0; s < t.slots; s++) {
+             const int32_t e = t.slot_expert[s];
+             if (e < 0 || is_protected(e)) { continue; }
+@@ -701,20 +1176,61 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
          g_acc_fills++;
          g_fill_bytes += (int64_t) t.expert_bytes;
          void * dst = (char *) t.arena + (size_t) slot * t.expert_bytes;
@@ -517,32 +627,60 @@ index cfc40e596..e53cf6adf 100644
 +        char *        pool_expert = nullptr;
 +        int           pool_slot   = -1;
 +        host_pool_t * pool        = table_pool_locked(t);
-+        if (pool != nullptr) {
++        // ADDITIVE: put the expert the arena just evicted into the pool, so it is ready when the arena
++        // needs it again (usually within a few tokens).  The arena slot still holds it, but re-reading
++        // through the page cache is simpler than a D2H and does not stall the compute stream.
++        if (pool != nullptr && victim >= 0) {
++            (void) pool_slot_locked(*pool, victim, nullptr, false);
++        }
++        // Only source from the pool when this table's slice fits inside a whole-expert slot.  The meta
++        // splitter can hand a device a DEGENERATE simple tensor (`ne[split]=0`, `nb[2]=0`), which
++        // `moe_cache_table` registers with `expert_bytes = host_bytes` and a nonzero `slice_off`; a pool
++        // fill would then read past the slot (and past the allocation on the last slot).  Fall back to
++        // the master (which spans the whole expert tensor) for that geometry.
++        if (pool != nullptr && t.src_off + t.expert_bytes <= t.host_bytes) {
 +            // A pass that cannot fill more experts than the pool holds cannot evict a slot it just filled,
 +            // so no per-slot copy drain is needed (the previous token's copies are already done).
 +            const bool pool_sync = (n_protect > pool->slots);
 +            pool_expert = pool_slot_locked(*pool, expert, &pool_slot, pool_sync);
 +        }
 +        const bool from_pool = pool_expert != nullptr;
++        const cudaMemcpyKind kind = from_pool ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
 +        const char * src = from_pool
-+                               ? (const char *) pool_expert + t.src_off
++                               ? (const char *) pool->base_dev + (size_t) pool_slot * pool->host_bytes + t.src_off
 +                               : (const char *) t.host + (size_t) expert * t.host_bytes + t.src_off;
          // Phase 3 slice fill.  An unsplit table (split_axis < 0) and a contiguous axis-1 slice both
          // copy `expert_bytes` in one 1-D transfer; an axis-0 slice is `rows` small rows strided by the
          // host expert pitch, so it needs a 2-D copy (the prefill campaign's §26.3 geometry).
-@@ -717,6 +1117,11 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
-                                         cudaMemcpyHostToDevice, (cudaStream_t) stream);
+         cudaError_t err = cudaSuccess;
+         if (t.split_axis != 0 || t.host_pitch == 0) {
+-            err = cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyHostToDevice,
+-                                  (cudaStream_t) stream);
++            err = cudaMemcpyAsync(dst, src, t.expert_bytes, kind, (cudaStream_t) stream);
+         } else {
+             const int64_t rows = t.host_bytes > 0 ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
+             const size_t  row  = rows > 0 ? (t.expert_bytes / (size_t) rows) : 0;
+             if (row > 0) {
+                 err = cudaMemcpy2DAsync(dst, row, src, t.host_pitch, row, (size_t) rows,
+-                                        cudaMemcpyHostToDevice, (cudaStream_t) stream);
++                                        kind, (cudaStream_t) stream);
++            }
++        }
++        if (from_pool && pool != nullptr && pool_slot >= 0 && stream != nullptr) {
++            // Mark when this slot's copy to THIS device has drained, so a later eviction can safely
++            // overwrite it (per-device: a process-wide slot may serve several devices).
++            cudaEvent_t ev = pool_slot_event(*pool, pool_slot, t.device >= 0 ? t.device : 0);
++            if (ev != nullptr) {
++                (void) cudaEventRecord(ev, (cudaStream_t) stream);
++            }
++            // ADDITIVE: the arena now owns this block; free the pool entry as soon as the copy drains
++            // (`pool_reap_locked`), so the pool stays the complement of the arena.
++            if (pool_slot < (int) pool->slot_state.size()) {
++                pool->slot_state[(size_t) pool_slot] = 2;
              }
          }
-+        if (from_pool && pool != nullptr && pool_slot >= 0 && stream != nullptr &&
-+                pool->slot_ev[(size_t) pool_slot] != nullptr) {
-+            // mark when this slot's copy has drained, so a later eviction can safely overwrite it
-+            (void) cudaEventRecord(pool->slot_ev[(size_t) pool_slot], (cudaStream_t) stream);
-+        }
          if (err != cudaSuccess) {
-             GGML_LOG_WARN("%s: async fill failed table layer=%d role=%s expert=%d: %s\n",
-                           __func__, t.layer, t.role.c_str(), expert, cudaGetErrorString(cudaGetLastError()));
-@@ -1075,35 +1480,43 @@ void policy_pull_host_locked(table_t & t, int device) {
+@@ -1075,35 +1591,43 @@ void policy_pull_host_locked(table_t & t, int device) {
  // non-empty; the seed takes effect from the NEXT token (this call is post-graph, before the batched policy
  // kernel, which then treats the seeded slots as provisional).  A no-op until a prefill has tallied.
  bool seed_prefill_lazy_locked(int device, void * stream) {
@@ -599,7 +737,7 @@ index cfc40e596..e53cf6adf 100644
              continue;
          }
          std::vector<int32_t> tally((size_t) t.n_experts, 0);
-@@ -1119,30 +1532,34 @@ bool seed_prefill_lazy_locked(int device, void * stream) {
+@@ -1119,30 +1643,34 @@ bool seed_prefill_lazy_locked(int device, void * stream) {
              total += tally[(size_t) e];
              rank[(size_t) e] = e;
          }
@@ -653,7 +791,7 @@ index cfc40e596..e53cf6adf 100644
          return true;
      }
      return false;
-@@ -1471,7 +1888,9 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -1471,7 +1999,9 @@ void alloc_table_locked(table_t & t, int slots) {
          const char * e = getenv("MOE_EXPERT_CACHE_DEVPOLICY_SPLIT");
          return e != nullptr && atoi(e) != 0;
      }();
@@ -664,7 +802,7 @@ index cfc40e596..e53cf6adf 100644
          device_guard pdg(t.device);
          bool ok = cudaMalloc((void **) &t.slot_expert_dev, (size_t) slots * sizeof(int32_t)) == cudaSuccess;
          ok = ok && cudaMalloc((void **) &t.count_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess;
-@@ -2397,10 +2816,13 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
+@@ -2397,10 +2927,13 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
          }
          table_t & t = g_tables[i];
          device_guard dg(t.device);
@@ -681,7 +819,7 @@ index cfc40e596..e53cf6adf 100644
          }
          t.arena = nullptr;
          t.slots = 0;
-@@ -2767,6 +3189,35 @@ bool moe_cache_has_tables() {
+@@ -2767,6 +3300,35 @@ bool moe_cache_has_tables() {
      return !g_tables.empty();
  }
  
@@ -717,7 +855,7 @@ index cfc40e596..e53cf6adf 100644
  int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                      size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
                      const void * host, int device) {
-@@ -2798,6 +3249,7 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -2798,6 +3360,7 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
          if (host != nullptr) {
              t.host = host;   // bind the master once it is known
          }
@@ -725,7 +863,7 @@ index cfc40e596..e53cf6adf 100644
          bind_host_dev_locked(t);
          if (g_slots_hint > 0 && !t.allocated) {
              alloc_table_locked(t, g_slots_hint);
-@@ -2817,6 +3269,7 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -2817,6 +3380,7 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
      t.cold_safe    = cold_safe;
      t.host         = host;
      t.device       = device;
@@ -733,7 +871,7 @@ index cfc40e596..e53cf6adf 100644
  
      const int id = (int) g_tables.size();
      g_tables.push_back(std::move(t));
-@@ -3150,21 +3603,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -3150,21 +3714,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // device's arena/remap and re-create them on `device`.  The old arena's bytes are gone, so the
      // residency map is reset (the next accesses refill from the host master).
      if (t.device >= 0 && t.device != device && t.allocated) {
@@ -767,7 +905,7 @@ index cfc40e596..e53cf6adf 100644
              if (old_remap != nullptr) { (void) cudaFree(old_remap); }
              (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
          }
-@@ -3818,27 +4274,31 @@ bool moe_cache_policy_flush(int device, void * stream) {
+@@ -3818,27 +4385,31 @@ bool moe_cache_policy_flush(int device, void * stream) {
      pd.tokens++;
      if (g_devpolicy) {
          build_policy_descs_locked(device);
@@ -817,7 +955,7 @@ index cfc40e596..e53cf6adf 100644
      }
      return true;
  }
-@@ -4099,6 +4559,23 @@ void moe_cache_report() {
+@@ -4099,6 +4670,23 @@ void moe_cache_report() {
      GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), budget_desc());
@@ -842,24 +980,26 @@ index cfc40e596..e53cf6adf 100644
                    __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
                    g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 130c5fc77..03aef44b7 100644
+index 130c5fc77..f56376d92 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -31,6 +31,13 @@
+@@ -31,6 +31,15 @@
  //   MOE_EXPERT_CACHE_PREFILL_SEED_N=N  cap the seeded experts/table (0 = all slots)
  //   MOE_EXPERT_CACHE_PROVISIONAL=0  disable reclaiming pre-filled/seed slots before first hit
  //                              (default 1)
-+//   MOE_HOST_POOL_MIB=N        per-device pinned host pool (L2) size in MiB; 0/unset disables it (default
-+//                              0).  The pool is a GPU-readable BOUNCE BUFFER: the GPU reads it (pinned),
-+//                              and it is refilled from the GGUF BUFFERED, through the page cache, so a
-+//                              miss is a RAM read, not disk.  Phase 2 of wip/host-expert-dio-cache.
++//   MOE_HOST_POOL_MIB=N        PROCESS-WIDE pinned host pool (L2) size in MiB; 0/unset disables it
++//                              (default 0).  One pool per host tensor, shared by every device; the budget
++//                              is split over the registered host tensors.  The pool is a GPU-readable
++//                              BOUNCE BUFFER: the GPU reads it (pinned), and it is refilled from the GGUF
++//                              BUFFERED, through the page cache, so a miss is a RAM read, not disk.
++//                              Phase 2b of wip/host-expert-dio-cache.
 +//   MOE_HOST_POOL_DIO=1        fill the pool with O_DIRECT instead of buffered (debug fallback only:
 +//                              bypasses the page cache)
 +//   MOE_HOST_POOL_PREWARM=0    do not DIO/buffered-fill every pool slot when it is built (default on)
  
  // Phase 1a status: registration + LFRU policy + arena + alias + fill + report.  The
  // `mul_mat_id` dispatch already calls `moe_cache_observe()` (live hit-rate measurement) and the
-@@ -165,6 +172,14 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -165,6 +174,14 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
                      size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
                      const void * host, int device);
  

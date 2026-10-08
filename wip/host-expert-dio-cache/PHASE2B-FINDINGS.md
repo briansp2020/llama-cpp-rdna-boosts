@@ -29,6 +29,37 @@ whose arena copy has not drained.  Budget is **process-wide**, and the implicati
 active prefetch/streaming** pattern that keeps the pool ready with what the devices need next.  Question
 3 is answered: the pool need not be ≥ the arena hot set; it is the complement of the arena.
 
+**Update 2026-10-08 (target 4 landed — 4a + 4b).**
+
+* **4a process-wide pool.**  `g_host_pools` is keyed by the host tensor only; `MOE_HOST_POOL_MIB` is the
+total non-swappable budget split over all registered host tensors (one whole-expert copy serves every
+device).  Per-`(slot, device)` in-flight events; the pool is `cudaHostAlloc(Portable|Mapped)` and the
+arena fill reads the UVA device alias with `cudaMemcpyDeviceToDevice`.  Two bugs found and fixed on the
+way: (i) a cross-device H2D from a plain `cudaMallocHost` pool is treated as pageable and crashes in the
+run-time staging `memmove` (gdb backtrace); (ii) the meta splitter hands the middle device of an axis
+split a **degenerate** simple tensor (`ne[split]==0`, `nb[2]==0`) that the cache registered with
+`expert_bytes = host_bytes` and a nonzero `slice_off`, so a pool fill read past the slot — the pool
+source is now guarded on `src_off + expert_bytes <= host_bytes` and falls back to the master.
+* **4b additive lifecycle.**  Per-slot state `0=free / 1=resident / 2=retiring`: an arena eviction
+fetches the victim into the pool, and an arena admission marks the entry retiring and frees it
+(`pool_reap_locked`, non-blocking `hipEventQuery`) as soon as the copy drains.  Retiring slots are never
+reused or evicted while a copy is in flight.
+
+35B-A3B Q4_K_M, prose prompt, `-n 128`, `MOE_HOST_POOL_MIB=6144` process-wide:
+
+| arm | 4a (non-additive) | 4b (additive) | pool h (4b) |
+|---|---:|---:|---:|
+| `-sm layer` | 41.1 | 39.1 | 0.224 |
+| `-sm tensor` | 18.7 | 17.1 | **0.493** |
+
+So the hit rate rose 2-8x, but t/s dipped ~5-9 %: the eviction fetch is still **synchronous and on the
+critical path**.  That is target 2's job (overlap / host-wanted streaming) — the additive pool is the
+prerequisite that makes an overlap worthwhile.  Note target 1's original 2x `-sm layer` gap (42.0 vs
+17.4) is now nearly closed by target 3 + the additive pool (41.1 / 39.1): re-validating it at this
+point may show only a residual benefit.  Gates green at 4b: short `359ff4337837`, prose `12d4fcd10886`
+(all four pool/split arms), dense 4B `1c5d32ac537d`, `MUL_MAT_ID` 931/931, prefill-logit KLD 0.000707 /
+98.755 % PASS.
+
 Read with [`PHASE2B-HANDOVER.md`](PHASE2B-HANDOVER.md) (targets), [`PHASE2.md`](PHASE2.md) (the pool
 design / the page-cache finding) and the repo [`AGENTS.md`](../../AGENTS.md).
 
@@ -138,11 +169,15 @@ smaller than the arena's for the same byte budget.
 ## Proposed designs and order
 
 Recommended order: **3 → 4 → 1 → 2** (make the pool useful first, then the policy, then the residual
-micro-optimisation); approved by the maintainer.  **Target 3 is done.**  Each step is independently
-gated (coherence, `MUL_MAT_ID`, prefill-logit KLD); per repo policy every new beneficial path ships
-default-on with a kill-switch and must clear the full gate matrix first.
+micro-optimisation); approved by the maintainer.  **Targets 3 and 4 are done** (4a + 4b above).
+Remaining: **target 2 is the highest-value next step** (overlap the now-synchronous eviction fetch so the
+additive hit rate becomes speed); **target 1 should be re-scoped** — target 3 + the additive pool have
+closed almost all of its original 2x `-sm layer` gap, so a pool-aware device policy is now a residual,
+not the headline.  Each step is independently gated (coherence, `MUL_MAT_ID`, prefill-logit KLD); per
+repo policy every new beneficial path ships default-on with a kill-switch and must clear the full gate
+matrix first.
 
-### Target 4 — additive, process-wide pool (maintainer's contract)
+### Target 4 — additive, process-wide pool (maintainer's contract) — DONE (4a + 4b)
 The pool becomes the **complement of the arena**, not a duplicate:
 * On an arena admission of expert `e`, `e` is released from the pool once its arena copy has drained
   (`slot_ev`); until then it is the in-transit exception and stays pinned.
@@ -177,7 +212,7 @@ The pool becomes the **complement of the arena**, not a duplicate:
 * Size the per-table pool to at least the arena's uniform slot count (the pool is created before
   `alloc_all_locked`, so it needs the sizing to move earlier or a second pass).
 
-### Target 1 — pool-aware device policy (the biggest single win for `-sm layer`)
+### Target 1 — pool-aware device policy (now a residual; re-scope before doing it)
 Maintainer's sketch: a device `expert -> pool_slot` map; the host pre-fills the pool for the token's used
 experts before `moe_cache_policy_flush`.
 
