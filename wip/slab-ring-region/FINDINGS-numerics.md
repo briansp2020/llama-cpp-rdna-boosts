@@ -62,9 +62,25 @@ toggles more:
 | `GGML_CUDA_DISABLE_FUSION=1` | **`a702e03f374e`** | **`a702e03f374e`** |
 | `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` | `233382632053` | `ef91112ab636` |
 | cache off (`MOE_EXPERT_CACHE_MIB=0`) | `ef91112ab636` | `ef91112ab636` |
+| **every individual fusion switch off, `GGML_CUDA_DISABLE_FUSION` unset** | `7b53871fb520` / `a702e03f374e` | same |
 
-`GGML_MOE_CACHE_STAGE=0` and `GGML_MOE_CACHE_INPLACE=0` leave it unchanged.  `SCHED_STAGE=0` makes the
-arms agree but also removes the ring region, consistent with the eviction explanation.
+### The alloc deps are NOT the cause (tested)
+
+`GGML_CUDA_DISABLE_FUSION=1` is **triply confounded** — line 8884 wraps the whole alloc-deps pass (`if
+(!disable_fusion)`) *and* that pass does a `std::rotate` of the shared-expert nodes, so the global switch
+skips the fusions, PR #27301's alloc deps, and a graph mutation together.  The deps were therefore tested
+separately, by leaving `GGML_CUDA_DISABLE_FUSION` unset (so the deps pass still runs) and disabling the
+fusions via the individual switches:
+
+* the deps pass inflates the compute buffer **+512 MiB** (2816 vs 2304 MiB with fusion on/off) and the slab
+  charges that against the arena like any work space;
+* but with the deps pass **on** and the fusion set **off**, the two placements already **agree**
+  (`7b53871fb520`), and adding only the qwen4exp HC group agrees at `a702e03f374e`.
+
+So the divergence is a property of the **fusion kernel mix**, not of the deps translation.  It is also not
+one bad kernel: either the HC group or the idx/concat/DSV4 group alone removes it, so it is a cumulative
+rounding shift.  The buffer-size numbers are in the log as
+`ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer ... from the slab work region`.
 
 **What it is not.**  No corruption: 0 NaN, 0 `////`, coherent text, and the prefill logits are
 bit-identical (KLD `0.000000`) everywhere the eviction does not fire (field model, `-ub 512`, `-ub 2048`
