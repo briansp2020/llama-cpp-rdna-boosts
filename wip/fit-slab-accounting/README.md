@@ -1484,6 +1484,63 @@ its own graceful-degradation item?) and (ii) is the WIP's `-ncmoe 4` early warmu
 or should the fit's layer selection be constrained/gated so the reservation cannot push a fitting config
 into an unsupported `-sm tensor` layout?
 
+**Decision (maintainer, 2026-10-09): out of scope, not a blocker.**  The "never crash on a shortfall"
+bar applies only where the model can *reasonably be expected to fit*; a config that asks for more
+weights than the cards hold may abort, as mainline llama.cpp would.  "Never crash" therefore means
+"if it can reasonably be expected to fit, we should not crash", not "never crash even in impossible
+conditions".  An early "this cannot fit, did you mean `-ncmoe 99`?" detection for MoE + `--fit` is a
+nice future idea, and likewise aborting early when a shortfall is anticipated, but neither blocks this
+campaign.  (§15.3 finding A is closed as accepted behaviour.)
+
 **B — G4 default evidence is thin.**  Issue #117 is still un-reproduced on `fingon`; the default flip
-therefore waits on §15.4.
+therefore waits on §15.4.  **(Resolved by §15.8: the default 50 % is safe on gfx1100.)**
+
+---
+
+### 15.8 `fingon` (gfx1100) validation (2026-10-09)
+
+**Setup.**  Fingon = RX 7900 XTX (gfx1100, 24 GiB) + gfx1036 iGPU; ROCm `/opt/rocm-7.14-gfx1100`.
+`HIP_VISIBLE_DEVICES=0` on every run.  The box's `~/llama.cpp` was already the **r37 tree**
+(`1ca19bc4c`, tree `322a7727…`, the same tree as the delivery); the WIP patch applied clean, built
+incremental via `cmake --build build-rocm` (~8 min, ccache), WIP symbols present.  Model:
+`Qwen3.6/35B-A3B/Q4_K_M` (22.6 GiB, 40 MoE layers, embedded MTP), `-ngl 99 -sm layer -ncmoe 20
+-fa on -ctk/-ctv q8_0 -t 8 -c 8192 -b 2048 -ub 2048`.  The box was restored to stock afterwards
+(`git checkout -- .`, rebuild, WIP symbols 0).
+
+**§11.4 staging A/B, `llama-bench -p 4096 -n 4 -r 1 -lm dio`:**
+
+| arm | pp4096 t/s | tg4 t/s |
+|---|---:|---:|
+| staging ON (default cap 50 %) | **4248.5** | 8.29 |
+| `GGML_SCHED_STAGE=0` | **3539.1** | 8.24 |
+| `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT=0` | 4253.3 | 8.29 |
+| `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT=1` | 4254.9 | 8.23 |
+| `MOE_EXPERT_CACHE_MIB=4096` (primed) | 4258.4 | **31.49** |
+
+Staging is never slower than OFF (4248 vs 3539) — issue #117 does not reproduce here, matching the stock
+§11.4 baseline.  Unprimed `tg4` is ~8 t/s; an explicit `MIB=4096` primes the cache and lifts it to ~31.
+
+**Primed `llama-server` prefill (two requests: a small warmup, then the 5246-token prose prompt):**
+
+| arm (cap %) | prefill t/s | cap refusal logged | arena |
+|---|---:|---|---:|
+| default 50 (dio) | 2502.2 | refuses 1312 MiB (FA staging) at 2456 MiB free | 7431.2/9280 (80.1 %) |
+| `=0` (dio) | 2315.1 | none | 80.1 % |
+| `=1` (dio) | 2432.3 | refuses 144 MiB ring → serial shortfall | 80.1 % |
+| `GGML_SCHED_STAGE=0` (dio) | 2436.9 | — | 80.1 % |
+| `MOE_EXPERT_CACHE_MIB=4096` (dio) | 2606.9 | refuses 1312 MiB | — |
+| default 50 (`-lm none`) | 2483.6 | refuses 1312 MiB | 80.1 % |
+
+**G4 default verdict: safe.**  At the default 50 % the cap *does* fire on this box — free VRAM after the
+slab is only ~2.4 GiB, so the 1312 MiB FA staging is refused and the arena keeps 80.1 % residency — and
+the result is **not slower** than the cap-off arm (server 2502 vs 2315; bench 4248 vs 4253).  Forcing
+1 % refuses the 144 MiB ring growth, logs the one-time `optional device allocation refused` warning and
+takes the serial shortfall path (`sched_stage_issue: H2D staging shortfall … serial for the rest`), still
+2432 t/s with no crash.  `-lm dio` and `-lm none` both work.  (The refusal warning is a single `static
+bool`, so only the *first* refusal of a process is logged — a later larger refusal is silent.)
+
+**Bonus — gfx1100 width purity (qwen35moe, embedded MTP, `-ncmoe 20`, `-lm dio`):**
+`none == n1 == n3 == n7` = **`cd5e36218bd2`** (266 chars), all exit 0; acceptance n1/n3 **0.84906**,
+n7 **0.66234**.  The G7 scheduler half is pure on RDNA3 as well.
+
 
