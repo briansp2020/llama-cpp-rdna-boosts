@@ -1,3 +1,20 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 46bc40dc5..a43c9a09a 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2832,6 +2832,12 @@ common_speculative_init_result::common_speculative_init_result(
+         model_path = params.speculative.draft.mparams.path;
+         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+ 
++        // The separate draft model's own `--spec-draft-n-cpu-moe` / `--spec-draft-cpu-moe` must be
++        // honoured: allow its CPU overrides to match its nextn/MTP head layer.  (The main model's
++        // `-ncmoe` never lands here -- `common_base_params_to_speculative` replaced the overrides with
++        // the draft's -- but this makes the intent explicit.)
++        mparams.allow_nextn_cpu_offload = true;
++
+         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+         if (model_dft == NULL) {
+             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index 1fa5e3321..4a4ed81a8 100644
 --- a/ggml/src/ggml-cuda/common.cuh
@@ -258,3 +275,127 @@ index 8736a8c4f..33531ec37 100644
      const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
                                        host_bytes, slice_off, host_pitch, split_axis, weight->data, device);
      if (table < 0) {
+diff --git a/include/llama.h b/include/llama.h
+index aa2d015fc..0f5a8ffd6 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -364,6 +364,10 @@ extern "C" {
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
++        bool allow_nextn_cpu_offload; // let a CPU expert override match an appended nextn/MTP layer
++                                      // (the SPECULATIVE head).  Default false: the main model's
++                                      // -ncmoe/-cmoe never offloads the head.  A separately loaded MTP
++                                      // draft model sets this so its own --spec-draft-n-cpu-moe works.
+     };
+ 
+     struct llama_sampler_seq_config {
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 2fe56df98..3ebfe96fd 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -548,6 +548,7 @@ llama_model_loader::llama_model_loader(
+         bool check_tensors,
+         bool no_alloc,
+         bool load_mtp,
++        bool allow_nextn_cpu_offload,
+         const llama_model_kv_override * param_overrides_p,
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+@@ -563,6 +564,7 @@ llama_model_loader::llama_model_loader(
+     }
+ 
+     tensor_buft_overrides = param_tensor_buft_overrides_p;
++    this->allow_nextn_cpu_offload = allow_nextn_cpu_offload;
+ 
+     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
+     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+@@ -1271,6 +1273,27 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+                 std::regex pattern(overrides->pattern);
+                 if (std::regex_search(tensor_name, pattern)) {
++                    // The appended nextn/MTP layer(s) are the SPECULATIVE head, not the trunk.  A CPU
++                    // expert override from the main model (`-ncmoe`/`-cmoe`) must never offload them: the
++                    // patterns are `blk.<i>` for i in 0..N-1, so `-ncmoe 99` matches
++                    // `blk.<n_layer>.ffn_*_exps` and silently moves the MTP head's own experts to the host
++                    // (measured: Qwen3.6-35B-A3B, n_layer 40, `-ncmoe 41` -> blk.40 experts on ROCm_Host).
++                    // The separate-file MTP draft (loaded with the draft's own `--spec-draft-n-cpu-moe`
++                    // overrides) is protected by the same rule: its only layer is the nextn layer, and
++                    // offloading the speculative head is never what the user wants.  Keep it on the
++                    // layer's device; `--spec-draft-n-cpu-moe` still governs a draft model's trunk layers.
++                    if (overrides->buft == ggml_backend_cpu_buffer_type() &&
++                            !allow_nextn_cpu_offload &&
++                            info.layer == LLM_TENSOR_LAYER_REPEATING &&
++                            hparams.n_layer() > 0 && tn.bid >= (int) hparams.n_layer()) {
++                        static std::once_flag once_nextn;
++                        std::call_once(once_nextn, [&] {
++                            LLAMA_LOG_INFO("llama_model_loader: keeping the speculative (nextn) layer %d experts "
++                                           "on the device; -ncmoe/-cmoe only offload the %u trunk layers\n",
++                                           (int) tn.bid, hparams.n_layer());
++                        });
++                        continue;
++                    }
+                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                         // Host-resident MoE experts: a device's host buffer type carries that device, and
+                         // the scheduler places the consumers of its tensors there.  Picking the device-0
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 4f6383012..c2d4bd040 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -141,6 +141,10 @@ struct llama_model_loader {
+     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
+     const llama_model_tensor_buft_override * tensor_buft_overrides;
++    // Allow a CPU expert override to match an appended nextn/MTP layer (the SPECULATIVE head).  False
++    // for the main model so `-ncmoe`/`-cmoe` cannot offload the head; true for a separately loaded MTP
++    // draft model so its own `--spec-draft-n-cpu-moe` is honoured.
++    bool allow_nextn_cpu_offload = false;
+ 
+     gguf_context_ptr metadata_ptr;
+     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
+@@ -213,6 +217,7 @@ struct llama_model_loader {
+         bool check_tensors,
+         bool no_alloc,
+         bool load_mtp,
++        bool allow_nextn_cpu_offload,
+         const llama_model_kv_override * param_overrides_p,
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e724e3cad..466d29d36 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3109,6 +3109,7 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.allow_nextn_cpu_offload     =*/ false,
+     };
+ 
+     return result;
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index bcb158870..eaebb2d5f 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -969,7 +969,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+     const llama_model_kv_override * kv_overrides = params->kv_overrides;
+     std::vector<std::string> splits = {};
+     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
+-        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*host_experts_mode*/ LLAMA_HOST_EXPERTS_MODE_AUTO, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
++        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*host_experts_mode*/ LLAMA_HOST_EXPERTS_MODE_AUTO, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, /*allow_nextn_cpu_offload*/ true, kv_overrides, nullptr);
+     ml.init_mappings(false); // no prefetching
+ 
+     auto mparams = llama_model_default_params();
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 265d02c26..f031e6555 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -342,7 +342,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+     try {
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+-            params.host_experts_mode, params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
++            params.host_experts_mode, params.check_tensors, params.no_alloc, params.load_mtp, params.allow_nextn_cpu_offload, params.kv_overrides, params.tensor_buft_overrides);
+ 
+         ml.lazy.mode            = params.lazy_mode;
+         ml.lazy.managed_budget  = params.lazy_mode == LLAMA_LAZY_MODE_AUTO ? llama_lazy_managed_budget() : 0;

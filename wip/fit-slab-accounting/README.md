@@ -3,15 +3,16 @@
 > **New to this campaign? Start at [Cold start (read me first)](#cold-start-read-me-first).**
 
 **Status:** **REVIVED (2026-10-09); a first implementation pass is now DONE and parked** (patch
-[`revival-2026-10-09.patch`](revival-2026-10-09.patch), 4 files, built warning-free on gfx1201 / ROCm
+[`revival-2026-10-09.patch`](revival-2026-10-09.patch), 11 files, built warning-free on gfx1201 / ROCm
 7.14.1, WIP only — `patches/` is untouched).  The revival reframed the campaign around the user's
 goal: **no memory-shortfall crash for *any* `-ncmoe`**, right-sized where it fits, and a loud,
 actionable warning plus a graceful performance fallback where it does not — and it must work without
-`--fit`.  Three changes landed in the WIP patch: **G3** (the slab reserve is now sized from what
+`--fit`.  Four changes landed in the WIP patch: **G3** (the slab reserve is now sized from what
 actually appears after the slab, not a flat `max(8192, 25 %)`), **G4** (the optional raw transients —
 the op-offload H2D ring and the FA prefill staging arena — are capped at a fraction of the free VRAM
-while the slab is active), and a **split-slice geometry guard** that fixes a reproducible host-memmove
-SIGSEGV in the `-sm tensor` identity fill.  See
+while the slab is active), **G5** a **split-slice geometry guard** that fixes a reproducible
+host-memmove SIGSEGV in the `-sm tensor` identity fill, and **G6** which keeps the **speculative
+(nextn/MTP) head weights on the GPU** no matter how large `-ncmoe` is.  See
 [§12](#12-revival-implementation-2026-10-09-r37) for the code, the measurements and what is left.
 
 Phase 1 (G1+G2 + the tensor-split plumbing it needs) remains implemented and parked: it was built
@@ -79,9 +80,11 @@ staging ring is unbounded by free VRAM; issue #117).
   **Both are now implemented in the 2026-10-09 revival patch** (plus the split-slice SIGSEGV fix); the
   G1/G2 fit-side work is still parked.  See §12.
 * **Revival patch (2026-10-09):** [`revival-2026-10-09.patch`](revival-2026-10-09.patch) (sha256
-  `1f7e3fafa74ee757d92f154cba8b4d72eca6449dc5beca4cd8920096973e1533`, 4 files: `common.cuh`,
-  `ggml-cuda.cu`, `ggml-cuda-vmm.h`, `moe-expert-cache.cu`).  Targets the **current r37 tree**
-  `322a77273531f88250ed01bc9ef6a64a74227028`; `git apply` in `~/llama.cpp`.
+  `7c3df7368a11a22fe13fc072a0287b17370d9d63497fb439f5bf6e42872c689a`, 11 files: `common.cuh`,
+  `ggml-cuda.cu`, `ggml-cuda-vmm.h`, `moe-expert-cache.cu`, `src/llama-model-loader.{h,cpp}`,
+  `src/llama-model.cpp`, `src/llama.cpp`, `src/llama-quant.cpp`, `include/llama.h`,
+  `common/speculative.cpp`).  Targets the **current r37 tree** `322a77273531f88250ed01bc9ef6a64a74227028`;
+  `git apply` in `~/llama.cpp`.
 
 **Which box does what.**
 
@@ -99,8 +102,8 @@ staging ring is unbounded by free VRAM; issue #117).
 3. Still open: decide the G2 gate (b1 vs b2, §4.2c) for the parked G1/G2 fit-side work, and re-test the
    `-sm tensor` auto-floor corruption that parked Phase 1.
 4. Still open: run the §5.7 staging matrix (now with the §12.3 cap) on `fingon` and the main box, and run
-   the §12.6 GSQ `/` -corruption band on 2 GPU with the adaptive reserve before promoting G3.  (The band
-   itself was re-tested and passed on 2026-10-09 - see §12.5.)
+   the §12.7 GSQ `/` -corruption band on 2 GPU with the adaptive reserve before promoting G3.  (The band
+   itself was re-tested and passed on 2026-10-09 - see §12.6.)
 5. Record decisions against the open questions in §8 as they are made; keep the WORKLOG/promotion path in
    mind before anything moves toward `patches/`.
 
@@ -120,6 +123,7 @@ Four concrete gaps, all fixable without touching the cache engine (G4 is new in 
 | **G3** | The slab's **`GGML_CUDA_SLAB_RESERVE_MIB`** is a flat `max(8192, 25 %)` that is never planned, and it is subtracted from `free_b` at slab creation. With partial offload `free_b - 8192 < work + 2048`, the slab **declines** (`cache_unusable`) and the whole run silently streams from the host. Too small is the exit-134 abort, too large is this decline, so it must be planned, not guessed. | **DONE (revival 2026-10-09):** the reserve now defaults to `headroom + aux_reserve` (the draft-context estimate the preflight already carries), because the KV cache is allocated **before** the slab, so it no longer has to be reserved.  `GGML_CUDA_SLAB_RESERVE_MIB` stays the explicit override.  §12.2 |
 | **G4** | The **op-offload H2D staging ring** (`h2d_stage_buffer` / `h2d_stage_budget`, common.cuh) is a fourth consumer: it lives **outside** the compute-graph reserve, auto-sizes to `slots * (largest host table + 512)`, and has **no free-VRAM cap or floor**.  On a partially offloaded model it competes with the slab reserve and the arena; when it over-commits, staging is slower than the serial path (issue #117: 32 vs 423 t/s, fixed by `GGML_SCHED_STAGE=0`). | **DONE (revival 2026-10-09):** a growth is refused once the ring (and, with the same helper, the FA staging arena) would exceed `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`% of the free VRAM while the slab is active; the caller falls back to the serial path / native K/V read.  `GGML_SCHED_STAGE_MAX_MB` stays the hard override.  §12.3 |
 | **G5** | A `-sm tensor` split slice whose `nb` does not describe its slice registers `expert_bytes == host_bytes` with a nonzero `slice_off`; the identity fill then reads `slice_off` bytes past the host master. | **DONE (revival 2026-10-09):** `moe_cache_slice_addr_ok()` declines the table when `slice_off + span > host_bytes`, so the scheduler's full-table copy serves it.  Fixes a reproducible SIGSEGV (`-sm tensor -ncmoe 24`, 3 GPU) - §12.4 |
+| **G6** | The main model's CPU expert overrides (`-ncmoe`/`-cmoe`) are `blk.<i>` regexes for i in 0..N-1, so `-ncmoe 99` matches the appended **nextn/MTP head layer** and moves the drafter's own experts to the host (measured: Qwen3.6-35B-A3B, `blk.40`). | **DONE (revival 2026-10-09):** the loader skips a CPU override for any `tn.bid >= hparams.n_layer()` tensor, so both the embedded nextn head and the separate-file MTP draft keep their experts on the layer's device; `--spec-draft-n-cpu-moe` still governs a draft model's trunk.  §12.5 |
 
 **Ship Phase 1 = G1 + G2.** G3 was added 2026-10-08; it is independent of the auto floor and can land
 with the option-A safe subset, or roll into Phase 2 if it grows.  G4 was added 2026-10-09; it is
@@ -815,9 +819,9 @@ See `ENVIRONMENT.md` for the full table.
 ## 12. Revival implementation (2026-10-09, r37)
 
 **Artifact:** [`revival-2026-10-09.patch`](revival-2026-10-09.patch) (sha256
-`1f7e3fafa74ee757d92f154cba8b4d72eca6449dc5beca4cd8920096973e1533`, 4 files, 156 insertions) applied to a
+`7c3df7368a11a22fe13fc072a0287b17370d9d63497fb439f5bf6e42872c689a`, 11 files, 197 insertions) applied to a
 clean r37 tree (`release.json` tree `322a77273531f88250ed01bc9ef6a64a74227028`), built warning-free on
-gfx1201 / ROCm 7.14.1.  `patches/` is untouched.  **WIP — do not promote without the §12.6 gates.**
+gfx1201 / ROCm 7.14.1.  `patches/` is untouched.  **WIP — do not promote without the §12.7 gates.**
 
 ### 12.0 The reframed goal
 
@@ -875,7 +879,7 @@ The Phase 1 code map (§3) is stale.  On r37:
 
 2 GPU (`-ncmoe 16`, warm): `-sm layer` **81.6** t/s, `-sm tensor` **93.0** t/s, both exit 0.
 The generated text was coherent (no `////`) in every arm; the old and new reserve produce different text
-only because one has the cache off — see the §12.6 purity question.
+only because one has the cache off — see the §12.7 purity question.
 
 ### 12.3 G4 — optional raw transients are capped against free VRAM while the slab is active
 
@@ -922,7 +926,45 @@ scheduler's always-correct full-table copy serves it, with a one-time warning na
 **Follow-up (perf):** declining loses the cache for the affected tables.  The proper root cause is the
 meta split's `slice_off`/`weight_cpy->nb[2]` for those layers; fixing it would make them cacheable again.
 
-### 12.5 Revival measurements (all WIP, 2026-10-09, gfx1201 / ROCm 7.14.1)
+### 12.5 G6 — the speculative/MTP head weights are never offloaded by `-ncmoe`
+
+**Code** (`src/llama-model-loader.cpp` + `include/llama.h`): in the tensor-buffer-override loop a CPU
+override (`-ncmoe`/`-cmoe`, i.e. `ggml_backend_cpu_buffer_type()`) is skipped for any tensor of an
+**appended nextn/MTP layer** (`tn.bid >= hparams.n_layer()` while the model has a trunk), unless the new
+`llama_model_params.allow_nextn_cpu_offload` is set (default false).  Both MTP shapes are covered:
+
+* **embedded head** (`nextn_predict_layers` in the main GGUF, e.g. Qwen3.6-35B-A3B, `n_layer` 40 ->
+  the head is `blk.40`): `-ncmoe 41` used to match `blk.40.ffn_*_exps` and move the drafter's own
+  experts to `ROCm_Host` (measured); the guard logs "keeping the speculative (nextn) layer 40 experts on
+  the device" and they stay on the layer's device.
+* **separate head file** (`mtp-*.gguf` via `-md`): the draft model is loaded with
+  `common_base_params_to_speculative()`'s params, so its overrides are the draft's
+  `--spec-draft-n-cpu-moe` / `--spec-draft-cpu-moe`, never the main `-ncmoe`; the guard additionally
+  keeps the head layer itself on device.  `--spec-draft-n-cpu-moe` still governs a draft model's trunk.
+
+A `--spec-draft-n-cpu-moe`/`--spec-draft-cpu-moe` override is honoured for the separate draft model
+(`common_speculative_init_result` sets `mparams.allow_nextn_cpu_offload = true` on that load), so a user
+who really wants the speculative head on the host can still have it — and it works: see the measurement.
+
+**Measured** (1 GPU, `Qwen3.6-35B-A3B-Q8_0`, embedded MTP, `-ncmoe 41`, `-n 128 --ignore-eos`): before,
+`blk.40.ffn_{gate,up,down}_exps` -> `ROCm_Host`; after (G6), they stay on ROCm and acceptance is 0.661
+(the embedded head tolerated the host path here, but the placement is now correct and the guarantee is
+explicit).
+
+**Measured (host speculation is correct)** — the user's requirement, 1 GPU Flash-Next IQ3_XXS + separate
+`-md` MTP head, `-ncmoe 44`, `-n 256 --ignore-eos`:
+
+| draft head placement | draft `ROCm0 model buffer` | acceptance |
+|---|---:|---|
+| GPU (no `-ncmoed`) | 2647 MiB | **0.53952 (157/291)** |
+| host (`-ncmoed 49`, G6 flag) | 97 MiB | **0.53952 (157/291)** |
+
+The host arm is byte-identical in acceptance: putting the speculative weights on the host does **not**
+break speculation.  (The separate Flash-Next `-ncmoe 48` 0/759 collapse is therefore **not** a
+speculative-host bug — the draft weights were verified on GPU and the target text is coherent; it is the
+**target's** late-trunk host path that the drafter is sensitive to.  See §12.7 item 3.)
+
+### 12.6 Revival measurements (all WIP, 2026-10-09, gfx1201 / ROCm 7.14.1)
 
 Warm decode unless noted; greedy seed 42.  "flat" = `GGML_CUDA_SLAB_RESERVE_MIB=8192` (the old
 default), "adaptive" = the new default.
@@ -937,16 +979,17 @@ default), "adaptive" = the new default.
 | 2 GPU, Flash-Next IQ3_XXS + MTP, `-sm tensor -ncmoe 12`, 4x-prose prefill | adaptive | coherent, acc **0.503**, 56.8 t/s | the §10.4 `////` band - **passed** |
 | 1 GPU, Flash-Next IQ3_XXS + MTP, `-ncmoe 44`, `-n 256 --ignore-eos` | adaptive | coherent, acc **0.539**, **39.8 t/s** | "works well" point |
 | 1 GPU, Flash-Next IQ3_XXS + MTP, `-ncmoe 44` | flat | identical (acc 0.539, 40.1 t/s) | no regression |
+| 1 GPU, Flash-Next IQ3_XXS + MTP, `-ncmoe 44 -ncmoed 49` (draft head on host) | adaptive | acc **0.53952 (157/291)**, byte-identical to the GPU-draft arm | host speculation correct (G6 flag) |
 | 1 GPU, 35B-A3B Q8_0, `-ncmoe 0` (does not fit) | - | exit 1, clean error | no abort/crash |
 
-**Finding (single GPU, Flash-Next):** the MTP head is **layer 49**.  `-ncmoe > 44` (48 and 99 both
-tested) offloads that layer's experts, so the drafter never matches: draft acceptance collapses to
-**0.000 (0/759)** and decode drops (18-19 t/s) with **no warning** and no `////`.  `-ncmoe <= 44` is
-healthy.  This is a silent performance cliff the campaign's warning mandate should cover: warn when the
-MTP layer's experts are host-resident while a draft is enabled, and recommend the largest `-ncmoe` that
-keeps layer 49 on device.  **Not yet implemented** (needs a per-layer host-residency check).
+**Finding (single GPU, Flash-Next, still open):** with the separate `-md` MTP file, `-ncmoe 44` gives
+draft acceptance 0.539 but `-ncmoe 48+` (48 and 99 both tested) collapses to **0.000 (0/759)** and
+~18 t/s.  The draft weights themselves are on the GPU (G6 confirms), so the collapse is the **target's
+late trunk layers** (44-47) feeding the drafter's input through a host path; `-ncmoe 44` keeps them on
+device.  Decide whether to warn when the target's last trunk layer is offloaded while a draft is
+enabled, or leave it as a documented trade-off.
 
-### 12.6 Open items / promotion gates (do not skip)
+### 12.7 Open items / promotion gates (do not skip)
 
 1. ~~The §10.4 `/` -corruption band is untested with the adaptive reserve.~~  **Tested and passed**
    (2 GPU, IQ3_XXS + MTP, `-sm tensor -ncmoe 12`, 4x-prose): coherent, acceptance 0.503, no stale-alias
@@ -957,13 +1000,18 @@ keeps layer 49 on device.  **Not yet implemented** (needs a per-layer host-resid
    cache on vs `MOE_EXPERT_CACHE_MIB=0` at a config where stock has the cache on) or a prefill-path
    difference.  The decode claim is byte-identity; prefill is gated by
    `benchmarks/prefill-logit-methodology.md`.
-3. **MTP-layer offload warning** (the Finding above).
+3. **Separate-draft acceptance cliff at high `-ncmoe`** (the Finding above).  The speculative **weights**
+   are protected (G6) and host speculation is verified correct; what remains is the target's late-trunk
+   host path collapsing draft acceptance while the target text stays coherent (Flash-Next, draft on GPU,
+   `-ncmoe 48` -> 0.000 vs `-ncmoe 44` -> 0.539).  This is a distinct correctness investigation: the
+   drafter's input from the host-computed last trunk layers diverges.  Root-cause it (the "host
+   speculation should just run" requirement), then decide warn vs fix.
 4. **G4 default.**  The 50 % default is a proposal; issue #117 is still un-reproduced on `fingon`
    (§11.4).  Run the §5.7 matrix before a default flip.
 5. **G1/G2** stay parked behind the `-sm tensor` auto-floor corruption (Phase 1).
 6. **The identity geometry root cause** (perf, not correctness) and the **`fingon` gfx1100** validation.
 
-### 12.7 Apply / revert
+### 12.8 Apply / revert
 
 ```sh
 cd ~/llama.cpp                      # clean r37 tree, tree 322a77273531f88250ed01bc9ef6a64a74227028
@@ -974,16 +1022,20 @@ git checkout -- ggml/src/ggml-cuda/common.cuh ggml/src/ggml-cuda/ggml-cuda.cu \
                ggml/src/ggml-cuda/ggml-cuda-vmm.h ggml/src/ggml-cuda/moe-expert-cache.cu
 ```
 
-### 12.8 Record
+### 12.9 Record
 
 * Build: `cmake --build build-rocm-hybrid --target llama-cli` rc=0, warning-free (2026-10-09).
 * **Standing gates:** dense `Qwen3.5-4B-Q8_0` `-sm tensor` same-seed sha **`1c5d32ac537d`** (matches
   the r36/r37 record); `scripts/gate-prefill-logits.sh` **PASS** mean KLD **0.000707**, same-top-p
   **98.755 %** (identical to the r37 record) - the changes are prefill-numeric-neutral.
+* **Host speculation verified correct:** Flash-Next separate `-md` MTP head, 1 GPU, `-ncmoe 44`:
+  GPU draft (draft `ROCm0 model buffer` 2647 MiB) and host draft (`-ncmoed 49`, G6 flag, 97 MiB) both give
+  acceptance **0.53952 (157/291)** - byte-identical.  Host path is sound.
 * Crash repro + backtrace: core PID 93911 / 95534, gdb `alloc_table_locked` -> `hipMemcpyAsync` (host
   memmove); stock-r37 re-run also SIGSEGV (pre-existing).
 * Sweeps (transient): `/tmp/q8_1gpu_warm_*`, `/tmp/q8_1gpu_r{3072,4096}.log`,
   `/tmp/q8_2gpu_ad_{layer,tensor}.log`, `/tmp/stage_{cap,on,off,tensor}*.log`, `/tmp/gsq_corr_adapt.log`,
-  `/tmp/iq3_1gpu_mtp_{44,44_flat,48,50,70,99}.log`.
-* Decision: implementation pass parked as WIP; promotion blocked on §12.6 items 1-3 (the purity question,
+  `/tmp/iq3_1gpu_mtp_{44,44_flat,48,50,70,99}.log`, `/tmp/fn_draft_host.log`,
+  `/tmp/35b_mtp_41{,_fix}.log`, `/tmp/iq3_1gpu_nomtp48.log`.
+* Decision: implementation pass parked as WIP; promotion blocked on §12.7 items 1-3 (the purity question,
   the MTP-layer warning, and a `fingon` + default-cap run; the corruption-band test itself passed).
