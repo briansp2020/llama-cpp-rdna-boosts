@@ -7,7 +7,7 @@ of the delivery, and nothing here may be applied to the fork without the maintai
 
 | directory | what | status |
 |---|---|---|
-| [`fit-slab-accounting/`](fit-slab-accounting/README.md) | bring the MoE arena budget and slab headroom into `--fit` (G1+G2) | **PARKED** — Phase 1 attempted; auto floor under `-sm tensor` corrupts ([`PHASE1-ATTEMPT.md`](fit-slab-accounting/PHASE1-ATTEMPT.md)) |
+| [`fit-slab-accounting/`](fit-slab-accounting/README.md) | bring the MoE arena budget, the slab headroom/reserve, and the op-offload staging ring into `--fit` (G1+G2+G3+G4) | **REVIVED / OPEN** (2026-10-09) — Phase 1 (G1+G2) attempted and parked; the auto floor under `-sm tensor` still corrupts ([`PHASE1-ATTEMPT.md`](fit-slab-accounting/PHASE1-ATTEMPT.md)).  Revival adds **G4** (staging ring, issue #117) and a `fingon` gfx1100 validation plan (§11) |
 | [`cache-split-admission/`](cache-split-admission/README.md) | expert-cache admission policy on `-sm tensor` split MoE tables (`MOE_EXPERT_CACHE_DEVPOLICY_SPLIT`); today the split tables use the slow host promotion | **OPEN / measured** — re-measured 2026-10-08 on r34 (bounded 2048 MiB arena; at the default AUTO the arena is fully resident and the choice is moot): device policy wins big in plain decode (35B `-sm tensor` 10.2 -> **36.5** t/s), byte-identical, but MTP n3 still favours host promotion (3-GPU `MOE_EXPERT_CACHE_MIB=16384`: **76.5** vs 55.6 t/s), so a blanket default flip would regress MTP |
 | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED |
 | [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | open |

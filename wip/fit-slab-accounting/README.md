@@ -1,9 +1,13 @@
-# `--fit` × slab × MoE arena — accounting campaign
+# `--fit` × slab × MoE arena × staging ring — accounting campaign
 
-**Status:** **PARKED (2026-10-07).**  Phase 1 (G1+G2 + the tensor-split plumbing it needs) was
-implemented, built warning-free and tested; it is not shipped and `patches/` is untouched.  G2 (slab
-headroom) and G1 (explicit `MOE_EXPERT_CACHE_MIB`) are validated safe, but newly enabling the **auto
-floor** under `-sm tensor` reproducibly corrupts.  Full record + the patch: [`PHASE1-ATTEMPT.md`](PHASE1-ATTEMPT.md).
+> **New to this campaign? Start at [Cold start (read me first)](#cold-start-read-me-first).**
+
+**Status:** **REVIVED (2026-10-09).**  Phase 1 (G1+G2 + the tensor-split plumbing it needs) remains
+implemented and parked: it was built warning-free and tested, is not shipped, and `patches/` is untouched.
+G2 (slab headroom) and G1 (explicit `MOE_EXPERT_CACHE_MIB`) are validated safe, but newly enabling the
+**auto floor** under `-sm tensor` reproducibly corrupts.  The revival adds **G4** (issue #117: the
+op-offload staging ring is a fourth unplanned VRAM consumer) and a `fingon` (gfx1100) test plan; see
+§4.6 and §11.  Full Phase 1 record + the parked patch: [`PHASE1-ATTEMPT.md`](PHASE1-ATTEMPT.md).
 
 **Update 2026-10-08 (field data, no code change).**  A third gap **G3** was identified from the
 discussion #108 field report (briansp2020: partial offload silently disables the MoE expert cache,
@@ -15,29 +19,95 @@ host streaming.  The same sweep also reproduced the parked `////` corruption at 
 procedure + numbers in **§10**.  G3 can land with the option-A safe subset (it never enables the auto
 floor).
 
+**Update 2026-10-09 (revival): G4 + the `fingon` test plan.**  Issue #117 (gfx1100 single W7800 48 GiB,
+qwen4exp, `--n-cpu-moe 26`: prefill 32 t/s with the op-offload H2D staging ring on, 423 t/s with
+`GGML_SCHED_STAGE=0`, reference 544 t/s) exposed a **fourth** VRAM consumer this campaign did not model:
+the **staging ring**.  It is allocated outside the compute-graph reserve, auto-sizes to
+`GGML_SCHED_STAGE_SLOTS * (largest host table + 512)`, and has no free-VRAM cap or floor.  Added as
+**G4** (§0, §1, §4.6).  The reporter's qwen4exp model does not fit `fingon` (smallest published quant
+~68 GiB), so gfx1100 validation will use the `qwen35moe` models there (§11); the staging A/B matrix on
+that box did **not** reproduce the collapse, which is itself a result: it points at the qwen4exp graph or
+at the slab/arena/ring interaction, not at the copy path per byte.
+
 **Goal:** make `--fit` the **single VRAM planner** for the RDNA/ROCm expert-cache system: it must reserve
-the MoE arena budget and the movable-boundary slab's headroom, instead of the arena being an emergent
-"whatever is free afterwards" third consumer.
-**Owner handover:** read §0 → §2 → §4.  §2 is the constraint that shapes everything.
+the MoE arena budget, the movable-boundary slab's headroom, and the op-offload staging ring, instead of
+each being an emergent "whatever is free afterwards" consumer.
+**Owner handover:** start at **Cold start (read me first)** above, then §0 → §2 → §4.  §2 is the constraint
+that shapes everything; `fingon` operators read §11 before running anything.
 **Related:** `archive/work/moe-cache-autosize/` (the slab + auto-sizing campaign, CLOSED),
 `wip/moe-cpu-overlap/` (TODO #36, a different miss-path question), TODO #47.
 
 ---
 
+## Cold start (read me first)
+
+This directory is a **WIP campaign**, not delivery code.  Nothing here goes into `patches/` without the
+maintainer's explicit go-ahead (AGENTS.md WIP/promotion rules).
+
+**The problem in one paragraph.**  With host-resident MoE experts (`-ncmoe`/`-cmoe`) the post-weights free
+VRAM is claimed by four consumers that no single planner coordinates: the slab **reserve** (weights / KV /
+draft / workspaces), the slab **work** region, the MoE-cache **arena**, and (new) the op-offload
+**staging ring**.  `--fit` reserves only some of them, and each runtime consumer sizes itself from
+"whatever is free".  The gaps are **G1** (explicit arena invisible to `--fit`), **G2** (slab headroom not
+modeled), **G3** (slab reserve is a flat guess; partial offload declines and streams), and **G4** (the
+staging ring is unbounded by free VRAM; issue #117).
+
+**Current state (2026-10-09).**
+
+* Delivery on `main`: **r37** (`v16-a55e952b8-r37`, `release.json` tree
+  `322a77273531f88250ed01bc9ef6a64a74227028`).  `patches/` is untouched by this campaign.
+* Phase 1 (G1+G2 + the tensor-split plumbing) is **implemented, built, tested, and parked**: see
+  [`PHASE1-ATTEMPT.md`](PHASE1-ATTEMPT.md) and `phase1-fit-slab-accounting-WIP.patch` (sha256
+  `71480cdfa9728d3ca31641ff42167631f4bb3d9ad86f5f2fb177d42ef4c8d094`).  **That patch targets the r26
+  block-15 tree `6c7dc021cd03cd5e367af79c29a5cba88092bab5`, so it does not apply to the current r37 tree
+  as-is**: rebase it onto a canonical fork rebuilt at `release.json.base` with `scripts/apply-all.sh`
+  before rebuilding.  G1 and G2 are validated safe; the **auto floor under `-sm tensor`** is the parked
+  corruption and must stay disabled.
+* G3 was added 2026-10-08 from the discussion #108 field report; G4 was added 2026-10-09 from issue #117.
+  Neither is implemented.
+
+**Which box does what.**
+
+* **Main development box** (gfx1201, 2x R9700): rebase and implement on the current tree, run the §10 warm
+  sweeps, and own the final patch.  This README is the handover.
+* **`fingon`** (gfx1100, single 7900 XTX, 24 GiB): gfx1100 validation and the issue #117 staging A/B.
+  Read **§11** before running anything; use `-lm dio`/`none` and prime the arena.  Access is arranged by
+  the maintainer.
+
+**First steps.**
+
+1. Read §0 (the four gaps) and **§2 (the hipBLASLt constraint)**; §2 is what forces G2 to be a hard floor.
+2. Rebuild a canonical fork at `release.json.base` (`scripts/apply-all.sh`) and rebase
+   `phase1-fit-slab-accounting-WIP.patch`; build it and re-run the §5 gates to confirm the Phase 1 status
+   on the current tree.
+3. Decide the G2 gate (b1 vs b2, §4.2c), and whether G3/G4 land with the option-A safe subset or roll into
+   Phase 2.
+4. For G4, prototype the free-VRAM cap from §4.6 (env-gated `GGML_SCHED_STAGE_MAX_FREE_PCT`) and run the
+   §5.7 staging matrix both on `fingon` and on the main box.
+5. Record decisions against the open questions in §8 as they are made; keep the WORKLOG/promotion path in
+   mind before anything moves toward `patches/`.
+
+Do **not** apply anything from this directory to the fork or the delivery without the maintainer's
+explicit go-ahead.
+
+---
+
 ## 0. TL;DR
 
-Three concrete gaps, all fixable without touching the cache engine:
+Four concrete gaps, all fixable without touching the cache engine (G4 is new in the 2026-10-09 revival):
 
 | # | gap | fix |
 |---|---|---|
 | **G1** | An **explicit `MOE_EXPERT_CACHE_MIB` is invisible to `--fit`** (`common/fit.cpp:305` only reserves when the var is *unset*). `--fit` sizes the context as if the arena were not there. | add the explicit per-device budget to the fit margin |
 | **G2** | The slab's **`GGML_CUDA_SLAB_HEADROOM_MIB` is a hard floor that `--fit` does not model**, and the `--fit` default target (1 GiB) is *smaller* than it (4096 MiB). A fully-fitted ROCm run can leave less free VRAM than hipBLASLt needs, and the next wide prefill aborts (`exit 134`). | add a slab-headroom floor to the fit margin, queried from the device (single source of truth) |
 | **G3** | The slab's **`GGML_CUDA_SLAB_RESERVE_MIB`** is a flat `max(8192, 25 %)` that is never planned, and it is subtracted from `free_b` at slab creation. With partial offload `free_b - 8192 < work + 2048`, the slab **declines** (`cache_unusable`) and the whole run silently streams from the host. Too small is the exit-134 abort, too large is this decline, so it must be planned, not guessed. | compute the reserve from the actual post-slab need (KV + draft + workspace) and hand it to the slab (Phase 2's `slab_reserve_bytes` gains a setter).  **Not** "lower the default" -- see §10.4. |
+| **G4** | The **op-offload H2D staging ring** (`h2d_stage_buffer` / `h2d_stage_budget`, common.cuh) is a fourth consumer: it lives **outside** the compute-graph reserve, auto-sizes to `slots * (largest host table + 512)`, and has **no free-VRAM cap or floor**.  On a partially offloaded model it competes with the slab reserve and the arena; when it over-commits, staging is slower than the serial path (issue #117: 32 vs 423 t/s, fixed by `GGML_SCHED_STAGE=0`). | cap the auto ring budget by free VRAM at growth time (refuse -> the existing serial fallback); keep `GGML_SCHED_STAGE_MAX_MB` as the hard override.  See §4.6 |
 
 **Ship Phase 1 = G1 + G2.** G3 was added 2026-10-08; it is independent of the auto floor and can land
-with the option-A safe subset, or roll into Phase 2 if it grows.  Phase 2 (single-source-of-truth
-getters/setters, de-duplicate the floor policy) and Phase 3 (arena-first budgeting / 2-pass auto) are
-scoped in §7 but not required for the release.
+with the option-A safe subset, or roll into Phase 2 if it grows.  G4 was added 2026-10-09; it is
+independent of the parked corruption.  Scope for G3 is §4.5 and for G4 is §4.6.  Phase 2
+(single-source-of-truth getters/setters, de-duplicate the floor policy) and Phase 3 (arena-first
+budgeting / 2-pass auto) are scoped in §7 but not required for the release.
 
 ---
 
@@ -121,6 +191,41 @@ boundary between "decline" and "fits" also corrupts.
 need (KV + draft + workspaces), so G3 = the fit computes the reserve and the slab consumes it.
 `slab_reserve_bytes` (Phase 2, §7) becomes a **settable** value rather than a flat default.  G3 is
 independent of the **auto floor** and therefore does not touch the parked corruption.
+
+### G4 — the op-offload H2D staging ring is a fourth unplanned consumer
+
+The ring is the delivery's op-offload upload path for host-resident weights (`GGML_SCHED_STAGE`, default
+on since r26, block 15 for the MoE-cache-aware form).  It is not part of any reservation:
+
+* Allocated by `ggml_backend_cuda_context::h2d_stage_buffer()` (`ggml/src/ggml-cuda/common.cuh`), which
+  `cudaMalloc`s a slot on demand and grows the ring to hold a whole host table.  It lives **outside** the
+  compute-graph reserve (the `--fit` `no_alloc` probe cannot see it), so it is a fourth claim on
+  post-weights free VRAM, alongside the slab reserve, the slab work region, and the MoE arena.
+* Auto budget `h2d_stage_budget()` = `GGML_SCHED_STAGE_SLOTS` (default 8) `* (largest host table + 512)`,
+  with **no free-VRAM cap and no floor**.  Explicit `GGML_SCHED_STAGE_MAX_MB` is the only bound.
+* The width gate `sched_stage_min_tokens_for_bytes()` (`ggml/src/ggml-backend.cpp`) is bandwidth-only:
+  `SCHED_STAGE_TABLE_REF_BYTES = 0` disables the table-size scaling, so a table far larger than the
+  144 MiB reference the base was fitted on is still staged whole once the batch reaches the calibrated
+  width (about 150 tokens on an x16 link).  The serial path (`GGML_SCHED_STAGE=0`) copies only the routed
+  experts per ubatch; on an asymmetric model the whole-table ring copy plus its D2D into the split input
+  can dominate.
+
+**Field symptom (issue #117).**  gfx1100 W7800 48 GiB, qwen4exp UD-Q4_K_XL, `--n-cpu-moe 26`: a 9k
+prompt prefills at 32 t/s with staging on, 423 t/s with `GGML_SCHED_STAGE=0`; the upstream reference (no
+ring) is 544 t/s.  The reporter measured the serial path re-uploading about 39 GiB per ubatch at PCIe
+speed, so the ring is not merely adding volume: it is not running at link speed.
+
+**Not reproduced on `fingon`** (gfx1100, 24 GiB, 30 GiB RAM) with `qwen35moe` under any tested
+configuration (§11): the ring is consistently equal to or faster than the serial path there.  That does
+not clear G4; it means the trigger is either the qwen4exp graph, the reporter's larger single-card VRAM
+(48 GiB, hence a larger auto arena and a larger auto ring), or the slab reserve on a card that carries
+more host experts.  The accounting gap is real regardless.
+
+**qwen4exp amplifiers.**  The scheduler re-registers the last layer's expert weights as an input of a
+later split for the unmasked MTP export (`ggml-backend.cpp:1831`), so the same table can be staged more
+than once per graph; and the merged MoE split carries roughly 31 inputs, so the
+`n_host_inputs <= GGML_SCHED_STAGE_SLOTS` guard in `sched_stage_issue()` can skip staging for a whole
+split when the host-weight count crosses the slot count.
 
 ---
 
@@ -226,6 +331,10 @@ reduced *workspace* floor, never a zero floor.
 | slab work-size getter + iface registration | `ggml-cuda.cu:739`, `:9953`, `:9981` |
 | existing device iface seam | `ggml/src/ggml-backend-impl.h:364-371`, wrapper `ggml-backend.cpp:300`, public decl `ggml/include/ggml-backend.h:68` |
 | drop / rearm on the prefill→decode transition | `src/llama-context.cpp:1700-1790` |
+| staging ring: slots + auto budget | `ggml/src/ggml-cuda/common.cuh` `h2d_stage_buffer` / `h2d_stage_budget` / `h2d_stage_bound` |
+| staging scheduler: gate, plan, ring, fallback | `ggml/src/ggml-backend.cpp` `sched_stage_min_tokens_for_bytes` / `sched_stage_issue` / `sched_input_gatherable` |
+| staging uploads (CUDA): cache-aware vs plain | `ggml/src/ggml-cuda/ggml-cuda.cu` `ggml_backend_cuda_stage_upload` / `_stage_gather` / `_stage_from_cache` |
+| ring accounting in `--fit` / breakdown | **absent today**: `h2d_stage_bound()` is not in `llama_get_memory_breakdown` or the fit margin (the G4 gap) |
 
 The iface already carries `slab_work_size`; adding `slab_headroom_bytes` (and, for Phase 2,
 `slab_reserve_bytes` / `slab_min_arena_bytes`) is the same pattern: append the field, add a public
@@ -234,7 +343,7 @@ warning-free-build rule).
 
 ---
 
-## 4. Phase 1 (the release): G1 + G2 (+ G3)
+## 4. Phase 1 (the release): G1 + G2 (+ G3 / G4 candidates)
 
 ### 4.1 The rule
 
@@ -321,6 +430,10 @@ Keep the `min_mib` / `min_res_pct` reads, but read them **once** and note the du
   `--fit` must see it.
 * The slab is the **lowest-priority** consumer (it yields via `moe_cache_release_arena` / `_shrink`).  The
   fit must not rely on that as the primary plan.
+* **The staging ring is a fourth consumer and today has no yield path** (§1, G4): it is bounded only by
+  `GGML_SCHED_STAGE_MAX_MB` / slot-growth failure, and it neither yields to nor coordinates with the
+  slab/arena.  Any ring budget rule must preserve the existing `nullptr` fallback so a refused growth is
+  a clean fall back to the serial path, not a partial split.
 
 ### 4.4 What Phase 1 deliberately does NOT change
 
@@ -349,6 +462,29 @@ with its own flat `GGML_CUDA_SLAB_RESERVE_MIB`.  G3 closes that gap:
 * Sequencing: G3 develops alongside G1+G2 (option A) because it never enables the auto floor under
   `-sm tensor`.  If it turns out to need a declared runtime arena budget, it merges with Phase 3 (§7).
 
+### 4.6 G4 — the staging ring must be a planned consumer (scope addition, 2026-10-09)
+
+The minimal safe fix, and the one to prototype first because it is contained to the ring:
+
+* **Free-VRAM cap at growth.**  In `h2d_stage_buffer()`, before `cudaMalloc`, query `cudaMemGetInfo` and
+  refuse the growth (return `nullptr`) when the ring would consume more than a fraction of current free
+  VRAM, or would leave less than a floor.  The scheduler already handles `nullptr` (skip staging for that
+  split, fall back to the serial/gather path), so the failure mode is the reporter's fast path.  New
+  `GGML_SCHED_STAGE_MAX_FREE_PCT` (default a conservative value; `0` restores the old unbounded
+  behaviour for A/B); `GGML_SCHED_STAGE_MAX_MB` stays the hard override.
+* **Count the ring in `--fit` and `llama_get_memory_breakdown`.**  `h2d_stage_bound(max_table)` already
+  computes the worst-case bytes; feed it into the fit margin (or at minimum the log) so the planner and
+  the runtime agree.  This is the G4 analogue of G1/G2 and should use the same getter/iface pattern if the
+  ring is ever sized rather than capped.
+* **Optional, second gate: table-size awareness.**  Restore a table-size term to
+  `sched_stage_min_tokens_for_bytes()` for very large tables (the reference scaling is disabled), so a
+  table that cannot be hidden behind the split's compute is not staged whole.  Do this only with the
+  x16/gfx1100 data, since the existing comment records why the old scaling was disabled.
+
+**Do not** ship G4 as a silent default flip: issue #117 is un-reproduced here and the reporter's fix is an
+env kill-switch today.  Prototype it env-gated, run the §5 matrix on `fingon` and the maintainer's 2x
+R9700 box, and only then consider default-on per the default-on policy.
+
 ---
 
 ## 5. Validation gates (Phase 1)
@@ -371,6 +507,13 @@ with its own flat `GGML_CUDA_SLAB_RESERVE_MIB`.  G3 closes that gap:
    fits (here ~12-16), assert coherent text (`////` = 0), MTP acceptance, and width purity.  §10.4 shows
    the boundary itself corrupts, so a reserve change that "unlocks" a declined band must be gated on
    coherence, not throughput.
+7. **Staging A/B (G4, added 2026-10-09).**  For each `-ncmoe` in the no-abort matrix, run
+   `GGML_SCHED_STAGE=1` (default), `=0`, `GGML_MOE_CACHE_INPLACE=0`, `GGML_MOE_CACHE_STAGE=0`,
+   `GGML_SCHED_STAGE_MAX_MB={512,2048}`, and `GGML_SCHED_STAGE_SLOTS={4,8,16}`.  Assert (a) staging is
+   never slower than `GGML_SCHED_STAGE=0` beyond a stated tolerance, or (b) it falls back to the serial
+   path.  Use `-b 8192` for a `-ub` sweep (the `-ub` cap gotcha in
+   `archive/work/h2d-staging-ring/README.md` §2).  On `fingon`, use `-lm dio`/`none` and prime the arena
+   (§11) so the host load and the cold arena do not confound the number.
 
 ---
 
@@ -386,14 +529,20 @@ with its own flat `GGML_CUDA_SLAB_RESERVE_MIB`.  G3 closes that gap:
   warning-free (the r26 rule) and ensure the CPU/Meta/RPC fields are `nullptr` so non-RDNA is inert.
 * **Duplicated floor policy** (fit vs preflight) remains until Phase 2 — a latent inconsistency, not a
   regression.
+* **Ring over-commit (G4).**  The ring's auto budget is unbounded by free VRAM; on a full card a growth
+  can succeed but land outside VRAM, or churn.  Any cap must preserve the current fast path on cards with
+  free VRAM (measure `fingon` and the maintainer's box) and must not turn a working staging run into a
+  serial one.
 
 ---
 
 ## 7. Phase 2 / 3 (not required for the release)
 
-**Phase 2 — single source of truth.**  Expose `slab_reserve_bytes`, `slab_min_arena_bytes` on the iface;
-move the floor policy into one helper both `fit.cpp` and `moe_cache_preflight` call; delete the duplicated
-`getenv` logic.  Makes future changes one-line.
+**Phase 2 — single source of truth.**  Expose `slab_reserve_bytes`, `slab_min_arena_bytes`, and the
+staging-ring budget on the iface; move the floor policy into one helper both `fit.cpp` and
+`moe_cache_preflight` call; delete the duplicated `getenv` logic.  Makes future changes one-line.  Once
+G4's prototype shows which form survives the field, the ring should be sized (or capped) from the same
+planner.
 
 **Phase 3 — arena-first budgeting (upstream's model).**  Let the user (or an auto policy) declare the
 per-device arena budget *before* fitting; `--fit` reserves it and the runtime sizes to exactly that budget
@@ -431,6 +580,11 @@ headroom proves insufficient in the field.
 4. **G3 reserve source:** should the fit publish an absolute per-device reserve (getter/setter), or
    should the slab derive it from a fit-declared post-slab need and keep `max(8192, 25 %)` only as the
    non-fitted fallback?  The former is smaller; the latter keeps one number.
+5. **G4 scope:** a cap-only fix (smallest, env-gated), or size the ring from `--fit` like the arena?
+   Does the ring need a floor (like the slab's `HEADROOM_MIB`) for the case where it is genuinely the
+   fast path?
+6. **G4 default:** issue #117 is un-reproduced on `fingon`, so the first cut is env-gated.  What evidence
+   (the reporter's log, or a qwen4exp repro) is required before a default flip?
 
 ---
 
@@ -444,6 +598,12 @@ headroom proves insufficient in the field.
 * `AGENTS.md` — WIP/promotion rules (this directory is **not** delivery), default-on policy, scope policy.
 * Discussion #108 comment 18801936 (briansp2020, 2026-10-07) — the partial-offload field report that G3
   (and §10) resolves; his N=18/N=14 `GGML_CUDA_SLAB_RESERVE_MIB=4608` workaround.
+* Issue #117 (`GGML_SCHED_STAGE=0` restores prefill on gfx1100/qwen4exp) and the A/B reply; the delivery's
+  op-offload staging code (`ggml-backend.cpp` `sched_stage_*`, `common.cuh` `h2d_stage_*`).
+* `archive/work/h2d-staging-ring/README.md` — the ring prototype, the x4/x16 crossover, the `-ub` cap
+  gotcha, and the measurement method the G4 gate should reuse.
+* `wip/host-memory-footprint/README.md` — the `fingon` host-memory footprint (the gfx1100 validation box);
+  §11 here is the quickstart.
 
 ---
 
@@ -520,4 +680,112 @@ The decode column is warm-up-limited (hit ~0.82); the 12/8 dip is the G3 decline
 it; (2) the boundary corruption stays quarantined as its own root-cause item and must not be "fixed"
 by a reserve default change; (3) any G3 change needs the §5 no-abort matrix plus a coherence / width-
 purity gate at the specific `-ncmoe` values where the slab transitions from decline to fits.
+
+---
+
+## 11. `fingon` quickstart (gfx1100 validation box)
+
+The main development box will ssh into `fingon` for gfx1100 validation.  This is the box-specific
+handover for that work.  `fingon` is a single-GPU, RAM-starved box; read §11.2 before running anything
+with `-ncmoe`.
+
+### 11.1 Hardware / OS facts (measured 2026-10-09)
+
+| item | value |
+|---|---|
+| GPU | AMD Radeon RX 7900 XTX, **gfx1100**, 24 GiB VRAM (`24560 MiB`), PCIe 4.0 x16, Wave32, VMM yes |
+| second ROCm device | Radeon **gfx1036** iGPU (Raphael).  **Always pin `HIP_VISIBLE_DEVICES=0`**, or a run layer-splits onto the iGPU |
+| host RAM | **~30 GiB** (`31215 MiB`) plus 131 GiB swap.  RAM, not VRAM, is the binding constraint for `-ncmoe` |
+| ROCm | `/opt/rocm-7.14-gfx1100` is the only ROCm tree on the box |
+| model storage | `/llm/models` on `/home` (`/dev/nvme0n1p2`, ext4) |
+| build | `~/bin/build-llama-rocm-714` (gfx1100, `-DGGML_HIP_RCCL=1`, `GGML_HIP_GRAPHS=ON`, ccache) -> `~/llama.cpp/build-rocm` |
+| trees | delivery `~/llama-cpp-rdna-boosts`; fork/build `~/llama.cpp` (branch `rdna-boosts`) |
+
+### 11.2 The host-memory trap (read before any `-ncmoe` run)
+
+With `-ncmoe`, the loader copies host experts into a pinned `ROCm_Host` buffer (shows up as `RssShmem`; see
+`wip/host-memory-footprint/`).  With the default `-lm mmap` the 22.6 GB file also stays in page cache, so
+`RssShmem + RssFile` reaches ~30 GB and the box thrashes (40+ s loads, hot kswapd, and an apparent "hang"
+that is really re-reading the file).
+
+* Use **`-lm dio`** (direct I/O; smallest RSS, fastest) or `-lm none` for every `-ncmoe` run.  Measured on
+  Q4_K_M `-ncmoe 20`: `mmap` 29.4 GB RSS / 41 s; `none` 9.5 GB / 26 s; `dio` 9.5 GB / 39 s.
+* `--host-experts pool` (r35) also stops the full pinning and is the only way to run a very high
+  `-ncmoe` here.  It is a valid A/B arm, but it is not the reporter's default path.
+* **Do not use `Qwen3.6-35B-A3B Q6_K` (28 GB)**: it fits neither VRAM nor RAM and thrashes.
+* Full VRAM (no `-ncmoe`) is the fast baseline: Q4_K_M loads in ~10 s (warm cache), `pp4096` **7460 t/s**,
+  `tg` **74 t/s**.
+* If a run looks stuck, check `pgrep -af llama` and `free -m`.  A killed-but-D-state `llama-bench` can
+  hold ~29 GB RSS and ~15 GB shmem until its I/O drains; `kill -9` and wait for it to leave `D`.
+
+### 11.3 Models available for gfx1100 validation
+
+| path | notes |
+|---|---|
+| `Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | 22.6 GB, 40 MoE layers x256 experts, **MTP** (`blk.40.nextn.*`).  Primary host-expert stand-in for issue #117 |
+| `Qwen3.6/35B-A3B/True-Q3_K_M/Qwen_Qwen3.6-35B-A3B-Q3_K_M.gguf` | 17.1 GB, smaller MoE |
+| `Qwen3.6/35B-A3B/Q6_K/...` | **do not use** (28 GB, RAM-thrashes) |
+| `Qwen3.6/27B/...`, `Qwen3.8/27B/Q4_K_M/...` | dense controls |
+| `Gemma4/...` | other dense/MoE controls |
+
+There is **no qwen4exp / Qwen3.8-Flash-Next** on `fingon`; the smallest published quant is about 68 GiB.
+The reporter's exact architecture cannot run here.  §11.4 is the closest available harness.
+
+### 11.4 Baseline staging A/B (from the issue #117 investigation)
+
+```
+M=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+OPTS="-m $M -ngl 99 -sm layer -fa on -t 8 -p 4096 -n 4 -b 2048 -ub 2048 -r 1 -lm dio"
+HIP_VISIBLE_DEVICES=0                             ./build-rocm/bin/llama-bench -ncmoe 20 $OPTS
+HIP_VISIBLE_DEVICES=0 GGML_SCHED_STAGE=0          ./build-rocm/bin/llama-bench -ncmoe 20 $OPTS
+HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=4096   ./build-rocm/bin/llama-bench -ncmoe 20 $OPTS
+```
+
+Measured on r37 (`pp4096` t/s, `-ub 2048`).  **Staging is never slower here**, so this box cannot show
+the reporter's collapse on `qwen35moe`:
+
+| `-ncmoe` | staging ON | staging OFF |
+|---:|---:|---:|
+| 4 | 6487 | 6013 |
+| 6 | 6070 | 5490 |
+| 8 | 5764 | 5082 |
+| 12 | 5175 | not run |
+| 16 | 3986 | not run |
+| 20 | 4127 | 2690 |
+| 26 | 4126 | 2690 |
+
+Also run and flat: `GGML_MOE_CACHE_INPLACE=0`, `GGML_MOE_CACHE_STAGE=0`, `GGML_SCHED_STAGE_SLOTS=16`,
+pinned vs `--host-experts pool`, and a `llama-server` 5246-token prompt.
+
+**Arena priming matters.**  A single `llama-bench` prefill may never size the MoE arena, so the in-place
+path is not exercised.  Use two `llama-server` requests (a small decode warmup, then the measured
+prefill), or `MOE_EXPERT_CACHE_MIB=4096`, when the test is about the cache/in-place path.  On `fingon`,
+`-ncmoe 20` Q4_K_M auto-sized the arena to **7540 MiB of 9280 MiB host experts (81.2 %)** with an
+**8.25 GiB slab**; the primed second prefill was 3043 t/s (in-place), 3007 t/s (in-place off), and
+2552 t/s (staging off).  These are the baseline numbers a G4 cap must not regress.
+
+### 11.5 Most relevant knobs
+
+| var | default | role |
+|---|---|---|
+| `GGML_SCHED_STAGE` | on | master staging switch (`0` = the reporter's fast path) |
+| `GGML_SCHED_STAGE_SLOTS` | 8 | ring depth; the auto-budget multiplier |
+| `GGML_SCHED_STAGE_MAX_MB` | unset (auto) | the only current bound on ring VRAM |
+| `GGML_MOE_CACHE_INPLACE` | on | r36 in-place host reads vs the cache-aware staging kernel |
+| `GGML_MOE_CACHE_STAGE` | on | `0` = plain whole-table upload |
+| `GGML_CUDA_SLAB` | on (host-expert) | movable-boundary slab; r37 gates it to host-expert models |
+| `GGML_CUDA_SLAB_RESERVE_MIB` / `_HEADROOM_MIB` | `max(8192, 25 %)` / `4096` | the G3 gap |
+| `MOE_EXPERT_CACHE_MIB` | auto | explicit arena budget |
+| `MOE_EXPERT_CACHE_RESERVE_MIB` | 1024 | VRAM held back from the arena |
+| `--host-experts pool` / `-lm dio` | pinned / mmap | the `fingon` loading workarounds |
+
+See `ENVIRONMENT.md` for the full table.
+
+### 11.6 Conventions
+
+* Never push from `fingon` to upstream; the delivery only goes to `stew675/llama-cpp-rdna-boosts`, and the
+  fork only to the personal `rdna-boosts` branch (AGENTS.md pushing policy).
+* Every gfx1100 result recorded in this campaign must state the `-lm` mode, the device pin, the `-ncmoe`
+  value, and whether the arena was primed.  The numbers are not comparable otherwise, and the difference
+  is large on this box.
 
