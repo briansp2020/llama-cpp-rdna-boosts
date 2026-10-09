@@ -3,6 +3,57 @@
 **Status: OPEN (opened 2026-10-10).**  Not part of the delivery; nothing here may be applied to the fork
 without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md`).
 
+## Directives (maintainer, 2026-10-10 — binding for this campaign)
+
+### D1 — Purity and the fused paths come first; never disable a fusion as the *fix*
+
+The objective is to **keep the fused paths intact and enabled** and to restore determinism — not to trade
+the fusions away.  A drift that depends on some condition must be:
+
+1. **Bisected to the exact condition first.**  The deliverable is a *condition*, stated precisely, plus the
+   minimal switch or metric that identifies it — not "the fusions are bad".  Example shape: "the fused
+   gate+up+GLU decode path drifts when a `MUL_MAT_ID` table is partially evicted *and* the batch width is
+   in the cache band".
+2. **Repaired for that condition if at all possible.**  E.g. make `ggml_cuda_cache_blocks_fusion`'s gate
+   per-table (the code's own `OPEN 2`) so a partial cache keeps serving, or make the two paths agree
+   numerically.  Repair is the preferred outcome, full stop.
+3. **If it cannot be repaired yet, scoped to exactly that condition** — stood down only **while the
+   condition is true**, and enabled everywhere else.  A per-run `GGML_CUDA_DISABLE_FUSION=1`, or a blanket
+   `GGML_CUDA_DISABLE_*` for a whole run, is **not** an acceptable fix.
+4. **Blast radius proven, not asserted.**  Ship a matrix (width × prompt × model, and the placements/configs
+   that trigger the condition) showing the fusions are ON everywhere the condition does not hold, and that
+   the disabled scope cannot be reached in the normal path.
+
+Cost reference for why this matters: a *global* fusion disable is **~9-10 % prefill / ~6 % decode** and
+lands *below* the unpatched stock 922 (`ENVIRONMENT.md` §7).  The whole point of D1 is that the fix must be
+scoped to the condition, not to the run.
+
+### D2 — A/B on the GSQ-IQ3_XXS model, which is checked and warm-cacheable
+
+Use this set as the **model of choice** for A/B iteration:
+
+```
+/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+```
+
+Rationale (verified 2026-10-10): the box has **184 GiB RAM / ~104 GiB page cache**, the GSQ set is
+**70.6 GiB (2 shards)** and stays resident between runs, while the IQ4_NL set is **96 GiB** and evicts — so
+a run loads roughly an order of magnitude faster.  This campaign is A/B-heavy, so iteration speed is the
+point; keep IQ4_NL for the periodic cross-check and for anything already recorded against it.
+
+**Verified 2026-10-10: the GSQ-IQ3_XXS model has NO embedded MTP head.**  It carries `blk.0..47` only —
+there is no `blk.48` and no `nextn.*` tensor (the separate MTP head *is* a `blk.48.*` layer file).  It must
+therefore be paired with the shared draft, exactly as the field harness already does for the IQ4_NL target:
+
+```
+--spec-draft-model /llm/models/Qwen3.8/Flash-Next/IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
+```
+
+Confirm on the first run that the draft is accepted (the head is Q8_0, the target IQ3_XXS; both are
+48-layer Flash-Next configs).  A mismatched draft fails loudly at load, so this is a one-run check rather
+than an assumption — and if it *is* rejected, say so and fall back to the IQ4_NL target rather than
+silently changing the experiment.
+
 This campaign tracks **two open findings together**, at the maintainer's request, because they are
 suspected of sharing a root cause:
 
@@ -98,6 +149,13 @@ Ordered tests, cheapest first — each is designed to *split* the hypothesis, no
 7. **Where the time goes**: `GGML_CUDA_OP_TIMING=1` on the 3-GPU verify, plus the graph-reuse counters
    (`graphs reused` was 267 on 3 GPUs vs 246/270 on 2 — a recapture loop would explain a per-step cost).
 
+**Deliverable shape (per D1).**  Success is *not* "disable X".  It is: (1) the **condition** named
+precisely; (2) the **minimal switch or metric** that identifies it at runtime; (3) either a **repair** so
+the fused path is correct under that condition, or a stand-down **scoped to that condition only**; and
+(4) a **blast-radius matrix** (verify width × prompt × model × slab placement) showing the fusions on
+everywhere the condition does not hold.  A change that turns a fusion off for a whole run is a failed
+outcome even if the output matches.
+
 **Then** the #50 fix: make `ggml_cuda_cache_blocks_fusion`'s gate **per table** (as the code's own
 `OPEN 2` marker asks: *"the wholesale-fallback invariant … must hold for EVERY consumer, not just the
 fusion guard and the take-over hook"*), so a partial cache keeps serving; or make the fused and non-fused
@@ -112,10 +170,20 @@ cd /tmp/srr
 # field.sh     = the r38 §5.5 arm (forces GGML_CUDA_ALLREDUCE=ce)
 # field3.sh    = same, without the forced AR (the 3-GPU production default)
 # field_nospec.sh = field3.sh with --spec-type none and no --spec-draft-model
-PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1,2         ./field3.sh     ~/llama.cpp/build-rocm-hybrid t3  run30kfit
-PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1,2         ./field_nospec.sh ~/llama.cpp/build-rocm-hybrid t3n run30kfit
-PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1           ./field3.sh     ~/llama.cpp/build-rocm-hybrid t2  run30kfit
+#
+# The harness hardcodes the target in `M=`.  For this campaign point it at the GSQ set and keep the
+# shared MTP draft in `D=`:
+#   M=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+#   D=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
+# (make a field_gsq.sh variant rather than editing field.sh, so the IQ4_NL cross-check stays reproducible)
+PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1,2         ./field_gsq.sh     ~/llama.cpp/build-rocm-hybrid t3  run30kfit
+PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1,2         ./field_nospec_gsq.sh ~/llama.cpp/build-rocm-hybrid t3n run30kfit
+PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1           ./field_gsq.sh     ~/llama.cpp/build-rocm-hybrid t2  run30kfit
 ```
+
+**Warm up before recording any number.**  The GSQ set should be warm from the previous run; the *first* run
+after a config change still pays the lazy PLE / host-expert disk read (measured: 563 vs 968 t/s prefill on
+the same config), so discard it.
 
 `/tmp/srr/mixed30k.txt` is `README.md + ENVIRONMENT.md + CONTAINERS.md + archive/docs/baseline-history.md`
 (99 174 B, sha256 `69624f4d207f40bdf7357e74ec978af5bfb4725a0968faf4eea4aab46c2ae241`, ~32 k tokens).  It is
@@ -150,7 +218,9 @@ GGML_CUDA_ALLREDUCE=ce GGML_CUDA_DISABLE_FUSION=1 run         # a702e03f374e bot
   comparisons must either pin `ce` or be repeated.  `ce` is 2-GPU-only, so on 3 GPUs the deterministic
   reference does not exist yet — prefer a *magnitude* metric (verify ms/step) over a text hash there.
 * Do not "fix" #50 by turning the fusions off: measured cost is **~9-10 % prefill / ~6 % decode** and the
-  fusion-off prefill (845-890) is *below* the unpatched stock 922.  Fusions stay default-on.
+  fusion-off prefill (845-890) is *below* the unpatched stock 922.  Fusions stay default-on, and per **D1**
+  any stand-down must be scoped to the exact condition, with the blast radius shown — the campaign's
+  success criterion is *purity restored with the fusions intact*, not a disabled feature.
 
 ## Pointers
 
