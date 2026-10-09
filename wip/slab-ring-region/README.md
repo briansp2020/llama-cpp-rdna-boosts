@@ -264,29 +264,51 @@ armed through `alloc_all_locked` makes the sizing exclude it (so no hot tables l
 prefill arm a no-op (`evicted 878 MiB` = work growth only, vs `6240 MiB` before).  Result: **0 NaN,
 acceptance 1.0**, prefill 921-929.  The gate lives in `ggml_backend_cuda_device_slab_ring_set`.
 
-### 9.5 The remaining decode gap and the dynamic ring
+### 9.5 The ordering is the fix: `0 -> RB -> PWB -> Arena`
 
-With the fix the hole is subtracted from the cache sizing, so the arena is 240-296 slots/table instead of
-337, and the cache never grows back after the disarm -> decode 43.9 (6 GiB hole) / 53.9 (2.5 GiB).  The
-maintainer's point stands: the hole should be **dynamically sized to what the ring actually uses** (~1 GiB
-live, from 8 slots of 124-270 MiB) instead of a static `slots*(max_table+512)` worst case (6 GiB here,
-because `max_host_weight_tensor_bytes()` is the merged 27 GiB host tensor).  A per-slot bump allocator at
-the top (each slot carves `size+512`, the hole grows downward, `ring_off` tracks it) would make the sizing
-cost ~1 GiB instead of 6 GiB, recovering most of the decode **provided** the arm still does not evict a hot
-table -- i.e. the same `moe_cache_is_sized()` gate applies and the hole stays armed through sizing.  That
-is the next implementation step.
+The top-of-arena hole was the wrong placement, and the maintainer's original ordering is the correct one:
+
+```
+low  [ 0 .. RB )  = Ring Buffer
+     [ RB .. B  ) = Prefill Work Buffers (grow upward)
+     [ B  .. mapped ) = Arena
+high
+```
+
+With the ring **below** the work and the arena **above** the work, the ring region is *never* part of the
+arena.  So arming the ring does **not** evict arena tables -- it is only a change of the work region's base
+(`0` vs `RB`) and boundary -- and the evict-then-cold-re-arm chain of §9.4 cannot happen at all.  That is
+the structural fix; the `moe_cache_is_sized()` gate is only a stopgap for the wrong placement.
+
+Mechanics:
+
+* `work_alloc` returns `base + work_off` (`work_off = RB` armed, `0` disarmed) and sets
+  `boundary = work_off + up(max(need, floor))`; the arena is `[boundary, mapped)` and
+  `arena_total = mapped - boundary`.
+* Arm/disarm == set `work_off` and re-derive the boundary.  Because the ring sits below the work, the work
+  boundary clamp is the arena floor, not the ring; nothing is evicted.
+* The base shift means the current work views must be re-created at the transition.  That is exactly what
+  the prefill -> decode `drop_buffers` + narrow re-reserve already does, so the arm/disarm belongs with the
+  work alloc/drop (the "one meta-unit"), not as an independent toggle.  The decode -> prefill direction
+  must likewise drop the narrow view before the wide reserve (or the arm is deferred until the work region
+  is idle -- `work_needs.empty()` -- and the ring falls back for that pass).
+* **Dynamic sizing:** with the prefix placement, the ring is sized by a top-down/bottom-up bump of the
+  actual slot allocations (`sum(size_i + 512)`), not `slots*(max_table+512)`; a ~1 GiB live ring on a
+  ~40 GiB arena is ~2 %, so the static-hole decode loss (53.9 vs 62.2) largely disappears **and** the ring
+  is reclaimed with the work regardless.
+* The ring's `arena_alloc_transient` serves `[0, work_off)` (the prefix), so `h2d_stage_buffer` needs no
+  change beyond using `work_off` as the base.
+
+This supersedes the top-of-arena hole; the standalone arm/disarm toggle and `moe_cache_is_sized()` gate
+are retired once the ordering lands.
 
 ### 9.6 Next steps
 
-1. **Per-slot dynamic ring** (§9.5): replace the uniform `slots*(max_table+512)` hole with a top-down bump
-   allocator whose size tracks the actual slot allocations; keep the `moe_cache_is_sized()` gate so the
-   sizing excludes the (then tiny) hole.  Target: prefill ~920 + decode ~60.
-2. If the decode still lags, **re-run the arena sizing after the ring disarms** (grow the cache into the
-   reclaimed hole) -- but only once the arm-eviction path is proven not to feed a wide consumer cold
-   tables (a multi-prefill server will re-arm and re-evict).
-3. Alternatively, make the **cold re-arm fill or cold-mark** the re-armed tables so a wide consumer never
-   reads unfilled slots; that would remove the eviction hazard generally and let the hole be reclaimed
-   freely.
-4. `fingon` (gfx1100): the §11.4 staging A/B and primed-arena server numbers must not regress once P1 is
+1. **Re-cut the ring as a work-region prefix in the `0 -> RB -> PWB -> Arena` ordering** (§9.5), with the
+   arm/disarm folded into the work alloc/drop so the base shift happens only when no work view is live.
+   Dynamic (`sum(size_i+512)`) hole.  Target: prefill ~920 + decode ~60-62 with 0 NaN.
+2. Keep a fallback: when the work region is not idle at the transition, leave the ring on `cudaMalloc`
+   (G4) for that pass rather than shifting the base under a live view.
+3. `fingon` (gfx1100): the §11.4 staging A/B and primed-arena server numbers must not regress once P1 is
    green here.
 
