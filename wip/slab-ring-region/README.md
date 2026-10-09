@@ -220,7 +220,10 @@ The maintainer's suggested before/after.  `srr_*` logs under `/tmp/srr/` (transi
   the arena during decode.  The draft's first few candidates are finite (acceptance 0.667), then NaN — a
   state corruption as the arena fills the hole, consistent with a stale expert-cache alias/remap (the
   G7 class), not a plain staging error.  A small `-c 8192 -ub 2048 -n 300` MTP run does **not** reproduce
-  it (both arm modes show one benign `nan` log line, acceptance 0.45).
+  it (both arm modes show one benign `nan` log line, acceptance 0.45).  `MOE_EXPERT_CACHE_VALIDATE=1` on
+  the field config reports the cache **consistent** (`[validate after-rearm] tables=288 resident=288
+  down=0 inconsistent=0`, both devices) at the post-prefill re-arm, so it is not a cache-state mismatch:
+  the corruption appears after the disarm as the arena fills the hole, not in the cache's own bookkeeping.
 * **Keeping the hole armed costs decode.**  The hole is removed from the arena for the whole run; a
   2.5 GiB hole costs ~13.5 % decode (62.2 → 53.8), a 6 GiB hole ~30 %.  So the prefill/decode trade is
   back, just moved from the G4 cap to the arena size — the reclaim is what makes it a pure win.
@@ -234,7 +237,12 @@ promotable until it is root-caused.  Next steps, in order:
    per-table `slot_dirty`/`remap` state across the disarm; check whether the re-arm places a table at a
    VA a live MTP-export consumer still reads.  The tiny repro is `srr_ring_in` (server, 31k prefill →
    1000 MTP decode) — `grep -ac nan` is the oracle.  The G7 condition (`node_n_consumers == 1`) is in
-   `ggml-backend.cpp:2694` and is untouched by this change.
+   `ggml-backend.cpp:2694` and is untouched by this change.  First datapoint: `MOE_EXPERT_CACHE_VALIDATE=1`
+   reports the cache consistent at the re-arm (see §9.3), so the bug is downstream of the cache bookkeeping
+   — most likely the ring's stale slot VAs overlapping a table the MTP export reads, or a scheduler copy
+   path that still references a slot after the hole is handed to the arena.  A useful next probe is to
+   keep the hole out of `arena_free` on disarm but still lower `arena_total` (tests whether the *VA
+   reuse* or only the *size accounting* matters).
 2. **Shrink the hole** once the reclaim is safe: it is sized for the worst-case slot (`slots*(270+512)`
    = 6 GiB here) while the ring's live total is ~1 GiB.  The `max_host_weight_tensor_bytes()` merged-tensor
    artifact is the reason the cap defaults to 6 GiB; a real per-table bound (or a `GGML_LOG` warning when
