@@ -46,6 +46,16 @@ across graphs), then pick a fix from the four candidates.  Full handover, reprod
 
 ### 47. Bring the MoE arena budget and slab headroom into `--fit` (G1 + G2)
 
+**RE-OPENED 2026-10-09 for retest; sequence AFTER the G7 MTP fix (#48).**  The r37 `-sm tensor` changes
+(slab armed only for host-expert models and born after the weights, the G5 split-slice guard, the
+cache/slab behaviour) may have altered the Phase 1 corruption picture, so the conclusion has to be
+re-established.  **Verified in r37:** the fit still cannot see the host-expert bytes under `-sm tensor`
+(`llama_model_moe_host_expert_bytes` reads the Meta device -> 0, the Phase 1 map-keyed plumbing is
+absent), so the auto floor is dead (`-sm layer` prints the floor line, `-sm tensor` does not); G1/G2 are
+unchanged.  Retest plan + the three separable arms (G2-only / G1-only / auto-floor) in
+`wip/fit-slab-accounting/README.md` §14.  Ship the safe subset (G2 + G1 + plumbing, auto floor off under
+`-sm tensor`) if the corruption reproduces.
+
 **Opened 2026-10-07; Phase 1 implemented then PARKED 2026-10-07.**  `--fit` is not a single VRAM planner for
 ROCm: (G1) an explicit `MOE_EXPERT_CACHE_MIB` is invisible to the fit margin, so the context is sized as
 if the arena did not exist; (G2) the slab's `GGML_CUDA_SLAB_HEADROOM_MIB` (4096, a HARD floor because

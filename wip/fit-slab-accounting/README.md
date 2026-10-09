@@ -1121,3 +1121,65 @@ the copy's `.data` was redirected).
   not cover it.
 * The campaign's arena/accounting work is orthogonal: this is a **correctness** bug in the cache's
   shared-copy takeover.  It should be fixed before any cache/slab default is promoted.
+
+---
+
+## 14. G1/G2 re-opened for retest (2026-10-09, post-r37)
+
+**Status: RE-OPENED for retest.**  The Phase 1 attempt was parked on a `-sm tensor` corruption (see
+[`PHASE1-ATTEMPT.md`](PHASE1-ATTEMPT.md)).  Since then r37 changed the `-sm tensor` expert path (the slab
+is armed only for host-expert models and is born **after** the weights, #118/#120; the G5 split-slice
+guard; the cache/slab behaviour), so the Phase 1 conclusion must be re-established before G1/G2 are
+either shipped or re-parked.  **Sequence: after the G7 MTP fix** (TODO #48) — G7 is a correctness bug and
+must land first.
+
+### 14.1 Verified current state (r37, 2026-10-09)
+
+The fit still cannot see the host-expert bytes under `-sm tensor`:
+
+* `common/fit.cpp` (`common_get_device_memory_data_impl`) fills `host_expert_bytes[i]` from
+  `llama_model_moe_host_expert_bytes(model, i)` (`common/fit.cpp:151`).
+* `llama_model_moe_host_expert_bytes` looks up `model->devices[dev_index]` (`src/llama-model.cpp:3572`),
+  which under `-sm tensor` is the **Meta** wrapper, so it returns 0 for every device.  The map-keyed
+  real-device enumerator from the Phase 1 plumbing (`llama_model_moe_host_expert_dev_count` / `_dev`) is
+  **not** in r37.
+* Therefore `host_total == 0` and the `cache_auto && host_total > 0` gate never fires under
+  `-sm tensor`: **the auto floor is dead**, and with it the whole reservation.
+
+Runtime confirmation (verbose logs): `-sm layer` prints
+`common_params_fit_impl: -ncmoe is active and MOE_EXPERT_CACHE_MIB is unset: reserving a floor of ...`;
+every `-sm tensor` run prints **no** such line.  G1 (explicit `MOE_EXPERT_CACHE_MIB` not reserved) and G2
+(the slab headroom not reserved) are unchanged from Phase 1; the `-sm tensor` path just never reaches
+the code.
+
+The **runtime** `-sm tensor` path is healthy today without the floor: 2-GPU `Qwen3.6-35B-A3B-Q8_0`
+`-ncmoe {0,8,16,20,28,36,41}` exits 0 with a graceful decode curve, and 2-GPU Flash-Next IQ3_XXS
+`-sm tensor -ncmoe 12` + MTP is coherent (acceptance 0.503).  The open question is only whether
+**enabling the floor** reintroduces the Phase 1 corruption.
+
+### 14.2 Retest plan (do after G7)
+
+1. Re-cut the Phase 1 plumbing onto the **current r37 tree** (do **not** apply
+   `phase1-fit-slab-accounting-WIP.patch`, which targets r26 `6c7dc021`): the map-keyed real-device
+   enumerator (`llama_model_moe_host_expert_dev_count` / `_dev`) plus the G2 headroom getter, and make
+   the fit apply the reservation to **both** `margins` (layer/single-GPU) and `ttarget` (tensor split).
+2. **Separate the three arms** so the corruption is attributable:
+   * **G2-only** (reserve the slab headroom, auto floor still off) — Phase 1 validated this safe; re-confirm.
+   * **G1-only** (reserve an explicit `MOE_EXPERT_CACHE_MIB`, auto floor still off) — Phase 1 validated
+     this safe; re-confirm.
+   * **auto floor on** (`MOE_EXPERT_CACHE_MIN_RES_PCT=18`, what corrupted 2/2) — the arm to re-test.
+3. Reproduce the Phase 1 scenario on the **2-GPU** box (`PHASE1-ATTEMPT.md` §2): `Qwen3.8-Flash-Next
+   UD-IQ4_XS` (or IQ3_XXS), `-sm tensor -ncmoe 48`, `--fit on` with `-ngl` unset, a ~6.4k-token prompt,
+   `--spec-type none`, greedy.  Assert coherent text (`////` = 0), no `alias_find_checked: ignoring a
+   stale MoE-cache alias`, arena not thrashing.
+4. If it still corrupts: bisect the layout (log the fit's chosen `n_gpu_layers`/tensor split for the
+   auto vs explicit arms, per `PHASE1-ATTEMPT.md` §3) and either fix the latent slab/cache bug or ship
+   the **safe subset** (G2 + G1 + plumbing, auto floor **off** under `-sm tensor`).
+5. If it is clean: run the §5 gate matrix (§5.1-§5.7) and the **G3 reserve** decision (§8 #4), then
+   decide the **G2 gate b1 vs b2** (§4.2c, §8 #1) and the `--fit-target`-vs-headroom question (§8 #3).
+
+### 14.3 What "done" looks like
+
+Either (a) the auto floor is re-enabled under `-sm tensor` with the §5 matrix green, or (b) the safe
+subset ships and the auto floor stays a documented `-sm layer`-only feature with the latent bug filed.
+Do **not** re-park without recording which arm reproduced and why.
