@@ -79,6 +79,42 @@ the fused and non-fused paths bit-identical.
 pre-existing property of the arena, not of the ring, and disabling the fusions would cost more than it
 fixes — see the measured cost and the re-enable recipe in `ENVIRONMENT.md` §7.
 
+### 51. 3-GPU MTP decode is 2.6x SLOWER than plain decode (pre-existing)
+
+**Opened 2026-10-10 (found during the `wip/slab-ring-region` 3-GPU gate).**  On 3 GPUs MTP is a *loss*,
+not a win — and it hits the production config (AGENTS.md: servers run unpinned, 3-GPU,
+`HIP_VISIBLE_DEVICES=0,1,2`, hybrid default).
+
+Field config, Qwen3.8-Flash-Next IQ4_NL + the shared Q8_0 MTP head, 32 358-token prompt, 1000 generated,
+`--spec-draft-n-max 3`, same tree:
+
+| config | prefill | decode | acceptance |
+|---|---:|---:|---:|
+| 2-GPU plain (`--spec-type none`) | 546 | 41.9 | — |
+| 2-GPU MTP | 961 | **64.8** | 0.91 |
+| 3-GPU plain | — | **52.2** | — |
+| 3-GPU MTP | 1043 | **19.5** | 0.90 |
+| 3-GPU MTP, ring off (`GGML_CUDA_SLAB_RING_MIB=0`) | 759 | 21.4 | 0.91 |
+| **3-GPU MTP, clean r38 (no WIP patch)** | 768 | **20.1** | — |
+| **3-GPU plain, clean r38** | 927 | **53.0** | — |
+
+The verify step costs ~190 ms on 3 GPUs against ~57 ms on 2.  **Reproduces on clean r38**, so it is not the
+H2D-ring WIP (and `GGML_CUDA_ALLREDUCE=ce` vs the hybrid default makes no difference; `ce` is 2-GPU-only
+anyway, ENVIRONMENT §6).  Also orthogonal to the cache residency (3-GPU logs 99.1 % residency).
+
+**Reproducer:**
+
+```bash
+cd /tmp/srr   # field.sh; field3.sh = same without the forced GGML_CUDA_ALLREDUCE=ce;
+              # field_nospec.sh = field3.sh with --spec-type none and no --spec-draft-model
+PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1,2 ./field3.sh      ~/llama.cpp/build-rocm-hybrid t3 run30kfit
+PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1,2 ./field_nospec.sh ~/llama.cpp/build-rocm-hybrid t3n run30kfit
+```
+
+Suspects to start from: the 3-way tensor-split verify gather (the 4-token verify reads experts from three
+devices), the draft/target device placement, and whether the per-op graph capture re-fires on 3 GPUs
+(`graphs reused` is 267 on 3 GPUs vs 246/270 on 2).  Details: `wip/slab-ring-region/HANDOVER.md` §4.3.1.
+
 ### 48. The MoE expert cache corrupts a wide MTP-export consumer (G7) — CORRECTNESS
 
 **ROOT-CAUSED, FIXED, GATED 2026-10-09 (WIP patch).**  The handover's alias/take-over hypothesis was

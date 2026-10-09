@@ -205,7 +205,43 @@ faster (64.8 vs 41.9).  The verify step is ~190 ms vs the 2-GPU ~57 ms.  Reprodu
 (AGENTS.md: servers run 3-GPU), so it deserves its own tracker item.  Separately, the ring-in-slab
 *improves* the 3-GPU prefill (1043 vs clean r38's 768), consistent with the 2-GPU win.
 
-### 4.4 Reserve-side decision (the maintainer's question)
+### 4.4 Reserve-side decision — **MEASURED 2026-10-10; needs the maintainer's call**
+
+Before the ring moved inside, it `cudaMalloc`'d from the outside **headroom** (`GGML_CUDA_SLAB_HEADROOM_MIB`,
+default 4096, which also protects hipBLASLt and the draft).  Now the region is inside the slab, so
+`want = free - (headroom + aux)` is unchanged and the region is carved from the arena; in decode it is
+reclaimed, so the arena returns to baseline.  The slab does not **gain** the headroom the outer ring held.
+The steady-state outside-free is `headroom` (`ggml_cuda_slab_extend_locked` adds chunks down to it), so
+that is the knob.  The ring's old live share was ~1 GiB (r38 refused a 990 MiB ring growth), making
+`4096 -> 3072` the *principled* cut rather than an arbitrary one.
+
+Field config (2-GPU, image prompt = `/tmp/srr/mixed30k.txt`, ring `2560`, `--fit on`):
+
+| `GGML_CUDA_SLAB_HEADROOM_MIB` | arena residency | cache slots/table (dev0/dev1) | prefill | decode | accept | **steps/s** | NaN | refusals | aborts |
+|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| **4096 (default)** | 61.7 % | 337 / 295 | 967.1 | 66.0 | 0.910 | **17.7** | 0 | 0 | 0 |
+| 3584 | 63.3 % | 345 / 303 | 959.4 | 67.9 | 0.812 | **19.8** | 0 | 0 | 0 |
+| 3072 | 64.9 % | 353 / — | 949.9 | 67.4 | 0.838 | **19.2** | 0 | 0 | 0 |
+| 2048 | 68.1 % | 369 / 328 | 946.7 | 70.4 | 0.899 | **19.0** | 0 | 0 | 0 |
+
+(Normalise by `steps/s = tps / mean_len` — the acceptance differs between arms, so raw tps is not
+comparable.  3584 stopped at 815 tokens by EOS; still clean.)
+
+**Result: ~+8-12 % decode step rate, saturating by ~3584, prefill flat (slightly lower, within noise), all
+arms clean.**  The gain comes entirely from arena residency (61.7 -> 64.9-68.1 %).  The `--fit` lockstep is
+honoured automatically: the fit reads the same headroom getter, so no double-count appeared (prefill and
+n_ctx are unchanged).
+
+**Recommendation (for the maintainer):** the ~1 GiB cut to **3072** is defensible because exactly that much
+headroom was reserved for the ring until now and is now idle; the more aggressive 2048 buys almost nothing
+extra (19.0 vs 19.2 steps/s) while thinning a region the AGENTS.md calls load-bearing (hipBLASLt Tensile
+objects + workspace, the MTP draft, compute-buffer growth).  If taken, make it a **promotion-time change**
+with a kill-switch (e.g. keep the 4096 default and have the slab subtract the *actual* ring region when the
+ring is placed inside), and **soak it on the 3-GPU + long-context production config first** — this
+measurement is 2-GPU / 32 k only, and the headroom is where a thin margin shows up as a failed hipBLASLt
+workspace or a truncated generation.
+
+### 4.4-old (the original question text, kept for context)
 
 Before the ring moved inside, it `cudaMalloc`'d from the outside **headroom** (`GGML_CUDA_SLAB_HEADROOM_MIB`,
 default 4096, which also protects hipBLASLt).  Now the region is inside the slab, so
