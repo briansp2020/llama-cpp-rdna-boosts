@@ -494,7 +494,11 @@ for per-block verification and `BASELINE.md` for provenance.
 
 The delivery is the **16-patch set** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork
 point recorded in [`release.json`](release.json) (**`a55e952b8`**, upstream master, 2026-10-03 re-base); the
-**current release is `v16-a55e952b8-r38`**: the `fit-slab-accounting` revival is folded into block 06
+**current release is `v16-a55e952b8-r39`**: the op-offload H2D staging ring moves **inside** the
+movable-boundary slab (block 06 + block 15), so it stops competing with the post-slab consumers for the
+slab headroom and the r38 G4 default's ~16 % field-prefill cost is gone (field §5.5 prefill 781 -> 946 t/s
+at a 2.5 GiB region / 992 at 6 GiB, vs 922 stock; decode 61.1-61.4 vs 62.2; 0 NaN).  Before it,
+**`v16-a55e952b8-r38`**: the `fit-slab-accounting` revival is folded into block 06
 (G1/G2 `--fit` arena+headroom reservation, G3 adaptive slab reserve, G4
 `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` free-VRAM cap, G5 split-slice guard, G6 nextn-offload guard,
 G7 scheduler multi-consumer fill, per-device host-expert accounting) plus the G4 FA-staging cap in

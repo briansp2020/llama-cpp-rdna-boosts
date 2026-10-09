@@ -272,19 +272,35 @@ the decode arena gains it.  Constraints:
   prefill unchanged; watch for hipBLASLt OOM (`hipblaslt.cpp:164`, Tensile `hipModuleLoad failed`) which
   means the headroom is too thin.
 
-### 4.5 P2 — the FA prefill staging arena
+### 4.5 P2 — the FA prefill staging arena — **CLOSED 2026-10-10: not beneficial, do not do it**
 
-The other raw outside allocation is the FA prefill staging arena (`fattn_stage_try_get` in `common.cuh`,
-capped by G4).  It has a known per-launch bound (`ggml_backend_cuda_fattn_stage_bound`) and the same shape
-as the ring: a transient that could live in the slab work region above the narrow floor.  Apply the same
-mechanism:
-* a second work sub-region (or share the ring region's unused tail) above the narrow floor;
-* route `fattn_stage_try_get` through a slab transient allocator;
-* the G4 FA-staging cap in block 15 then only guards what the slab cannot predict (or is retired).
-P2 is where the *rest* of the field prefill win (the FA staging refusal on `fingon`) lands.  Keep the
-`mtp-adaptive-methodology.md` rule-5 batched-bench gate and the prefill-logit gate in the loop.
+The hypothesis was that the FA prefill staging arena (`fattn_stage_try_get` in `common.cuh`, capped by G4)
+should move into the slab like the ring.  **Measured against it:**
 
-### 4.6 P3 — retire / keep G4
+* On the 2-GPU field config the arena is **never refused** — 0 `FA prefill staging` messages in every run
+  (`hr4096`, `default3072`, `back4096w`, `srr_clean2560`).  It already runs; P2 would reserve slab space for
+  something that already fits, shrinking the arena for no gain.
+* On `fingon`, where the cap *does* fire, **allowing the arena is slower**: r38 §15.8 primed-server prefill
+  is **2502.2 t/s with the 1312 MiB FA staging refused** (cap 50 %) vs **2315.1 t/s with it allowed**
+  (cap 0, no refusals).  The native K/V read beats the staging there.
+
+So the G4 cap is not a limitation to retire, it is the *adaptive* mechanism doing its job: use the staging
+when there is room, skip it when tight.  Reserving room for it in the slab (or letting it always run) would
+make the one box where it matters slower.  **No code change; P2 and P3 (retire G4) are closed with this
+evidence.**  The measured gate that WOULD show a P2 win — `mtp-adaptive-methodology.md` rule 5 plus the
+prefill-logit gate on a config that refuses the staging — now has its baseline recorded here: 2502.2 t/s is
+the number a future P2 attempt must beat, and 2315.1 is what "allow it" buys.
+
+### 4.6 P3 — retire / keep G4 — **CLOSED: keep it**
+
+With the ring inside the slab, G4 now guards only the FA prefill staging arena (the ring no longer draws on
+the free-VRAM cap).  Per §4.5 the cap is a measured *benefit* on `fingon` (2502.2 refused vs 2315.1
+allowed), so it stays at the default 50 % and `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` keeps its current
+meaning.  The remaining raw outside allocations (hipBLASLt Tensile code objects + workspace, the MTP draft
+buffer, compute-buffer growth) cannot be routed into the slab — that is the `GGML_CUDA_SLAB_HEADROOM_MIB`
+story in `ENVIRONMENT.md` §1.3, not a G4 question.
+
+### 4.6-old (the original text, kept for context)
 
 Once P2 lands, audit what still allocates outside the slab (hipBLASLt Tensile objects + workspace, the MTP
 draft buffer, compute-buffer growth).  If nothing transient is left outside, `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`

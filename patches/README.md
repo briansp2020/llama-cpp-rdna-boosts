@@ -3,7 +3,31 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r38` (2026-10-09) -- `fit-slab-accounting` folded into block 06 (plus the G4 FA-staging cap in block 15):**
+> **Current release `v16-a55e952b8-r39` (2026-10-10) -- the op-offload H2D staging ring moves INSIDE the movable-boundary slab (block 06 + block 15):**
+> promotes `wip/slab-ring-region/` (TODO #49).  The ring is no longer a raw `cudaMalloc` competing with the
+> post-slab consumers for the slab headroom: it is a **work-region sub-region** in the
+> `0 -> narrow -> RB -> wide -> arena` ordering -- a fixed narrow (decode/verify) floor at base 0, the ring
+> above it, the transient wide (prefill) view above that, and the arena always above the work -- so arming
+> it is an ordinary work-boundary move and it is reclaimed on the prefill->decode drop.  `ggml_cuda_slab_work_alloc`
+> hands out **two stable bases** and `work_needs` stores each view's boundary contribution; the context
+> pins the narrow floor with a `split_only` size-only narrow reserve plus the compute-chunk formula; new
+> optional device hooks `slab_ring_set` / `slab_narrow_floor`; block 15 serves `h2d_stage_buffer` from the
+> region first (`GGML_CUDA_SLAB_RING_MIB`, default 6144, caps it -- the honest bound is one real table, not
+> the merged host tensor) with the `cudaMalloc` + G4 fallback.  **Field §5.5: prefill 781 -> 946 t/s (2.5 GiB
+> region) / 992 (6 GiB)** vs 922 stock and 768 for the r38 G4 default, decode 61.1-61.4 vs 62.2, 0 NaN,
+> acceptance 1.0 -- this removes the ~16 % prefill the r38 G4 default cost.  Gates: dense `1c5d32ac537d`,
+> prefill-logit 0.000707 / 98.755 %, `MUL_MAT_ID` 931/931, width purity `b00fdf534227`; `fingon` no
+> regression (staging A/B 4247/3565/4259/4260, primed server 2497.0 vs 2502.2, arena 7431.2/9280 exact,
+> width purity `885ba10156f6`); 3-GPU per-device balanced (99.1 % residency) and the ring *improves* the
+> 3-GPU prefill (1043 vs clean r38's 768).  **P2 (FA staging) and P3 (retire G4) are closed as
+> not-beneficial** -- the G4 cap is measured *faster* on `fingon` (2502.2 refused vs 2315.1 allowed).  The
+> slab headroom keeps its **4096** default; 3072 was trialled (+8.5 % decode step rate on a `--fit on`
+> config) and rejected (it dies in `hipblaslt.cpp:164` under `--fit off -c 204800`), so
+> `GGML_CUDA_SLAB_HEADROOM_MIB` stays the per-user MiB knob.  Canonical block-15 tip
+> `795ea7185f4c1d131725bbc8f4d10d4ce85cbb17`, net tree `cc124b21e72fdc314936960f0e52394e02fd6c8c`; strict
+> **16/16** `git am` (`validate-set.sh` green).  Full record: `WORKLOG.md` r39, `wip/slab-ring-region/`.
+>
+> **Previous release `v16-a55e952b8-r38` (2026-10-09) -- `fit-slab-accounting` folded into block 06 (plus the G4 FA-staging cap in block 15):**
 > promotes `archive/work/fit-slab-accounting/` through the block-06 path: **G1/G2** `--fit` reserves an explicit
 > `MOE_EXPERT_CACHE_MIB`/the auto floor and the slab headroom (the G2 getter now reports the configured
 > headroom whenever `GGML_CUDA_SLAB` is not disabled -- the r37 `slab_enabled()` is `env_on &&

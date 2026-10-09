@@ -1,5 +1,80 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-10 (r39) -- PROMOTION: the H2D staging ring moves INSIDE the movable-boundary slab (block 06 + block 15)
+
+**Release `v16-a55e952b8-r39`** (base `a55e952b8`, canonical block-15 tip
+`795ea7185f4c1d131725bbc8f4d10d4ce85cbb17`, net tree
+`cc124b21e72fdc314936960f0e52394e02fd6c8c`; `n_blocks` 16; `validate-set.sh` green -- strict 16/16
+`git am`, reconstructed tree == `release.json`).  Promotes `wip/slab-ring-region/` (TODO #49).  `patches/`
+was regenerated from a canonical fork rebuilt at the base (`scripts/apply-all.sh`) -- **do not hand-edit**.
+
+**What was folded:**
+
+* **block 06 (the slab side)** -- the ring becomes a work-region sub-region in the
+  `0 -> narrow -> RB -> wide -> arena` ordering: a fixed always-resident narrow (decode/verify) floor at
+  base 0, the ring above it, the transient wide (prefill) view above that, and the arena always above the
+  work.  `work_alloc` returns two stable bases, `work_needs` stores each view's boundary contribution, and
+  the context pins the narrow floor with a `split_only` size-only narrow reserve (plus the compute-chunk
+  formula so the pinned size matches the real allocation).  New optional device hooks
+  `slab_ring_set` / `slab_narrow_floor` through the backend iface; the `moe_cache_evict_slab_range` /
+  `rearm` helpers; the `--fit` h2d-bound lockstep (`ggml_backend_cuda_h2d_stage_bound` returns 0 when the
+  slab is active so the ring is not reserved twice).
+* **block 15 (the staging side)** -- `h2d_stage_buffer` serves a slot from the slab's reserved ring region
+  first (stable VA, no `cudaFree`, no G4 cap) with the `cudaMalloc` fallback; `h2d_stage_region_bytes`
+  (capped by `GGML_CUDA_SLAB_RING_MIB`, default 6144, against the merged host-tensor estimate); the
+  `h2d_stage_slab` / `h2d_stage_max_req` fields; and the guarded `h2d_stage_free`.
+
+**Field §5.5 (gfx1201, 2x R9700, `--fit on`, 31 482-token prose, 1000 MTP tokens).**  The point of the
+campaign: r38's G4 default refused ~990 MiB of ring growth and cost **~16 % prefill**.
+
+| arm | prefill | decode | accept | NaN |
+|---|---:|---:|---:|---:|
+| r38 (G4 default 50 %, ring refused) | 767-769 | 61.8-62.0 | 1.0 | 0 |
+| **r39, `GGML_CUDA_SLAB_RING_MIB=2560`** | **945.5-946.8** | 61.2-61.4 | 1.0 | **0** |
+| **r39, default (6144)** | **992.2** | 61.1 | 1.0 | **0** |
+
+The ring is reclaimed on the prefill->decode drop (boundary back to the narrow floor), the arena returns
+to the 39993.8 MiB / 61.7 % baseline, and the expert cache re-sizes to 337/295 slots like r38.
+
+**Gates on the promoted tree (gfx1201):** dense `Qwen3.5-4B-Q8_0` `-sm tensor` golden **`1c5d32ac537d`**;
+`scripts/gate-prefill-logits.sh` **PASS** mean KLD **0.000707**, same-top-p **98.755 %**;
+`test-backend-ops -o MUL_MAT_ID` **931/931**; width purity `none == n1 == n3 == n7` = **`b00fdf534227`**
+(2-GPU Flash-Next `-ncmoe 48`), 0 `////`.
+
+**gfx1100 (`fingon`), no regression:** §11.4 staging A/B (pp4096) default **4247.1** vs r38's 4248.5,
+`GGML_SCHED_STAGE=0` **3565.3** vs 3539.1, `..._MAX_FREE_PCT=0` **4259.4** vs 4253.3, `=1` **4259.8** vs
+4254.9.  Primed `llama-server` **2497.0** t/s vs r38's 2502.2, arena **7431.2/9280 MiB (80.1 %)** -- the
+exact r38 sizing -- and the cap refuses the **1312 MiB FA staging**, not the ring.  Width purity
+**`885ba10156f6`** (343 chars), 0 `////`, MTP acceptance 0.8395.
+
+**3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`):** per-device control balanced (all three log the identical
+`slab 20.44 GiB`, `sized 512/505/505`, 99.1 % residency); the ring-in-slab *improves* the 3-GPU prefill
+(1043 vs clean r38's 768).
+
+**Findings recorded here, NOT fixed (own tracker items).**  `TODO.md` **#50**: the cache-aware fusion guard
+is **global** (`moe_cache_has_arena()`) while the slab's eviction is **per table** -- the code's own
+`OPEN 2` -- so an arena change toggles the fusions mid-run and the greedy output depends on eviction timing
+(no corruption: 0 NaN, 0 `////`, prefill logits bit-identical; PR #27301's alloc dependencies were tested
+and **excluded**).  Fusions stay **default-ON** (`ENVIRONMENT.md` §7 records the ~9-10 % prefill / ~6 %
+decode cost of a full disable and the re-enable recipe).  `TODO.md` **#51**: 3-GPU MTP decode is **2.6x
+SLOWER** than plain decode (19.5-21.4 vs 52.2 t/s), reproduced on **clean r38**, so it is orthogonal to
+this change.
+
+**P2 (FA prefill staging arena) and P3 (retire G4) are CLOSED as not-beneficial.**  The 2-GPU field config
+never refuses the FA staging, and on `fingon` allowing it is *slower* (r38 §15.8: 2502.2 t/s refused vs
+2315.1 allowed).  The G4 cap is the adaptive mechanism doing its job, so it stays at the default 50 %.
+
+**Reserve-side:** `GGML_CUDA_SLAB_HEADROOM_MIB` keeps its **4096** default.  3072 was trialled (the ring no
+longer spends ~1 GiB of it; +8.5 % decode step rate on the `--fit on` field config) and **rejected**: on
+the §2.2 wide-prefill config (`--fit off`, IQ4_XS, `-c 204800`) 4096 is clean (312 t/s, 0 corruption) while
+3072 dies in `hipblaslt.cpp:164`.  The env var (a MiB value, not a switch) stays the documented per-user
+knob.
+
+**Committed:** `patches/0000-0015` + `rdna-boosts-all.patch` regenerated; `release.json` refreshed
+(`v16-a55e952b8-r39`); `ENVIRONMENT.md` catalogues `GGML_CUDA_SLAB_RING_MIB`; `TODO.md` #49 closed, #50/#51
+opened; `wip/CAMPAIGNS.md` updated.  The fork's `rdna-boosts` branch is refreshed at release time per
+`AGENTS.md`.
+
 ## 2026-10-09 (later, r38) -- PROMOTION: fit/slab accounting + host-expert cache fixes into block 06
 
 **Release `v16-a55e952b8-r38`** (base `a55e952b8`, canonical block-15 tip

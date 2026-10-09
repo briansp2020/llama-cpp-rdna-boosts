@@ -1,4 +1,4 @@
-From cac3439e02c09904aa389be531e61eca5adb21aa Mon Sep 17 00:00:00 2001
+From 2e7dd0022c1c61c421d3a48c110dc062dfde6976 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 11/15] rdna-boosts: block 11: skip CUDA graphs for multi-token
@@ -30,7 +30,7 @@ keeps the update path available for a ROCm that carries the driver fix.
  2 files changed, 108 insertions(+), 14 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 71b4605b7..3c58079a1 100644
+index 165a0b7f1..364a20d75 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1496,6 +1496,26 @@ struct ggml_cuda_stream_context {
@@ -92,10 +92,10 @@ index 71b4605b7..3c58079a1 100644
          it->second->last_used_time = time_now;
          return it->second.get();
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f2c887229..f4976ecb8 100644
+index b9e2fb582..7596fc3dd 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3664,14 +3664,53 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -3832,14 +3832,53 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
      return use_cuda_graph;
  }
  
@@ -152,7 +152,7 @@ index f2c887229..f4976ecb8 100644
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
      if (cgraph->uid != 0 &&
-@@ -3710,9 +3749,31 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+@@ -3878,9 +3917,31 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
      return res;
  }
  
@@ -185,7 +185,7 @@ index f2c887229..f4976ecb8 100644
  #if CUDART_VERSION >= 12000
      cudaGraphExecUpdateResultInfo result_info;
      cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
-@@ -6619,7 +6680,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6787,7 +6848,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      return 0;
  }
  
@@ -194,7 +194,7 @@ index f2c887229..f4976ecb8 100644
      bool graph_evaluated_or_captured = false;
  
      // per-op timing instrumentation (env-gated, diagnostic only)
-@@ -6919,7 +6980,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -7087,7 +7148,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  }
  
  #ifdef USE_CUDA_GRAPH
@@ -203,7 +203,7 @@ index f2c887229..f4976ecb8 100644
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
      if (graph->graph == nullptr) {
-@@ -6946,7 +7007,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7114,7 +7175,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
@@ -212,7 +212,7 @@ index f2c887229..f4976ecb8 100644
  
      // op timing instruments each node with stream events, which is not possible during capture
      const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
-@@ -6960,6 +7021,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7128,6 +7189,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      if (!op_timing && graph->is_enabled()) {
          const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
          if (graph_compatible) {
@@ -230,7 +230,7 @@ index f2c887229..f4976ecb8 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -6982,6 +7054,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7150,6 +7222,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instance == nullptr;
                  }
              }
@@ -238,7 +238,7 @@ index f2c887229..f4976ecb8 100644
          }
      }
  #endif // USE_CUDA_GRAPH
-@@ -7166,7 +7239,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7334,7 +7407,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  
  #ifdef USE_CUDA_GRAPH
