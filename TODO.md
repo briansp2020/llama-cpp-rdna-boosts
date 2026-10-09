@@ -32,6 +32,8 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 
 ### 50. The cache-aware fusion guard is global while the slab's eviction is per-table (code `OPEN 2`)
 
+**Working home: `wip/moe-verify-fusions/`** (tracked together with #51 — the maintainer suspects a shared root cause on the cache-band routed-MMVQ verify path).
+
 **Opened 2026-10-10 (WIP finding, `archive/work/slab-ring-region/`).**  `ggml_cuda_cache_blocks_fusion`
 (`ggml-cuda.cu:5804`) is gated on the **global** `moe_cache_has_arena()`, but the movable-boundary slab
 evicts cache tables **per table** — `moe-expert-cache.cu` says *"the movable-boundary slab evicts the
@@ -59,6 +61,8 @@ pre-existing property of the arena, not of the ring, and disabling the fusions w
 fixes — see the measured cost and the re-enable recipe in `ENVIRONMENT.md` §7.
 
 ### 51. 3-GPU MTP decode is 2.6x SLOWER than plain decode (pre-existing)
+
+**Working home: `wip/moe-verify-fusions/`** (tracked together with #50 — the maintainer suspects a shared root cause on the cache-band routed-MMVQ verify path).
 
 **Opened 2026-10-10 (found during the `archive/work/slab-ring-region/` 3-GPU gate).**  On 3 GPUs MTP is a *loss*,
 not a win — and it hits the production config (AGENTS.md: servers run unpinned, 3-GPU,
