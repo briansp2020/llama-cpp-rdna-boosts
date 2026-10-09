@@ -21,7 +21,7 @@ decision, the P2/P3 follow-ons, and promotion.
 ## 1. Artifact and a working reproduction
 
 * **Artifact:** [`slab-ring-p1.patch`](slab-ring-p1.patch) — sha256
-  `e0d5fda7d0306866c9e4308534c6253855e416d4d7f710dff454bc9f09c51048`, **927 lines**, against a clean r38
+  `f23ca9703624d700c4ce556ad7b118041dec098b7de15aacf63a62a84ebc9799`, **912 lines**, against a clean r38
   tree (`scripts/apply-all.sh` from `release.json.base a55e952b8` yields tip `849c04161`, tree `88856410`).
 * **Prototype tree:** `~/llama.cpp`, branch `slab-ring-prototype` at `849c04161` **with the patch applied
   (uncommitted `git diff`)**.  If it is lost: stash/`git checkout -- .`, re-apply the patch, rebuild.
