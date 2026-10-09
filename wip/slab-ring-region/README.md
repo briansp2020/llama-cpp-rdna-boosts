@@ -12,8 +12,10 @@ prompt is the repo doc ×6, so **acceptance is 1.0 because the model copies it**
 name the prompt *and* its acceptance, and must be a warm repeat (the first pass pays the lazy PLE /
 host-expert disk read).  The ring-in-slab changes the greedy text vs ring-outside **only** by evicting ~3×
 more expert cache during prefill (8514+9108 vs 2442+2970 MiB); the prefill logits are bit-identical
-(KLD 0.000000) and it is a near-tie flip at the first novel token.  The underlying gap — with `-ncmoe`, a
-host-served expert is not bit-identical to a device-served one — is **pre-existing and not ring-specific**.
+(KLD 0.000000), the cache always serves the right expert (residency 8192 vs 65536 → KLD 0.000000), and
+pinning `GGML_CUDA_DISABLE_FUSION=1` makes the two placements produce **identical** text.  The real
+trigger is the **cache-aware fusion guard toggling with the eviction state** (fused ≠ non-fused at
+rounding level) — pre-existing and not ring-specific.
 
 This campaign exists because of the §5.5 finding in
 [`archive/work/fit-slab-accounting/README.md`](../../archive/work/fit-slab-accounting/README.md) §15.9: the G4 free-VRAM cap
