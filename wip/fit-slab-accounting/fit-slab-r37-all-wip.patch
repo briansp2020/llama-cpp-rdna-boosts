@@ -690,7 +690,7 @@ index 285f5d99d..523d99a42 100644
  
  // Set whether the context outputs nextn embeddings or not
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 2fe56df98..3ebfe96fd 100644
+index 2fe56df98..e7f7e663e 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -548,6 +548,7 @@ llama_model_loader::llama_model_loader(
@@ -709,7 +709,48 @@ index 2fe56df98..3ebfe96fd 100644
  
      this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
      this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
-@@ -1271,6 +1273,27 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1142,6 +1144,40 @@ void llama_model_loader::lazy_read::add_range(const std::string & name, const ll
+             __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
+ }
+ 
++// wip/fit-slab-accounting: account a host-resident MoE expert tensor's bytes per REAL device, so the
++// fit's G1/G2 reservation and the post-prefill drop/rearm cover every device.  Under `-sm tensor` the
++// layer's device is the Meta wrapper and the tensor is split across its simple devices, so distribute the
++// tensor across them; under `-sm layer`/single-GPU the host buffer already carries the layer's real device.
++// (Before this, every `-sm tensor` shard was keyed to device 0, which reserved the expert-cache arena on
++// device 0 only.)
++static void moe_host_expert_account(std::map<ggml_backend_dev_t, size_t> & acc,
++        const std::string & name, size_t bytes, ggml_backend_buffer_type_t buft,
++        const buft_list_t * buft_list_layer) {
++    if (buft == nullptr || !ggml_backend_buft_is_host(buft) || name.find("exps") == std::string::npos) {
++        return;
++    }
++    ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
++    ggml_backend_dev_t layer_dev = (buft_list_layer != nullptr && !buft_list_layer->empty())
++                                 ? buft_list_layer->front().first : buft_dev;
++    if (layer_dev != nullptr && ggml_backend_dev_is_meta(layer_dev)) {
++        const size_t n_dev = ggml_backend_meta_dev_n_devs(layer_dev);
++        if (n_dev > 0) {
++            const size_t per = bytes / n_dev;
++            size_t assigned = 0;
++            for (size_t d = 0; d < n_dev; d++) {
++                const size_t b = (d + 1 == n_dev) ? (bytes - assigned) : per;
++                ggml_backend_dev_t sdev = ggml_backend_meta_dev_simple_dev(layer_dev, d);
++                if (sdev != nullptr) {
++                    acc[sdev] += b;
++                }
++                assigned += b;
++            }
++            return;
++        }
++    }
++    acc[buft_dev] += bytes;
++}
++
+ struct ggml_tensor * llama_model_loader::create_tensor(
+         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+@@ -1271,6 +1307,27 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                  std::regex pattern(overrides->pattern);
                  if (std::regex_search(tensor_name, pattern)) {
@@ -737,6 +778,24 @@ index 2fe56df98..3ebfe96fd 100644
                      if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                          // Host-resident MoE experts: a device's host buffer type carries that device, and
                          // the scheduler places the consumers of its tensors there.  Picking the device-0
+@@ -1410,7 +1467,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             return nullptr;
+         }
+         if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
+-            moe_host_expert_bytes[ggml_backend_buft_get_device(buft)] += ggml_nbytes(&t_meta);
++            moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), buft, buft_list_layer);
+         }
+         ggml_context * ctx = ctx_for_buft(buft);
+         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+@@ -1452,7 +1509,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return nullptr;
+     }
+     if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
+-        moe_host_expert_bytes[ggml_backend_buft_get_device(buft)] += ggml_nbytes(&t_meta);
++        moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), buft, buft_list_layer);
+     }
+ 
+     ggml_context * ctx = ctx_for_buft(buft);
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
 index 4f6383012..c2d4bd040 100644
 --- a/src/llama-model-loader.h

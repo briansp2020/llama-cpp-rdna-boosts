@@ -66,13 +66,15 @@ across graphs), then pick a fix from the four candidates.  Full handover, reprod
 
 **RETESTED 2026-10-09 (post-G7, r37 + revival).**  The Phase 1 patch applies to the current tree with
 offsets; **the auto floor under `-sm tensor` no longer corrupts** (2/2 auto runs coherent, no arena
-thrash — the Phase 1 `////` + `moe_cache_rearm` is gone).  Two re-cut findings: the G2 CUDA getter was
-**inert on r37** (`ggml_cuda_slab_enabled()` is `env_on && g_slab_armed`, false at fit time), fixed in
-`wip/fit-slab-accounting/phase1-r37-g2-getter.patch`; and the host-expert map attributes all 56762 MiB to
-device 0, so G1/the auto floor reserve only on device 0 while the G2 headroom applies to both.  §5 sample
-all green (no-abort MIB sweep, dense golden `1c5d32ac537d` untouched, `GGML_CUDA_SLAB=0` zeroes G2); the
-full §5.1-§5.7 matrix and the G2 b1-vs-b2 decision remain open.  Record + arms:
-`wip/fit-slab-accounting/README.md` §14.4; combined current-state patch `fit-slab-r37-all-wip.patch`.
+thrash — the Phase 1 `////` + `moe_cache_rearm` is gone).  Three re-cut fixes: the G2 CUDA getter was
+**inert on r37** (`ggml_cuda_slab_enabled()` is `env_on && g_slab_armed`, false at fit time); and the
+host-expert map attributed all 56762 MiB to device 0, so the MIB/auto floor reserved device 0 only — the
+loader now distributes each `exps` tensor across the layer Meta device's simple devices, so G1 reserves
+**both** devices (`20108 / 20110` MiB) and the post-prefill drop/rearm loop covers device 1.  Decisions:
+the MIB is a **cap** (built arena must be 95-100 % of it), **G2 gate = b1**, and the **full §5.1-§5.7
+matrix must pass before release** (no-abort MIB sweep, dense golden `1c5d32ac537d`, `GGML_CUDA_SLAB=0`
+zeroes G2 are green).  Record + arms: `wip/fit-slab-accounting/README.md` §14.4; combined current-state
+patch `fit-slab-r37-all-wip.patch`.
 
 *(Phase 1 history, kept for context.)*
 

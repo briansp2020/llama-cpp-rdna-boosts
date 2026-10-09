@@ -28,20 +28,28 @@ Gates all PASS: `-ncmoe {44,48,99}` acceptance 0.57353 (0 NaN); dense 4B `1c5d32
 KLD 0.000707 / same-top-p 98.755 %; `MUL_MAT_ID` 931/931; 2-GPU GSQ `MOE_EXPERT_CACHE_MIB=2048` r5 repro
 acceptance 0.72727, 0 NaN.
 
-### G1/G2 -- retest (auto floor clean on r37)
+### G1/G2 -- retest (auto floor clean on r37; host-expert accounting fixed)
 
 TODO #47.  Re-cut the Phase 1 patch onto r37 (applies cleanly; its G2 CUDA getter was inert because
 r37's `ggml_cuda_slab_enabled()` is `env_on && g_slab_armed`, false at fit time -- fixed in
 `wip/fit-slab-accounting/phase1-r37-g2-getter.patch`).  The Phase 1 `-sm tensor` auto-floor corruption
 **does not reproduce**: G2-only, G1-only (`MOE_EXPERT_CACHE_MIB=8192`) and the auto floor (2/2 runs) are
 all coherent with 0 `////`, no `moe_cache_evict_slab_range`/`rearm`, stable arenas.  §5 sample green
-(no-abort MIB {unset,0,4096,8192,16384}, dense `--fit` golden, `GGML_CUDA_SLAB=0` zeroes G2).  Open: the
-host-expert map attributes all 56762 MiB to device 0 (G1 reserves device 0 only; G2 headroom both), the
-built arena sits 0.3-1.6 % under the requested budget, the full §5.1-§5.7 matrix, and the G2 b1-vs-b2
-decision.  Detail: `wip/fit-slab-accounting/README.md` §13.6/§14.4.
+(no-abort MIB {unset,0,4096,8192,16384}, dense `--fit` golden, `GGML_CUDA_SLAB=0` zeroes G2).
+
+Third re-cut: the host-expert map attributed all 56762 MiB to device 0 (the loader's `buft_for_tensor`
+fallback picks device 0's pinned host buft for every `-sm tensor` shard), so the MIB/auto floor reserved
+device 0 only and the post-prefill drop/rearm loop skipped device 1.  `src/llama-model-loader.cpp` now
+distributes each `exps` tensor across the layer Meta device's simple devices
+(`host-expert-per-device-accounting.patch`); G1 then reserves both devices (`20108/20110` MiB) and the
+auto floor both (`23191/23193`), coherent.
+
+**Decisions (maintainer):** the MIB is a **cap** -- the built arena must be 95-100 % of it (measured
+98.4/99.1/99.7 %, so the shortfall is slot rounding); **G2 gate = b1**; the **full §5.1-§5.7 matrix must
+pass before release**.  Detail: `wip/fit-slab-accounting/README.md` §13.6/§14.4.
 
 **Decision:** G7 is a delivery correctness fix, blocked on the maintainer's go-ahead before it reaches
-`patches/` (promote through block 06); the G1/G2 re-cut stays WIP pending the §5 matrix.
+`patches/` (promote through block 06); the G1/G2 re-cut + loader fix stay WIP pending the §5 matrix.
 
 ## 2026-10-09 (r37) -- issues #118/#120: the movable-boundary slab and the compute chunk are armed only for host-expert models
 

@@ -517,9 +517,10 @@ R9700 box, and only then consider default-on per the default-on policy.
    `-sm {layer, tensor}` × MTP {on, off} × `-c {auto, 32768, 204800}`.  Assert exit 0 and no
    `hipModuleLoad failed` / `hipblaslt.cpp:164` in the log.  Include the wide-prefill case
    (`-ub 4096/8192` with a 16k+ prompt) that reproduces the G2 abort today.
-2. **Reservation is honoured.** With an explicit `MOE_EXPERT_CACHE_MIB`, the built arena
-   (`slot print_timing` / `moe_cache_report`) is ≥ the requested value, and the fitted `n_ctx` is
-   monotonically non-increasing as the requested budget grows.
+2. **Reservation is honoured (budget = cap).** With an explicit `MOE_EXPERT_CACHE_MIB`, the built arena
+   (`slot print_timing` / `moe_cache_report`) must land at **95-100 %** of the requested budget (anything
+   below 95 % is almost certainly a bug), and the fitted `n_ctx` is monotonically non-increasing as the
+   requested budget grows.
 3. **Dense / non-MoE unaffected** (if b2): a dense ROCm `--fit` model still fits and runs; and on a
    non-slab backend (`GGML_CUDA_SLAB=0`, or a non-ROCm arm) the margin is unchanged.
 4. **Standing gates** (unchanged): byte-identity to the `-ncmoe 0` oracle, width purity
@@ -596,7 +597,9 @@ headroom proves insufficient in the field.
 
 ## 8. Open questions for the maintainer
 
-1. **G2 gate:** b1 (host experts only) or b2 (every slab device)?  Recommend b2 after an A/B.
+1. **G2 gate:** b1 (host experts only) or b2 (every slab device)?  ~~Recommend b2 after an A/B.~~
+   **RESOLVED 2026-10-09: b1** (the headroom is reserved only when the model has host experts; b2 would
+   change dense `--fit` margins for no crash class we have).
 2. **Auto semantics:** should `MIN_RES_PCT` become a *target* (reserve and size to it) rather than just a
    floor?  That would make the arena predictable at the cost of context size.
 3. **`--fit-target` default (1 GiB) vs slab headroom (4 GiB):** this looks like a bug independent of the
@@ -1261,23 +1264,30 @@ and coherent; dense `Qwen3.5-4B-Q8_0` `--fit on` gives `1c5d32ac537d` with no re
 `free - 1024 - MIB`).  Full §5.1-§5.7 (the §2.2 wide-prefill abort and the §5.7 staging matrix in
 particular) were **not** run this session.
 
-**Findings / open questions for the maintainer:**
+**Re-cut 2 — host-expert bytes were device-0-only (FIXED 2026-10-09).**  The map was populated with
+`ggml_backend_buft_get_device(buft)`, which under `-sm tensor` is device 0 for every shard (the loader's
+`buft_for_tensor` fallback picks the first device whose pinned host buffer supports the tensor), so
+`host_experts` had one 56762.5 MiB entry and the explicit MIB / auto floor reserved device 0 only while
+device 1 got the headroom only.  The loader now distributes each `exps` tensor across the layer Meta
+device's simple devices (`moe_host_expert_account`, `llama-model-loader.cpp`), so the map is
+per-real-device again.  Verified on the two-GPU flash config: G1 (`MOE_EXPERT_CACHE_MIB=8192`) targets
+`20108 / 20110` MiB and the auto floor `23191 / 23193` MiB (**both** devices), coherent, 0 `////`;
+`-sm layer`/single-GPU are unchanged (the layer device is real there).  This also fixes the post-prefill
+drop/rearm device iteration, which silently skipped device 1 under `-sm tensor`.  Patch:
+[`host-expert-per-device-accounting.patch`](host-expert-per-device-accounting.patch).
 
-1. **G1 is device-0-only in this config.**  `host_experts` has one entry (all **56762.5 MiB** attributed
-   to device 0), so the explicit `MOE_EXPERT_CACHE_MIB` and the auto floor are reserved only on device 0;
-   device 1 gets the G2 headroom only.  The map is populated from `ggml_backend_buft_get_device(buft)`
-   (`llama-model-loader.cpp:1436`), which returns one device here.  Whether the loader should key the
-   host bytes per tensor-split device (or the fit should spread the budget) is unresolved.  The G2
-   headroom (the crash fix) **is** applied to both devices.
-2. **The built arena is slightly below the requested budget** (4096 -> 4031.8 MiB, 8192 -> 8118.7,
-   16384 -> 16331.9).  §5.2's "arena >= requested" as literally written would fail by 0.3-1.6 %; the
-   shortfall looks like per-table slot rounding, not a missing reservation.  Decide whether the gate is
-   `>= requested - epsilon` or the budget is a cap.
-3. **G2 gate b1 vs b2.**  The re-cut reserves the headroom only when the model has host experts (the
-   fit's `host_total > 0` gate) — **b1**.  b2 (every slab device) would change dense `--fit` margins for
-   no crash class we have; recommend **b1** unless a dense thin-headroom repro is found.
+**Decisions taken by the maintainer (2026-10-09):**
 
-**Artifacts:** the Phase 1 patch (r26 base) plus the combined current-state patch
-[`fit-slab-r37-all-wip.patch`](fit-slab-r37-all-wip.patch) (revival + G7 + Phase 1 re-cut; sha256
-`4130952fc2b42db0444bca45ff8f2543813e2fecc8da0d8dfd415b39ccd347c0`); G2 getter delta in
-[`phase1-r37-g2-getter.patch`](phase1-r37-g2-getter.patch).
+* **Item 3 — the budget is a CAP.**  The built arena must land at **95-100 %** of the requested budget;
+  anything below 95 % is almost certainly a bug.  Measured 98.4 / 99.1 / 99.7 % for 4096 / 8192 / 16384,
+  so the observed shortfall is per-table slot rounding, not a missing reservation.
+* **Item 4 — G2 gate is b1** (the headroom is reserved only for host-expert models).  The re-cut already
+  does this; no change.
+* **Item 5 — the full §5.1-§5.7 matrix MUST pass before any release** of the G1/G2 work (and the G7 fix
+  rides the same release train).
+
+**Artifacts:** the Phase 1 patch (r26 base) + G2 getter delta
+[`phase1-r37-g2-getter.patch`](phase1-r37-g2-getter.patch) + loader fix
+[`host-expert-per-device-accounting.patch`](host-expert-per-device-accounting.patch); combined
+current-state patch [`fit-slab-r37-all-wip.patch`](fit-slab-r37-all-wip.patch) (revival + G7 + Phase 1
+re-cut + loader fix; sha256 `14c2ccbd5215fff295e980962282b0bd7cac657a51547e8e0ca2703d27b28604`).
