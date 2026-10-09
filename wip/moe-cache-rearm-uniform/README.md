@@ -1,7 +1,8 @@
 # moe-cache-rearm-uniform: re-arm a stood-down layer's other tables with it, so the layer stays slot-uniform
 
-One format-patch on top of `v16-a55e952b8-r37`, applied with `git am`.  9 lines in
-`ggml/src/ggml-cuda/moe-expert-cache.cu`.
+Three format-patches on top of `v16-a55e952b8-r37`, applied with `git am`, all in
+`ggml/src/ggml-cuda/moe-expert-cache.cu` (34 lines).  0001 is the original re-arm fix; 0002 and 0003 (added
+later) are the cause of the remaining tight-headroom output difference described below.  Each stands alone.
 
 ## What
 
@@ -37,14 +38,42 @@ after the 17.8k-token warm-up prompt; reference sha `45e68f1bdfeb` (also the all
 
 At 2048 both builds abort with OOM in the warm-up prefill.
 
-## Not fixed by this patch
+## 0002 and 0003: the rest of the tight-headroom difference
 
-At 3072 the output stays wrong with the patch: stable within a run, different between runs (`992a1e108d05`,
-`8237a68abb22`, `5480747a87e3`).  `MOE_EXPERT_CACHE_VALIDATE=2` after the re-arm: 288 tables resident, 0
-inconsistent.  The only log difference from 4096 is a 600 MiB `cudaMalloc` failure on both devices: the meta
-backend's all-reduce tmp buffer (`ggml_backend_meta_graph_compute`, allocation not checked).  It is harmless here:
-with that allocation forced to fail at 4096 the output stays `45e68f1bdfeb` and the null buffer is never used (the
-butterfly fallback does not run).  So the cause is elsewhere in the tight-headroom eviction / re-arm; not found yet.
+With 0001 alone, 3072 MiB headroom still gave a wrong greedy output after the warm-up (stable within a run,
+different per run), and - found later - the second request after start differed too (`44c0b3703427`, stock as
+well).  A debug check (not included) that compares every resident slot with the host master, the device
+`expert -> slot` map against the host slot map in both directions, and gate vs up slot order found two causes:
+
+- **0002, pipelined used-list readback across a re-allocation.**  `alloc_table_locked` re-allocates
+  `used_dev` / `used_host` / `used_host2`, but `used_pending` / `used_toggle` carried over, so the first
+  `moe_cache_promote_host` after a re-arm read a buffer no readback had written (zeros) and admitted expert 0 into
+  slot 0 - in some of a layer's tables but not the others.  Every later admission landed one slot further there:
+  e.g. layer 45 on device 1, gate and up holding the same 502 experts with ~250 in different slots (gate slot 0 =
+  expert 0, up slot 0 = expert 303).  The fused gate+up redirect reads up's remap for both lanes, so the gate lane
+  read the wrong expert for those.  Fix: start the readback pipeline over on a (re)allocation, `used_dev` = -1.
+- **0003, the prompt-routing seed did not refresh `slot_dev`.**  `apply_prefill_seed_rank_locked` evicts and places
+  residents in a live table but neither uploads the device map nor marks it dirty, so an evicted expert kept pointing
+  at its old slot, now holding another expert (layer 42: expert 501 -> slot 177, which held 499, in gate, up and down
+  on both devices) until some later admission refreshed the map.  Fix: upload it at the end of the seed, as the
+  promotion does.
+
+The 600 MiB `cudaMalloc` failure at 3072 (the meta backend's tmp buffer for the butterfly all-reduce, allocation
+not checked) is not part of this output difference, but it is not harmless either: if the internal all-reduce
+times out ("peer arrival not observed") after it, the butterfly fallback hits `GGML_ASSERT(buffer)`.  We only saw
+that when the debug check stalled one GPU for seconds.  Not addressed here.
+
+## Validation (r37 + 0001-0003, no debug code; 2 greedy requests before and 2 after the warm-up, one run each)
+
+| config (pinned host experts) | before | after the warm-up | other |
+|---|---|---|---|
+| `-sm tensor -ub 6144`, headroom 3072 | `45e68f1bdfeb` x2 | `45e68f1bdfeb` x2 | stock: `44c0b3703427` 2nd request, then drifting |
+| `-sm tensor -ub 6144`, headroom 4096 | `45e68f1bdfeb` x2 | `45e68f1bdfeb` x2 | |
+| `-sm tensor -ub 6144`, default headroom | `45e68f1bdfeb` x2 | `45e68f1bdfeb` x2 | |
+| `-sm tensor -ub 2048`, default | `45e68f1bdfeb` x2 | `45e68f1bdfeb` x2 | 900-building 36k recall OK; prefill 1.8k / 37k / 155k 1988 / 2448-2499 / 2008 t/s |
+| `-sm layer -ts 59,41 -ub 2048`, default | `9f826c79de59` x2 | `9f826c79de59` x2 | 900-building recall OK; prefill 1737 / 1962-1989 / 1648 t/s |
+
+0 GPU faults in every run.
 
 In the earlier `-ts 59,41` / `-ts 50,50` / default `-ub 2048` runs on stock r37 the eviction took gate and up of a
 layer together (re-armed to one size) and the output stayed correct; `ffn_down_exps` of that layer stayed at 509
