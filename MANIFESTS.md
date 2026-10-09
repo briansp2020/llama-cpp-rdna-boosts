@@ -5,10 +5,14 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r35`** (canonical block-15 tip `645fd4989`, net tree
-`b2ba2bb32c76e857`): **the bounded pinned host-expert pool (`--host-experts pool`) is folded into block
-06** (plus the `mul_mat_vec_q_moe` row-tail clamp in block 13).  The pool is an **option** (the default
-stays `pinned`); it sizes to `MOE_HOST_POOL_MIB`, auto = 25 % of the MoE host expert bytes.  Before it,
+**`a55e952b8`**, released as **`v16-a55e952b8-r36`** (canonical block-15 tip `8e28631f6`, net tree
+`d55aebfe0d7af530aa485ffd7ebf5e1dce331b08`): three contributor prefill PRs are folded into the existing
+blocks (shared BF16 src1 reuse #119 and in-place host-expert prefill reads #121 into block 15; the pool
+free-VRAM floor #122-0001 into block 06 and the 6 GiB `-sm layer` slab headroom #122-0002 into block 09).
+Before it, **`v16-a55e952b8-r35`** (tip `645fd4989`, tree `b2ba2bb32c76e857`) folded the bounded pinned
+host-expert pool into block 06 (plus the `mul_mat_vec_q_moe` row-tail clamp in block 13).  The pool is an
+**option** (the default stays `pinned`); it sizes to `MOE_HOST_POOL_MIB`, auto = 25 % of the MoE host
+expert bytes.  Before that,
 **`v16-a55e952b8-r34`** (tip `40ce2ab86`, tree `a253691093acbd96`) deferred block 12's NCCL init to the
 first large tensor: the hybrid
 all-reduce already served every decode-sized reduce through the internal pipeline, but an eager

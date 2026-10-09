@@ -3,7 +3,18 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r35` (2026-10-08) -- the bounded pinned host-expert pool is folded into block 06:**
+> **Current release `v16-a55e952b8-r36` (2026-10-08) -- three contributor prefill PRs folded into the existing blocks:**
+> PR #119 (shared BF16 src1 reuse for the qwen4exp hc mixer GEMMs) and PR #121 (in-place host-expert
+> prefill reads, arena when resident / pinned host master otherwise, plus a zero-padded tail guard) are in
+> **block 15**; PR #122 patch 0001 (a 512 MiB free-VRAM floor on the workspace pool's first attempt,
+> `GGML_CUDA_POOL_MIN_FREE_MIB`) is in **block 06** and patch 0002 (at least 6 GiB of slab headroom under
+> `-sm layer` when every cache table is unsplit and spans more than one device) is in **block 09**.
+> Switches: `GGML_CUDA_BF16_SRC1_CACHE`, `GGML_MOE_CACHE_INPLACE`, `GGML_MOE_CACHE_STAGE` (default on);
+> `GGML_CUDA_POOL_MIN_FREE_MIB`.  Canonical block-15 tip `8e28631f6`, net tree
+> `d55aebfe0d7af530aa485ffd7ebf5e1dce331b08`; strict **16/16** `git am` (`validate-set.sh` green).  Full
+> record: `WORKLOG.md` r36.
+>
+> **Previous release `v16-a55e952b8-r35` (2026-10-08) -- the bounded pinned host-expert pool is folded into block 06:**
 > `--host-experts pool` adds an **optional** pinned host pool over the page cache for systems that cannot
 > hold the weights resident; the default stays `pinned` (no pool).  The pool is sized to
 > `MOE_HOST_POOL_MIB`, default `MOE_HOST_POOL_FRAC` (25) % of the MoE host expert bytes

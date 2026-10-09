@@ -1,5 +1,68 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-08 (r36) -- prefill work from three contributor PRs (#119, #121, #122) folded into blocks 06, 09, 15
+
+**Release** `v16-a55e952b8-r36`, same fork point `a55e952b8`; canonical block-15 tip **`8e28631f6`**,
+net tree **`d55aebfe0d7af530aa485ffd7ebf5e1dce331b08`** (strict **16/16** `git am`, `validate-set.sh`
+green).  Block count stays **16**: PR #119 and PR #121 are folded into **block 15** (the MoE-cache campaign
+block, which defines `ggml_backend_cuda_stage_gather`), PR #122 patch 0001 into **block 06** and patch 0002
+into **block 09**.  The folded tree is byte-identical to r35 + the four patches (verified with `git write-tree`
+against a reference worktree).
+
+### Why
+
+Three `wip/` PRs from @briansp2020, measured on the 3x R9700 (PCIe5 x4) and 2-GPU configs against the
+GSQ-RCO IQ3_XXS build:
+
+* **PR #119 (`wip/bf16-src1-reuse`)** -- the qwen4exp hc mixer feeds one F32 `xn` to two BF16 cuBLAS GEMMs
+  (`hc_down`, `hc_inject`); convert it to BF16 once per graph instead of once per GEMM.  Bit identical;
+  prefill only (multi-token, `>= 64` columns).  GSQ model (hc_inject BF16), 3 GPUs, all experts in VRAM,
+  pp2048: `-sm tensor` 1786.6 -> 1864.7 t/s (+4.4 %), `-sm layer` 1561.4 -> 1628.3 (+4.3 %).  The unsloth
+  UD-IQ3_XXS build gains only +1.1 to +1.6 % because its `hc_inject` is F32, so only the
+  `hc_combine_norm` producer half of the patch fires.
+* **PR #121 (`wip/moe-cache-inplace`)** -- with `-ncmoe` host experts the MoE cache staged every routed
+  expert table whole for each prefill ubatch; read the compact table in place instead (arena when resident,
+  pinned host master otherwise), with a zero-padded tail guard for MMQ's one-tile over-read.  Server
+  prefill, 2 GPUs, `--n-cpu-moe 48`: 2.9k 431.8 -> 1214.1 t/s and 61k 1005.1 -> 2471.6 (`-sm tensor`);
+  2.9k 491.4 -> 1460.8 and 61k 682.3 -> 1998.3 (`-sm layer -ts 59,41`).  Greedy output identical to r35 at
+  2.9k and 61k (3 reps each).  The in-place path needs the cache to be sized by a decode-band pass first;
+  a decode-free prefill never primes it (primer: it also needs the arena to be sized).
+* **PR #122 (`wip/moe-cache-layer-split-fixes`)** -- 0001 keeps a free-VRAM floor (512 MiB) on the workspace
+  pool's first attempt while the cache holds host experts (`GGML_CUDA_POOL_MIN_FREE_MIB`), so the flush +
+  retry runs; 0002 asks the slab for at least 6 GiB of headroom under `-sm layer` when every cache table is
+  unsplit and spans more than one device.  Standalone (symbol-verified: no PR #119/#121 code): r35 baseline
+  OOMs at 255k under both `-sm layer -ts 59,41` and `-sm tensor`; r36 survives both (682 / 1010 t/s
+  prefill).  61k `-sm layer -ts 59,41` greedy decode is bit-identical to r35 (`251702d5ebf6`).  The
+  specific "broken greedy decode after a 61k prefill" symptom did not reproduce on r35 (both reps coherent),
+  likely because r35 already folded the slab peer-access fix, so 0001 is a safety floor rather than a fix for
+  a live r35 symptom on this box; 0002 is the active 255k fix.
+
+### What landed
+
+* **block 15**: PR #119 and PR #121.  New switches `GGML_CUDA_BF16_SRC1_CACHE`, `GGML_MOE_CACHE_INPLACE`,
+  `GGML_MOE_CACHE_STAGE` (all default on, set to `0` to restore r35).
+* **block 06**: PR #122 patch 0001.  New `moe_cache_floor_active()` and `GGML_CUDA_POOL_MIN_FREE_MIB`.
+* **block 09**: PR #122 patch 0002.  New `ggml_cuda_slab_headroom_at_least_mib()` (6 GiB under `-sm layer`).
+
+### Validation
+
+`validate-set.sh` green (fresh-tarball strict 16/16 apply, applied tree == `release.json`).
+
+* dense `Qwen3.5-4B-Q8_0` `-sm tensor` same-seed `1c5d32ac537d` (r35-identical);
+* `test-backend-ops -o MUL_MAT_ID` OK (4/4 backends);
+* prefill-logit KLD **0.000707** mean / **98.755 %** same-top-p PASS (identical to the r35 recorded base);
+* GSQ IQ3_XXS + shared Q8_0 MTP, 2 GPUs, `--n-cpu-moe 48`, `-n 2000` `--spec-draft-n-max 3` greedy:
+  generated text sha `2b2341670f23` (6320 chars), identical to r35.
+* Server coherence through the new in-place prefill path: 2.9k and 61k greedy shas identical to r35
+  (3 reps each); PR #119 same-seed greedy identical on the dense hc path.
+
+### Note on PR #121 and the host pool
+
+The in-place path reads the full pinned host master, which r35 always keeps (Phase 3 master-removal was
+withdrawn), so this is correct.  It does mean `--host-experts pool` is bypassed for in-place tables: the
+pool's disk-cache benefit does not apply to a prefill served in place.  Worth a follow-up if the pool ever
+becomes the default.
+
 ## 2026-10-08 (r35) -- the bounded pinned host-expert pool (`--host-experts pool`); block 06
 
 **Release** `v16-a55e952b8-r35`, same fork point `a55e952b8`; canonical block-15 tip

@@ -1,12 +1,15 @@
-From 71534b346151f840ce963b5f60a8d9434631f26d Mon Sep 17 00:00:00 2001
+From d056b76704eddb75d9948f96684d84794bcf4a53 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 09/15] rdna-boosts: block 09: meta-buffer compute-container
  headroom for
 
 ---
- ggml/src/ggml-backend-meta.cpp | 7 ++++++-
- 1 file changed, 6 insertions(+), 1 deletion(-)
+ ggml/src/ggml-backend-meta.cpp         |  7 ++++++-
+ ggml/src/ggml-cuda/ggml-cuda-vmm.h     |  2 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 11 +++++++++--
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 16 ++++++++++++++++
+ 4 files changed, 33 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
 index e90b1a2e8..67dde9ce8 100644
@@ -26,6 +29,73 @@ index e90b1a2e8..67dde9ce8 100644
      const ggml_init_params params_static = {
          /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
          /*.mem_buffer =*/ nullptr,
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index 7c22446de..948165269 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -42,6 +42,8 @@ size_t ggml_cuda_slab_arena_total (int device);
+ // correction once the weights / KV / draft are resident.  Safe to call repeatedly (a no-op when there is
+ // nothing to gain); moves no address, so every work view and arena table keeps its base.
+ void   ggml_cuda_slab_extend_all();
++// raise the free VRAM the slab extension leaves (never lowers an explicit GGML_CUDA_SLAB_HEADROOM_MIB)
++void   ggml_cuda_slab_headroom_at_least_mib(size_t mib);
+ // The arena's allocation unit (fine: the slab is one mapping, so this is bookkeeping only).
+ size_t ggml_cuda_slab_arena_unit  (int device);
+ // Base of the work region for a `need`-byte compute buffer, moving the boundary up (evicting the arena
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 88c97a65d..66333c670 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -678,13 +678,20 @@ static size_t ggml_cuda_slab_min_arena_bytes() {
+ // Session 5), which would allow this default to go back down.
+ #define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 4096
+ 
++static size_t g_slab_headroom_min_mib = 0;
++void ggml_cuda_slab_headroom_at_least_mib(size_t mib) {
++    g_slab_headroom_min_mib = mib;
++}
+ static size_t ggml_cuda_slab_headroom_bytes() {
+     static size_t mib = SIZE_MAX;
++    static bool   env_set = false;
+     if (mib == SIZE_MAX) {
+         const char * env = getenv("GGML_CUDA_SLAB_HEADROOM_MIB");
+-        mib = env != NULL ? (size_t) atoll(env) : GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT;
++        env_set = env != NULL;
++        mib = env_set ? (size_t) atoll(env) : GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT;
+     }
+-    return mib * 1024 * 1024;
++    const size_t eff = (!env_set && g_slab_headroom_min_mib > mib) ? g_slab_headroom_min_mib : mib;
++    return eff * 1024 * 1024;
+ }
+ 
+ // Public MiB form, for the cache's own fallback message.
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 3e0cdc090..be4af6d1a 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -2330,6 +2330,22 @@ void alloc_all_locked() {
+     // the first moment the weights / KV / draft are all resident, so measure what they did NOT need and
+     // hand it to the arena before sizing.  Without it that VRAM sits idle (~1.9 GiB/card measured) even
+     // though the cache is capped by its region.
++    // -sm layer (every table unsplit, tables on more than one device): each device runs its layers' attention over
++    // the whole context, so leave 6 GiB, not the default, free after the extension (255k needle: the later-layer
++    // device ran out of VRAM with 4 GiB of headroom).
++    {
++        bool all_unsplit = !g_tables.empty();
++        int  dev_mask = 0;
++        for (const table_t & t : g_tables) {
++            all_unsplit = all_unsplit && t.split_axis < 0;
++            if (t.device >= 0 && t.device < 31) {
++                dev_mask |= 1 << t.device;
++            }
++        }
++        if (all_unsplit && (dev_mask & (dev_mask - 1)) != 0) {
++            ggml_cuda_slab_headroom_at_least_mib(6144);
++        }
++    }
+     ggml_cuda_slab_extend_all();
+     // Fail-soft / --fit (§3.1 #5, issue #33): the arena is the LOWEST-priority VRAM consumer.  Size it
+     // from what is actually free NOW - after --fit, the compute-graph reserve and the KV cache have all
 -- 
 2.55.0
 

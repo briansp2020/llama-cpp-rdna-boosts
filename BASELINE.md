@@ -2,10 +2,14 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r35`** (canonical block-15
-tip `645fd4989e542d93`, net tree `b2ba2bb32c76e857`), which folds the bounded pinned host-expert pool
-(`--host-experts pool`, an option; the default stays `pinned`) into block 06 and the `mul_mat_vec_q_moe`
-row-tail clamp into block 13.  Before it, **`v16-a55e952b8-r34`** deferred block 12's `ncclCommInitAll`
+point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r36`** (canonical block-15
+tip `8e28631f6`, net tree `d55aebfe0d7af530aa485ffd7ebf5e1dce331b08`), which folds three contributor
+prefill PRs into the existing blocks: the shared BF16 src1 reuse (#119) and the in-place host-expert
+prefill reads (#121) into block 15, the pool free-VRAM floor (#122-0001) into block 06, and the 6 GiB
+`-sm layer` slab headroom (#122-0002) into block 09.  Before it, **`v16-a55e952b8-r35`** (tip
+`645fd4989e542d93`, tree `b2ba2bb32c76e857`) folded the bounded pinned host-expert pool (`--host-experts
+pool`, an option; the default stays `pinned`) into block 06 and the `mul_mat_vec_q_moe`
+row-tail clamp into block 13.  Before that, **`v16-a55e952b8-r34`** deferred block 12's `ncclCommInitAll`
 to the first large tensor, and **`v16-a55e952b8-r33`** removed the pageable host-expert master (issue
 #116).  Before that, the r32 state fixed the two bugs found during the PR #115 review: **issue #48** (the post-prefill re-reserve uses the current ubatch's sequence count, so a
 multi-sequence decode no longer builds a zero-token attention graph; `llama-batched-bench -npl 4`

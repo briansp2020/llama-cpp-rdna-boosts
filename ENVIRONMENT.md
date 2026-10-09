@@ -124,7 +124,8 @@ tensor address).  It replaces the per-allocation VMM pool (`GGML_CUDA_COMPUTE_VM
 | `GGML_CUDA_SLAB_CHUNK_MIB` | `64` | tuning | the boundary-move granularity (must be a power of two).  Arena *allocations* use the finer VMM granularity (2 MiB), so this does not waste arena. |
 | `GGML_CUDA_SLAB_RESERVE_MIB` | `max(8192, 25 % of the device)` | tuning | left OUTSIDE the slab for the weights / KV / draft / workspaces.  This is a **hard** constraint: ROCm will not unmap a sub-range of the slab's single mapping, so a value too small ENDS THE RUN (measured: 4096 -> a failed hipBLASLt workspace, exit 134). |
 | `GGML_CUDA_SLAB_MIN_ARENA_MIB` | `2048` | tuning | hard cache floor: the slab is created only if it fits `estimated work buffer + this`.  Otherwise it declines, logs an error and the cache STREAMS from the host (`MOE_EXPERT_CACHE_MIB=0` semantics). |
-| `GGML_CUDA_SLAB_HEADROOM_MIB` | `4096` | tuning | how much stays free outside the slab when `slab_extend` reclaims the reserve the model did not need.  **Not slack**: it must cover every allocation made after that point, including ones we cannot redirect (see below).  `0` disables the reclaim. |
+| `GGML_CUDA_SLAB_HEADROOM_MIB` | `4096` (or `6144` under `-sm layer` with host experts, r36) | tuning | how much stays free outside the slab when `slab_extend` reclaims the reserve the model did not need.  **Not slack**: it must cover every allocation made after that point, including ones we cannot redirect (see below).  `0` disables the reclaim.  Since r36 the MoE cache asks for at least **6144** when every cache table is unsplit and the tables span more than one device (`ggml_cuda_slab_headroom_at_least_mib`); the 255k `-sm layer -ts 59,41` run OOMed at 4096 and passes at 6144.  An explicit value still wins. |
+| `GGML_CUDA_POOL_MIN_FREE_MIB` | `512` when the cache holds host-expert tables, else `0` | tuning / kill-switch | r36.  The workspace pool's **first** attempt refuses like a real OOM when it would leave less than this much VRAM free, so its existing flush + retry runs instead.  The retry has no floor, so it never aborts.  `0` disables the floor. |
 | `GGML_COMPUTE_BUFFER_CHUNK_MIB` | `256` | tuning | the compute buffer is allocated in whole chunks + one spare (`(ceil(need/C)+1)*C`), so growth inside the chunk is free.  `0` falls back to `GGML_COMPUTE_BUFFER_MARGIN_PCT`. |
 
 **Why the cards sit near-full.**  `GGML_CUDA_SLAB_HEADROOM_MIB` is what is free *at the moment the slab is
@@ -163,6 +164,8 @@ configuration.
 | `GGML_STAGE_META_REDIRECT` | off | diagnostic | meta redirection instead of the explicit d2d completion. |
 | `GGML_STAGE_NO_RESTORE` | off | diagnostic | skip the redirect restore (debug only — unsafe). |
 | `GGML_STAGE_GATHER_SCRATCH` | off | diagnostic | force the gather scratch path. |
+| `GGML_MOE_CACHE_INPLACE` | on | kill-switch | r36.  With `-ncmoe` host experts, `0` keeps the cache-aware staging copy (arena + host, one kernel) instead of reading the routed table in place. |
+| `GGML_MOE_CACHE_STAGE` | on | kill-switch | r36.  `0` restores the plain whole-table upload (pre-r36 behaviour, the full staging copy). |
 
 ---
 
@@ -268,6 +271,7 @@ The same idiom — and therefore also default-on despite the name — covers
 | `GGML_HC_UP_V2` | on | kill-switch | `0` restores the row-at-a-time BF16 `hc_mix` up/collapse kernel (r27); v2 is bit-identical and 4-21 % faster on the op. |
 | `GGML_CUDA_GRAPH_MEM_GEN` | on | kill-switch | `0` disables the per-device graph memory generation (r25): a graph that captured pool temporary / FA-staging / H2D-ring memory freed since is otherwise recaptured. |
 | `GGML_CUDA_Q8_1_ARENA_FREE_OLD` | off | kill-switch (**opt-in**) | `1` restores the immediate `cudaFree` of a grown-out Q8_1 input arena (the r24 behaviour, A/B only): captured decode/verify graphs keep pointers into it, so this reintroduces the `quantize_q8_1` page fault. |
+| `GGML_CUDA_BF16_SRC1_CACHE` | on | kill-switch | r36.  `0` disables the per-graph reuse of the BF16 copy of a shared F32 src1 across the qwen4exp hc-mixer cuBLAS BF16 GEMMs (prefill only, `>= 64` columns); bit-identical either way. |
 | `LLAMA_HC_PIN_BLOCK_OUT` | off | kill-switch (**opt-in**) | `1` restores pinning every qwen4exp layer's `block_out` as a prefill graph output (r24 behaviour; costs ~1.9 GiB of the `-ub 2048` compute buffer). |
 | `LLAMA_HC_MIX_PLANAR` | on | kill-switch | `0` restores the interleaved HC_MIX output (r24) instead of the planar layout (r25; BF16 CUDA path only). |
 | `LLAMA_CONV_TAIL_CONT` | off | kill-switch (**opt-in**) | `1` restores the `cont` + `cpy` conv-state tail copy instead of the direct strided 2D memcpy (r25). |

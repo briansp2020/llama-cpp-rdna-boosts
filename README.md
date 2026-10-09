@@ -19,10 +19,13 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r35`** (the bounded pinned host-expert pool is folded into block 06: `--host-experts
+**`v16-a55e952b8-r36`** (three contributor prefill PRs folded into the existing blocks: the shared BF16
+src1 reuse (#119) and the in-place host-expert prefill reads (#121) in block 15, and the pool free-VRAM
+floor plus the 6 GiB `-sm layer` slab headroom (#122) in blocks 06 and 09).  Before it,
+**`v16-a55e952b8-r35`** folded the bounded pinned host-expert pool into block 06: `--host-experts
 pool` adds an **optional** host pool over the page cache, sized to `MOE_HOST_POOL_MIB` (auto = 25 % of the
 MoE host expert bytes); the default stays `pinned`, and the `mul_mat_vec_q_moe` row-tail clamp is in block
-13).  Before it, **`v16-a55e952b8-r33`** removed the pageable host-expert master (**issue #116**:
+13.  Before that, **`v16-a55e952b8-r33`** removed the pageable host-expert master (**issue #116**:
 `--host-experts mmap` and `LLAMA_MMAP_HOST_EXPERTS` are dropped, `-ncmoe`/`-cmoe` experts are always
 pinned, and `MOE_EXPERT_CACHE_MIB` below 2048 errors).  Before that, **`v16-a55e952b8-r32`** fixed the two crashes found
 during the PR #115 review (the multi-sequence post-prefill re-reserve, **issue #48** in block 06, and the
