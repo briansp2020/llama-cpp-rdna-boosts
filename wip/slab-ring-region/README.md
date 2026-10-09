@@ -1,10 +1,12 @@
 # `slab-ring-region` — make the H2D staging ring a first-class slab region
 
-**Status: P1 IMPLEMENTED, NaN ROOT-CAUSED AND FIXED, decode gap remains (2026-10-10).**  The slab-side
-plumbing, the `--fit` lockstep, the arm/disarm lifecycle and the "stay armed through cache sizing" fix are
-in (`slab-ring-p1.patch`, from an r38 tree).  Standing gates green; field prefill **782 → 921-929 t/s**
-with **0 NaN, acceptance 1.0**.  The remaining decode gap (53.9 vs 62.2 with a 2.5 GiB hole) is the static
-hole being subtracted from the cache sizing.  See §9, especially §9.4.
+**Status: P1 RE-CUT to the `0 -> narrow -> RB -> wide -> arena` work-region ordering (2026-10-10).**
+The ring is no longer an arena hole: the slab work region is split into a fixed narrow (decode/verify) floor
+at base 0, the ring above it, and the transient wide (prefill) view above that, with the arena always above
+the work.  Structurally this removes the eviction/NaN class; field prefill **779 -> 920 t/s**, **0 NaN,
+acceptance 1.0**, and the ring is reclaimed on disarm (boundary back to the narrow floor).  **Open: decode
+51.4 vs 62.2** because the auto cache sizes while the narrow floor is still being established.  Artifact
+`slab-ring-p1.patch`; details §10.
 
 This campaign exists because of the §5.5 finding in
 [`archive/work/fit-slab-accounting/README.md`](../../archive/work/fit-slab-accounting/README.md) §15.9: the G4 free-VRAM cap
@@ -311,4 +313,64 @@ are retired once the ordering lands.
    (G4) for that pass rather than shifting the base under a live view.
 3. `fingon` (gfx1100): the §11.4 staging A/B and primed-arena server numbers must not regress once P1 is
    green here.
+
+---
+
+## 10. Re-cut: the `0 -> narrow -> RB -> wide -> arena` work-region ordering (2026-10-10)
+
+**Artifact: [`slab-ring-p1.patch`](slab-ring-p1.patch)** (sha256 `0df428378e77…`, 883 lines, r38).  This
+replaces the top-of-arena hole (§9) with the maintainer's ordering.  The ring is now part of the **work**
+region, never the arena:
+
+```
+low  [ 0 ......... narrow )              fixed, always-resident decode/verify view   base 0
+     [ narrow .... narrow + RB )         H2D staging ring (transient)
+     [ narrow+RB ... wide )              wide prefill view (transient)               base narrow+RB
+     [ wide .... mapped )                arena (always above the work)
+high
+```
+
+* `work_alloc` returns **two stable bases**: `s.base` for a narrow-sized request and `s.base + narrow_floor
+  + ring_region` for a wide one.  `work_needs` stores each live view's **boundary contribution**
+  (`base_off + up(need)`), so a view placed before the narrow floor existed cannot inflate the floor.
+* The **narrow floor** is pinned by the context (`ggml_backend_dev_slab_narrow_floor`, called after the
+  narrow re-reserve) with the real decode/verify compute size; the slab also auto-establishes it from the
+  first small reserve as a fallback.
+* The ring is reserved exactly when the wide view is (`boundary >= narrow_floor + ring_region`); when the
+  wide view is dropped the boundary shrinks to `narrow_floor` and the ring region returns to the arena as
+  its **coldest** space.  `arena_total = mapped - boundary` (unchanged), no arm/disarm, no eviction of hot
+  tables -- the §9.4 NaN cannot occur.
+* `ggml_cuda_slab_ring_set`/`moe_cache_is_sized` are retired (the ring lifecycle is implicit).
+
+### 10.1 Field §5.5 result
+
+| arm | prefill | decode | accept | NaN |
+|---|---:|---:|---:|---:|
+| old top-of-arena hole, ring never armed (baseline) | 781 | 62.2 | 1.0 | 0 |
+| **new ordering, `GGML_CUDA_SLAB_RING_MIB=2560`** | **920-923** | 51.4 | 1.0 | **0** |
+
+Timeline (2.5 GiB ring): `3072` wide init -> `768`/`512` first small reserves -> `1792` decode -> cache
+`sized 284 slots/table` -> `2816` prefill (`evict 948 MiB`) -> ring used -> post-prefill `1792` with
+**`boundary = 1792`** (ring region reclaimed) -> `re-arm 18`.
+
+### 10.2 Open: decode 51.4 vs 62.2 (cache sizing timing)
+
+The cache's deferred sizing (`alloc_all_locked`) runs on the first decode-band pass, **after** the first
+narrow reserve.  Because the narrow-floor hint necessarily arrives *after* that reserve, the first narrow
+view is classified as **wide** (1792 > the auto floor 768) and the boundary at sizing is inflated to
+`5120` MiB; the cache sizes to **284 slots/table** instead of **337**, and never re-sizes after the boundary
+settles to `1792`.  The arena is correct again during decode, but the cache is already small.
+
+Next step: get the narrow floor pinned **before** the first narrow reserve, so the sizing sees the settled
+boundary:
+
+* The clean route is for `llama_context` to reserve the narrow layout once before the first decode-band pass
+  (or to pass the narrow size it already measured on a previous pass) and call
+  `ggml_backend_dev_slab_narrow_floor` then, rather than after the reserve that the hint is trying to
+  classify.  A `split_only` narrow reserve at `sched_reserve` time would give the size without executing.
+* Alternatively, have the cache re-size once the ring is armed/dropped for the first time (re-run
+  `alloc_all_locked`'s budget against the settled `arena_total`).
+
+Everything else is in place: the ordering, the two bases, the contribution floor, the ring carve/reclaim,
+and the NaN-free field run.
 

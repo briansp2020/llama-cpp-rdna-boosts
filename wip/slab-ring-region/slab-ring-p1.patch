@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index b965961d8..35a3e3618 100644
+index b965961d8..163a8bb11 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -46,8 +46,9 @@ extern "C" {
@@ -14,7 +14,7 @@ index b965961d8..35a3e3618 100644
  
      // WIP r42 (TODO #42): reserve `bytes` of this device's free VRAM for the post-prefill compute
      // layout.  Called at the prefill -> decode transition, before the MoE expert cache arena is sized.
-@@ -63,6 +64,11 @@ extern "C" {
+@@ -63,6 +64,15 @@ extern "C" {
      // Returns true when anything was re-armed.
      GGML_API bool                  ggml_backend_dev_moe_cache_rearm(ggml_backend_dev_t dev);
  
@@ -23,11 +23,15 @@ index b965961d8..35a3e3618 100644
 +    // No-op for a backend without a slab or with no ring hole.
 +    GGML_API void                  ggml_backend_dev_slab_ring_set(ggml_backend_dev_t dev, bool arm);
 +
++    // wip/slab-ring-region: pin the always-resident narrow (decode/verify) work size, so the allocator can
++    // place the staging ring above it.  No-op for a backend without a slab.
++    GGML_API void                  ggml_backend_dev_slab_narrow_floor(ggml_backend_dev_t dev, size_t bytes);
++
      // OPEN 2 (TODO #42): the size of the device's movable-boundary slab WORK region, or 0 when it has no
      // slab.  `llama_context` uses it to right-size the compute reserve to the observed workload.
      GGML_API size_t                ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev);
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index ffe6fe21c..a0dea0909 100644
+index ffe6fe21c..f2b8582f5 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -351,7 +351,7 @@ extern "C" {
@@ -39,7 +43,7 @@ index ffe6fe21c..a0dea0909 100644
  
          // (optional) MoE expert cache: hold `bytes` of the free VRAM for the post-prefill compute
          // layout, so the auto-sized arena does not take the space a later compute growth needs.
-@@ -383,6 +383,12 @@ extern "C" {
+@@ -383,6 +383,16 @@ extern "C" {
          // allocated from real free VRAM.  Appended like the fields above, so every backend that does not
          // set it is zero-initialized.
          size_t (*slab_headroom_bytes)(ggml_backend_dev_t dev);
@@ -49,23 +53,28 @@ index ffe6fe21c..a0dea0909 100644
 +        // (returned to the arena, so a decode-only stretch gets the VRAM back).  Appended like the fields
 +        // above, so every backend that does not set it is zero-initialized.
 +        void (*slab_ring_set)(ggml_backend_dev_t dev, bool arm);
++
++        // (optional) wip/slab-ring-region: pin the always-resident narrow (decode/verify) work size, so
++        // the allocator can place the staging ring above it.  Appended like the fields above.
++        void (*slab_narrow_floor)(ggml_backend_dev_t dev, size_t bytes);
      };
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 40d5db798..0422ac2ba 100644
+index 40d5db798..4b2298341 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -225,6 +225,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+@@ -225,6 +225,8 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
      /* .moe_cache_rearm      = */ nullptr,
      /* .slab_work_size       = */ nullptr,
      /* .slab_headroom_bytes  = */ nullptr,
 +    /* .slab_ring_set        = */ nullptr,
++    /* .slab_narrow_floor    = */ nullptr,
  };
  
  bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 7bed59f67..3767863b2 100644
+index 7bed59f67..5d3103b43 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -267,11 +267,11 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
@@ -82,7 +91,7 @@ index 7bed59f67..3767863b2 100644
  }
  
  void ggml_backend_dev_moe_cache_set_reserve(ggml_backend_dev_t dev, size_t bytes) {
-@@ -297,6 +297,15 @@ bool ggml_backend_dev_moe_cache_rearm(ggml_backend_dev_t dev) {
+@@ -297,6 +297,23 @@ bool ggml_backend_dev_moe_cache_rearm(ggml_backend_dev_t dev) {
      return dev->iface.moe_cache_rearm(dev);
  }
  
@@ -95,23 +104,32 @@ index 7bed59f67..3767863b2 100644
 +    dev->iface.slab_ring_set(dev, arm);
 +}
 +
++void ggml_backend_dev_slab_narrow_floor(ggml_backend_dev_t dev, size_t bytes) {
++    // wip/slab-ring-region: pin the narrow (decode/verify) work floor.  Optional hook.
++    if (dev == nullptr || dev->iface.slab_narrow_floor == nullptr) {
++        return;
++    }
++    dev->iface.slab_narrow_floor(dev, bytes);
++}
++
  size_t ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): 0 when this backend has no movable-boundary slab (or never set the hook), which is
      // how the caller tells "no slab to reclaim the wide layout with" from "slab, and it is this wide".
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 31be9fe07..6d6519b9b 100644
+index 31be9fe07..94adcfd1b 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
-@@ -700,6 +700,7 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
+@@ -700,6 +700,8 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
      /* .moe_cache_rearm      = */ nullptr,
      /* .slab_work_size       = */ nullptr,
      /* .slab_headroom_bytes  = */ nullptr,
 +    /* .slab_ring_set        = */ nullptr,
++    /* .slab_narrow_floor    = */ nullptr,
  };
  
  // CPU backend - backend (reg)
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 317713cca..7aa98fcd5 100644
+index 317713cca..1bfce9fc3 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1600,6 +1600,13 @@ struct ggml_cuda_graph_key_hash {
@@ -229,7 +247,7 @@ index 317713cca..7aa98fcd5 100644
                  ggml_cuda_graph_mem_freed(device);   // captured graphs may read the old slot
                  CUDA_CHECK(cudaFree(h2d_stage[slot]));
                  h2d_stage[slot]      = nullptr;
-@@ -1995,7 +2069,11 @@ struct ggml_backend_cuda_context {
+@@ -1995,7 +2069,15 @@ struct ggml_backend_cuda_context {
              }
              h2d_stage[slot]      = p;
              h2d_stage_size[slot] = new_size;
@@ -237,12 +255,16 @@ index 317713cca..7aa98fcd5 100644
 +            h2d_stage_total     += new_size - old_size;
 +        }
 +        if (h2d_stage_slab[slot]) {
-+            // The hole is handed to the arena while the ring is disarmed; re-arm before a slab slot is read.
-+            ggml_cuda_slab_ring_set(device, true);
++            // wip/slab-ring-region: the ring region is reserved only while the WIDE view is (the boundary is
++            // above the narrow floor).  If it is not, this slot's VA belongs to the arena and must not be
++            // read; refuse so the scheduler takes the serial fallback.
++            if (ggml_cuda_slab_ring_slot_capacity(device) == 0) {
++                return nullptr;
++            }
          }
          return h2d_stage[slot];
      }
-@@ -2003,9 +2081,12 @@ struct ggml_backend_cuda_context {
+@@ -2003,9 +2085,12 @@ struct ggml_backend_cuda_context {
      void h2d_stage_free() {
          for (int s = 0; s < H2D_STAGE_SLOTS; ++s) {
              if (h2d_stage[s] != nullptr) {
@@ -257,11 +279,15 @@ index 317713cca..7aa98fcd5 100644
              if (h2d_pin[s] != nullptr) {
                  CUDA_CHECK(cudaFreeHost(h2d_pin[s]));
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
-index b9f19a903..dca68e00a 100644
+index b9f19a903..ee522b934 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
 +++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
-@@ -57,8 +57,19 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need);
- void   ggml_cuda_slab_work_release(int device, size_t reported);
+@@ -54,11 +54,22 @@ size_t ggml_cuda_slab_arena_unit  (int device);
+ void * ggml_cuda_slab_work_alloc(int device, size_t need);
+ // A work-region view was dropped; the next, smaller work need may shrink the boundary and hand the slack
+ // back to the arena.
+-void   ggml_cuda_slab_work_release(int device, size_t reported);
++void   ggml_cuda_slab_work_release(int device, size_t off, size_t need);
  // Chunk-aligned arena allocation from `[boundary, size)`; nullptr when the arena region is full.
  void * ggml_cuda_slab_arena_alloc(int device, size_t size);
 -// Serve a large TRANSIENT (a workspace or a draft buffer) from the arena, EVICTING the tables in the top
@@ -284,28 +310,30 @@ index b9f19a903..dca68e00a 100644
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
  void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d980f2892..124895adc 100644
+index d980f2892..8d06a9d34 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -604,6 +604,17 @@ struct ggml_cuda_slab {
+@@ -604,6 +604,19 @@ struct ggml_cuda_slab {
                                                  //  would waste up to chunk-1 bytes per table: ~9 GiB over
                                                  //  288 tables, which made most tables fail to allocate)
      size_t                   boundary = 0;      // work = [0, boundary), arena = [boundary, size)
-+    // wip/slab-ring-region: the op-offload H2D staging ring is a NON-EVICTABLE transient that must not be
-+    // taken by a boundary move.  It is a fixed hole `[ring_off, ring_off + ring_region)` carved out of the
-+    // arena budget at creation; the work boundary is clamped below it.  While `ring_armed` the hole is the
-+    // ring (excluded from `arena_free`); when disarmed (prefill idle, after a compute-buffer drop) the hole
-+    // is handed back to the arena, so a decode-only stretch gets the VRAM.  Re-arming evicts the tables the
-+    // arena put there.  All of this is bookkeeping inside the ONE slab mapping -- no ROCm call.
-+    size_t                   ring_region = 0;   // reserved ring hole (bytes; 0 = no ring region)
-+    size_t                   ring_off    = 0;   // hole start: work and arena stay below it
-+    bool                     ring_armed  = false;
-+    size_t                   ring_used   = 0;   // bump cursor within the hole
-+    int                      ring_slots  = 0;   // slots the hole was sized for (slot capacity = region/slots)
++    // wip/slab-ring-region (0 -> narrow -> RB -> wide -> arena): the work region is split so the
++    // always-resident NARROW (decode/verify) compute view owns [0, `narrow_floor`), the H2D staging ring
++    // owns [`narrow_floor`, `narrow_floor + ring_region`), and the transient WIDE (prefill) compute view
++    // owns [`narrow_floor + ring_region`, boundary).  The arena is always [boundary, mapped), i.e. above
++    // the work, so the ring is NEVER part of the arena and arming it is an ordinary work-boundary move
++    // (it evicts the COLDEST tables, exactly like a prefill grow).  When the wide view is dropped the
++    // boundary shrinks back to `narrow_floor` and the ring + wide regions return to the arena.
++    size_t                   narrow_floor = 0;  // the fixed, always-resident narrow size (0 = not established)
++    size_t                   ring_region  = 0;  // ring bytes above the narrow floor (0 = no ring)
++    bool                     ring_placed  = false; // a wide view has been placed above the ring (floor frozen)
++    bool                     ring_armed   = false; // the wide view (hence the ring region) is reserved
++    size_t                   ring_used    = 0;  // bump cursor within the ring region
++    int                      ring_slots   = 0;  // slots the ring region was sized for (capacity = region/slots)
      std::multiset<size_t>    work_needs;        // REQUESTED size of every live work view -- the floor the
                                                  //  boundary may shrink to (see `work_alloc`)
      bool                     cache_unusable = false; // the slab was declined because `work + min arena`
-@@ -622,6 +633,16 @@ static ggml_cuda_slab g_slabs[GGML_CUDA_MAX_DEVICES];
+@@ -622,6 +635,46 @@ static ggml_cuda_slab g_slabs[GGML_CUDA_MAX_DEVICES];
  // longer switch it on for a dense model.  `GGML_CUDA_SLAB=0` still kills it outright.
  static bool g_slab_armed = false;
  
@@ -313,16 +341,46 @@ index d980f2892..124895adc 100644
 +// outside the slab).  Set once by the model preflight, before the slab is created, from the largest
 +// host-resident weight table (so the per-slot capacity covers every upload the ring will see).
 +static size_t g_slab_ring_region_bytes = 0;
++static size_t ggml_cuda_slab_up(size_t x, size_t a);   // defined below (used by the ring-floor pin)
 +void ggml_cuda_slab_set_ring_region(size_t bytes) {
 +    g_slab_ring_region_bytes = bytes;
 +    GGML_LOG_WARN("%s: H2D staging-ring region %zu bytes (%.1f MiB)\n", __func__, bytes,
 +                  (double) bytes / (1024 * 1024));
 +}
 +
++// wip/slab-ring-region: pin the always-resident narrow (decode/verify) floor.  The context knows the real
++// decode/verify compute size (from the narrow re-reserve), which is more reliable than inferring it from the
++// reserve sizes -- a decode view can be LARGER than the first small reserve (measured: the field's target
++// decode is 1792 MiB while the first small reserve is 768 MiB, and treating 1792 as a wide view kept the
++// boundary high so the ring region was never reclaimed).  Only honored before the first wide view is placed
++// above the ring, so the ring's VA does not move.
++void ggml_cuda_slab_set_narrow_floor(int device, size_t bytes) {
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
++    ggml_cuda_slab & s = g_slabs[device];
++    if (!s.inited || s.ring_used > 0) {
++        return;   // the ring is already in use: its VA must not move
++    }
++    const size_t nf = ggml_cuda_slab_up(bytes, s.chunk);
++    if (nf <= s.narrow_floor) {
++        return;
++    }
++    s.narrow_floor = nf;
++    size_t ring = g_slab_ring_region_bytes;
++    if (ring > 0) {
++        ring = ggml_cuda_slab_up(ring, s.chunk);
++        if (s.narrow_floor + ring + s.chunk > s.mapped) {
++            ring = 0;
++        }
++    }
++    s.ring_region = ring;
++    s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
++    s.ring_used   = 0;
++}
++
  static size_t ggml_cuda_slab_chunk_bytes() {
      static size_t chunk_mib = SIZE_MAX;
      if (chunk_mib == SIZE_MAX) {
-@@ -807,7 +828,12 @@ size_t ggml_cuda_slab_work_size(int device) {
+@@ -807,7 +860,15 @@ size_t ggml_cuda_slab_work_size(int device) {
  size_t ggml_cuda_slab_arena_total(int device) {
      std::lock_guard<std::mutex> lock(g_slab_mutex);
      const ggml_cuda_slab & s = g_slabs[device];
@@ -331,19 +389,20 @@ index d980f2892..124895adc 100644
 +        return 0;
 +    }
 +    const size_t total = s.mapped - s.boundary;
-+    // The armed ring hole is not available to the cache; when disarmed it is (it is in `arena_free`).
-+    return s.ring_armed ? total - s.ring_region : total;
++    // wip/slab-ring-region: the arena is always exactly [boundary, mapped); the ring region sits BELOW the
++    // boundary (above the narrow floor) while the wide view is reserved, so it is not part of the arena and
++    // needs no adjustment here.  When the wide view is dropped the boundary shrinks and the ring region is
++    // already included in this total.
++    return total;
  }
  
  // GROW the slab into the VA it reserved at creation but left unmapped, down to `headroom` of free VRAM.
-@@ -930,15 +956,28 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+@@ -930,15 +991,26 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
      // HARD MINIMUM (see `ggml_cuda_slab_min_arena_bytes`): the work estimate plus a usable cache floor.
      // Report it and decline the slab -- `cache_unusable` then makes the expert cache stream from the host
      // instead of building an arena that a wide prefill would have to evict wholesale (the r21 abort).
-+    // wip/slab-ring-region: carve the H2D staging-ring hole out of the arena budget.  It comes off the
-+    // TOP of the mapped region (`ring_off = want - ring`), so a later `slab_extend` maps ABOVE it and never
-+    // disturbs it, and the work boundary stays below it.  It is chunk-aligned and must leave the cache its
-+    // floor even while the ring is armed, or the slab declines exactly as before.
++    // wip/slab-ring-region: the ring region sits ABOVE the narrow floor and its size only needs to be
++    // reserved against the arena budget (it is work space while the wide view is reserved).
 +    size_t ring = g_slab_ring_region_bytes;
 +    if (ring > 0) {
 +        ring = ggml_cuda_slab_up(ring, s.chunk);
@@ -370,96 +429,198 @@ index d980f2892..124895adc 100644
                         (double) want / (1024 * 1024), ggml_cuda_slab_reserve_mib(total_b),
                         (double) free_b / (1024 * 1024), (double) total_b / (1024 * 1024));
          return false;
-@@ -961,15 +1000,27 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+@@ -960,16 +1032,23 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+         (void) cuMemAddressFree(s.base, s.size);
          return false;
      }
-     s.boundary = w;
-+    s.ring_region = ring;
-+    s.ring_off    = ring > 0 ? s.mapped - ring : s.mapped;
-+    s.ring_armed  = ring > 0;
-+    s.ring_used   = 0;
-+    s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
+-    s.boundary = w;
++    s.boundary     = w;
++    s.narrow_floor = 0;   // established on the first narrow reserve or by `ggml_cuda_slab_set_narrow_floor`
++    s.ring_region  = 0;
++    s.ring_placed  = false;
++    s.ring_armed   = false;
++    s.ring_used    = 0;
++    s.ring_slots   = ggml_backend_cuda_context::h2d_stage_slots();
      s.arena_free.clear();
--    s.arena_free[w] = s.mapped - w;
-+    s.arena_free[w] = s.ring_off - w;
-+    if (!s.ring_armed && s.ring_region > 0) {
-+        s.arena_free[s.ring_off] = s.ring_region;   // disarmed at creation: the arena owns the hole
-+    }
+     s.arena_free[w] = s.mapped - w;
      s.inited = true;
      GGML_LOG_WARN("%s: device %d: slab %.2f GiB (chunk %.1f MiB): work %.2f GiB + arena %.2f GiB "
 -                  "(%.2f GiB reserve, %.2f GiB VA spare for `ggml_cuda_slab_extend`)\n",
-+                  "(%.2f GiB reserve, %.2f GiB VA spare for `ggml_cuda_slab_extend`; ring hole %.2f GiB at "
-+                  "offset %.2f GiB, %s)\n",
++                  "(%.2f GiB reserve, %.2f GiB VA spare for `ggml_cuda_slab_extend`; ring region %s)\n",
                    __func__, device, (double) s.mapped / (1ull << 30), (double) s.chunk / (1024 * 1024),
--                  (double) s.boundary / (1ull << 30), (double) (s.mapped - s.boundary) / (1ull << 30),
-+                  (double) s.boundary / (1ull << 30),
-+                  (double) (s.ring_off - s.boundary) / (1ull << 30),
+                   (double) s.boundary / (1ull << 30), (double) (s.mapped - s.boundary) / (1ull << 30),
                    (double) ggml_cuda_slab_reserve_bytes(total_b) / (1ull << 30),
 -                  (double) (s.size - s.mapped) / (1ull << 30));
 +                  (double) (s.size - s.mapped) / (1ull << 30),
-+                  (double) s.ring_region / (1ull << 30), (double) s.ring_off / (1ull << 30),
-+                  s.ring_armed ? "armed" : "disarmed");
++                  g_slab_ring_region_bytes > 0 ? "pending (above the narrow floor)" : "off");
      return true;
  }
  
-@@ -1032,6 +1083,13 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
-         // that.
-         const size_t floor  = s.work_needs.empty() ? 0 : *s.work_needs.rbegin();
-         const size_t target = ggml_cuda_slab_up(need > floor ? need : floor, s.chunk);
-+        // wip/slab-ring-region: the work pool must never grow into the ring hole.  If the layout asks for
-+        // more than the space below it, refuse (the caller falls back to a plain cudaMalloc) rather than
-+        // overlap the ring.  In practice the widest work estimate fits (the hole is subtracted from the
-+        // arena budget at creation, and `want >= w + min_arena + ring`).
-+        if (s.ring_region > 0 && target > s.ring_off) {
-+            return nullptr;
-+        }
-         if (target <= s.boundary) {
-             // Shrink to the live need so the slack goes back to the arena (the narrow post-prefill layout
-             // should not hold a wide region).  Safe while a view is live: the target never goes below the
-@@ -1143,6 +1201,9 @@ void ggml_cuda_slab_arena_free(int device, void * ptr, size_t size) {
-     if (off < s.boundary) {
-         return;   // already reassigned to the work pool: nothing to give back
+@@ -989,13 +1068,15 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+ // MTP draft context each own one), so a release must not make the slab believe the work region is idle --
+ // doing that is what corrupted the no-drop runs (a release shrank the boundary under a live view and the
+ // arena re-took chunks that view was still using: MTP acceptance 0.010, `////` output).
+-void ggml_cuda_slab_work_release(int device, size_t need) {
++void ggml_cuda_slab_work_release(int device, size_t off, size_t need) {
+     std::lock_guard<std::mutex> lock(g_slab_mutex);
+     ggml_cuda_slab & s = g_slabs[device];
+     if (!s.inited) {
+         return;
      }
-+    if (s.ring_armed && off >= s.ring_off && off < s.ring_off + s.ring_region) {
-+        return;   // the ring hole is not the arena's while armed (a table there is being evicted)
-+    }
-     size_t lo = off;
-     size_t hi = off + want;
-     auto next = s.arena_free.lower_bound(off);
-@@ -1160,6 +1221,145 @@ void ggml_cuda_slab_arena_free(int device, void * ptr, size_t size) {
+-    const auto it = s.work_needs.find(need);
++    // Remove this view's boundary contribution (`off + up(need)`), the same value `work_alloc` inserted.
++    const size_t contrib = off + ggml_cuda_slab_up(need, s.chunk);
++    const auto it = s.work_needs.find(contrib);
+     if (it != s.work_needs.end()) {
+         s.work_needs.erase(it);
+     }
+@@ -1003,9 +1084,17 @@ void ggml_cuda_slab_work_release(int device, size_t need) {
+ 
+ // The work pool's base for a `need`-byte compute buffer, moving the boundary up if required.  The arena
+ // tables in the taken range are evicted (the callback frees their slabs back through `arena_free`).
++//
++// wip/slab-ring-region (0 -> narrow -> RB -> wide -> arena): TWO stable bases are handed out.  A NARROW
++// request (the decode/verify compute view) always gets `s.base`; a WIDE request (the prefill view) always
++// gets `s.base + narrow_floor + ring_region`, i.e. above the fixed narrow region and the ring.  The
++// always-resident narrow view never moves; the ring and wide regions are transient and return to the arena
++// when the wide view is dropped.  The ring is never part of the arena, so arming it is an ordinary
++// boundary move (evicting the COLDEST tables), not an independent arena eviction.
+ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+     size_t lo = 0, hi = 0;
+     bool   move = false;
++    size_t ret_off = 0;
+     CUdeviceptr base = 0;
+     {
+         std::lock_guard<std::mutex> lock(g_slab_mutex);
+@@ -1014,28 +1103,53 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+             if (!ggml_cuda_slab_init_locked(device, s, need)) {
+                 return nullptr;
+             }
+-            s.work_needs.insert(need);
++            s.work_needs.insert(ggml_cuda_slab_up(need, s.chunk));
++            // Provisional base 0: the first reserve is the WIDE one, before the narrow floor exists.
+             return (void *) s.base;
+         }
+-        // The boundary may shrink only as far as the TALLEST live view's REQUESTED size (the floor).  That
+-        // request is what bounds the view's tensor layout (`ggml_vbuffer_alloc` passes the tallocr's
+-        // `max_size`, rounded up plus one spare unit, as the size to allocate), and the graph allocator
+-        // keeps its offsets inside it; the buffer's REPORTED size is only the boundary we advertise so a
+-        // slightly larger layout reuses this buffer instead of asking for a new one.  Using the reported
+-        // size instead would pin the floor at the widest boundary any view was ever handed -- the MTP
+-        // draft context allocates while the boundary is wide -- and the shrink would never fire again
+-        // (measured: arena 17128 MiB, decode 48.5 t/s instead of 36584 MiB / 74.2 t/s).
+-        //
+-        // Getting this wrong in the other direction -- letting a release shrink the boundary under a
+-        // still-live view -- hands the arena chunks that view is still using: measured as the no-drop
+-        // corruption (MTP acceptance 0.010, `////` output) when a bool "is a view live" flag did exactly
+-        // that.
+-        const size_t floor  = s.work_needs.empty() ? 0 : *s.work_needs.rbegin();
+-        const size_t target = ggml_cuda_slab_up(need > floor ? need : floor, s.chunk);
++        // Establish the fixed narrow floor: the first reserve smaller than the boundary (the
++        // prefill -> decode drop re-reserves the decode/verify layout there).  Its ring region then sits
++        // just above it, and the wide view above that.  The live wide view (the target/draft context keeps
++        // one) stays at base 0 until the graph allocator re-creates it above the ring on the next wide
++        // reserve; `work_needs` still floors the boundary at the wide need meanwhile.
++        if (s.narrow_floor == 0 && need < s.boundary) {
++            s.narrow_floor = ggml_cuda_slab_up(need, s.chunk);
++            size_t ring = g_slab_ring_region_bytes;
++            if (ring > 0) {
++                ring = ggml_cuda_slab_up(ring, s.chunk);
++                if (s.narrow_floor + ring + s.chunk > s.mapped) {
++                    ring = 0;   // no room for a meaningful region: leave the ring on the cudaMalloc path
++                }
++            }
++            s.ring_region = ring;
++            s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
++            s.ring_used   = 0;
++        }
++
++        const bool   narrow   = s.narrow_floor > 0 && need <= s.narrow_floor;
++        const size_t wide_off = s.narrow_floor + s.ring_region;
++
++        // The boundary may shrink only to the TALLEST live view's boundary contribution.  Each view's
++        // contribution is `base_off + up(need)` (a narrow view at base 0, a wide view above the ring), so
++        // the multiset stores that directly and a view placed before the narrow floor existed cannot
++        // inflate the floor after the fact.
++        ret_off = narrow ? 0 : wide_off;
++        const size_t contrib = ret_off + ggml_cuda_slab_up(need, s.chunk);
++        size_t floor = s.narrow_floor;
++        if (!s.work_needs.empty()) {
++            const size_t mx = *s.work_needs.rbegin();
++            if (mx > floor) {
++                floor = mx;
++            }
++        }
++        if (contrib > floor) {
++            floor = contrib;
++        }
++        const size_t target = ggml_cuda_slab_up(floor, s.chunk);
++        base    = s.base;
+         if (target <= s.boundary) {
+-            // Shrink to the live need so the slack goes back to the arena (the narrow post-prefill layout
+-            // should not hold a wide region).  Safe while a view is live: the target never goes below the
+-            // floor, so every live view still fits.
++            // Shrink to the live need so the slack goes back to the arena (the decode layout should not hold
++            // the wide region).  Safe while a view is live: the target never goes below the floor.
+             if (target < s.boundary) {
+                 const size_t old = s.boundary;
+                 s.boundary = target;
+@@ -1055,12 +1169,12 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+                 }
+                 s.arena_free[lo2] = hi2 - lo2;
+             }
+-            s.work_needs.insert(need);
+-            return (void *) s.base;
++            s.ring_armed = s.ring_region > 0 && wide_off > s.narrow_floor && s.boundary >= wide_off;
++            s.work_needs.insert(contrib);
++            return (void *) (uintptr_t) ((char *) s.base + ret_off);
+         }
+         lo   = s.boundary;
+         hi   = target;
+-        base = s.base;
+         move = true;
+     }
+     if (move) {
+@@ -1088,9 +1202,11 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+             }
+         }
+         if (s.inited) {
+-            s.work_needs.insert(need);
++            const size_t wide_off = s.narrow_floor + s.ring_region;
++            s.ring_armed = s.ring_region > 0 && wide_off > s.narrow_floor && s.boundary >= wide_off;
++            s.work_needs.insert(ret_off + ggml_cuda_slab_up(need, s.chunk));
+         }
+-        return (void *) base;
++        return (void *) (uintptr_t) ((char *) base + ret_off);
+     }
+     return nullptr;
+ }
+@@ -1160,6 +1276,55 @@ void ggml_cuda_slab_arena_free(int device, void * ptr, size_t size) {
      s.arena_free[lo] = hi - lo;
  }
  
-+// wip/slab-ring-region: the reserved H2D staging ring.
++// wip/slab-ring-region: the H2D staging ring.
 +//
-+// The ring is a non-evictable transient carved from a fixed hole at the top of the mapped slab
-+// (`[ring_off, ring_off + ring_region)`).  It is pre-split: the hole holds `ring_slots` slots and every slot
-+// gets a STABLE VA for the life of the slab, so a slot's address never changes when the ring grows and a
-+// captured graph is never invalidated by it.  `arena_alloc_transient` bump-allocates within the hole; the
-+// ring calls it once per slot with the full per-slot capacity, so the hole is exactly consumed.
-+//
-+// The hole is toggled in/out of `arena_free` by `ggml_cuda_slab_ring_set`: armed during prefill (excluded
-+// from the arena, so a boundary move or an arena allocation can never take it), disarmed at the
-+// prefill -> decode transition (returned to the arena, so a decode-only stretch gets the VRAM back).
-+// Because this is bookkeeping inside the ONE slab mapping, nothing here calls ROCm.
++// The ring is the sub-region `[narrow_floor, narrow_floor + ring_region)` of the work region, i.e. ABOVE the
++// always-resident narrow (decode/verify) view and BELOW the transient wide (prefill) view.  It is not part
++// of the arena, so there is no arm/disarm and no arena eviction: it is reserved exactly when the wide view
++// is (`boundary >= narrow_floor + ring_region`), and when the wide view is dropped the boundary shrinks to
++// `narrow_floor` and the ring region returns to the arena as its coldest space.  `arena_alloc_transient`
++// bump-allocates the slots within it; the ring calls it once per slot with the full per-slot capacity, so
++// each slot has a stable VA.
 +size_t ggml_cuda_slab_ring_slot_capacity(int device) {
 +    std::lock_guard<std::mutex> lock(g_slab_mutex);
 +    const ggml_cuda_slab & s = g_slabs[device];
-+    if (!s.inited || s.ring_region == 0 || s.ring_slots <= 0) {
++    if (!s.inited || !s.ring_armed || s.ring_region == 0 || s.ring_slots <= 0) {
 +        return 0;
 +    }
 +    return (s.ring_region / (size_t) s.ring_slots) / s.unit * s.unit;
 +}
 +
-+void ggml_cuda_slab_ring_set(int device, bool arm);   // defined below (used by arena_alloc_transient)
-+
 +void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size) {
 +    if (size == 0) {
 +        return nullptr;
 +    }
-+    // Arm lazily if needed.  The context arms the ring at the first wide pass, but a miss must never hand
-+    // back memory the arena is using, so arm here as well (a no-op when already armed).
-+    ggml_cuda_slab_ring_set(device, true);
 +    std::lock_guard<std::mutex> lock(g_slab_mutex);
 +    ggml_cuda_slab & s = g_slabs[device];
 +    if (!s.inited || !s.ring_armed || s.ring_region == 0) {
@@ -467,112 +628,60 @@ index d980f2892..124895adc 100644
 +    }
 +    const size_t want = ggml_cuda_slab_up(size, s.unit);
 +    if (s.ring_used + want > s.ring_region) {
-+        return nullptr;   // hole exhausted (sized for `ring_slots` full-capacity slots, so unexpected)
++        return nullptr;   // region exhausted (sized for `ring_slots` full-capacity slots, so unexpected)
 +    }
 +    if (s.ring_used == 0) {
-+        GGML_LOG_WARN("%s: device %d: ring hole in use (%.0f MiB/slot, first carve %.0f MiB)\n",
++        GGML_LOG_WARN("%s: device %d: ring region in use (%.0f MiB/slot, first carve %.0f MiB)\n",
 +                      __func__, device, (double) s.ring_region / (size_t) s.ring_slots / (1024 * 1024),
 +                      (double) want / (1024 * 1024));
 +    }
-+    void * p = (void *) (uintptr_t) ((char *) s.base + s.ring_off + s.ring_used);
++    void * p = (void *) (uintptr_t) ((char *) s.base + s.narrow_floor + s.ring_used);
 +    s.ring_used += want;
 +    return p;
 +}
 +
-+// Arm/disarm the ring hole (see the header comment above).  Arming drops the hole from `arena_free` and
-+// evicts the tables the arena had placed there; disarming gives the hole back (coalescing).  `--fit` is not
-+// affected: the hole is inside the slab, it is not an outside allocation.
-+//
-+// Called with NO lock held (the eviction path requires cache -> slab ordering).
++// Retained for the device API: the ring's lifecycle is now implicit in the wide work reservation (see
++// `work_alloc`), so there is nothing to toggle.  Kept so the generic arm/disarm plumbing stays valid for a
++// future non-slab allocator.
 +void ggml_cuda_slab_ring_set(int device, bool arm) {
-+    if (arm) {
-+        static const bool never = getenv("GGML_CUDA_SLAB_RING_NEVER") != nullptr;
-+        if (never) {
-+            return;   // wip debug: never arm (the ring stays on the cudaMalloc fallback)
-+        }
-+    }
-+    if (!arm) {
-+        static const bool keep = getenv("GGML_CUDA_SLAB_RING_KEEP") != nullptr;
-+        if (keep) {
-+            return;   // wip debug: keep the hole reserved (never hand it to the arena)
-+        }
-+    }
-+    CUdeviceptr base = 0;
-+    size_t lo = 0, hi = 0, region = 0;
-+    bool evict = false, sync = false;
-+    {
-+        std::lock_guard<std::mutex> lock(g_slab_mutex);
-+        ggml_cuda_slab & s = g_slabs[device];
-+        if (!s.inited || s.ring_region == 0 || s.ring_armed == arm) {
-+            return;
-+        }
-+        base   = s.base;
-+        lo     = s.ring_off;
-+        hi     = s.ring_off + s.ring_region;
-+        region = s.ring_region;
-+        if (arm) {
-+            // Drop every free run that overlaps the hole, keeping the parts outside it.
-+            for (auto it = s.arena_free.begin(); it != s.arena_free.end(); ) {
-+                const size_t off = it->first;
-+                const size_t end = off + it->second;
-+                if (end <= lo || off >= hi) {
-+                    ++it;
-+                    continue;
-+                }
-+                const size_t keep_lo_off = off, keep_lo_sz = off < lo ? lo - off : 0;
-+                const size_t keep_hi_off = hi,  keep_hi_sz = end > hi ? end - hi : 0;
-+                it = s.arena_free.erase(it);
-+                if (keep_lo_sz > 0) {
-+                    s.arena_free[keep_lo_off] = keep_lo_sz;
-+                }
-+                if (keep_hi_sz > 0) {
-+                    s.arena_free[keep_hi_off] = keep_hi_sz;
-+                }
-+            }
-+            s.ring_armed = true;
-+            s.ring_used  = 0;
-+            evict = true;
-+        } else {
-+            s.ring_armed = false;
-+            s.ring_used  = 0;
-+            sync = true;
-+            size_t nlo = lo, nhi = hi;
-+            auto next = s.arena_free.lower_bound(lo);
-+            if (next != s.arena_free.end() && next->first == nhi) {
-+                nhi  = next->first + next->second;
-+                next = s.arena_free.erase(next);
-+            }
-+            if (next != s.arena_free.begin()) {
-+                auto prev = std::prev(next);
-+                if (prev->first + prev->second == nlo) {
-+                    nlo = prev->first;
-+                    s.arena_free.erase(prev);
-+                }
-+            }
-+            s.arena_free[nlo] = nhi - nlo;
-+        }
-+    }
-+    // A disarm hands the ring's physical to the arena, and the prefill kernels that read the slots may still
-+    // be in flight (the drop is issued right after the prefill completes).  Sync before the arena can reuse
-+    // the range.  An arm evicts via the cache, which synchronizes internally.
-+    if (sync) {
-+        ggml_cuda_set_device(device);
-+        CUDA_CHECK(cudaDeviceSynchronize());
-+        GGML_LOG_WARN("%s: device %d: ring hole disarmed (%.0f MiB back to the arena)\n",
-+                      __func__, device, (double) region / (1024 * 1024));
-+    }
-+    if (evict) {
-+        GGML_LOG_WARN("%s: device %d: ring hole armed (%.0f MiB reserved for the ring)\n",
-+                      __func__, device, (double) region / (1024 * 1024));
-+        moe_cache_evict_slab_range(device, (void *) (uintptr_t) ((char *) base + lo),
-+                                   (void *) (uintptr_t) ((char *) base + hi));
-+    }
++    GGML_UNUSED(device);
++    GGML_UNUSED(arm);
 +}
 +
  // #define DEBUG_CUDA_MALLOC
  
  // buffer pool for cuda (legacy)
-@@ -10185,13 +10385,17 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -1540,9 +1705,10 @@ struct ggml_backend_cuda_buffer_context {
+     // OPEN 2: the buffer is a VIEW of the movable-boundary slab's work region (base = slab base).  Freeing
+     // it must NOT release anything -- the region belongs to the slab, which lives until the process exits.
+     bool slab_view = false;
+-    // The size this view REQUESTED (what bounds its tensor layout); `ggml_cuda_slab_work_release` removes
+-    // it from the live set so the boundary can shrink once a wide view is gone.
++    // The size this view REQUESTED (what bounds its tensor layout) and its base offset in the slab work
++    // region; together they form the boundary contribution `ggml_cuda_slab_work_release` removes.
+     size_t slab_need = 0;
++    size_t slab_off  = 0;
+     std::string name;
+ 
+     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
+@@ -1552,7 +1718,7 @@ struct ggml_backend_cuda_buffer_context {
+ 
+     ~ggml_backend_cuda_buffer_context() {
+         if (slab_view) {
+-            ggml_cuda_slab_work_release(device, slab_need);   // the slab owns the region; the slack may go to the arena
++            ggml_cuda_slab_work_release(device, slab_off, slab_need);   // the slab owns the region; the slack may go to the arena
+             return;
+         }
+         // A compute buffer allocated from the slab is a VIEW (handled above); everything else here is a
+@@ -1782,6 +1948,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_usage(gg
+                 ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+                 ctx->slab_view     = true;
+                 ctx->slab_need     = size;
++                ctx->slab_off      = (size_t) ((char *) dev_ptr - (char *) ggml_cuda_slab_work_base(buft_ctx->device));
+                 return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+             }
+             GGML_LOG_WARN("%s: slab work region has no room for %.2f MiB on device %d; falling back\n",
+@@ -10185,13 +10352,17 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -591,7 +700,7 @@ index d980f2892..124895adc 100644
          // This model HAS host-resident experts, so the work/arena split is meaningful -- arm the slab.
          // Dense models never reach here (`llama_model_moe_cache_preflight` skips an empty host-expert map),
          // which is what keeps the slab off them.  Runs before the context, so before any compute buffer.
-@@ -10241,6 +10445,22 @@ static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t de
+@@ -10241,6 +10412,28 @@ static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t de
      return ggml_cuda_slab_headroom_bytes();
  }
  
@@ -611,18 +720,25 @@ index d980f2892..124895adc 100644
 +    ggml_cuda_slab_ring_set(ctx->device, arm);
 +}
 +
++static void ggml_backend_cuda_device_slab_narrow_floor(ggml_backend_dev_t dev, size_t bytes) {
++    // wip/slab-ring-region: pin the narrow (decode/verify) work size; the ring is placed just above it.
++    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
++    ggml_cuda_slab_set_narrow_floor(ctx->device, bytes);
++}
++
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -10263,6 +10483,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -10263,6 +10456,8 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_cache_rearm         = */ ggml_backend_cuda_device_moe_cache_rearm,
      /* .slab_work_size          = */ ggml_backend_cuda_device_slab_work_size,
      /* .slab_headroom_bytes     = */ ggml_backend_cuda_device_slab_headroom_bytes,
 +    /* .slab_ring_set           = */ ggml_backend_cuda_device_slab_ring_set,
++    /* .slab_narrow_floor       = */ ggml_backend_cuda_device_slab_narrow_floor,
  };
  
  // backend reg
-@@ -10386,6 +10607,13 @@ static size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t m
+@@ -10386,6 +10581,13 @@ static size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t m
      if (ctx == nullptr) {
          return 0;
      }
@@ -675,19 +791,20 @@ index 8c355b2e4..6907a4351 100644
  // reporting.  `host` is the master the cache fills from (may be null).  Idempotent per `(src0, device)`.
  // `device` is the CUDA ordinal whose kernels will read this table's arena (the layer's owner under
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 6cb544339..3ac2cc16d 100644
+index 6cb544339..ea3991f07 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -2287,6 +2287,7 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+@@ -2287,6 +2287,8 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
      /* .moe_cache_rearm      = */ nullptr,
      /* .slab_work_size       = */ nullptr,
      /* .slab_headroom_bytes  = */ nullptr,
 +    /* .slab_ring_set        = */ nullptr,
++    /* .slab_narrow_floor    = */ nullptr,
  };
  
  // backend reg interface
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 8c0ce7bbe..f6cf38b82 100644
+index 8c0ce7bbe..f036f1eea 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1728,6 +1728,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
@@ -715,6 +832,31 @@ index 8c0ce7bbe..f6cf38b82 100644
      if (drop_now) {
          ggml_backend_sched_drop_buffers(sched.get());
          // re-reserve the widest post-prefill (verify) layout so the first decode graphs fit.
+@@ -1746,8 +1764,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             // buffers, so refresh the expectation to the layout this workload settled on -- otherwise
+             // every dropped run reports a healthy buffer as a mismatch.  (The field's only other reader is
+             // the no-alloc memory accounting, which this branch skips.)
++            size_t narrow_bytes = 0;
+             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                 backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
++                if (backend_buf_exp_size[i] > narrow_bytes) {
++                    narrow_bytes = backend_buf_exp_size[i];
++                }
++            }
++            // wip/slab-ring-region: pin the narrow (decode/verify) work floor so the slab places the H2D
++            // staging ring just above it (and reclaims it with the wide view on a decode stretch).
++            if (narrow_bytes > 0) {
++                for (const auto & kv : model.moe_host_expert_bytes) {
++                    ggml_backend_dev_slab_narrow_floor(kv.first, narrow_bytes);
++                }
++                for (size_t d = 0; d < model.devices.size(); ++d) {
++                    if (!model.devices[d].is_meta) {
++                        ggml_backend_dev_slab_narrow_floor(model.devices[d].dev, narrow_bytes);
++                    }
++                }
+             }
+         }
+         // Record the work region's size AFTER the narrow re-reserve: that is the steady state this workload
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index a1999e914..f9b2bca00 100644
 --- a/src/llama-model.cpp
