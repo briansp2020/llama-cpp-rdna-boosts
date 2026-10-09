@@ -93,6 +93,25 @@ first 528 chars; the divergence is a **near-tie at the first novel token** (`"We
   saturated.  Future field records must name the prompt **and** its acceptance.
 * The two findings above belong in their own `TODO.md` items; they are not this campaign's to fix.
 
+### Cost of the `GGML_CUDA_DISABLE_FUSION=1` hammer (field §5.5, ring-in-slab 2560, warm)
+
+| prompt | arm | prefill t/s | decode t/s | acceptance |
+|---|---|---:|---:|---:|
+| prose30k | fusion on | 944.9 | 61.3 | 1.000 |
+| prose30k | fusion off | 845.6 / 860.5 | 57.6 / 57.5 | 1.000 |
+| mixed30k | fusion on | 972.4 | 65.2 | 0.910 |
+| mixed30k | fusion off | 889.8 | 65.3 | 0.956 |
+
+**Prefill ~-9 to -10 %, decode ~-6 %** (the mixed decode is not comparable — the acceptance
+changes, 0.910 vs 0.956, so the token streams differ).
+
+Two caveats.  This is the **upper bound**: `GGML_CUDA_DISABLE_FUSION=1` disables the whole §7.2 set, not
+just the cache-aware band; a targeted fix (keeping the guard stable, or making the fused and non-fused
+paths bit-identical) should cost far less.  And it is **not a viable purity fix**: fusion-off prefill
+(845-890) is *below* the unpatched stock reference (922), so it would give back the campaign's win.  The
+stock comparison is fusion-**on**; the toggle is a pre-existing property of the cache, not something the
+ring introduces.
+
 ## Reproduce
 
 ```bash
