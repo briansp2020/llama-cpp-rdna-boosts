@@ -1,7 +1,7 @@
 # `slab-ring-region` — make the H2D staging ring a first-class slab region
 
 **Status: SCOPING (2026-10-09).**  No code yet.  This campaign exists because of the §5.5 finding in
-[`wip/fit-slab-accounting/README.md`](../fit-slab-accounting/README.md) §15.9: the G4 free-VRAM cap
+[`archive/work/fit-slab-accounting/README.md`](../../archive/work/fit-slab-accounting/README.md) §15.9: the G4 free-VRAM cap
 refuses the op-offload H2D staging ring on the maintainer's field config and costs ~16 % prefill.  The
 maintainer's framing: *the ring is our construction; it should live inside the movable-boundary slab,
 where we control placement, instead of fighting the general HIP allocator.*
@@ -145,6 +145,6 @@ growth entirely, and the top-of-arena placement only works until the work region
 * `ggml/src/ggml-cuda/ggml-cuda-vmm.h:63`: `ggml_cuda_slab_arena_alloc_transient` (declared, undefined).
 * `ggml/src/ggml-cuda/common.cuh`: `h2d_stage_buffer` (`cudaMalloc` at ~`:1985`), `fattn_stage_try_get`,
   `optional_alloc_within_free_cap`.
-* `wip/fit-slab-accounting/README.md` §15.9 (the §5.5 finding) and §12.1/§12.3 (G3/G4).
+* `archive/work/fit-slab-accounting/README.md` §15.9 (the §5.5 finding) and §12.1/§12.3 (G3/G4).
 * `archive/work/moe-cache-autosize/` (`ARENA-UB-TENSION.md` §13/§14) — the movable-boundary slab design.
 * `ENVIRONMENT.md` §1.3 (`GGML_CUDA_SLAB*`), §2 (`GGML_SCHED_STAGE*`).

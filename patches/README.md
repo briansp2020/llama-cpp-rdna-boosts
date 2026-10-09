@@ -4,7 +4,7 @@
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
 > **Current release `v16-a55e952b8-r38` (2026-10-09) -- `fit-slab-accounting` folded into block 06 (plus the G4 FA-staging cap in block 15):**
-> promotes `wip/fit-slab-accounting/` through the block-06 path: **G1/G2** `--fit` reserves an explicit
+> promotes `archive/work/fit-slab-accounting/` through the block-06 path: **G1/G2** `--fit` reserves an explicit
 > `MOE_EXPERT_CACHE_MIB`/the auto floor and the slab headroom (the G2 getter now reports the configured
 > headroom whenever `GGML_CUDA_SLAB` is not disabled -- the r37 `slab_enabled()` is `env_on &&
 > g_slab_armed`, false at fit time); **G3** the slab reserve is sized from the post-slab need (`headroom +
@@ -21,7 +21,7 @@
 > the follow-up `wip/slab-ring-region/` (TODO #49).  Canonical block-15 tip
 > `849c041613421ee807054d8a4254171b6a04ab59`, net tree
 > `888564105e13dd73fefda755ea5b055d65011c16`; strict **16/16** `git am` (`validate-set.sh` green).  Full
-> record: `WORKLOG.md` r38 and `wip/fit-slab-accounting/README.md` §15.
+> record: `WORKLOG.md` r38 and `archive/work/fit-slab-accounting/README.md` §15.
 >
 > **Previous release `v16-a55e952b8-r37` (2026-10-09) -- issues #118/#120: the slab and the compute chunk are armed only for host-expert models:**
 > `ggml_cuda_slab_enabled()` was default-ON for every HIP model with no MoE gate, so a dense model (and a

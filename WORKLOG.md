@@ -5,7 +5,7 @@
 **Release `v16-a55e952b8-r38`** (base `a55e952b8`, canonical block-15 tip
 `849c041613421ee807054d8a4254171b6a04ab59`, net tree
 `888564105e13dd73fefda755ea5b055d65011c16`; `n_blocks` 16; `validate-set.sh` green -- strict 16/16
-`git am`, reconstructed tree == `release.json`).  This promotes the `wip/fit-slab-accounting/` revival
+`git am`, reconstructed tree == `release.json`).  This promotes the `archive/work/fit-slab-accounting/` revival
 (2026-10-09) through the block-06 path.  `patches/` was regenerated from a canonical fork rebuilt at the
 base (`scripts/apply-all.sh`) -- **do not hand-edit**.
 
@@ -35,7 +35,7 @@ base (`scripts/apply-all.sh`) -- **do not hand-edit**.
 **Gates on the final tree (gfx1201):** dense `Qwen3.5-4B-Q8_0` `-sm tensor` golden **`1c5d32ac537d`**;
 `scripts/gate-prefill-logits.sh` **PASS** mean KLD **0.000707**, same-top-p **98.755 %**;
 `test-backend-ops -o MUL_MAT_ID` **931/931**; width purity `none == n1 == n3 == n7` =
-**`010f816e376c`** (2-GPU Flash-Next `-ncmoe 48`).  Full validation record: `wip/fit-slab-accounting/`
+**`010f816e376c`** (2-GPU Flash-Next `-ncmoe 48`).  Full validation record: `archive/work/fit-slab-accounting/`
 `§15.7-§15.9`; gfx1100 `fingon` record in `§15.8`.
 
 **Accepted trade (maintainer decision).**  The G4 default (50 %) refuses a ~990 MiB H2D-ring growth on

@@ -36,7 +36,7 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 slab, so it competes with the non-routable post-slab consumers (hipBLASLt Tensile code objects +
 workspace, the MTP draft buffer, compute-buffer growth) for the one `GGML_CUDA_SLAB_HEADROOM_MIB`
 region.  The G4 cap (`GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`) guards that region by refusing the ring,
-which cost **~16 % prefill** on the maintainer's field config (§5.5, `wip/fit-slab-accounting/README.md`
+which cost **~16 % prefill** on the maintainer's field config (§5.5, `archive/work/fit-slab-accounting/README.md`
 §15.9).  The ring is our construction and the slab is exactly the mechanism for placing our own internal
 segments, so it should live **inside** the slab and stop consuming the outside headroom.
 
@@ -62,9 +62,9 @@ it read the unfilled copy -> NaN in `t_h_nextn`.
 
 **Fix:** in `ggml_backend_sched_compute_splits`, count the `MUL_MAT_ID` consumers of the input copy; when
 there is more than one, skip both the cache takeover and the pruned fill and copy the whole table.
-Patch `wip/fit-slab-accounting/g7-multi-consumer-fill.patch` (46 lines, `ggml/src/ggml-backend.cpp`, sha256
+Patch `archive/work/fit-slab-accounting/g7-multi-consumer-fill.patch` (46 lines, `ggml/src/ggml-backend.cpp`, sha256
 `a041a4d8b4fc81c83ce2b0101e9336a088a3493e04ce4b3a9da815a81b3b9b84`).  Full handover, evidence and gates:
-`wip/fit-slab-accounting/README.md` §13.6.
+`archive/work/fit-slab-accounting/README.md` §13.6.
 
 **Gates PASS:** acceptance **0.57353** for `-ncmoe {44,48,99}` (0 NaN); dense 4B `1c5d32ac537d`;
 prefill-logit KLD **0.000707 / 98.755 %**; `MUL_MAT_ID` 931/931; 2-GPU GSQ r5 repro acceptance **0.72727**,
@@ -81,7 +81,7 @@ wide export consumer that reads the same unfilled copy -> NaN in `t_h_nextn`.  T
 fix (`ggml-backend.cpp:1826`) is present but insufficient for this 1-GPU/`-sm layer`/`n_copies==1` config.
 **Next:** prove the exact skip (ids-not-ready at staging time vs the copy-pointer alias map surviving
 across graphs), then pick a fix from the four candidates.  Full handover, reproducer and gates:
-`wip/fit-slab-accounting/README.md` §13.
+`archive/work/fit-slab-accounting/README.md` §13.
 
 ### 47. Bring the MoE arena budget and slab headroom into `--fit` (G1 + G2)
 
@@ -94,13 +94,13 @@ loader now distributes each `exps` tensor across the layer Meta device's simple 
 **both** devices (`20108 / 20110` MiB) and the post-prefill drop/rearm loop covers device 1.  Decisions:
 the MIB is a **cap** (built arena must be 95-100 % of it), **G2 gate = b1**, and the **full §5.1-§5.7
 matrix must pass before release** (no-abort MIB sweep, dense golden `1c5d32ac537d`, `GGML_CUDA_SLAB=0`
-zeroes G2 are green).  Record + arms: `wip/fit-slab-accounting/README.md` §14.4; combined current-state
+zeroes G2 are green).  Record + arms: `archive/work/fit-slab-accounting/README.md` §14.4; combined current-state
 patch `fit-slab-r37-all-wip.patch`.  **Ordered release plan: README §15** (purity/determinism first, then
 `ENVIRONMENT.md`, the full §5.1-§5.7 matrix, `fingon`, and promotion).
 
 **DELIVERED in `v16-a55e952b8-r38` (block 06).**  `--fit` now reserves the MoE-arena budget and the
 slab headroom; the auto floor under `-sm tensor` no longer corrupts, and per-device host-expert
-accounting covers every device.  Record: `wip/fit-slab-accounting/README.md` §14.4/§15; `WORKLOG.md`
+accounting covers every device.  Record: `archive/work/fit-slab-accounting/README.md` §14.4/§15; `WORKLOG.md`
 2026-10-09 (r38).  *(Phase 1 history, kept for context.)*
 
 **Opened 2026-10-07; Phase 1 implemented then PARKED 2026-10-07.**  `--fit` is not a single VRAM planner for
@@ -112,10 +112,10 @@ Phase 1 (G1 + G2 + the tensor-split plumbing they need) was **implemented, built
 G2 (headroom) and G1 (explicit MIB) are safe, but newly enabling the **auto floor** under `-sm tensor`
 reproducibly corrupts (2/2; `!!!!!!!!` output, arena thrash) — a latent layout-dependent bug the fix
 exposes.  **PARKED** by the maintainer; the patch + full matrix + the open root-cause are in
-`wip/fit-slab-accounting/PHASE1-ATTEMPT.md`.  `patches/` was never touched.  **Do NOT** recommend
+`archive/work/fit-slab-accounting/PHASE1-ATTEMPT.md`.  `patches/` was never touched.  **Do NOT** recommend
 disabling hipBLASLt (corrupt at a thin headroom, stunted at 4096).  To revisit: ship the safe subset
 (headroom + explicit MIB, auto floor off under `-sm tensor`) or root-cause the corruption first.
-Full handover: `wip/fit-slab-accounting/README.md`.
+Full handover: `archive/work/fit-slab-accounting/README.md`.
 
 ### 46. Re-cut PR #106 patch 0002 (data-pointer graph key) against the slab
 
