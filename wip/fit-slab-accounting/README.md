@@ -1571,11 +1571,17 @@ a WIP one.
 | arm | prefill t/s | cap refusal |
 |---|---:|---|
 | stock r37 (no cap) | **922.0 / 923.3 / 923.6** | none |
-| WIP, G4 default 50 % | **767.4 / 767.7 / 768.5** | refuses **990 MiB** at 1624 MiB free |
+| WIP, G4 default 50 % | **767.4 / 767.7 / 768.5** | refuses **990 MiB** ring growth at 1624 MiB free |
+| WIP, `GGML_SCHED_STAGE=0` (ring off) | 730.6 | none (ring disabled) |
+| WIP, `GGML_SCHED_STAGE_MAX_MB=512` | 749.1 | none (budget < 990) |
 | WIP, `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT=0` | **913.0 / 914.7** | none |
 | WIP, `...=1` | 721.1 | refuses; serial fallback |
 
-The default 50 % cap refuses a 990 MiB optional allocation once the slab has left only ~1.6 GiB free,
+The refused allocation is the **op-offload H2D staging ring** (`h2d_stage_buffer`, issue #117), not the
+FA staging arena: `new_total = h2d_stage_total - old_size + new_size` with `new_size = upload + 512` and
+ring depth `GGML_SCHED_STAGE_SLOTS` = 8 (so 990 MiB is the ring *total* after growth, within its auto
+budget).  `GGML_SCHED_STAGE=0` and `GGML_SCHED_STAGE_MAX_MB=512` both remove the shared warning, and
+`fattn_stage_try_get` never logs its own message - so the FA staging is not involved.  The default 50 % cap refuses a 990 MiB optional allocation once the slab has left only ~1.6 GiB free,
 and the fallback costs **~16 % prefill** on the maintainer's own field config (decode unchanged).  With
 the cap off the WIP matches stock (~914 vs ~923, within noise).  On `fingon` the same default was
 *neutral-to-faster* (§15.8), so the effect is config-dependent - but a 16 % field prefill regression is
