@@ -1,5 +1,48 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-09 -- G7: the MoE expert cache corrupts a wide MTP-export consumer (FIX); G1/G2 retest
+
+**WIP campaign** `wip/fit-slab-accounting/`; `patches/` untouched.  One session on the gfx1201 box,
+`~/llama.cpp` at the r37 tree `322a77273531f88250ed01bc9ef6a64a74227028` with the revival patch (combined
+current-state artifact `wip/fit-slab-accounting/fit-slab-r37-all-wip.patch`, sha256 `4130952f...`).
+
+### G7 -- correctness fix (root-caused, gated)
+
+TODO #48.  `--spec-type draft-mtp` on Flash-Next + separate `-md` head collapsed draft acceptance to 0
+with NaN draft logits while the target stayed coherent; `MOE_EXPERT_CACHE_MIB=0` was the only escape.
+The handover blamed the `moe_cache_take_over` alias; instrumentation proved the skip is elsewhere:
+
+* the wide export never redirects to the arena (`moe_cache_get_table` declines every `dst->ne[2] > band`);
+* the failing graph is a 15-row prefill chunk whose `blk.47` weight has **two `MUL_MAT_ID` consumers in the
+  SAME split** (the 0-row gathered logits tail + the 15-row unmasked MTP export).  The scheduler's
+  first-match node search picked the 0-row tail, hit `ggml_nelements(ids) == 0 -> continue`, and skipped
+  the fill; the export read the never-filled copy -> NaN in `t_h_nextn`.
+
+**Fix** (`ggml/src/ggml-backend.cpp`, +13/-5): count the `MUL_MAT_ID` consumers of the split's input copy;
+when > 1, skip the cache takeover and the pruned fill and let the general path copy the whole table
+(picking the widest consumer aborts -- the export's ids are not ready at staging).  Pure decode has one
+1-row consumer, so the fast path is untouched.  Patch
+`wip/fit-slab-accounting/g7-multi-consumer-fill.patch` (sha256 `a041a4d8...`).
+
+Gates all PASS: `-ncmoe {44,48,99}` acceptance 0.57353 (0 NaN); dense 4B `1c5d32ac537d`; prefill-logit
+KLD 0.000707 / same-top-p 98.755 %; `MUL_MAT_ID` 931/931; 2-GPU GSQ `MOE_EXPERT_CACHE_MIB=2048` r5 repro
+acceptance 0.72727, 0 NaN.
+
+### G1/G2 -- retest (auto floor clean on r37)
+
+TODO #47.  Re-cut the Phase 1 patch onto r37 (applies cleanly; its G2 CUDA getter was inert because
+r37's `ggml_cuda_slab_enabled()` is `env_on && g_slab_armed`, false at fit time -- fixed in
+`wip/fit-slab-accounting/phase1-r37-g2-getter.patch`).  The Phase 1 `-sm tensor` auto-floor corruption
+**does not reproduce**: G2-only, G1-only (`MOE_EXPERT_CACHE_MIB=8192`) and the auto floor (2/2 runs) are
+all coherent with 0 `////`, no `moe_cache_evict_slab_range`/`rearm`, stable arenas.  §5 sample green
+(no-abort MIB {unset,0,4096,8192,16384}, dense `--fit` golden, `GGML_CUDA_SLAB=0` zeroes G2).  Open: the
+host-expert map attributes all 56762 MiB to device 0 (G1 reserves device 0 only; G2 headroom both), the
+built arena sits 0.3-1.6 % under the requested budget, the full §5.1-§5.7 matrix, and the G2 b1-vs-b2
+decision.  Detail: `wip/fit-slab-accounting/README.md` §13.6/§14.4.
+
+**Decision:** G7 is a delivery correctness fix, blocked on the maintainer's go-ahead before it reaches
+`patches/` (promote through block 06); the G1/G2 re-cut stays WIP pending the §5 matrix.
+
 ## 2026-10-09 (r37) -- issues #118/#120: the movable-boundary slab and the compute chunk are armed only for host-expert models
 
 **Release** `v16-a55e952b8-r37`, same fork point `a55e952b8`; canonical block-15 tip

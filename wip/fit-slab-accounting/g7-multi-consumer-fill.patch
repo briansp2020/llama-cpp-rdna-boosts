@@ -1,0 +1,46 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 0543a3676..51427c4c4 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2654,11 +2654,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 // split's first node.  A cache-merged split holds the layer's routed gate/up/down
+                 // together, so `nodes[0]` is the gate and only the first input would ever be hooked.
+                 ggml_tensor * node = nullptr;
++                int node_n_consumers = 0;
+                 for (int ni = 0; ni < split->graph.n_nodes; ni++) {
+                     ggml_tensor * cand = split->graph.nodes[ni];
+                     if (cand->op == GGML_OP_MUL_MAT_ID && cand->src[0] == input_cpy) {
+-                        node = cand;
+-                        break;
++                        // A split can hold more than one MUL_MAT_ID consumer of the same expert
++                        // weight: qwen4exp's 0-row gathered logits tail sits next to the full-row
++                        // unmasked MTP export.  Either consumer's routing is not enough: the tail's
++                        // ids are empty (nothing is staged) and the export's ids are computed by
++                        // this very split (not ready at staging time, so they cannot drive a pruned
++                        // fill and the cache must not take the copy over).  Count them and let the
++                        // general input path copy the whole table for every consumer.
++                        node_n_consumers++;
++                        if (node == nullptr) {
++                            node = cand;
++                        }
+                     }
+                 }
+                 // wip/moe-expert-cache (session 7) takeover fast path: an identity table reads the
+@@ -2669,7 +2679,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 // decode/verify band: prefill keeps the staged upload and its direct-reading MMQ
+                 // fusions (which are not cache-aware).  A device-remap takeover records the pair for
+                 // the deferred promotion pass below.
+-                if (node != nullptr && node->ne[2] <= sched_moe_cache_band(split_backend) &&
++                if (node != nullptr && node_n_consumers == 1 && node->ne[2] <= sched_moe_cache_band(split_backend) &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                     ggml_backend_buffer_is_host(input->buffer) &&
+                     split_backend->iface.moe_cache_take_over != NULL) {
+@@ -2704,7 +2714,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     }
+                 }
+ 
+-                if (node != nullptr &&
++                if (node != nullptr && node_n_consumers == 1 &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                     ggml_backend_buffer_is_host(input->buffer)) {
+ 

@@ -1122,6 +1122,47 @@ the copy's `.data` was redirected).
 * The campaign's arena/accounting work is orthogonal: this is a **correctness** bug in the cache's
   shared-copy takeover.  It should be fixed before any cache/slab default is promoted.
 
+### 13.6 Resolution (2026-10-09) — the exact skip, the fix, the gates
+
+**The handover's `moe_cache_take_over` alias hypothesis is not what fires on this box.**  Instrumenting
+the scheduler (`ggml-backend.cpp`), the cache hooks and the `MUL_MAT_ID` consumer redirect on the 1-GPU
+reproducer showed:
+
+* the **wide export op never redirects to the arena**: `moe_cache_get_table` returns false for every
+  `dst->ne[2] > band` op, so the export reads the copied table, not an aliased arena;
+* the failing graph is a **15-row prefill chunk** whose `blk.47` weight has **two `MUL_MAT_ID` consumers in
+  the SAME split**: the 0-row gathered logits tail and the 15-row unmasked MTP export.  The scheduler's
+  single-consumer node search picked the *first* (the 0-row tail), then hit
+  `ggml_nelements(ids_tensor) == 0 -> continue` and **skipped the fill entirely**.  The export op in the
+  same split read the never-filled (`input_cpy`) copy -> NaN in `t_h_nextn`.  `MOE_EXPERT_CACHE_MIB=0`
+  escapes it because the host-weight path then stages the whole table instead of the pruned fill;
+  `GGML_SCHED_DEBUG=2` printed `ncons=2 first_ne2=0` and the per-consumer `ZERO_IDS skip` for all three
+  `blk.47` weights in the graph whose `t_h_nextn` was 100 % non-finite.  The wide prefill (42-row) graph
+  keeps the two consumers in *separate* splits and full-copies correctly (the r5 path).
+
+**Fix (candidate 4, "don't skip a copy with a second consumer").**  In `ggml_backend_sched_compute_splits`
+count the `MUL_MAT_ID` consumers of the input copy in the split; when there is more than one, skip BOTH the
+cache takeover fast path and the pruned fill and let the general input path copy the whole table.  The wide
+consumer's routing is not ready at staging time (selecting the widest consumer aborts with the r5 record's
+`GGML_ASSERT(id >= 0 && id < n_expert)`), so a full copy is the only safe fill.  Pure decode has a single
+1-row consumer, so the fast path is unchanged.  Patch:
+[`g7-multi-consumer-fill.patch`](g7-multi-consumer-fill.patch) (46 lines, `ggml/src/ggml-backend.cpp`;
+sha256 `a041a4d8b4fc81c83ce2b0101e9336a088a3493e04ce4b3a9da815a81b3b9b84`).
+
+**Gates (all PASS, 2026-10-09, gfx1201 / ROCm 7.14.1):**
+
+| gate | result |
+|---|---|
+| reproducer, `-ncmoe {44,48,99}`, 1 GPU | acceptance **0.57353 (39/68)** in all three, **0** NaN; `MOE_EXPERT_CACHE_MIB=0` reference 0.588 |
+| dense `Qwen3.5-4B-Q8_0` `-sm tensor` | `1c5d32ac537d` (golden) |
+| `scripts/gate-prefill-logits.sh` | PASS mean KLD **0.000707**, same-top-p **98.755 %** (r37-identical) |
+| `test-backend-ops -o MUL_MAT_ID` | **931/931** |
+| r5 archive repro, 2 GPU GSQ-IQ3_XXS + shared `Q8_0` MTP, `MOE_EXPERT_CACHE_MIB=2048`, 5246-token prose | acceptance **0.72727 (16/22)**, 0 NaN, no stale-alias/abort |
+| 2 GPU `-ncmoe 48 -ub 2048 -ctk/-ctv q8_0` short repro | acceptance 0.917, finite draft probs |
+
+This is a **delivery correctness fix**: promote it through the block-06 path (the scheduler half of the MoE
+expert cache) before any release; `patches/` is untouched by this campaign.
+
 ---
 
 ## 14. G1/G2 re-opened for retest (2026-10-09, post-r37)
@@ -1183,3 +1224,60 @@ The **runtime** `-sm tensor` path is healthy today without the floor: 2-GPU `Qwe
 Either (a) the auto floor is re-enabled under `-sm tensor` with the §5 matrix green, or (b) the safe
 subset ships and the auto floor stays a documented `-sm layer`-only feature with the latent bug filed.
 Do **not** re-park without recording which arm reproduced and why.
+
+### 14.4 Retest result (2026-10-09, r37 + revival + G7)
+
+**The auto floor under `-sm tensor` does NOT reproduce the Phase 1 corruption on r37** (3 clean arms +
+2 auto-floor repeats).  The Phase 1 patch applies to the current tree with offsets; its G2 getter was
+re-cut first.
+
+**Re-cut finding — G2 was inert on r37.**  The Phase 1 CUDA getter was
+`return ggml_cuda_slab_enabled() ? ggml_cuda_slab_headroom_bytes() : 0;`, but r37 makes
+`ggml_cuda_slab_enabled()` return `env_on && g_slab_armed` and the slab is armed only by the MoE
+preflight, **after** `--fit`.  So the getter returned 0 at fit time and G2 reserved nothing (verified: the
+G2-only targets stayed at `free - 1024` and the arena was unchanged).  The re-cut getter reports the
+configured headroom whenever `GGML_CUDA_SLAB` is not disabled, deferring the "does this device need it"
+decision to the fit's `host_total > 0` gate.
+
+**Arms** (2 GPU, `Qwen3.8-Flash-Next UD-IQ4_XS`, `-sm tensor -ncmoe 48`, `--fit on` with `-ngl` unset,
+5246-token prose prompt, `--spec-type none`, greedy, `-c 8192`):
+
+| arm | device-0 target | arena | `////` | result |
+|---|---:|---:|---:|---|
+| G2-only (`MIN_RES_PCT=0`) | 28300 MiB | 22644 MiB | 0 | coherent |
+| G1-only (`MOE_EXPERT_CACHE_MIB=8192`) | 20108 MiB | 8119 MiB | 0 | coherent |
+| auto floor (default 18 %), run 1 | 18082 MiB | 22447 MiB | 0 | coherent |
+| auto floor (default 18 %), run 2, 15 s gap | 18082 MiB | 22447 MiB | 0 | coherent |
+| `MOE_EXPERT_CACHE_MIB=0` (reference) | — | — | 0 | coherent |
+
+No `moe_cache_evict_slab_range`, no `moe_cache_rearm`, no arena thrash in the auto arms; the per-device
+arenas are stable.  The Phase 1 corruption was `////` **plus** arena thrash at the same class of config,
+so r37's slab changes (slab born after the weights, adaptive reserve, optional-allocation cap, split-slice
+guard) are the difference.
+
+**§5 sample (all PASS):** no-abort arms `MOE_EXPERT_CACHE_MIB {unset, 0, 4096, 8192, 16384}` all exit 0
+and coherent; dense `Qwen3.5-4B-Q8_0` `--fit on` gives `1c5d32ac537d` with no reservation line
+(`host_total == 0`, dense untouched); `GGML_CUDA_SLAB=0` makes the G2 headroom term 0 (targets return to
+`free - 1024 - MIB`).  Full §5.1-§5.7 (the §2.2 wide-prefill abort and the §5.7 staging matrix in
+particular) were **not** run this session.
+
+**Findings / open questions for the maintainer:**
+
+1. **G1 is device-0-only in this config.**  `host_experts` has one entry (all **56762.5 MiB** attributed
+   to device 0), so the explicit `MOE_EXPERT_CACHE_MIB` and the auto floor are reserved only on device 0;
+   device 1 gets the G2 headroom only.  The map is populated from `ggml_backend_buft_get_device(buft)`
+   (`llama-model-loader.cpp:1436`), which returns one device here.  Whether the loader should key the
+   host bytes per tensor-split device (or the fit should spread the budget) is unresolved.  The G2
+   headroom (the crash fix) **is** applied to both devices.
+2. **The built arena is slightly below the requested budget** (4096 -> 4031.8 MiB, 8192 -> 8118.7,
+   16384 -> 16331.9).  §5.2's "arena >= requested" as literally written would fail by 0.3-1.6 %; the
+   shortfall looks like per-table slot rounding, not a missing reservation.  Decide whether the gate is
+   `>= requested - epsilon` or the budget is a cap.
+3. **G2 gate b1 vs b2.**  The re-cut reserves the headroom only when the model has host experts (the
+   fit's `host_total > 0` gate) — **b1**.  b2 (every slab device) would change dense `--fit` margins for
+   no crash class we have; recommend **b1** unless a dense thin-headroom repro is found.
+
+**Artifacts:** the Phase 1 patch (r26 base) plus the combined current-state patch
+[`fit-slab-r37-all-wip.patch`](fit-slab-r37-all-wip.patch) (revival + G7 + Phase 1 re-cut; sha256
+`4130952fc2b42db0444bca45ff8f2543813e2fecc8da0d8dfd415b39ccd347c0`); G2 getter delta in
+[`phase1-r37-g2-getter.patch`](phase1-r37-g2-getter.patch).

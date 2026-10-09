@@ -32,7 +32,25 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 
 ### 48. The MoE expert cache corrupts a wide MTP-export consumer (G7) — CORRECTNESS
 
-**Opened 2026-10-09; needs its own session.**  `--spec-type draft-mtp` on Flash-Next (separate `-md`
+**ROOT-CAUSED, FIXED, GATED 2026-10-09 (WIP patch).**  The handover's alias/take-over hypothesis was
+wrong: the skip is in the SAME split.  On the 1-GPU reproducer, `blk.47`'s weight has **two `MUL_MAT_ID`
+consumers in one split** (the 0-row gathered logits tail and the 15-row unmasked MTP export); the scheduler
+picked the first (0-row), hit `ggml_nelements(ids) == 0 -> continue`, and never filled the copy the export
+reads.  The wide export never redirects to the arena (`moe_cache_get_table` declines every `ne[2] > band`), so
+it read the unfilled copy -> NaN in `t_h_nextn`.
+
+**Fix:** in `ggml_backend_sched_compute_splits`, count the `MUL_MAT_ID` consumers of the input copy; when
+there is more than one, skip both the cache takeover and the pruned fill and copy the whole table.
+Patch `wip/fit-slab-accounting/g7-multi-consumer-fill.patch` (46 lines, `ggml/src/ggml-backend.cpp`, sha256
+`a041a4d8b4fc81c83ce2b0101e9336a088a3493e04ce4b3a9da815a81b3b9b84`).  Full handover, evidence and gates:
+`wip/fit-slab-accounting/README.md` §13.6.
+
+**Gates PASS:** acceptance **0.57353** for `-ncmoe {44,48,99}` (0 NaN); dense 4B `1c5d32ac537d`;
+prefill-logit KLD **0.000707 / 98.755 %**; `MUL_MAT_ID` 931/931; 2-GPU GSQ r5 repro acceptance **0.72727**,
+0 NaN.  **Next:** promote through block 06 (the scheduler half of the cache) — `patches/` is untouched by
+this campaign.
+
+*(Original handover, kept for context.)*  `--spec-type draft-mtp` on Flash-Next (separate `-md`
 head) can collapse draft acceptance to **0** with **NaN** draft logits while the target text stays
 coherent.  Isolated to the cache: `MOE_EXPERT_CACHE_MIB=0` gives acceptance 0.588 and no NaN;
 `GGML_OP_OFFLOAD_MIN_BATCH=100000` does not help; `-ncmoe 44` is fine, `-ncmoe 48` NaNs.  The qwen4exp
@@ -46,15 +64,17 @@ across graphs), then pick a fix from the four candidates.  Full handover, reprod
 
 ### 47. Bring the MoE arena budget and slab headroom into `--fit` (G1 + G2)
 
-**RE-OPENED 2026-10-09 for retest; sequence AFTER the G7 MTP fix (#48).**  The r37 `-sm tensor` changes
-(slab armed only for host-expert models and born after the weights, the G5 split-slice guard, the
-cache/slab behaviour) may have altered the Phase 1 corruption picture, so the conclusion has to be
-re-established.  **Verified in r37:** the fit still cannot see the host-expert bytes under `-sm tensor`
-(`llama_model_moe_host_expert_bytes` reads the Meta device -> 0, the Phase 1 map-keyed plumbing is
-absent), so the auto floor is dead (`-sm layer` prints the floor line, `-sm tensor` does not); G1/G2 are
-unchanged.  Retest plan + the three separable arms (G2-only / G1-only / auto-floor) in
-`wip/fit-slab-accounting/README.md` §14.  Ship the safe subset (G2 + G1 + plumbing, auto floor off under
-`-sm tensor`) if the corruption reproduces.
+**RETESTED 2026-10-09 (post-G7, r37 + revival).**  The Phase 1 patch applies to the current tree with
+offsets; **the auto floor under `-sm tensor` no longer corrupts** (2/2 auto runs coherent, no arena
+thrash — the Phase 1 `////` + `moe_cache_rearm` is gone).  Two re-cut findings: the G2 CUDA getter was
+**inert on r37** (`ggml_cuda_slab_enabled()` is `env_on && g_slab_armed`, false at fit time), fixed in
+`wip/fit-slab-accounting/phase1-r37-g2-getter.patch`; and the host-expert map attributes all 56762 MiB to
+device 0, so G1/the auto floor reserve only on device 0 while the G2 headroom applies to both.  §5 sample
+all green (no-abort MIB sweep, dense golden `1c5d32ac537d` untouched, `GGML_CUDA_SLAB=0` zeroes G2); the
+full §5.1-§5.7 matrix and the G2 b1-vs-b2 decision remain open.  Record + arms:
+`wip/fit-slab-accounting/README.md` §14.4; combined current-state patch `fit-slab-r37-all-wip.patch`.
+
+*(Phase 1 history, kept for context.)*
 
 **Opened 2026-10-07; Phase 1 implemented then PARKED 2026-10-07.**  `--fit` is not a single VRAM planner for
 ROCm: (G1) an explicit `MOE_EXPERT_CACHE_MIB` is invisible to the fit margin, so the context is sized as

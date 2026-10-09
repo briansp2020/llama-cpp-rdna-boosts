@@ -1,0 +1,823 @@
+diff --git a/common/fit.cpp b/common/fit.cpp
+index f7cc4cf3a..e27677e16 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -27,6 +27,62 @@ class common_params_fit_exception : public std::runtime_error {
+     using std::runtime_error::runtime_error;
+ };
+ 
++// wip/fit-slab-accounting (Phase 1): the per-device reservation --fit must hold for the MoE expert cache
++// and the movable-boundary slab.  See wip/fit-slab-accounting/README.md.
++namespace {
++
++struct common_fit_cache_reserve {
++    bool    cache_auto    = true;   // MOE_EXPERT_CACHE_MIB unset
++    int64_t mib_bytes     = 0;      // explicit MOE_EXPERT_CACHE_MIB, in bytes
++    int64_t min_mib_bytes = 0;      // MOE_EXPERT_CACHE_MIN_MIB, in bytes
++    int     min_res_pct   = 18;     // MOE_EXPERT_CACHE_MIN_RES_PCT
++
++    static common_fit_cache_reserve from_env() {
++        constexpr int64_t MiB = 1024 * 1024;
++        common_fit_cache_reserve r;
++        const char * mib_env = getenv("MOE_EXPERT_CACHE_MIB");
++        if (mib_env != nullptr && mib_env[0] != '\0') {
++            r.cache_auto = false;
++            r.mib_bytes  = (int64_t) atoll(mib_env) * MiB;
++        }
++        const char * min_mib_env = getenv("MOE_EXPERT_CACHE_MIN_MIB");
++        const char * min_res_env = getenv("MOE_EXPERT_CACHE_MIN_RES_PCT");
++        r.min_mib_bytes = min_mib_env ? (int64_t) atoi(min_mib_env) * MiB : 0;
++        r.min_res_pct   = min_res_env ? atoi(min_res_env) : 18;
++        return r;
++    }
++
++    // The --fit margin for a device that owns `host_bytes` of host-resident experts, over the base
++    // fit_params_target: max(base, slab headroom) + arena budget.  The headroom is additive-safe because
++    // the arena lives INSIDE the slab while the headroom stays OUTSIDE it (both draw on the same free
++    // VRAM); `max` rather than `+` avoids double-counting a large user target.
++    int64_t margin(ggml_backend_dev_t dev, size_t host_bytes, int64_t base) const {
++        int64_t m = base;
++        const int64_t headroom = (int64_t) ggml_backend_dev_slab_headroom_bytes(dev);
++        if (headroom > m) {
++            m = headroom;
++        }
++        if (host_bytes == 0) {
++            return m;
++        }
++        int64_t arena;
++        if (!cache_auto) {
++            arena = mib_bytes;  // G1: the explicit budget is reserved verbatim
++        } else {
++            arena = min_mib_bytes;
++            if (min_res_pct > 0) {
++                const int64_t res = (int64_t) host_bytes * min_res_pct / 100;
++                if (res > arena) {
++                    arena = res;
++                }
++            }
++        }
++        return m + arena;
++    }
++};
++
++} // namespace
++
+ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+         const char * path_model,
+         const llama_model_params * mparams,
+@@ -36,7 +92,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+         uint32_t & hp_n_ctx_train,
+         uint32_t & hp_n_expert,
+         ggml_log_level log_level,
+-        std::vector<size_t> * host_expert_bytes_out = nullptr) {
++        std::vector<size_t> * host_expert_bytes_out = nullptr,
++        std::vector<std::pair<ggml_backend_dev_t, size_t>> * host_experts_out = nullptr) {
+     struct user_data_t {
+         struct {
+             ggml_log_callback callback;
+@@ -152,6 +209,21 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+         }
+     }
+ 
++    // wip/fit-slab-accounting (Phase 1): the same host-expert bytes, but keyed by the REAL device that
++    // owns the buffer.  `model->devices` is the scheduler's Meta wrapper under -sm tensor, so the
++    // index-based lookup above sees 0 there; --fit needs the real devices to reserve per device.
++    if (host_experts_out != nullptr) {
++        host_experts_out->clear();
++        const int32_t n_host = llama_model_moe_host_expert_dev_count(model);
++        for (int32_t i = 0; i < n_host; i++) {
++            ggml_backend_dev_t dev = nullptr;
++            size_t bytes = 0;
++            if (llama_model_moe_host_expert_dev(model, i, &dev, &bytes) && bytes > 0) {
++                host_experts_out->emplace_back(dev, bytes);
++            }
++        }
++    }
++
+     common_memory_breakdown_print(ctx);
+ 
+     llama_free(ctx);
+@@ -267,7 +339,8 @@ static void common_params_fit_impl(
+ 
+     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
+     std::vector<size_t> host_expert_bytes;
+-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &host_expert_bytes);
++    std::vector<std::pair<ggml_backend_dev_t, size_t>> host_experts;
++    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &host_expert_bytes, &host_experts);
+ 
+     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
+     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
+@@ -296,47 +369,44 @@ static void common_params_fit_impl(
+         }
+     }
+ 
+-    // wip/moe-cache-autosize (policy c): when host experts are in use and the arena size was NOT set
+-    // explicitly, reserve a floor for the MoE expert cache in --fit's per-device margin.  --fit then
+-    // sizes the context around it, and the arena takes any remaining free device memory afterwards.
+-    // An explicit MOE_EXPERT_CACHE_MIB is used verbatim (no reservation); a fully resident model (no
+-    // host expert tensor) is untouched.
+-    if (nd > 0) {
+-        const char * mib_env    = getenv("MOE_EXPERT_CACHE_MIB");
+-        const bool   cache_auto = (mib_env == nullptr || mib_env[0] == '\0');
+-        int64_t host_total = 0;
+-        for (size_t id = 0; id < host_expert_bytes.size(); id++) {
+-            host_total += (int64_t) host_expert_bytes[id];
+-        }
+-        if (cache_auto && host_total > 0) {
+-            const char * min_mib_env = getenv("MOE_EXPERT_CACHE_MIN_MIB");
+-            const char * min_res_env = getenv("MOE_EXPERT_CACHE_MIN_RES_PCT");
+-            const int    min_mib     = min_mib_env ? atoi(min_mib_env) : 0;
+-            const int    min_res_pct = min_res_env ? atoi(min_res_env) : 18;
+-            int64_t floor_total = 0;
+-            for (size_t id = 0; id < nd; id++) {
+-                int64_t floor_b = min_mib > 0 ? (int64_t) min_mib * MiB : 0;
+-                if (min_res_pct > 0 && host_expert_bytes[id] > 0) {
+-                    const int64_t res_b = (int64_t) host_expert_bytes[id] * min_res_pct / 100;
+-                    if (res_b > floor_b) {
+-                        floor_b = res_b;
+-                    }
+-                }
+-                if (floor_b > 0) {
+-                    margins[id] += floor_b;
+-                    floor_total += floor_b;
+-                }
+-            }
+-            const char * reserve_env = getenv("MOE_EXPERT_CACHE_RESERVE_MIB");
+-            const int    reserve_mib = reserve_env ? atoi(reserve_env) : 1024;
+-            LOG_WRN("%s: -ncmoe is active and MOE_EXPERT_CACHE_MIB is unset: reserving a floor of %.0f MiB "
+-                    "for the MoE expert cache arena (%.0f%% of the %.0f MiB of host experts; min %d MiB/device) "
+-                    "before fitting the context.  --fit sizes the context around it, then the arena takes any "
+-                    "remaining free device memory (keeping MOE_EXPERT_CACHE_RESERVE_MIB=%d MiB per device).  "
+-                    "Set MOE_EXPERT_CACHE_MIB to size the arena explicitly.\n",
+-                    __func__, (double) floor_total / MiB, (double) min_res_pct, (double) host_total / MiB,
+-                    min_mib, reserve_mib);
++    // wip/fit-slab-accounting (Phase 1).  Reserve the MoE expert cache's arena budget AND the
++    // movable-boundary slab's headroom in --fit's per-device margin, so --fit sizes the context around
++    // them instead of letting both claim the free VRAM afterwards.
++    //
++    //   G1  an explicit MOE_EXPERT_CACHE_MIB is reserved verbatim (it used to be ignored: --fit sized the
++    //       context as if the arena did not exist).
++    //   G2  the slab headroom is a HARD floor: hipBLASLt loads its Tensile code objects and workspace
++    //       BEHIND the application's back and the slab cannot serve them, so a thin headroom corrupts
++    //       (measured: '!!!!!!!!' output, arena thrash, a 32.5 -> 13.0 GiB VRAM collapse).  See
++    //       wip/fit-slab-accounting/README.md.
++    //
++    // Both apply only when the model has host-resident experts (the -ncmoe path); a fully resident model
++    // is untouched.  The reservation is keyed on the REAL device that owns the host-expert buffer
++    // (host_experts), not on model->devices: under -sm tensor the latter is the scheduler's Meta wrapper,
++    // which is why the old code silently reserved nothing there.  The tensor-split path applies the same
++    // reservation to its per-simple-device targets below.
++    const common_fit_cache_reserve cache_reserve = common_fit_cache_reserve::from_env();
++    int64_t host_total = 0;
++    for (const auto & he : host_experts) {
++        host_total += (int64_t) he.second;
++    }
++    if (host_total > 0) {
++        int64_t reserve_total = 0;
++        for (size_t id = 0; id < nd; id++) {
++            const int64_t before = margins[id];
++            margins[id] = cache_reserve.margin(devs[id], host_expert_bytes[id], margins[id]);
++            reserve_total += margins[id] - before;
+         }
++        const char * reserve_env = getenv("MOE_EXPERT_CACHE_RESERVE_MIB");
++        const int    reserve_mib = reserve_env ? atoi(reserve_env) : 1024;
++        LOG_WRN("%s: host-resident MoE experts active: reserving the slab headroom plus the expert-cache arena "
++                "(%s) in the --fit margin before fitting the context (%.0f MiB this pass over %.0f MiB of host "
++                "experts).  --fit sizes the context around it; the arena then takes any remaining free device "
++                "memory keeping MOE_EXPERT_CACHE_RESERVE_MIB=%d MiB per device.\n",
++                __func__,
++                cache_reserve.cache_auto ? "auto floor: MOE_EXPERT_CACHE_MIN_MIB / MIN_RES_PCT"
++                                         : "explicit MOE_EXPERT_CACHE_MIB",
++                (double) reserve_total / MiB, (double) host_total / MiB, reserve_mib);
+     }
+ 
+     // ===== tensor split (-sm tensor / LLAMA_SPLIT_MODE_TENSOR) =====
+@@ -379,7 +449,19 @@ static void common_params_fit_impl(
+             size_t free = 0;
+             size_t total = 0;
+             ggml_backend_dev_memory(tdevs[id], &free, &total);
+-            ttarget[id] = std::max<int64_t>(0, (int64_t) free - (int64_t) margins_s[id]);
++            // wip/fit-slab-accounting: this branch consumes margins_s (per simple device), not `margins`,
++            // so apply the cache/slab reservation here too, per real device.
++            size_t host_bytes_t = 0;
++            for (const auto & he : host_experts) {
++                if (he.first == tdevs[id]) {
++                    host_bytes_t = he.second;
++                    break;
++                }
++            }
++            const int64_t tmargin = host_total > 0
++                ? cache_reserve.margin(tdevs[id], host_bytes_t, (int64_t) margins_s[id])
++                : (int64_t) margins_s[id];
++            ttarget[id] = std::max<int64_t>(0, (int64_t) free - tmargin);
+             target_sum += ttarget[id];
+             LOG_TRC("%s: tensor split: device %zu target %" PRId64 " MiB (free %" PRId64 " MiB, margin %zu MiB)\n",
+                 __func__, id, ttarget[id]/MiB, (int64_t) free/MiB, margins_s[id]/MiB);
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 46bc40dc5..a43c9a09a 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2832,6 +2832,12 @@ common_speculative_init_result::common_speculative_init_result(
+         model_path = params.speculative.draft.mparams.path;
+         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+ 
++        // The separate draft model's own `--spec-draft-n-cpu-moe` / `--spec-draft-cpu-moe` must be
++        // honoured: allow its CPU overrides to match its nextn/MTP head layer.  (The main model's
++        // `-ncmoe` never lands here -- `common_base_params_to_speculative` replaced the overrides with
++        // the draft's -- but this makes the intent explicit.)
++        mparams.allow_nextn_cpu_offload = true;
++
+         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+         if (model_dft == NULL) {
+             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index bcf270a11..b965961d8 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -67,6 +67,12 @@ extern "C" {
+     // slab.  `llama_context` uses it to right-size the compute reserve to the observed workload.
+     GGML_API size_t                ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev);
+ 
++    // wip/fit-slab-accounting (Phase 1): the VRAM this device's allocator must keep free OUTSIDE the
++    // movable-boundary slab, or 0 when there is no such consumer.  hipBLASLt loads its Tensile code
++    // objects and workspace behind the application's back and the slab cannot serve them, so `--fit`
++    // reserves this much before sizing the context.
++    GGML_API size_t                ggml_backend_dev_slab_headroom_bytes(ggml_backend_dev_t dev);
++
+     //
+     // Backend buffer
+     //
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 48ec479a5..ffe6fe21c 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -376,6 +376,13 @@ extern "C" {
+         // reserve can follow the workload instead of a worst case.  Appended like the fields above, so
+         // every backend that does not set it is zero-initialized.
+         size_t (*slab_work_size)(ggml_backend_dev_t dev);
++
++        // (optional) wip/fit-slab-accounting: the VRAM this device's allocator must keep free OUTSIDE the
++        // movable-boundary slab (0 when there is nothing the slab cannot serve).  `--fit` reserves it as a
++        // hard floor: a thin headroom corrupts, because hipBLASLt's Tensile code objects and workspace are
++        // allocated from real free VRAM.  Appended like the fields above, so every backend that does not
++        // set it is zero-initialized.
++        size_t (*slab_headroom_bytes)(ggml_backend_dev_t dev);
+     };
+ 
+     struct ggml_backend_device {
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 2d1f10a12..40d5db798 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -224,6 +224,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .moe_cache_stats      = */ nullptr,
+     /* .moe_cache_rearm      = */ nullptr,
+     /* .slab_work_size       = */ nullptr,
++    /* .slab_headroom_bytes  = */ nullptr,
+ };
+ 
+ bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 0543a3676..7bed59f67 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -306,6 +306,15 @@ size_t ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev) {
+     return dev->iface.slab_work_size(dev);
+ }
+ 
++size_t ggml_backend_dev_slab_headroom_bytes(ggml_backend_dev_t dev) {
++    // wip/fit-slab-accounting (Phase 1): 0 when this backend has no such consumer (or never set the hook),
++    // which is how --fit tells "no slab headroom" from "reserve this much".
++    if (dev == nullptr || dev->iface.slab_headroom_bytes == nullptr) {
++        return 0;
++    }
++    return dev->iface.slab_headroom_bytes(dev);
++}
++
+ // backend buffer
+ 
+ ggml_backend_buffer_t ggml_backend_buffer_init(
+@@ -2654,11 +2663,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 // split's first node.  A cache-merged split holds the layer's routed gate/up/down
+                 // together, so `nodes[0]` is the gate and only the first input would ever be hooked.
+                 ggml_tensor * node = nullptr;
++                int node_n_consumers = 0;
+                 for (int ni = 0; ni < split->graph.n_nodes; ni++) {
+                     ggml_tensor * cand = split->graph.nodes[ni];
+                     if (cand->op == GGML_OP_MUL_MAT_ID && cand->src[0] == input_cpy) {
+-                        node = cand;
+-                        break;
++                        // A split can hold more than one MUL_MAT_ID consumer of the same expert
++                        // weight: qwen4exp's 0-row gathered logits tail sits next to the full-row
++                        // unmasked MTP export.  Either consumer's routing is not enough: the tail's
++                        // ids are empty (nothing is staged) and the export's ids are computed by
++                        // this very split (not ready at staging time, so they cannot drive a pruned
++                        // fill and the cache must not take the copy over).  Count them and let the
++                        // general input path copy the whole table for every consumer.
++                        node_n_consumers++;
++                        if (node == nullptr) {
++                            node = cand;
++                        }
+                     }
+                 }
+                 // wip/moe-expert-cache (session 7) takeover fast path: an identity table reads the
+@@ -2669,7 +2688,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 // decode/verify band: prefill keeps the staged upload and its direct-reading MMQ
+                 // fusions (which are not cache-aware).  A device-remap takeover records the pair for
+                 // the deferred promotion pass below.
+-                if (node != nullptr && node->ne[2] <= sched_moe_cache_band(split_backend) &&
++                if (node != nullptr && node_n_consumers == 1 && node->ne[2] <= sched_moe_cache_band(split_backend) &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                     ggml_backend_buffer_is_host(input->buffer) &&
+                     split_backend->iface.moe_cache_take_over != NULL) {
+@@ -2704,7 +2723,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     }
+                 }
+ 
+-                if (node != nullptr &&
++                if (node != nullptr && node_n_consumers == 1 &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                     ggml_backend_buffer_is_host(input->buffer)) {
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 6ca01fd80..31be9fe07 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -699,6 +699,7 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
+     /* .moe_cache_stats      = */ nullptr,
+     /* .moe_cache_rearm      = */ nullptr,
+     /* .slab_work_size       = */ nullptr,
++    /* .slab_headroom_bytes  = */ nullptr,
+ };
+ 
+ // CPU backend - backend (reg)
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 1fa5e3321..4a4ed81a8 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1612,6 +1612,11 @@ static inline size_t ggml_cuda_fattn_stage_max_bytes() {
+ // device allocation inherits the same fail-soft policy.
+ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+ 
++// fit-slab-accounting revival (G4, issue #117): is the movable-boundary slab live on this device?  The
++// H2D staging ring consults it before growing -- see `h2d_stage_buffer` in this header.  Defined in
++// ggml-cuda.cu (declared in ggml-cuda-vmm.h, which this header does not include).
++bool ggml_cuda_slab_active(int device);
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+@@ -1811,6 +1816,19 @@ struct ggml_backend_cuda_context {
+         GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
+         if (size > fattn_stage_size[stream_no]) {
+             const size_t new_size = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
++            // fit-slab-accounting revival (G4): bound this optional transient by the free VRAM it would
++            // still leave when the movable-boundary slab is active (see
++            // `optional_alloc_within_free_cap`).  A refusal falls back to the native K/V read.
++            if (!optional_alloc_within_free_cap(fattn_stage_bytes() - fattn_stage_size[stream_no] + new_size)) {
++                if (!fattn_stage_oom_warned) {
++                    fattn_stage_oom_warned = true;
++                    GGML_LOG_WARN("%s: leaving the FA prefill staging arena at %zu MiB rather than %zu MiB "
++                                  "(the slab is active and free VRAM is tight); reading the K/V cache "
++                                  "natively instead (prefill may be slower)\n",
++                                  __func__, fattn_stage_size[stream_no] >> 20, new_size >> 20);
++                }
++                return nullptr;
++            }
+             char * new_arena = nullptr;
+             if (cudaMalloc(&new_arena, new_size) != cudaSuccess) {
+                 (void) cudaGetLastError(); // clear the sticky error
+@@ -1880,6 +1898,57 @@ struct ggml_backend_cuda_context {
+         return budget;
+     }
+ 
++    // fit-slab-accounting revival (G4, issue #117): optional raw device allocations -- the op-offload
++    // H2D staging ring and the FA prefill staging arena -- live OUTSIDE both the compute-graph reserve
++    // and the movable-boundary slab.  When the slab is active, the VRAM outside it (the slab's
++    // GGML_CUDA_SLAB_HEADROOM_MIB) is the only source for the consumers it cannot route: hipBLASLt's
++    // Tensile code objects + workspace, and the MTP draft buffer.  An unbounded optional transient can
++    // consume that reserve, after which the next `ggml_cuda_device_malloc` cannot be satisfied -- the
++    // arena's physical is mapped INTO the slab and ROCm will not unmap a sub-range, so the arena cannot
++    // yield it back -- and the run aborts (`exit 134`) or, on a thin headroom, corrupts silently.
++    // Bound every optional transient to `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`% of the currently-free
++    // VRAM (default 50, 0 disables).  A refusal is fail-soft: the caller falls back (serial staging /
++    // native K/V read).  Inert when the slab is inactive (no headroom policy to protect).
++    static int optional_alloc_max_free_pct() {
++        static const int n = []() {
++            const char * e = getenv("GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT");
++            int v = e ? atoi(e) : 50;
++            if (v < 0)   v = 0;
++            if (v > 100) v = 100;
++            return v;
++        }();
++        return n;
++    }
++
++    // Returns true when growing an optional allocation to a total of `new_total` bytes stays within the
++    // cap above.  Slab-inactive devices and a 0 cap always allow (the pre-slab behaviour); a failed
++    // measurement also allows (fail-soft, never invert a working run into a refuse on a driver hiccup).
++    bool optional_alloc_within_free_cap(size_t new_total) const {
++        if (!ggml_cuda_slab_active(device)) {
++            return true;
++        }
++        const int pct = optional_alloc_max_free_pct();
++        if (pct <= 0) {
++            return true;
++        }
++        size_t free_b = 0, total_b = 0;
++        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
++            return true;
++        }
++        if (new_total <= free_b / 100 * (size_t) pct) {
++            return true;
++        }
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("optional device allocation refused: %.0f MiB total against %.0f MiB free "
++                          "(the movable-boundary slab is active; the cap is %d%%).  The caller falls "
++                          "back.  Raise GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT to allow.\n",
++                          (double) new_total / (1024 * 1024), (double) free_b / (1024 * 1024), pct);
++        }
++        return false;
++    }
++
+     // Total device budget for the staging ring.  GGML_SCHED_STAGE_MAX_MB (MiB) bounds it explicitly
+     // (A/B and VRAM control).  When it is unset the budget is **auto-sized so the full ring can hold
+     // the largest upload seen**: the old fixed 2048 MiB default held only four 450 MiB expert tables,
+@@ -1909,6 +1978,11 @@ struct ggml_backend_cuda_context {
+             if (h2d_stage_total - old_size + new_size > h2d_stage_budget(new_size)) {
+                 return nullptr;
+             }
++            // fit-slab-accounting revival (G4, issue #117): bound the ring by the free VRAM it would
++            // still leave.  See `optional_alloc_within_free_cap` above.
++            if (!optional_alloc_within_free_cap(h2d_stage_total - old_size + new_size)) {
++                return nullptr;
++            }
+             if (h2d_stage[slot] != nullptr) {
+                 ggml_cuda_graph_mem_freed(device);   // captured graphs may read the old slot
+                 CUDA_CHECK(cudaFree(h2d_stage[slot]));
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index 948165269..b9f19a903 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -44,6 +44,9 @@ size_t ggml_cuda_slab_arena_total (int device);
+ void   ggml_cuda_slab_extend_all();
+ // raise the free VRAM the slab extension leaves (never lowers an explicit GGML_CUDA_SLAB_HEADROOM_MIB)
+ void   ggml_cuda_slab_headroom_at_least_mib(size_t mib);
++// fit-slab-accounting revival (G3): the draft-context VRAM the MoE preflight projected; the slab reserve
++// is sized from it (plus the headroom) because the slab is created before the draft context.
++void   ggml_cuda_slab_set_aux_reserve(size_t bytes);
+ // The arena's allocation unit (fine: the slab is one mapping, so this is bookkeeping only).
+ size_t ggml_cuda_slab_arena_unit  (int device);
+ // Base of the work region for a `need`-byte compute buffer, moving the boundary up (evicting the arena
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c934d3ee5..d980f2892 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -631,6 +631,16 @@ static size_t ggml_cuda_slab_chunk_bytes() {
+     return chunk_mib * 1024 * 1024;
+ }
+ 
++// fit-slab-accounting revival (G3): the MTP/DFlash draft context's VRAM, passed to the MoE preflight
++// before the slab is armed.  The reserve uses it because the draft is created AFTER the slab.
++static size_t g_slab_aux_reserve_bytes = 0;
++void ggml_cuda_slab_set_aux_reserve(size_t bytes) {
++    g_slab_aux_reserve_bytes = bytes;
++}
++
++// Forward declaration: the reserve policy reads the (single-sourced) headroom.
++static size_t ggml_cuda_slab_headroom_bytes();
++
+ static size_t ggml_cuda_slab_reserve_bytes(size_t total_b) {
+     static size_t reserve_mib = SIZE_MAX;
+     if (reserve_mib == SIZE_MAX) {
+@@ -638,17 +648,21 @@ static size_t ggml_cuda_slab_reserve_bytes(size_t total_b) {
+         if (env != NULL) {
+             reserve_mib = (size_t) atoll(env);
+         } else {
+-            // Left OUT of the slab for everything that is NOT the work pool or the arena: the GPU-resident
+-            // model weights, the KV cache, the draft model and the various workspace pools are allocated
+-            // AFTER the slab is created (the slab is born during the fitting probe), and under the slab
+-            // they can no longer borrow from the arena -- ROCm will not unmap a sub-range of the slab's
+-            // single mapping, so a freed arena table returns a byte to the slab's free list, never to the
+-            // driver.  A reserve that is too small therefore ENDS THE RUN (measured: 4096 MiB -> a failed
+-            // hipBLASLt workspace allocation at load, exit 134), which is why the default is deliberately
+-            // generous and scales with the card rather than being a flat constant: ~1/4 of the device, and
+-            // never less than 8 GiB (the measured need of the primary Qwen3.8-Flash-Next IQ4_XS config on
+-            // a 32 GiB card).
+-            reserve_mib = (size_t) std::max<size_t>(8192, total_b / 4 / (1024 * 1024));
++            // fit-slab-accounting revival (G3): size the reserve from what actually appears AFTER the
++            // slab, not a flat guess.  The slab is born during `sched_reserve`, and `llama_context`
++            // allocates the KV cache BEFORE that (`create_memory` at llama-context.cpp:543 vs
++            // `sched_reserve` at :609), so the reserve does NOT need to cover the weights or the KV --
++            // they are already resident and are counted in `free_b`.  It only has to cover the
++            // allocations that follow: the MTP draft context (the `aux_reserve_bytes` the preflight was
++            // given, ~3.7 GiB when a draft is present, 0 otherwise) plus the slab's own headroom (the
++            // workspaces hipBLASLt and the FA staging draw on).  A flat max(8192, total/4) still charged
++            // a no-draft run 8 GiB, so under partial offload `want` fell below `work + min_arena` and the
++            // slab DECLINED -- the cache streamed from the host (measured on a 32 GiB card, Q8_0 35B-A3B,
++            // `-ncmoe 16`: 47 t/s, vs 55-59 t/s once the reserve fits).  `GGML_CUDA_SLAB_RESERVE_MIB`
++            // remains the explicit override.
++            const size_t headroom_mib = ggml_cuda_slab_headroom_bytes() / (1024 * 1024);
++            const size_t aux_mib      = g_slab_aux_reserve_bytes / (1024 * 1024);
++            reserve_mib = std::max<size_t>(headroom_mib + aux_mib, (size_t) 1024);
+         }
+     }
+     return reserve_mib * 1024 * 1024;
+@@ -10175,6 +10189,9 @@ static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev,
+     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+     const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
+     if (on) {
++        // fit-slab-accounting revival (G3): remember the draft-context estimate for the slab reserve (it
++        // is created BEFORE the draft context, so the reserve has to leave room for it).
++        ggml_cuda_slab_set_aux_reserve(aux_reserve_bytes);
+         // This model HAS host-resident experts, so the work/arena split is meaningful -- arm the slab.
+         // Dense models never reach here (`llama_model_moe_cache_preflight` skips an empty host-expert map),
+         // which is what keeps the slab off them.  Runs before the context, so before any compute buffer.
+@@ -10210,6 +10227,20 @@ static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
+     return ggml_cuda_slab_active(ctx->device) ? ggml_cuda_slab_work_size(ctx->device) : 0;
+ }
+ 
++static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t dev) {
++    // wip/fit-slab-accounting (Phase 1, re-cut for r37): the configured slab headroom, reported even
++    // though the slab is not armed yet.  `--fit` runs BEFORE the MoE preflight arms the slab, and r37
++    // makes `ggml_cuda_slab_enabled()` false until then (`env_on && g_slab_armed`), so it cannot gate
++    // this getter.  Report the headroom whenever the slab could be created (the env kill switch is on);
++    // the fit only consults it for a model that actually has host-resident experts.
++    GGML_UNUSED(dev);
++    const char * env = getenv("GGML_CUDA_SLAB");
++    if (env != NULL && atoi(env) == 0) {
++        return 0;
++    }
++    return ggml_cuda_slab_headroom_bytes();
++}
++
+ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .get_name                = */ ggml_backend_cuda_device_get_name,
+     /* .get_description         = */ ggml_backend_cuda_device_get_description,
+@@ -10231,6 +10262,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .moe_cache_stats         = */ ggml_backend_cuda_device_moe_cache_stats,
+     /* .moe_cache_rearm         = */ ggml_backend_cuda_device_moe_cache_rearm,
+     /* .slab_work_size          = */ ggml_backend_cuda_device_slab_work_size,
++    /* .slab_headroom_bytes     = */ ggml_backend_cuda_device_slab_headroom_bytes,
+ };
+ 
+ // backend reg
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 8736a8c4f..33531ec37 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -4121,6 +4121,31 @@ void moe_cache_inplace_fill(int device, const moe_cache_inplace_src & src, void
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++// fit-slab-accounting revival: a split host slice is only addressable when its byte range stays inside
++// one host expert.  A meta view whose `nb` does not describe its slice (measured on `-sm tensor`: a
++// layer registering `expert_bytes == host_bytes` with a nonzero `slice_off`) makes every cache fill read
++// `slice_off` bytes past the end of the master -- a host memmove SIGSEGV in the identity fill, or a
++// device page fault in the gather.  Returns false so the caller declines the table; the scheduler's
++// full-table copy is always correct.  `host_pitch` is the strided axis-0 case (a 2-D fill whose span
++// differs from `expert_bytes`).
++static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size_t src_off, size_t host_pitch) {
++    if (host_bytes == 0 || expert_bytes == 0 || src_off > host_bytes) {
++        return false;
++    }
++    size_t span = expert_bytes;
++    if (host_pitch > 0) {
++        if (host_bytes % host_pitch != 0) {
++            return false;
++        }
++        const size_t rows = host_bytes / host_pitch;
++        if (rows == 0 || expert_bytes % rows != 0) {
++            return false;
++        }
++        span = (rows - 1) * host_pitch + expert_bytes / rows;
++    }
++    return span <= host_bytes - src_off;
++}
++
+ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
+                            const ggml_tensor * ids, void * stream, int device,
+                            size_t slice_off, int split_axis) {
+@@ -4149,6 +4174,19 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     if (host_bytes == 0 || expert_bytes == 0) {
+         return false;
+     }
++    if (!moe_cache_slice_addr_ok(host_bytes, expert_bytes, slice_off, host_pitch)) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("%s: declining a MoE expert table with an unaddressable split slice "
++                          "(layer=%d role=%s host_bytes=%zu expert_bytes=%zu slice_off=%zu host_pitch=%zu, "
++                          "split_axis=%d); the scheduler's full-table copy will serve it, so decode uses "
++                          "the host path for that table.  Please report this geometry.\n",
++                          __func__, name_layer(weight), name_role(weight).c_str(),
++                          host_bytes, expert_bytes, slice_off, host_pitch, split_axis);
++        }
++        return false;
++    }
+     // Register the table with the cache even though this pass uploads through the gather.  The
+     // deferred arena sizing (`alloc_all_locked`) latches on the first full decode pass and sizes every
+     // table registered by then, so a table that is ONLY ever uploaded through the gather path would be
+@@ -4257,6 +4295,19 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+             host_pitch = weight->nb[1];   // a strided axis-0 slice needs a 2-D fill
+         }
+     }
++    if (!moe_cache_slice_addr_ok(host_bytes, expert_bytes, slice_off, host_pitch)) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("%s: declining a MoE expert table with an unaddressable split slice "
++                          "(layer=%d role=%s host_bytes=%zu expert_bytes=%zu slice_off=%zu host_pitch=%zu, "
++                          "split_axis=%d); the scheduler's full-table copy will serve it, so decode uses "
++                          "the host path for that table.  Please report this geometry.\n",
++                          __func__, layer, name_role(weight).c_str(),
++                          host_bytes, expert_bytes, slice_off, host_pitch, split_axis);
++        }
++        return false;
++    }
+     const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
+                                       host_bytes, slice_off, host_pitch, split_axis, weight->data, device);
+     if (table < 0) {
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 01e38999e..6cb544339 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -2286,6 +2286,7 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+     /* .moe_cache_stats      = */ nullptr,
+     /* .moe_cache_rearm      = */ nullptr,
+     /* .slab_work_size       = */ nullptr,
++    /* .slab_headroom_bytes  = */ nullptr,
+ };
+ 
+ // backend reg interface
+diff --git a/include/llama.h b/include/llama.h
+index aa2d015fc..0f5a8ffd6 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -364,6 +364,10 @@ extern "C" {
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
++        bool allow_nextn_cpu_offload; // let a CPU expert override match an appended nextn/MTP layer
++                                      // (the SPECULATIVE head).  Default false: the main model's
++                                      // -ncmoe/-cmoe never offloads the head.  A separately loaded MTP
++                                      // draft model sets this so its own --spec-draft-n-cpu-moe works.
+     };
+ 
+     struct llama_sampler_seq_config {
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 285f5d99d..523d99a42 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -88,6 +88,17 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
+ 
+ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+ 
++// wip/fit-slab-accounting (Phase 1): enumerate the REAL devices that own host-resident MoE expert
++// weights (the `moe_host_expert_bytes` map).  Under `-sm tensor` the model's device list is the
++// scheduler's Meta wrapper, so `llama_model_moe_host_expert_bytes()` sees 0 on every device; `--fit`
++// needs the per-real-device bytes to reserve the expert-cache arena and the slab headroom.
++LLAMA_API int32_t llama_model_moe_host_expert_dev_count(const struct llama_model * model);
++
++// Fill *dev/*bytes with the i-th host-expert device (map iteration order).  Returns false when i is out
++// of range.  Either out pointer may be null.
++LLAMA_API bool llama_model_moe_host_expert_dev(const struct llama_model * model, int32_t i,
++                                               ggml_backend_dev_t * dev, size_t * bytes);
++
+ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+ 
+ // Set whether the context outputs nextn embeddings or not
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 2fe56df98..3ebfe96fd 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -548,6 +548,7 @@ llama_model_loader::llama_model_loader(
+         bool check_tensors,
+         bool no_alloc,
+         bool load_mtp,
++        bool allow_nextn_cpu_offload,
+         const llama_model_kv_override * param_overrides_p,
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+@@ -563,6 +564,7 @@ llama_model_loader::llama_model_loader(
+     }
+ 
+     tensor_buft_overrides = param_tensor_buft_overrides_p;
++    this->allow_nextn_cpu_offload = allow_nextn_cpu_offload;
+ 
+     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
+     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+@@ -1271,6 +1273,27 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+                 std::regex pattern(overrides->pattern);
+                 if (std::regex_search(tensor_name, pattern)) {
++                    // The appended nextn/MTP layer(s) are the SPECULATIVE head, not the trunk.  A CPU
++                    // expert override from the main model (`-ncmoe`/`-cmoe`) must never offload them: the
++                    // patterns are `blk.<i>` for i in 0..N-1, so `-ncmoe 99` matches
++                    // `blk.<n_layer>.ffn_*_exps` and silently moves the MTP head's own experts to the host
++                    // (measured: Qwen3.6-35B-A3B, n_layer 40, `-ncmoe 41` -> blk.40 experts on ROCm_Host).
++                    // The separate-file MTP draft (loaded with the draft's own `--spec-draft-n-cpu-moe`
++                    // overrides) is protected by the same rule: its only layer is the nextn layer, and
++                    // offloading the speculative head is never what the user wants.  Keep it on the
++                    // layer's device; `--spec-draft-n-cpu-moe` still governs a draft model's trunk layers.
++                    if (overrides->buft == ggml_backend_cpu_buffer_type() &&
++                            !allow_nextn_cpu_offload &&
++                            info.layer == LLM_TENSOR_LAYER_REPEATING &&
++                            hparams.n_layer() > 0 && tn.bid >= (int) hparams.n_layer()) {
++                        static std::once_flag once_nextn;
++                        std::call_once(once_nextn, [&] {
++                            LLAMA_LOG_INFO("llama_model_loader: keeping the speculative (nextn) layer %d experts "
++                                           "on the device; -ncmoe/-cmoe only offload the %u trunk layers\n",
++                                           (int) tn.bid, hparams.n_layer());
++                        });
++                        continue;
++                    }
+                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                         // Host-resident MoE experts: a device's host buffer type carries that device, and
+                         // the scheduler places the consumers of its tensors there.  Picking the device-0
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 4f6383012..c2d4bd040 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -141,6 +141,10 @@ struct llama_model_loader {
+     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
+     const llama_model_tensor_buft_override * tensor_buft_overrides;
++    // Allow a CPU expert override to match an appended nextn/MTP layer (the SPECULATIVE head).  False
++    // for the main model so `-ncmoe`/`-cmoe` cannot offload the head; true for a separately loaded MTP
++    // draft model so its own `--spec-draft-n-cpu-moe` is honoured.
++    bool allow_nextn_cpu_offload = false;
+ 
+     gguf_context_ptr metadata_ptr;
+     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
+@@ -213,6 +217,7 @@ struct llama_model_loader {
+         bool check_tensors,
+         bool no_alloc,
+         bool load_mtp,
++        bool allow_nextn_cpu_offload,
+         const llama_model_kv_override * param_overrides_p,
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e724e3cad..a1999e914 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3109,6 +3109,7 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.allow_nextn_cpu_offload     =*/ false,
+     };
+ 
+     return result;
+@@ -3576,6 +3577,22 @@ size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev
+     return it != model->moe_host_expert_bytes.end() ? it->second : 0;
+ }
+ 
++int32_t llama_model_moe_host_expert_dev_count(const struct llama_model * model) {
++    return model == nullptr ? 0 : (int32_t) model->moe_host_expert_bytes.size();
++}
++
++bool llama_model_moe_host_expert_dev(const struct llama_model * model, int32_t i,
++                                     ggml_backend_dev_t * dev, size_t * bytes) {
++    if (model == nullptr || i < 0 || i >= (int32_t) model->moe_host_expert_bytes.size()) {
++        return false;
++    }
++    auto it = model->moe_host_expert_bytes.begin();
++    std::advance(it, i);
++    if (dev   != nullptr) { *dev   = it->first;  }
++    if (bytes != nullptr) { *bytes = it->second; }
++    return true;
++}
++
+ int32_t llama_model_n_expert(const struct llama_model * model) {
+     return model->hparams.n_expert;
+ }
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index bcb158870..eaebb2d5f 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -969,7 +969,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+     const llama_model_kv_override * kv_overrides = params->kv_overrides;
+     std::vector<std::string> splits = {};
+     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
+-        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*host_experts_mode*/ LLAMA_HOST_EXPERTS_MODE_AUTO, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
++        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*host_experts_mode*/ LLAMA_HOST_EXPERTS_MODE_AUTO, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, /*allow_nextn_cpu_offload*/ true, kv_overrides, nullptr);
+     ml.init_mappings(false); // no prefetching
+ 
+     auto mparams = llama_model_default_params();
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 265d02c26..f031e6555 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -342,7 +342,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+     try {
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+-            params.host_experts_mode, params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
++            params.host_experts_mode, params.check_tensors, params.no_alloc, params.load_mtp, params.allow_nextn_cpu_offload, params.kv_overrides, params.tensor_buft_overrides);
+ 
+         ml.lazy.mode            = params.lazy_mode;
+         ml.lazy.managed_budget  = params.lazy_mode == LLAMA_LAZY_MODE_AUTO ? llama_lazy_managed_budget() : 0;
