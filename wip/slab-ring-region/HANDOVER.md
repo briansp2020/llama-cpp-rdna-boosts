@@ -119,7 +119,13 @@ Key timeline to recognize a good run (2.5 GiB region): wide `3072` init -> first
 
 ## 4. Remaining work, in order
 
-### 4.1 Local cleanup (do first, cheap)
+### 4.1 Local cleanup (DONE 2026-10-10 — artifact `f23ca9703624…`, 912 lines)
+
+The session diagnostics, the `GGML_CUDA_SLAB_RING_NOTRANSIENT` switch and the unused `ring_placed` field
+are gone; the fields are unchanged (946.7 / 992.8 prefill, 61.3-61.4 decode, 0 NaN).  **Read
+[`FINDINGS-numerics.md`](FINDINGS-numerics.md) before recording any new field number**: the §5.5 prompt is
+degenerate (acceptance 1.0 is the model copying the prompt) and the first pass after a config change pays
+the lazy PLE / host-expert disk read.  Original checklist:
 
 * Remove the diagnostic `GGML_LOG_WARN`s added for this session: `ggml_cuda_slab_set_ring_region`
   (the "H2D staging-ring region" line), `ggml_cuda_slab_set_narrow_floor` (the per-hint line),

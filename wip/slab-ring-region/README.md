@@ -7,6 +7,14 @@ narrow floor).  Field §5.5: prefill **992 t/s** (6 GiB region) / **946** (2.5 G
 All standing gates green.  Artifact `slab-ring-p1.patch`; details §10.  Not yet done: `fingon` gfx1100, the
 3-GPU run, and the reserve-side (`headroom - ring`) accounting decision.
 
+**Measurement/purity caveats (read [`FINDINGS-numerics.md`](FINDINGS-numerics.md)):** the §5.5 field
+prompt is the repo doc ×6, so **acceptance is 1.0 because the model copies it** — a new field record must
+name the prompt *and* its acceptance, and must be a warm repeat (the first pass pays the lazy PLE /
+host-expert disk read).  The ring-in-slab changes the greedy text vs ring-outside **only** by evicting ~3×
+more expert cache during prefill (8514+9108 vs 2442+2970 MiB); the prefill logits are bit-identical
+(KLD 0.000000) and it is a near-tie flip at the first novel token.  The underlying gap — with `-ncmoe`, a
+host-served expert is not bit-identical to a device-served one — is **pre-existing and not ring-specific**.
+
 This campaign exists because of the §5.5 finding in
 [`archive/work/fit-slab-accounting/README.md`](../../archive/work/fit-slab-accounting/README.md) §15.9: the G4 free-VRAM cap
 refuses the op-offload H2D staging ring on the maintainer's field config and costs ~16 % prefill.  The
