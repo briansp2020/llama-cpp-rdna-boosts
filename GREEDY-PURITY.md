@@ -1193,7 +1193,7 @@ pre-amendment build, so every recorded reference hash holds.
 * **A bug that only fires past a regime threshold needs the threshold crossed in the test.**  The
   1..8-width probe was green because below 2051 the `shortcut` arm covers every width; the divergence
   appears only for a `W > 8` verify with `n_kv >` the selection width.  The regression is the real-model
-  width matrix at `P > 2051` (`wip/recurrent-rewind-depth/`), not the short-context probe.
+  width matrix at `P > 2051` (`archive/work/wip-archive/recurrent-rewind-depth/`), not the short-context probe.
 * **A depth-policy change has to re-run the width matrix for every model family the band touches.**
   The clamp relaxation was validated on the recurrent snapshot machinery (deterministic sweep) and on
   qwen4exp's QSA arm; the residual `W=9` difference on all models is the documented §11 kernel-family

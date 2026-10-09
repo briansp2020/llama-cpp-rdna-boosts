@@ -1,6 +1,11 @@
 # `slab-ring-region` — make the H2D staging ring a first-class slab region
 
-**Status: P1 WORKING on gfx1201 (2026-10-10).**  The ring is a work-region sub-region in the
+> **PROMOTED 2026-10-10 (r39, `v16-a55e952b8-r39`, tree `cc124b21e`).**  Folded into **block 06**
+> (the slab side) + **block 15** (the staging side); `validate-set.sh` green.  This directory is the
+> archived record — see `WORKLOG.md` r39 for the promotion and `FINDINGS-numerics.md` for the
+> measurement caveats and the two findings it produced (`TODO.md` #50/#51).
+
+**Status (at archive time): P1 WORKING on gfx1201 (2026-10-10)** — since PROMOTED, see the banner.  The text below is the pre-promotion record.  The ring is a work-region sub-region in the
 `0 -> narrow -> RB -> wide -> arena` ordering (two stable work bases, contribution floor, context-pinned
 narrow floor).  Field §5.5: prefill **992 t/s** (6 GiB region) / **946** (2.5 GiB) vs **922 stock** and
 **768** for the r38 G4 cap, decode **61.1 / 61.3** vs the **62.2** baseline, **0 NaN, acceptance 1.0**.

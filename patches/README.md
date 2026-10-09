@@ -4,7 +4,7 @@
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
 > **Current release `v16-a55e952b8-r39` (2026-10-10) -- the op-offload H2D staging ring moves INSIDE the movable-boundary slab (block 06 + block 15):**
-> promotes `wip/slab-ring-region/` (TODO #49).  The ring is no longer a raw `cudaMalloc` competing with the
+> promotes `archive/work/slab-ring-region/` (TODO #49).  The ring is no longer a raw `cudaMalloc` competing with the
 > post-slab consumers for the slab headroom: it is a **work-region sub-region** in the
 > `0 -> narrow -> RB -> wide -> arena` ordering -- a fixed narrow (decode/verify) floor at base 0, the ring
 > above it, the transient wide (prefill) view above that, and the arena always above the work -- so arming
@@ -25,7 +25,7 @@
 > config) and rejected (it dies in `hipblaslt.cpp:164` under `--fit off -c 204800`), so
 > `GGML_CUDA_SLAB_HEADROOM_MIB` stays the per-user MiB knob.  Canonical block-15 tip
 > `795ea7185f4c1d131725bbc8f4d10d4ce85cbb17`, net tree `cc124b21e72fdc314936960f0e52394e02fd6c8c`; strict
-> **16/16** `git am` (`validate-set.sh` green).  Full record: `WORKLOG.md` r39, `wip/slab-ring-region/`.
+> **16/16** `git am` (`validate-set.sh` green).  Full record: `WORKLOG.md` r39, `archive/work/slab-ring-region/`.
 >
 > **Previous release `v16-a55e952b8-r38` (2026-10-09) -- `fit-slab-accounting` folded into block 06 (plus the G4 FA-staging cap in block 15):**
 > promotes `archive/work/fit-slab-accounting/` through the block-06 path: **G1/G2** `--fit` reserves an explicit
@@ -42,7 +42,7 @@
 > device's simple devices.  Gates: dense `1c5d32ac537d`, prefill-logit 0.000707 / 98.755 %,
 > `MUL_MAT_ID` 931/931, width purity `010f816e376c`; gfx1100 `fingon` green.  Accepted trade: the G4
 > default costs ~16 % field prefill via a refused ~990 MiB ring growth; the ring moves inside the slab in
-> the follow-up `wip/slab-ring-region/` (TODO #49).  Canonical block-15 tip
+> the follow-up `archive/work/slab-ring-region/` (TODO #49).  Canonical block-15 tip
 > `849c041613421ee807054d8a4254171b6a04ab59`, net tree
 > `888564105e13dd73fefda755ea5b055d65011c16`; strict **16/16** `git am` (`validate-set.sh` green).  Full
 > record: `WORKLOG.md` r38 and `archive/work/fit-slab-accounting/README.md` §15.
@@ -1703,7 +1703,7 @@ small ROCm-7.14-specific dips for q5_1/iq4_xs at n=2/3 (kept as tuned; retune is
 
 ## 2026-09-28 block-15 amendment (r21): RDNA4 GQA-6 FA band gets 64-wide K/V batches + 8 warps (PR #62)
 
-Integrates **PR #62 by @briansp2020** (`wip/rdna4-fa-band/`, added to `main` as its own `wip/` directory).
+Integrates **PR #62 by @briansp2020** (`archive/work/rdna4-fa-band/`, added to `main` as its own `wip/` directory).
 Only `fattn-mma-f16.cuh` changes.  The band (`flash_attn_ext_f16<256,256,4,8>`, RDNA4, `n_q <= 8`) is where
 single-token decode time goes at depth on the dense 27B; with a q8_0 cache it read the cache at ~310 GB/s
 (half the DRAM rate) and sat at 256 VGPRs with scratch spills.
@@ -1726,12 +1726,12 @@ patch 1.  The split does not depend on `n_q`, so `W = 1..8` stay bit-identical t
 `tg128 @ d50000` **24.42 -> 25.52 t/s (+4.5 %)**.  Note the new row matches `ncols == 32` (the
 **native-quantized** band arm, `ncols1 = 4`); the 2-byte f16/bf16 arm (`ncols1 = 2`, `ncols = 16`) is
 unaffected (measured within noise), so the PR README's "f16 3-4 %" is misattributed - extending the row to
-the 2-byte arm is a follow-up.  Full record: `wip/rdna4-fa-band/VERIFICATION-r21.md` and `WORKLOG.md`
+the 2-byte arm is a follow-up.  Full record: `archive/work/rdna4-fa-band/VERIFICATION-r21.md` and `WORKLOG.md`
 2026-09-28 (r21, PR #62).
 
 ## 2026-09-28 block-08 + block-14 amendments (r21): five bit-exact verify-band fusions (PR #63)
 
-Integrates **PR #63 by @briansp2020** (`wip/rdna4-verify-fusions/`, added to `main` as its own `wip/`
+Integrates **PR #63 by @briansp2020** (`archive/work/rdna4-verify-fusions/`, added to `main` as its own `wip/`
 directory).  A 5-token DFlash2 n-max-4 verify pass of the dense 27B launched 2,171 kernels against 1,485
 for one token because several decode fusions were gated to `ne[1] == 1`.  Four patches fold into **block 08**
 (`norm.cu`, `norm.cuh`, `unary.cu`, `unary.cuh`, `ggml-cuda.cu`); the conv-input concat patch folds into
@@ -1757,7 +1757,7 @@ for one token because several decode fusions were gated to `ne[1] == 1`.  Four p
 (the multi-row `rms_norm_q8_1` path exercises the stride fix); MoE (35B-A3B Q4_K_M, `-ncmoe 99`) MTP
 acceptance **identical** (0.77695), 55.1 -> 56.9 t/s.  Combined r21 vs r20 `llama-bench -p 1,2,4,5,8 -n 0`:
 26.77/47.65/81.74/90.60/106.28 -> 27.17/51.08/95.63/114.30/151.19 t/s.  Full record:
-`wip/rdna4-verify-fusions/VERIFICATION-r21.md` and `WORKLOG.md` 2026-09-28 (r21, PR #63).
+`archive/work/rdna4-verify-fusions/VERIFICATION-r21.md` and `WORKLOG.md` 2026-09-28 (r21, PR #63).
 
 
 
@@ -1830,7 +1830,7 @@ green (strict 16/16 `git am`, applied tree `b1a3bf1a…`).
 
 ## 2026-09-27 block-06 amendment (r12): the op-offload H2D staging ring + tensor-split op-offload
 
-Promoted from `wip/h2d-staging-ring/` (now `archive/work/h2d-staging-ring/`).  The block-06 home follows
+Promoted from `archive/work/h2d-staging-ring/` (now `archive/work/h2d-staging-ring/`).  The block-06 home follows
 the block's actual role — it is the delivery's general system-operations bucket, which is why it is
 renamed in this release.
 

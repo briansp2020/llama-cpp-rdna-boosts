@@ -3,46 +3,27 @@
 This is the index `AGENTS.md` refers to.  `wip/` holds **active exploration only** — nothing here is part
 of the delivery, and nothing here may be applied to the fork without the maintainer's explicit go-ahead
 (see the WIP and promotion rules in `AGENTS.md`).  Each campaign is a self-contained handover under its own
-`README.md`.
+`README.md` (there is no `wip/README.md`).
+
+**A closed or promoted campaign does not live here — not even as a redirect stub.**  Its record moves to
+`archive/work/<campaign>/` and `WORKLOG.md`; the history in dated records refers to the path that was
+correct at the time.  Keeping finished work under `wip/` (or leaving a "MOVED — see archive" placeholder)
+makes the directory lie about what is in flight, so the stub habit is retired.  See
+`archive/work/lightning-indexer-fusion/README.md` for the resolution pattern
+(investigate -> fold into the owning block -> regenerate + validate -> record -> archive -> ship).
+
+An entry below is one of exactly two things: a campaign with **work in flight**, or a **scoping note for
+work not yet started** (a plan, not a result).  Both stay.  The distinction matters when tidying: a
+"MOVED — archived/closed/promoted" redirect is finished work and is deleted, while an unstarted scoping
+note is open work and stays.  When in doubt, look for the word MOVED at the top of the `README.md` — that
+is the signature of a stub, not of a campaign.
 
 | directory | what | status |
 |---|---|---|
-| [`slab-ring-region/`](slab-ring-region/README.md) | move the op-offload H2D staging ring **inside** the movable-boundary slab so it stops competing with the non-routable post-slab consumers and the G4 free-VRAM cap is no longer needed for it | **PROMOTED 2026-10-10 (r39, `v16-a55e952b8-r39`, tree `cc124b21e`)** — the ring is a work-region sub-region in the `0 -> narrow -> RB -> wide -> arena` ordering; folded into block 06 (slab side) + block 15 (staging side).  Field §5.5: prefill **781 → 946 (2.5 GiB region) / 992 (6 GiB)** vs 922 stock and 768 for the r38 G4 cap, decode 61.1-61.4 vs 62.2, 0 NaN; gates green (`1c5d32ac537d`, KLD 0.000707/98.755 %, 931/931, `b00fdf534227`); `fingon` + 3-GPU clean.  P2/P3 closed as not-beneficial.  Records: `README.md`, `HANDOVER.md`, `FINDINGS-numerics.md`, `WORKLOG.md` r39. |
 | [`cache-split-admission/`](cache-split-admission/README.md) | expert-cache admission policy on `-sm tensor` split MoE tables (`MOE_EXPERT_CACHE_DEVPOLICY_SPLIT`); today the split tables use the slow host promotion | **OPEN / measured** — re-measured 2026-10-08 on r34 (bounded 2048 MiB arena; at the default AUTO the arena is fully resident and the choice is moot): device policy wins big in plain decode (35B `-sm tensor` 10.2 -> **36.5** t/s), byte-identical, but MTP n3 still favours host promotion (3-GPU `MOE_EXPERT_CACHE_MIB=16384`: **76.5** vs 55.6 t/s), so a blanket default flip would regress MTP |
-| [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED |
-| [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | open |
-| [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact) | open |
-| [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | genuine CPU/GPU overlap for the expert misses (Strata shape) | OPEN / scoping |
+| [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED (2026-09-26) — rebased and building, fully RDNA4-gated, but **gate 2 failed** (the fp8 4B is 0.69x Q8_0 where cllm had 1.16x, because the delivery's MMB/GEMM work made Q8_0 +32 % and the fp8 WMMA path did not follow).  Resume actions are in `PLAN.md`.  Not closed — paused behind the delivery work |
+| [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | OPEN (seeded 2026-10-02) |
+| [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact, 2-8-token verify width) | OPEN — **not integrated**; the patch series is validated against `v16-84e76d8a2-r17`, so it needs a re-base and a re-validation before it can be promoted |
+| [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | genuine CPU/GPU overlap for the expert misses (the Strata shape) | OPEN / scoping (TODO #36) — **work in flight**: the note refutes the earlier "cannot be done" verdict for the interleaved shape and sets out the pipeline to try |
 | [`nwarps/`](nwarps/README.md) | per-M `nwarps` MoE candidate — the one deliberate width-purity impurity | ACTIVE (env-OFF) |
-| [`strata-amd-kernels/`](strata-amd-kernels/README.md) | compare Strata's AMD decode kernels against block-10/13/15 | OPEN / scoping |
-
-**Closed campaigns** live in `archive/work/`; each left a redirect stub here so historical pointers resolve.
-Recently closed:
-
-* [`archive/work/fit-slab-accounting/`](../archive/work/fit-slab-accounting/README.md) - the `--fit`/slab/MoE-arena accounting campaign, **promoted in `v16-a55e952b8-r38`**: G1/G2 (`--fit` arena+headroom reservation), G3 adaptive slab reserve, G4 `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`, G5 split-slice guard, G6 nextn-offload guard and G7 (the wide MTP-export NaN collapse) are folded into **block 06**, plus the G4 FA-staging cap in **block 15**.  Decisions: the MIB is a cap (arena 95-100 %), G2 = b1; the G4 default 50 % ships accepting ~16 % field prefill until the ring moves inside the slab (`wip/slab-ring-region/`, TODO #49).  Redirect stub: [`../wip/fit-slab-accounting/README.md`](../wip/fit-slab-accounting/README.md).
-
-* [`archive/work/host-expert-dio-cache/`](../archive/work/host-expert-dio-cache/README.md) - the bounded pinned host-expert pool, **folded into block 06 in r35** (`--host-experts pool`, an **option**; the default stays `pinned`).  It sizes to `MOE_HOST_POOL_MIB` (auto = 25 % of the MoE host expert bytes) and runs the device admission policy with a pool-sourced fill; the routing prefill is default-off.  Also folded: the parked slab peer-access fix (block 06) and the `mul_mat_vec_q_moe` row-tail clamp (block 13); the block-12 lazy-NCCL all-reduce bug was found en route and delivered in r34.
-
-* [`archive/work/moe-cache-band16/`](../archive/work/moe-cache-band16/README.md) - PR #115's expert-cache band widening (the decode/verify band now follows the routed-expert MMVQ band, 16 tokens on RDNA4, via a single-owner `moe_cache_band` hook) plus the device-side admission fill-list fix, **folded into block 06 in r31** behind `GGML_MOE_CACHE_MAX_TOK=8`.  On qwen35moe `-ncmoe 40`: the 16-token MoE batch 123.7 -> 702.5 t/s, `draft-mtp n-max 12` 33.9 -> 110.7 t/s, `n_max <= 7` byte-identical and `n-max 8` cache text bit-identical to all-VRAM.
-
-* [`archive/work/gfx12-gdn-accuracy/`](../archive/work/gfx12-gdn-accuracy/README.md) - the gfx1201 (RDNA4) bf16 chunked-GDN accuracy-parity campaign.  **Refuted:** the gfx12 kernel has per-op parity (equal op NMSE, identical layer-0 real-data error, marginally tighter WMMA), is tiling-invariant, and an fp16-operand variant that is 65x more accurate per op still moves the model KLD only 1.5x.  The residual gfx1201-vs-gfx11 KLD is model-level numerical sensitivity, not a GDN defect.  Only artifact: a **test coverage fix folded into block 02** (cache-fusion bf16 gate + the model's exact op shape), pending the next release; no kernel change.
-
-* [`archive/work/gdn-bf16-audit/`](../archive/work/gdn-bf16-audit/README.md) - issue #113's BF16 chunked-GDN prefill KLD: the r29 divergence was an `A_sc` stride aliasing bug for `n_seqs > 1` (not bf16 precision).  **Fixed in r30** (block 02), the bf16 default is back on, and the op test's gates are now realistic with a 1e-4 bf16 tolerance.
-* [`archive/work/rdna4-qwen4exp-decode-fusions/`](../archive/work/rdna4-qwen4exp-decode-fusions/README.md) - PR #114's four bit-identical qwen4exp decode fusions (latency-scheduled BF16 `hc_mix` up/collapse, `HC_COMBINE` folded into that norm, the shared-expert `sigmoid`-`mul`-`add` gate, and the GDN `beta` sigmoid), **folded into block 15 in r27** behind four default-on `=0` switches (`GGML_HC_UP_V2`, `GGML_CUDA_FUSE_HC_COMBINE_MIX`, `GGML_CUDA_FUSE_SIGMOID_MUL_ADD`, `GGML_CUDA_FUSE_GDN_BETA_SIGMOID`); +2.4 % decode with byte-identical text.
-* [`archive/work/r26-rdna4-dpp-butterflies/`](../archive/work/r26-rdna4-dpp-butterflies/README.md) - PR #110's DPP wave32 warp butterflies, **folded into block 15 in r26** behind the build-time `-DGGML_HIP_NO_DPP_XOR` gate (a runtime device-side gate wedged the FA prefill, so it was dropped).
-* [`archive/work/r26-dflash-dev-default-on/`](../archive/work/r26-dflash-dev-default-on/README.md) - PR #107's DFlash F1 warn-and-fall-back + default-on, **folded into block 15 in r26** (TODO #30 closed).
-* [`archive/work/moe-cache-autosize/`](../archive/work/moe-cache-autosize/README.md) - the expert-cache /
-  arena campaign (arm + auto-size, the movable-boundary slab).
-* [`archive/work/expert-cache-split/`](../archive/work/expert-cache-split/README.md) — closed with its
-  "mirrored experts" premise **refuted** (the weights are already split per device).
-* [`archive/work/host-pinned-buffer-crash/`](../archive/work/host-pinned-buffer-crash/README.md) — the
-  `--load-mode none` host-expert page fault; no longer reproduces (14/14 clean on r24).  Only the stale
-  `common/common.cpp` warning removal remains (`TODO.md` #45).
-* [`archive/work/layer-split-host-experts/`](../archive/work/layer-split-host-experts/README.md) —
-  per-device host bufts so `-sm layer` spreads host experts over the GPUs (**delivered in r14**, block 06).
-* [`archive/work/moe-mmq-overread/`](../archive/work/moe-mmq-overread/README.md) — the MoE MMQ expert-table
-  over-read (**resolved 2026-10-03**; the host gather's prefill "win" was the corruption).
-
-The resolution pattern (investigate -> fold into the owning block -> regenerate + validate -> record +
-archive -> ship) is documented in `archive/work/lightning-indexer-fusion/README.md`; promotion rules are in
-`AGENTS.md`.
+| [`strata-amd-kernels/`](strata-amd-kernels/README.md) | compare Strata's AMD decode kernels against block-10/13/15 (TODO #35) | **scoping note — not yet started**: no implementation yet, just the candidate list and the comparison method |

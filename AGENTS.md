@@ -126,6 +126,15 @@ out is promotion: collect *validated* wins, give each an env kill-switch, re-val
 **combination** (individual validations do not carry over), then cut a new block with the maintainer's
 go-ahead. Anything also applicable to unadulterated upstream gets a copy under `upstream/`.
 
+**A finished campaign leaves `wip/` — it does not become a stub.**  The moment a campaign is promoted
+(folded into `patches/`), closed, or refuted, its record moves to `archive/work/<campaign>/` and the
+result is recorded in `WORKLOG.md`, then the `wip/` entry is **deleted** and `wip/CAMPAIGNS.md` is
+updated.  Do **not** leave a "MOVED — see archive" placeholder behind: a redirect stub makes `wip/` claim
+work is in flight when it is not, which is exactly the state this rule exists to prevent.  Dated records
+(`WORKLOG.md`, `MANIFESTS.md`, `BASELINE.md`, `archive/`) keep the path that was correct when they were
+written; when a campaign moves, fix those paths to the new `archive/work/` location rather than keeping a
+stub alive to serve them, and treat a `wip/` path in an old record as a historical location.
+
 ## Critical facts (do not re-derive)
 
 - **`llama-cli` MUST be run with `--single-turn`** (plus `--no-display-prompt` for scripted output).

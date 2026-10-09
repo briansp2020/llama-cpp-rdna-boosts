@@ -233,7 +233,7 @@ the variable turns it off.**  Read the idiom column carefully — setting a pres
 still disables the feature.
 
 **The fusions are ON, and stay ON.**  The one known stand-down path — the cache-aware guard against
-per-table slab eviction (`TODO.md` #50, evidence in `wip/slab-ring-region/FINDINGS-numerics.md` F3) — is a
+per-table slab eviction (`TODO.md` #50, evidence in `archive/work/slab-ring-region/FINDINGS-numerics.md` F3) — is a
 pre-existing property of the arena, not a reason to turn them off.  Measured on the field config
 (Qwen3.8-Flash-Next IQ4_NL, `-sm tensor -ncmoe 48`, 32 358-token prompt, `--spec-type none`, warm):
 

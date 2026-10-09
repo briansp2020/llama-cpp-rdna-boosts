@@ -5,7 +5,7 @@
 **Release `v16-a55e952b8-r39`** (base `a55e952b8`, canonical block-15 tip
 `795ea7185f4c1d131725bbc8f4d10d4ce85cbb17`, net tree
 `cc124b21e72fdc314936960f0e52394e02fd6c8c`; `n_blocks` 16; `validate-set.sh` green -- strict 16/16
-`git am`, reconstructed tree == `release.json`).  Promotes `wip/slab-ring-region/` (TODO #49).  `patches/`
+`git am`, reconstructed tree == `release.json`).  Promotes `archive/work/slab-ring-region/` (TODO #49).  `patches/`
 was regenerated from a canonical fork rebuilt at the base (`scripts/apply-all.sh`) -- **do not hand-edit**.
 
 **What was folded:**
@@ -116,7 +116,7 @@ base (`scripts/apply-all.sh`) -- **do not hand-edit**.
 **Accepted trade (maintainer decision).**  The G4 default (50 %) refuses a ~990 MiB H2D-ring growth on
 the field config once the slab leaves ~1.6 GiB free, costing **~16 % prefill** (decode unchanged); this
 ships as-is because the ring will move **inside** the slab in the follow-up campaign
-**`wip/slab-ring-region/`** (TODO #49), which removes the tension.  Separately, the exact r22 field
+**`archive/work/slab-ring-region/`** (TODO #49), which removes the tension.  Separately, the exact r22 field
 setting (`--fit off`, `-ub 6144 -c 204800`, `-ncmoe 48`) aborts (`hipblaslt.cpp:164`) on **both** stock
 r37 and the WIP identically -- a pre-existing r37 regression, not a blocker; the field run passes with
 `--fit on`.
@@ -128,9 +128,9 @@ the deliverable; the fork's `rdna-boosts` branch is refreshed at release time pe
 
 ## 2026-10-09 -- G7: the MoE expert cache corrupts a wide MTP-export consumer (FIX); G1/G2 retest
 
-**WIP campaign** `wip/fit-slab-accounting/`; `patches/` untouched.  One session on the gfx1201 box,
+**WIP campaign** `archive/work/fit-slab-accounting/`; `patches/` untouched.  One session on the gfx1201 box,
 `~/llama.cpp` at the r37 tree `322a77273531f88250ed01bc9ef6a64a74227028` with the revival patch (combined
-current-state artifact `wip/fit-slab-accounting/fit-slab-r37-all-wip.patch`, sha256 `4130952f...`).
+current-state artifact `archive/work/fit-slab-accounting/fit-slab-r37-all-wip.patch`, sha256 `4130952f...`).
 
 ### G7 -- correctness fix (root-caused, gated)
 
@@ -148,7 +148,7 @@ The handover blamed the `moe_cache_take_over` alias; instrumentation proved the 
 when > 1, skip the cache takeover and the pruned fill and let the general path copy the whole table
 (picking the widest consumer aborts -- the export's ids are not ready at staging).  Pure decode has one
 1-row consumer, so the fast path is untouched.  Patch
-`wip/fit-slab-accounting/g7-multi-consumer-fill.patch` (sha256 `a041a4d8...`).
+`archive/work/fit-slab-accounting/g7-multi-consumer-fill.patch` (sha256 `a041a4d8...`).
 
 Gates all PASS: `-ncmoe {44,48,99}` acceptance 0.57353 (0 NaN); dense 4B `1c5d32ac537d`; prefill-logit
 KLD 0.000707 / same-top-p 98.755 %; `MUL_MAT_ID` 931/931; 2-GPU GSQ `MOE_EXPERT_CACHE_MIB=2048` r5 repro
@@ -158,7 +158,7 @@ acceptance 0.72727, 0 NaN.
 
 TODO #47.  Re-cut the Phase 1 patch onto r37 (applies cleanly; its G2 CUDA getter was inert because
 r37's `ggml_cuda_slab_enabled()` is `env_on && g_slab_armed`, false at fit time -- fixed in
-`wip/fit-slab-accounting/phase1-r37-g2-getter.patch`).  The Phase 1 `-sm tensor` auto-floor corruption
+`archive/work/fit-slab-accounting/phase1-r37-g2-getter.patch`).  The Phase 1 `-sm tensor` auto-floor corruption
 **does not reproduce**: G2-only, G1-only (`MOE_EXPERT_CACHE_MIB=8192`) and the auto floor (2/2 runs) are
 all coherent with 0 `////`, no `moe_cache_evict_slab_range`/`rearm`, stable arenas.  §5 sample green
 (no-abort MIB {unset,0,4096,8192,16384}, dense `--fit` golden, `GGML_CUDA_SLAB=0` zeroes G2).
@@ -172,7 +172,7 @@ auto floor both (`23191/23193`), coherent.
 
 **Decisions (maintainer):** the MIB is a **cap** -- the built arena must be 95-100 % of it (measured
 98.4/99.1/99.7 %, so the shortfall is slot rounding); **G2 gate = b1**; the **full §5.1-§5.7 matrix must
-pass before release**.  Detail: `wip/fit-slab-accounting/README.md` §13.6/§14.4.
+pass before release**.  Detail: `archive/work/fit-slab-accounting/README.md` §13.6/§14.4.
 
 **Decision:** G7 is a delivery correctness fix, blocked on the maintainer's go-ahead before it reaches
 `patches/` (promote through block 06); the G1/G2 re-cut + loader fix stay WIP pending the §5 matrix.
@@ -562,7 +562,7 @@ Campaign record: `archive/work/moe-cache-band16/` (the original PR README plus t
 
 ## 2026-10-08 (pending, no release) -- the gfx12-GDN-accuracy campaign closed; a test-only fix folded into block 02
 
-**Campaign** `wip/gfx12-gdn-accuracy/` closed and archived to `archive/work/gfx12-gdn-accuracy/`.  The
+**Campaign** `archive/work/gfx12-gdn-accuracy/` closed and archived to `archive/work/gfx12-gdn-accuracy/`.  The
 premise (the gfx1201/RDNA4 bf16 chunked-GDN kernel is less accurate than the gfx11 one) was **refuted**:
 equal op NMSE, identical layer-0 real-data error, a marginally tighter gfx12 WMMA, a bit-identical retile
 to the gfx11 shape, and an fp16-operand variant that is **65x more accurate per op** (2e-7 vs 1.35e-5
@@ -912,7 +912,7 @@ drop is recorded in block 15's message; the contributor may re-cut 0002 against 
 
 ## 2026-10-07 (docs) — TODO #44 closed: the expert weights are already split, not mirrored (no delivery change)
 
-`TODO.md` #44 and its handoff `wip/expert-cache-split/` claimed that `-sm tensor --n-cpu-moe N` **mirrors**
+`TODO.md` #44 and its handoff `archive/work/expert-cache-split/` claimed that `-sm tensor --n-cpu-moe N` **mirrors**
 the expert weights across the GPUs, so splitting them would double cache residency and halve the host copy.
 The claim was inferred from the field log's **288 cache tables** — but the cache keys a table on
 `(layer, role, device)` (`g_sem_to_id`), so a **split also yields 288 tables** and the count cannot
@@ -934,7 +934,7 @@ constraint.  No delivery code changed.  The stale `AGENTS.md` note ("a tensor sp
 weights, so `-sm tensor -ncmoe` is inherently slower than `-sm layer`") is corrected to say the weights are
 split and the gap is the upload/pruning machinery.  The campaign is archived at
 `archive/work/expert-cache-split/` (README + the geometry diagnostic patch) with a redirect stub at
-`wip/expert-cache-split/`; `TODO.md` #44 is CLOSED and the wip index no longer lists it.  Residual, **not**
+`archive/work/expert-cache-split/`; `TODO.md` #44 is CLOSED and the wip index no longer lists it.  Residual, **not**
 part of this item: the field config's `--load-mode none` — now **CLOSED** as TODO #38 in the cleanup entry
 below (the fault no longer reproduces on the current delivery and the warning is stale).
 
@@ -4115,7 +4115,7 @@ a Release by design.
 
 ## 2026-09-28 (r21, PR #63) — block-08 + block-14 amendments: five bit-exact verify-band fusions
 
-**Integration of PR #63 by @briansp2020** (`wip/rdna4-verify-fusions/`, accepted into `main` as its own
+**Integration of PR #63 by @briansp2020** (`archive/work/rdna4-verify-fusions/`, accepted into `main` as its own
 `wip/` directory).  Four of the five patches fold into **block 08** (`norm.cu`, `norm.cuh`, `unary.cu`,
 `unary.cuh`, `ggml-cuda.cu`); the GDN conv-input concat patch folds into **block 14** (`concat.cu`).  A
 5-token DFlash2 n-max-4 verify pass of the dense 27B launched 2,171 kernels against 1,485 for one token
@@ -4141,12 +4141,12 @@ output would be garbage); MoE (35B-A3B Q4_K_M, `-ncmoe 99`) MTP acceptance **ide
 55.1 -> 56.9 t/s.  Combined r21 (all three PRs) vs r20 `llama-bench -p 1,2,4,5,8 -n 0`: 26.77/47.65/81.74/
 90.60/106.28 -> 27.17/51.08/95.63/114.30/151.19 t/s.
 
-`validate-set.sh` green (strict 16/16 `git am`).  Full record: `wip/rdna4-verify-fusions/VERIFICATION-r21.md`,
+`validate-set.sh` green (strict 16/16 `git am`).  Full record: `archive/work/rdna4-verify-fusions/VERIFICATION-r21.md`,
 `patches/README.md` 2026-09-28 block-08/14 (r21, PR #63).
 
 ## 2026-09-28 (r21, PR #62) — block-15 amendment: RDNA4 GQA-6 FA band gets 64-wide K/V batches + 8 warps
 
-**Integration of PR #62 by @briansp2020** (`wip/rdna4-fa-band/`, accepted into `main` as its own `wip/`
+**Integration of PR #62 by @briansp2020** (`archive/work/rdna4-fa-band/`, accepted into `main` as its own `wip/`
 directory).  Only **block 15** changes content (`fattn-mma-f16.cuh`).
 
 **Patch 1 (bit-exact).**  The RDNA4 GQA-6 decode/verify band (`flash_attn_ext_f16<256,256,4,8>`) staged K
@@ -4172,7 +4172,7 @@ a greedy token); decode-path perplexity (`-ub 1 -c 2048 --chunks 8`) **5.0109 +/
 f16 KV `tg128 @ d16384`: 27.50 -> 27.57, within noise), so the README's "f16 3-4 %" is misattributed
 (likely a pre-r5 measurement).  Extending the 64-wide row to the 2-byte arm is a documented follow-up.
 
-`validate-set.sh` green (strict 16/16 `git am`).  Full record: `wip/rdna4-fa-band/VERIFICATION-r21.md`,
+`validate-set.sh` green (strict 16/16 `git am`).  Full record: `archive/work/rdna4-fa-band/VERIFICATION-r21.md`,
 `patches/README.md` 2026-09-28 block-15 (r21, PR #62).
 
 ## 2026-09-28 (r21, PR #57) — block-10 + block-13 amendments: RDNA4 multi-row mmvq verify blocks + exact `__mul24` scale multiplies
@@ -4599,7 +4599,7 @@ purpose when upstream reverted #24233 in #28604, leaving it a rationale marker t
 repurposed as the delivery's catch-all) to **`general system-operations bucket`** — what it has actually
 been since r6.  The old name was actively misleading.
 
-**Promoted** `wip/h2d-staging-ring/` — now `archive/work/h2d-staging-ring/` (issue #50, the op-offload
+**Promoted** `archive/work/h2d-staging-ring/` — now `archive/work/h2d-staging-ring/` (issue #50, the op-offload
 H2D staging ring).  It merges **PR #51 by
 @briansp2020**, whose contributions are load-bearing, not cosmetic: the **redirect design** (the
 consuming op reads the ring slot and the pointer is restored at the next issue, so the staged bytes move
@@ -4711,7 +4711,7 @@ still 2/2 OK; 35B-A3B Q4_K_M same-seed greedy text unchanged (`sha=e7e29d5a470a`
 on); `llama-batched-bench` `-npl 1,4,8` unchanged.  The fix is a literal no-op for any shape with
 `blocks_per_row_x != 3` (the snapped value equals the old one), and real MoE geometries have
 `blocks_per_row_x` 2 or ≥8, so no measured result moves.  Found while gating the issue-#50 staging ring
-(`wip/h2d-staging-ring/`); `TODO.md` item 25 closes with this entry.
+(`archive/work/h2d-staging-ring/`); `TODO.md` item 25 closes with this entry.
 
 ## 2026-09-26 (r10) — block-15 amendment: skip fully-masked KV groups in the FA prefill kernels (issue #48)
 

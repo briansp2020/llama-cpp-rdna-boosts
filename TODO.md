@@ -32,7 +32,7 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 
 ### 50. The cache-aware fusion guard is global while the slab's eviction is per-table (code `OPEN 2`)
 
-**Opened 2026-10-10 (WIP finding, `wip/slab-ring-region/`).**  `ggml_cuda_cache_blocks_fusion`
+**Opened 2026-10-10 (WIP finding, `archive/work/slab-ring-region/`).**  `ggml_cuda_cache_blocks_fusion`
 (`ggml-cuda.cu:5804`) is gated on the **global** `moe_cache_has_arena()`, but the movable-boundary slab
 evicts cache tables **per table** — `moe-expert-cache.cu` says *"the movable-boundary slab evicts the
 tables in the chunks it hands to the work pool, so a PARTIAL cache is the normal state"*.  Any arena
@@ -43,7 +43,7 @@ greedy output then depends on the **timing** of the eviction.  The code already 
 *"OPEN 2: the wholesale-fallback invariant … must hold for EVERY consumer, not just the fusion guard and
 the take-over hook."*
 
-Evidence + the A/B matrix: `wip/slab-ring-region/FINDINGS-numerics.md` F3.  On the field model
+Evidence + the A/B matrix: `archive/work/slab-ring-region/FINDINGS-numerics.md` F3.  On the field model
 (ring-in-slab vs ring-outside) the placements differ; with **every** individual fusion switch off but the
 `GGML_CUDA_DISABLE_FUSION`-gated alloc-deps pass still ON they agree, which also **excludes PR #27301's
 alloc dependencies** as the cause (the deps do cost +512 MiB of compute buffer, charged to the arena).  Not
@@ -60,7 +60,7 @@ fixes — see the measured cost and the re-enable recipe in `ENVIRONMENT.md` §7
 
 ### 51. 3-GPU MTP decode is 2.6x SLOWER than plain decode (pre-existing)
 
-**Opened 2026-10-10 (found during the `wip/slab-ring-region` 3-GPU gate).**  On 3 GPUs MTP is a *loss*,
+**Opened 2026-10-10 (found during the `archive/work/slab-ring-region/` 3-GPU gate).**  On 3 GPUs MTP is a *loss*,
 not a win — and it hits the production config (AGENTS.md: servers run unpinned, 3-GPU,
 `HIP_VISIBLE_DEVICES=0,1,2`, hybrid default).
 
@@ -92,7 +92,7 @@ PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1,2 ./field_nospec.sh ~/llama.cpp/build-rocm
 
 Suspects to start from: the 3-way tensor-split verify gather (the 4-token verify reads experts from three
 devices), the draft/target device placement, and whether the per-op graph capture re-fires on 3 GPUs
-(`graphs reused` is 267 on 3 GPUs vs 246/270 on 2).  Details: `wip/slab-ring-region/HANDOVER.md` §4.3.1.
+(`graphs reused` is 267 on 3 GPUs vs 246/270 on 2).  Details: `archive/work/slab-ring-region/HANDOVER.md` §4.3.1.
 
 ### 48. The MoE expert cache corrupts a wide MTP-export consumer (G7) — CORRECTNESS
 
@@ -314,7 +314,7 @@ only the **native-quantized** arm (`ncols1 = 4`).  The 2-byte f16/bf16 arm uses 
 "f16 3-4 %" is therefore **misattributed** (measured f16 KV `tg128 @ d16384` 27.50 -> 27.57, noise).  A
 64-wide row for the 2-byte arm is worth a sweep: the arm has no dequantisation to hide the unused
 columns, and r6 made native bf16 default-on so the arm is live.  Record:
-`wip/rdna4-fa-band/VERIFICATION-r21.md`, `WORKLOG.md` 2026-09-28 (r21, PR #62).
+`archive/work/rdna4-fa-band/VERIFICATION-r21.md`, `WORKLOG.md` 2026-09-28 (r21, PR #62).
 
 ## Waiting on others (not actionable in this repo)
 
