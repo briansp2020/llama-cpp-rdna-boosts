@@ -1000,12 +1000,10 @@ enabled, or leave it as a documented trade-off.
    cache on vs `MOE_EXPERT_CACHE_MIB=0` at a config where stock has the cache on) or a prefill-path
    difference.  The decode claim is byte-identity; prefill is gated by
    `benchmarks/prefill-logit-methodology.md`.
-3. **Separate-draft acceptance cliff at high `-ncmoe`** (the Finding above).  The speculative **weights**
-   are protected (G6) and host speculation is verified correct; what remains is the target's late-trunk
-   host path collapsing draft acceptance while the target text stays coherent (Flash-Next, draft on GPU,
-   `-ncmoe 48` -> 0.000 vs `-ncmoe 44` -> 0.539).  This is a distinct correctness investigation: the
-   drafter's input from the host-computed last trunk layers diverges.  Root-cause it (the "host
-   speculation should just run" requirement), then decide warn vs fix.
+3. **Separate-draft acceptance cliff at high `-ncmoe`** -> now root-caused as the **G7 correctness bug**
+   (the cache corrupts the wide MTP-export consumer; draft logits NaN, target coherent).  Full handover,
+   reproducer and fix candidates in **§13** (TODO #48); needs its own session.  The speculative weights
+   are protected (G6) and host speculation is verified correct; G7 is the **target's** export path.
 4. **G4 default.**  The 50 % default is a proposal; issue #117 is still un-reproduced on `fingon`
    (§11.4).  Run the §5.7 matrix before a default flip.
 5. **G1/G2** stay parked behind the `-sm tensor` auto-floor corruption (Phase 1).
@@ -1039,3 +1037,87 @@ git checkout -- ggml/src/ggml-cuda/common.cuh ggml/src/ggml-cuda/ggml-cuda.cu \
   `/tmp/35b_mtp_41{,_fix}.log`, `/tmp/iq3_1gpu_nomtp48.log`.
 * Decision: implementation pass parked as WIP; promotion blocked on §12.7 items 1-3 (the purity question,
   the MTP-layer warning, and a `fingon` + default-cap run; the corruption-band test itself passed).
+
+---
+
+## 13. OPEN CORRECTNESS BUG — the expert cache corrupts a wide MTP-export consumer (G7)
+
+**This is a real, pre-existing delivery bug, not caused by the revival patch.**  It is the reason
+`--spec-type draft-mtp` on Flash-Next can collapse draft acceptance to **0** (draft logits = **NaN**)
+while the target output stays coherent.  It needs its own focused session; this section is the handover.
+
+### 13.1 Symptom and reproducer
+
+1 GPU, Flash-Next UD-IQ3_XXS + separate shared Q8_0 MTP head:
+
+```sh
+HIP_VISIBLE_DEVICES=0 ./build-rocm-hybrid/bin/llama-cli \
+  -m /llm/models/Qwen3.8/Flash-Next/IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
+  -md /llm/models/Qwen3.8/Flash-Next/IQ3_XXS/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  -ngl 99 -sm layer -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0 -t 8 -c 4096 -b 2048 -ub 2048 \
+  --spec-type draft-mtp --spec-draft-n-max 3 --seed 42 --temp 0 \
+  -p "Write a detailed history of the Roman Empire." -n 64 --ignore-eos \
+  --no-display-prompt --single-turn -v
+```
+
+* Default cache: every `spec draft:` candidate prints `(     nan)`; acceptance **0.00000** (0/759 in the
+  256-token run).  Target text is coherent.
+* `MOE_EXPERT_CACHE_MIB=0` (cache off): acceptance **0.58824 (40/68)**, **no** NaN.  -> the cache is the
+  cause, not the host path per se.
+* `GGML_OP_OFFLOAD_MIN_BATCH=100000`: **still NaN** (0/183).  -> not the r5 op-offload gather path.
+* `-ncmoe 44` (last trunk layers on device): acceptance **0.53952 (157/291)**, finite.  The trigger is
+  the host-resident **last trunk layer** (`blk.47`) plus the cache.
+* `MOE_EXPERT_CACHE_VALIDATE=1` was not run yet; the alias/stale-remap validator may name it directly.
+
+### 13.2 Mechanism (evidence-backed, not yet proven end-to-end)
+
+`qwen4exp`'s unmasked MTP export recomputes the last trunk layer's FFN **on every row** during a
+prefill chunk (`mtp_export_defer`), so `blk.47.ffn_{gate,up,down}_exps` have **two `MUL_MAT_ID`
+consumers**: the ordinary 1-row decode-band tail and the wide export tail.  `GGML_SCHED_DEBUG=2` on the
+reproducer shows them as the decode split `SPLIT #49 # 3 inputs [blk.47 gate/up/down]` and the export
+splits `SPLIT #143/#144/#145 # 1 inputs [blk.47 ...]`.
+
+`moe_cache_take_over()` (`moe-expert-cache.cu:4697`) handles the decode-band consumer by setting
+`g_alias_to_id[weight_cpy] = id` and returning true, so the scheduler **skips filling `weight_cpy`** and
+the cache-aware op reads the arena instead.  A wide consumer that is **not** cache-aware reads the same
+`weight_cpy` -> the bytes were never staged for its routing (or `.data` was redirected by the alias) ->
+NaN in `t_h_nextn` -> the MTP head's logits are NaN -> acceptance 0.
+
+The r5 fix (`archive/work/sched-moe-restage/`, present at `ggml/src/ggml-backend.cpp:1826`) re-registers
+the weight as an input of the later split; that was validated on a **2-GPU** config.  It is **not
+sufficient here** (1 GPU, `-sm layer`, separate `-md` head, `n_copies == 1`, `-c 4096`).  Why exactly it
+does not stage is the open question (candidate: the export split's ids are not ready at staging time, or
+the alias map is keyed by the copy pointer and survives across graphs, or the staging is skipped because
+the copy's `.data` was redirected).
+
+### 13.3 Fix candidates (pick after the root cause)
+
+1. **Graph pre-pass**: if a host weight copy has a wide (`ne[2] > moe_cache_band`) `MUL_MAT_ID` consumer
+   anywhere in the sched graph, refuse `moe_cache_take_over` for it in that graph (stage it normally).
+   Pure-decode graphs have no wide consumer, so the decode fast path is unchanged.  Needs the pre-pass
+   because the decode split is processed before the export split.
+2. **Separate copies**: force `n_copies >= 2` when a draft/MTP head is enabled so the decode and export
+   consumers never share a copy.  Simple, but costs VRAM.
+3. **Make the wide export consumer cache-aware** (a remapped wide op).  Largest, most invasive.
+4. **Don't skip the fill for a copy that has a second consumer**: `take_over` could return false when
+   `weight_cpy` is consumed more than once.  Closest to the r5 intent, but needs the consumer count.
+
+### 13.4 Gates for the fix
+
+* The reproducer above: finite draft probabilities and acceptance > 0 in **every** arm
+  (`-ncmoe {44,48,99}`), no NaN.
+* `MOE_EXPERT_CACHE_MIB=0` remains the reference (0.588 on this prompt).
+* `scripts/gate-prefill-logits.sh` (PASS), dense coherence `1c5d32ac537d`, MTP acceptance on the
+  maintainer's server config, `test-backend-ops -o MUL_MAT_ID`, and the `-sm tensor` 2/3-GPU MTP gates.
+* Re-run the r5 archive repro (2 GPU, QR/RCO IQ3_XXS, `MOE_EXPERT_CACHE_MIB=2048`) to prove no
+  regression of the original fix.
+
+### 13.5 Relationship to the rest of the campaign
+
+* **Not** introduced by the revival patch; stock r37 reproduces it (cache on, no patch).  The G5
+  split-slice SIGSEGV is unrelated.
+* G6 keeps the **speculative-head** weights on device, which avoids the *embedded*-head variant, but the
+  corruption here is in the **target's** MTP export consuming the target's own host experts, so G6 does
+  not cover it.
+* The campaign's arena/accounting work is orthogonal: this is a **correctness** bug in the cache's
+  shared-copy takeover.  It should be fixed before any cache/slab default is promoted.

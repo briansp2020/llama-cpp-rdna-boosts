@@ -30,6 +30,20 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 48. The MoE expert cache corrupts a wide MTP-export consumer (G7) — CORRECTNESS
+
+**Opened 2026-10-09; needs its own session.**  `--spec-type draft-mtp` on Flash-Next (separate `-md`
+head) can collapse draft acceptance to **0** with **NaN** draft logits while the target text stays
+coherent.  Isolated to the cache: `MOE_EXPERT_CACHE_MIB=0` gives acceptance 0.588 and no NaN;
+`GGML_OP_OFFLOAD_MIN_BATCH=100000` does not help; `-ncmoe 44` is fine, `-ncmoe 48` NaNs.  The qwen4exp
+unmasked MTP export recomputes the last trunk layer's FFN on every row, so `blk.47.ffn_*_exps` has a
+1-row decode-band consumer (whose copy `moe_cache_take_over` aliases to the arena and never fills) and a
+wide export consumer that reads the same unfilled copy -> NaN in `t_h_nextn`.  The r5 `sched-moe-restage`
+fix (`ggml-backend.cpp:1826`) is present but insufficient for this 1-GPU/`-sm layer`/`n_copies==1` config.
+**Next:** prove the exact skip (ids-not-ready at staging time vs the copy-pointer alias map surviving
+across graphs), then pick a fix from the four candidates.  Full handover, reproducer and gates:
+`wip/fit-slab-accounting/README.md` §13.
+
 ### 47. Bring the MoE arena budget and slab headroom into `--fit` (G1 + G2)
 
 **Opened 2026-10-07; Phase 1 implemented then PARKED 2026-10-07.**  `--fit` is not a single VRAM planner for
