@@ -1457,9 +1457,9 @@ with a cross-reference from the §2 staging table.
 `G4=0` 390.5, `G4=1%` 340.0.  (Single runs; pp spread ~±10 %, so `G4=0` being fastest needs repeats before
 it is read as a cap cost.)
 
-**Not run this session:** §5.5 field A/B (`-ub 6144 -c 204800`, `GGML_CUDA_ALLREDUCE=ce`),
-the 8 `-sm layer -c auto` §5.1 arms did not generate (they kept the tool-default `n_ctx=4096` while the
-prompt is 5298 tokens — a clean request-rejected exit, not a crash), §15.4 `fingon`, §15.5, §15.6.
+**Not run this session:** the 8 `-sm layer -c auto` §5.1 arms did not generate (they kept the
+tool-default `n_ctx=4096` while the prompt is 5298 tokens — a clean request-rejected exit, not a crash).
+(§5.5 is in §15.9, §15.4 in §15.8, both 2026-10-09.)
 
 #### Findings (need a maintainer decision before §15.4-§15.6)
 
@@ -1542,5 +1542,56 @@ bool`, so only the *first* refusal of a process is logged — a later larger ref
 **Bonus — gfx1100 width purity (qwen35moe, embedded MTP, `-ncmoe 20`, `-lm dio`):**
 `none == n1 == n3 == n7` = **`cd5e36218bd2`** (266 chars), all exit 0; acceptance n1/n3 **0.84906**,
 n7 **0.66234**.  The G7 scheduler half is pure on RDNA3 as well.
+
+---
+
+### 15.9 §5.5 field A/B (2026-10-09)
+
+**Config (the r22 field config, per §5.5):** 2 GPU (`HIP_VISIBLE_DEVICES=0,1`, two gfx1201 R9700 — the
+box's gfx1036 iGPU is not a HIP agent), `GGML_CUDA_ALLREDUCE=ce`, `Qwen3.8-Flash-Next IQ4_NL 9-shard`
+(64 800 MiB host experts) + shared Q8_0 MTP head, `-sm tensor -ncmoe 48 -ub 6144 -b 6144 -c 204800
+--no-kv-unified -ctk/-ctv q8_0 -fa on`, `--spec-type draft-mtp --spec-draft-n-max 3`, server, prompt =
+`prose-rdna-boosts.txt` ×6 = **31 482 tokens**, then 1000 MTP decode tokens.  Raw logs `/tmp/fsa155/`.
+
+**Fit A/B (`--fit on`, no user `-ngl`):** the WIP reservation changes the fit *target* (as designed) but
+**not the realised n_ctx or arena**:
+
+| arm | fit target dev0/1 | n_ctx | slab | arena |
+|---|---|---:|---|---:|
+| WIP | 22 468 / 22 470 MiB | 204 800 | 20.19 / 18.56 GiB (8 GiB reserve) | 39 993.8 MiB (61.7 %) |
+| stock r37 | 31 372 / 31 374 MiB | 204 800 | 20.19 / 18.56 GiB (8 GiB reserve) | 39 993.8 MiB (61.7 %) |
+
+**30k path, `--fit on`:** 0 aborts in every arm; `moe_cache_evict_slab_range` (936 MiB) +
+`moe_cache_rearm` (8 tables) fire; acceptance **1.0**; decode **61.5–62.1 t/s** everywhere.  r22's
+68–71 t/s is not reproduced on r37 **stock** either (~62), so that number is a r22-vs-r37 difference, not
+a WIP one.
+
+**New WIP-specific cost - the G4 default regresses the field prefill:**
+
+| arm | prefill t/s | cap refusal |
+|---|---:|---|
+| stock r37 (no cap) | **922.0 / 923.3 / 923.6** | none |
+| WIP, G4 default 50 % | **767.4 / 767.7 / 768.5** | refuses **990 MiB** at 1624 MiB free |
+| WIP, `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT=0` | **913.0 / 914.7** | none |
+| WIP, `...=1` | 721.1 | refuses; serial fallback |
+
+The default 50 % cap refuses a 990 MiB optional allocation once the slab has left only ~1.6 GiB free,
+and the fallback costs **~16 % prefill** on the maintainer's own field config (decode unchanged).  With
+the cap off the WIP matches stock (~914 vs ~923, within noise).  On `fingon` the same default was
+*neutral-to-faster* (§15.8), so the effect is config-dependent - but a 16 % field prefill regression is
+enough that the **G4 default should not ship at 50 % unqualified**.
+
+**`--fit off` (the exact r22 run setting) is broken on r37 - but pre-existing.**  With `--fit off` the
+same 30k prompt aborts on **both** stock r37 and the WIP with
+`Hip error: 'out of memory'(2) ... hipblaslt.cpp:164` + Tensile `hipModuleLoad failed` (identical arena
+shrink counts); on 3 GPU stock fails at `hipblasCreate` (`CUBLAS_STATUS_ALLOC_FAILED`).  A 2000-token
+warmup generation fails the same way.  The WIP changes nothing here (identical failure), so it is a
+**r37 regression against the r22 field record**, not a campaign blocker - but the field run only passes
+with `--fit on` (which re-arms the boundary move).
+
+**Decision requested (feeds §12.7 item 4 / §8 #6):** the G4 default.  Options: keep 50 % but accept the
+field prefill cost, lower the default / make it absolute-MiB-bounded so a 990 MiB staging growth at
+1.6 GiB free is still allowed, or ship G4 default-**off** (env opt-in) until the issue-#117 repro is
+pinned down.  Nothing else in §5.5 blocks the WIP.
 
 
