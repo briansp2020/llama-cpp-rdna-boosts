@@ -1,0 +1,260 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 1fa5e3321..4a4ed81a8 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1612,6 +1612,11 @@ static inline size_t ggml_cuda_fattn_stage_max_bytes() {
+ // device allocation inherits the same fail-soft policy.
+ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+ 
++// fit-slab-accounting revival (G4, issue #117): is the movable-boundary slab live on this device?  The
++// H2D staging ring consults it before growing -- see `h2d_stage_buffer` in this header.  Defined in
++// ggml-cuda.cu (declared in ggml-cuda-vmm.h, which this header does not include).
++bool ggml_cuda_slab_active(int device);
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+@@ -1811,6 +1816,19 @@ struct ggml_backend_cuda_context {
+         GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
+         if (size > fattn_stage_size[stream_no]) {
+             const size_t new_size = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
++            // fit-slab-accounting revival (G4): bound this optional transient by the free VRAM it would
++            // still leave when the movable-boundary slab is active (see
++            // `optional_alloc_within_free_cap`).  A refusal falls back to the native K/V read.
++            if (!optional_alloc_within_free_cap(fattn_stage_bytes() - fattn_stage_size[stream_no] + new_size)) {
++                if (!fattn_stage_oom_warned) {
++                    fattn_stage_oom_warned = true;
++                    GGML_LOG_WARN("%s: leaving the FA prefill staging arena at %zu MiB rather than %zu MiB "
++                                  "(the slab is active and free VRAM is tight); reading the K/V cache "
++                                  "natively instead (prefill may be slower)\n",
++                                  __func__, fattn_stage_size[stream_no] >> 20, new_size >> 20);
++                }
++                return nullptr;
++            }
+             char * new_arena = nullptr;
+             if (cudaMalloc(&new_arena, new_size) != cudaSuccess) {
+                 (void) cudaGetLastError(); // clear the sticky error
+@@ -1880,6 +1898,57 @@ struct ggml_backend_cuda_context {
+         return budget;
+     }
+ 
++    // fit-slab-accounting revival (G4, issue #117): optional raw device allocations -- the op-offload
++    // H2D staging ring and the FA prefill staging arena -- live OUTSIDE both the compute-graph reserve
++    // and the movable-boundary slab.  When the slab is active, the VRAM outside it (the slab's
++    // GGML_CUDA_SLAB_HEADROOM_MIB) is the only source for the consumers it cannot route: hipBLASLt's
++    // Tensile code objects + workspace, and the MTP draft buffer.  An unbounded optional transient can
++    // consume that reserve, after which the next `ggml_cuda_device_malloc` cannot be satisfied -- the
++    // arena's physical is mapped INTO the slab and ROCm will not unmap a sub-range, so the arena cannot
++    // yield it back -- and the run aborts (`exit 134`) or, on a thin headroom, corrupts silently.
++    // Bound every optional transient to `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`% of the currently-free
++    // VRAM (default 50, 0 disables).  A refusal is fail-soft: the caller falls back (serial staging /
++    // native K/V read).  Inert when the slab is inactive (no headroom policy to protect).
++    static int optional_alloc_max_free_pct() {
++        static const int n = []() {
++            const char * e = getenv("GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT");
++            int v = e ? atoi(e) : 50;
++            if (v < 0)   v = 0;
++            if (v > 100) v = 100;
++            return v;
++        }();
++        return n;
++    }
++
++    // Returns true when growing an optional allocation to a total of `new_total` bytes stays within the
++    // cap above.  Slab-inactive devices and a 0 cap always allow (the pre-slab behaviour); a failed
++    // measurement also allows (fail-soft, never invert a working run into a refuse on a driver hiccup).
++    bool optional_alloc_within_free_cap(size_t new_total) const {
++        if (!ggml_cuda_slab_active(device)) {
++            return true;
++        }
++        const int pct = optional_alloc_max_free_pct();
++        if (pct <= 0) {
++            return true;
++        }
++        size_t free_b = 0, total_b = 0;
++        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
++            return true;
++        }
++        if (new_total <= free_b / 100 * (size_t) pct) {
++            return true;
++        }
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("optional device allocation refused: %.0f MiB total against %.0f MiB free "
++                          "(the movable-boundary slab is active; the cap is %d%%).  The caller falls "
++                          "back.  Raise GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT to allow.\n",
++                          (double) new_total / (1024 * 1024), (double) free_b / (1024 * 1024), pct);
++        }
++        return false;
++    }
++
+     // Total device budget for the staging ring.  GGML_SCHED_STAGE_MAX_MB (MiB) bounds it explicitly
+     // (A/B and VRAM control).  When it is unset the budget is **auto-sized so the full ring can hold
+     // the largest upload seen**: the old fixed 2048 MiB default held only four 450 MiB expert tables,
+@@ -1909,6 +1978,11 @@ struct ggml_backend_cuda_context {
+             if (h2d_stage_total - old_size + new_size > h2d_stage_budget(new_size)) {
+                 return nullptr;
+             }
++            // fit-slab-accounting revival (G4, issue #117): bound the ring by the free VRAM it would
++            // still leave.  See `optional_alloc_within_free_cap` above.
++            if (!optional_alloc_within_free_cap(h2d_stage_total - old_size + new_size)) {
++                return nullptr;
++            }
+             if (h2d_stage[slot] != nullptr) {
+                 ggml_cuda_graph_mem_freed(device);   // captured graphs may read the old slot
+                 CUDA_CHECK(cudaFree(h2d_stage[slot]));
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index 948165269..b9f19a903 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -44,6 +44,9 @@ size_t ggml_cuda_slab_arena_total (int device);
+ void   ggml_cuda_slab_extend_all();
+ // raise the free VRAM the slab extension leaves (never lowers an explicit GGML_CUDA_SLAB_HEADROOM_MIB)
+ void   ggml_cuda_slab_headroom_at_least_mib(size_t mib);
++// fit-slab-accounting revival (G3): the draft-context VRAM the MoE preflight projected; the slab reserve
++// is sized from it (plus the headroom) because the slab is created before the draft context.
++void   ggml_cuda_slab_set_aux_reserve(size_t bytes);
+ // The arena's allocation unit (fine: the slab is one mapping, so this is bookkeeping only).
+ size_t ggml_cuda_slab_arena_unit  (int device);
+ // Base of the work region for a `need`-byte compute buffer, moving the boundary up (evicting the arena
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c934d3ee5..1f2bff16e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -631,6 +631,16 @@ static size_t ggml_cuda_slab_chunk_bytes() {
+     return chunk_mib * 1024 * 1024;
+ }
+ 
++// fit-slab-accounting revival (G3): the MTP/DFlash draft context's VRAM, passed to the MoE preflight
++// before the slab is armed.  The reserve uses it because the draft is created AFTER the slab.
++static size_t g_slab_aux_reserve_bytes = 0;
++void ggml_cuda_slab_set_aux_reserve(size_t bytes) {
++    g_slab_aux_reserve_bytes = bytes;
++}
++
++// Forward declaration: the reserve policy reads the (single-sourced) headroom.
++static size_t ggml_cuda_slab_headroom_bytes();
++
+ static size_t ggml_cuda_slab_reserve_bytes(size_t total_b) {
+     static size_t reserve_mib = SIZE_MAX;
+     if (reserve_mib == SIZE_MAX) {
+@@ -638,17 +648,21 @@ static size_t ggml_cuda_slab_reserve_bytes(size_t total_b) {
+         if (env != NULL) {
+             reserve_mib = (size_t) atoll(env);
+         } else {
+-            // Left OUT of the slab for everything that is NOT the work pool or the arena: the GPU-resident
+-            // model weights, the KV cache, the draft model and the various workspace pools are allocated
+-            // AFTER the slab is created (the slab is born during the fitting probe), and under the slab
+-            // they can no longer borrow from the arena -- ROCm will not unmap a sub-range of the slab's
+-            // single mapping, so a freed arena table returns a byte to the slab's free list, never to the
+-            // driver.  A reserve that is too small therefore ENDS THE RUN (measured: 4096 MiB -> a failed
+-            // hipBLASLt workspace allocation at load, exit 134), which is why the default is deliberately
+-            // generous and scales with the card rather than being a flat constant: ~1/4 of the device, and
+-            // never less than 8 GiB (the measured need of the primary Qwen3.8-Flash-Next IQ4_XS config on
+-            // a 32 GiB card).
+-            reserve_mib = (size_t) std::max<size_t>(8192, total_b / 4 / (1024 * 1024));
++            // fit-slab-accounting revival (G3): size the reserve from what actually appears AFTER the
++            // slab, not a flat guess.  The slab is born during `sched_reserve`, and `llama_context`
++            // allocates the KV cache BEFORE that (`create_memory` at llama-context.cpp:543 vs
++            // `sched_reserve` at :609), so the reserve does NOT need to cover the weights or the KV --
++            // they are already resident and are counted in `free_b`.  It only has to cover the
++            // allocations that follow: the MTP draft context (the `aux_reserve_bytes` the preflight was
++            // given, ~3.7 GiB when a draft is present, 0 otherwise) plus the slab's own headroom (the
++            // workspaces hipBLASLt and the FA staging draw on).  A flat max(8192, total/4) still charged
++            // a no-draft run 8 GiB, so under partial offload `want` fell below `work + min_arena` and the
++            // slab DECLINED -- the cache streamed from the host (measured on a 32 GiB card, Q8_0 35B-A3B,
++            // `-ncmoe 16`: 47 t/s, vs 55-59 t/s once the reserve fits).  `GGML_CUDA_SLAB_RESERVE_MIB`
++            // remains the explicit override.
++            const size_t headroom_mib = ggml_cuda_slab_headroom_bytes() / (1024 * 1024);
++            const size_t aux_mib      = g_slab_aux_reserve_bytes / (1024 * 1024);
++            reserve_mib = std::max<size_t>(headroom_mib + aux_mib, (size_t) 1024);
+         }
+     }
+     return reserve_mib * 1024 * 1024;
+@@ -10175,6 +10189,9 @@ static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev,
+     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+     const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
+     if (on) {
++        // fit-slab-accounting revival (G3): remember the draft-context estimate for the slab reserve (it
++        // is created BEFORE the draft context, so the reserve has to leave room for it).
++        ggml_cuda_slab_set_aux_reserve(aux_reserve_bytes);
+         // This model HAS host-resident experts, so the work/arena split is meaningful -- arm the slab.
+         // Dense models never reach here (`llama_model_moe_cache_preflight` skips an empty host-expert map),
+         // which is what keeps the slab off them.  Runs before the context, so before any compute buffer.
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 8736a8c4f..33531ec37 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -4121,6 +4121,31 @@ void moe_cache_inplace_fill(int device, const moe_cache_inplace_src & src, void
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++// fit-slab-accounting revival: a split host slice is only addressable when its byte range stays inside
++// one host expert.  A meta view whose `nb` does not describe its slice (measured on `-sm tensor`: a
++// layer registering `expert_bytes == host_bytes` with a nonzero `slice_off`) makes every cache fill read
++// `slice_off` bytes past the end of the master -- a host memmove SIGSEGV in the identity fill, or a
++// device page fault in the gather.  Returns false so the caller declines the table; the scheduler's
++// full-table copy is always correct.  `host_pitch` is the strided axis-0 case (a 2-D fill whose span
++// differs from `expert_bytes`).
++static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size_t src_off, size_t host_pitch) {
++    if (host_bytes == 0 || expert_bytes == 0 || src_off > host_bytes) {
++        return false;
++    }
++    size_t span = expert_bytes;
++    if (host_pitch > 0) {
++        if (host_bytes % host_pitch != 0) {
++            return false;
++        }
++        const size_t rows = host_bytes / host_pitch;
++        if (rows == 0 || expert_bytes % rows != 0) {
++            return false;
++        }
++        span = (rows - 1) * host_pitch + expert_bytes / rows;
++    }
++    return span <= host_bytes - src_off;
++}
++
+ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
+                            const ggml_tensor * ids, void * stream, int device,
+                            size_t slice_off, int split_axis) {
+@@ -4149,6 +4174,19 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     if (host_bytes == 0 || expert_bytes == 0) {
+         return false;
+     }
++    if (!moe_cache_slice_addr_ok(host_bytes, expert_bytes, slice_off, host_pitch)) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("%s: declining a MoE expert table with an unaddressable split slice "
++                          "(layer=%d role=%s host_bytes=%zu expert_bytes=%zu slice_off=%zu host_pitch=%zu, "
++                          "split_axis=%d); the scheduler's full-table copy will serve it, so decode uses "
++                          "the host path for that table.  Please report this geometry.\n",
++                          __func__, name_layer(weight), name_role(weight).c_str(),
++                          host_bytes, expert_bytes, slice_off, host_pitch, split_axis);
++        }
++        return false;
++    }
+     // Register the table with the cache even though this pass uploads through the gather.  The
+     // deferred arena sizing (`alloc_all_locked`) latches on the first full decode pass and sizes every
+     // table registered by then, so a table that is ONLY ever uploaded through the gather path would be
+@@ -4257,6 +4295,19 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+             host_pitch = weight->nb[1];   // a strided axis-0 slice needs a 2-D fill
+         }
+     }
++    if (!moe_cache_slice_addr_ok(host_bytes, expert_bytes, slice_off, host_pitch)) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("%s: declining a MoE expert table with an unaddressable split slice "
++                          "(layer=%d role=%s host_bytes=%zu expert_bytes=%zu slice_off=%zu host_pitch=%zu, "
++                          "split_axis=%d); the scheduler's full-table copy will serve it, so decode uses "
++                          "the host path for that table.  Please report this geometry.\n",
++                          __func__, layer, name_role(weight).c_str(),
++                          host_bytes, expert_bytes, slice_off, host_pitch, split_axis);
++        }
++        return false;
++    }
+     const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
+                                       host_bytes, slice_off, host_pitch, split_axis, weight->data, device);
+     if (table < 0) {

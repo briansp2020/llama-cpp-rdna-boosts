@@ -2,12 +2,24 @@
 
 > **New to this campaign? Start at [Cold start (read me first)](#cold-start-read-me-first).**
 
-**Status:** **REVIVED (2026-10-09).**  Phase 1 (G1+G2 + the tensor-split plumbing it needs) remains
-implemented and parked: it was built warning-free and tested, is not shipped, and `patches/` is untouched.
-G2 (slab headroom) and G1 (explicit `MOE_EXPERT_CACHE_MIB`) are validated safe, but newly enabling the
-**auto floor** under `-sm tensor` reproducibly corrupts.  The revival adds **G4** (issue #117: the
-op-offload staging ring is a fourth unplanned VRAM consumer) and a `fingon` (gfx1100) test plan; see
-§4.6 and §11.  Full Phase 1 record + the parked patch: [`PHASE1-ATTEMPT.md`](PHASE1-ATTEMPT.md).
+**Status:** **REVIVED (2026-10-09); a first implementation pass is now DONE and parked** (patch
+[`revival-2026-10-09.patch`](revival-2026-10-09.patch), 4 files, built warning-free on gfx1201 / ROCm
+7.14.1, WIP only — `patches/` is untouched).  The revival reframed the campaign around the user's
+goal: **no memory-shortfall crash for *any* `-ncmoe`**, right-sized where it fits, and a loud,
+actionable warning plus a graceful performance fallback where it does not — and it must work without
+`--fit`.  Three changes landed in the WIP patch: **G3** (the slab reserve is now sized from what
+actually appears after the slab, not a flat `max(8192, 25 %)`), **G4** (the optional raw transients —
+the op-offload H2D ring and the FA prefill staging arena — are capped at a fraction of the free VRAM
+while the slab is active), and a **split-slice geometry guard** that fixes a reproducible host-memmove
+SIGSEGV in the `-sm tensor` identity fill.  See
+[§12](#12-revival-implementation-2026-10-09-r37) for the code, the measurements and what is left.
+
+Phase 1 (G1+G2 + the tensor-split plumbing it needs) remains implemented and parked: it was built
+warning-free and tested, is not shipped, and `patches/` is untouched.  G2 (slab headroom) and G1
+(explicit `MOE_EXPERT_CACHE_MIB`) are validated safe, but newly enabling the **auto floor** under
+`-sm tensor` reproducibly corrupts.  The revival adds **G4** (issue #117: the op-offload staging ring
+is a fourth unplanned VRAM consumer) and a `fingon` (gfx1100) test plan; see §4.6 and §11.  Full
+Phase 1 record + the parked patch: [`PHASE1-ATTEMPT.md`](PHASE1-ATTEMPT.md).
 
 **Update 2026-10-08 (field data, no code change).**  A third gap **G3** was identified from the
 discussion #108 field report (briansp2020: partial offload silently disables the MoE expert cache,
@@ -64,7 +76,12 @@ staging ring is unbounded by free VRAM; issue #117).
   before rebuilding.  G1 and G2 are validated safe; the **auto floor under `-sm tensor`** is the parked
   corruption and must stay disabled.
 * G3 was added 2026-10-08 from the discussion #108 field report; G4 was added 2026-10-09 from issue #117.
-  Neither is implemented.
+  **Both are now implemented in the 2026-10-09 revival patch** (plus the split-slice SIGSEGV fix); the
+  G1/G2 fit-side work is still parked.  See §12.
+* **Revival patch (2026-10-09):** [`revival-2026-10-09.patch`](revival-2026-10-09.patch) (sha256
+  `1f7e3fafa74ee757d92f154cba8b4d72eca6449dc5beca4cd8920096973e1533`, 4 files: `common.cuh`,
+  `ggml-cuda.cu`, `ggml-cuda-vmm.h`, `moe-expert-cache.cu`).  Targets the **current r37 tree**
+  `322a77273531f88250ed01bc9ef6a64a74227028`; `git apply` in `~/llama.cpp`.
 
 **Which box does what.**
 
@@ -77,13 +94,13 @@ staging ring is unbounded by free VRAM; issue #117).
 **First steps.**
 
 1. Read §0 (the four gaps) and **§2 (the hipBLASLt constraint)**; §2 is what forces G2 to be a hard floor.
-2. Rebuild a canonical fork at `release.json.base` (`scripts/apply-all.sh`) and rebase
-   `phase1-fit-slab-accounting-WIP.patch`; build it and re-run the §5 gates to confirm the Phase 1 status
-   on the current tree.
-3. Decide the G2 gate (b1 vs b2, §4.2c), and whether G3/G4 land with the option-A safe subset or roll into
-   Phase 2.
-4. For G4, prototype the free-VRAM cap from §4.6 (env-gated `GGML_SCHED_STAGE_MAX_FREE_PCT`) and run the
-   §5.7 staging matrix both on `fingon` and on the main box.
+2. **Done (revival):** the current r37 tree is built and the revival patch
+   [`revival-2026-10-09.patch`](revival-2026-10-09.patch) is applied; see §12 for the code + measurements.
+3. Still open: decide the G2 gate (b1 vs b2, §4.2c) for the parked G1/G2 fit-side work, and re-test the
+   `-sm tensor` auto-floor corruption that parked Phase 1.
+4. Still open: run the §5.7 staging matrix (now with the §12.3 cap) on `fingon` and the main box, and run
+   the §12.6 GSQ `/` -corruption band on 2 GPU with the adaptive reserve before promoting G3.  (The band
+   itself was re-tested and passed on 2026-10-09 - see §12.5.)
 5. Record decisions against the open questions in §8 as they are made; keep the WORKLOG/promotion path in
    mind before anything moves toward `patches/`.
 
@@ -100,12 +117,15 @@ Four concrete gaps, all fixable without touching the cache engine (G4 is new in 
 |---|---|---|
 | **G1** | An **explicit `MOE_EXPERT_CACHE_MIB` is invisible to `--fit`** (`common/fit.cpp:305` only reserves when the var is *unset*). `--fit` sizes the context as if the arena were not there. | add the explicit per-device budget to the fit margin |
 | **G2** | The slab's **`GGML_CUDA_SLAB_HEADROOM_MIB` is a hard floor that `--fit` does not model**, and the `--fit` default target (1 GiB) is *smaller* than it (4096 MiB). A fully-fitted ROCm run can leave less free VRAM than hipBLASLt needs, and the next wide prefill aborts (`exit 134`). | add a slab-headroom floor to the fit margin, queried from the device (single source of truth) |
-| **G3** | The slab's **`GGML_CUDA_SLAB_RESERVE_MIB`** is a flat `max(8192, 25 %)` that is never planned, and it is subtracted from `free_b` at slab creation. With partial offload `free_b - 8192 < work + 2048`, the slab **declines** (`cache_unusable`) and the whole run silently streams from the host. Too small is the exit-134 abort, too large is this decline, so it must be planned, not guessed. | compute the reserve from the actual post-slab need (KV + draft + workspace) and hand it to the slab (Phase 2's `slab_reserve_bytes` gains a setter).  **Not** "lower the default" -- see §10.4. |
-| **G4** | The **op-offload H2D staging ring** (`h2d_stage_buffer` / `h2d_stage_budget`, common.cuh) is a fourth consumer: it lives **outside** the compute-graph reserve, auto-sizes to `slots * (largest host table + 512)`, and has **no free-VRAM cap or floor**.  On a partially offloaded model it competes with the slab reserve and the arena; when it over-commits, staging is slower than the serial path (issue #117: 32 vs 423 t/s, fixed by `GGML_SCHED_STAGE=0`). | cap the auto ring budget by free VRAM at growth time (refuse -> the existing serial fallback); keep `GGML_SCHED_STAGE_MAX_MB` as the hard override.  See §4.6 |
+| **G3** | The slab's **`GGML_CUDA_SLAB_RESERVE_MIB`** is a flat `max(8192, 25 %)` that is never planned, and it is subtracted from `free_b` at slab creation. With partial offload `free_b - 8192 < work + 2048`, the slab **declines** (`cache_unusable`) and the whole run silently streams from the host. Too small is the exit-134 abort, too large is this decline, so it must be planned, not guessed. | **DONE (revival 2026-10-09):** the reserve now defaults to `headroom + aux_reserve` (the draft-context estimate the preflight already carries), because the KV cache is allocated **before** the slab, so it no longer has to be reserved.  `GGML_CUDA_SLAB_RESERVE_MIB` stays the explicit override.  §12.2 |
+| **G4** | The **op-offload H2D staging ring** (`h2d_stage_buffer` / `h2d_stage_budget`, common.cuh) is a fourth consumer: it lives **outside** the compute-graph reserve, auto-sizes to `slots * (largest host table + 512)`, and has **no free-VRAM cap or floor**.  On a partially offloaded model it competes with the slab reserve and the arena; when it over-commits, staging is slower than the serial path (issue #117: 32 vs 423 t/s, fixed by `GGML_SCHED_STAGE=0`). | **DONE (revival 2026-10-09):** a growth is refused once the ring (and, with the same helper, the FA staging arena) would exceed `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`% of the free VRAM while the slab is active; the caller falls back to the serial path / native K/V read.  `GGML_SCHED_STAGE_MAX_MB` stays the hard override.  §12.3 |
+| **G5** | A `-sm tensor` split slice whose `nb` does not describe its slice registers `expert_bytes == host_bytes` with a nonzero `slice_off`; the identity fill then reads `slice_off` bytes past the host master. | **DONE (revival 2026-10-09):** `moe_cache_slice_addr_ok()` declines the table when `slice_off + span > host_bytes`, so the scheduler's full-table copy serves it.  Fixes a reproducible SIGSEGV (`-sm tensor -ncmoe 24`, 3 GPU) - §12.4 |
 
 **Ship Phase 1 = G1 + G2.** G3 was added 2026-10-08; it is independent of the auto floor and can land
 with the option-A safe subset, or roll into Phase 2 if it grows.  G4 was added 2026-10-09; it is
-independent of the parked corruption.  Scope for G3 is §4.5 and for G4 is §4.6.  Phase 2
+independent of the parked corruption.  **The 2026-10-09 revival implemented G3 + G4 + the G5 crash fix
+(§12); G1/G2 remain parked behind the `-sm tensor` auto-floor corruption.**  Scope for G3 is §4.5 and
+for G4 is §4.6.  Phase 2
 (single-source-of-truth getters/setters, de-duplicate the floor policy) and Phase 3 (arena-first
 budgeting / 2-pass auto) are scoped in §7 but not required for the release.
 
@@ -789,3 +809,181 @@ See `ENVIRONMENT.md` for the full table.
   value, and whether the arena was primed.  The numbers are not comparable otherwise, and the difference
   is large on this box.
 
+
+---
+
+## 12. Revival implementation (2026-10-09, r37)
+
+**Artifact:** [`revival-2026-10-09.patch`](revival-2026-10-09.patch) (sha256
+`1f7e3fafa74ee757d92f154cba8b4d72eca6449dc5beca4cd8920096973e1533`, 4 files, 156 insertions) applied to a
+clean r37 tree (`release.json` tree `322a77273531f88250ed01bc9ef6a64a74227028`), built warning-free on
+gfx1201 / ROCm 7.14.1.  `patches/` is untouched.  **WIP — do not promote without the §12.6 gates.**
+
+### 12.0 The reframed goal
+
+The maintainer's framing for the revival: end users trust the fitment system to work for *any* `-ncmoe`.
+The campaign's job is to (a) right-size every consumer where the run fits, (b) **never crash** on a
+memory shortfall, and (c) where it does not fit or would be slow, warn loudly with actionable guidance
+and degrade gracefully.  It must hold **without `--fit`** — the runtime, not the planner, is the last
+line of defence.  Upstream has not got this right in all cases either, so a graceful performance curve
+as the user turns the knobs is the bar, not a guarantee of no slowdown.
+
+### 12.1 Current r37 implementation facts (what changed since Phase 1)
+
+The Phase 1 code map (§3) is stale.  On r37:
+
+* The slab is **armed by the MoE preflight** (`ggml_backend_cuda_device_moe_cache_preflight`, called only
+  for models with host-resident experts) and is therefore **born after the model weights** (r37, #118/#120).
+* `llama_context` allocates the **KV cache BEFORE the slab** (`create_memory` at `llama-context.cpp:543`
+  vs `sched_reserve()` at `:609`).  The slab's `free_b` is thus post-weights **and post-KV**.
+* `ggml_cuda_slab_extend` maps the reserve the model did not need into the arena, down to
+  `GGML_CUDA_SLAB_HEADROOM_MIB` (the extension runs from `alloc_all_locked`, the arena sizing).
+* When the slab is active the arena sizes from `ggml_cuda_slab_arena_total` (the slab region, not free
+  VRAM); when it is not, it sizes from free VRAM per table and fails soft per table.
+* The fit already counts the FA staging arena and the H2D ring worst case
+  (`llama-context.cpp` `memory_breakdown` -> `llama_{fattn,h2d}_stage_accounting`), so **G4's "count it in
+  `--fit`" is done**; only the runtime cap was missing.
+* `ggml_cuda_device_malloc` is the single allocation choke point and yields the arena on OOM — but under
+  the slab the arena's physical is mapped into the slab and ROCm will not unmap a sub-range, so the
+  **reserve must have been large enough** before the slab was created.  That is why the reserve (G3) is
+  the load-bearing fix for shortness, and the optional transients (G4) are the ones that must yield.
+
+### 12.2 G3 — the slab reserve is now sized from post-slab need, not a flat guess
+
+**Code** (`ggml-cuda.cu`, `ggml-cuda-vmm.h`): `ggml_cuda_slab_reserve_bytes()` no longer defaults to
+`max(8192, total/4)`.  When `GGML_CUDA_SLAB_RESERVE_MIB` is unset it returns
+`max(headroom + aux_reserve, 1024)`:
+
+* the **KV cache is already resident** when the slab is created, so it is in `free_b` and does not need to
+  be reserved;
+* the only post-slab consumer the preflight already knows about is the **draft context** (MTP/DFlash), the
+  `aux_reserve_bytes` handed to `moe_cache_preflight` (0 without a draft) — remembered via the new
+  `ggml_cuda_slab_set_aux_reserve()` called from the CUDA preflight wrapper;
+* the **headroom** (`GGML_CUDA_SLAB_HEADROOM_MIB`) covers the workspaces hipBLASLt and the FA staging draw
+  on, and is the same value the extension leaves free, so the reserve never drops below the runtime floor.
+
+`GGML_CUDA_SLAB_RESERVE_MIB` remains the explicit override (A/B and a user who knows their config).
+
+**Why it matters (measured, 1 GPU, `Qwen3.6-35B-A3B-Q8_0` 37.8 GB on a 32 GiB card, `-c 4096 -b 2048
+-ub 2048`, `--ignore-eos -n 2000`, seed 42, greedy):**
+
+| config | reserve | slab | cache | decode |
+|---|---|---:|---|---:|
+| `-ncmoe 16` | flat 8192 (old) | **declines** (`want 2432 < work 1024 + floor 2048`) | streams | **50.4 t/s** |
+| `-ncmoe 16` | adaptive 4096 (new) | fits (arena 5151 MiB, 39.5 %) | on | **59.7 t/s** |
+| `-ncmoe 24` | adaptive | fits | on | 70.2 t/s |
+
+2 GPU (`-ncmoe 16`, warm): `-sm layer` **81.6** t/s, `-sm tensor` **93.0** t/s, both exit 0.
+The generated text was coherent (no `////`) in every arm; the old and new reserve produce different text
+only because one has the cache off — see the §12.6 purity question.
+
+### 12.3 G4 — optional raw transients are capped against free VRAM while the slab is active
+
+**Code** (`common.cuh`): a single helper pair, `optional_alloc_max_free_pct()` (new env
+`GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`, default **50**, `0` = old unbounded behaviour) and
+`optional_alloc_within_free_cap()`.  It is consulted by **both** unbounded optional raw allocations:
+
+* `ggml_backend_cuda_context::h2d_stage_buffer()` — the op-offload ring (issue #117); a refusal returns
+  `nullptr`, which `sched_stage_issue` already turns into the serial path for that split.
+* `ggml_backend_cuda_context::fattn_stage_try_get()` — the FA prefill staging arena; a refusal falls back
+  to the native K/V read.
+
+The cap is **inert unless the slab is active on the device**, so non-host-expert / non-ROCm runs are
+unchanged, and it is a cap, not a reservation: it never forces an allocation, only refuses one that would
+leave too little for the consumers the slab cannot route.  `GGML_SCHED_STAGE_MAX_MB` remains the hard ring
+override.  The campaign's proposed name was `GGML_SCHED_STAGE_MAX_FREE_PCT`; the generic name was chosen
+because the same helper also bounds the FA staging arena.
+
+**Measured** (3 GPU, 35B-A3B Q4_K_M, 5256-token prefill): with the cap forced to 1 % the ring refuses a
+144 MiB growth with a one-time warning and the serial path serves the split; with the default 50 % the
+prefill still stages (1433 -> 2848 t/s) and the generated text is unchanged vs `GGML_SCHED_STAGE=0`.
+
+### 12.4 G5 — split-slice geometry guard (a reproducible SIGSEGV, pre-existing)
+
+While testing the revival a **host-memmove SIGSEGV** reproduced on stock r37 (not caused by this patch):
+`Qwen3.6-35B-A3B-Q4_K_M`, 3 GPU, `-sm tensor -ncmoe 24`.  GDB put it in
+`alloc_table_locked` -> `hipMemcpyAsync` -> libc `__memmove`.  Instrumentation of the identity fill showed
+the geometry:
+
+```
+dev=1 layer=1 role=blk.1.ffn_gate_exps.weight  host_bytes=589824 expert_bytes=589824 slice_off=294912
+  -> src span ends 294912 B past the host master
+```
+
+A meta view whose `nb` does not describe its slice registered `expert_bytes == host_bytes` with a nonzero
+`slice_off`, so the identity fill (and the seed/gather kernels) read past the master.
+
+**Fix** (`moe-expert-cache.cu`): `moe_cache_slice_addr_ok()` checks the per-expert source span
+(`(rows-1)*pitch + row` for a strided axis-0 slice, else `expert_bytes`) against `host_bytes - slice_off`;
+`moe_cache_update_host()` and `moe_cache_gather_host()` decline the table when it fails, so the
+scheduler's always-correct full-table copy serves it, with a one-time warning naming the layer/role.
+`-sm tensor -ncmoe 24` / `-ncmoe {4,16,24,41}` now exit 0 on 3 GPU.
+
+**Follow-up (perf):** declining loses the cache for the affected tables.  The proper root cause is the
+meta split's `slice_off`/`weight_cpy->nb[2]` for those layers; fixing it would make them cacheable again.
+
+### 12.5 Revival measurements (all WIP, 2026-10-09, gfx1201 / ROCm 7.14.1)
+
+Warm decode unless noted; greedy seed 42.  "flat" = `GGML_CUDA_SLAB_RESERVE_MIB=8192` (the old
+default), "adaptive" = the new default.
+
+| config | arm | result | note |
+|---|---|---|---|
+| 1 GPU, 35B-A3B Q8_0, `-ncmoe 16`, `-n 2000 --ignore-eos` | flat | **50.4 t/s** | slab declines -> streams |
+| 1 GPU, 35B-A3B Q8_0, `-ncmoe 16`, `-n 2000 --ignore-eos` | adaptive | **59.7 t/s** | slab fits, arena 5151 MiB (39.5 %) |
+| 1 GPU, 35B-A3B Q8_0, `-ncmoe 24`, `-n 2000 --ignore-eos` | adaptive | 70.2 t/s | |
+| 2 GPU, 35B-A3B Q8_0, `-ncmoe 16`, `-n 2000 --ignore-eos` | adaptive | `-sm layer` 81.6 / `-sm tensor` 93.0 t/s | both exit 0 |
+| 3 GPU, 35B-A3B Q4_K_M, `-sm tensor -ncmoe 24` | adaptive | exit 0 | **stock r37 SIGSEGV**; G5 fixed it |
+| 2 GPU, Flash-Next IQ3_XXS + MTP, `-sm tensor -ncmoe 12`, 4x-prose prefill | adaptive | coherent, acc **0.503**, 56.8 t/s | the §10.4 `////` band - **passed** |
+| 1 GPU, Flash-Next IQ3_XXS + MTP, `-ncmoe 44`, `-n 256 --ignore-eos` | adaptive | coherent, acc **0.539**, **39.8 t/s** | "works well" point |
+| 1 GPU, Flash-Next IQ3_XXS + MTP, `-ncmoe 44` | flat | identical (acc 0.539, 40.1 t/s) | no regression |
+| 1 GPU, 35B-A3B Q8_0, `-ncmoe 0` (does not fit) | - | exit 1, clean error | no abort/crash |
+
+**Finding (single GPU, Flash-Next):** the MTP head is **layer 49**.  `-ncmoe > 44` (48 and 99 both
+tested) offloads that layer's experts, so the drafter never matches: draft acceptance collapses to
+**0.000 (0/759)** and decode drops (18-19 t/s) with **no warning** and no `////`.  `-ncmoe <= 44` is
+healthy.  This is a silent performance cliff the campaign's warning mandate should cover: warn when the
+MTP layer's experts are host-resident while a draft is enabled, and recommend the largest `-ncmoe` that
+keeps layer 49 on device.  **Not yet implemented** (needs a per-layer host-residency check).
+
+### 12.6 Open items / promotion gates (do not skip)
+
+1. ~~The §10.4 `/` -corruption band is untested with the adaptive reserve.~~  **Tested and passed**
+   (2 GPU, IQ3_XXS + MTP, `-sm tensor -ncmoe 12`, 4x-prose): coherent, acceptance 0.503, no stale-alias
+   warning.  The adaptive reserve (`headroom + aux` = ~7.8 GiB with a draft) gives a smaller arena
+   (4450 MiB) than the campaign's manual `4608` reserve did, so it does not reach the corrupt region.
+2. **Cache-on vs cache-off text purity.**  In one `-ncmoe 16` pair the cache-on and streaming runs
+   generated different text.  Establish whether that is pre-existing (run the unmodified r37 with the
+   cache on vs `MOE_EXPERT_CACHE_MIB=0` at a config where stock has the cache on) or a prefill-path
+   difference.  The decode claim is byte-identity; prefill is gated by
+   `benchmarks/prefill-logit-methodology.md`.
+3. **MTP-layer offload warning** (the Finding above).
+4. **G4 default.**  The 50 % default is a proposal; issue #117 is still un-reproduced on `fingon`
+   (§11.4).  Run the §5.7 matrix before a default flip.
+5. **G1/G2** stay parked behind the `-sm tensor` auto-floor corruption (Phase 1).
+6. **The identity geometry root cause** (perf, not correctness) and the **`fingon` gfx1100** validation.
+
+### 12.7 Apply / revert
+
+```sh
+cd ~/llama.cpp                      # clean r37 tree, tree 322a77273531f88250ed01bc9ef6a64a74227028
+git apply /path/to/wip/fit-slab-accounting/revival-2026-10-09.patch
+cmake --build build-rocm-hybrid --target llama-cli llama-server -j 16
+# revert:
+git checkout -- ggml/src/ggml-cuda/common.cuh ggml/src/ggml-cuda/ggml-cuda.cu \
+               ggml/src/ggml-cuda/ggml-cuda-vmm.h ggml/src/ggml-cuda/moe-expert-cache.cu
+```
+
+### 12.8 Record
+
+* Build: `cmake --build build-rocm-hybrid --target llama-cli` rc=0, warning-free (2026-10-09).
+* **Standing gates:** dense `Qwen3.5-4B-Q8_0` `-sm tensor` same-seed sha **`1c5d32ac537d`** (matches
+  the r36/r37 record); `scripts/gate-prefill-logits.sh` **PASS** mean KLD **0.000707**, same-top-p
+  **98.755 %** (identical to the r37 record) - the changes are prefill-numeric-neutral.
+* Crash repro + backtrace: core PID 93911 / 95534, gdb `alloc_table_locked` -> `hipMemcpyAsync` (host
+  memmove); stock-r37 re-run also SIGSEGV (pre-existing).
+* Sweeps (transient): `/tmp/q8_1gpu_warm_*`, `/tmp/q8_1gpu_r{3072,4096}.log`,
+  `/tmp/q8_2gpu_ad_{layer,tensor}.log`, `/tmp/stage_{cap,on,off,tensor}*.log`, `/tmp/gsq_corr_adapt.log`,
+  `/tmp/iq3_1gpu_mtp_{44,44_flat,48,50,70,99}.log`.
+* Decision: implementation pass parked as WIP; promotion blocked on §12.6 items 1-3 (the purity question,
+  the MTP-layer warning, and a `fingon` + default-cap run; the corruption-band test itself passed).
