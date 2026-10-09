@@ -5,7 +5,12 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r36`** (canonical block-15 tip `8e28631f6`, net tree
+**`a55e952b8`**, released as **`v16-a55e952b8-r38`** (canonical block-15 tip `849c04161`, net tree
+`888564105e13dd73fefda755ea5b055d65011c16`): the `fit-slab-accounting` revival is folded into
+block 06 (G1/G2 `--fit` arena+headroom reservation, G3 adaptive slab reserve, G4
+`GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` free-VRAM cap, G5 split-slice guard, G6 nextn-offload guard,
+G7 scheduler multi-consumer fill, per-device host-expert accounting) plus the G4 FA-staging cap in
+block 15.  Before it, **`v16-a55e952b8-r36`** (canonical block-15 tip `8e28631f6`, net tree
 `d55aebfe0d7af530aa485ffd7ebf5e1dce331b08`): three contributor prefill PRs are folded into the existing
 blocks (shared BF16 src1 reuse #119 and in-place host-expert prefill reads #121 into block 15; the pool
 free-VRAM floor #122-0001 into block 06 and the 6 GiB `-sm layer` slab headroom #122-0002 into block 09).

@@ -19,6 +19,10 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
+**`v16-a55e952b8-r38`**: the `fit-slab-accounting` revival is folded into block 06 (G1/G2 `--fit`
+arena+headroom reservation, G3 adaptive slab reserve, G4 `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`
+free-VRAM cap, G5 split-slice guard, G6 nextn-offload guard, G7 scheduler multi-consumer fill,
+per-device host-expert accounting) plus the G4 FA-staging cap in block 15.  Before it,
 **`v16-a55e952b8-r36`** (three contributor prefill PRs folded into the existing blocks: the shared BF16
 src1 reuse (#119) and the in-place host-expert prefill reads (#121) in block 15, and the pool free-VRAM
 floor plus the 6 GiB `-sm layer` slab headroom (#122) in blocks 06 and 09).  Before it,
@@ -490,7 +494,11 @@ for per-block verification and `BASELINE.md` for provenance.
 
 The delivery is the **16-patch set** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork
 point recorded in [`release.json`](release.json) (**`a55e952b8`**, upstream master, 2026-10-03 re-base); the
-**current release is `v16-a55e952b8-r34`**: block 12's hybrid all-reduce no longer initialises NCCL
+**current release is `v16-a55e952b8-r38`**: the `fit-slab-accounting` revival is folded into block 06
+(G1/G2 `--fit` arena+headroom reservation, G3 adaptive slab reserve, G4
+`GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` free-VRAM cap, G5 split-slice guard, G6 nextn-offload guard,
+G7 scheduler multi-consumer fill, per-device host-expert accounting) plus the G4 FA-staging cap in
+block 15.  Before it, **`v16-a55e952b8-r34`**: block 12's hybrid all-reduce no longer initialises NCCL
 eagerly -- NCCL comes up lazily on the first tensor too large for the internal pipeline (prefill), so a
 decode-only `-sm tensor` run never pays for it.  Eager `ncclCommInitAll` measurably degraded the
 internal pipeline ~3x even when no collective used it, which kept `-sm tensor` MoE decode at ~22 t/s

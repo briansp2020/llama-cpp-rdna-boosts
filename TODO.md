@@ -71,7 +71,7 @@ prefill-logit KLD **0.000707 / 98.755 %**; `MUL_MAT_ID` 931/931; 2-GPU GSQ r5 re
 0 NaN.  **Next:** promote through block 06 (the scheduler half of the cache) — `patches/` is untouched by
 this campaign.
 
-*(Original handover, kept for context.)*  `--spec-type draft-mtp` on Flash-Next (separate `-md`
+**DELIVERED in `v16-a55e952b8-r38` (block 06).**  Original handover: `--spec-type draft-mtp` on Flash-Next (separate `-md`
 head) can collapse draft acceptance to **0** with **NaN** draft logits while the target text stays
 coherent.  Isolated to the cache: `MOE_EXPERT_CACHE_MIB=0` gives acceptance 0.588 and no NaN;
 `GGML_OP_OFFLOAD_MIN_BATCH=100000` does not help; `-ncmoe 44` is fine, `-ncmoe 48` NaNs.  The qwen4exp
@@ -98,7 +98,10 @@ zeroes G2 are green).  Record + arms: `wip/fit-slab-accounting/README.md` §14.4
 patch `fit-slab-r37-all-wip.patch`.  **Ordered release plan: README §15** (purity/determinism first, then
 `ENVIRONMENT.md`, the full §5.1-§5.7 matrix, `fingon`, and promotion).
 
-*(Phase 1 history, kept for context.)*
+**DELIVERED in `v16-a55e952b8-r38` (block 06).**  `--fit` now reserves the MoE-arena budget and the
+slab headroom; the auto floor under `-sm tensor` no longer corrupts, and per-device host-expert
+accounting covers every device.  Record: `wip/fit-slab-accounting/README.md` §14.4/§15; `WORKLOG.md`
+2026-10-09 (r38).  *(Phase 1 history, kept for context.)*
 
 **Opened 2026-10-07; Phase 1 implemented then PARKED 2026-10-07.**  `--fit` is not a single VRAM planner for
 ROCm: (G1) an explicit `MOE_EXPERT_CACHE_MIB` is invisible to the fit margin, so the context is sized as

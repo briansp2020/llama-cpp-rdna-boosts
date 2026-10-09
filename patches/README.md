@@ -3,7 +3,27 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r37` (2026-10-09) -- issues #118/#120: the slab and the compute chunk are armed only for host-expert models:**
+> **Current release `v16-a55e952b8-r38` (2026-10-09) -- `fit-slab-accounting` folded into block 06 (plus the G4 FA-staging cap in block 15):**
+> promotes `wip/fit-slab-accounting/` through the block-06 path: **G1/G2** `--fit` reserves an explicit
+> `MOE_EXPERT_CACHE_MIB`/the auto floor and the slab headroom (the G2 getter now reports the configured
+> headroom whenever `GGML_CUDA_SLAB` is not disabled -- the r37 `slab_enabled()` is `env_on &&
+> g_slab_armed`, false at fit time); **G3** the slab reserve is sized from the post-slab need (`headroom +
+> draft aux`), not the flat `max(8192, 25 %)`; **G4** `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` (default 50,
+> `0` = old behaviour) caps the op-offload H2D ring and the FA staging arena at a percentage of free VRAM,
+> fail-soft; **G5** `moe_cache_slice_addr_ok()` declines a split host slice that leaves the master (a
+> pre-existing `-sm tensor` SIGSEGV); **G6** a `-ncmoe`/`-cmoe` CPU override never offloads an appended
+> nextn/MTP layer (`llama_model_params.allow_nextn_cpu_offload`); **G7** the scheduler copies the whole
+> table when a split's input copy has more than one `MUL_MAT_ID` consumer (the wide MTP-export NaN
+> collapse); and per-device host-expert accounting distributes each `exps` tensor across the layer Meta
+> device's simple devices.  Gates: dense `1c5d32ac537d`, prefill-logit 0.000707 / 98.755 %,
+> `MUL_MAT_ID` 931/931, width purity `010f816e376c`; gfx1100 `fingon` green.  Accepted trade: the G4
+> default costs ~16 % field prefill via a refused ~990 MiB ring growth; the ring moves inside the slab in
+> the follow-up `wip/slab-ring-region/` (TODO #49).  Canonical block-15 tip
+> `849c041613421ee807054d8a4254171b6a04ab59`, net tree
+> `888564105e13dd73fefda755ea5b055d65011c16`; strict **16/16** `git am` (`validate-set.sh` green).  Full
+> record: `WORKLOG.md` r38 and `wip/fit-slab-accounting/README.md` §15.
+>
+> **Previous release `v16-a55e952b8-r37` (2026-10-09) -- issues #118/#120: the slab and the compute chunk are armed only for host-expert models:**
 > `ggml_cuda_slab_enabled()` was default-ON for every HIP model with no MoE gate, so a dense model (and a
 > dense model + `--mmproj`) created a movable-boundary slab that parked nearly all free VRAM in an unused
 > arena (#118), and the slab-motivated compute chunk (`(ceil(need/C)+1)*C`) inflated the small MTP/per-slot

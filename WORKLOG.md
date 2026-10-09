@@ -1,5 +1,56 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-09 (later, r38) -- PROMOTION: fit/slab accounting + host-expert cache fixes into block 06
+
+**Release `v16-a55e952b8-r38`** (base `a55e952b8`, canonical block-15 tip
+`849c041613421ee807054d8a4254171b6a04ab59`, net tree
+`888564105e13dd73fefda755ea5b055d65011c16`; `n_blocks` 16; `validate-set.sh` green -- strict 16/16
+`git am`, reconstructed tree == `release.json`).  This promotes the `wip/fit-slab-accounting/` revival
+(2026-10-09) through the block-06 path.  `patches/` was regenerated from a canonical fork rebuilt at the
+base (`scripts/apply-all.sh`) -- **do not hand-edit**.
+
+**What was folded (block 06 unless noted):**
+
+* **G1/G2 (TODO #47)** -- `--fit` reserves the MoE-arena budget (explicit `MOE_EXPERT_CACHE_MIB`/auto
+  floor) and the slab headroom, so a `--fit` run sizes the context around the cache it will actually
+  build.  The G2 getter reports the configured headroom whenever `GGML_CUDA_SLAB` is not disabled (the
+  r37 `slab_enabled()` is `env_on && g_slab_armed`, false at fit time, which made the Phase 1 getter
+  inert).
+* **G3** -- the slab reserve is sized from the post-slab need (`headroom + draft aux`), not the flat
+  `max(8192, 25 %)`; `GGML_CUDA_SLAB_RESERVE_MIB` stays the override.
+* **G4** -- `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` (default **50**, `0` = old behaviour) caps the
+  op-offload H2D staging ring and the FA prefill staging arena at a percentage of free VRAM while the
+  slab is active; a refusal is fail-soft (serial staging / native K/V read).
+* **G5** -- `moe_cache_slice_addr_ok()` declines a split host slice whose byte range leaves the master
+  (a pre-existing SIGSEGV on `-sm tensor`) so the scheduler's full-table copy serves it.
+* **G6** -- a CPU expert override (`-ncmoe`/`-cmoe`) never offloads an appended nextn/MTP layer
+  (`llama_model_params.allow_nextn_cpu_offload` escapes it); host speculation is verified correct.
+* **G7 (TODO #48)** -- the scheduler copies the whole table when a split's input copy has more than one
+  `MUL_MAT_ID` consumer; the wide MTP-export NaN collapse is fixed.
+* **per-device host-expert accounting** -- the loader distributes each `exps` tensor across the layer
+  Meta device's simple devices, so the fit's reservation and the post-prefill drop/rearm cover every
+  device under `-sm tensor` (previously device 0 only).
+* **block 15** -- the G4 FA-staging cap lands here, where `fattn_stage_try_get` lives.
+
+**Gates on the final tree (gfx1201):** dense `Qwen3.5-4B-Q8_0` `-sm tensor` golden **`1c5d32ac537d`**;
+`scripts/gate-prefill-logits.sh` **PASS** mean KLD **0.000707**, same-top-p **98.755 %**;
+`test-backend-ops -o MUL_MAT_ID` **931/931**; width purity `none == n1 == n3 == n7` =
+**`010f816e376c`** (2-GPU Flash-Next `-ncmoe 48`).  Full validation record: `wip/fit-slab-accounting/`
+`§15.7-§15.9`; gfx1100 `fingon` record in `§15.8`.
+
+**Accepted trade (maintainer decision).**  The G4 default (50 %) refuses a ~990 MiB H2D-ring growth on
+the field config once the slab leaves ~1.6 GiB free, costing **~16 % prefill** (decode unchanged); this
+ships as-is because the ring will move **inside** the slab in the follow-up campaign
+**`wip/slab-ring-region/`** (TODO #49), which removes the tension.  Separately, the exact r22 field
+setting (`--fit off`, `-ub 6144 -c 204800`, `-ncmoe 48`) aborts (`hipblaslt.cpp:164`) on **both** stock
+r37 and the WIP identically -- a pre-existing r37 regression, not a blocker; the field run passes with
+`--fit on`.
+
+**Committed:** `patches/0000-0015` and `rdna-boosts-all.patch` regenerated; `release.json` refreshed
+(`v16-a55e952b8-r38`); `ENVIRONMENT.md` catalogues `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`;
+`TODO.md` #47/#48 closed, #49 opened; `wip/CAMPAIGNS.md` status updated.  The existing 16 patches are
+the deliverable; the fork's `rdna-boosts` branch is refreshed at release time per `AGENTS.md`.
+
 ## 2026-10-09 -- G7: the MoE expert cache corrupts a wide MTP-export consumer (FIX); G1/G2 retest
 
 **WIP campaign** `wip/fit-slab-accounting/`; `patches/` untouched.  One session on the gfx1201 box,
