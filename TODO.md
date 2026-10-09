@@ -51,6 +51,34 @@ target clamped to it, and the ring bound moved from the `--fit` margin into the 
 [`wip/slab-ring-region/README.md`](wip/slab-ring-region/README.md).  **Not part of the current
 delivery/promotion** — it is a follow-on to the G4 default decision, not a prerequisite for it.
 
+### 50. The cache-aware fusion guard is global while the slab's eviction is per-table (code `OPEN 2`)
+
+**Opened 2026-10-10 (WIP finding, `wip/slab-ring-region/`).**  `ggml_cuda_cache_blocks_fusion`
+(`ggml-cuda.cu:5804`) is gated on the **global** `moe_cache_has_arena()`, but the movable-boundary slab
+evicts cache tables **per table** — `moe-expert-cache.cu` says *"the movable-boundary slab evicts the
+tables in the chunks it hands to the work pool, so a PARTIAL cache is the normal state"*.  Any arena
+change therefore flips the cache-aware fusions for the whole model *mid-run*: the H2D-ring region (item
+49), the G4 refusal, `MOE_EXPERT_CACHE_RESERVE_MIB`, a `GGML_CUDA_SLAB_RESERVE_MIB` change.  The fused and
+non-fused paths are not bit-identical (the code says the stand-down "changes the arithmetic"), so the
+greedy output then depends on the **timing** of the eviction.  The code already carries the marker:
+*"OPEN 2: the wholesale-fallback invariant … must hold for EVERY consumer, not just the fusion guard and
+the take-over hook."*
+
+Evidence + the A/B matrix: `wip/slab-ring-region/FINDINGS-numerics.md` F3.  On the field model
+(ring-in-slab vs ring-outside) the placements differ; with **every** individual fusion switch off but the
+`GGML_CUDA_DISABLE_FUSION`-gated alloc-deps pass still ON they agree, which also **excludes PR #27301's
+alloc dependencies** as the cause (the deps do cost +512 MiB of compute buffer, charged to the arena).  Not
+one bad kernel either — either the qwen4exp HC group or the idx/concat/DSV4 group alone removes it, so it
+is a cumulative rounding shift.  No corruption: 0 NaN, 0 `////`, prefill logits bit-identical; the visible
+symptom is one flipped near-tie at the first novel decode token.
+
+**Fix direction:** make the guard per-table (as the marker asks) so a partial cache keeps serving, or make
+the fused and non-fused paths bit-identical.
+
+**Default decision (maintainer, 2026-10-10): fusions stay default-ON, unchanged.**  The divergence is a
+pre-existing property of the arena, not of the ring, and disabling the fusions would cost more than it
+fixes — see the measured cost and the re-enable recipe in `ENVIRONMENT.md` §7.
+
 ### 48. The MoE expert cache corrupts a wide MTP-export consumer (G7) — CORRECTNESS
 
 **ROOT-CAUSED, FIXED, GATED 2026-10-09 (WIP patch).**  The handover's alias/take-over hypothesis was

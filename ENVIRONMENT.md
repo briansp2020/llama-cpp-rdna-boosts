@@ -231,6 +231,26 @@ Each of these disables exactly one optimization so it can be bisected.  **The fe
 the variable turns it off.**  Read the idiom column carefully — setting a presence-only switch to `0`
 still disables the feature.
 
+**The fusions are ON, and stay ON.**  The one known stand-down path — the cache-aware guard against
+per-table slab eviction (`TODO.md` #50, evidence in `wip/slab-ring-region/FINDINGS-numerics.md` F3) — is a
+pre-existing property of the arena, not a reason to turn them off.  Measured on the field config
+(Qwen3.8-Flash-Next IQ4_NL, `-sm tensor -ncmoe 48`, 32 358-token prompt, `--spec-type none`, warm):
+
+| | prefill t/s | decode t/s |
+|---|---:|---:|
+| fusions on (default) | 945-972 | 61.3-65.2 |
+| `GGML_CUDA_DISABLE_FUSION=1` | 845-890 | 57.5-65.3 |
+
+so a full disable costs **~9-10 % prefill and ~6 % decode**, and the fusion-off prefill (845-890) is
+*below* the unpatched stock reference (922) — it gives back the delivery's prefill win.
+
+**To restore the full speed** after an A/B or a debug recipe, make sure none of the switches below is set:
+unset `GGML_CUDA_DISABLE_FUSION` and the rest of §7.2/§7.3, and unset (or `=1`) every `GGML_CUDA_FUSE_*` in
+§7.1.  A clean environment is already the full-speed configuration — there is nothing to add, only
+switches to remove.  (`GGML_CUDA_DISABLE_FUSION=1` is a **sledgehammer**: it also skips the
+`graph_optimize` alloc-dependency pass and its shared-expert node reorder, so its cost is not the cost of
+any single fusion.)
+
 ### 7.1 `GGML_CUDA_FUSE_*` — presence of the variable with a value, `0` disables
 
 `GGML_CUDA_FUSE_ADD_RMS_Q8`, `GGML_CUDA_FUSE_CPY_BATCH`, `GGML_CUDA_FUSE_GATE_BETA_VERIFY`,
