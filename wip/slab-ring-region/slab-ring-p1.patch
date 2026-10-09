@@ -310,7 +310,7 @@ index b9f19a903..ee522b934 100644
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
  void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d980f2892..8d06a9d34 100644
+index d980f2892..b2d33e33f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -604,6 +604,19 @@ struct ggml_cuda_slab {
@@ -333,7 +333,7 @@ index d980f2892..8d06a9d34 100644
      std::multiset<size_t>    work_needs;        // REQUESTED size of every live work view -- the floor the
                                                  //  boundary may shrink to (see `work_alloc`)
      bool                     cache_unusable = false; // the slab was declined because `work + min arena`
-@@ -622,6 +635,46 @@ static ggml_cuda_slab g_slabs[GGML_CUDA_MAX_DEVICES];
+@@ -622,6 +635,59 @@ static ggml_cuda_slab g_slabs[GGML_CUDA_MAX_DEVICES];
  // longer switch it on for a dense model.  `GGML_CUDA_SLAB=0` still kills it outright.
  static bool g_slab_armed = false;
  
@@ -360,7 +360,20 @@ index d980f2892..8d06a9d34 100644
 +    if (!s.inited || s.ring_used > 0) {
 +        return;   // the ring is already in use: its VA must not move
 +    }
-+    const size_t nf = ggml_cuda_slab_up(bytes, s.chunk);
++    GGML_LOG_WARN("%s: device %d: narrow floor hint %.1f MiB (current %.1f MiB)\n", __func__, device,
++                  (double) bytes / (1024 * 1024), (double) s.narrow_floor / (1024 * 1024));
++    // The `split_only` probe reports the LAYOUT size; the real compute allocation is rounded up to whole
++    // `GGML_COMPUTE_BUFFER_CHUNK_MIB` units plus one spare unit (`ggml_vbuffer_chunk_alloc_size`).  Apply
++    // the same formula so the pinned floor matches the size the first narrow reserve will actually request
++    // (otherwise the floor is a chunk short and that reserve is misclassified as wide).
++    static const size_t cchunk = []() {
++        const char * e = getenv("GGML_COMPUTE_BUFFER_CHUNK_MIB");
++        return (size_t) (e ? atoll(e) : 256) << 20;
++    }();
++    size_t nf = ggml_cuda_slab_up(bytes, s.chunk);
++    if (cchunk > 0) {
++        nf = ggml_cuda_slab_up(bytes, cchunk) + cchunk;
++    }
 +    if (nf <= s.narrow_floor) {
 +        return;
 +    }
@@ -380,7 +393,7 @@ index d980f2892..8d06a9d34 100644
  static size_t ggml_cuda_slab_chunk_bytes() {
      static size_t chunk_mib = SIZE_MAX;
      if (chunk_mib == SIZE_MAX) {
-@@ -807,7 +860,15 @@ size_t ggml_cuda_slab_work_size(int device) {
+@@ -807,7 +873,14 @@ size_t ggml_cuda_slab_work_size(int device) {
  size_t ggml_cuda_slab_arena_total(int device) {
      std::lock_guard<std::mutex> lock(g_slab_mutex);
      const ggml_cuda_slab & s = g_slabs[device];
@@ -389,15 +402,14 @@ index d980f2892..8d06a9d34 100644
 +        return 0;
 +    }
 +    const size_t total = s.mapped - s.boundary;
-+    // wip/slab-ring-region: the arena is always exactly [boundary, mapped); the ring region sits BELOW the
-+    // boundary (above the narrow floor) while the wide view is reserved, so it is not part of the arena and
-+    // needs no adjustment here.  When the wide view is dropped the boundary shrinks and the ring region is
-+    // already included in this total.
++    // wip/slab-ring-region: the arena is exactly [boundary, mapped); the cache's real allocations are
++    // bounded by `arena_free`, so this is the CAP it sizes its budget against and it must reflect what is
++    // allocatable NOW (an inflated cap here makes `alloc_table_locked` fail and self-disable).
 +    return total;
  }
  
  // GROW the slab into the VA it reserved at creation but left unmapped, down to `headroom` of free VRAM.
-@@ -930,15 +991,26 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+@@ -930,15 +1003,26 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
      // HARD MINIMUM (see `ggml_cuda_slab_min_arena_bytes`): the work estimate plus a usable cache floor.
      // Report it and decline the slab -- `cache_unusable` then makes the expert cache stream from the host
      // instead of building an arena that a wide prefill would have to evict wholesale (the r21 abort).
@@ -429,7 +441,7 @@ index d980f2892..8d06a9d34 100644
                         (double) want / (1024 * 1024), ggml_cuda_slab_reserve_mib(total_b),
                         (double) free_b / (1024 * 1024), (double) total_b / (1024 * 1024));
          return false;
-@@ -960,16 +1032,23 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+@@ -960,16 +1044,23 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
          (void) cuMemAddressFree(s.base, s.size);
          return false;
      }
@@ -456,7 +468,7 @@ index d980f2892..8d06a9d34 100644
      return true;
  }
  
-@@ -989,13 +1068,15 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+@@ -989,13 +1080,15 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
  // MTP draft context each own one), so a release must not make the slab believe the work region is idle --
  // doing that is what corrupted the no-drop runs (a release shrank the boundary under a live view and the
  // arena re-took chunks that view was still using: MTP acceptance 0.010, `////` output).
@@ -474,7 +486,7 @@ index d980f2892..8d06a9d34 100644
      if (it != s.work_needs.end()) {
          s.work_needs.erase(it);
      }
-@@ -1003,9 +1084,17 @@ void ggml_cuda_slab_work_release(int device, size_t need) {
+@@ -1003,9 +1096,17 @@ void ggml_cuda_slab_work_release(int device, size_t need) {
  
  // The work pool's base for a `need`-byte compute buffer, moving the boundary up if required.  The arena
  // tables in the taken range are evicted (the callback frees their slabs back through `arena_free`).
@@ -492,7 +504,7 @@ index d980f2892..8d06a9d34 100644
      CUdeviceptr base = 0;
      {
          std::lock_guard<std::mutex> lock(g_slab_mutex);
-@@ -1014,28 +1103,53 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1014,28 +1115,53 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
              if (!ggml_cuda_slab_init_locked(device, s, need)) {
                  return nullptr;
              }
@@ -565,7 +577,7 @@ index d980f2892..8d06a9d34 100644
              if (target < s.boundary) {
                  const size_t old = s.boundary;
                  s.boundary = target;
-@@ -1055,12 +1169,12 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1055,12 +1181,12 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
                  }
                  s.arena_free[lo2] = hi2 - lo2;
              }
@@ -581,7 +593,7 @@ index d980f2892..8d06a9d34 100644
          move = true;
      }
      if (move) {
-@@ -1088,9 +1202,11 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1088,9 +1214,11 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
              }
          }
          if (s.inited) {
@@ -595,7 +607,7 @@ index d980f2892..8d06a9d34 100644
      }
      return nullptr;
  }
-@@ -1160,6 +1276,55 @@ void ggml_cuda_slab_arena_free(int device, void * ptr, size_t size) {
+@@ -1160,6 +1288,55 @@ void ggml_cuda_slab_arena_free(int device, void * ptr, size_t size) {
      s.arena_free[lo] = hi - lo;
  }
  
@@ -651,7 +663,7 @@ index d980f2892..8d06a9d34 100644
  // #define DEBUG_CUDA_MALLOC
  
  // buffer pool for cuda (legacy)
-@@ -1540,9 +1705,10 @@ struct ggml_backend_cuda_buffer_context {
+@@ -1540,9 +1717,10 @@ struct ggml_backend_cuda_buffer_context {
      // OPEN 2: the buffer is a VIEW of the movable-boundary slab's work region (base = slab base).  Freeing
      // it must NOT release anything -- the region belongs to the slab, which lives until the process exits.
      bool slab_view = false;
@@ -664,7 +676,7 @@ index d980f2892..8d06a9d34 100644
      std::string name;
  
      ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-@@ -1552,7 +1718,7 @@ struct ggml_backend_cuda_buffer_context {
+@@ -1552,7 +1730,7 @@ struct ggml_backend_cuda_buffer_context {
  
      ~ggml_backend_cuda_buffer_context() {
          if (slab_view) {
@@ -673,7 +685,7 @@ index d980f2892..8d06a9d34 100644
              return;
          }
          // A compute buffer allocated from the slab is a VIEW (handled above); everything else here is a
-@@ -1782,6 +1948,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_usage(gg
+@@ -1782,6 +1960,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_usage(gg
                  ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
                  ctx->slab_view     = true;
                  ctx->slab_need     = size;
@@ -681,7 +693,7 @@ index d980f2892..8d06a9d34 100644
                  return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
              }
              GGML_LOG_WARN("%s: slab work region has no room for %.2f MiB on device %d; falling back\n",
-@@ -10185,13 +10352,17 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -10185,13 +10364,17 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -700,7 +712,7 @@ index d980f2892..8d06a9d34 100644
          // This model HAS host-resident experts, so the work/arena split is meaningful -- arm the slab.
          // Dense models never reach here (`llama_model_moe_cache_preflight` skips an empty host-expert map),
          // which is what keeps the slab off them.  Runs before the context, so before any compute buffer.
-@@ -10241,6 +10412,28 @@ static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t de
+@@ -10241,6 +10424,28 @@ static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t de
      return ggml_cuda_slab_headroom_bytes();
  }
  
@@ -729,7 +741,7 @@ index d980f2892..8d06a9d34 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -10263,6 +10456,8 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -10263,6 +10468,8 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_cache_rearm         = */ ggml_backend_cuda_device_moe_cache_rearm,
      /* .slab_work_size          = */ ggml_backend_cuda_device_slab_work_size,
      /* .slab_headroom_bytes     = */ ggml_backend_cuda_device_slab_headroom_bytes,
@@ -738,7 +750,7 @@ index d980f2892..8d06a9d34 100644
  };
  
  // backend reg
-@@ -10386,6 +10581,13 @@ static size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t m
+@@ -10386,6 +10593,13 @@ static size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t m
      if (ctx == nullptr) {
          return 0;
      }
@@ -804,7 +816,7 @@ index 6cb544339..ea3991f07 100644
  
  // backend reg interface
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 8c0ce7bbe..f036f1eea 100644
+index 8c0ce7bbe..141622abd 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1728,6 +1728,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
@@ -832,7 +844,39 @@ index 8c0ce7bbe..f036f1eea 100644
      if (drop_now) {
          ggml_backend_sched_drop_buffers(sched.get());
          // re-reserve the widest post-prefill (verify) layout so the first decode graphs fit.
-@@ -1746,8 +1764,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1736,6 +1754,31 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         // query and the cache to agree on the stream dim (`q->ne[3] == k->ne[3]`).  A hard-coded 1
+         // against a multi-sequence batch took `q->ne[2]/n_stream` to zero and aborted (issue #48).
+         const uint32_t n_rs_seqs = std::max<uint32_t>(1, ubatch.n_seqs);
++        // wip/slab-ring-region: measure the narrow (decode/verify) layout BEFORE allocating it, so the slab
++        // can pin its narrow floor AHEAD of the cache's deferred sizing (which runs later in this same pass).
++        // `split_only` + a `sizes` array is a size-only reserve (no allocation); the real reserve follows.
++        {
++            size_t narrow_sizes[16] = {0};
++            if (graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, mctx, /*split_only=*/true,
++                              narrow_sizes, kq_mask_packed_reachable()) != nullptr) {
++                size_t narrow_bytes = 0;
++                for (int i = 0; i < 16; i++) {
++                    if (narrow_sizes[i] > narrow_bytes) {
++                        narrow_bytes = narrow_sizes[i];
++                    }
++                }
++                if (narrow_bytes > 0) {
++                    for (const auto & kv : model.moe_host_expert_bytes) {
++                        ggml_backend_dev_slab_narrow_floor(kv.first, narrow_bytes);
++                    }
++                    for (size_t d = 0; d < model.devices.size(); ++d) {
++                        if (!model.devices[d].is_meta) {
++                            ggml_backend_dev_slab_narrow_floor(model.devices[d].dev, narrow_bytes);
++                        }
++                    }
++                }
++            }
++        }
+         const bool narrow_ok = graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, mctx, false) != nullptr;
+         if (!narrow_ok) {
+             LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
+@@ -1746,8 +1789,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              // buffers, so refresh the expectation to the layout this workload settled on -- otherwise
              // every dropped run reports a healthy buffer as a mismatch.  (The field's only other reader is
              // the no-alloc memory accounting, which this branch skips.)

@@ -1,12 +1,11 @@
 # `slab-ring-region` — make the H2D staging ring a first-class slab region
 
-**Status: P1 RE-CUT to the `0 -> narrow -> RB -> wide -> arena` work-region ordering (2026-10-10).**
-The ring is no longer an arena hole: the slab work region is split into a fixed narrow (decode/verify) floor
-at base 0, the ring above it, and the transient wide (prefill) view above that, with the arena always above
-the work.  Structurally this removes the eviction/NaN class; field prefill **779 -> 920 t/s**, **0 NaN,
-acceptance 1.0**, and the ring is reclaimed on disarm (boundary back to the narrow floor).  **Open: decode
-51.4 vs 62.2** because the auto cache sizes while the narrow floor is still being established.  Artifact
-`slab-ring-p1.patch`; details §10.
+**Status: P1 WORKING on gfx1201 (2026-10-10).**  The ring is a work-region sub-region in the
+`0 -> narrow -> RB -> wide -> arena` ordering (two stable work bases, contribution floor, context-pinned
+narrow floor).  Field §5.5: prefill **992 t/s** (6 GiB region) / **946** (2.5 GiB) vs **922 stock** and
+**768** for the r38 G4 cap, decode **61.1 / 61.3** vs the **62.2** baseline, **0 NaN, acceptance 1.0**.
+All standing gates green.  Artifact `slab-ring-p1.patch`; details §10.  Not yet done: `fingon` gfx1100, the
+3-GPU run, and the reserve-side (`headroom - ring`) accounting decision.
 
 This campaign exists because of the §5.5 finding in
 [`archive/work/fit-slab-accounting/README.md`](../../archive/work/fit-slab-accounting/README.md) §15.9: the G4 free-VRAM cap
@@ -347,30 +346,49 @@ high
 | arm | prefill | decode | accept | NaN |
 |---|---:|---:|---:|---:|
 | old top-of-arena hole, ring never armed (baseline) | 781 | 62.2 | 1.0 | 0 |
-| **new ordering, `GGML_CUDA_SLAB_RING_MIB=2560`** | **920-923** | 51.4 | 1.0 | **0** |
+| **new ordering, 2.5 GiB region** (3 runs) | **945.5-946.8** | 61.2-61.4 | 1.0 | **0** |
+| **new ordering, 6 GiB region** (default cap) | **992.2** | 61.1 | 1.0 | **0** |
 
-Timeline (2.5 GiB ring): `3072` wide init -> `768`/`512` first small reserves -> `1792` decode -> cache
-`sized 284 slots/table` -> `2816` prefill (`evict 948 MiB`) -> ring used -> post-prefill `1792` with
-**`boundary = 1792`** (ring region reclaimed) -> `re-arm 18`.
+Cache sizing matches the baseline again (`sized 337 / 295 slots/table`).  Timeline (2.5 GiB): `3072` wide
+init -> `768`/`512` first small reserves -> narrow-floor hint (layout 1350.7 -> chunk formula 1792) ->
+`1792` decode with **`boundary = 1792`** -> cache `sized 337/295` -> `2816` prefill -> ring used ->
+post-prefill `1792` (ring region reclaimed) -> re-arm.
 
-### 10.2 Open: decode 51.4 vs 62.2 (cache sizing timing)
+### 10.2 What closed the decode gap
 
-The cache's deferred sizing (`alloc_all_locked`) runs on the first decode-band pass, **after** the first
-narrow reserve.  Because the narrow-floor hint necessarily arrives *after* that reserve, the first narrow
-view is classified as **wide** (1792 > the auto floor 768) and the boundary at sizing is inflated to
-`5120` MiB; the cache sizes to **284 slots/table** instead of **337**, and never re-sizes after the boundary
-settles to `1792`.  The arena is correct again during decode, but the cache is already small.
+The cache sizes **once**, on the first decode-band pass, and its budget is `mapped - boundary` at that
+instant.  Two things had to be right before it ran:
 
-Next step: get the narrow floor pinned **before** the first narrow reserve, so the sizing sees the settled
-boundary:
+1. **The narrow floor must be pinned before the first narrow reserve.**  `llama_context` now does a
+   `split_only` + `sizes` *size-only* reserve (`ggml_backend_sched_reserve_size`, no allocation) of the
+   narrow shape and pins the slab's floor with it **before** the real reserve.  Without this, the first
+   narrow view (1792) is classified as wide (1792 > the auto floor 768) and the boundary at sizing is
+   inflated.
+2. **The pinned size must match the real allocation.**  The probe reports the *layout* size (1350.7 MiB);
+   the compute allocation is `(ceil(layout/C)+1)*C` with `C = GGML_COMPUTE_BUFFER_CHUNK_MIB` (256), i.e.
+   1792 MiB.  `ggml_cuda_slab_set_narrow_floor` applies the same formula, so the floor is not a chunk short.
 
-* The clean route is for `llama_context` to reserve the narrow layout once before the first decode-band pass
-  (or to pass the narrow size it already measured on a previous pass) and call
-  `ggml_backend_dev_slab_narrow_floor` then, rather than after the reserve that the hint is trying to
-  classify.  A `split_only` narrow reserve at `sched_reserve` time would give the size without executing.
-* Alternatively, have the cache re-size once the ring is armed/dropped for the first time (re-run
-  `alloc_all_locked`'s budget against the settled `arena_total`).
+The first attempt (making the cache size against `mapped - narrow_floor`) was wrong: it over-promised the
+cap and `alloc_table_locked` self-disabled.  `arena_total` must stay `mapped - boundary` (what is
+allocatable **now**).
 
-Everything else is in place: the ordering, the two bases, the contribution floor, the ring carve/reclaim,
-and the NaN-free field run.
+### 10.3 Standing gates (all PASS)
+
+| gate | result |
+|---|---|
+| dense `Qwen3.5-4B-Q8_0` `-sm tensor` (slab never armed) | **`1c5d32ac537d`** |
+| `scripts/gate-prefill-logits.sh` (gfx1201, 27B Q8_0) | **PASS** mean KLD **0.000707**, same-top-p **98.755 %** |
+| `test-backend-ops -o MUL_MAT_ID` | **931/931** |
+| width purity 2-GPU Flash-Next IQ4_NL `-ncmoe 48`, `none == n1 == n3 == n7` | **`b00fdf534227`**, 0 `////` |
+
+### 10.4 Reserve-side note (open decision)
+
+Before the ring moved inside, it `cudaMalloc`'d from the slab's outside **headroom** (the
+`GGML_CUDA_SLAB_HEADROOM_MIB` that also protects hipBLASLt).  Now the region is inside the slab, so the
+slab's `want = free - (headroom + aux)` is unchanged and the region is carved from the arena instead; in
+decode it is reclaimed, so the cache arena returns to the baseline (which is why decode is back to ~61
+without any reserve change).  But the slab does **not gain** the headroom the outer ring used to hold --
+that slack is idle outside.  Reducing the reserve by the ring's *actual* share (not the worst-case region)
+would grow `want` and the decode arena, at the risk of starving hipBLASLt; it needs a decision and a safe
+size source.  Not done in this session.
 
