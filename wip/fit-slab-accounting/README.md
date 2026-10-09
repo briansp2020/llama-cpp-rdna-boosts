@@ -1306,6 +1306,11 @@ checkout).  Build: `cd ~/llama.cpp && cmake --build build-rocm-hybrid --target l
 
 ### 15.1 FIRST — settle the purity/determinism question (§12.7 item 2)
 
+> **RESOLVED 2026-10-09 (second pass).**  The reported restart nondeterminism was an **extraction
+> artifact of `-v` + `2>&1 | extract-generated.py`**, not a model nondeterminism: the verbose log
+> interleaves into the extracted `> … [ Prompt:` span, so identical greedy text hashes differently.
+> The pure generated text is byte-identical across 5/5 restarts.  Full evidence in **§15.7**.
+
 This can invalidate a whole matrix run, so do it before §15.3.
 
 **Observed:** two identical `--fit on` `-sm tensor` auto-floor runs (same config, same targets/arena)
@@ -1393,3 +1398,92 @@ the G4 default flip (§12.7 item 4 / §8 #6).
 **Owner handover:** start here, §15.1 -> §15.6 in order.  Evidence for everything above is in
 §12.9 / §13.6 / §14.4, the `g7-multi-consumer-fill.patch`, `host-expert-per-device-accounting.patch`,
 `phase1-r37-g2-getter.patch` and the combined patch.
+
+---
+
+### 15.7 Session record (2026-10-09, second pass — §15.1 / §15.2 / §15.3)
+
+Build: r37 tree `322a77273531f88250ed01bc9ef6a64a74227028` + `fit-slab-r37-all-wip.patch`
+(sha256 `14c2ccbd…`), `llama-cli`/`llama-server`/`llama-perplexity`/`test-backend-ops`, gfx1201 /
+ROCm 7.14.1.  Raw logs/TSV: `/tmp/fsa151/`, `/tmp/fsa153/` (transient); the matrix rows are preserved as
+[`results-2026-10-09-matrix.tsv`](results-2026-10-09-matrix.tsv) (`stock_*` rows = the same arm on
+unpatched r37, built by stashing the WIP patch in place; the tree was restored to `322a7727…` after).
+
+#### §15.1 — RESOLVED: the nondeterminism was an extraction artifact
+
+The §15.1 command pipes `-v` output through `2>&1 | extract-generated.py`.  When `-v` and `2>&1` are
+combined, the verbose log lines are interleaved into the `> … [ Prompt:` span that the extractor
+hashes, and the interleaving is timing-dependent.  Three identical runs of that exact pipeline gave
+**3 different hashes** (131610 / 131664 / 131673 chars), while the same runs with stdout/stderr
+separated gave the same 241-char text hash every time.
+
+| arm (2 GPU unless noted) | runs | result |
+|---|---:|---|
+| `-sm tensor -ncmoe 48`, no `--fit`, auto MIB | 5 | text **9dcaf06d55e8** identical |
+| `-sm tensor -ncmoe 48 --fit on`, auto MIB | 5 | text **9dcaf06d55e8** identical |
+| same, `-v` with stdout/stderr **separated** | 3 | **9dcaf06d55e8** identical |
+| same, `-v 2>&1 \| extract` (the §15.1 command) | 3 | 3 different hashes — **artifact** |
+| `-sm tensor` + `draft-mtp n3` | 3 | text **bd444b574180**, acceptance **0.47134** identical |
+| G7 1-GPU `-sm layer -ncmoe 48` reproducer | 3 | text **d610c3f2daca**, acceptance **0.57353** identical |
+| `MOE_EXPERT_CACHE_MIB=0` (cache off) | 2 | text **bbea55b05c07** (deterministic, different path) |
+| explicit `MOE_EXPERT_CACHE_MIB=4096` | 2 | text **9dcaf06d55e8** |
+| `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT=0`, `GGML_CUDA_SLAB_RESERVE_MIB={4608,8192}` | 1 each | text **9dcaf06d55e8** |
+
+**Cache-on vs cache-off:** the two paths differ (cache-on computes every expert on the GPU — resident
+from the arena, misses over UVA; `=0` computes the host experts on the CPU), so a different greedy text
+is expected and is **not** a purity violation — each path is deterministic.  The WIP reserve/cap knobs
+(`G3`, `G4`) are text-neutral on this config.
+
+#### §15.2 — done
+
+`GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` added to `ENVIRONMENT.md` §1.3 (default 50, `=0` = old
+unbounded, inert unless the slab is armed, `GGML_SCHED_STAGE_MAX_MB` remains the hard ring override),
+with a cross-reference from the §2 staging table.
+
+#### §15.3 — matrix coverage and results
+
+| gate | arms | result |
+|---|---|---|
+| §5.1 no-abort, `-ncmoe 48`, 2 GPU | 4 MIB × 2 `-sm` × 2 MTP × 3 `-c` = 48 | **all exit 0**, no `hipModuleLoad failed`/`hipblaslt.cpp:164`, 0 `////` |
+| §5.2 arena = 95-100 % of explicit MIB | 2/3 GPU | 2-GPU 4096 → **4077.0/4061.6** (99.5/99.2 %), 16384 → **16365/16353** (99.9/99.8 %); 3-GPU 4096 → **4078.8/4096.0/4020.3** (99.6/100/98.2 %), 8192 → 8157.6/8192/8040.5 |
+| §5.3 dense unaffected | 4B `1c5d32ac537d` | **PASS** (no reservation line); `GGML_CUDA_SLAB=0` makes the G2 headroom term 0, coherent, no abort |
+| §5.4 standing | prefill-logit / `MUL_MAT_ID` / width purity | **0.000707 / 98.755 % PASS**; **931/931**; `none == n1 == n3 == n7` = **010f816e376c** |
+| §5.6 G3 transitions | `-ncmoe {0,4,8,12,16,20,24,28,32,40,48,56,99}` | see finding A |
+| §5.7 staging A/B (`-ncmoe 48`) | `STAGE=0`, `INPLACE=0`, `CACHE_STAGE=0`, `MAX_MB {512,2048}`, `SLOTS {4,8,16}`, G4 `{0,1}` | all coherent **9dcaf06d55e8**, 0 fatal; staging default 348.8 pp ≥ `STAGE=0` 339.7 pp |
+| 3-GPU `-sm tensor` accounting | explicit + auto | per-device arena balanced, ≥98 % of MIB on **all three** devices (the loader fix) |
+
+§5.7 single-run prefill (pp t/s): default 348.8, `STAGE=0` 339.7, `INPLACE=0` 349.4, `CACHE_STAGE=0`
+348.0, `MAX_MB=512` 342.7, `MAX_MB=2048` 348.1, `SLOTS=4` 381.0, `SLOTS=8` 348.6, `SLOTS=16` 344.1,
+`G4=0` 390.5, `G4=1%` 340.0.  (Single runs; pp spread ~±10 %, so `G4=0` being fastest needs repeats before
+it is read as a cap cost.)
+
+**Not run this session:** §5.5 field A/B (`-ub 6144 -c 204800`, `GGML_CUDA_ALLREDUCE=ce`),
+the 8 `-sm layer -c auto` §5.1 arms did not generate (they kept the tool-default `n_ctx=4096` while the
+prompt is 5298 tokens — a clean request-rejected exit, not a crash), §15.4 `fingon`, §15.5, §15.6.
+
+#### Findings (need a maintainer decision before §15.4-§15.6)
+
+**A — `--fit on` on a too-small `-ncmoe` aborts; this is PRE-EXISTING and unchanged by the WIP.**  On
+the 2-GPU Flash-Next IQ4_XS + `-c 8192`:
+
+* `-ncmoe 0`: **stock r37 aborts** at `ggml-backend-meta.cpp:944`
+  (`GGML_ASSERT(src_ss[5].axis == …)`); WIP aborts at the same assert (line 945 after the patch
+  offset).  `-ncmoe 0` has no host experts, so G1/G2 are inert — the WIP cannot be the cause.
+* `-ncmoe 4`: **stock r37 aborts with a runtime ROCm OOM** (`ggml-cuda.cu:1285`, core dump);
+  **WIP aborts at `ggml-backend-meta.cpp:562` (`GGML_ASSERT(ggml_backend_buffer_is_meta(meta_buf))`)
+  during warmup**, because the WIP fit reserves the host-expert bytes per device and therefore chooses a
+  *different* `n_gpu_layers` (42 vs stock "no changes needed").  This is the Phase-1 class of
+  "the new reservation changes the fitted layout and exposes a latent meta-split bug".
+
+Both are configurations that cannot fit; neither crash is graceful, which conflicts with the campaign's
+"never crash on a shortfall" bar.  The campaign changes do **not** regress a *fitting* config (ncmoe ≥ 8
+all exit 0/coherent), and `-ncmoe 12` is a **win**: the adaptive G3 reserve lets the slab fit
+(arena 4140 MiB, resident) where stock declined (arena 0, "running this layer uncached").
+**Decision needed:** (i) is the pre-existing abort at `-ncmoe 0/4` in scope for this promotion (file as
+its own graceful-degradation item?) and (ii) is the WIP's `-ncmoe 4` early warmup assert acceptable as-is,
+or should the fit's layer selection be constrained/gated so the reservation cannot push a fitting config
+into an unsupported `-sm tensor` layout?
+
+**B — G4 default evidence is thin.**  Issue #117 is still un-reproduced on `fingon`; the default flip
+therefore waits on §15.4.
+
