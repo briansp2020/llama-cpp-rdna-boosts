@@ -154,11 +154,56 @@ Note: gfx1100 is a **single 24 GiB card**, so the narrow/wide split and the ring
 watch for the `narrow_floor + ring + chunk > mapped` guard disabling the ring (`h2d_stage_region_bytes`
 returns 0 when it cannot fit) and for `cache_unusable`.
 
-### 4.3 3-GPU gate
+### 4.3 3-GPU gate — **DONE 2026-10-10** (see 4.3.1)
 
 Run the §5.5 field config on `HIP_VISIBLE_DEVICES=0,1,2` (`-sm tensor`) and the standing gates (dense
 golden is unaffected; width purity is the 2-GPU one).  Confirm per-device narrow floors and ring regions
 are balanced and no device declines the slab.
+
+### 4.2.1 `fingon` results (2026-10-10) — **no regression**
+
+Tree `888564105` (r38) + the ring patch, `build-rocm` (gfx1100).  §11.4 staging A/B,
+`llama-bench -p 4096 -n 4 -b 2048 -ub 2048 -r 1 -lm dio -ncmoe 20`:
+
+| arm | pp4096 | tg4 | r38 §15.8 |
+|---|---:|---:|---:|
+| default (ring-in-slab) | **4247.1** | 8.25 | 4248.5 / 8.29 |
+| `GGML_SCHED_STAGE=0` | 3565.3 | 8.20 | 3539.1 / 8.24 |
+| `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT=0` | 4259.4 | 8.23 | 4253.3 / 8.29 |
+| `…=1` | 4259.8 | 8.23 | 4254.9 / 8.23 |
+
+Staging is never slower than OFF (4247 vs 3565) and the G4 cap does not fire at the default 50 %.
+Primed `llama-server` (5246-token prose): prefill **2497.0** t/s (r38 2502.2), arena **7431.2/9280 MiB
+(80.1 %)** — bit-for-bit the r38 sizing — slab `8.38 GiB (work 1.00 + arena 7.38, ring region pending)`,
+`sized 205 slots/table from 60 tables / 36.2 MiB per expert`, and the cap refuses the **1312 MiB FA
+staging** (same as r38), *not* the ring.  gfx1100 width purity: `none == n1 == n3 == n7` = **`885ba10156f6`**
+(343 chars), 0 `////`, all rc 0 — MTP engages (n3 acceptance **0.83951**, r38 ~0.849).  The hash differs
+from r38's `cd5e36218bd2` only because r38 did not record the exact prompt/params; purity is what the gate
+asks for.
+
+### 4.3.1 3-GPU results (2026-10-10)
+
+Per-device control is balanced and no device declines the slab: all three log the identical
+`slab 20.44 GiB (work 3.00 GiB + arena 17.44 GiB, 8.00 GiB reserve, 4.00 GiB VA spare; ring region
+pending)`, cache `sized 512/505/505 slots/table`, **99.1 % residency** (64209.4 of 64800 MiB).
+
+**A pre-existing 3-GPU MTP regression (NOT the ring).**  Same prompt, same tree:
+
+| config | prefill | decode | acceptance |
+|---|---:|---:|---:|
+| 2-GPU plain (`--spec-type none`) | 546 | 41.9 | — |
+| 2-GPU MTP | 961 | **64.8** | 0.91 |
+| 3-GPU plain | — | **52.2** | — |
+| 3-GPU MTP (ring-in-slab) | 1043 | **19.5** | 0.90 |
+| 3-GPU MTP (ring off, `SLAB_RING_MIB=0`) | 759 | **21.4** | 0.91 |
+| **3-GPU MTP, clean r38 (no patch)** | 768 | **20.1** | — |
+| **3-GPU plain, clean r38** | 927 | **53.0** | — |
+
+On 3 GPUs **MTP is 2.6× SLOWER than plain decode** (19.5-21.4 vs 52.2), where on 2 GPUs it is 1.5×
+faster (64.8 vs 41.9).  The verify step is ~190 ms vs the 2-GPU ~57 ms.  Reproduced on clean r38, so it is
+**pre-existing and orthogonal to this campaign** — but it hits the maintainer's production config
+(AGENTS.md: servers run 3-GPU), so it deserves its own tracker item.  Separately, the ring-in-slab
+*improves* the 3-GPU prefill (1043 vs clean r38's 768), consistent with the 2-GPU win.
 
 ### 4.4 Reserve-side decision (the maintainer's question)
 
