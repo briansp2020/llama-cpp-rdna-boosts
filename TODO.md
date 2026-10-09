@@ -30,6 +30,27 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 49. Move the H2D staging ring inside the movable-boundary slab
+
+**Opened 2026-10-09 (WIP scoping).**  The op-offload H2D staging ring is a raw `cudaMalloc` outside the
+slab, so it competes with the non-routable post-slab consumers (hipBLASLt Tensile code objects +
+workspace, the MTP draft buffer, compute-buffer growth) for the one `GGML_CUDA_SLAB_HEADROOM_MIB`
+region.  The G4 cap (`GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`) guards that region by refusing the ring,
+which cost **~16 % prefill** on the maintainer's field config (§5.5, `wip/fit-slab-accounting/README.md`
+§15.9).  The ring is our construction and the slab is exactly the mechanism for placing our own internal
+segments, so it should live **inside** the slab and stop consuming the outside headroom.
+
+The slab is currently two-region (`work` + evictable `arena`), and the boundary move can only take
+contiguous arena chunks while evicting MoE tables (`moe_cache_evict_slab_range` walks `g_tables` only),
+so an in-flight ring in the arena would be overlapped; `ggml_cuda_slab_arena_alloc_transient()` is
+declared (`ggml-cuda-vmm.h:63`) but has no definition or caller — the vestige of this idea.  Fix: a
+reserved non-evictable region at the top of the slab, pre-split into fixed per-slot buffers, boundary
+target clamped to it, and the ring bound moved from the `--fit` margin into the slab reservation.
+
+**Scope, design, phases (P1 ring, P2 FA staging, P3 retire G4), invariants, risks and gates:**
+[`wip/slab-ring-region/README.md`](wip/slab-ring-region/README.md).  **Not part of the current
+delivery/promotion** — it is a follow-on to the G4 default decision, not a prerequisite for it.
+
 ### 48. The MoE expert cache corrupts a wide MTP-export consumer (G7) — CORRECTNESS
 
 **ROOT-CAUSED, FIXED, GATED 2026-10-09 (WIP patch).**  The handover's alias/take-over hypothesis was
