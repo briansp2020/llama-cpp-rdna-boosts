@@ -1,9 +1,10 @@
 # `slab-ring-region` — make the H2D staging ring a first-class slab region
 
-**Status: P1 IMPLEMENTED (2026-10-09/10), BLOCKED on the decode reclaim.**  The slab-side plumbing, the
-`--fit` lockstep and the arm/disarm lifecycle are in (`slab-ring-p1.patch`, from an r38 tree); the standing
-gates are green and the field **prefill** win is real, but handing the ring's hole back to the arena during
-decode corrupts the MTP draft (NaN).  See §9 for the record.
+**Status: P1 IMPLEMENTED, NaN ROOT-CAUSED AND FIXED, decode gap remains (2026-10-10).**  The slab-side
+plumbing, the `--fit` lockstep, the arm/disarm lifecycle and the "stay armed through cache sizing" fix are
+in (`slab-ring-p1.patch`, from an r38 tree).  Standing gates green; field prefill **782 → 921-929 t/s**
+with **0 NaN, acceptance 1.0**.  The remaining decode gap (53.9 vs 62.2 with a 2.5 GiB hole) is the static
+hole being subtracted from the cache sizing.  See §9, especially §9.4.
 
 This campaign exists because of the §5.5 finding in
 [`archive/work/fit-slab-accounting/README.md`](../../archive/work/fit-slab-accounting/README.md) §15.9: the G4 free-VRAM cap
@@ -158,7 +159,7 @@ growth entirely, and the top-of-arena placement only works until the work region
 
 ## 9. P1 implementation record (2026-10-09/10, gfx1201)
 
-**Artifact: [`slab-ring-p1.patch`](slab-ring-p1.patch)** (sha256 `de78092acd1b…`, 694 lines) against a clean
+**Artifact: [`slab-ring-p1.patch`](slab-ring-p1.patch)** (sha256 `19c640b4f044…`, 741 lines) against a clean
 r38 tree (`849c04161`, tree `88856410`, `scripts/apply-all.sh`).  Built with
 `cmake --build build-rocm-hybrid --target llama-cli llama-server test-backend-ops llama-perplexity -j 16`.
 Not applied to any delivery checkout; `patches/` untouched.
@@ -210,43 +211,82 @@ The maintainer's suggested before/after.  `srr_*` logs under `/tmp/srr/` (transi
 | this build, ring in slab, **hole kept armed** (2.5 GiB) | **921.2** | 53.8 | 1.0 | **0** |
 | this build, ring in slab, **hole disarmed after prefill** (6 GiB) | **973.4** | 28.9 | **0.002** | **8901** |
 | this build, ring in slab, **hole disarmed after prefill** (2.5 GiB) | — | — | **0.0027** | **8874** |
+| this build, + **stay-armed-until-sized** fix, hole disarmed (6 GiB) | **928.8** | 43.9 | 1.0 | **0** |
+| this build, + **stay-armed-until-sized** fix, hole disarmed (2.5 GiB) | **921.0** | 53.9 | 1.0 | **0** |
+| this build, + fix, explicit `MOE_EXPERT_CACHE_MIB=8192` (fits below the hole), disarmed | **1113.1** | 33.3 | 1.0 | **0** |
 
 **The G4 tension is removed and the prefill win is real** (973 vs 782, and above the stock 922).  But:
 
-* **The decode reclaim corrupts.**  With the disarm, the MTP draft logits go **NaN** ~3 s into the decode
-  (8901 NaN lines; acceptance 0.002), and decode collapses to 28.9 t/s.  It is deterministic (2.5 GiB and
-  6 GiB holes both do it); it is **not** the arm's eviction (never-arm and keep-armed are clean) and it is
-  **not** the ring's use (keep-armed uses the ring and is clean).  It needs the hole to be handed back to
-  the arena during decode.  The draft's first few candidates are finite (acceptance 0.667), then NaN — a
-  state corruption as the arena fills the hole, consistent with a stale expert-cache alias/remap (the
-  G7 class), not a plain staging error.  A small `-c 8192 -ub 2048 -n 300` MTP run does **not** reproduce
-  it (both arm modes show one benign `nan` log line, acceptance 0.45).  `MOE_EXPERT_CACHE_VALIDATE=1` on
-  the field config reports the cache **consistent** (`[validate after-rearm] tables=288 resident=288
-  down=0 inconsistent=0`, both devices) at the post-prefill re-arm, so it is not a cache-state mismatch:
-  the corruption appears after the disarm as the arena fills the hole, not in the cache's own bookkeeping.
-* **Keeping the hole armed costs decode.**  The hole is removed from the arena for the whole run; a
-  2.5 GiB hole costs ~13.5 % decode (62.2 → 53.8), a 6 GiB hole ~30 %.  So the prefill/decode trade is
-  back, just moved from the G4 cap to the arena size — the reclaim is what makes it a pure win.
+* **The decode reclaim corrupted (now fixed).**  With the disarm, the MTP draft logits went **NaN** ~3 s
+  into the decode (8901 NaN lines; acceptance 0.002, decode 28.9).  It is **not** the ring's use of the
+  hole (`RING_NOTRANSIENT` still NaN; `RING_KEEP` clean) and **not** bad arena data (the level-2 validator
+  reports no `NONFINITE-HEAD`); it is the auto-sized cache placing its hottest tables in the hole while the
+  ring was disarmed, then the prefill arm evicting them and the cold re-arm feeding the wide MTP export.
+  Full chain, isolation matrix and the `moe_cache_is_sized()` fix in **§9.4**.
 
 **Conclusion for P1:** the slab-side ring (hole + `arena_alloc_transient` + `h2d_stage_buffer` routing +
 `--fit` lockstep + arm/disarm plumbing) is correct and green on the standing gates, and it removes the G4
-refusal (field prefill 782 → 921-973).  **The decode reclaim is blocked on the MTP NaN** and P1 is not
-promotable until it is root-caused.  Next steps, in order:
+refusal (field prefill 782 → 921-973).  The NaN is root-caused and fixed (§9.4).  The remaining gap is
+**decode** (53.9 vs 62.2 at a 2.5 GiB hole, 43.9 at 6 GiB) because the cache sizes against the armed
+(hold-excluded) arena and does not grow back after the disarm; the **dynamic, per-slot ring** the
+maintainer asked for is what closes it (see §9.5).  Not promotable until the decode gap is closed.
 
-1. **Root-cause the NaN.**  `MOE_EXPERT_CACHE_VALIDATE=1` on the field config; diff the `g_alias_to_id` /
-   per-table `slot_dirty`/`remap` state across the disarm; check whether the re-arm places a table at a
-   VA a live MTP-export consumer still reads.  The tiny repro is `srr_ring_in` (server, 31k prefill →
-   1000 MTP decode) — `grep -ac nan` is the oracle.  The G7 condition (`node_n_consumers == 1`) is in
-   `ggml-backend.cpp:2694` and is untouched by this change.  First datapoint: `MOE_EXPERT_CACHE_VALIDATE=1`
-   reports the cache consistent at the re-arm (see §9.3), so the bug is downstream of the cache bookkeeping
-   — most likely the ring's stale slot VAs overlapping a table the MTP export reads, or a scheduler copy
-   path that still references a slot after the hole is handed to the arena.  A useful next probe is to
-   keep the hole out of `arena_free` on disarm but still lower `arena_total` (tests whether the *VA
-   reuse* or only the *size accounting* matters).
-2. **Shrink the hole** once the reclaim is safe: it is sized for the worst-case slot (`slots*(270+512)`
-   = 6 GiB here) while the ring's live total is ~1 GiB.  The `max_host_weight_tensor_bytes()` merged-tensor
-   artifact is the reason the cap defaults to 6 GiB; a real per-table bound (or a `GGML_LOG` warning when
-   the cap clamps) would let it be ~2.5 GiB.
-3. If the hole cannot be shared safely, P1's fallback is the **keep-armed** configuration (prefill +18 %,
-   decode −13.5 %); that is a smaller, honest win, and it still retires the G4 refusal for the field.
+### 9.4 Root cause of the MTP NaN (2026-10-10)
+
+Reproduced deterministically, isolated by A/B, and fixed.  The chain:
+
+1. The slab **arms** the ring at creation and the first narrow setup pass **disarms** it, so the hole is
+   back in the arena when the cache's deferred sizing (`alloc_all_locked`) runs on the priming pass.
+2. The **auto-sized** arena then places its highest (hottest) tables **in the hole** -- the `arena_alloc`
+   top-down fill reaches the top first.  Measured: 337 slots/table, `arena 39993.8 MiB`.
+3. The first wide prefill **arms** the ring again, which must **evict** the hole's tables --
+   `moe_cache_evict_slab_range` frees `6240.0 MiB` of hot tables (plus 936 MiB from the work growth).
+4. At the prefill -> decode transition the ring disarms and the drop's `moe_cache_rearm` re-arms the stood-
+   down tables **cold** (arena allocated, experts not yet filled).  The qwen4exp wide MTP export then reads
+   a re-armed table and gets NaN (`draft acceptance` 0.667 -> 0.002, 8901 NaN lines; decode 28.9 t/s).
+
+The isolation matrix (all on the field config):
+
+| variant | semantics | result |
+|---|---|---|
+| `GGML_CUDA_SLAB_RING_NEVER=1` | hole reserved but never armed; ring on `cudaMalloc` + G4 | prefill 782, decode 62.2, **0 NaN** |
+| `GGML_CUDA_SLAB_RING_NOTRANSIENT=1` | hole **toggled + evicted**, ring on `cudaMalloc` | prefill 792, decode 29.0, **8901 NaN** |
+| `GGML_CUDA_SLAB_RING_KEEP=1` | hole armed at creation and **never disarmed**; ring in the hole | prefill 929, decode 43.8, **0 NaN** |
+| `MOE_EXPERT_CACHE_MIB=8192` | explicit budget that **fits below the hole**, disarmed | prefill 1113, decode 33.3, **0 NaN** |
+| `MOE_EXPERT_CACHE_INPLACE=0` / `MOE_EXPERT_CACHE_VALIDATE=2` | rule out the in-place/deferred path and the arena data | still NaN; cache validator **consistent**, no `NONFINITE-HEAD` |
+
+Two conclusions: the ring **using** the hole is irrelevant (`NOTRANSIENT` still NaN, `KEEP` clean); and
+`MOE_EXPERT_CACHE_VALIDATE=2` never reports `NONFINITE-HEAD`, so the arena data is fine -- it is the
+**evict-then-cold-re-arm of tables the arena had already placed in the hole** that breaks the wide export.
+
+**The fix:** do not disarm the ring before the cache has sized (`moe_cache_is_sized()`).  Keeping the hole
+armed through `alloc_all_locked` makes the sizing exclude it (so no hot tables land there) and the later
+prefill arm a no-op (`evicted 878 MiB` = work growth only, vs `6240 MiB` before).  Result: **0 NaN,
+acceptance 1.0**, prefill 921-929.  The gate lives in `ggml_backend_cuda_device_slab_ring_set`.
+
+### 9.5 The remaining decode gap and the dynamic ring
+
+With the fix the hole is subtracted from the cache sizing, so the arena is 240-296 slots/table instead of
+337, and the cache never grows back after the disarm -> decode 43.9 (6 GiB hole) / 53.9 (2.5 GiB).  The
+maintainer's point stands: the hole should be **dynamically sized to what the ring actually uses** (~1 GiB
+live, from 8 slots of 124-270 MiB) instead of a static `slots*(max_table+512)` worst case (6 GiB here,
+because `max_host_weight_tensor_bytes()` is the merged 27 GiB host tensor).  A per-slot bump allocator at
+the top (each slot carves `size+512`, the hole grows downward, `ring_off` tracks it) would make the sizing
+cost ~1 GiB instead of 6 GiB, recovering most of the decode **provided** the arm still does not evict a hot
+table -- i.e. the same `moe_cache_is_sized()` gate applies and the hole stays armed through sizing.  That
+is the next implementation step.
+
+### 9.6 Next steps
+
+1. **Per-slot dynamic ring** (§9.5): replace the uniform `slots*(max_table+512)` hole with a top-down bump
+   allocator whose size tracks the actual slot allocations; keep the `moe_cache_is_sized()` gate so the
+   sizing excludes the (then tiny) hole.  Target: prefill ~920 + decode ~60.
+2. If the decode still lags, **re-run the arena sizing after the ring disarms** (grow the cache into the
+   reclaimed hole) -- but only once the arm-eviction path is proven not to feed a wide consumer cold
+   tables (a multi-prefill server will re-arm and re-evict).
+3. Alternatively, make the **cold re-arm fill or cold-mark** the re-armed tables so a wide consumer never
+   reads unfilled slots; that would remove the eviction hazard generally and let the hole be reclaimed
+   freely.
+4. `fingon` (gfx1100): the §11.4 staging A/B and primed-arena server numbers must not regress once P1 is
+   green here.
 

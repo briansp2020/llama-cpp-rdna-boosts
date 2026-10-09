@@ -111,7 +111,7 @@ index 31be9fe07..6d6519b9b 100644
  
  // CPU backend - backend (reg)
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 317713cca..d492368c8 100644
+index 317713cca..7aa98fcd5 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1600,6 +1600,13 @@ struct ggml_cuda_graph_key_hash {
@@ -178,7 +178,7 @@ index 317713cca..d492368c8 100644
      // Effective ring depth, GGML_SCHED_STAGE_SLOTS (default 8, clamped to H2D_STAGE_SLOTS).  The
      // scheduler uses the same variable for its own round-robin; the backend needs it only to size the
      // auto budget below.
-@@ -1974,15 +2016,46 @@ struct ggml_backend_cuda_context {
+@@ -1974,15 +2016,47 @@ struct ggml_backend_cuda_context {
          if (size > h2d_stage_size[slot]) {
              const size_t old_size = h2d_stage_size[slot];
              const size_t new_size = size + 512;
@@ -196,7 +196,8 @@ index 317713cca..d492368c8 100644
 +            // The slot is allocated ONCE at the full per-slot capacity, so its VA is stable for the life of
 +            // the slab (a growing layout does not free/realloc it, so no captured graph is invalidated) and
 +            // it does not draw on the free VRAM the G4 cap protects.
-+            if (!h2d_stage_slab[slot]) {
++            static const bool notransient = getenv("GGML_CUDA_SLAB_RING_NOTRANSIENT") != nullptr;
++            if (!h2d_stage_slab[slot] && !notransient) {
 +                const size_t cap = ggml_cuda_slab_ring_slot_capacity(device);
 +                if (cap >= new_size) {
 +                    void * p = ggml_cuda_slab_arena_alloc_transient(device, cap);
@@ -228,7 +229,7 @@ index 317713cca..d492368c8 100644
                  ggml_cuda_graph_mem_freed(device);   // captured graphs may read the old slot
                  CUDA_CHECK(cudaFree(h2d_stage[slot]));
                  h2d_stage[slot]      = nullptr;
-@@ -1995,7 +2068,11 @@ struct ggml_backend_cuda_context {
+@@ -1995,7 +2069,11 @@ struct ggml_backend_cuda_context {
              }
              h2d_stage[slot]      = p;
              h2d_stage_size[slot] = new_size;
@@ -241,7 +242,7 @@ index 317713cca..d492368c8 100644
          }
          return h2d_stage[slot];
      }
-@@ -2003,9 +2080,12 @@ struct ggml_backend_cuda_context {
+@@ -2003,9 +2081,12 @@ struct ggml_backend_cuda_context {
      void h2d_stage_free() {
          for (int s = 0; s < H2D_STAGE_SLOTS; ++s) {
              if (h2d_stage[s] != nullptr) {
@@ -283,7 +284,7 @@ index b9f19a903..dca68e00a 100644
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
  void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d980f2892..09b466d86 100644
+index d980f2892..124895adc 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -604,6 +604,17 @@ struct ggml_cuda_slab {
@@ -590,7 +591,7 @@ index d980f2892..09b466d86 100644
          // This model HAS host-resident experts, so the work/arena split is meaningful -- arm the slab.
          // Dense models never reach here (`llama_model_moe_cache_preflight` skips an empty host-expert map),
          // which is what keeps the slab off them.  Runs before the context, so before any compute buffer.
-@@ -10241,6 +10445,14 @@ static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t de
+@@ -10241,6 +10445,22 @@ static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t de
      return ggml_cuda_slab_headroom_bytes();
  }
  
@@ -598,6 +599,14 @@ index d980f2892..09b466d86 100644
 +    // wip/slab-ring-region: arm/disarm the reserved H2D staging-ring hole.  One meta-unit with the wide
 +    // compute layout: armed at a wide (prefill) pass, disarmed at the prefill -> decode drop, so a
 +    // decode-only stretch gets the ring's VRAM back in the arena.
++    //
++    // Do NOT disarm before the cache has sized.  The auto-sized arena sizes against `arena_total`; if the
++    // hole is available at that moment its highest (hottest) tables land IN the hole, and the next arm
++    // evicts them -- the cold re-arm is what corrupts a wide MTP-export consumer (measured: MTP draft NaN,
++    // acceptance 0.002).  Keeping the hole armed through sizing makes the later arm a no-op.
++    if (!arm && !moe_cache_is_sized()) {
++        return;
++    }
 +    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
 +    ggml_cuda_slab_ring_set(ctx->device, arm);
 +}
@@ -605,7 +614,7 @@ index d980f2892..09b466d86 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -10263,6 +10475,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -10263,6 +10483,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_cache_rearm         = */ ggml_backend_cuda_device_moe_cache_rearm,
      /* .slab_work_size          = */ ggml_backend_cuda_device_slab_work_size,
      /* .slab_headroom_bytes     = */ ggml_backend_cuda_device_slab_headroom_bytes,
@@ -613,7 +622,7 @@ index d980f2892..09b466d86 100644
  };
  
  // backend reg
-@@ -10386,6 +10599,13 @@ static size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t m
+@@ -10386,6 +10607,13 @@ static size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t m
      if (ctx == nullptr) {
          return 0;
      }
@@ -627,6 +636,44 @@ index d980f2892..09b466d86 100644
      return ggml_backend_cuda_context::h2d_stage_bound(max_table);
  }
  
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 33531ec37..0348afdea 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -3579,6 +3579,17 @@ bool moe_cache_has_arena() {
+     return moe_cache_has_arena_locked();
+ }
+ 
++// wip/slab-ring-region: has the deferred arena sizing run?  The slab's H2D-ring hole must stay ARMED
++// through sizing (so the auto-sized arena never allocates its highest tables into the hole); a disarm
++// before that makes the next arm evict those hot tables, and the cold re-arm corrupts a wide consumer.
++bool moe_cache_is_sized() {
++    if (!g_enabled) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    return g_sized;
++}
++
+ // ---------------------------------------------------------------------------------------------------
+ // OPEN 2 debug validator (`MOE_EXPERT_CACHE_VALIDATE`).  A no-op unless the env var is set, so a normal
+ // run pays nothing.  Level 1 checks the structural invariants every consumer relies on; level 2 also
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 8c355b2e4..6907a4351 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -163,6 +163,11 @@ bool moe_cache_has_tables();
+ // down wholesale and let the per-op path run.  Returns false before sizing and for an empty cache.
+ bool moe_cache_has_arena();
+ 
++// wip/slab-ring-region: the deferred arena sizing has run.  The slab's H2D-ring hole must stay ARMED
++// through sizing, so the auto-sized arena never allocates its highest tables into the hole (a disarm
++// before that makes the next arm evict those hot tables, and the cold re-arm corrupts a wide consumer).
++bool moe_cache_is_sized();
++
+ // Register (or look up) the expert table backing `src0` and return its id.  `layer`/`role` are for
+ // reporting.  `host` is the master the cache fills from (may be null).  Idempotent per `(src0, device)`.
+ // `device` is the CUDA ordinal whose kernels will read this table's arena (the layer's owner under
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 index 6cb544339..3ac2cc16d 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
