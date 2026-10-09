@@ -21,7 +21,7 @@ decision, the P2/P3 follow-ons, and promotion.
 ## 1. Artifact and a working reproduction
 
 * **Artifact:** [`slab-ring-p1.patch`](slab-ring-p1.patch) — sha256
-  `f23ca9703624d700c4ce556ad7b118041dec098b7de15aacf63a62a84ebc9799`, **912 lines**, against a clean r38
+  `6f769be42a6e4369e415a5637867ad803913536766e4f2ae6f6eb41b970cb9f8`, **945 lines**, against a clean r38
   tree (`scripts/apply-all.sh` from `release.json.base a55e952b8` yields tip `849c04161`, tree `88856410`).
 * **Prototype tree:** `~/llama.cpp`, branch `slab-ring-prototype` at `849c04161` **with the patch applied
   (uncommitted `git diff`)**.  If it is lost: stash/`git checkout -- .`, re-apply the patch, rebuild.
@@ -205,41 +205,51 @@ faster (64.8 vs 41.9).  The verify step is ~190 ms vs the 2-GPU ~57 ms.  Reprodu
 (AGENTS.md: servers run 3-GPU), so it deserves its own tracker item.  Separately, the ring-in-slab
 *improves* the 3-GPU prefill (1043 vs clean r38's 768), consistent with the 2-GPU win.
 
-### 4.4 Reserve-side decision — **MEASURED 2026-10-10; needs the maintainer's call**
+### 4.4 Reserve-side decision — **DECIDED 2026-10-10: default stays 4096; env var is the knob**
 
 Before the ring moved inside, it `cudaMalloc`'d from the outside **headroom** (`GGML_CUDA_SLAB_HEADROOM_MIB`,
 default 4096, which also protects hipBLASLt and the draft).  Now the region is inside the slab, so
 `want = free - (headroom + aux)` is unchanged and the region is carved from the arena; in decode it is
 reclaimed, so the arena returns to baseline.  The slab does not **gain** the headroom the outer ring held.
 The steady-state outside-free is `headroom` (`ggml_cuda_slab_extend_locked` adds chunks down to it), so
-that is the knob.  The ring's old live share was ~1 GiB (r38 refused a 990 MiB ring growth), making
-`4096 -> 3072` the *principled* cut rather than an arbitrary one.
+that is the knob.
 
-Field config (2-GPU, image prompt = `/tmp/srr/mixed30k.txt`, ring `2560`, `--fit on`):
+The headroom is a **MiB value** (`GGML_CUDA_SLAB_HEADROOM_MIB`), not a boolean switch.  **The default is
+4096 and stays 4096.**  3072 was implemented, measured and **rejected** — the trial and its numbers are
+recorded in the code comment at `GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT` and `ENVIRONMENT.md` §1.3 so nobody
+re-runs it blind.
 
-| `GGML_CUDA_SLAB_HEADROOM_MIB` | arena residency | cache slots/table (dev0/dev1) | prefill | decode | accept | **steps/s** | NaN | refusals | aborts |
-|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|
-| **4096 (default)** | 61.7 % | 337 / 295 | 967.1 | 66.0 | 0.910 | **17.7** | 0 | 0 | 0 |
-| 3584 | 63.3 % | 345 / 303 | 959.4 | 67.9 | 0.812 | **19.8** | 0 | 0 | 0 |
-| 3072 | 64.9 % | 353 / — | 949.9 | 67.4 | 0.838 | **19.2** | 0 | 0 | 0 |
-| 2048 | 68.1 % | 369 / 328 | 946.7 | 70.4 | 0.899 | **19.0** | 0 | 0 | 0 |
+**Why 3072 looked right.**  The ring's old live share was ~1 GiB (r38 refused a 990 MiB ring growth), so
+`4096 -> 3072` looked like the principled *equivalent* cut.  On the field config (2-GPU, `/tmp/srr/mixed30k.txt`,
+ring 2560, `--fit on`) it did help — the arena residency rose and the decode step rate improved:
 
-(Normalise by `steps/s = tps / mean_len` — the acceptance differs between arms, so raw tps is not
-comparable.  3584 stopped at 815 tokens by EOS; still clean.)
+| `GGML_CUDA_SLAB_HEADROOM_MIB` | arena residency | cache slots (dev0/dev1) | prefill | decode | accept | **steps/s** |
+|---:|---:|---|---:|---:|---:|---:|
+| **4096 (default)** | 61.7 % | 337 / 295 | 967.1 | 66.0 | 0.910 | **17.7** |
+| 3584 | 63.3 % | 345 / 303 | 959.4 | 67.9 | 0.812 | **19.8** |
+| 3072 | 64.9 % | 353 / 312 | 955.9 | 69.4 | 0.838 | **19.8** |
+| 2048 | 68.1 % | 369 / 328 | 946.7 | 70.4 | 0.899 | **19.0** |
 
-**Result: ~+8-12 % decode step rate, saturating by ~3584, prefill flat (slightly lower, within noise), all
-arms clean.**  The gain comes entirely from arena residency (61.7 -> 64.9-68.1 %).  The `--fit` lockstep is
-honoured automatically: the fit reads the same headroom getter, so no double-count appeared (prefill and
-n_ctx are unchanged).
+(`steps/s = tps / mean_len`; the acceptance differs per arm, so raw tps is not comparable.)  All arms 0 NaN
+/ 0 refusals / 0 aborts, and the `--fit` lockstep held automatically (the fit reads the same getter).
 
-**Recommendation (for the maintainer):** the ~1 GiB cut to **3072** is defensible because exactly that much
-headroom was reserved for the ring until now and is now idle; the more aggressive 2048 buys almost nothing
-extra (19.0 vs 19.2 steps/s) while thinning a region the AGENTS.md calls load-bearing (hipBLASLt Tensile
-objects + workspace, the MTP draft, compute-buffer growth).  If taken, make it a **promotion-time change**
-with a kill-switch (e.g. keep the 4096 default and have the slab subtract the *actual* ring region when the
-ring is placed inside), and **soak it on the 3-GPU + long-context production config first** — this
-measurement is 2-GPU / 32 k only, and the headroom is where a thin margin shows up as a failed hipBLASLt
-workspace or a truncated generation.
+**Why 3072 is rejected.**  The §2.2 wide-prefill config (`--fit off`, IQ4_XS, `-ngl 99 -sm tensor
+-ncmoe 48 -ub 6144 -b 6144 -c 204800 --no-kv-unified`, 5697-token prefill, `GGML_CUDA_ALLREDUCE=ce`):
+
+| headroom | outcome |
+|---:|---|
+| **4096** | **clean** — 312 t/s prefill, 0 `////` / 0 `!!!!` |
+| 3072 | `Hip error: 'out of memory'(2) at hipblaslt.cpp:164` |
+| 2048 | `hipGraphInstantiate` OOM (`ggml-cuda.cu:8362`) |
+
+So the +8.5 % decode is real but only *safe while the context is fitted*: with `--fit on` the fit sizes n_ctx
+down to hold the configured headroom, but a user who forces the context (`--fit off` + a large `-c`) is
+relying on the headroom itself, and 3072 is inside the abort band.  A shipped default must hold for that
+user too.  (Contrast the field config, `--fit on -c 204800`, which is clean at 3072.)
+
+**Decision:** default 4096; `GGML_CUDA_SLAB_HEADROOM_MIB` (MiB) remains the documented per-user knob for
+anyone who accepts the narrow-context trade.  Reverted in `ggml-cuda.cu`; artifact now
+`slab-ring-p1.patch` sha256 `6f769be42a6e4369e415a5637867ad803913536766e4f2ae6f6eb41b970cb9f8` (945 lines).
 
 ### 4.4-old (the original question text, kept for context)
 
