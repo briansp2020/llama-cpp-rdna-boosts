@@ -1,6 +1,11 @@
 # `slab-ring-region` — make the H2D staging ring a first-class slab region
 
-**Status: SCOPING (2026-10-09).**  No code yet.  This campaign exists because of the §5.5 finding in
+**Status: P1 IMPLEMENTED (2026-10-09/10), BLOCKED on the decode reclaim.**  The slab-side plumbing, the
+`--fit` lockstep and the arm/disarm lifecycle are in (`slab-ring-p1.patch`, from an r38 tree); the standing
+gates are green and the field **prefill** win is real, but handing the ring's hole back to the arena during
+decode corrupts the MTP draft (NaN).  See §9 for the record.
+
+This campaign exists because of the §5.5 finding in
 [`archive/work/fit-slab-accounting/README.md`](../../archive/work/fit-slab-accounting/README.md) §15.9: the G4 free-VRAM cap
 refuses the op-offload H2D staging ring on the maintainer's field config and costs ~16 % prefill.  The
 maintainer's framing: *the ring is our construction; it should live inside the movable-boundary slab,
@@ -148,3 +153,92 @@ growth entirely, and the top-of-arena placement only works until the work region
 * `archive/work/fit-slab-accounting/README.md` §15.9 (the §5.5 finding) and §12.1/§12.3 (G3/G4).
 * `archive/work/moe-cache-autosize/` (`ARENA-UB-TENSION.md` §13/§14) — the movable-boundary slab design.
 * `ENVIRONMENT.md` §1.3 (`GGML_CUDA_SLAB*`), §2 (`GGML_SCHED_STAGE*`).
+
+---
+
+## 9. P1 implementation record (2026-10-09/10, gfx1201)
+
+**Artifact: [`slab-ring-p1.patch`](slab-ring-p1.patch)** (sha256 `de78092acd1b…`, 694 lines) against a clean
+r38 tree (`849c04161`, tree `88856410`, `scripts/apply-all.sh`).  Built with
+`cmake --build build-rocm-hybrid --target llama-cli llama-server test-backend-ops llama-perplexity -j 16`.
+Not applied to any delivery checkout; `patches/` untouched.
+
+### 9.1 What was implemented (the §3 design, with the lifecycle tie-in)
+
+* **The ring is a slab hole** `[ring_off, ring_off + ring_region)` at the top of the mapped slab
+  (`ring_off = mapped - ring_region`).  `ggml_cuda_slab_work_alloc` clamps the boundary to `ring_off`;
+  `slab_extend` maps above `mapped`, so it never touches the hole; the hole is excluded from
+  `arena_free` while armed.
+* **`ggml_cuda_slab_arena_alloc_transient()`** (the declaration that had no definition) is now the hole's
+  bump allocator; `arena_alloc_transient` recomputes `h2d_stage_bound(max_table)` (`slot_cap =
+  h2d_stage_region_bytes(max_table)/slots`) and `h2d_stage_buffer()` allocates one FULL slot capacity per
+  slot on first use, so the ring's VA is stable for the life of the slab and the G4 free-VRAM cap is
+  bypassed entirely (it is our own reservation).  `h2d_stage_free()` does not `cudaFree` slab slots.
+* **Sizing**: `h2d_stage_region_bytes(max_table)` = `min(slots*(max_table+512),
+  GGML_CUDA_SLAB_RING_MIB [default 6144], GGML_SCHED_STAGE_MAX_MB when set)`; `0` when `GGML_SCHED_STAGE=0`.
+  `max_table` comes from `llama_model::max_host_weight_tensor_bytes()`, which for this model is the
+  **merged** host tensor (27 466 MiB), 100x the largest staged slice (270 MiB) — hence the 6144 MiB cap.
+* **Arm/disarm** (`ggml_backend_dev_slab_ring_set`): armed for a wide pass (`ubatch.n_tokens >= 64`) and
+  disarmed for a narrow one, from `llama_context::process_ubatch` **before** the drop's `moe_cache_rearm`
+  (so a post-prefill re-arm sizes against the full arena).  Arming removes the hole from `arena_free` and
+  evicts the tables the arena put there (`moe_cache_evict_slab_range`, no slab lock held); disarming syncs
+  the device and returns the hole.  `--fit` no longer counts the ring bound (`ggml_backend_cuda_h2d_stage_bound`
+  returns 0 when the slab is enabled), so it is not double-counted; the fit n_ctx/arena are unchanged.
+* Debug switches used below: `GGML_CUDA_SLAB_RING_MIB`, `GGML_CUDA_SLAB_RING_KEEP=1` (never disarm),
+  `GGML_CUDA_SLAB_RING_NEVER=1` (never arm → the ring stays on `cudaMalloc` + G4).
+
+### 9.2 Standing gates (all PASS, ring path live where relevant)
+
+| gate | result |
+|---|---|
+| dense `Qwen3.5-4B-Q8_0` `-sm tensor` (slab never armed) | **`1c5d32ac537d`** (matches the golden) |
+| `scripts/gate-prefill-logits.sh` (gfx1201, 27B Q8_0) | **PASS** mean KLD **0.000707**, same-top-p **98.755 %** |
+| `test-backend-ops -o MUL_MAT_ID` | **931/931** |
+| width purity 2-GPU Flash-Next IQ4_NL `-ncmoe 48`, `none == n1 == n3 == n7` | **`b00fdf534227`** (329 chars), 0 `////` (different prompt/len than §15.3, hence a different hash) |
+
+### 9.3 §5.5 field config (2 GPU, `--fit on`, 31 482-token prose, 1000 MTP tokens)
+
+The maintainer's suggested before/after.  `srr_*` logs under `/tmp/srr/` (transient); harness
+`/tmp/fsa155/field.sh` re-pointed at `/tmp/srr`.
+
+| arm | prefill t/s | decode t/s | acceptance | NaN |
+|---|---:|---:|---:|---:|
+| **stock r37 reference** (§15.9) | **922-924** | 61.5-61.8 | 1.0 | 0 |
+| r38 WIP, G4 default 50 % (§15.9) | **767-769** | 61.8-62.0 | 1.0 | 0 |
+| this build, ring never armed (`RING_NEVER`, = the r38 G4 cost) | **781.4 / 782.6** | **62.2** | 1.0 | **0** |
+| this build, ring in slab, **hole kept armed** (6 GiB) | **929.3** | 43.8 | 1.0 | **0** |
+| this build, ring in slab, **hole kept armed** (2.5 GiB) | **921.2** | 53.8 | 1.0 | **0** |
+| this build, ring in slab, **hole disarmed after prefill** (6 GiB) | **973.4** | 28.9 | **0.002** | **8901** |
+| this build, ring in slab, **hole disarmed after prefill** (2.5 GiB) | — | — | **0.0027** | **8874** |
+
+**The G4 tension is removed and the prefill win is real** (973 vs 782, and above the stock 922).  But:
+
+* **The decode reclaim corrupts.**  With the disarm, the MTP draft logits go **NaN** ~3 s into the decode
+  (8901 NaN lines; acceptance 0.002), and decode collapses to 28.9 t/s.  It is deterministic (2.5 GiB and
+  6 GiB holes both do it); it is **not** the arm's eviction (never-arm and keep-armed are clean) and it is
+  **not** the ring's use (keep-armed uses the ring and is clean).  It needs the hole to be handed back to
+  the arena during decode.  The draft's first few candidates are finite (acceptance 0.667), then NaN — a
+  state corruption as the arena fills the hole, consistent with a stale expert-cache alias/remap (the
+  G7 class), not a plain staging error.  A small `-c 8192 -ub 2048 -n 300` MTP run does **not** reproduce
+  it (both arm modes show one benign `nan` log line, acceptance 0.45).
+* **Keeping the hole armed costs decode.**  The hole is removed from the arena for the whole run; a
+  2.5 GiB hole costs ~13.5 % decode (62.2 → 53.8), a 6 GiB hole ~30 %.  So the prefill/decode trade is
+  back, just moved from the G4 cap to the arena size — the reclaim is what makes it a pure win.
+
+**Conclusion for P1:** the slab-side ring (hole + `arena_alloc_transient` + `h2d_stage_buffer` routing +
+`--fit` lockstep + arm/disarm plumbing) is correct and green on the standing gates, and it removes the G4
+refusal (field prefill 782 → 921-973).  **The decode reclaim is blocked on the MTP NaN** and P1 is not
+promotable until it is root-caused.  Next steps, in order:
+
+1. **Root-cause the NaN.**  `MOE_EXPERT_CACHE_VALIDATE=1` on the field config; diff the `g_alias_to_id` /
+   per-table `slot_dirty`/`remap` state across the disarm; check whether the re-arm places a table at a
+   VA a live MTP-export consumer still reads.  The tiny repro is `srr_ring_in` (server, 31k prefill →
+   1000 MTP decode) — `grep -ac nan` is the oracle.  The G7 condition (`node_n_consumers == 1`) is in
+   `ggml-backend.cpp:2694` and is untouched by this change.
+2. **Shrink the hole** once the reclaim is safe: it is sized for the worst-case slot (`slots*(270+512)`
+   = 6 GiB here) while the ring's live total is ~1 GiB.  The `max_host_weight_tensor_bytes()` merged-tensor
+   artifact is the reason the cap defaults to 6 GiB; a real per-table bound (or a `GGML_LOG` warning when
+   the cap clamps) would let it be ~2.5 GiB.
+3. If the hole cannot be shared safely, P1's fallback is the **keep-armed** configuration (prefill +18 %,
+   decode −13.5 %); that is a smaller, honest win, and it still retires the G4 refusal for the field.
+
