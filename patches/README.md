@@ -3,7 +3,17 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r36` (2026-10-08) -- three contributor prefill PRs folded into the existing blocks:**
+> **Current release `v16-a55e952b8-r37` (2026-10-09) -- issues #118/#120: the slab and the compute chunk are armed only for host-expert models:**
+> `ggml_cuda_slab_enabled()` was default-ON for every HIP model with no MoE gate, so a dense model (and a
+> dense model + `--mmproj`) created a movable-boundary slab that parked nearly all free VRAM in an unused
+> arena (#118), and the slab-motivated compute chunk (`(ceil(need/C)+1)*C`) inflated the small MTP/per-slot
+> buffers by +739 MiB (#120).  Amends **block 06** (`ggml-cuda.cu`): a `g_slab_armed` flag armed by the MoE
+> preflight (`llama_model_moe_cache_preflight`, host-resident experts only), and `get_compute_chunk_bytes`
+> returning 0 unless the slab is enabled.  Blocks 07-15 rebased unchanged.  Canonical block-15 tip
+> `8d8a967fb`, net tree `322a77273531f88250ed01bc9ef6a64a74227028`; strict **16/16** `git am`
+> (`validate-set.sh` green).  Full record: `WORKLOG.md` r37.
+>
+> **Previous release `v16-a55e952b8-r36` (2026-10-08) -- three contributor prefill PRs folded into the existing blocks:**
 > PR #119 (shared BF16 src1 reuse for the qwen4exp hc mixer GEMMs) and PR #121 (in-place host-expert
 > prefill reads, arena when resident / pinned host master otherwise, plus a zero-padded tail guard) are in
 > **block 15**; PR #122 patch 0001 (a 512 MiB free-VRAM floor on the workspace pool's first attempt,

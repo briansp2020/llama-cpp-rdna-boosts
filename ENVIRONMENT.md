@@ -34,7 +34,7 @@ The only ones worth knowing by heart:
 |---|---|---|
 | `GGML_COMPUTE_BUFFER_MARGIN_PCT` | `10` (HIP only) | `0` disables the compute-buffer slack — the fastest way to reproduce the old TODO #42 abort |
 | `MOE_EXPERT_CACHE_MIB` | unset = auto | `0` disables the MoE expert cache entirely (CPU expert path) |
-| `GGML_CUDA_SLAB` | **on** | `0` disables the movable-boundary slab allocator (back to per-allocation `cudaMalloc`; reintroduces the TODO #42 server abort) |
+| `GGML_CUDA_SLAB` | **on** | `0` disables the movable-boundary slab allocator (back to per-allocation `cudaMalloc`; reintroduces the TODO #42 server abort).  Since **r37** the slab is additionally **armed only for models with host-resident experts** (`-ncmoe`/`-cmoe` > 0); a dense model never creates one |
 | `GGML_CUDA_SLAB_HEADROOM_MIB` | `4096` | VRAM left outside the slab after it reclaims the unused reserve. **Raising it buys steady-state margin at the cost of arena**; `2048` aborts the 16k path inside hipBLASLt |
 | `GGML_CUDA_ALLREDUCE` | `hybrid` | force `internal` \| `nccl` \| `ce` for multi-GPU A/B |
 | `LLAMA_DROP_COMPUTE_BUFFERS` | **on for every tool** | `0` keeps the wide-prefill layout (smaller arena). Under the slab a later wide prefill reclaims it via a boundary move, so a server may drop too |
@@ -58,6 +58,9 @@ the slack up front moves the cost to before the arena is sized.
   ≈127 MiB per percentage point.
 * Only the RDNA/ROCm path opts in (`#if defined(GGML_USE_HIP)`); every other backend's allocation sizes
   are unchanged.  Read once per process.
+* **Unchanged in r37:** the margin still applies to dense models (about 10 % of a now-small layout).  Only
+  the **chunk** is slab-gated (`GGML_COMPUTE_BUFFER_CHUNK_MIB`); together with the r37 host-expert slab gate
+  this is what restores a dense model's pre-slab compute-buffer sizes (issue #120).
 * Compute-only: model weights, the KV cache and the arena are untouched.
 
 ### 1.2 MoE expert-cache arena
@@ -126,7 +129,7 @@ tensor address).  It replaces the per-allocation VMM pool (`GGML_CUDA_COMPUTE_VM
 | `GGML_CUDA_SLAB_MIN_ARENA_MIB` | `2048` | tuning | hard cache floor: the slab is created only if it fits `estimated work buffer + this`.  Otherwise it declines, logs an error and the cache STREAMS from the host (`MOE_EXPERT_CACHE_MIB=0` semantics). |
 | `GGML_CUDA_SLAB_HEADROOM_MIB` | `4096` (or `6144` under `-sm layer` with host experts, r36) | tuning | how much stays free outside the slab when `slab_extend` reclaims the reserve the model did not need.  **Not slack**: it must cover every allocation made after that point, including ones we cannot redirect (see below).  `0` disables the reclaim.  Since r36 the MoE cache asks for at least **6144** when every cache table is unsplit and the tables span more than one device (`ggml_cuda_slab_headroom_at_least_mib`); the 255k `-sm layer -ts 59,41` run OOMed at 4096 and passes at 6144.  An explicit value still wins. |
 | `GGML_CUDA_POOL_MIN_FREE_MIB` | `512` when the cache holds host-expert tables, else `0` | tuning / kill-switch | r36.  The workspace pool's **first** attempt refuses like a real OOM when it would leave less than this much VRAM free, so its existing flush + retry runs instead.  The retry has no floor, so it never aborts.  `0` disables the floor. |
-| `GGML_COMPUTE_BUFFER_CHUNK_MIB` | `256` | tuning | the compute buffer is allocated in whole chunks + one spare (`(ceil(need/C)+1)*C`), so growth inside the chunk is free.  `0` falls back to `GGML_COMPUTE_BUFFER_MARGIN_PCT`. |
+| `GGML_COMPUTE_BUFFER_CHUNK_MIB` | `256` | tuning | the compute buffer is allocated in whole chunks + one spare (`(ceil(need/C)+1)*C`), so growth inside the chunk is free.  `0` falls back to `GGML_COMPUTE_BUFFER_MARGIN_PCT`.  Since **r37** the chunk applies **only when the slab is in use**: a dense model (no slab) falls back to the percentage margin, which removes the +739 MiB of issue #120. |
 
 **Why the cards sit near-full.**  `GGML_CUDA_SLAB_HEADROOM_MIB` is what is free *at the moment the slab is
 extended*, and the steady state is that minus everything allocated afterwards — measured ~3.7 GiB of it: the

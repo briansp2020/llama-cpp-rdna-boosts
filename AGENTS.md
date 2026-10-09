@@ -200,6 +200,16 @@ go-ahead. Anything also applicable to unadulterated upstream gets a copy under `
   be freed while a kernel that carries its address in its launch parameters is in flight
   (`moe_cache_sync_devices_locked`). `GREEDY-PURITY.md`/`archive/work/moe-cache-autosize/ARENA-UB-TENSION.md`
   §13-§14.
+- **The movable-boundary slab is MoE-only and must stay that way (r37).** `ggml_cuda_slab_enabled()`
+  returns `env_on && g_slab_armed`; `g_slab_armed` is set **only** by the MoE preflight
+  (`ggml_backend_cuda_device_moe_cache_preflight`), which `llama_model_moe_cache_preflight` calls only for
+  models with a non-empty `model->moe_host_expert_bytes` (`-ncmoe`/`-cmoe` > 0).  The slab exists to let the
+  work region and the expert-cache arena coexist; with no arena it parks nearly all free VRAM in an unused
+  region (measured ~18 GiB/GPU on a dense 27B).  The **compute chunk** (`GGML_COMPUTE_BUFFER_CHUNK_MIB`) is
+  slab-motivated and is gated on the same condition.  Do **not** re-enable either for dense models; the
+  dense regression is issues #118 (slab before the weights OOMs a 48 GiB card under `--mmproj`) and #120
+  (the chunk cost a dense config +739 MiB and tipped it into shared memory).  The percentage margin
+  (`GGML_COMPUTE_BUFFER_MARGIN_PCT`) is deliberately *not* gated (kept for dense).
 - **The op-offload H2D staging ring (block 06, r12) has three invariants:** (1) prefill is never
   CUDA-graph captured, so a redirected split input that reaches a copy path aborts (tripwire asserts
   this); (2) the width gate is floored at **64 tokens**; (3) the arena lives **outside** the

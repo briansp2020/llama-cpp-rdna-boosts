@@ -1,4 +1,4 @@
-From d056b76704eddb75d9948f96684d84794bcf4a53 Mon Sep 17 00:00:00 2001
+From c2d20da474ccbb6b1698beb617530be01edf1362 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 09/15] rdna-boosts: block 09: meta-buffer compute-container
@@ -43,10 +43,10 @@ index 7c22446de..948165269 100644
  size_t ggml_cuda_slab_arena_unit  (int device);
  // Base of the work region for a `need`-byte compute buffer, moving the boundary up (evicting the arena
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 88c97a65d..66333c670 100644
+index 52dbed23f..262daaf80 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -678,13 +678,20 @@ static size_t ggml_cuda_slab_min_arena_bytes() {
+@@ -686,13 +686,20 @@ static size_t ggml_cuda_slab_min_arena_bytes() {
  // Session 5), which would allow this default to go back down.
  #define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 4096
  
@@ -97,5 +97,5 @@ index 3e0cdc090..be4af6d1a 100644
      // Fail-soft / --fit (§3.1 #5, issue #33): the arena is the LOWEST-priority VRAM consumer.  Size it
      // from what is actually free NOW - after --fit, the compute-graph reserve and the KV cache have all
 -- 
-2.55.0
+2.56.0
 

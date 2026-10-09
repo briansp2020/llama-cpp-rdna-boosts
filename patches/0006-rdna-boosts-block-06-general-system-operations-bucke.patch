@@ -1,4 +1,4 @@
-From 0a65f11ee26100c655f8daf687f7c31a7ac6f1da Mon Sep 17 00:00:00 2001
+From 1c57b588b09d8ba0f6f0d47ae402f0dfe83ff25e Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
@@ -70,7 +70,7 @@ longer reproduces (14/14 clean on r24).  Record: archive/work/host-pinned-buffer
  ggml/src/ggml-cuda/CMakeLists.txt             |    6 +
  ggml/src/ggml-cuda/common.cuh                 |   59 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   59 +
- ggml/src/ggml-cuda/ggml-cuda.cu               | 2167 ++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 2191 ++++++-
  ggml/src/ggml-cuda/moe-expert-cache.cu        | 5418 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  339 ++
  ...stance-ncols1_1-ncols2_16-dkq192-dv128.cu} |    1 -
@@ -243,7 +243,7 @@ longer reproduces (14/14 clean on r24).  Record: archive/work/host-pinned-buffer
  src/llama.cpp                                 |    2 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   60 +-
- 190 files changed, 11383 insertions(+), 306 deletions(-)
+ 190 files changed, 11407 insertions(+), 306 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm.h
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
@@ -3361,7 +3361,7 @@ index 000000000..7c22446de
 +void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size);
 +void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 4e97a5038..fef9a7941 100644
+index 4e97a5038..2d66f4427 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -26,15 +26,24 @@
@@ -3484,7 +3484,7 @@ index 4e97a5038..fef9a7941 100644
          info.devices[id].nsm        = prop.multiProcessorCount;
          info.devices[id].smpb       = prop.sharedMemPerBlock;
          info.devices[id].warp_size  = prop.warpSize;
-@@ -408,9 +488,663 @@ const ggml_cuda_device_info & ggml_cuda_info() {
+@@ -408,9 +488,673 @@ const ggml_cuda_device_info & ggml_cuda_info() {
      return info;
  }
  
@@ -3605,6 +3605,14 @@ index 4e97a5038..fef9a7941 100644
 +static std::mutex    g_slab_mutex;
 +static ggml_cuda_slab g_slabs[GGML_CUDA_MAX_DEVICES];
 +
++// The slab exists for ONE reason: to let a wide prefill's work region and the MoE expert-cache arena
++// coexist on a driver that will not coalesce.  With no arena to arbitrate (a dense model, or `-ncmoe 0`)
++// the movable boundary serves nothing and the slab only parks nearly all of the card's free VRAM in an
++// "arena" that will never hold a table.  It is therefore ARMED by the MoE preflight, which runs before the
++// context and only for models that actually have host-resident expert weights; the env var alone can no
++// longer switch it on for a dense model.  `GGML_CUDA_SLAB=0` still kills it outright.
++static bool g_slab_armed = false;
++
 +static size_t ggml_cuda_slab_chunk_bytes() {
 +    static size_t chunk_mib = SIZE_MAX;
 +    if (chunk_mib == SIZE_MAX) {
@@ -3723,7 +3731,9 @@ index 4e97a5038..fef9a7941 100644
 +        const char * env = getenv("GGML_CUDA_SLAB");
 +        enabled = env != NULL ? atoi(env) : 1;
 +    }
-+    return enabled != 0;
++    // Armed only for host-resident-expert models (see `g_slab_armed`): a dense model has no arena, so the
++    // slab would just withhold the free VRAM the model/KV/workspaces need.
++    return enabled != 0 && g_slab_armed;
 +#else
 +    return false;   // RDNA/ROCm-scoped
 +#endif
@@ -4148,7 +4158,7 @@ index 4e97a5038..fef9a7941 100644
  struct ggml_cuda_pool_leg : public ggml_cuda_pool {
      static const int MAX_BUFFERS = 256;
  
-@@ -487,7 +1221,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+@@ -487,7 +1231,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
          size_t look_ahead_size = (size_t) (1.05 * size);
          look_ahead_size = 256 * ((look_ahead_size + 255)/256);
          ggml_cuda_set_device(device);
@@ -4160,7 +4170,7 @@ index 4e97a5038..fef9a7941 100644
          if (err == cudaErrorMemoryAllocation) {
              (void)cudaGetLastError();
              const size_t cached_bytes = pool_size;
-@@ -698,6 +1435,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -698,6 +1445,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      std::unique_lock<std::mutex> lock(ggml_cuda_lock);
      ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
  
@@ -4169,7 +4179,7 @@ index 4e97a5038..fef9a7941 100644
      if (copy_event != nullptr) {
          CUDA_CHECK(cudaEventDestroy(copy_event));
      }
-@@ -722,6 +1461,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -722,6 +1471,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
  struct ggml_backend_cuda_buffer_context {
      int device;
      void * dev_ptr = nullptr;
@@ -4182,7 +4192,7 @@ index 4e97a5038..fef9a7941 100644
      std::string name;
  
      ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-@@ -730,6 +1475,12 @@ struct ggml_backend_cuda_buffer_context {
+@@ -730,6 +1485,12 @@ struct ggml_backend_cuda_buffer_context {
      }
  
      ~ggml_backend_cuda_buffer_context() {
@@ -4195,7 +4205,7 @@ index 4e97a5038..fef9a7941 100644
          CUDA_CHECK(cudaFree(dev_ptr));
      }
  };
-@@ -895,6 +1646,57 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -895,6 +1656,57 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -4253,7 +4263,7 @@ index 4e97a5038..fef9a7941 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -920,8 +1722,49 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
+@@ -920,8 +1732,56 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
      return size;
  }
  
@@ -4295,6 +4305,13 @@ index 4e97a5038..fef9a7941 100644
 +        const char * env = getenv("GGML_COMPUTE_BUFFER_CHUNK_MIB");
 +        chunk_mib = env != NULL ? (size_t) atoll(env) : 256;
 +    }
++    // Chunk-quantizing the compute buffer (`(ceil(need/C)+1)*C`) exists to keep the SLAB's work region in
++    // whole units, so it makes sense only when the slab is in use.  With no slab (a dense model) it just
++    // inflates small buffers -- a 178 MiB layout becomes 512 MiB -- so fall back to the percentage margin,
++    // which is the pre-slab behaviour.  This is what removes the dense +739 MiB of issue #120.
++    if (!ggml_cuda_slab_enabled()) {
++        return 0;
++    }
 +    return chunk_mib * 1024 * 1024;
 +#else
 +    return 0;
@@ -4305,7 +4322,7 @@ index 4e97a5038..fef9a7941 100644
      /* .alloc_buffer        = */ ggml_backend_cuda_buffer_type_alloc_buffer,
      /* .alloc_buffer_n      = */ NULL,
      /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
-@@ -929,6 +1772,9 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+@@ -929,6 +1789,9 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
      /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
      /* .get_alloc_size_n    = */ NULL,
      /* .is_host             = */ NULL,
@@ -4315,7 +4332,7 @@ index 4e97a5038..fef9a7941 100644
  };
  
  ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
-@@ -1304,23 +2150,41 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
+@@ -1304,23 +2167,41 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
      return buffer;
  }
  
@@ -4363,17 +4380,17 @@ index 4e97a5038..fef9a7941 100644
 +        };
 +        init[device] = true;
 +    }
-+
-+    return &bufts[device];
-+}
  
 -    return &ggml_backend_cuda_buffer_type_host;
++    return &bufts[device];
++}
++
 +ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 +    return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
  //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
-@@ -1967,6 +2831,72 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -1967,6 +2848,72 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      GGML_ASSERT(src1->type == GGML_TYPE_F32);
      GGML_ASSERT(dst->type  == GGML_TYPE_F32);
  
@@ -4446,7 +4463,7 @@ index 4e97a5038..fef9a7941 100644
      GGML_TENSOR_BINARY_OP_LOCALS
  
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -2613,6 +3543,27 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+@@ -2613,6 +3560,27 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
  #ifdef USE_CUDA_GRAPH
  static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
  
@@ -4474,7 +4491,7 @@ index 4e97a5038..fef9a7941 100644
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
-@@ -3500,15 +4451,418 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3500,15 +4468,418 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  }
  
  // try and fuse nodes and return the number of nodes to skip
@@ -4893,7 +4910,7 @@ index 4e97a5038..fef9a7941 100644
      if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
              ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {
          const int outputs[] = { i + 2, i + 5 };
-@@ -3528,20 +4882,287 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3528,20 +4899,287 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -5189,7 +5206,7 @@ index 4e97a5038..fef9a7941 100644
          ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
          const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
          if (nodes_to_skip > 0) {
-@@ -4053,13 +5674,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4053,13 +5691,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  break;
              }
  
@@ -5248,7 +5265,7 @@ index 4e97a5038..fef9a7941 100644
                  fused_mul_mat_vec = true;
                  fused_node_count  = 3;
                  break;
-@@ -4162,28 +5826,285 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4162,28 +5843,285 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -5541,7 +5558,7 @@ index 4e97a5038..fef9a7941 100644
                  continue;
              }
              bias_tensor = bias_node->src[1];
-@@ -5034,6 +6955,112 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5034,6 +6972,112 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -5654,7 +5671,7 @@ index 4e97a5038..fef9a7941 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -5050,7 +7077,19 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -5050,7 +7094,19 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -5674,7 +5691,7 @@ index 4e97a5038..fef9a7941 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -5321,8 +7360,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -5321,8 +7377,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -5685,7 +5702,7 @@ index 4e97a5038..fef9a7941 100644
  }
  
  // TODO: move these functions here
-@@ -5831,6 +7870,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -5831,6 +7887,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -5702,13 +5719,20 @@ index 4e97a5038..fef9a7941 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -5865,6 +7914,38 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -5865,6 +7931,45 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
 +static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes) {
 +    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
-+    return moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
++    const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
++    if (on) {
++        // This model HAS host-resident experts, so the work/arena split is meaningful -- arm the slab.
++        // Dense models never reach here (`llama_model_moe_cache_preflight` skips an empty host-expert map),
++        // which is what keeps the slab off them.  Runs before the context, so before any compute buffer.
++        g_slab_armed = true;
++    }
++    return on;
 +}
 +
 +static void ggml_backend_cuda_device_moe_cache_set_reserve(ggml_backend_dev_t dev, size_t bytes) {
@@ -5741,7 +5765,7 @@ index 4e97a5038..fef9a7941 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -5881,6 +7962,11 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -5881,6 +7986,11 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -5753,7 +5777,7 @@ index 4e97a5038..fef9a7941 100644
  };
  
  // backend reg
-@@ -6060,6 +8146,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -6060,6 +8170,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -14469,5 +14493,5 @@ index 8361e6ae6..97614b8ed 100644
                                              std::to_string(no_op_offload),
                                              std::to_string(no_host),
 -- 
-2.55.0
+2.56.0
 

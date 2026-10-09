@@ -80,7 +80,9 @@ sub-range `hipMemUnmap` limitation stops mattering).  It ends the TODO #42 serve
 drop is now default **on for every tool**, and `wide1 -> short -> wide2` at `-ub 8192` runs with **0 aborts**
 (server arena 15908.8 -> 38026.8 MiB, 67.0 % residency).  DoD `-ub 8192` cache-auto 16k: decode **74.2 t/s**
 / prefill **1712.9 t/s**, coherent; MTP `-n 3000 --reasoning on` acceptance **bit-identical to r21**
-(0.53519).  `GGML_CUDA_SLAB=0` is the kill switch; see `ENVIRONMENT.md` §1.3.
+(0.53519).  `GGML_CUDA_SLAB=0` is the kill switch; see `ENVIRONMENT.md` §1.3.  Since **r37** the slab (and the
+slab-motivated compute chunk) is **armed only for models with host-resident experts**; a dense model never
+creates one (issues #118/#120).
 
 The dated release history — every block amendment, issue fix and measurement, r1 through the
 current release — is in [`WORKLOG.md`](WORKLOG.md), newest first.  `release.json` is the single

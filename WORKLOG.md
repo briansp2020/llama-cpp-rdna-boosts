@@ -1,5 +1,65 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-09 (r37) -- issues #118/#120: the movable-boundary slab and the compute chunk are armed only for host-expert models
+
+**Release** `v16-a55e952b8-r37`, same fork point `a55e952b8`; canonical block-15 tip
+**`8d8a967fb`**, net tree **`322a77273531f88250ed01bc9ef6a64a74227028`** (strict **16/16** `git am`,
+`validate-set.sh` green).  Block count stays **16**: the fix amends **block 06** (the block that owns both
+the slab and the compute chunk); blocks 07-15 are rebased unchanged.
+
+### Why
+
+Two field reports, one root cause:
+
+* **#118** (dense Qwen3.8-27B Q8_0 + `--mmproj`, W7800 48 GiB, gfx1100): the slab was initialised when the
+  projector first touched the device, before the 26 GB weight buffer, and took 33 GiB, so the weight
+  `cudaMalloc` failed.  `GGML_CUDA_SLAB=0` was the workaround.
+* **#120** (dense Qwen3.8-27B UD-Q5_K_XL, `-np 2 --kv-unified`, ctx 180224, draft-mtp): the compute-buffer
+  chunk quantization (`(ceil(need/C)+1)*C`, `GGML_COMPUTE_BUFFER_CHUNK_MIB=256`) turned the small MTP/per-slot
+  buffers (298/244/244 MiB at r8) into 768/512/512 MiB, +739 MiB, tipping a full-VRAM configuration into
+  shared memory (decode 43 -> 17 t/s).  `GGML_COMPUTE_BUFFER_CHUNK_MIB=0` + `GGML_COMPUTE_BUFFER_MARGIN_PCT=0`
+  restored the r8 sizes.
+
+Both are the same bug: **the slab had no MoE gate.**  `ggml_cuda_slab_enabled()` was
+`env ? atoi(env) : 1` plus a VMM-capability check, so it was default-ON for every HIP model with no check
+for host-resident experts.  The slab exists only to let the work region and the MoE expert-cache arena
+coexist, so on a dense model it parks nearly all of the card's free VRAM in an arena nothing can use
+(measured: dense Qwen3.8-27B, 3x R9700, `-sm layer -c 4096` -- slab ~18 GiB/GPU mapped, ~8 GiB/GPU free,
+against ~26 GiB free with it off).  The chunk quantization is the same story one level down: it keeps the
+slab's work region in whole units, so with no slab it only inflates small buffers.
+
+### Change (block 06, `ggml-cuda.cu`; +26/-2)
+
+* a process-global `g_slab_armed` (default false).  `ggml_cuda_slab_enabled()` now returns
+  `env_on && g_slab_armed`, so the env var can no longer switch the slab on for a dense model (and
+  `GGML_CUDA_SLAB=0` still kills it outright).
+* the slab is **armed by the MoE preflight** (`ggml_backend_cuda_device_moe_cache_preflight`), which
+  `llama_model_moe_cache_preflight` calls only for models that actually have host-resident expert weights
+  (`model->moe_host_expert_bytes`).  It runs after the model load and before the context, so the slab is now
+  also born *after* the weights, which is the ordering #118 needs.
+* `get_compute_chunk_bytes` returns 0 unless the slab is enabled, so a dense model falls back to the
+  percentage margin (the pre-slab behaviour).
+
+`GGML_COMPUTE_BUFFER_MARGIN_PCT` is deliberately **left unchanged** (still 10 %, still HIP-only): its
+job is the same arena coexistence, but it predates the slab, is only ~10 % of a now-small layout, and was
+the validated r20 fix for the TODO #42 abort.  A dense model now pays at most that 10 % on the exact layout
+size; the chunk was the +739 MiB.  Gating it is a one-line follow-up if wanted.
+
+### Validation
+
+`validate-set.sh` green (fresh-tarball strict 16/16 apply, applied tree == `release.json`).
+
+* dense `Qwen3.5-4B-Q8_0` `-sm tensor` same-seed `1c5d32ac537d` (r36-identical);
+* prefill-logit KLD **0.000707** mean / **98.755 %** same-top-p PASS (unchanged from the recorded base);
+* dense Qwen3.8-27B `-c 4096`: no slab, ~26 GiB free/GPU, compute buffer **195.87 MiB** (was 512); the #120
+  reporter's config (`-c 180224 -np 2 --kv-unified -ctk/-ctv q8_0 --spec-type draft-mtp`): no slab, compute
+  buffer **953.84 MiB** (was 1280);
+* dense + `--mmproj`: no slab even with `GGML_CUDA_SLAB=1` forced (the #118 path);
+* MoE unchanged: `Qwen3.6-35B-A3B -ncmoe 99` under `-sm layer` and `-sm tensor` still arms the slab, chunks
+  the compute buffer and reports the same arena (`32640 MiB`, `h=1.0`);
+* GSQ IQ3_XXS `-ncmoe 48 -sm tensor`, 2 GPU, same-seed greedy: slab armed and `GGML_CUDA_SLAB=0` produce the
+  identical text sha `359ff4337837`.
+
 ## 2026-10-08 (r36) -- prefill work from three contributor PRs (#119, #121, #122) folded into blocks 06, 09, 15
 
 **Release** `v16-a55e952b8-r36`, same fork point `a55e952b8`; canonical block-15 tip **`8e28631f6`**,
