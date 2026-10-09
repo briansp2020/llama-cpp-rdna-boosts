@@ -163,22 +163,20 @@ paths bit-identical.  Either must be gated on the batch-width matrix and the pre
 
 ## Reproducers
 
-Field (the r39 field harness; `/tmp` is transient, re-create from the campaign records if lost):
+Field: the harness is committed under [`tools/`](tools/README.md) (so it survives `/tmp` being cleared) —
+`field.sh` (the r38 §5.5 arm, forces the deterministic `GGML_CUDA_ALLREDUCE=ce`), `field3.sh` (same, no
+forced AR = the 3-GPU production default) and `field_nospec.sh` (plain, no MTP = `#51`'s control).  All three
+take `M` / `D` / `PROMPT` / `GPUS` from the environment:
 
 ```bash
-cd /tmp/srr
-# field.sh     = the r38 §5.5 arm (forces GGML_CUDA_ALLREDUCE=ce)
-# field3.sh    = same, without the forced AR (the 3-GPU production default)
-# field_nospec.sh = field3.sh with --spec-type none and no --spec-draft-model
-#
-# The harness hardcodes the target in `M=`.  For this campaign point it at the GSQ set and keep the
-# shared MTP draft in `D=`:
-#   M=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
-#   D=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
-# (make a field_gsq.sh variant rather than editing field.sh, so the IQ4_NL cross-check stays reproducible)
-PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1,2         ./field_gsq.sh     ~/llama.cpp/build-rocm-hybrid t3  run30kfit
-PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1,2         ./field_nospec_gsq.sh ~/llama.cpp/build-rocm-hybrid t3n run30kfit
-PROMPT=/tmp/srr/mixed30k.txt GPUS=0,1           ./field_gsq.sh     ~/llama.cpp/build-rocm-hybrid t2  run30kfit
+cd wip/moe-verify-fusions/tools
+export M=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+export D=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
+export PROMPT=/tmp/srr/mixed30k.txt
+# (re)create the prompt: cat README.md ENVIRONMENT.md CONTAINERS.md archive/docs/baseline-history.md > $PROMPT
+PROMPT=$PROMPT GPUS=0,1,2 ./field3.sh      ~/llama.cpp/build-rocm-hybrid t3  run30kfit   # MTP
+PROMPT=$PROMPT GPUS=0,1,2 ./field_nospec.sh ~/llama.cpp/build-rocm-hybrid t3n run30kfit  # plain control
+PROMPT=$PROMPT GPUS=0,1   ./field3.sh      ~/llama.cpp/build-rocm-hybrid t2  run30kfit   # 2-GPU reference
 ```
 
 **Warm up before recording any number.**  The GSQ set should be warm from the previous run; the *first* run
