@@ -1291,3 +1291,105 @@ drop/rearm device iteration, which silently skipped device 1 under `-sm tensor`.
 [`host-expert-per-device-accounting.patch`](host-expert-per-device-accounting.patch); combined
 current-state patch [`fit-slab-r37-all-wip.patch`](fit-slab-r37-all-wip.patch) (revival + G7 + Phase 1
 re-cut + loader fix; sha256 `14c2ccbd5215fff295e980962282b0bd7cac657a51547e8e0ca2703d27b28604`).
+
+---
+
+## 15. Next session — ordered plan to release
+
+**State at handover (2026-10-09, ~40 % context).**  `~/llama.cpp` is the r37 tree
+`322a77273531f88250ed01bc9ef6a64a74227028` with the working tree = revival + G7 + Phase 1 re-cut +
+loader fix, all uncommitted; the single artifact that reproduces it is
+[`fit-slab-r37-all-wip.patch`](fit-slab-r37-all-wip.patch) (sha256 `14c2ccbd...`, applies to a clean r37
+checkout).  Build: `cd ~/llama.cpp && cmake --build build-rocm-hybrid --target llama-cli llama-server -j 16`
+(`EXTRA_CMAKE_FLAGS`/runtime libs per AGENTS.md).  `patches/` is untouched; the delivery WIP is pushed
+(`origin main`).
+
+### 15.1 FIRST — settle the purity/determinism question (§12.7 item 2)
+
+This can invalidate a whole matrix run, so do it before §15.3.
+
+**Observed:** two identical `--fit on` `-sm tensor` auto-floor runs (same config, same targets/arena)
+produced **different** greedy text:
+
+```sh
+cd ~/llama.cpp && export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx120X/lib:$LD_LIBRARY_PATH
+export HIP_VISIBLE_DEVICES=0,1
+MOE_EXPERT_CACHE_MIB= /tmp/...  # default auto floor
+timeout 1800 ./build-rocm-hybrid/bin/llama-cli -v \
+  -m /llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
+  -sm tensor -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0 -t 8 -c 8192 -b 2048 -ub 2048 \
+  --spec-type none --seed 42 --temp 0 \
+  -f prompts/prose-rdna-boosts.txt -n 48 --ignore-eos --no-display-prompt --single-turn 2>&1 \
+  | scripts/extract-generated.py /dev/stdin
+```
+
+Run 1/2 shas `d1423c1131b1` / `fbfda32ac740` (both coherent, 0 `////`).
+
+**What to establish:** is the difference (a) a pre-existing `-sm tensor`/slab restart sensitivity (the
+Phase 1 `PHASE1-ATTEMPT.md` already flags `--fit on` as restart-sensitive), (b) cache-on vs cache-off
+purity (the same §12.7 item 2 question), or (c) a regression from the revival/G7/loader changes?
+
+Suggested method:
+1. Repeat the run 4-5x and hash the text; also run the G7 1-GPU repro (`-sm layer`) 3x — that one was
+   identical (0.91667) across runs, so the nondeterminism may be `-sm tensor`/cache-specific.
+2. A/B the suspected WIP pieces against stock r37 on the same config: `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`
+   (G4), `GGML_CUDA_SLAB_RESERVE_MIB` (G3), and `MOE_EXPERT_CACHE_MIB=0`.  Compare `extract-generated.py`
+   shas AND the prefill-logit KLD (a uniform prefill shift would explain different greedy text while both
+   remain "coherent").
+3. Run `scripts/gate-prefill-logits.sh --ab "<suspect>=0"` on any arm that moves the sha; a KLD inside
+   0.005 with the text differing points at decode/allocator nondeterminism, not prefill.
+4. Cache cold-path suspects: the UVA/cold admission (`g_cold_uva`), the deferred promotion pipelining
+   (one-token lag), and the post-prefill drop/rearm (`llama-context.cpp` 1700-1790) all depend on timing.
+
+**Acceptance:** either same-seed text is byte-identical across restarts (then record it), or the source
+is shown pre-existing and benign (documented trade-off).  Do **not** start §15.3 until this is answered.
+
+### 15.2 Document the G4 env var (fast, no GPU)
+
+`ENVIRONMENT.md` is missing `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` (the revival's §12.3 cap, default 50,
+`0` = old unbounded behaviour).  Add it to the cache/slab section with: default, kill-switch semantics,
+that it is inert unless the slab is active, and that `GGML_SCHED_STAGE_MAX_MB` remains the hard ring
+override.  (AGENTS.md requires every added/repointed variable to be documented before promotion.)
+
+### 15.3 The full §5.1-§5.7 matrix (the release gate)
+
+Run **§5.1-§5.7** as written (README §5).  Practical notes from this session:
+
+* The matrix `--fit on` arms need `-ngl` **unset** (the fit aborts on a user-set `-ngl`); use
+  2 GPU `HIP_VISIBLE_DEVICES=0,1`, `Qwen3.8-Flash-Next UD-IQ4_XS` (or IQ3_XXS) + the shared `Q8_0`
+  MTP head, `-c 8192` (or `32768` for the larger arms), `-t 8`.
+* Assert per arm: exit 0, `////` = 0, no `hipModuleLoad failed` / `hipblaslt.cpp:164`, no
+  `alias_find_checked: ignoring a stale`, no `moe_cache_evict_slab_range`/`rearm` thrash, and for an
+  explicit MIB the arena is **95-100 %** of it.
+* §5.6 (G3 transitions) and §5.7 (staging A/B) are the long poles; §5.7 also needs `fingon`.
+* Add a **3-GPU** `-sm tensor` arm for the new per-device accounting (verified on 2 GPU only so far).
+* Keep every run's log; record the shas/arenas in this README and a new `WORKLOG.md` entry.
+
+### 15.4 `fingon` (gfx1100) validation
+
+Per README §11: issue #117's staging A/B, the `qwen35moe` models (qwen4exp does not fit), `-lm dio`/`none`
+with a primed arena, plus the G4 cap at default vs `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT=0`.  This gates
+the G4 default flip (§12.7 item 4 / §8 #6).
+
+### 15.5 Decide remaining §8 questions
+
+* #2 `MOE_EXPERT_CACHE_MIN_RES_PCT` floor vs target (Phase 3).  #3 `--fit-target` 1 GiB vs the 4 GiB
+  headroom.  #4 the G3 reserve source (getter/setter vs post-slab need).  #5 G4 scope (cap-only vs
+  `--fit`-sized).  — Decide or explicitly defer each in the WORKLOG.
+
+### 15.6 Promotion (only after §15.1-§15.5 are green)
+
+1. Split `fit-slab-r37-all-wip.patch` into its delivery blocks: G7 -> **block 06** (scheduler half of the
+   cache); the loader accounting + `common/fit.cpp` G1/G2 -> block 06 (loader) and a fit-side block
+   (currently the fit floor lives in the same block-06 lineage — confirm `patches/README.md`).
+2. Re-cut on a clean r37 fork via `scripts/apply-all.sh`, `scripts/make-patches.sh`, `scripts/make-release.sh`
+   (never hand-edit hashes); `validate-set.sh` must be green and the tree must equal `release.json`.
+3. Refresh the headers (`patches/README.md`, `README.md`, `MANIFESTS.md`/`BASELINE.md` top, `WORKLOG.md`),
+   add `TODO.md` closures (#47/#48), and re-run the standing gates on the final tree.
+4. **Release-time only:** force-push the personal fork's `rdna-boosts` branch from the `.base` commit
+   (`apply-all.sh` + build + coherence/MTP/prefill gates), per the AGENTS.md Pushing policy.  Never push
+   `ggml-org/llama.cpp`.
+
+**Owner handover:** start here, §15.1 -> §15.6 in order.  Evidence for everything above is in
+§12.9 / §13.6 / §14.4, the `g7-multi-consumer-fill.patch`, `host-expert-per-device-accounting.patch`,
+`phase1-r37-g2-getter.patch` and the combined patch.

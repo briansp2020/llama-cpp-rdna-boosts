@@ -74,7 +74,8 @@ loader now distributes each `exps` tensor across the layer Meta device's simple 
 the MIB is a **cap** (built arena must be 95-100 % of it), **G2 gate = b1**, and the **full §5.1-§5.7
 matrix must pass before release** (no-abort MIB sweep, dense golden `1c5d32ac537d`, `GGML_CUDA_SLAB=0`
 zeroes G2 are green).  Record + arms: `wip/fit-slab-accounting/README.md` §14.4; combined current-state
-patch `fit-slab-r37-all-wip.patch`.
+patch `fit-slab-r37-all-wip.patch`.  **Ordered release plan: README §15** (purity/determinism first, then
+`ENVIRONMENT.md`, the full §5.1-§5.7 matrix, `fingon`, and promotion).
 
 *(Phase 1 history, kept for context.)*
 
