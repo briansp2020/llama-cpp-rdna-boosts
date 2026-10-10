@@ -1,0 +1,358 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index b2944bb85..28a36f131 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1756,9 +1756,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.n_ctx             = params.n_ctx;
+     cparams.n_seq_max         = params.n_parallel;
+     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
++    // TEMP diagnostic (wip/moe-verify-fusions): force the recurrent snapshot count to isolate the
++    // plain (n_rs_seq=0) vs MTP (n_rs_seq=n_max) prefill-path difference.
++    if (const char * e = getenv("GGML_FORCE_N_RS_SEQ")) {
++        cparams.n_rs_seq = (uint32_t) atoi(e);
++    }
+     // the longest draft any enabled speculator can produce plus the sampled token; a speculative
+     // verify batch with more tokens than this cannot be rolled back into
+     cparams.n_rs_batch        = std::max(1, common_speculative_n_max(&params.speculative) + 1);
++    if (getenv("GGML_FORCE_N_RS_SEQ")) {
++        cparams.n_rs_batch = std::max<uint32_t>(1, cparams.n_rs_seq + 1);
++    }
+     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+     cparams.n_batch           = params.n_batch;
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 163a8bb11..8dfe77e2c 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -73,6 +73,11 @@ extern "C" {
+     // place the staging ring above it.  No-op for a backend without a slab.
+     GGML_API void                  ggml_backend_dev_slab_narrow_floor(ggml_backend_dev_t dev, size_t bytes);
+ 
++    // wip/moe-verify-fusions: enable/disable routing this context's COMPUTE buffers through the
++    // movable-boundary slab.  Disabled for the MTP draft context so its compute buffer cannot alias the
++    // target's narrow verify buffer at slab base 0.  No-op for a backend without a slab.
++    GGML_API void                  ggml_backend_dev_slab_compute_enable(ggml_backend_dev_t dev, bool enable);
++
+     // OPEN 2 (TODO #42): the size of the device's movable-boundary slab WORK region, or 0 when it has no
+     // slab.  `llama_context` uses it to right-size the compute reserve to the observed workload.
+     GGML_API size_t                ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev);
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index f2b8582f5..d250f6dd4 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -393,6 +393,13 @@ extern "C" {
+         // (optional) wip/slab-ring-region: pin the always-resident narrow (decode/verify) work size, so
+         // the allocator can place the staging ring above it.  Appended like the fields above.
+         void (*slab_narrow_floor)(ggml_backend_dev_t dev, size_t bytes);
++
++        // (optional) wip/moe-verify-fusions: route (or not) this context's COMPUTE buffers through the
++        // movable-boundary slab.  The MTP draft context's compute buffer must stay OUT of the slab: the
++        // slab hands a single narrow base to every narrow view, so the draft's buffer would alias the
++        // target's verify buffer at base 0 (measured: plain != MTP, near-tie flip at decode token 69).
++        // Appended like the fields above, so every backend that does not set it is zero-initialized.
++        void (*slab_compute_enable)(ggml_backend_dev_t dev, bool enable);
+     };
+ 
+     struct ggml_backend_device {
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 4b2298341..5346706eb 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -203,6 +203,14 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
+     return true;
+ }
+ 
++static void ggml_backend_meta_device_slab_compute_enable(ggml_backend_dev_t dev, bool enable) {
++    // forward to the simple devices: the meta device owns no slab of its own
++    ggml_backend_meta_device_context * ctx = (ggml_backend_meta_device_context *) dev->context;
++    for (ggml_backend_dev_t d : ctx->simple_devs) {
++        ggml_backend_dev_slab_compute_enable(d, enable);
++    }
++}
++
+ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .get_name             = */ ggml_backend_meta_device_get_name,
+     /* .get_description      = */ ggml_backend_meta_device_get_description,
+@@ -227,6 +235,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .slab_headroom_bytes  = */ nullptr,
+     /* .slab_ring_set        = */ nullptr,
+     /* .slab_narrow_floor    = */ nullptr,
++    /* .slab_compute_enable  = */ ggml_backend_meta_device_slab_compute_enable,
+ };
+ 
+ bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 5d3103b43..2b0a5dde4 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -314,6 +314,15 @@ void ggml_backend_dev_slab_narrow_floor(ggml_backend_dev_t dev, size_t bytes) {
+     dev->iface.slab_narrow_floor(dev, bytes);
+ }
+ 
++void ggml_backend_dev_slab_compute_enable(ggml_backend_dev_t dev, bool enable) {
++    // wip/moe-verify-fusions: route (or not) this context's COMPUTE buffers through the slab.  Optional
++    // hook; a backend without a slab (or that never set it) is a no-op.
++    if (dev == nullptr || dev->iface.slab_compute_enable == nullptr) {
++        return;
++    }
++    dev->iface.slab_compute_enable(dev, enable);
++}
++
+ size_t ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev) {
+     // OPEN 2 (TODO #42): 0 when this backend has no movable-boundary slab (or never set the hook), which is
+     // how the caller tells "no slab to reclaim the wide layout with" from "slab, and it is this wide".
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 445c5a198..b0cf775d4 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -634,6 +634,11 @@ static ggml_cuda_slab g_slabs[GGML_CUDA_MAX_DEVICES];
+ // longer switch it on for a dense model.  `GGML_CUDA_SLAB=0` still kills it outright.
+ static bool g_slab_armed = false;
+ 
++// wip/moe-verify-fusions: when false, COMPUTE buffers bypass the slab (raw cudaMalloc from the slab
++// reserve).  Set for the MTP draft context so its compute buffer cannot alias the target's narrow verify
++// buffer at slab base 0 (the slab hands a single narrow base to every narrow view).
++static bool g_slab_compute_enabled = true;
++
+ // wip/slab-ring-region: the H2D staging-ring hole the slab must carve (0 = the ring stays a cudaMalloc
+ // outside the slab).  Set once by the model preflight, before the slab is created, from the largest
+ // host-resident weight table (so the per-slot capacity covers every upload the ring will see).
+@@ -1148,6 +1153,12 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+         // the multiset stores that directly and a view placed before the narrow floor existed cannot
+         // inflate the floor after the fact.
+         ret_off = narrow ? 0 : wide_off;
++        // TEMP diagnostic (wip/moe-verify-fusions): show the base offset each compute buffer gets.
++        if (getenv("GGML_CUDA_WORK_ALLOC_DEBUG")) {
++            GGML_LOG_WARN("WORK_ALLOC dev=%d need=%.1f MiB narrow=%d ret_off=%.1f MiB narrow_floor=%.1f ring=%.1f boundary=%.1f\n",
++                device, (double) need/1048576.0, (int) narrow, (double) ret_off/1048576.0,
++                (double) s.narrow_floor/1048576.0, (double) s.ring_region/1048576.0, (double) s.boundary/1048576.0);
++        }
+         const size_t contrib = ret_off + ggml_cuda_slab_up(need, s.chunk);
+         size_t floor = s.narrow_floor;
+         if (!s.work_needs.empty()) {
+@@ -1931,13 +1942,18 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_usage(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage) {
+     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
+ 
++    if (usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE && getenv("GGML_CUDA_WORK_ALLOC_DEBUG")) {
++        GGML_LOG_WARN("COMPUTE_ALLOC %.1f MiB dev=%d slab_on=%d flag=%d\n", (double) size/1048576.0,
++                      buft_ctx->device, (int) ggml_cuda_slab_enabled(), (int) g_slab_compute_enabled);
++    }
++
+     if (usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+         // OPEN 2: the movable-boundary slab.  The compute buffer is a VIEW of the slab's work region: its
+         // base is the slab base (so a growing layout keeps its tensor addresses) and its REPORTED size is
+         // the boundary (so growth inside the region does not look like a realloc to the graph allocator).
+         // Growing past the boundary moves the split -- evicting the arena tables in the taken chunks -- and
+         // HIP is NOT called at runtime.
+-        if (ggml_cuda_slab_enabled()) {
++        if (ggml_cuda_slab_enabled() && g_slab_compute_enabled) {
+             ggml_cuda_set_device(buft_ctx->device);
+             void * dev_ptr = ggml_cuda_slab_work_alloc(buft_ctx->device, size);
+             if (dev_ptr != NULL) {
+@@ -5813,6 +5829,19 @@ static bool ggml_cuda_cache_blocks_fusion(const ggml_cgraph * cgraph, int i) {
+     if (!moe_cache_enabled()) {
+         return false;
+     }
++    // TEMP diagnostic (wip/moe-verify-fusions #50): log on every change of the partial-cache state.
++    {
++        static const bool dbg = getenv("GGML_CUDA_CACHE_GUARD_DEBUG") != nullptr;
++        if (dbg) {
++            int nt = 0, nd = 0;
++            moe_cache_guard_stats(&nt, &nd);
++            static int last_nt = -2, last_nd = -2;
++            if (nt != last_nt || nd != last_nd) {
++                GGML_LOG_WARN("CACHE_GUARD tables=%d down=%d has_arena=%d\n", nt, nd, (int) moe_cache_has_arena());
++                last_nt = nt; last_nd = nd;
++            }
++        }
++    }
+     const ggml_tensor * node = cgraph->nodes[i];
+ 
+     // gate+up+GLU, the routed pair, and the qwen4exp weighted-down all start at the routed
+@@ -5875,6 +5904,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     if (disable_fusion) {
+         return 0;
+     }
++    // TEMP diagnostic (wip/moe-verify-fusions): disable fusions for PREFILL (wide) graphs only, keeping
++    // the cache-band decode/verify fusions.  Tests the "prefill fusions poison the MTP verify" hypothesis.
++    {
++        static const bool prefill_fusion_off = getenv("GGML_CUDA_PREFILL_FUSION_OFF") != nullptr;
++        if (prefill_fusion_off && ggml_cuda_graph_n_tokens(cgraph) > MMVQ_MAX_BATCH_SIZE) {
++            return 0;
++        }
++    }
+     if (ggml_cuda_cache_blocks_fusion(cgraph, i)) {
+         return 0;
+     }
+@@ -8875,6 +8912,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     }
+ 
+     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
++    // TEMP diagnostic (wip/moe-verify-fusions): skip ONLY the alloc-deps pass / shared-expert rotate,
++    // leaving every fusion kernel enabled, to separate the DISABLE_FUSION confound.
++    static const bool skip_alloc_deps = getenv("GGML_CUDA_SKIP_ALLOC_DEPS") != nullptr;
+ 
+     auto add_alloc_deps = [&](size_t start, size_t last_node) {
+ 
+@@ -8889,7 +8929,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         }
+     };
+ 
+-    if (!disable_fusion) {
++    if (!disable_fusion && !skip_alloc_deps) {
+         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
+         // TODO: consolidate fusion paths in graph_optimize and graph_compute
+         ggml_cuda_set_device(cuda_ctx->device);
+@@ -10443,6 +10483,12 @@ static void ggml_backend_cuda_device_slab_narrow_floor(ggml_backend_dev_t dev, s
+     ggml_cuda_slab_set_narrow_floor(ctx->device, bytes);
+ }
+ 
++static void ggml_backend_cuda_device_slab_compute_enable(ggml_backend_dev_t dev, bool enable) {
++    // wip/moe-verify-fusions: the MTP draft context keeps its COMPUTE buffers out of the slab.
++    GGML_UNUSED(dev);
++    g_slab_compute_enabled = enable;
++}
++
+ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .get_name                = */ ggml_backend_cuda_device_get_name,
+     /* .get_description         = */ ggml_backend_cuda_device_get_description,
+@@ -10467,6 +10513,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .slab_headroom_bytes     = */ ggml_backend_cuda_device_slab_headroom_bytes,
+     /* .slab_ring_set           = */ ggml_backend_cuda_device_slab_ring_set,
+     /* .slab_narrow_floor       = */ ggml_backend_cuda_device_slab_narrow_floor,
++    /* .slab_compute_enable     = */ ggml_backend_cuda_device_slab_compute_enable,
+ };
+ 
+ // backend reg
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 0348afdea..95b071f70 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -3579,6 +3579,22 @@ bool moe_cache_has_arena() {
+     return moe_cache_has_arena_locked();
+ }
+ 
++// TEMP diagnostic (wip/moe-verify-fusions #50).
++void moe_cache_guard_stats(int * n_tables, int * n_down) {
++    int nt = 0, nd = 0;
++    if (g_enabled) {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        for (const table_t & t : g_tables) {
++            nt++;
++            if (t.arena == nullptr || t.slots <= 0) {
++                nd++;
++            }
++        }
++    }
++    if (n_tables) *n_tables = nt;
++    if (n_down)   *n_down   = nd;
++}
++
+ // wip/slab-ring-region: has the deferred arena sizing run?  The slab's H2D-ring hole must stay ARMED
+ // through sizing (so the auto-sized arena never allocates its highest tables into the hole); a disarm
+ // before that makes the next arm evict those hot tables, and the cold re-arm corrupts a wide consumer.
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 6907a4351..1d2ea09aa 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -59,6 +59,11 @@ struct ggml_tensor;
+ // source: the scheduler asks the backend through the `moe_cache_band` iface hook.
+ int moe_cache_max_tok_dev(int device);
+ int moe_cache_max_tok();   // the current device's band
++
++// TEMP diagnostic (wip/moe-verify-fusions #50): how many registered tables exist and how many have a
++// usable arena.  `down > 0` is a PARTIAL cache (the global fusion guard stands all cache-aware fusions
++// down for the whole graph).
++void moe_cache_guard_stats(int * n_tables, int * n_down);
+ #define MOE_EXPERT_CACHE_MAX_TOK (moe_cache_max_tok())
+ 
+ struct moe_cache_alias {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 141622abd..735d8cb97 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1889,7 +1889,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
+-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
++        // wip/moe-verify-fusions: the draft context keeps its compute buffers out of the slab here too
++        // (the reserve-time toggle in `graph_reserve` does not cover the first `alloc_graph`).
++        const bool is_draft = cparams.ctx_other != nullptr;
++        if (is_draft) {
++            for (const auto & d : model.devices) {
++                ggml_backend_dev_slab_compute_enable(d.dev, false);
++            }
++        }
++        const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
++        if (is_draft) {
++            for (const auto & d : model.devices) {
++                ggml_backend_dev_slab_compute_enable(d.dev, true);
++            }
++        }
++        if (!alloc_ok) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+@@ -3154,10 +3168,32 @@ ggml_cgraph * llama_context::graph_reserve(
+         } else {
+             ggml_backend_sched_split_graph(sched.get(), gf);
+         }
+-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+-        GGML_ASSERT(!sizes);
+-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+-        return nullptr;
++    } else {
++        // wip/moe-verify-fusions: the MTP draft context (identified by `ctx_other`, set for every
++        // speculative draft context) must NOT take its COMPUTE buffer from the movable-boundary slab.
++        // The slab hands a single narrow base to every narrow view, so the draft's buffer would alias the
++        // target's narrow verify buffer at base 0 (the MTP-vs-plain near-tie drift).  Allocate it as a
++        // normal cudaMalloc; the slab reserve already holds the VRAM for it (g_slab_aux_reserve_bytes).
++        const bool is_draft = cparams.ctx_other != nullptr;
++        if (getenv("GGML_CUDA_WORK_ALLOC_DEBUG")) {
++            LLAMA_LOG_WARN("GRAPH_RESERVE ctx=%p is_draft=%d n_tokens=%u\n", (void *) this, (int) is_draft, n_tokens);
++        }
++        if (is_draft) {
++            for (const auto & d : model.devices) {
++                ggml_backend_dev_slab_compute_enable(d.dev, false);
++            }
++        }
++        const bool reserved = ggml_backend_sched_reserve(sched.get(), gf);
++        if (is_draft) {
++            for (const auto & d : model.devices) {
++                ggml_backend_dev_slab_compute_enable(d.dev, true);
++            }
++        }
++        if (!reserved) {
++            GGML_ASSERT(!sizes);
++            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
++            return nullptr;
++        }
+     }
+ 
+     return gf;
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index e7f7e663e..d8256e42d 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1469,6 +1469,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
+             moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), buft, buft_list_layer);
+         }
++        if (tn.str().find("exps") != std::string::npos && tn.bid >= 48) {
++            LLAMA_LOG_WARN("NEXTN_EXPS %s host=%d buft=%s\n", tn.str().c_str(), (int) ggml_backend_buft_is_host(buft), ggml_backend_buft_name(buft));
++        }
+         ggml_context * ctx = ctx_for_buft(buft);
+         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+         ggml_set_name(ret, tn.str().c_str());
+@@ -1511,6 +1514,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
+         moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), buft, buft_list_layer);
+     }
++    if (tn.str().find("exps") != std::string::npos && tn.bid >= 48) {
++        LLAMA_LOG_WARN("NEXTN_EXPS %s host=%d buft=%s\n", tn.str().c_str(), (int) ggml_backend_buft_is_host(buft), ggml_backend_buft_name(buft));
++    }
+ 
+     ggml_context * ctx = ctx_for_buft(buft);
+ 

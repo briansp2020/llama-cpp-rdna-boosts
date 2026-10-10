@@ -3,6 +3,24 @@
 **Status: OPEN (opened 2026-10-10).**  Not part of the delivery; nothing here may be applied to the fork
 without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md`).
 
+> **PREP READY — next session implements the slab-resident narrow-2 layout.**
+> **2026-10-11 session result:** the cache-band routed-MMVQ path's problem was located: `ggml_cuda_slab_work_alloc`
+> hands a single NARROW base to **every** narrow compute view, and with MTP there are **two** live compute
+> buffers (the target's verify view *and* the draft context's), so they aliased at slab base 0.  A quick fix
+> (allocate the draft's COMPUTE buffers with `cudaMalloc` instead — upstream-shaped, via a new optional
+> `slab_compute_enable` hook keyed off `cparams.ctx_other`) is implemented and measured on GSQ 2-GPU:
+> **MTP acceptance 0.693 -> 0.738, decode 43.1 -> 53.5 t/s (~16 % lower verify step)**.  The maintainer wants
+> the durable form instead — a second static narrow region **inside the slab**, end-pinned
+> `| narrow-1 | ring | wide | arena (top-down) | narrow-2 |` — so the allocator stays all-in-the-slab (no
+> fragmentation).  That implementation + validation is the handover:
+> [`HANDOVER-slab-narrow2.md`](HANDOVER-slab-narrow2.md) (read it first; it is self-contained).  The quick fix
+> and the session diagnostics are saved as `session-quickfix-and-diagnostics.diff` beside this file.
+>
+> **The plain-vs-MTP verify-width divergence is a SECOND, independent defect** (it survives the aliasing fix;
+> it is not CPU, not the partial cache, not fusions, not `n_rs_seq`, not the MMVQ bands, not GDN/FA).  It is
+> the follow-on item *after* the slab-resident layout is in and validated — see the handover §5.  Recommend
+> classifying GSQ against the IQ4_NL purity model (`b00fdf534227`) before any kernel work.
+
 ## Directives (maintainer, 2026-10-10 — binding for this campaign)
 
 ### D1 — Purity and the fused paths come first; never disable a fusion as the *fix*
