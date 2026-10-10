@@ -76,15 +76,21 @@ the slack up front moves the cost to before the arena is sized.
 | `MOE_EXPERT_CACHE_PERIOD` | `32` | tuning | promotion/rebalance period, in tokens. |
 | `MOE_EXPERT_CACHE_FILL` | `1` | kill-switch | fill-on-miss. |
 | `MOE_EXPERT_CACHE_TOUCH` | `2` | tuning | `admit=touch`: uses since last resident before a fill is allowed. |
-| `MOE_EXPERT_CACHE_DEVMAP` | `1` | kill-switch | device-side remap (builds the slot remap on the device). |
-| `MOE_EXPERT_CACHE_DEVPOLICY` | `1` | kill-switch | device-side admission policy. |
-| `MOE_EXPERT_CACHE_DEVPOLICY_SPLIT` | unset | tuning | split-policy variant. |
-| `MOE_EXPERT_CACHE_KSLOT` | `1` | kill-switch | resolve the slot map in the MoE ids consumer instead of a materialized remap buffer. |
 | `MOE_EXPERT_CACHE_PROVISIONAL` | `1` | kill-switch | provisional eviction during a pass. |
 | `MOE_EXPERT_CACHE_PREFILL_SEED` | `1` | kill-switch | seed the cache during prefill. |
 | `MOE_EXPERT_CACHE_PREFILL_SEED_N` | `0` | tuning | how many prefill seeds (0 = default). |
 | `GGML_MOE_CACHE_MAX_TOK` | device MMVQ band (16 on RDNA4; 8 on RDNA3, NVIDIA) | kill-switch | caps the expert-cache **decode/verify band** (routed `MUL_MAT_ID` tokens the cache serves from the arena).  It defaults to the routed-expert MMVQ kernel's own band on the device since r31; `8` restores the pre-r31 band (band widening in `archive/work/moe-cache-band16/`).  A non-numeric value silently yields 1. |
 | `GGML_MOE_GATHER_ONCE` | off | diagnostic | gather each expert once per pass. |
+
+> **REMOVED — do not reintroduce (2026-10-10).**  The device-remap path and its whole family
+> (`MOE_EXPERT_CACHE_DEVMAP`, `MOE_EXPERT_CACHE_DEVPOLICY`, `MOE_EXPERT_CACHE_DEVPOLICY_SPLIT`,
+> `MOE_EXPERT_CACHE_KSLOT`, `MOE_EXPERT_CACHE_DEV_EAGER`) were **deleted from the code base**.  The eager
+> host-routing path (materialized remap) is the only `-sm tensor` split policy; it is MTP-pure on qwen4exp
+> (`none == n3`), within noise of the old `DEVMAP=0` performance, and resolves `TODO.md` #50.  The device
+> path's divergence was a layout-sensitive **hipBLASLt** solution flip (issue #67), not a cache bug; the
+> only workaround (`ROCBLAS_USE_HIPBLASLT=0`) costs ~12-17 % prefill on gfx1201/ROCm 7.14, and ROCm 10.1.0
+> does not fix it.  See `wip/moe-verify-fusions/FINDINGS-devmap-removal.md`.  Do **not** add any
+> `*DEVMAP*`/`*KSLOT*`/`*DEVPOLICY*` variable or device slot-map path back. |
 
 > The arena is the **lowest-priority** VRAM consumer: without a slab, any device allocation that runs short
 > frees the largest table (then the whole arena) and retries.  With the slab on (the default, see §1.3) that

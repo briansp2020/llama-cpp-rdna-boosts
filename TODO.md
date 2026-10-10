@@ -32,6 +32,13 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 
 ### 50. The cache-aware fusion guard is global while the slab's eviction is per-table (code `OPEN 2`)
 
+**RESOLVED (2026-10-10).**  The guard is now **per-table** (`moe_cache_table_serves`, mirroring the
+take-over's `identity` decision) and the **device-remap path that could disagree with it has been removed
+from the code base**.  The eager host-routing path is the only `-sm tensor` split policy: MTP-pure on
+qwen4exp (`none == n3`), budget-sweep-pure (MIB8000 vs MIB14000 `None`), and within run-to-run noise of
+the old `DEVMAP=0` performance (MTP prefill 1581.7 vs 1587.0, decode 71.76 vs 72.56; plain prefill 1469.8
+vs 1471.9, decode 41.60 vs 41.80).  See `wip/moe-verify-fusions/FINDINGS-devmap-removal.md`.
+
 **Working home: `wip/moe-verify-fusions/`** (tracked together with #51 — the maintainer suspects a shared root cause on the cache-band routed-MMVQ verify path).
 
 **Opened 2026-10-10 (WIP finding, `archive/work/slab-ring-region/`).**  `ggml_cuda_cache_blocks_fusion`

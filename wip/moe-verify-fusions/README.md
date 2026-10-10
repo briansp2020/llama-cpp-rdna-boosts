@@ -3,17 +3,14 @@
 **Status: OPEN (opened 2026-10-10).**  Not part of the delivery; nothing here may be applied to the fork
 without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md`).
 
-> **NEXT SESSION: read [`FINDINGS-devmap-generation-fix.md`](FINDINGS-devmap-generation-fix.md) and
-> [`HANDOVER-devmap-consistency.md`](HANDOVER-devmap-consistency.md) end to end.**
->
-> **2026-10-10 session: the residency-generation repair is in (WIP) and the level-4 validator is clean, but
-> `DEVMAP=1` is STILL not pure — budget sweep 64, `none` vs `n3` 9, invariant across `PREFILL_SEED`/`KSLOT`/
-> `ADMIT`/`DEVPOLICY`; the residual is a graph/cold-classification effect, not a stale map.  The default
-> `DEVMAP=0` is pure on every check (2-GPU/1-GPU budget sweeps, `n_rs_seq`, field `none` vs `n3`, level-4
-> 0/0).  Per §8 the fixed device path does not clearly beat the eager path on both decode and prefill
-> (plain decode ~14 % faster, MTP prefill ~4-7 % slower) → keep `DEVMAP=0` default, `DEVMAP=1` opt-in.  §9:
-> the 35B-A3B tables are already split under `-sm tensor -ncmoe 99` (the `§5e` "mirrored" premise is stale),
-> and the split diverges at 82 — do not serve the 35B split.  Full numbers: the new findings file.**
+> **NEXT SESSION: read [`FINDINGS-devmap-removal.md`](FINDINGS-devmap-removal.md) FIRST.**  DEVMAP has been
+> **removed from the code base** (2026-10-10): the eager host-routing path is the only `-sm tensor` split
+> policy; it is MTP-pure on qwen4exp (`none == n3`), budget-sweep-pure, and within noise of the old
+> `DEVMAP=0` perf.  `TODO.md` #50 is resolved.  The removal diff is `remove-devmap.diff`; the delivery
+> `patches/`/`release.json` are **not yet regenerated** (the next delivery step).  Do **not** reintroduce
+> any `*DEVMAP*`/`*KSLOT*`/`*DEVPOLICY*` device slot-map path (see `ENVIRONMENT.md`'s REMOVED note).
+> Earlier device-path records (`HANDOVER-devmap-consistency.md`, `FINDINGS-single-seq-rollback.md`,
+> `FINDINGS-devmap-generation-fix.md`) are kept for the record but are superseded.
 >
 > **2026-10-12 session (later): the single-sequence divergence is ROOT-CAUSED AND FIXED (WIP).**  The
 > device-remap path built its remap from a `slot_dev` snapshot that is not the generation the arena fills
