@@ -3,7 +3,14 @@
 **Status: OPEN (opened 2026-10-10).**  Not part of the delivery; nothing here may be applied to the fork
 without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md`).
 
-> **PREP READY — next session implements the slab-resident narrow-2 layout.**
+> **2026-10-12 session: the slab-resident narrow-2 layout is IMPLEMENTED and functionally validated** —
+> no alias, and the exact token streams agree with the quick fix once the cache/fusion confound is
+> controlled.  The numeric acceptance gate (handover §4.2) turned out to be confounded by the **open
+> #50** (arena-layout-dependent cache-aware fusion selection): the quick fix itself measures 0.738 in one
+> run and 0.763 in another, and pinning the cache budget flips the ordering (narrow-2 0.752 vs quick-fix
+> 0.685).  Full evidence, numbers and open questions: [`RESULTS-slab-narrow2.md`](RESULTS-slab-narrow2.md).
+> The layout is in the `~/llama.cpp` working tree; `patches/` and `release.json` are untouched.
+>
 > **2026-10-11 session result:** the cache-band routed-MMVQ path's problem was located: `ggml_cuda_slab_work_alloc`
 > hands a single NARROW base to **every** narrow compute view, and with MTP there are **two** live compute
 > buffers (the target's verify view *and* the draft context's), so they aliased at slab base 0.  A quick fix
