@@ -1610,18 +1610,16 @@ gotchas).  The knobs: `MOE_EXPERT_CACHE_MIB` (per-device arena in MiB, **0/unset
 it is allocated on every device that owns cache tables), `_SLOTS` (uniform slots/table, 0 = derive from the
 budget and the measured expert bytes), `_PERIOD` 32 (LFRU decay), `_TOUCH` 2 (re-touch threshold before
 admission), `_FILL` 1, `_RESERVE_MIB` 1024 (VRAM held back - the arena sizes itself from *free* memory),
-`_DEVMAP` 1 (device-side remap + deferred promotion; `0` = the eager host readback path), `_DEVPOLICY` 1
-(on-GPU LFRU admission/eviction/fill), `_KSLOT` 1 (resolve the slot map inside the `MUL_MAT_ID` ids
-consumer, which removes the per-table remap launches), `_PREFILL_SEED` 1 + `_PREFILL_SEED_N` (tally the
+`_PREFILL_SEED` 1 + `_PREFILL_SEED_N` (tally the
 prompt's routing on the device and pre-admit the hottest experts at the first decode-band policy flush) and
 `_PROVISIONAL` 1 (reclaim seeded/ pre-filled slots before their first hit).  Each is a kill-switch for its
 own feature; the arena clamps itself to `free - _RESERVE_MIB` with a warning rather than starving the
 compute buffer.
 
 **Block mapping.**  06 = the generic iface + the scheduler half (routed-expert rebalance, the merged
-per-layer MoE split, the device gather + staging deferral, input takeover + deferred promotion, the Meta
+per-layer MoE split, the device gather + staging deferral, input takeover, the Meta
 delegations, and `GGML_ENV_STR` relocated here from block 15); 13 = `moe-expert-cache.{cu,h}` + the
-`mul_mat_vec_q_moe` slot lookup; 14 = `llm_arch_supports_sm_tensor()` rejecting `LLM_ARCH_GEMMA4`; 15 = the
+`mul_mat_vec_q_moe` item-split; 14 = `llm_arch_supports_sm_tensor()` rejecting `LLM_ARCH_GEMMA4`; 15 = the
 CUDA consumer hooks (the cache-aware fused gate+up+GLU and down folds, the `MUL_MAT_ID` takeover, the
 cache-band fusion stand-down, the iface assignment), the `h2d_pin`/`h2d_scratch` helpers and the
 `stage_input` `stage_gather` guard, which interleave with block-15's own fusion/staging code.  Blocks

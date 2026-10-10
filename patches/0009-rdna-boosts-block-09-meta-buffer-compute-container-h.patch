@@ -1,4 +1,4 @@
-From 21f05a2d7b190c2a318344972e57618e242c2fdc Mon Sep 17 00:00:00 2001
+From 11b11dc514fd6ad0054f5ca616e71aeda247cefd Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 09/15] rdna-boosts: block 09: meta-buffer compute-container
@@ -12,7 +12,7 @@ Subject: [PATCH 09/15] rdna-boosts: block 09: meta-buffer compute-container
  4 files changed, 33 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index b2bfa3853..0d8a5eb52 100644
+index 143d97549..ec46f2d1e 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1748,7 +1748,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
@@ -43,7 +43,7 @@ index c21873860..ee522b934 100644
  // is sized from it (plus the headroom) because the slab is created before the draft context.
  void   ggml_cuda_slab_set_aux_reserve(size_t bytes);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1db45ffbd..72f577f62 100644
+index da0ba46af..e42d44156 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -761,13 +761,20 @@ static size_t ggml_cuda_slab_min_arena_bytes() {
@@ -70,10 +70,10 @@ index 1db45ffbd..72f577f62 100644
  
  // Public MiB form, for the cache's own fallback message.
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 0896855d0..8cfc4eb47 100644
+index 18ff17bbb..9325a39bf 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -2330,6 +2330,22 @@ void alloc_all_locked() {
+@@ -1808,6 +1808,22 @@ void alloc_all_locked() {
      // the first moment the weights / KV / draft are all resident, so measure what they did NOT need and
      // hand it to the arena before sizing.  Without it that VRAM sits idle (~1.9 GiB/card measured) even
      // though the cache is capped by its region.

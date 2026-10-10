@@ -5,7 +5,11 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r38`** (canonical block-15 tip `849c04161`, net tree
+**`a55e952b8`**, released as **`v16-a55e952b8-r40`** (canonical block-15 tip `fdecb4d337b2`, net tree
+`73c371a2f453489dccdcea73ed22216b27cb9a28`): the device-remap (`DEVMAP`/`DEVPOLICY`/`KSLOT`/`DEV_EAGER`)
+experiment is **removed from the code base** (block 06 never creates it) together with the non-devmap WIP
+fixes (the per-table fusion guard for issue #50, the narrow-2 slab MTP-aliasing fix, `-ncmoe` host-expert
+offload).  Before it, **`v16-a55e952b8-r38`** (canonical block-15 tip `849c04161`, net tree
 `888564105e13dd73fefda755ea5b055d65011c16`): the `fit-slab-accounting` revival is folded into
 block 06 (G1/G2 `--fit` arena+headroom reservation, G3 adaptive slab reserve, G4
 `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` free-VRAM cap, G5 split-slice guard, G6 nextn-offload guard,

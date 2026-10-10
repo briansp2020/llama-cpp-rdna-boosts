@@ -82,9 +82,10 @@ the slack up front moves the cost to before the arena is sized.
 | `GGML_MOE_CACHE_MAX_TOK` | device MMVQ band (16 on RDNA4; 8 on RDNA3, NVIDIA) | kill-switch | caps the expert-cache **decode/verify band** (routed `MUL_MAT_ID` tokens the cache serves from the arena).  It defaults to the routed-expert MMVQ kernel's own band on the device since r31; `8` restores the pre-r31 band (band widening in `archive/work/moe-cache-band16/`).  A non-numeric value silently yields 1. |
 | `GGML_MOE_GATHER_ONCE` | off | diagnostic | gather each expert once per pass. |
 
-> **REMOVED — do not reintroduce (2026-10-10).**  The device-remap path and its whole family
+> **REMOVED — do not reintroduce (2026-10-10, released r40).**  The device-remap path and its whole family
 > (`MOE_EXPERT_CACHE_DEVMAP`, `MOE_EXPERT_CACHE_DEVPOLICY`, `MOE_EXPERT_CACHE_DEVPOLICY_SPLIT`,
-> `MOE_EXPERT_CACHE_KSLOT`, `MOE_EXPERT_CACHE_DEV_EAGER`) were **deleted from the code base**.  The eager
+> `MOE_EXPERT_CACHE_KSLOT`, `MOE_EXPERT_CACHE_DEV_EAGER`) plus the device-policy knob `MOE_HOST_POOL_POLICY`
+> were **deleted from the code base**.  The eager
 > host-routing path (materialized remap) is the only `-sm tensor` split policy; it is MTP-pure on qwen4exp
 > (`none == n3`), within noise of the old `DEVMAP=0` performance, and resolves `TODO.md` #50.  The device
 > path's divergence was a layout-sensitive **hipBLASLt** solution flip (issue #67), not a cache bug; the
@@ -110,7 +111,7 @@ expert-cache fills.  r35.
 | `--host-experts pool` | `pinned` | option | select the bounded host pool.  `pinned`/`auto` = no pool; `mmap` was removed in r33. |
 | `MOE_HOST_POOL_MIB` | `auto` | tuning | pool size when enabled: unset/`auto` = `MOE_HOST_POOL_FRAC` % of the MoE host expert bytes (`moe_host_expert_bytes`); `N` = explicit MiB; `0` = disable even with `--host-experts pool`. |
 | `MOE_HOST_POOL_FRAC` | `25` | tuning | the auto percentage (1–100). |
-| `MOE_HOST_POOL_POLICY` | `1` | kill-switch | pooled tables on the device policy: `1` pool-aware fill, `0` host promotion (pre-r35), `2` master fill (A/B). |
+| `MOE_HOST_POOL_POLICY` | — | **removed (r40)** | the pooled-table device-policy selector.  The device-policy fill (and the whole device-remap family) was deleted 2026-10-10; pooled tables always fill from the pinned pool with a master fallback.  The variable is ignored. |
 | `MOE_HOST_POOL_PREFETCH` | `0` | opt-in | routing-driven speculative pool prefill; **off** because a long-prompt sweep showed it hurts until the pool nears full residency (`1` enables). |
 | `MOE_HOST_POOL_PREWARM` | `1` | kill-switch | one-shot slot fill when a pool is built (ranked by the prefill tally / arena residents). |
 | `MOE_HOST_POOL_BGFETCH` | `1` | kill-switch | low-priority background eviction prefetch; `0` is the synchronous path. |

@@ -19,7 +19,13 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r38`**: the `fit-slab-accounting` revival is folded into block 06 (G1/G2 `--fit`
+**`v16-a55e952b8-r40`**: the device-remap (`DEVMAP`/`DEVPOLICY`/`KSLOT`/`DEV_EAGER`) experiment is
+**removed from the code base** — block 06 no longer creates it, so the eager host-routing path is the sole
+`-sm tensor` split policy — and the non-devmap WIP fixes ride with it (the per-table fusion guard that
+resolves **issue #50**, the narrow-2 slab MTP-aliasing fix, and `-ncmoe` host-expert offload).  The device
+path's divergence was a layout-sensitive **hipBLASLt** solution flip (**issue #67**), not a cache bug;
+removing it is MTP-pure on qwen4exp, within noise of the old `DEVMAP=0` performance, and keeps the
+prefill-logit gate at mean KLD 0.000707.  Before it, **`v16-a55e952b8-r38`** folded the `fit-slab-accounting` revival into block 06 (G1/G2 `--fit`
 arena+headroom reservation, G3 adaptive slab reserve, G4 `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`
 free-VRAM cap, G5 split-slice guard, G6 nextn-offload guard, G7 scheduler multi-consumer fill,
 per-device host-expert accounting) plus the G4 FA-staging cap in block 15.  Before it,

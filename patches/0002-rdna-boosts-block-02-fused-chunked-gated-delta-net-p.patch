@@ -1,4 +1,4 @@
-From 2825942c0d1eee2e5dae18e57da63d1e85924eb8 Mon Sep 17 00:00:00 2001
+From 996940232d58405d4e5aa80f603125dc71a820de Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net

@@ -1,17 +1,17 @@
-From abd50eece399aa94ea51cf6cc013e00b92c224ce Mon Sep 17 00:00:00 2001
+From 3e45b9f59d5d5a12ca6bd41cc03b080c7f84acc2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
 
 Campaign fold (wip/moe-expert-cache, beta2): adds the generic backend
-expert-cache interface -- `moe_cache_update`, `moe_cache_take_over`,
-`moe_cache_promote` and `moe_cache_gather` in the backend iface
+expert-cache interface -- `moe_cache_update`, `moe_cache_take_over`
+and `moe_cache_gather` in the backend iface
 (ggml-backend-impl.h) -- so a backend can drive a residency policy for a
 host-resident routed-expert table, plus the scheduler half of the consumer:
 the routed-expert rebalance onto the layer's owning device and the merged
 per-layer MoE split (ggml-backend.cpp), the device-side expert gather that
 defers a gatherable routed table from whole-tensor H2D staging, the
-input-takeover fast path with its deferred promotion pass, the Meta
+input-takeover fast path, the Meta
 delegation to the per-device simple backends (ggml-backend-meta.cpp), and the
 `#define GGML_ENV_STR` cache macro the campaign's gates use.  The cache engine
 and its CUDA consumers land in block 13; the gemma4 `-sm tensor` exclusion is
@@ -61,18 +61,18 @@ longer reproduces (14/14 clean on r24).  Record: archive/work/host-pinned-buffer
  docs/multi-gpu.md                             |    4 +-
  ggml/include/ggml-backend.h                   |   48 +
  ggml/src/ggml-alloc.c                         |   52 +-
- ggml/src/ggml-backend-impl.h                  |  147 +
- ggml/src/ggml-backend-meta.cpp                |  507 +-
- ggml/src/ggml-backend.cpp                     | 1020 ++-
+ ggml/src/ggml-backend-impl.h                  |  140 +
+ ggml/src/ggml-backend-meta.cpp                |  457 +-
+ ggml/src/ggml-backend.cpp                     |  936 +++-
  ggml/src/ggml-blas/ggml-blas.cpp              |    6 +
  ggml/src/ggml-cann/ggml-cann.cpp              |    6 +
- ggml/src/ggml-cpu/ggml-cpu.cpp                |  195 +-
+ ggml/src/ggml-cpu/ggml-cpu.cpp                |  194 +-
  ggml/src/ggml-cuda/CMakeLists.txt             |    6 +
  ggml/src/ggml-cuda/common.cuh                 |  149 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   73 +
- ggml/src/ggml-cuda/ggml-cuda.cu               | 2419 +++++++-
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 5480 +++++++++++++++++
- ggml/src/ggml-cuda/moe-expert-cache.h         |  344 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 2387 +++++++++-
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 3820 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.h         |  283 ++
  ...stance-ncols1_1-ncols2_16-dkq192-dv128.cu} |    1 -
  ...nstance-ncols1_1-ncols2_16-dkq576-dv512.cu |    5 +
  ...stance-ncols1_1-ncols2_32-dkq320-dv256.cu} |    1 -
@@ -222,7 +222,7 @@ longer reproduces (14/14 clean on r24).  Record: archive/work/host-pinned-buffer
  ggml/src/ggml-metal/ggml-metal.cpp            |    6 +
  ggml/src/ggml-opencl/ggml-opencl.cpp          |    6 +
  ggml/src/ggml-openvino/ggml-openvino.cpp      |    6 +
- ggml/src/ggml-rpc/ggml-rpc.cpp                |   19 +
+ ggml/src/ggml-rpc/ggml-rpc.cpp                |   18 +
  ggml/src/ggml-sycl/ggml-sycl.cpp              |    6 +
  ggml/src/ggml-virtgpu/ggml-backend.cpp        |    6 +
  ggml/src/ggml-vulkan/ggml-vulkan.cpp          |    6 +
@@ -244,7 +244,7 @@ longer reproduces (14/14 clean on r24).  Record: archive/work/host-pinned-buffer
  src/llama.cpp                                 |    2 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   60 +-
- 191 files changed, 12143 insertions(+), 306 deletions(-)
+ 191 files changed, 10247 insertions(+), 306 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm.h
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
@@ -1075,7 +1075,7 @@ index b0c067b49..0e2d6e68b 100644
              ggml_vbuffer_free(buf);
              return NULL;
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index dc7367dec..f6066e73b 100644
+index dc7367dec..69f228e17 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -30,6 +30,26 @@ extern "C" {
@@ -1118,7 +1118,7 @@ index dc7367dec..f6066e73b 100644
  
      GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
      GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
-@@ -152,8 +178,81 @@ extern "C" {
+@@ -152,8 +178,74 @@ extern "C" {
          // wait for an event on on a different stream
          void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
  
@@ -1171,20 +1171,13 @@ index dc7367dec..f6066e73b 100644
 +        // forwards to each simple backend's hook with that device's simple tensor as `weight_cpy`.
 +        bool (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis);
 +
-+        // wip/moe-expert-cache (session 7) identity/device-remap fast path.  Return true iff this expert
-+        // input is cache-managed and the consumer can read the arena WITHOUT the host routing: an
-+        // identity table (slot == expert, raw ids) or a device-remap table (a device slot map + a small
-+        // remap kernel).  The scheduler calls this BEFORE the ids readback; a true lets it skip the
-+        // readback, the full device synchronize it forces, the used-expert pruning and the copy.
-+        // `need_promote` is set for a device-remap table, whose routing must be recorded for the deferred
-+        // promotion pass.  The Meta backend forwards to each simple backend and returns true only if
-+        // every device took over.
-+        bool (*moe_cache_take_over)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, bool * need_promote);
-+
-+        // wip/moe-expert-cache: deferred promotion for a device-remap table - run the LFRU admission +
-+        // fills for the used experts (`ids`, a contiguous host `n_used x n_tok` int32 copy) and refresh
-+        // the device slot map.  Called by the scheduler once per token, after the graph.
-+        bool (*moe_cache_promote)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1);
++        // wip/moe-expert-cache (session 7) identity fast path.  Return true iff this expert input is
++        // cache-managed and the consumer can read the arena WITHOUT the host routing (an identity table:
++        // slot == expert, raw ids).  The scheduler calls this BEFORE the ids readback; a true lets it
++        // skip the readback, the full device synchronize it forces, the used-expert pruning and the
++        // copy.  The Meta backend forwards to each simple backend and returns true only if every device
++        // took over.
++        bool (*moe_cache_take_over)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy);
 +
 +        // wip/moe-expert-cache (B2): device-side host-weight expert gather for an offloaded `MUL_MAT_ID`
 +        // prefill.  Copy only the routed experts from the host master (`weight`) into the device tensor
@@ -1200,7 +1193,7 @@ index dc7367dec..f6066e73b 100644
      };
  
      struct ggml_backend {
-@@ -216,6 +315,54 @@ extern "C" {
+@@ -216,6 +308,54 @@ extern "C" {
          ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
          void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
          void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
@@ -1256,7 +1249,7 @@ index dc7367dec..f6066e73b 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 0394433c0..b2bfa3853 100644
+index 0394433c0..143d97549 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -82,7 +82,7 @@ struct ggml_backend_meta_device_context {
@@ -1665,7 +1658,7 @@ index 0394433c0..b2bfa3853 100644
          {
              // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
              auto get_i_delayed_branch = [&](const int i) -> int {
-@@ -2477,6 +2734,203 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2477,6 +2734,154 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      return GGML_STATUS_SUCCESS;
  }
  
@@ -1716,14 +1709,11 @@ index 0394433c0..b2bfa3853 100644
 +    return all;
 +}
 +
-+// wip/moe-expert-cache (session 7) identity/device-remap fast path: forward to every simple backend
-+// and take the input over only if ALL of them can (a mixed outcome would leave one device reading an
-+// arena nobody filled).  `need_promote` is the OR over devices.
++// wip/moe-expert-cache (session 7) identity fast path: forward to every simple backend and take the
++// input over only if ALL of them can (a mixed outcome would leave one device reading an arena nobody
++// filled).
 +static bool ggml_backend_meta_moe_cache_take_over(ggml_backend_t backend, const struct ggml_tensor * weight,
-+        const struct ggml_tensor * weight_cpy, bool * need_promote) {
-+    if (need_promote != nullptr) {
-+        *need_promote = false;
-+    }
++        const struct ggml_tensor * weight_cpy) {
 +    if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2) {
 +        return false;
 +    }
@@ -1735,60 +1725,14 @@ index 0394433c0..b2bfa3853 100644
 +        return false;
 +    }
 +    const size_t n_backends = ggml_backend_meta_n_backends(backend);
-+    bool all     = true;
-+    bool promote = false;
++    bool all = true;
 +    for (size_t j = 0; j < n_backends; j++) {
 +        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
 +        ggml_tensor *  simple_tensor  = ggml_backend_meta_buffer_simple_tensor(weight_cpy, j);
 +        if (simple_tensor == nullptr || simple_backend->iface.moe_cache_take_over == nullptr) {
 +            return false;
 +        }
-+        bool np = false;
-+        all     = all && simple_backend->iface.moe_cache_take_over(simple_backend, weight, simple_tensor, &np);
-+        promote = promote || np;
-+    }
-+    if (need_promote != nullptr) {
-+        *need_promote = promote;
-+    }
-+    return all;
-+}
-+
-+// wip/moe-expert-cache: deferred promotion, forwarded to each simple device (the routing is shared,
-+// each device promotes into its own arena slice).  The consumer alias is refreshed by `take_over`, so
-+// promotion passes a null `weight_cpy`.
-+static bool ggml_backend_meta_moe_cache_promote(ggml_backend_t backend, const struct ggml_tensor * weight,
-+        const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok,
-+        size_t ids_nb0, size_t ids_nb1) {
-+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
-+    // `weight == nullptr` is the end-of-pass flush for the batched device-side admission policy: one
-+    // call per simple backend, which runs its own per-device policy kernel.
-+    if (weight == nullptr) {
-+        bool all = true;
-+        for (size_t j = 0; j < n_backends; j++) {
-+            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
-+            if (simple_backend->iface.moe_cache_promote == nullptr) {
-+                continue;
-+            }
-+            all = all && simple_backend->iface.moe_cache_promote(simple_backend, nullptr, nullptr,
-+                                                                 nullptr, 0, 0, 0, 0);
-+        }
-+        return all;
-+    }
-+    if (weight_cpy == nullptr) {
-+        return false;
-+    }
-+    if (!ggml_backend_buffer_is_meta(weight_cpy->buffer)) {
-+        return false;
-+    }
-+    bool all = true;
-+    for (size_t j = 0; j < n_backends; j++) {
-+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
-+        if (simple_backend->iface.moe_cache_promote == nullptr) {
-+            all = false;
-+            break;
-+        }
-+        all = all && simple_backend->iface.moe_cache_promote(simple_backend, weight, nullptr,
-+                                                             ids, n_used, n_tok, ids_nb0, ids_nb1);
++        all = all && simple_backend->iface.moe_cache_take_over(simple_backend, weight, simple_tensor);
 +    }
 +    return all;
 +}
@@ -1869,7 +1813,7 @@ index 0394433c0..b2bfa3853 100644
  static const ggml_backend_i ggml_backend_meta_i = {
      /* .get_name                = */ ggml_backend_meta_get_name,
      /* .free                    = */ ggml_backend_meta_free,
-@@ -2493,7 +2947,18 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -2493,7 +2898,17 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .graph_compute           = */ ggml_backend_meta_graph_compute,
      /* .event_record            = */ nullptr,
      /* .event_wait              = */ nullptr,
@@ -1882,14 +1826,13 @@ index 0394433c0..b2bfa3853 100644
      /* .graph_optimize          = */ nullptr,
 +    /* .moe_cache_update        = */ ggml_backend_meta_moe_cache_update,
 +    /* .moe_cache_take_over     = */ ggml_backend_meta_moe_cache_take_over,
-+    /* .moe_cache_promote       = */ ggml_backend_meta_moe_cache_promote,
 +    /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
 +    /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
  };
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 5bdade6de..2c39a6a5c 100644
+index 5bdade6de..a37ace67e 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,11 @@
@@ -2690,30 +2633,7 @@ index 5bdade6de..2c39a6a5c 100644
  static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      struct ggml_backend_sched_split * splits = sched->splits;
-@@ -1807,6 +2483,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
-     std::vector<int32_t> ids;
-     std::vector<ggml_bitset_t> used_ids;
- 
-+    // wip/moe-expert-cache: records for the deferred promotion pass (the device-remap fast path took
-+    // these inputs over before the host read the routing; the routing is read once after the graph and
-+    // feeds the LFRU admission for the NEXT token).
-+    struct moe_promote_rec {
-+        const struct ggml_tensor * weight;
-+        const struct ggml_tensor * weight_cpy;
-+        struct ggml_tensor *       ids;
-+        ggml_backend_t             ids_backend;
-+        ggml_backend_t             promote_backend;
-+        int64_t                    n_used;
-+        int64_t                    n_tok;
-+        size_t                     nb0;
-+        size_t                     nb1;
-+    };
-+    std::vector<moe_promote_rec> moe_promote_recs;
-+
-     int prev_backend_id = -1;
- 
-     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
-@@ -1814,6 +2506,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1814,6 +2490,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          int split_backend_id = split->backend_id;
          ggml_backend_t split_backend = sched->backends[split_backend_id];
  
@@ -2722,7 +2642,7 @@ index 5bdade6de..2c39a6a5c 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -1830,7 +2524,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1830,7 +2508,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              struct ggml_tensor * input = split->inputs[input_id];
              struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
  
@@ -2732,7 +2652,7 @@ index 5bdade6de..2c39a6a5c 100644
                  // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                      ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-@@ -1839,27 +2534,147 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1839,27 +2518,118 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                  }
                  ggml_backend_tensor_copy(input, input_cpy);
              } else {
@@ -2784,8 +2704,8 @@ index 5bdade6de..2c39a6a5c 100644
 +                    if (split_backend->iface.stage_input(split_backend, input, input_cpy)) {
 +                        continue;
 +                    }
-                 }
- 
++                }
++
 +                // tripwire (issue #50 WIP): a split input that redirect mode pointed at a ring slot must
 +                // be consumed by the staged branch above, never by one of the copy paths below.  Catching
 +                // it here turns a future silent stale-slot read into an abort (reporters' suggestion,
@@ -2793,8 +2713,8 @@ index 5bdade6de..2c39a6a5c 100644
 +                for (int k = 0; k < sched->stage_consumed_n; k++) {
 +                    GGML_ASSERT(sched->stage_consumed[k].dst != input_cpy &&
 +                                "H2D staging: a redirected split input reached a copy path");
-+                }
-+
+                 }
+ 
 +                // wait for the split backend to finish using the input before overwriting it.  exp37:
 +                // the meta backend has no event_record/event_wait, so this falls through to a FULL host
 +                // synchronize of both devices per expert upload, which keeps the host from running ahead.
@@ -2835,54 +2755,25 @@ index 5bdade6de..2c39a6a5c 100644
 +                    }
 +                }
 +                // wip/moe-expert-cache (session 7) takeover fast path: an identity table reads the
-+                // arena with its own routing ids, and a device-remap table builds the remap on the
-+                // device from a device slot map - either way the host needs no routing.  Take the
-+                // input over BEFORE the ids readback so the readback, the full device synchronize it
-+                // forces, the used-expert pruning and the copy are all skipped.  Restricted to the
-+                // decode/verify band: prefill keeps the staged upload and its direct-reading MMQ
-+                // fusions (which are not cache-aware).  A device-remap takeover records the pair for
-+                // the deferred promotion pass below.
++                // arena with its own routing ids.  Take the input over BEFORE the ids readback so the
++                // readback, the full device synchronize it forces, the used-expert pruning and the copy
++                // are all skipped.  Restricted to the decode/verify band: prefill keeps the staged
++                // upload and its direct-reading MMQ fusions (which are not cache-aware).
 +                if (node != nullptr && node_n_consumers == 1 && node->ne[2] <= sched_moe_cache_band(split_backend) &&
-                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
--                    ggml_backend_buffer_is_host(input->buffer) && (
--                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
--                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
--                    )) {
++                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
 +                    ggml_backend_buffer_is_host(input->buffer) &&
 +                    split_backend->iface.moe_cache_take_over != NULL) {
-+                    bool need_promote = false;
-+                    if (split_backend->iface.moe_cache_take_over(split_backend, input, input_cpy, &need_promote)) {
-+                        if (need_promote && node->src[2] != NULL) {
-+                            // Resolve the routing tensor against the split's input copies exactly as the
-+                            // eager hook does: `node->src[2]` can be a stale copy-view of a split input,
-+                            // and reading that pointer back yields garbage (empty `used`, no promotions).
-+                            ggml_tensor *  ids_tensor  = node->src[2];
-+                            ggml_backend_t ids_backend = split_backend;
-+                            for (int i2 = input_id + 1; i2 < split->n_inputs; i2++) {
-+                                if (ids_tensor == tensor_copy(split->inputs[i2], split_backend_id, sched->cur_copy)) {
-+                                    ids_tensor  = split->inputs[i2];
-+                                    ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i2]);
-+                                    break;
-+                                }
-+                            }
-+                            moe_promote_rec r;
-+                            r.weight          = input;
-+                            r.weight_cpy      = input_cpy;
-+                            r.ids             = ids_tensor;
-+                            r.ids_backend     = ids_backend;
-+                            r.promote_backend = split_backend;
-+                            r.n_used          = ids_tensor->ne[0];
-+                            r.n_tok           = ids_tensor->ne[1];
-+                            r.nb0             = ids_tensor->nb[0];
-+                            r.nb1             = ids_tensor->nb[1];
-+                            moe_promote_recs.push_back(r);
-+                        }
++                    if (split_backend->iface.moe_cache_take_over(split_backend, input, input_cpy)) {
 +                        continue;
 +                    }
 +                }
 +
 +                if (node != nullptr && node_n_consumers == 1 &&
-+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+-                    ggml_backend_buffer_is_host(input->buffer) && (
+-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
+-                    )) {
 +                    ggml_backend_buffer_is_host(input->buffer)) {
  
                      const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
@@ -2893,7 +2784,7 @@ index 5bdade6de..2c39a6a5c 100644
                      // get the ids
                      ggml_tensor * ids_tensor = node->src[2];
                      ggml_backend_t ids_backend = split_backend;
-@@ -1878,6 +2693,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1878,6 +2648,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
  
@@ -2923,7 +2814,7 @@ index 5bdade6de..2c39a6a5c 100644
                      if (ids_tensor != prev_ids_tensor) {
                          ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                          ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-@@ -1897,6 +2735,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1897,6 +2690,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          prev_ids_tensor = ids_tensor;
                      }
  
@@ -2947,7 +2838,7 @@ index 5bdade6de..2c39a6a5c 100644
                      // group consecutive experts and copy them together
                      auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                          const size_t expert_offset = first_id * expert_size;
-@@ -1912,6 +2767,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1912,6 +2722,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                              expert_size_copy + padding_end);
                      };
  
@@ -2955,7 +2846,7 @@ index 5bdade6de..2c39a6a5c 100644
                      int id = 0;
                      while (!ggml_bitset_get(used_ids.data(), id)) {
                          id++;
-@@ -1936,6 +2792,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1936,6 +2747,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                      }
                      copy_experts(first_id, last_id);
                  } else {
@@ -2992,7 +2883,7 @@ index 5bdade6de..2c39a6a5c 100644
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                      if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-@@ -1995,9 +2881,56 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1995,6 +2836,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
          }
  
@@ -3007,49 +2898,7 @@ index 5bdade6de..2c39a6a5c 100644
          prev_backend_id = split_backend_id;
      }
  
-+    // wip/moe-expert-cache: deferred promotion.  After the graph, run the LFRU admission + fills for
-+    // this token's routing; they apply to the NEXT token (the current token was already computed from
-+    // the pre-promotion device slot map, with a miss served through the UVA cold region).  The routing is
-+    // read from each table's persistent used-list (`used_dev`), which the remap kernel wrote during the
-+    // graph - NOT from the graph's routing tensor, whose storage is recycled once the graph completes
-+    // (a deferred readback of it returns garbage and the promotions no-op).  One synchronize per backend
-+    // is therefore enough, and there is no per-record D2H.
-+    if (!moe_promote_recs.empty()) {
-+        std::vector<ggml_backend_t> syncs;
-+        for (const moe_promote_rec & r : moe_promote_recs) {
-+            bool seen = false;
-+            for (ggml_backend_t b : syncs) {
-+                if (b == r.promote_backend) { seen = true; break; }
-+            }
-+            if (!seen) {
-+                syncs.push_back(r.promote_backend);
-+            }
-+        }
-+        for (ggml_backend_t b : syncs) {
-+            ggml_backend_synchronize(b);
-+        }
-+        for (const moe_promote_rec & r : moe_promote_recs) {
-+            if (r.promote_backend->iface.moe_cache_promote != NULL) {
-+                r.promote_backend->iface.moe_cache_promote(
-+                        r.promote_backend, r.weight, r.weight_cpy, NULL,
-+                        r.n_used, r.n_tok, r.nb0, r.nb1);
-+            }
-+        }
-+        // wip/moe-expert-cache: end-of-pass flush for the batched device-side admission policy
-+        // (MOE_EXPERT_CACHE_DEVPOLICY=1).  A no-op unless that policy is enabled; the per-table calls
-+        // above only recorded each table's routing shape.  One call per backend; the Meta backend
-+        // forwards it to each simple device, which runs one policy kernel for all its tables.
-+        for (ggml_backend_t b : syncs) {
-+            if (b->iface.moe_cache_promote != NULL) {
-+                b->iface.moe_cache_promote(b, NULL, NULL, NULL, 0, 0, 0, 0);
-+            }
-+        }
-+    }
-+
-     return GGML_STATUS_SUCCESS;
- }
- 
-@@ -2058,7 +2991,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2058,7 +2907,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -3065,7 +2914,7 @@ index 5bdade6de..2c39a6a5c 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -2067,6 +3007,48 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2067,6 +2923,48 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -3114,7 +2963,7 @@ index 5bdade6de..2c39a6a5c 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -2081,6 +3063,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2081,6 +2979,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -3125,12 +2974,12 @@ index 5bdade6de..2c39a6a5c 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2182,6 +3168,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2182,6 +3084,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  
 +    // wip/moe-expert-cache: the routed expert tables read the cache arena, so no calibration pass is
-+    // needed here; the cache's own deferred promotion runs after the graph.
++    // needed here.
      return ggml_backend_sched_compute_splits(sched);
  }
  
@@ -3169,7 +3018,7 @@ index 28e17f3f7..a5eb40581 100644
  };
  
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 81ff5d79f..be7e4540e 100644
+index 81ff5d79f..05f74e0fa 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
 @@ -7,7 +7,9 @@
@@ -3366,7 +3215,7 @@ index 81ff5d79f..be7e4540e 100644
  
      if (cpu_ctx->work_size < cplan.work_size) {
          delete[] cpu_ctx->work_data;
-@@ -206,7 +380,18 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
+@@ -206,7 +380,17 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
      /* .graph_compute           = */ ggml_backend_cpu_graph_compute,
      /* .event_record            = */ NULL,
      /* .event_wait              = */ NULL,
@@ -3379,13 +3228,12 @@ index 81ff5d79f..be7e4540e 100644
      /* .graph_optimize          = */ NULL,
 +    /* .moe_cache_update        = */ NULL,
 +    /* .moe_cache_take_over     = */ NULL,
-+    /* .moe_cache_promote       = */ NULL,
 +    /* .moe_cache_band          = */ NULL,
 +    /* .moe_cache_gather        = */ NULL,
  };
  
  static ggml_guid_t ggml_backend_cpu_guid(void) {
-@@ -507,6 +692,14 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
+@@ -507,6 +691,14 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
      /* .event_new            = */ NULL,
      /* .event_free           = */ NULL,
      /* .event_synchronize    = */ NULL,
@@ -3667,7 +3515,7 @@ index 000000000..c21873860
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
 +void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 4e97a5038..ff62b4f55 100644
+index 4e97a5038..0b03f9565 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -26,15 +26,24 @@
@@ -4868,30 +4716,20 @@ index 4e97a5038..ff62b4f55 100644
 +        };
 +        init[device] = true;
 +    }
-+
-+    return &bufts[device];
-+}
  
 -    return &ggml_backend_cuda_buffer_type_host;
++    return &bufts[device];
++}
++
 +ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 +    return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
  //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
-@@ -1967,6 +3030,72 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -1967,6 +3030,53 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      GGML_ASSERT(src1->type == GGML_TYPE_F32);
      GGML_ASSERT(dst->type  == GGML_TYPE_F32);
  
-+    // wip/moe-expert-cache prefill-routing seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): tally the prompt's
-+    // routing on the device so the first decode token can bulk-admit its hottest experts.  Under
-+    // `-sm tensor` the scheduler's block-06 staging intercepts the prefill upload before the host
-+    // `moe_cache_update` hook, so this is the one place the routing device tensor is in hand.  Prefill
-+    // only (the cache owns the decode band); no host readback, no sync - the histogram lands on the
-+    // same compute stream and the first decode flush reads it after the inter-token synchronize.
-+    if (moe_cache_enabled() && ids->ne[1] > MOE_EXPERT_CACHE_MAX_TOK) {
-+        moe_cache_tally_prefill(dst, src0, ids, ctx.device, ctx.stream());
-+    }
-+
 +    // wip/moe-expert-cache slot-remap consumer: if the scheduler handed this expert table to the
 +    // cache (the backend iface `moe_cache_update` returned true), read the compact arena and the
 +    // slot-remapped ids instead of the full expert table.  `src0` is the redirected `input_cpy`,
@@ -4905,22 +4743,13 @@ index 4e97a5038..ff62b4f55 100644
 +        int64_t   nu = 0;
 +        int64_t   nt = 0;
 +        size_t    eb = 0;
-+        moe_cache_devmap dm{};
-+        if (moe_cache_get_table(dst, src0, ctx.device, &arena, &n_slots, &eb, &remap, &nu, &nt, &dm) &&
-+            (dm.slot_dev != nullptr || remap == nullptr ||
-+             (nu == ids->ne[0] && nt == ids->ne[1]))) {
-+            if (dm.slot_dev != nullptr) {
-+                // Device-remap mode: build the slot-remapped ids from the routing + the device slot map.
-+                moe_cache_launch_remap(ids->data, ids->nb[0], ids->nb[1], &dm,
-+                                       ids->ne[0], ids->ne[1], (int32_t *) remap, ctx.stream());
-+            }
++        if (moe_cache_get_table(dst, src0, ctx.device, &arena, &n_slots, &eb, &remap, &nu, &nt) &&
++            (remap == nullptr || (nu == ids->ne[0] && nt == ids->ne[1]))) {
 +            // Keep `ne[2]`/`nb` exactly as the full table so the dispatcher's kernel-family
 +            // heuristics (which read `ne[2]`/`n_experts`) are unchanged and the arithmetic stays
 +            // bit-identical; only the base pointer moves to the arena, and the remapped ids stay
 +            // below `slots`, so the kernel never reads an expert outside the arena.  Unused expert
 +            // slots are never referenced by the ids and are only skipped over.
-+            // NOTE: `moe_cache_read_check` is a bring-up diagnostic; call it only with CUDA graphs
-+            // disabled (it stream-synchronizes, which aborts during capture).
 +            GGML_UNUSED(n_slots);
 +            GGML_UNUSED(eb);
 +            ggml_tensor src0c = *src0;
@@ -4951,7 +4780,7 @@ index 4e97a5038..ff62b4f55 100644
      GGML_TENSOR_BINARY_OP_LOCALS
  
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -2613,6 +3742,27 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+@@ -2613,6 +3723,27 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
  #ifdef USE_CUDA_GRAPH
  static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
  
@@ -4979,7 +4808,7 @@ index 4e97a5038..ff62b4f55 100644
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
-@@ -3500,15 +4650,418 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3500,15 +4631,417 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  }
  
  // try and fuse nodes and return the number of nodes to skip
@@ -5298,21 +5127,20 @@ index 4e97a5038..ff62b4f55 100644
 +        }
 +        // Tables exist but cannot serve (priming pass, every arena allocation failed, or a budget below
 +        // one expert): the cache takes no input over, so its cache-aware fusions MUST stay stood down.
-+        // The gate+up mmvq fusion reads the scheduler's copy through the fused call site, which is only
-+        // staged when the scheduler performs the copy itself; forcing the per-op path here is what keeps
-+        // the output byte-identical to the cache-less run.
-+        if (!moe_cache_has_arena()) {
-+            return true;
-+        }
-+        // The decode gate+up+GLU triple is cache-aware: its mmvq call site redirects both expert
-+        // tables and the routing onto the compact arenas/remap (`moe_cache_redirect_fused`), so it
-+        // may fire.  Every other routed-expert fusion still reads the scheduler's `input_cpy`, which
-+        // the cache does NOT populate when it takes the input over - so they stay stood down until
-+        // each is taught the arena.
++        //
++        // wip/moe-verify-fusions (OPEN 2 / #50): ask THIS table, under the same `identity`
++        // condition the scheduler take-over uses, so the fusion guard and the take-over agree
++        // per table instead of on the whole-graph `moe_cache_has_arena()`.  A partial cache
++        // evicts tables PER TABLE, so a global answer flipped the cache-band arithmetic of the
++        // whole graph and the plain/MTP arms (which evict at different points) diverged.
++        const int device = cuda_ctx->device;
 +        if (i + 2 < cgraph->n_nodes &&
 +                cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
 +                cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
-+            return false;   // allowed: the plain gate+up+GLU decode fusion
++            const bool up_ok   = moe_cache_table_serves(node, node->src[0], device);
++            const bool gate_ok = moe_cache_table_serves(cgraph->nodes[i + 1],
++                                                        cgraph->nodes[i + 1]->src[0], device);
++            return !(up_ok && gate_ok);   // allowed: the plain gate+up+GLU decode fusion
 +        }
 +        // down projection + per-(expert,token) routing-weight fold ([MUL_MAT_ID, MUL]): the
 +        // cache-aware variant in the epilogue below redirects the down table and the routing onto
@@ -5321,7 +5149,7 @@ index 4e97a5038..ff62b4f55 100644
 +        // redirect-safe; it is kept stood down by its own `!moe_cache_enabled()` gate at its site.
 +        if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
 +                cgraph->nodes[i + 1]->src[0] == node) {
-+            return false;   // allowed: the cache-aware down projection fold
++            return !moe_cache_table_serves(node, node->src[0], device);   // allowed: the cache-aware down projection fold
 +        }
 +        return true;
 +    }
@@ -5398,7 +5226,7 @@ index 4e97a5038..ff62b4f55 100644
      if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
              ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {
          const int outputs[] = { i + 2, i + 5 };
-@@ -3528,20 +5081,287 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3528,20 +5061,287 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -5694,7 +5522,7 @@ index 4e97a5038..ff62b4f55 100644
          ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
          const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
          if (nodes_to_skip > 0) {
-@@ -4053,13 +5873,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4053,13 +5853,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  break;
              }
  
@@ -5753,7 +5581,7 @@ index 4e97a5038..ff62b4f55 100644
                  fused_mul_mat_vec = true;
                  fused_node_count  = 3;
                  break;
-@@ -4162,28 +6025,285 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4162,28 +6005,285 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -6046,7 +5874,7 @@ index 4e97a5038..ff62b4f55 100644
                  continue;
              }
              bias_tensor = bias_node->src[1];
-@@ -5034,6 +7154,112 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5034,6 +7134,101 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -6126,23 +5954,12 @@ index 4e97a5038..ff62b4f55 100644
 +    return moe_cache_update_host(weight, weight_cpy, ids, n_used, n_tok, ids_nb0, ids_nb1, ctx->stream(), ctx->device, slice_off, split_axis);
 +}
 +
-+// Session 7 identity/device-remap fast path (see moe-expert-cache.h).  Called by the scheduler before
-+// it reads the routing ids back to the host: a true lets it skip the readback, the full device
-+// synchronize it forces, the used-expert pruning and the copy, because the consumer will read the
-+// compact arena with its own routing ids (identity) or a device-built remap (device-remap).
-+static bool ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, bool * need_promote) {
++// Session 7 identity fast path (see moe-expert-cache.h).  Called by the scheduler before it reads the
++// routing ids back to the host: a true lets it skip the readback, the full device synchronize it forces,
++// the used-expert pruning and the copy, because the consumer reads the compact arena with the raw ids.
++static bool ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy) {
 +    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
-+    return moe_cache_take_over(weight, weight_cpy, ctx->device, need_promote);
-+}
-+
-+// Deferred promotion (device-remap tables), called by the scheduler once per token after the graph.
-+// `weight == nullptr` is the end-of-pass flush that runs the batched device-side admission policy.
-+static bool ggml_backend_cuda_moe_cache_promote(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1) {
-+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
-+    if (weight == nullptr) {
-+        return moe_cache_policy_flush(ctx->device, ctx->stream());
-+    }
-+    return moe_cache_promote_host(weight, weight_cpy, ids, n_used, n_tok, ids_nb0, ids_nb1, ctx->stream(), ctx->device);
++    return moe_cache_take_over(weight, weight_cpy, ctx->device);
 +}
 +
 +// B2: device-side host-weight expert gather for an offloaded `MUL_MAT_ID` prefill (see the iface comment).
@@ -6159,7 +5976,7 @@ index 4e97a5038..ff62b4f55 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -5050,7 +7276,19 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -5050,7 +7245,18 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -6173,13 +5990,12 @@ index 4e97a5038..ff62b4f55 100644
      /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
 +    /* .moe_cache_update        = */ ggml_backend_cuda_moe_cache_update,
 +    /* .moe_cache_take_over     = */ ggml_backend_cuda_moe_cache_take_over,
-+    /* .moe_cache_promote       = */ ggml_backend_cuda_moe_cache_promote,
 +    /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
 +    /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -5321,8 +7559,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -5321,8 +7527,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -6190,7 +6006,7 @@ index 4e97a5038..ff62b4f55 100644
  }
  
  // TODO: move these functions here
-@@ -5831,6 +8069,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -5831,6 +8037,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -6207,7 +6023,7 @@ index 4e97a5038..ff62b4f55 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -5865,6 +8113,88 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -5865,6 +8081,88 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -6296,7 +6112,7 @@ index 4e97a5038..ff62b4f55 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -5881,6 +8211,14 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -5881,6 +8179,14 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -6311,7 +6127,7 @@ index 4e97a5038..ff62b4f55 100644
  };
  
  // backend reg
-@@ -6060,6 +8398,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -6060,6 +8366,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -6323,10 +6139,10 @@ index 4e97a5038..ff62b4f55 100644
          /* .iface   = */ ggml_backend_cuda_interface,
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..0896855d0
+index 000000000..18ff17bbb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,5480 @@
+@@ -0,0 +1,3820 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -6361,43 +6177,6 @@ index 000000000..0896855d0
 +// state
 +// ---------------------------------------------------------------------------------------------
 +
-+// Device-side admission-policy descriptor (MOE_EXPERT_CACHE_DEVPOLICY=1).  One per device-remap table,
-+// built once at sizing and updated in place by `moe_cache_policy_kernel`.  All pointers are device
-+// addresses on the table's owner device; `used` is the persistent routing buffer the remap kernel
-+// wrote during the graph.  `arena`/`host_dev` drive the fill copy (device write, UVA host read).
-+struct moe_cache_policy_desc {
-+    int32_t *       slot_expert;
-+    int32_t *       slot;
-+    int32_t *       count;
-+    int32_t *       ghost;
-+    int32_t *       last;
-+    uint8_t *       slot_prov;   // slot -> provisional (pre-filled, never hit)
-+    const int32_t * used;
-+    void *          arena;
-+    const void *    host_dev;
-+    // Target 1 (pool-aware device policy): the bounded host pool, if one exists for this table's host
-+    // tensor.  The in-kernel fill sources a whole host expert from `pool_base + pool_slot[e]*host_bytes
-+    // + src_off` when `pool_slot[e] >= 0`, and falls back to `host_dev` (the master) otherwise.
-+    const void *    pool_base;
-+    int32_t *       pool_slot;
-+    int32_t         pool_slots;
-+    int64_t         host_bytes;
-+    int64_t         src_off;
-+    int64_t         expert_bytes;
-+    int64_t         host_pitch;
-+    int64_t         clock;
-+    int64_t         last_decay;
-+    int32_t         n_experts;
-+    int32_t         slots;
-+    int32_t         occupied;
-+    int32_t         split_axis;
-+    int64_t         acc_hits;
-+    int64_t         acc_misses;
-+    int64_t         acc_fills;
-+    int64_t         acc_evict;
-+    int64_t         pad0;
-+    int64_t         pad1;
-+};
 +
 +// The kernel stages a token's admitted experts in shared memory before the block cooperatively copies them
 +// into the arena.  A table can see up to `n_used * n_tok` routed experts in one pass (16 x 16 = 256 at the
@@ -6462,42 +6241,6 @@ index 000000000..0896855d0
 +    std::vector<int32_t> remap_host;    // persistent staging (the async H2D must not race its source)
 +    std::vector<int32_t> hook_experts;  // the routing the hook last consumed (read-check only)
 +
-+    // Device-side remap (gentle-curve follow-up): a device `expert -> slot` map the consumer uses to
-+    // build the remap without a host routing readback.  Enabled for partial-residency tables.
-+    int32_t *   slot_dev    = nullptr;  // device int32[n_experts]
-+    // Target 1 (pool-aware device policy): device `expert -> host-pool slot` map.  -1 = the expert is
-+    // not pool-resident, so the policy kernel's fill falls back to the master.  The host snapshots the
-+    // pool's LRU into this buffer under `g_mutex` before each policy flush.
-+    int32_t *   pool_slot_dev = nullptr;
-+    const void * policy_pool_base = nullptr;  // device alias of that pool (null = pool off / no pool)
-+    int         policy_pool_slots = 0;        // pool slot count (kernel fill bound)
-+    int32_t *   used_dev    = nullptr;  // device int32[n_experts*8]: the routing the remap kernel last read
-+    int64_t     used_cap    = 0;
-+    int32_t *   used_host   = nullptr;  // PINNED staging for the used-list D2H
-+    int32_t *   used_host2  = nullptr;  // second pinned buffer: double-buffered PIPELINED readback
-+    int         used_toggle = 0;        // which pinned buffer the NEXT readback writes
-+    bool        used_pending= false;    // a readback was enqueued and has not been consumed yet
-+    int32_t *   slot_pin    = nullptr;  // PINNED staging for the slot-map H2D
-+    std::vector<int32_t> slot_dev_host; // staging for the async H2D
-+    bool        devmap      = false;
-+    // A sibling (the layer's routed `down`) built this table's remap in the gate+up redirect this pass;
-+    // the redirect skips its own launch and the per-table promotion clears the flag after the graph.
-+    bool        remap_fresh = false;
-+
-+    // Device-side admission policy (MOE_EXPERT_CACHE_DEVPOLICY=1, default off).  When `policy` is set
-+    // the LFRU decision runs on the GPU (one batched kernel per device per token): these are the
-+    // device mirrors of `slot_expert`/`count`/`ghost`/`last`.  The per-table promote only records the
-+    // token's routing shape; `moe_cache_policy_flush` launches the kernel and copies admitted experts
-+    // into the arena.  The host mirrors above go stale while `policy` is on (refreshed for the report).
-+    bool        policy          = false;
-+    bool        policy_pending  = false;   // this table is in the current token's graph
-+    int         policy_n_used   = 0;       // shape recorded by the per-table promote
-+    int         policy_n_tok    = 0;
-+    int32_t *   slot_expert_dev = nullptr;  // device slot -> expert, -1 empty
-+    int32_t *   count_dev       = nullptr;  // device per-expert decaying LFU counter
-+    int32_t *   ghost_dev       = nullptr;  // device per-expert decaying demand counter
-+    int32_t *   last_dev        = nullptr;  // device per-expert last use (per-table clock)
-+    uint8_t *   slot_prov_dev   = nullptr;  // device slot -> provisional (pre-filled, never hit)
 +    // Provisional slots (MOE_EXPERT_CACHE_PROVISIONAL=1): a pre-filled/loaded expert is "provisional"
 +    // until it is hit.  While it is, the touch doorkeeper is bypassed for it, so the entry is evictable
 +    // like an empty slot while still serving hits - the model-both-ways behaviour arbitrary pre-fill
@@ -6509,37 +6252,10 @@ index 000000000..0896855d0
 +    // arena sizing by `apply_prefill_seed_locked`.  The decode band never uses it.
 +    std::vector<int64_t> prefill_count;     // [n_experts], 0 until a prefill touches this table
 +    int64_t     prefill_tokens = 0;         // prefill tokens tallied (reporting)
-+    // Device-side prefill tally (session 14): the host hook above is bypassed under `-sm tensor`
-+    // (block-06 staging intercepts the prefill upload), so the prompt's routing is histogrammed on the
-+    // GPU from `ggml_cuda_mul_mat_id`, where the routing device tensor is in hand.  One-shot: the first
-+    // decode-band flush after a non-empty tally bulk-admits it as provisional slots (`seed_prefill_lazy`).
-+    int32_t *   prefill_count_dev     = nullptr;   // device int32[n_experts]
-+    bool        prefill_tally_pending = false;     // a prefill op tallied since the last seed
-+    bool        prefill_seeded        = false;     // the prompt seed was applied (one-shot per table)
 +};
 +
 +std::mutex                          g_mutex;
 +std::vector<table_t>                g_tables;
-+// Device-side admission policy: one descriptor array per CUDA device (indexed by ordinal).  Built
-+// lazily after sizing (all tables registered), then reused for the life of the process.
-+struct policy_dev_t {
-+    moe_cache_policy_desc * desc       = nullptr;
-+    int32_t *               shape_dev  = nullptr;   // device int32[n]: this token's n_used*n_tok, 0 = inactive
-+    std::vector<int>        ids;                     // global table indices, in descriptor order
-+    std::vector<int32_t>    shape_host;
-+    int                     n          = 0;
-+    int                     cap        = 0;
-+    bool                    initialized = false;     // device arrays seeded from the host mirrors
-+    // Periodic progress logging: one tick per token per device (the scheduler's end-of-pass flush).
-+    int64_t                 tokens      = 0;
-+    int64_t                 last_fills  = 0;
-+    int64_t                 last_evicts = 0;
-+    int64_t                 last_resident = 0;
-+    int64_t                 last_time_us = 0;
-+    int64_t                 last_hits   = 0;
-+    int64_t                 last_misses = 0;
-+};
-+std::vector<policy_dev_t>           g_policy_dev;
 +// Stable registration key: (host master weight, device).  It must not be the tensor the op reads
 +// (`weight_cpy`): the graph allocator reuses those pointers across layers, so the consumer alias map
 +// below is re-pointed on every hook call while registration stays fixed.
@@ -6613,10 +6329,6 @@ index 000000000..0896855d0
 +bool    g_pool_prewarm     = true;   // MOE_HOST_POOL_PREWARM: fill every pool slot when it is built
 +bool    g_pool_dio         = false;  // MOE_HOST_POOL_DIO=1: O_DIRECT fill (debug fallback; bypasses the page cache)
 +bool    g_pool_bg          = true;   // MOE_HOST_POOL_BGFETCH=0: do eviction fills synchronously on the critical path
-+int     g_pool_policy     = 1;   // MOE_HOST_POOL_POLICY: 1 = pool-aware device policy (default; the
-+                                  //   kernel fills from the pinned pool when the expert is resident and
-+                                  //   falls back to the master); 0 = pooled tables use host promotion
-+                                  //   (original); 2 = device policy fills from the master (1b probe)
 +bool    g_pool_prefetch   = false; // MOE_HOST_POOL_PREFETCH=1: speculatively warm the pool from the routing
 +                                   //   (a net loss unless the pool nears full residency -- long-prompt sweep)
 +int64_t g_pool_total_bytes = 0;   // PROCESS-WIDE total budget (split over all registered host tensors)
@@ -6639,7 +6351,7 @@ index 000000000..0896855d0
 +// An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
 +// several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
 +// graph can therefore hit a stale alias: another layer's table, or another device's (its arena/counters are then read
-+// or written from the wrong GPU - a page fault in moe_cache_tally_kernel, or garbage, with -sm layer on 2 GPUs).
++// or written from the wrong GPU - a page fault or garbage, with -sm layer on 2 GPUs).
 +// Only trust an alias whose table is on the calling device and, when the op is known, belongs to the op's layer.
 +static int64_t g_alias_stale = 0;
 +static int alias_find_checked(const void * key, int device, int layer) {
@@ -6684,19 +6396,6 @@ index 000000000..0896855d0
 +int                                 g_rearm_slots[512];
 +bool                                g_sized           = false;  // the deferred sizing has run
 +bool                                g_cold_uva        = false;  // MOE_EXPERT_CACHE_COLD=uva: serve rejected misses from the host alias
-+bool                                g_devmap          = false;  // MOE_EXPERT_CACHE_DEVMAP (default ON): build the remap on the device
-+bool                                g_devpolicy       = false;  // MOE_EXPERT_CACHE_DEVPOLICY=1: LFRU admission on the device
-+bool                                g_kslot           = false;  // MOE_EXPERT_CACHE_KSLOT=1: resolve the slot map in the MoE ids consumer (B3)
-+// Device-remap transition arming.  Sizing happens mid-token inside the eager hook (the first decode-band
-+// role to reach `!g_sized`), so on that token some roles are filled by the eager hook and the rest would
-+// be taken over by devmap.  The two paths must not be mixed across the roles of a layer: the fused
-+// gate+up kernel indexes the gate lane with the UP table's remap, so gate/up/down must hold identical
-+// `expert_slot` maps.  Devmap takeover therefore stays disabled until a full decode pass has filled every
-+// devmap-capable table eagerly (one uniform pass), and only then flips on.
-+bool                                g_devmap_armed    = true;
-+int                                 g_devmap_arm_expected = 0;
-+int                                 g_devmap_arm_seen  = 0;
-+std::vector<uint8_t>                g_devmap_eager_seen;
 +int64_t                             g_cold_reaches    = 0;
 +// Phase 1b fill-vs-cold admission policy (only consulted when a cold read is available):
 +//   0 = always : fill every miss (LFRU eviction is the whole admission control)
@@ -6724,8 +6423,6 @@ index 000000000..0896855d0
 +int64_t                             g_alloc_clamped   = 0;
 +int64_t                             g_alloc_failed    = 0;
 +
-+// Deferred-promotion call accounting (used by the exit report).
-+int64_t                             g_promote_calls   = 0;
 +// Expert-traffic accounting (per access through the policy): a FILL is one host->device copy of
 +// `expert_bytes`; a COLD access is the MMVQ kernel reading those bytes in place over PCIe.  Both are
 +// host->device traffic; only the fill is managed by the cache.
@@ -6734,7 +6431,6 @@ index 000000000..0896855d0
 +int64_t                             g_acc_colds       = 0;
 +int64_t                             g_fill_bytes      = 0;
 +int64_t                             g_cold_bytes      = 0;
-+int64_t                             g_remap_launches  = 0;
 +
 +int env_int(const char * name, int dflt) {
 +    const char * e = getenv(name);
@@ -6809,7 +6505,7 @@ index 000000000..0896855d0
 +// (`--host-experts mmap` -> `CPU_Mapped`) maps to no device address; on a GPU without XNACK (RDNA
 +// under ROCm reports `XNACK enabled: NO`) a kernel read of it is a fatal "page not present" fault
 +// (issue #116, `mul_mat_vec_q_moe`'s cold read).  Leave `host_dev` null in that case: the in-place
-+// cold region, the device remap and the device-policy fill all require it and stand down, while the
++// cold region requires it and stands down, while the
 +// fill copies (which source `t.host` through cudaMemcpyAsync, pageable-safe) keep the cache correct.
 +void bind_host_dev_locked(table_t & t) {
 +    if (!(g_cold_uva && t.host != nullptr && !t.host_dev_bound)) {
@@ -6894,7 +6590,6 @@ index 000000000..0896855d0
 +    g_pool_prewarm     = env_int("MOE_HOST_POOL_PREWARM", 1) != 0;
 +    g_pool_dio         = env_int("MOE_HOST_POOL_DIO", 0) != 0;
 +    g_pool_bg          = env_int("MOE_HOST_POOL_BGFETCH", 1) != 0;
-+    g_pool_policy      = env_int("MOE_HOST_POOL_POLICY", 1);
 +    g_pool_prefetch    = env_int("MOE_HOST_POOL_PREFETCH", 0) != 0;
 +    g_pool_total_bytes = (g_pool_enabled && !g_pool_auto) ? moe_host_pool_mib() * 1024 * 1024 : 0;
 +    if (g_pool_enabled) {
@@ -6922,27 +6617,6 @@ index 000000000..0896855d0
 +    if (g_touch < 2) {
 +        g_touch = 2;
 +    }
-+    // Device-remap mode (item 3 / the "gentle curve"): build the slot remap on the device + deferred
-+    // post-graph promotion, instead of the eager per-op host routing readback + full device sync.  The
-+    // eager host path reads the routing back per layer and synchronizes, so at partial residency the
-+    // decode stalls to ~70 t/s; the device-remap path is +22 % over it at every h (session 10).  At h=1 the
-+    // identity fast path wins the lookup first, so this is a no-op at full residency, and it self-arms
-+    // after one uniform eager decode pass (see `g_devmap_armed`).  DEFAULT ON since session 19 (the
-+    // post-session-10 promotion gates - byte-identity, width purity, MTP, coherence, MUL_MAT_ID - were
-+    // re-run green on the device-remap path); `MOE_EXPERT_CACHE_DEVMAP=0` restores the eager host path.
-+    g_devmap      = env_int("MOE_EXPERT_CACHE_DEVMAP", 1) != 0;
-+    // Device-side admission policy: run the LFRU decision on the GPU (one batched kernel per device
-+    // per token) instead of the per-table host promotion.  Requires the device-remap path.  DEFAULT ON
-+    // when `DEVMAP` is on (it passed byte-identity, width purity, the policy self-test, MTP and the
-+    // concurrency sweep); `MOE_EXPERT_CACHE_DEVPOLICY=0` is the kill switch.
-+    g_devpolicy   = g_devmap && env_int("MOE_EXPERT_CACHE_DEVPOLICY", 1) != 0;
-+    // B3: the MoE ids consumer (mmvq MoE kernel) resolves `slot_dev[ids[i]]` itself and writes the raw
-+    // routing into the table's used-list, so the per-table `moe_cache_build_remap_kernel` launches are
-+    // not needed.  DEFAULT ON whenever DEVMAP is on (opt out with `MOE_EXPERT_CACHE_KSLOT=0`): it is
-+    // bit-exact on every split (1/2/3 GPU, layer and tensor) including the UVA cold encoding, and it is
-+    // neutral-to-positive at every arena size measured (tiny MIB=1024/2048) as well as high h; the only
-+    // effect is to remove remap launches from the graph.  Requires the device-remap path.
-+    g_kslot       = g_devmap && env_int("MOE_EXPERT_CACHE_KSLOT", 1) != 0;
 +    // Fail-soft / --fit: the reserve kept for the compute reserve / KV growth.
 +    g_reserve_mib      = env_int("MOE_EXPERT_CACHE_RESERVE_MIB", 1024);
 +    if (g_reserve_mib < 0) {
@@ -6964,10 +6638,7 @@ index 000000000..0896855d0
 +        g_min_res_pct = 0;
 +    }
 +    // Prefill seed: use the prompt's prefill routing to bulk-admit its hot experts as provisional slots
-+    // before decode starts (session 14).  Default ON (kill switch `MOE_EXPERT_CACHE_PREFILL_SEED=0`);
-+    // it passed the byte-identity / width-purity / MUL_MAT_ID / MTP / coherence gates, and the repo's
-+    // default-on policy says a beneficial feature ships on.  It rides the device-policy path, so the
-+    // tally is also gated on `g_devmap` below (with `DEVMAP=0` there is no consumer and it is inert).
++    // before decode starts (session 14).  Default ON (kill switch `MOE_EXPERT_CACHE_PREFILL_SEED=0`).
 +    g_prefill_seed   = env_int("MOE_EXPERT_CACHE_PREFILL_SEED", 1) != 0;
 +    // Provisional pre-fill/seed slots: a pre-filled expert the policy has never hit is treated as an
 +    // empty slot for admission (the touch doorkeeper is bypassed for it) while still serving hits.  This
@@ -7838,8 +7509,8 @@ index 000000000..0896855d0
 +// `t.prefill_count` was accumulated in `moe_cache_update_host`'s prefill branch; here it is ranked
 +// (count desc, expert id asc), the top `min(slots, cap)` are placed in slots 0.. and copied from the
 +// pinned host master - the same bytes a decode fill would fetch, just front-loaded.  The host mirrors are
-+// populated so both the eager remap and the device-policy seed (`build_policy_descs_locked`) pick them
-+// up.  No-op for an identity table (already wholly resident) or one with no prefill tally.
++// populated so the eager remap picks them up.  No-op for an identity table (already wholly resident)
++// or one with no prefill tally.
 +void apply_prefill_seed_locked(table_t & t) {
 +    const bool from_tally = g_prefill_seed;
 +    if (!g_prefill_seed || t.identity || t.slots <= 0 || t.host == nullptr ||
@@ -7948,34 +7619,8 @@ index 000000000..0896855d0
 +    }
 +}
 +
-+// Prefill-seed fill (session 14): one expert, from the device-accessible host alias into its arena slot.
-+// One tiny launch per seed entry (<= slots per table), reading the same UVA alias the policy kernel
-+// fills from, so a `-sm tensor` pageable host master (a host `cudaMemcpyAsync` here measured ~1 GB/s)
-+// is served at device-read speed.  `do2d` covers a strided axis-0 slice via `rows` rows of `row_bytes`.
-+// Modelled on the policy kernel's fill phase: `blockIdx.x` selects a seeded expert (one block per
-+// expert), `slots[blockIdx.x]` its arena slot and `experts[blockIdx.x]` its host master index.
-+static __global__ void moe_cache_seed_fill_kernel(char * __restrict__ arena, const char * __restrict__ host_dev,
-+                                                  const int32_t * __restrict__ slots,
-+                                                  const int32_t * __restrict__ experts, int n,
-+                                                  int64_t expert_bytes, int64_t host_bytes, int64_t src_off,
-+                                                  int64_t rows, int64_t row_bytes, int64_t host_pitch, int do2d) {
-+    const int i = blockIdx.x;
-+    if (i >= n) {
-+        return;
-+    }
-+    char *       dst = arena + (int64_t) slots[i] * expert_bytes;
-+    const char * src = host_dev + (int64_t) experts[i] * host_bytes + src_off;
-+    const int tid = threadIdx.x;
-+    const int nt  = blockDim.x;
-+    if (!do2d) {
-+        moe_cache_policy_copy(dst, src, (size_t) expert_bytes, tid, nt);
-+        return;
-+    }
-+    for (int64_t r = 0; r < rows; r++) {
-+        moe_cache_policy_copy(dst + (size_t) r * (size_t) row_bytes,
-+                              src + (size_t) r * (size_t) host_pitch, (size_t) row_bytes, tid, nt);
-+    }
-+}
++
++
 +
 +// Host-weight expert gather (B2, session 15): for an offloaded `MUL_MAT_ID` expert upload, copy only the
 +// experts the routing selects, straight from the host master into the scheduler's device `input_cpy`,
@@ -8040,233 +7685,8 @@ index 000000000..0896855d0
 +    }
 +}
 +
-+// Generalised seed placement for a NON-empty arena (session 14 live path).  `rank` is descending
-+// prefill frequency (expert id asc on a tie).  Free slots are used first; if none, the lowest-count
-+// resident that is NOT in the seed set is evicted - a provisional entry has count 0, so a stale
-+// pre-fill is reclaimed first, exactly like an empty slot.  The fills run on `stream` (one tiny kernel
-+// per expert, reading the device-accessible host alias) and are ordered before the following policy
-+// kernel.  A device fill rather than a host `cudaMemcpyAsync` because under `-sm tensor` the host master
-+// is a pageable mmap: a pageable H2D measured ~1 GB/s (25k calls = 8 s/device), while the GPU reading
-+// the same UVA alias is the fast path the policy kernel already uses.  Returns the number placed.
-+int apply_prefill_seed_rank_locked(table_t & t, const std::vector<int32_t> & rank, int k, void * stream) {
-+    if (t.identity || t.slots <= 0 || t.host == nullptr || k <= 0) {
-+        return 0;
-+    }
-+    std::vector<uint8_t> protect((size_t) t.n_experts, 0);
-+    for (int i = 0; i < k && i < (int) rank.size(); i++) {
-+        const int32_t e = rank[(size_t) i];
-+        if (e >= 0 && e < t.n_experts) {
-+            protect[(size_t) e] = 1;
-+        }
-+    }
-+    const int64_t rows = (t.split_axis == 0 && t.host_pitch > 0 && t.host_bytes > 0)
-+                             ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
-+    const size_t  row  = rows > 0 ? (t.expert_bytes / (size_t) rows) : 0;
-+    std::vector<int32_t> pair_slot, pair_exp;
-+    pair_slot.reserve((size_t) k);
-+    pair_exp.reserve((size_t) k);
-+    int placed = 0;
-+    for (int i = 0; i < k && i < (int) rank.size(); i++) {
-+        const int32_t e = rank[(size_t) i];
-+        if (e < 0 || e >= t.n_experts) {
-+            continue;
-+        }
-+        if (t.expert_slot.find(e) != t.expert_slot.end()) {
-+            continue;   // already resident
-+        }
-+        int slot = -1;
-+        for (int s = 0; s < t.slots; s++) {
-+            if (t.slot_expert[(size_t) s] < 0) { slot = s; break; }
-+        }
-+        int victim = -1;
-+        if (slot < 0) {
-+            int64_t vcount = 0, vlast = 0;
-+            for (int s = 0; s < t.slots; s++) {
-+                const int32_t ce = t.slot_expert[(size_t) s];
-+                if (ce < 0 || ce >= t.n_experts || protect[(size_t) ce]) {
-+                    continue;
-+                }
-+                const int64_t c = (size_t) ce < t.count.size() ? t.count[(size_t) ce] : 0;
-+                const int64_t l = (size_t) ce < t.last.size()  ? t.last[(size_t) ce]  : 0;
-+                if (victim < 0 || c < vcount || (c == vcount && l < vlast)) {
-+                    victim = ce; slot = s; vcount = c; vlast = l;
-+                }
-+            }
-+            if (slot >= 0 && victim >= 0) {
-+                t.expert_slot.erase(victim);
-+                t.slot_expert[(size_t) slot] = -1;
-+                t.evictions++;
-+            }
-+        }
-+        if (slot < 0) {
-+            continue;   // every slot holds a protected seed expert already
-+        }
-+        if (t.host_dev == nullptr) {
-+            break;   // no device-accessible host alias: cannot fill
-+        }
-+        const bool do2d = (t.split_axis == 0 && t.host_pitch > 0);
-+        if (do2d && row == 0) {
-+            break;   // the host geometry is not representable by a single fill
-+        }
-+        pair_slot.push_back(slot);
-+        pair_exp.push_back(e);
-+        t.slot_expert[(size_t) slot] = e;
-+        t.expert_slot[e]             = slot;
-+        if ((int) t.slot_prov.size() == t.slots) {
-+            t.slot_prov[(size_t) slot] = 1;   // provisional until first hit (MOE_EXPERT_CACHE_PROVISIONAL=1)
-+        }
-+        t.count[(size_t) e] = 0;
-+        t.ghost[(size_t) e] = 0;
-+        t.last[(size_t) e]  = 0;
-+        placed++;
-+    }
-+    // ONE fill launch for the whole table (a block per seeded expert, `blockIdx.x` = expert).  A launch
-+    // per expert measured ~0.6 ms of host launch overhead x ~25k experts = ~15 s/device; one launch per
-+    // table is ~10 us.  The pair list is staged in `remap_dev`, which is free between graphs and is
-+    // overwritten by the next token's remap only after this fill (same stream, ordered).
-+    if (placed > 0 && 2 * placed <= (int) t.remap_cap) {
-+        std::vector<int32_t> staging((size_t) 2 * placed);
-+        for (int i = 0; i < placed; i++) {
-+            staging[(size_t) i]          = pair_slot[(size_t) i];
-+            staging[(size_t) placed + i] = pair_exp[(size_t) i];
-+        }
-+        const bool do2d = (t.split_axis == 0 && t.host_pitch > 0);
-+        (void) cudaMemcpyAsync(t.remap_dev, staging.data(), staging.size() * sizeof(int32_t),
-+                               cudaMemcpyHostToDevice, (cudaStream_t) stream);
-+        moe_cache_seed_fill_kernel<<<placed, 256, 0, (cudaStream_t) stream>>>(
-+            (char *) t.arena, (const char *) t.host_dev, t.remap_dev, t.remap_dev + placed, placed,
-+            (int64_t) t.expert_bytes, (int64_t) t.host_bytes, (int64_t) t.src_off,
-+            rows, (int64_t) row, (int64_t) t.host_pitch, do2d ? 1 : 0);
-+        if (cudaGetLastError() != cudaSuccess) {
-+            (void) cudaGetLastError();
-+            GGML_LOG_ERROR("%s: seed fill launch failed layer=%d role=%s; slots may be stale\n",
-+                           __func__, t.layer, t.role.c_str());
-+        }
-+    }
-+    if (placed > 0) {
-+        t.fills += placed;
-+    }
-+    return placed;
-+}
 +
-+// D2H the device-policy residency/counters into the host mirrors.  Under DEVPOLICY the host mirrors go
-+// stale (the kernel mutates only the device arrays), so the live seed snapshots them before placing.
-+void policy_pull_host_locked(table_t & t, int device) {
-+    if (!t.policy || t.slot_expert_dev == nullptr || t.slots <= 0) {
-+        return;
-+    }
-+    device_guard dg(device);
-+    t.slot_expert.assign((size_t) t.slots, -1);
-+    t.slot_prov.assign((size_t) t.slots, 0);
-+    t.count.assign((size_t) t.n_experts, 0);
-+    t.ghost.assign((size_t) t.n_experts, 0);
-+    t.last.assign((size_t) t.n_experts, 0);
-+    (void) cudaMemcpy(t.slot_expert.data(), t.slot_expert_dev, (size_t) t.slots * sizeof(int32_t), cudaMemcpyDeviceToHost);
-+    (void) cudaMemcpy(t.count.data(),       t.count_dev,       (size_t) t.n_experts * sizeof(int32_t), cudaMemcpyDeviceToHost);
-+    (void) cudaMemcpy(t.ghost.data(),       t.ghost_dev,       (size_t) t.n_experts * sizeof(int32_t), cudaMemcpyDeviceToHost);
-+    (void) cudaMemcpy(t.last.data(),        t.last_dev,        (size_t) t.n_experts * sizeof(int32_t), cudaMemcpyDeviceToHost);
-+    if (t.slot_prov_dev != nullptr && (int) t.slot_prov.size() == t.slots) {
-+        (void) cudaMemcpy(t.slot_prov.data(), t.slot_prov_dev, (size_t) t.slots * sizeof(uint8_t), cudaMemcpyDeviceToHost);
-+    }
-+    t.expert_slot.clear();
-+    for (int s = 0; s < t.slots; s++) {
-+        const int32_t e = t.slot_expert[(size_t) s];
-+        if (e >= 0 && e < t.n_experts) {
-+            t.expert_slot[e] = s;
-+        }
-+    }
-+    t.slot_dirty = true;
-+}
 +
-+// One-shot bulk admission of the prompt's hottest experts into a LIVE arena (MOE_EXPERT_CACHE_PREFILL_SEED=1,
-+// the device-tally path).  Called from the first decode-band policy flush after the prefill tally is
-+// non-empty; the seed takes effect from the NEXT token (this call is post-graph, before the batched policy
-+// kernel, which then treats the seeded slots as provisional).  A no-op until a prefill has tallied.
-+bool seed_prefill_lazy_locked(int device, void * stream) {
-+    if (!g_prefill_seed || device < 0) {
-+        return false;
-+    }
-+    // Iterate the device's registered cache tables DIRECTLY, not the device-policy descriptor list: the
-+    // seed must run for the host expert pool path too, where the pool forces `t.policy` off and the
-+    // descriptor list is empty even though the device tally was collected.
-+    std::vector<int> ids;
-+    bool any = false;
-+    for (int i = 0; i < (int) g_tables.size(); i++) {
-+        const table_t & t = g_tables[i];
-+        if (t.device != device || t.n_experts <= 0) {
-+            continue;
-+        }
-+        ids.push_back(i);
-+        if (t.prefill_tally_pending && !t.prefill_seeded) {
-+            any = true;
-+        }
-+    }
-+    if (!any) {
-+        return false;
-+    }
-+    // If the device policy is live the host mirrors are stale; snapshot the true residency so a victim is
-+    // never a slot the device still holds.  A no-op for a non-policy table, where the mirrors ARE the
-+    // source (the host-promotion path).
-+    for (int id : ids) {
-+        policy_pull_host_locked(g_tables[id], device);
-+    }
-+    int seeded_tables = 0, seeded_slots = 0;
-+    device_guard dg(device);
-+    for (int id : ids) {
-+        table_t & t = g_tables[id];
-+        if (!t.prefill_tally_pending || t.prefill_seeded || t.n_experts <= 0) {
-+            continue;
-+        }
-+        t.prefill_seeded        = true;
-+        t.prefill_tally_pending = false;
-+        if (t.prefill_count_dev == nullptr) {
-+            continue;
-+        }
-+        std::vector<int32_t> tally((size_t) t.n_experts, 0);
-+        if (cudaMemcpy(tally.data(), t.prefill_count_dev, (size_t) t.n_experts * sizeof(int32_t),
-+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-+            (void) cudaGetLastError();
-+            continue;
-+        }
-+        (void) cudaMemsetAsync(t.prefill_count_dev, 0, (size_t) t.n_experts * sizeof(int32_t), (cudaStream_t) stream);
-+        int64_t total = 0;
-+        std::vector<int32_t> rank((size_t) t.n_experts);
-+        for (int e = 0; e < t.n_experts; e++) {
-+            total += tally[(size_t) e];
-+            rank[(size_t) e] = e;
-+        }
-+        if (total > 0 && !t.identity && t.slots > 0 && t.host != nullptr && t.host_dev != nullptr) {
-+            std::sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) {
-+                if (tally[(size_t) a] != tally[(size_t) b]) return tally[(size_t) a] > tally[(size_t) b];
-+                return a < b;
-+            });
-+            int k = t.n_experts;
-+            if (g_prefill_seed_n > 0 && g_prefill_seed_n < k) {
-+                k = g_prefill_seed_n;
-+            }
-+            if (k > t.slots) {
-+                k = t.slots;
-+            }
-+            const int placed = apply_prefill_seed_rank_locked(t, rank, k, stream);
-+            if (placed > 0) {
-+                seeded_tables++;
-+                seeded_slots += placed;
-+            }
-+        }
-+        // Target 3: rank the host pool from the same tally AFTER the arena seed, so the seeded residents
-+        // are excluded and the pool holds the next-most-wanted (additive) experts.
-+        pool_rerank_from_tally_locked(t, tally);
-+    }
-+    if (seeded_tables > 0) {
-+        GGML_LOG_WARN("%s: prompt-routing seed dev=%d: %d tables, %d provisional slots\n",
-+                      __func__, device, seeded_tables, seeded_slots);
-+        if (device < (int) g_policy_dev.size()) {
-+            g_policy_dev[device].initialized = false;   // resync the policy from the seeded host mirrors
-+        }
-+        return true;
-+    }
-+    return false;
-+}
 +
 +// Allocate `slots` (capped at n_experts) for one table.  Fail-soft: a failed cudaMalloc disables
 +// just this table (the op falls back to the full-table path for it).
@@ -8305,19 +7725,6 @@ index 000000000..0896855d0
 +        t.arena = nullptr;
 +    }
 +    if (t.remap_dev != nullptr){ (void) cudaFree(t.remap_dev); t.remap_dev = nullptr; }
-+    if (t.slot_dev != nullptr) { (void) cudaFree(t.slot_dev); t.slot_dev = nullptr; }
-+    if (t.pool_slot_dev != nullptr) { (void) cudaFree(t.pool_slot_dev); t.pool_slot_dev = nullptr; }
-+    t.policy_pool_base = nullptr;
-+    if (t.used_dev != nullptr) { (void) cudaFree(t.used_dev); t.used_dev = nullptr; }
-+    if (t.slot_expert_dev != nullptr) { (void) cudaFree(t.slot_expert_dev); t.slot_expert_dev = nullptr; }
-+    if (t.count_dev != nullptr)  { (void) cudaFree(t.count_dev);  t.count_dev  = nullptr; }
-+    if (t.ghost_dev != nullptr)  { (void) cudaFree(t.ghost_dev);  t.ghost_dev  = nullptr; }
-+    if (t.last_dev != nullptr)   { (void) cudaFree(t.last_dev);   t.last_dev   = nullptr; }
-+    if (t.slot_prov_dev != nullptr) { (void) cudaFree(t.slot_prov_dev); t.slot_prov_dev = nullptr; }
-+    if (t.prefill_count_dev != nullptr) { (void) cudaFree(t.prefill_count_dev); t.prefill_count_dev = nullptr; }
-+    if (t.used_host != nullptr)  { (void) cudaFreeHost(t.used_host);  t.used_host  = nullptr; }
-+    if (t.used_host2 != nullptr) { (void) cudaFreeHost(t.used_host2); t.used_host2 = nullptr; }
-+    if (t.slot_pin != nullptr)   { (void) cudaFreeHost(t.slot_pin);   t.slot_pin   = nullptr; }
 +    (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
 +
 +    g_arena_bytes -= (int64_t) t.slots * (int64_t) t.expert_bytes;
@@ -8327,21 +7734,13 @@ index 000000000..0896855d0
 +    t.slots          = 0;
 +    t.allocated      = false;
 +    t.identity       = false;
-+    t.devmap         = false;
-+    t.policy         = false;
-+    t.policy_pending = false;
-+    t.remap_fresh    = false;
 +    t.remap_cap      = 0;
 +    t.remap_n_used   = 0;
 +    t.remap_n_tok    = 0;
-+    t.used_cap       = 0;
-+    t.used_pending   = false;
-+    t.used_toggle    = 0;
 +    t.slot_dirty     = true;
 +    t.slot_expert.clear();
 +    t.slot_prov.clear();
 +    t.expert_slot.clear();
-+    t.slot_dev_host.clear();
 +    t.remap_host.clear();
 +    t.hook_experts.clear();
 +}
@@ -8521,113 +7920,8 @@ index 000000000..0896855d0
 +                          __func__, t.layer, t.role.c_str());
 +        }
 +    }
-+    // Device-remap mode (gentle-curve follow-up): a PARTIAL-residency table cannot keep `slot == expert`,
-+    // so allocate a device `expert -> slot` map (all -1 = cold) that the consumer's remap kernel reads.
-+    // The host refreshes it once per token from the deferred promotion pass.  Requirement: the table must
-+    // be COLD-SAFE, because the promotion lags one token and the current token's misses must be servable
-+    // through the UVA cold region.  Item 1 (session 8) made that true for a `-sm tensor` split whose host
-+    // slice geometry is representable (contiguous gate/up, strided axis-0 down), so split tables now
-+    if (g_devmap && !t.identity && table_cold_ok(t) && t.remap_dev != nullptr && t.n_experts > 0) {
-+        if (cudaMalloc((void **) &t.slot_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess) {
-+            const size_t used_cap = (size_t) t.n_experts * MOE_EXPERT_CACHE_MAX_TOK;
-+            if (cudaMalloc((void **) &t.used_dev, used_cap * sizeof(int32_t)) != cudaSuccess) {
-+                (void) cudaGetLastError();
-+                t.used_dev = nullptr;
-+            } else {
-+                t.used_cap = (int64_t) used_cap;
-+            }
-+            // The deferred promotion is per table per token; pageable D2H/H2D staging made it ~60 us
-+            // per table.  Pinned staging cuts that by ~5x and keeps the promotion off the critical path.
-+            if (t.used_dev != nullptr && cudaMallocHost((void **) &t.used_host, used_cap * sizeof(int32_t)) != cudaSuccess) {
-+                (void) cudaGetLastError();
-+                t.used_host = nullptr;
-+            }
-+            // Second pinned buffer for the PIPELINED (double-buffered) readback: each promote call
-+            // enqueues this token's async D2H and applies the policy to the previous call's data, whose
-+            // copy the backend synchronize between tokens has already completed.  A per-table
-+            // synchronous D2H on 240 tables cost ~4.8 ms/token (measured 2026-09-29).
-+            if (t.used_dev != nullptr && cudaMallocHost((void **) &t.used_host2, used_cap * sizeof(int32_t)) != cudaSuccess) {
-+                (void) cudaGetLastError();
-+                t.used_host2 = nullptr;
-+            }
-+            if (cudaMallocHost((void **) &t.slot_pin, (size_t) t.n_experts * sizeof(int32_t)) != cudaSuccess) {
-+                (void) cudaGetLastError();
-+                t.slot_pin = nullptr;
-+            }
-+            t.slot_dev_host.assign(t.n_experts, -1);
-+            (void) cudaMemcpy(t.slot_dev, t.slot_dev_host.data(), (size_t) t.n_experts * sizeof(int32_t),
-+                              cudaMemcpyHostToDevice);
-+            // The used-list buffer is what the deferred promotion reads (the routing tensor's own storage
-+            // is recycled once the graph completes, so reading it back later yields garbage).
-+            t.devmap = t.used_dev != nullptr && t.used_host != nullptr && t.used_host2 != nullptr && t.slot_pin != nullptr;
-+            // Prefill-seed tally (session 14, MOE_EXPERT_CACHE_PREFILL_SEED): allocate the device
-+            // histogram HERE, at sizing.  A lazy cudaMalloc on the first prefill op is a device
-+            // synchronize, and 240 of them interleaved with the prefill graph measured the prompt at
-+            // 207 -> 127 t/s (1.2 s).  Allocating once here keeps the prefill path allocation-free.
-+            if (g_prefill_seed && t.prefill_count_dev == nullptr) {
-+                if (cudaMalloc((void **) &t.prefill_count_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess) {
-+                    (void) cudaMemset(t.prefill_count_dev, 0, (size_t) t.n_experts * sizeof(int32_t));
-+                } else {
-+                    (void) cudaGetLastError();
-+                    t.prefill_count_dev = nullptr;
-+                }
-+            }
-+        } else {
-+            (void) cudaGetLastError();
-+            t.slot_dev = nullptr;
-+            t.devmap   = false;
-+        }
-+    }
-+    // Device-side admission policy state (MOE_EXPERT_CACHE_DEVPOLICY=1): the device mirrors of the
-+    // LFRU residency map + counters, updated in place by `moe_cache_policy_kernel`.  Only a devmap
-+    // table can use it, because the kernel replaces the host `access_locked` policy entirely.
-+    //
-+    // A SPLIT table (`split_axis >= 0`: a `-sm tensor` / Meta-split expert slice) must NOT use the
-+    // device policy.  Its policy kernel and its prefill seed are tuned for a whole, per-device expert
-+    // and measurably hurt the split case: 2 GPU IQ4_NL `-ncmoe 48`, MTP n3, n=1024 went 60.3 -> 70.7 t/s
-+    // (better than `-sm layer`) once the split tables fell back to the host promotion.  The unsplit
-+    // (`-sm layer`) case keeps the device policy -- that is where the seed pays off.  The split tables
-+    // still get the cache (the arena + slot remap); only the admission-policy engine changes.
-+    // `MOE_EXPERT_CACHE_DEVPOLICY_SPLIT=1` restores the old behaviour.
-+    static const bool devpolicy_split = [] {
-+        const char * e = getenv("MOE_EXPERT_CACHE_DEVPOLICY_SPLIT");
-+        return e != nullptr && atoi(e) != 0;
-+    }();
-+    // Target 1 (pool-aware device policy): a pooled table now uses the device policy too.  The policy
-+    // kernel's fill sources the bounded host pool when the expert is pool-resident (the `pool_slot`
-+    // map below) and falls back to the master otherwise, so the pool relieves a small arena instead of
-+    // being bypassed.  The master stays present in Phase 2, so a `-1` map entry is always servable.
-+    if (g_devpolicy && (g_pool_policy != 0 || !g_pool_enabled) && t.devmap && (t.split_axis < 0 || devpolicy_split)) {
-+        device_guard pdg(t.device);
-+        bool ok = cudaMalloc((void **) &t.slot_expert_dev, (size_t) slots * sizeof(int32_t)) == cudaSuccess;
-+        ok = ok && cudaMalloc((void **) &t.count_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess;
-+        ok = ok && cudaMalloc((void **) &t.ghost_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess;
-+        ok = ok && cudaMalloc((void **) &t.last_dev,  (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess;
-+        ok = ok && cudaMalloc((void **) &t.slot_prov_dev, (size_t) slots * sizeof(uint8_t)) == cudaSuccess;
-+        ok = ok && cudaMalloc((void **) &t.pool_slot_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess;
-+        if (ok) {
-+            (void) cudaMemset(t.slot_expert_dev, 0xFF, (size_t) slots * sizeof(int32_t));
-+            (void) cudaMemset(t.count_dev, 0, (size_t) t.n_experts * sizeof(int32_t));
-+            (void) cudaMemset(t.ghost_dev, 0, (size_t) t.n_experts * sizeof(int32_t));
-+            (void) cudaMemset(t.last_dev,  0, (size_t) t.n_experts * sizeof(int32_t));
-+            (void) cudaMemset(t.slot_prov_dev, 0, (size_t) slots * sizeof(uint8_t));
-+            (void) cudaMemset(t.pool_slot_dev, 0xFF, (size_t) t.n_experts * sizeof(int32_t));
-+            t.policy = true;
-+        } else {
-+            (void) cudaGetLastError();
-+            if (t.slot_expert_dev != nullptr) { (void) cudaFree(t.slot_expert_dev); t.slot_expert_dev = nullptr; }
-+            if (t.count_dev       != nullptr) { (void) cudaFree(t.count_dev);       t.count_dev       = nullptr; }
-+            if (t.ghost_dev       != nullptr) { (void) cudaFree(t.ghost_dev);       t.ghost_dev       = nullptr; }
-+            if (t.last_dev        != nullptr) { (void) cudaFree(t.last_dev);        t.last_dev        = nullptr; }
-+            if (t.slot_prov_dev   != nullptr) { (void) cudaFree(t.slot_prov_dev);   t.slot_prov_dev   = nullptr; }
-+            if (t.pool_slot_dev   != nullptr) { (void) cudaFree(t.pool_slot_dev);   t.pool_slot_dev   = nullptr; }
-+            GGML_LOG_WARN("%s: device-policy state alloc failed layer=%d role=%s; using the host promotion\n",
-+                          __func__, t.layer, t.role.c_str());
-+        }
-+    }
 +    // Prefill seed: bulk-admit the prompt's hottest experts before the first decode token (one-shot).
-+    // (The live, device-tally-driven seed runs later, from the first decode-band policy flush - see
-+    // `seed_prefill_lazy_locked`; this sizing-time call only serves the gate-off/eager path.)
++    // This sizing-time call only serves the gate-off/eager path.
 +    apply_prefill_seed_locked(t);
 +    // Account the count ACTUALLY allocated (`slots`/`t.slots`), not the requested `arena_slots`: on a
 +    // shrunk table the two differ and the old `arena_slots` accounting over-reported the arena.
@@ -8906,16 +8200,7 @@ index 000000000..0896855d0
 +            }
 +        }
 +    }
-+    // Arm the device-remap takeover only after one uniform eager decode pass (see `g_devmap_armed`).
-+    g_devmap_arm_expected = 0;
-+    for (const table_t & t : g_tables) {
-+        if (t.devmap) {
-+            g_devmap_arm_expected++;
-+        }
-+    }
-+    g_devmap_arm_seen = 0;
-+    g_devmap_eager_seen.assign(g_tables.size(), 0);
-+    g_devmap_armed = (g_devmap_arm_expected == 0);
++    g_uniform_slots = max_dev >= 0 ? slots_d[0] : -1;
 +    for (int d = 0; d <= max_dev; d++) {
 +        if (dev_n_tables[d] == 0) {
 +            continue;
@@ -8941,287 +8226,16 @@ index 000000000..0896855d0
 +
 +} // namespace
 +
-+// Device-side remap build (gentle-curve follow-up): remap[tok*n_used + j] = slot[ids[tok,j]], or
-+// `n_res + e` for a non-resident expert (the Phase 1b UVA cold region).  Tiny (n_used*n_tok <= 64);
-+// capture-safe so it can be baked into a decode CUDA graph.
-+static __global__ void moe_cache_build_remap_kernel(
-+        const int32_t * __restrict__ slot,
-+        const char * __restrict__ ids,
-+        int32_t * __restrict__ remap,
-+        int32_t * __restrict__ used,
-+        int32_t * __restrict__ used2,
-+        const int32_t * __restrict__ slot2,
-+        int32_t * __restrict__ remap2,
-+        int32_t * __restrict__ used3,
-+        int n_experts, int n_res, int n_used, int n_tok,
-+        size_t nb0, size_t nb1) {
-+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-+    if (i >= n_used * n_tok) {
-+        return;
-+    }
-+    const int tok = i / n_used;
-+    const int j   = i - tok * n_used;
-+    const int32_t e = *(const int32_t *) (ids + (size_t) tok * nb1 + (size_t) j * nb0);
-+    int32_t s = -1;
-+    const int32_t ev = (e >= 0 && e < n_experts) ? e : -1;
-+    if (ev >= 0) {
-+        s = slot[ev];
-+    }
-+    if (used != nullptr) {
-+        used[i] = ev;
-+    }
-+    // used2 folds a second table's used-list write into the same launch (the fused gate+up path: the
-+    // gate lane's remap VALUE is unused - the fused kernel reads the up remap for both lanes - but the
-+    // deferred promotion needs the gate table's routing).  One kernel, both tables' used-lists.
-+    if (used2 != nullptr) {
-+        used2[i] = ev;
-+    }
-+    // slot2/remap2/used3 build a SIBLING table's remap from its OWN slot map (the layer's routed
-+    // `down`, whose redirect would otherwise be a separate launch).  Using slot2 - not the up map -
-+    // keeps it correct even if a role's map ever diverges; the down op reads this same routing `ids`.
-+    if (used3 != nullptr) {
-+        used3[i] = ev;
-+    }
-+    if (remap2 != nullptr) {
-+        int32_t s2 = -1;
-+        if (ev >= 0 && slot2 != nullptr) {
-+            s2 = slot2[ev];
-+        }
-+        remap2[i] = (s2 >= 0 && s2 < n_res) ? s2 : (n_res + (ev >= 0 ? ev : 0));
-+    }
-+    remap[i] = (s >= 0 && s < n_res) ? s : (n_res + (ev >= 0 ? ev : 0));
-+}
 +
-+void moe_cache_launch_remap(const void * ids, size_t nb0, size_t nb1,
-+                            const moe_cache_devmap * dm, int64_t n_used, int64_t n_tok,
-+                            int32_t * remap_dev, void * stream, int32_t * used2,
-+                            const int32_t * slot2, int32_t * remap2, int32_t * used3) {
-+    if (ids == nullptr || dm == nullptr || dm->slot_dev == nullptr || remap_dev == nullptr) {
-+        return;
-+    }
-+    g_remap_launches++;
-+    const int n = (int) (n_used * n_tok);
-+    if (n <= 0) {
-+        return;
-+    }
-+    const int threads = 128;
-+    const int blocks  = (n + threads - 1) / threads;
-+    moe_cache_build_remap_kernel<<<blocks, threads, 0, (cudaStream_t) stream>>>(
-+        dm->slot_dev, (const char *) ids, remap_dev, dm->used_dev, used2, slot2, remap2, used3,
-+        dm->n_experts, dm->n_res, (int) n_used, (int) n_tok, nb0, nb1);
-+}
 +
 +// ---------------------------------------------------------------------------------------------
 +// Prefill-routing seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): device tally
 +// ---------------------------------------------------------------------------------------------
 +
-+// One thread per (token, expert-slot) of the prefill routing.  `ids` is a strided device view
-+// (`n_used x n_tok`, strides `nb0`/`nb1`); the histogram lands in `count[n_experts]`.  Atomics are
-+// cheap here (top-8 x <=2048 tokens per op, one op per role per prefill ubatch) and the kernel is
-+// fire-and-forget on the compute stream, so the prefill keeps no host readback and no sync.
-+static __global__ void moe_cache_tally_kernel(
-+        const char * __restrict__ ids, size_t nb0, size_t nb1,
-+        int n_used, int n_tok, int n_experts, int32_t * __restrict__ count) {
-+    const int total = n_used * n_tok;
-+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
-+        const int tok = i / n_used;
-+        const int j   = i - tok * n_used;
-+        const int32_t e = *(const int32_t *) (ids + (size_t) tok * nb1 + (size_t) j * nb0);
-+        if (e >= 0 && e < n_experts) {
-+            atomicAdd(&count[e], 1);
-+        }
-+    }
-+}
-+
 +// ---------------------------------------------------------------------------------------------
-+// Device-side admission policy kernel (MOE_EXPERT_CACHE_DEVPOLICY=1)
++// Coalesced copy helper (used by the device-side expert gather).
 +// ---------------------------------------------------------------------------------------------
 +
-+// `moe_cache_policy_copy` and `moe_cache_seed_fill_kernel` live above (next to the seed placement) so the
-+// seed fill can use them; the policy kernel below reuses the same coalesced copy helper.
-+
-+// One block per device-remap table.  Thread 0 replays the host `access_locked` LFRU logic sequentially
-+// over this token's routing (so the counters, decay cadence and victim tie-break are identical), staging
-+// each admitted `(slot, expert)` in shared memory; then the whole block copies the admitted experts from
-+// the pinned host alias into their arena slots.  The device slot map is updated in place, so the next
-+// token's remap kernel sees the new residency without any host readback.
-+//
-+// `shape[ti]` is this token's `n_used * n_tok` for table `ti`, or 0 when the table was not in the graph
-+// (its `used` buffer then holds stale routing and must not be replayed).
-+__global__ void moe_cache_policy_kernel(
-+        moe_cache_policy_desc * __restrict__ descs,
-+        const int32_t * __restrict__ shape,
-+        int n_tables, int admit, int touch, int period, int noevict, int do_fill, int prov_evict) {
-+    const int ti = blockIdx.x;
-+    if (ti >= n_tables) {
-+        return;
-+    }
-+    const int n = shape[ti];
-+    if (n <= 0) {
-+        return;
-+    }
-+    moe_cache_policy_desc & t = descs[ti];
-+    const int n_experts = t.n_experts;
-+    const int slots     = t.slots;
-+
-+    __shared__ int32_t fill_slot[MOE_CACHE_POLICY_MAX_FILL];
-+    __shared__ int32_t fill_exp [MOE_CACHE_POLICY_MAX_FILL];
-+    __shared__ int     fill_n;
-+
-+    if (threadIdx.x == 0) {
-+        fill_n = 0;
-+        if (slots > 0) {
-+            int64_t clock      = t.clock;
-+            int64_t last_decay = t.last_decay;
-+            int     occupied   = t.occupied;
-+            int64_t acc_hits   = t.acc_hits;
-+            int64_t acc_misses = t.acc_misses;
-+            int64_t acc_fills  = t.acc_fills;
-+            int64_t acc_evict  = t.acc_evict;
-+            for (int i = 0; i < n; i++) {
-+                const int32_t e = t.used[i];
-+                if (e < 0 || e >= n_experts) {
-+                    continue;
-+                }
-+                // host `access_locked`: clock++ then decay, per ACCESS
-+                clock++;
-+                if (period > 0 && clock - last_decay >= period) {
-+                    for (int x = 0; x < n_experts; x++) {
-+                        t.count[x] >>= 1;
-+                        t.ghost[x] >>= 1;
-+                    }
-+                    last_decay = clock - (clock % period);
-+                }
-+                if (t.slot[e] >= 0) {
-+                    t.count[e]++;
-+                    t.last[e] = (int32_t) clock;
-+                    if (t.slot_prov != nullptr) {
-+                        t.slot_prov[t.slot[e]] = 0;   // hit: no longer provisional
-+                    }
-+                    acc_hits++;
-+                    continue;
-+                }
-+                t.ghost[e]++;
-+                acc_misses++;
-+                if (noevict && occupied >= slots) {
-+                    continue;
-+                }
-+                if (do_fill && fill_n >= MOE_CACHE_POLICY_MAX_FILL) {
-+                    continue;   // fill list full: admitting would mark the expert resident with no fill staged
-+                }
-+                int slot = -1;
-+                if (occupied < slots) {
-+                    for (int s = 0; s < slots; s++) {
-+                        if (t.slot_expert[s] < 0) { slot = s; break; }
-+                    }
-+                }
-+                if (slot < 0) {
-+                    // evict the resident with the smallest decaying count; tie -> oldest use; never a
-+                    // victim used earlier in this same token (intra-token protect).
-+                    int32_t victim = -1;
-+                    int     vcount = 0;
-+                    int     vlast  = 0;
-+                    for (int s = 0; s < slots; s++) {
-+                        const int32_t ce = t.slot_expert[s];
-+                        if (ce < 0) {
-+                            continue;
-+                        }
-+                        bool prot = false;
-+                        for (int j = 0; j < n; j++) {
-+                            if (t.used[j] == ce) { prot = true; break; }
-+                        }
-+                        if (prot) {
-+                            continue;
-+                        }
-+                        if (victim < 0 || t.count[ce] < vcount ||
-+                            (t.count[ce] == vcount && t.last[ce] < vlast)) {
-+                            victim = ce;
-+                            slot   = s;
-+                            vcount = t.count[ce];
-+                            vlast  = t.last[ce];
-+                        }
-+                    }
-+                    bool reject = false;
-+                    if (slot >= 0) {
-+                        const bool prov = prov_evict && t.slot_prov != nullptr && t.slot_prov[slot] != 0;
-+                        if (!prov) {
-+                            if (admit == 1) {
-+                                reject = t.ghost[e] <= vcount;
-+                            } else if (admit == 2) {
-+                                reject = t.ghost[e] < touch;
-+                            }
-+                        }
-+                    }
-+                    if (reject) {
-+                        continue;
-+                    }
-+                    if (slot >= 0) {
-+                        t.slot[victim]       = -1;
-+                        t.slot_expert[slot]  = -1;
-+                        occupied--;
-+                        acc_evict++;
-+                    }
-+                }
-+                if (slot < 0) {
-+                    continue;
-+                }
-+                t.slot_expert[slot] = e;
-+                t.slot[e]           = slot;
-+                t.count[e]++;
-+                t.ghost[e]          = 0;
-+                t.last[e]           = (int32_t) clock;
-+                if (t.slot_prov != nullptr) {
-+                    t.slot_prov[slot] = 0;   // a real admission is not provisional
-+                }
-+                occupied++;
-+                acc_fills++;
-+                if (fill_n < MOE_CACHE_POLICY_MAX_FILL) {
-+                    fill_slot[fill_n] = slot;
-+                    fill_exp [fill_n] = e;
-+                    fill_n++;
-+                }
-+            }
-+            t.clock      = clock;
-+            t.last_decay = last_decay;
-+            t.occupied   = occupied;
-+            t.acc_hits   = acc_hits;
-+            t.acc_misses = acc_misses;
-+            t.acc_fills  = acc_fills;
-+            t.acc_evict  = acc_evict;
-+        }
-+    }
-+    __syncthreads();
-+
-+    if (!do_fill || t.host_dev == nullptr || t.arena == nullptr) {
-+        return;
-+    }
-+    const int tid = threadIdx.x;
-+    const int nt  = blockDim.x;
-+    const int fn  = fill_n;
-+    for (int f = 0; f < fn; f++) {
-+        const int    slot = fill_slot[f];
-+        const int    e    = fill_exp[f];
-+        char *       dst  = (char *) t.arena + (size_t) slot * (size_t) t.expert_bytes;
-+        // Target 1: source the fill from the bounded host pool when this expert is pool-resident, else
-+        // from the pinned master.  Both hold the WHOLE host expert, so the slice geometry is identical;
-+        // only the base differs.  The map is a per-token host snapshot (see `policy_pool_refresh`).
-+        const void * expert_base = (const char *) t.host_dev + (size_t) e * (size_t) t.host_bytes;
-+        if (t.pool_base != nullptr && t.pool_slot != nullptr && t.pool_slot[e] >= 0 &&
-+            t.pool_slot[e] < t.pool_slots) {
-+            expert_base = (const char *) t.pool_base + (size_t) t.pool_slot[e] * (size_t) t.host_bytes;
-+        }
-+        const char * src  = (const char *) expert_base + (size_t) t.src_off;
-+        if (t.split_axis != 0 || t.host_pitch == 0) {
-+            moe_cache_policy_copy(dst, src, (size_t) t.expert_bytes, tid, nt);
-+        } else {
-+            const int64_t rows = t.host_bytes > 0 ? (t.host_bytes / t.host_pitch) : 0;
-+            const size_t  row  = rows > 0 ? ((size_t) t.expert_bytes / (size_t) rows) : 0;
-+            for (int64_t r = 0; r < rows; r++) {
-+                moe_cache_policy_copy(dst + (size_t) r * row, src + (size_t) r * t.host_pitch, row, tid, nt);
-+            }
-+        }
-+    }
-+}
 +
 +// ---------------------------------------------------------------------------------------------
 +// public API
@@ -9273,13 +8287,7 @@ index 000000000..0896855d0
 +    if (!moe_cache_has_tables()) {
 +        return true;
 +    }
-+    // CUDA graphs must not be captured until the read source is constant.  Device-remap tables need one
-+    // more condition: the takeover decision flips when `g_devmap_armed` turns on (one uniform eager pass
-+    // after sizing), and a graph captured before that would bake the eager remap pointer.  Hold capture
-+    // off across the transition; the eager pass is short and runs uncaptured like the sizing token.
-+    if (g_devmap && !g_devmap_armed) {
-+        return false;
-+    }
++    // CUDA graphs must not be captured until the read source is constant (the arena sizing).
 +    return g_slots_hint > 0 || g_sized;
 +}
 +
@@ -9353,27 +8361,6 @@ index 000000000..0896855d0
 +        return false;
 +    }
 +    std::lock_guard<std::mutex> lock(g_mutex);
-+    // the device-side admission policy owns the counters; pull them back first (as moe_cache_report does)
-+    for (int d = 0; d < (int) g_policy_dev.size(); d++) {
-+        policy_dev_t & pd = g_policy_dev[(size_t) d];
-+        if (pd.desc == nullptr || pd.n <= 0) {
-+            continue;
-+        }
-+        device_guard dg(d);
-+        std::vector<moe_cache_policy_desc> host((size_t) pd.n);
-+        if (cudaMemcpy(host.data(), pd.desc, (size_t) pd.n * sizeof(moe_cache_policy_desc),
-+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-+            (void) cudaGetLastError();
-+            continue;
-+        }
-+        for (int i = 0; i < pd.n; i++) {
-+            table_t & t = g_tables[pd.ids[(size_t) i]];
-+            t.hits      = host[(size_t) i].acc_hits;
-+            t.misses    = host[(size_t) i].acc_misses;
-+            t.fills     = host[(size_t) i].acc_fills;
-+            t.evictions = host[(size_t) i].acc_evict;
-+        }
-+    }
 +    int64_t h = 0, m = 0, a = 0;
 +    for (const table_t & t : g_tables) {
 +        h += t.hits;
@@ -9441,7 +8428,6 @@ index 000000000..0896855d0
 +    t.slot_dirty   = true;
 +    t.slot_expert.clear();
 +    t.expert_slot.clear();
-+    t.slot_dev_host.clear();
 +    g_arena_bytes -= (int64_t) old_slots * (int64_t) t.expert_bytes;
 +    if (g_arena_bytes < 0) {
 +        g_arena_bytes = 0;
@@ -9458,20 +8444,6 @@ index 000000000..0896855d0
 +        if (old_remap != nullptr) {
 +            (void) cudaFree(old_remap);
 +        }
-+        // The device-side expert->slot map still advertises the OLD residency, but the arena's bytes are
-+        // gone (unmapped, and zeroed when a re-arm maps it again).  Clear it, or the device-remap takeover
-+        // serves slots that no longer hold their expert -- measured as the repeated-`/` corruption once a
-+        // re-arm had re-mapped the arena.  The host `expert_slot`/`slot_expert` maps are cleared above.
-+        if (t.slot_dev != nullptr && t.n_experts > 0) {
-+            (void) cudaMemset(t.slot_dev, 0xff, (size_t) t.n_experts * sizeof(int32_t));
-+        }
-+        if (t.pool_slot_dev != nullptr && t.n_experts > 0) {
-+            (void) cudaMemset(t.pool_slot_dev, 0xff, (size_t) t.n_experts * sizeof(int32_t));
-+        }
-+        if (t.used_dev != nullptr && t.used_cap > 0) {
-+            (void) cudaMemset(t.used_dev, 0xff, (size_t) t.used_cap * sizeof(int32_t));
-+        }
-+        t.remap_fresh = false;
 +        (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
 +    }
 +    for (auto it = g_alias_to_id.begin(); it != g_alias_to_id.end(); ) {
@@ -9771,7 +8743,7 @@ index 000000000..0896855d0
 +            continue;   // outside the taken chunks
 +        }
 +        // Give the whole allocation back to the slab FIRST, then clear the table.  The small per-table
-+        // device buffers (remap_dev/slot_dev/...) are separate cudaMalloc allocations and are kept, so a
++        // device buffers are separate cudaMalloc allocations and are kept, so a
 +        // later re-size/re-arm can reuse them.
 +        ggml_cuda_slab_arena_free(device, t.arena, bytes);
 +        g_arena_bytes -= (int64_t) t.slots * (int64_t) t.expert_bytes;
@@ -9785,11 +8757,9 @@ index 000000000..0896855d0
 +        t.slots          = 0;
 +        t.identity       = false;
 +        t.remap_n_used   = 0;
-+        t.remap_fresh    = false;
 +        t.slot_dirty     = true;
 +        t.slot_expert.clear();
 +        t.expert_slot.clear();
-+        t.slot_dev_host.clear();
 +        t.allocated      = true;   // it was decided; a re-arm can rebuild it
 +    }
 +    if (freed > 0) {
@@ -9823,6 +8793,7 @@ index 000000000..0896855d0
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    return moe_cache_has_arena_locked();
 +}
++
 +
 +// wip/slab-ring-region: has the deferred arena sizing run?  The slab's H2D-ring hole must stay ARMED
 +// through sizing (so the auto-sized arena never allocates its highest tables into the hole); a disarm
@@ -9880,9 +8851,6 @@ index 000000000..0896855d0
 +            GGML_LOG_ERROR("[validate %s] IDENTITY-SHORT layer=%d slots=%d n_experts=%d\n",
 +                           where, t.layer, t.slots, t.n_experts);
 +        }
-+        if (resident && t.devmap && t.slot_dev == nullptr) {
-+            GGML_LOG_ERROR("[validate %s] DEVMAP-NULL-SLOTDEV layer=%d\n", where, t.layer);
-+        }
 +        if (t.remap_dev == nullptr && t.remap_cap != 0) {
 +            GGML_LOG_ERROR("[validate %s] DANGLING-REMAP layer=%d remap_dev=null remap_cap=%lld\n",
 +                           where, t.layer, (long long) t.remap_cap);
@@ -9922,6 +8890,61 @@ index 000000000..0896855d0
 +                           where, t.layer, t.role.c_str(), t.slots, n_nonfinite, n_zero);
 +        }
 +    }
++
++    if (level < 3) {
++        return;
++    }
++    // Level 3 (wip/moe-verify-fusions): byte-compare every resident slot with its expert's slice in the
++    // host master.  A mismatch means the slot holds the wrong bytes -- the direct cause of a residency-
++    // dependent wrong-expert read.  Geometry mirrors the host fill.
++    static const char * vlay_e = getenv("MOE_EXPERT_CACHE_VALIDATE_LAYER");
++    const int only_layer = vlay_e ? atoi(vlay_e) : -1;
++    for (table_t & t : g_tables) {
++        if (t.arena == nullptr || t.slots <= 0 || t.device < 0 || t.host == nullptr) {
++            continue;
++        }
++        if (only_layer >= 0 && t.layer != only_layer) {
++            continue;
++        }
++        const bool    do2d = (t.split_axis == 0 && t.host_pitch > 0);
++        const int64_t rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++        const int64_t row  = rows > 0 ? (int64_t) (t.expert_bytes / rows) : 0;
++        device_guard dg(t.device);
++        const size_t cmp_bytes = only_layer >= 0 ? (size_t) t.expert_bytes
++                                                 : (t.expert_bytes < 4096 ? (size_t) t.expert_bytes : 4096);
++        std::vector<uint8_t> buf(cmp_bytes);
++        int n_bad = 0;
++        for (int s = 0; s < t.slots && n_bad < 8; s++) {
++            const int e = t.slot_expert[(size_t) s];
++            if (e < 0 || e >= t.n_experts) {
++                continue;
++            }
++            const char * slotp = (const char *) t.arena + (size_t) s * t.expert_bytes;
++            if (cudaMemcpy(buf.data(), slotp, cmp_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
++                (void) cudaGetLastError();
++                break;
++            }
++            const char * hsrc = (const char *) t.host + (size_t) e * t.host_bytes + t.src_off;
++            bool bad = false;
++            if (do2d && row > 0) {
++                const int64_t nrows_cmp = (int64_t) (cmp_bytes / (size_t) row);
++                for (int64_t r = 0; r < nrows_cmp && r < rows && !bad; r++) {
++                    if (memcmp(buf.data() + r * row, hsrc + r * t.host_pitch, (size_t) row) != 0) {
++                        bad = true;
++                    }
++                }
++            } else {
++                bad = memcmp(buf.data(), hsrc, cmp_bytes) != 0;
++            }
++            if (bad) {
++                n_bad++;
++                GGML_LOG_ERROR("[validate %s] SLOT-CONTENT-MISMATCH layer=%d role=%s slot=%d expert=%d expert_bytes=%lld host_bytes=%lld split_axis=%d host_pitch=%lld\n",
++                               where, t.layer, t.role.c_str(), s, e, (long long) t.expert_bytes,
++                               (long long) t.host_bytes, t.split_axis, (long long) t.host_pitch);
++            }
++        }
++    }
++
 +}
 +
 +// True only when the cache has at least one registered routed expert table.  An empty cache (the model
@@ -10096,61 +9119,6 @@ index 000000000..0896855d0
 +    }
 +}
 +
-+// Device-side prefill tally (MOE_EXPERT_CACHE_PREFILL_SEED=1).  The scheduler's block-06 staging
-+// intercepts the prefill expert upload before `moe_cache_update_host` under `-sm tensor`, so the host
-+// hook never sees the prefill routing there; this is called from `ggml_cuda_mul_mat_id`, where the
-+// routing device tensor is in hand, and just histograms it on the compute stream.  Idempotent per
-+// (layer, role, device): the table is already registered by the load-time warmup decode.
-+bool moe_cache_tally_prefill(const ggml_tensor * op, const ggml_tensor * weight, const ggml_tensor * ids,
-+                             int device, void * stream) {
-+    // `g_devmap` because the seed is consumed by the device-policy flush; with `DEVMAP=0` the tally would
-+    // only waste a prefill kernel per op (the seed can never be applied).
-+    if (!g_enabled || !g_prefill_seed || !g_devmap || op == nullptr || weight == nullptr || ids == nullptr) {
-+        return false;
-+    }
-+    if (ids->type != GGML_TYPE_I32 || ids->ne[1] <= MOE_EXPERT_CACHE_MAX_TOK) {
-+        return false;   // decode/verify band (the band the cache serves), or a non-int routing
-+    }
-+    const int layer = name_layer(op);
-+    if (layer < 0) {
-+        return false;
-+    }
-+    std::lock_guard<std::mutex> lock(g_mutex);
-+    int id = -1;
-+    // The op's `src0` is the per-device simple tensor (or the staged copy) whose name normalizes to the
-+    // host master's role, so the semantic key is the reliable lookup under `-sm tensor`.
-+    const auto sit = g_sem_to_id.find(std::make_tuple(layer, sem_role(weight), device));
-+    if (sit != g_sem_to_id.end()) {
-+        id = sit->second;
-+    } else {
-+        id = alias_find_checked(weight, device, layer);
-+    }
-+    if (id < 0 || id >= (int) g_tables.size()) {
-+        return false;
-+    }
-+    table_t & t = g_tables[id];
-+    if (t.prefill_seeded || t.n_experts <= 0) {
-+        return false;
-+    }
-+    device_guard dg(device);
-+    if (t.prefill_count_dev == nullptr) {
-+        if (cudaMalloc((void **) &t.prefill_count_dev, (size_t) t.n_experts * sizeof(int32_t)) != cudaSuccess) {
-+            (void) cudaGetLastError();
-+            return false;
-+        }
-+        (void) cudaMemsetAsync(t.prefill_count_dev, 0, (size_t) t.n_experts * sizeof(int32_t),
-+                               (cudaStream_t) stream);
-+    }
-+    const int n_used  = (int) ids->ne[0];
-+    const int n_tok   = (int) ids->ne[1];
-+    const int total   = n_used * n_tok;
-+    const int threads = 256;
-+    const int blocks  = (total + threads - 1) / threads;
-+    moe_cache_tally_kernel<<<blocks, threads, 0, (cudaStream_t) stream>>>(
-+        (const char *) ids->data, ids->nb[0], ids->nb[1], n_used, n_tok, t.n_experts, t.prefill_count_dev);
-+    t.prefill_tally_pending = true;
-+    return true;
-+}
 +
 +// Device-side expert gather (B2).  `weight` is the host master, `weight_cpy` the device tensor the op
 +// will read, `ids` the routing (device, strided) and `slice_off`/`split_axis` the per-device slice
@@ -10602,18 +9570,6 @@ index 000000000..0896855d0
 +    t.remap_n_used = n_used;
 +    t.remap_n_tok  = n_tok;
 +    g_takeover++;
-+    // Devmap transition arming: record that this devmap table has completed one eager fill pass.  Once
-+    // every devmap table has, the takeover fast path may switch on (next token).  Only a decode-band
-+    // eager stage counts, so the pass is a real decode pass.
-+    if (g_devmap && !g_devmap_armed && t.devmap && n_tok <= MOE_EXPERT_CACHE_MAX_TOK &&
-+        table >= 0 && table < (int) g_devmap_eager_seen.size() && !g_devmap_eager_seen[table]) {
-+        g_devmap_eager_seen[table] = 1;
-+        if (++g_devmap_arm_seen >= g_devmap_arm_expected) {
-+            g_devmap_armed = true;
-+            GGML_LOG_WARN("%s: device-remap fast path armed after a uniform eager pass over %d tables\n",
-+                          __func__, g_devmap_arm_expected);
-+        }
-+    }
 +    return true;
 +}
 +
@@ -10643,32 +9599,11 @@ index 000000000..0896855d0
 +    return false;
 +}
 +
-+bool moe_cache_kslot_active() {
-+    return g_enabled && g_kslot;
-+}
 +
-+bool moe_cache_get_slot(const void * arena, const int32_t ** slot_dev, int32_t ** used_dev, int32_t * n_experts) {
-+    if (!g_enabled || !g_kslot || arena == nullptr) {
-+        return false;
-+    }
-+    std::lock_guard<std::mutex> lock(g_mutex);
-+    // OPEN 2: per-table, like the other consumers (the loop below already skips a table with no arena).
-+    for (const table_t & t : g_tables) {
-+        if (t.arena != arena || !t.devmap || t.slots <= 0 || t.slot_dev == nullptr) {
-+            continue;
-+        }
-+        if (slot_dev)  *slot_dev  = t.slot_dev;
-+        if (used_dev)  *used_dev  = t.used_dev;
-+        if (n_experts) *n_experts = t.n_experts;
-+        return true;
-+    }
-+    return false;
-+}
 +
 +bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy, int device,
 +                         void ** arena, int64_t * n_slots,
-+                         size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok,
-+                         moe_cache_devmap * dm) {
++                         size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok) {
 +    if (!g_enabled || weight_cpy == nullptr) {
 +        return false;
 +    }
@@ -10707,29 +9642,6 @@ index 000000000..0896855d0
 +        if (n_tok)        *n_tok        = 0;
 +        return true;
 +    }
-+    // Device-remap mode (partial residency): the caller builds the remap from `dm->slot_dev` with
-+    // `moe_cache_launch_remap` before dispatching.  Same decode-band restriction as identity.
-+    if (t.devmap && t.arena != nullptr && t.slots > 0 && t.slot_dev != nullptr &&
-+        op != nullptr && op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
-+        g_get_ok++;
-+        if (arena)        *arena        = t.arena;
-+        if (n_slots)      *n_slots      = t.slots;
-+        if (expert_bytes) *expert_bytes = t.expert_bytes;
-+        // B3: under KSLOT the consumer resolves the slot in-kernel, so there is no remap buffer to
-+        // consume.  Returning null here (rather than a stale buffer) makes the existing `remap !=
-+        // nullptr` guards at the redirect sites naturally keep the raw routing ids.
-+        if (remap_dev)    *remap_dev    = g_kslot ? nullptr : t.remap_dev;
-+        if (n_used)       *n_used       = 0;
-+        if (n_tok)        *n_tok        = 0;
-+        if (dm) {
-+            dm->slot_dev    = t.slot_dev;
-+            dm->used_dev    = t.used_dev;
-+            dm->n_experts   = t.n_experts;
-+            dm->n_res       = t.slots;
-+            dm->remap_fresh = t.remap_fresh;
-+        }
-+        return true;
-+    }
 +    if (t.arena == nullptr || t.slots <= 0 || t.remap_dev == nullptr || t.remap_n_used <= 0) {
 +        return false;
 +    }
@@ -10743,11 +9655,31 @@ index 000000000..0896855d0
 +    return true;
 +}
 +
-+bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_cpy, int device,
-+                         bool * need_promote) {
-+    if (need_promote != nullptr) {
-+        *need_promote = false;
++// Per-table fusion-guard query (wip/moe-verify-fusions OPEN 2).  Mirrors `moe_cache_take_over`'s
++// `identity` decision for THIS table, with no side effects, so the fusion guard and the scheduler
++// take-over agree per table instead of on the whole-graph `moe_cache_has_arena()`.
++bool moe_cache_table_serves(const ggml_tensor * op, const ggml_tensor * weight, int device) {
++    if (!g_enabled || weight == nullptr) {
++        return false;
 +    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    int id = alias_find_checked(weight, device, op != nullptr ? name_layer(op) : -1);
++    if (id < 0 && op != nullptr && weight->buffer != nullptr) {
++        const int layer = name_layer(op);
++        const auto sit = g_sem_to_id.find(std::make_tuple(layer, sem_role(weight), device));
++        if (sit != g_sem_to_id.end()) {
++            id = sit->second;
++        }
++    }
++    if (id < 0 || id >= (int) g_tables.size()) {
++        return false;
++    }
++    const table_t & t = g_tables[id];
++    return t.identity && t.arena != nullptr && t.slots >= t.n_experts;
++}
++
++bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_cpy, int device) {
++    g_write_seq++;
 +    if (!g_enabled || weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 1) {
 +        return false;
 +    }
@@ -10762,7 +9694,7 @@ index 000000000..0896855d0
 +    // after an arena release its stale `data` can even point into the freed arena (measured: a GPU VM
 +    // fault in `mul_mat_vec_q_moe` on an address inside a just-freed table arena).
 +    //
-+    // OPEN 2 slab: gate per TABLE.  The `identity`/`devmap` checks below already require THIS table's arena
++    // OPEN 2 slab: gate per TABLE.  The `identity` check below already requires THIS table's arena
 +    // and slots, so this hook, the update hook and `moe_cache_get_table` agree per table; only the fusion
 +    // guard is global (`moe_cache_has_arena()`), so a partial cache loses the fusions but keeps serving.
 +    const auto it = g_key_to_id.find({ (const void *) weight, device });
@@ -10775,526 +9707,22 @@ index 000000000..0896855d0
 +    }
 +    table_t & t = g_tables[id];
 +    const bool identity = t.identity && t.arena != nullptr && t.slots >= t.n_experts;
-+    const bool devmap   = g_devmap_armed && t.devmap && t.arena != nullptr && t.slots > 0 && t.slot_dev != nullptr;
-+    if (!identity && !devmap) {
++    if (!identity) {
 +        return false;
 +    }
 +    // Overwrite: the graph allocator reuses these device pointers across graphs (see
 +    // `moe_cache_update_host`), so the alias must track the current tensor.
 +    g_alias_to_id[weight_cpy] = id;
-+    if (need_promote != nullptr && !identity) {
-+        *need_promote = true;   // a partial-residency table needs the deferred promotion pass
-+    }
 +    return true;
 +}
 +
-+bool moe_cache_promote_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
-+                            const int32_t * ids, int64_t n_used, int64_t n_tok,
-+                            size_t ids_nb0, size_t ids_nb1, void * stream, int device) {
-+    if (!g_enabled || !g_devmap || weight == nullptr || weight->ne[2] < 1) {
-+        return false;
-+    }
-+    if (n_tok > MOE_EXPERT_CACHE_MAX_TOK || name_layer(weight) < 0) {
-+        return false;
-+    }
-+    std::lock_guard<std::mutex> lock(g_mutex);
-+    const auto it = g_key_to_id.find({ (const void *) weight, device });
-+    if (it == g_key_to_id.end()) {
-+        return false;
-+    }
-+    table_t & t = g_tables[it->second];
-+    if (!t.devmap || t.arena == nullptr || t.slots <= 0 || t.slot_dev == nullptr) {
-+        return false;
-+    }
-+    // this pass is over for this table: the next redirect must (re)build its remap
-+    t.remap_fresh = false;
-+    // Device-side admission policy: this per-table call only records the token's routing shape; the
-+    // batched kernel runs once per device in `moe_cache_policy_flush` (called by the scheduler after
-+    // this per-table loop).  No host policy, no used-list D2H, no slot-map H2D - the kernel updates
-+    // the device map in place.
-+    if (t.policy) {
-+        t.policy_n_used  = (int) n_used;
-+        t.policy_n_tok   = (int) n_tok;
-+        t.policy_pending = true;
-+        // Target 1: keep the bounded host pool warm for this table's routed experts so the device-policy
-+        // kernel can source its fills from it.  The per-table promote already has the routing on the
-+        // device, so reuse the host promotion's PIPELINED pinned readback (one-token lag; the backend is
-+        // synchronised between tokens) and fill the pool for the PREVIOUS call's experts.  A pool miss in
-+        // the kernel still falls back to the master, so this is purely additive.
-+        if (g_pool_enabled && g_pool_prefetch && t.used_dev != nullptr && t.used_host != nullptr && t.used_host2 != nullptr &&
-+            t.used_cap >= n_used * n_tok) {
-+            int32_t *       write_buf = t.used_toggle ? t.used_host2 : t.used_host;
-+            const int32_t * read_buf  = t.used_toggle ? t.used_host : t.used_host2;
-+            if (cudaMemcpyAsync(write_buf, t.used_dev, (size_t) n_used * n_tok * sizeof(int32_t),
-+                                cudaMemcpyDeviceToHost, (cudaStream_t) stream) == cudaSuccess) {
-+                if (t.used_pending) {
-+                    host_pool_t * pool = table_pool_locked(t);
-+                    if (pool != nullptr) {
-+                        // Off the critical path: hand the previous token's experts to the low-priority
-+                        // background worker (target 2) instead of doing page-cache reads under `g_mutex`.
-+                        // The next flush's map snapshot picks up whatever has published by then.
-+                        for (int64_t i = 0; i < n_used * n_tok; i++) {
-+                            const int32_t e = read_buf[(size_t) i];
-+                            if (e >= 0 && e < t.n_experts) {
-+                                if (g_pool_bg) {
-+                                    pool_bg_enqueue(pool, e);
-+                                } else {
-+                                    (void) pool_slot_locked(*pool, e, nullptr, false);
-+                                }
-+                            }
-+                        }
-+                    }
-+                }
-+                t.used_toggle ^= 1;
-+                t.used_pending = true;
-+            } else {
-+                (void) cudaGetLastError();
-+            }
-+        }
-+        return true;
-+    }
-+    // The promotion allocates/fills into and copies to `t.arena`/`t.slot_dev`, which live on `t.device`,
-+    // so make that device current for the async fills and the device-map update (a stream from another
-+    // device does not make the pointer's device current).
-+    device_guard dg(t.device);
-+    if (weight_cpy != nullptr) {
-+        g_alias_to_id[weight_cpy] = it->second;
-+    }
-+    std::vector<int32_t> used;
-+    used.reserve((size_t) n_used * n_tok);
-+    // Read the routing from the table's persistent used-list buffer, which the remap kernel wrote during
-+    // the graph.  The graph's own routing tensor must NOT be read here: its storage is recycled once the
-+    // graph completes, so a deferred readback returns garbage (and the subsequent promotions no-op).
-+    if (t.used_dev != nullptr && t.used_host != nullptr && t.used_host2 != nullptr && t.used_cap >= n_used * n_tok) {
-+        // PIPELINED readback (2026-09-29): a per-table *synchronous* D2H on 240 tables measured
-+        // ~4.8 ms/token (81 % of the whole deferred pass).  Instead enqueue this token's readback
-+        // async (pinned dst, backend stream) and apply the policy to the PREVIOUS call's buffer, whose
-+        // copy the backend synchronize between tokens has already completed.  One token of extra lag,
-+        // which `touch` admission tolerates; the number of D2H API calls is unchanged, but none of
-+        // them blocks.  `used_host`/`used_host2` alternate, so a call never reads the buffer it is
-+        // about to overwrite (and the in-flight copy is ordered on the stream, not by the host).
-+        int32_t *       write_buf = t.used_toggle ? t.used_host2 : t.used_host;
-+        const int32_t * read_buf  = t.used_toggle ? t.used_host : t.used_host2;
-+        if (cudaMemcpyAsync(write_buf, t.used_dev, (size_t) n_used * n_tok * sizeof(int32_t),
-+                            cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess) {
-+            (void) cudaGetLastError();
-+            return false;
-+        }
-+        if (t.used_pending) {
-+            for (int64_t i = 0; i < n_used * n_tok; i++) {
-+                const int32_t e = read_buf[(size_t) i];
-+                if (e >= 0 && e < t.n_experts) {
-+                    used.push_back(e);
-+                }
-+            }
-+        }
-+        t.used_toggle ^= 1;
-+        t.used_pending = true;
-+    } else if (ids != nullptr) {
-+        for (int64_t tok = 0; tok < n_tok; tok++) {
-+            for (int64_t j = 0; j < n_used; j++) {
-+                const int32_t e = *(const int32_t *) ((const char *) ids + (size_t) tok * ids_nb1 + (size_t) j * ids_nb0);
-+                if (e >= 0 && e < t.n_experts) {
-+                    used.push_back(e);
-+                }
-+            }
-+        }
-+    }
-+    if (used.empty()) {
-+        g_promote_calls++;
-+        return true;
-+    }
-+    // LFRU admission + fills for this token's used experts, protected from each other.  The admission
-+    // rule is the same active policy as the eager hook's (`touch` by default): `access_locked` only
-+    // applies it when `out_cold` is non-null.
-+    for (int32_t e : used) {
-+        bool cold = false;
-+        (void) access_locked(t, e, stream, used.data(), (int) used.size(), &cold);
-+    }
-+    if (t.slot_dirty) {
-+        for (int i = 0; i < t.n_experts; i++) {
-+            t.slot_pin[i] = -1;
-+        }
-+        for (const auto & kv : t.expert_slot) {
-+            if (kv.first >= 0 && kv.first < t.n_experts) {
-+                t.slot_pin[kv.first] = kv.second;
-+            }
-+        }
-+        (void) cudaMemcpyAsync(t.slot_dev, t.slot_pin, (size_t) t.n_experts * sizeof(int32_t),
-+                               cudaMemcpyHostToDevice, (cudaStream_t) stream);
-+        t.slot_dirty = false;
-+    }
-+    g_promote_calls++;
-+    return true;
-+}
 +
-+// Build (or rebuild) the per-device device-policy descriptor array.  Runs after sizing, when every
-+// table is registered; the device arrays are seeded from the host mirrors so the residency the arming
-+// eager pass built is not lost when the device policy takes over.
-+static void build_policy_descs_locked(int device) {
-+    std::vector<int> ids;
-+    for (int i = 0; i < (int) g_tables.size(); i++) {
-+        const table_t & t = g_tables[i];
-+        if (t.policy && t.device == device) {
-+            ids.push_back(i);
-+        }
-+    }
-+    if (device >= (int) g_policy_dev.size()) {
-+        g_policy_dev.resize(device + 1);
-+    }
-+    policy_dev_t & pd = g_policy_dev[device];
-+    if (pd.initialized && pd.n == (int) ids.size()) {
-+        return;   // the set of policy tables on this device is stable
-+    }
-+    device_guard dg(device);
-+    if (pd.desc != nullptr)      { (void) cudaFree(pd.desc);      pd.desc = nullptr; }
-+    if (pd.shape_dev != nullptr) { (void) cudaFree(pd.shape_dev); pd.shape_dev = nullptr; }
-+    pd.ids         = ids;
-+    pd.n           = (int) ids.size();
-+    pd.cap         = pd.n;
-+    pd.initialized = true;
-+    pd.shape_host.assign((size_t) pd.n, 0);
-+    if (pd.n == 0) {
-+        return;
-+    }
-+    std::vector<moe_cache_policy_desc> host((size_t) pd.n);
-+    for (int i = 0; i < pd.n; i++) {
-+        table_t & t = g_tables[ids[i]];
-+        moe_cache_policy_desc & d = host[(size_t) i];
-+        d.slot_expert  = t.slot_expert_dev;
-+        d.slot         = t.slot_dev;
-+        d.count        = t.count_dev;
-+        d.ghost        = t.ghost_dev;
-+        d.last         = t.last_dev;
-+        d.slot_prov    = t.slot_prov_dev;
-+        d.used         = t.used_dev;
-+        d.arena        = t.arena;
-+        d.host_dev     = t.host_dev;
-+        d.pool_base    = t.policy_pool_base;
-+        d.pool_slot    = t.pool_slot_dev;
-+        d.pool_slots   = t.policy_pool_slots;
-+        d.host_bytes   = (int64_t) t.host_bytes;
-+        d.src_off      = (int64_t) t.src_off;
-+        d.expert_bytes = (int64_t) t.expert_bytes;
-+        d.host_pitch   = (int64_t) t.host_pitch;
-+        d.clock        = 0;
-+        d.last_decay   = 0;
-+        d.n_experts    = t.n_experts;
-+        d.slots        = t.slots;
-+        d.occupied     = (int32_t) t.expert_slot.size();
-+        d.split_axis   = t.split_axis;
-+        d.acc_hits     = 0;
-+        d.acc_misses   = 0;
-+        d.acc_fills    = 0;
-+        d.acc_evict    = 0;
-+        // Seed the device counters/residency from the host mirrors (the arming eager pass).  The host
-+        // clock restarts on the device, which only shifts the decay cadence, never correctness.
-+        std::vector<int32_t> sc((size_t) t.n_experts, 0), sg((size_t) t.n_experts, 0), sl((size_t) t.n_experts, 0);
-+        for (int e = 0; e < t.n_experts; e++) {
-+            sc[(size_t) e] = (size_t) e < t.count.size() ? (int32_t) t.count[(size_t) e] : 0;
-+            sg[(size_t) e] = (size_t) e < t.ghost.size() ? (int32_t) t.ghost[(size_t) e] : 0;
-+            sl[(size_t) e] = (size_t) e < t.last.size()  ? (int32_t) t.last[(size_t) e]  : 0;
-+        }
-+        (void) cudaMemcpy(t.count_dev, sc.data(), (size_t) t.n_experts * sizeof(int32_t), cudaMemcpyHostToDevice);
-+        (void) cudaMemcpy(t.ghost_dev, sg.data(), (size_t) t.n_experts * sizeof(int32_t), cudaMemcpyHostToDevice);
-+        (void) cudaMemcpy(t.last_dev,  sl.data(), (size_t) t.n_experts * sizeof(int32_t), cudaMemcpyHostToDevice);
-+        std::vector<int32_t> se((size_t) t.slots, -1);
-+        for (const auto & kv : t.expert_slot) {
-+            if (kv.second >= 0 && kv.second < t.slots) {
-+                se[(size_t) kv.second] = kv.first;
-+            }
-+        }
-+        std::vector<int32_t> sm((size_t) t.n_experts, -1);
-+        for (const auto & kv : t.expert_slot) {
-+            if (kv.first >= 0 && kv.first < t.n_experts) {
-+                sm[(size_t) kv.first] = kv.second;
-+            }
-+        }
-+        (void) cudaMemcpy(t.slot_expert_dev, se.data(), (size_t) t.slots * sizeof(int32_t), cudaMemcpyHostToDevice);
-+        (void) cudaMemcpy(t.slot_dev, sm.data(), (size_t) t.n_experts * sizeof(int32_t), cudaMemcpyHostToDevice);
-+        if (t.slot_prov_dev != nullptr && (int) t.slot_prov.size() == t.slots) {
-+            (void) cudaMemcpy(t.slot_prov_dev, t.slot_prov.data(), (size_t) t.slots * sizeof(uint8_t), cudaMemcpyHostToDevice);
-+        }
-+        t.slot_dirty = false;
-+    }
-+    void * desc_dev = nullptr;
-+    if (cudaMalloc(&desc_dev, host.size() * sizeof(moe_cache_policy_desc)) != cudaSuccess) {
-+        (void) cudaGetLastError();
-+        pd.desc        = nullptr;
-+        pd.initialized = false;   // retry on the next flush (fail-soft)
-+        return;
-+    }
-+    (void) cudaMemcpy(desc_dev, host.data(), host.size() * sizeof(moe_cache_policy_desc), cudaMemcpyHostToDevice);
-+    pd.desc = (moe_cache_policy_desc *) desc_dev;
-+    if (cudaMalloc((void **) &pd.shape_dev, (size_t) pd.n * sizeof(int32_t)) != cudaSuccess) {
-+        (void) cudaGetLastError();
-+        (void) cudaFree(pd.desc);
-+        pd.desc        = nullptr;
-+        pd.shape_dev   = nullptr;
-+        pd.initialized = false;   // retry on the next flush (fail-soft)
-+    }
-+}
 +
-+// Per-token progress log: cumulative admissions (fills) vs evictions.  While the cache is warming up
-+// admits > evicts (empty slots are still being filled); once the arena is full and the working set is
-+// stable the per-interval deltas match.  Reads the device counters under DEVPOLICY, the host counters
-+// otherwise.
-+static void moe_cache_progress_locked(int device, policy_dev_t & pd, int64_t now_us) {
-+    int64_t fills = 0, evicts = 0, hits = 0, misses = 0, occupied = 0;
-+    int64_t slots = 0;
-+    int     n_tab = 0;
-+    if (g_devpolicy && pd.desc != nullptr && pd.n > 0) {
-+        device_guard dg(device);
-+        std::vector<moe_cache_policy_desc> host((size_t) pd.n);
-+        if (cudaMemcpy(host.data(), pd.desc, (size_t) pd.n * sizeof(moe_cache_policy_desc),
-+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-+            (void) cudaGetLastError();
-+            return;
-+        }
-+        for (int i = 0; i < pd.n; i++) {
-+            fills    += host[(size_t) i].acc_fills;
-+            evicts   += host[(size_t) i].acc_evict;
-+            hits     += host[(size_t) i].acc_hits;
-+            misses   += host[(size_t) i].acc_misses;
-+            occupied += host[(size_t) i].occupied;
-+            slots    += host[(size_t) i].slots;
-+            n_tab++;
-+        }
-+    } else {
-+        for (const table_t & t : g_tables) {
-+            if (t.device != device || t.slots <= 0) {
-+                continue;
-+            }
-+            fills    += t.fills;
-+            evicts   += t.evictions;
-+            hits     += t.hits;
-+            misses   += t.misses;
-+            occupied += (int64_t) t.expert_slot.size();
-+            slots    += t.slots;
-+            n_tab++;
-+        }
-+    }
-+    const int64_t df      = fills   - pd.last_fills;
-+    const int64_t de      = evicts  - pd.last_evicts;
-+    const int64_t dres    = occupied - pd.last_resident;
-+    const int64_t dt_us   = (pd.last_time_us > 0 && now_us > pd.last_time_us) ? now_us - pd.last_time_us : 0;
-+    const double  dt_s    = (double) dt_us / 1e6;
-+    const double  a_rate  = dt_s > 0.0 ? (double) df   / dt_s : 0.0;
-+    const double  e_rate  = dt_s > 0.0 ? (double) de   / dt_s : 0.0;
-+    const double  r_rate  = dt_s > 0.0 ? (double) dres / dt_s : 0.0;
-+    const int64_t total   = hits + misses;
-+    const double  h       = total > 0 ? (double) hits / (double) total : 0.0;
-+    // Instantaneous (per-interval) hit rate: the cumulative `h` hides the warm-up crossover.
-+    const int64_t dh      = hits   - pd.last_hits;
-+    const int64_t dm      = misses - pd.last_misses;
-+    const double  h_int   = (dh + dm) > 0 ? (double) dh / (double) (dh + dm) : 0.0;
-+    // Instantaneous state from the RATES, not the running totals: QUIESCENT = no admissions at all
-+    // (the resident set has stopped growing); CHURN = admits == evicts > 0 (full, stable set);
-+    // FILLING = admitting more than evicting (empty slots remain, resident rising).
-+    const char * state = (df == 0 && de == 0) ? "QUIESCENT" : (df <= de ? "CHURN" : "FILLING");
-+    GGML_LOG_WARN("%s: dev %d tok=%lld dt=%.2fs admits=+%lld (%.1f/s) evicts=+%lld (%.1f/s) dRes=+%lld (%.1f/s) "
-+                  "resident=%lld/%lld (%.1f%%) h=%.4f h_int=%.4f tables=%d %s\n",
-+                  __func__, device, (long long) pd.tokens, dt_s,
-+                  (long long) df, a_rate, (long long) de, e_rate, (long long) dres, r_rate,
-+                  (long long) occupied, (long long) slots,
-+                  slots > 0 ? 100.0 * (double) occupied / (double) slots : 0.0, h, h_int, n_tab, state);
-+    pd.last_fills    = fills;
-+    pd.last_evicts   = evicts;
-+    pd.last_resident = occupied;
-+    pd.last_time_us  = now_us;
-+    pd.last_hits     = hits;
-+    pd.last_misses   = misses;
-+}
 +
-+// Target 1 (pool-aware device policy): attach the bounded host pool to every device-policy table on
-+// this device and record its device alias.  Called before `build_policy_descs_locked` so the
-+// descriptors carry a valid `pool_base` from their first build.  `table_pool_locked` creates (and, on
-+// first use, prewarms) the pool; a table whose source is unknown simply keeps a null base and falls back
-+// to the master.  Caller holds `g_mutex`.
-+static void policy_pool_attach_locked(int device) {
-+    if (!g_pool_enabled) {
-+        return;
-+    }
-+    for (table_t & t : g_tables) {
-+        if (!t.policy || t.device != device) {
-+            continue;
-+        }
-+        host_pool_t * pool = table_pool_locked(t);
-+        if (pool != nullptr && g_pool_policy == 1) {
-+            // Target 1a: the kernel fills from the bounded pool when the expert is pool-resident.
-+            t.policy_pool_base  = pool->base_dev;
-+            t.policy_pool_slots = pool->slots;
-+        } else if (pool != nullptr && g_pool_policy == 2) {
-+            // Target 1b probe: the device policy runs for pooled tables but fills from the master.
-+            t.policy_pool_base  = t.host_dev;
-+            t.policy_pool_slots = t.n_experts;
-+        } else {
-+            t.policy_pool_base  = nullptr;
-+            t.policy_pool_slots = 0;
-+        }
-+    }
-+}
 +
-+// Snapshot every policy table's pool `expert -> slot` map into its device buffer, ordered on `stream`
-+// before the policy kernel.  A `-1` entry makes the kernel fall back to the master for that expert, so
-+// the map only needs to be an under-approximation.  The flush holds `g_mutex` across the kernel launch,
-+// so the host pool cannot mutate a slot the kernel is about to read.  Caller holds `g_mutex`.
-+static void policy_pool_snapshot_locked(int device, void * stream) {
-+    if (!g_pool_enabled) {
-+        return;
-+    }
-+    for (table_t & t : g_tables) {
-+        if (!t.policy || t.device != device || t.pool_slot_dev == nullptr || t.n_experts <= 0) {
-+            continue;
-+        }
-+        // Stage through the table's persistent PINNED buffer (`slot_pin` is unused while the table is on
-+        // the device policy), so the async H2D source outlives the copy.  A pageable local vector is not
-+        // safe here: the runtime may defer the read past the vector's lifetime (observed as a garbage
-+        // slot index and a `moe_cache_policy_kernel` page fault).
-+        if (t.slot_pin == nullptr) {
-+            continue;
-+        }
-+        int32_t * ps = t.slot_pin;
-+        for (int e = 0; e < t.n_experts; e++) {
-+            ps[e] = -1;
-+        }
-+        host_pool_t * pool = table_pool_locked(t);
-+        if (g_pool_policy == 2) {
-+            // 1b probe: `pool_base` is the master, so the identity map reproduces the master fill.
-+            for (int e = 0; e < t.n_experts; e++) {
-+                ps[e] = e;
-+            }
-+        } else if (pool != nullptr) {
-+            for (const auto & kv : pool->expert_slot) {
-+                const int e = kv.first;
-+                const int s = kv.second;
-+                if (e >= 0 && e < t.n_experts && s >= 0 && s < pool->slots &&
-+                    pool->slot_state[(size_t) s] == 1) {
-+                    ps[e] = s;
-+                }
-+            }
-+        }
-+        (void) cudaMemcpyAsync(t.pool_slot_dev, ps, (size_t) t.n_experts * sizeof(int32_t),
-+                               cudaMemcpyHostToDevice, (cudaStream_t) stream);
-+    }
-+}
 +
-+// Patch the pool fields into the device descriptors.  `build_policy_descs_locked` early-returns once the
-+// table set is stable, so a pool that appears after the first build would otherwise never reach the
-+// kernel.  A small D2H/H2D of the descriptor array per device per token is negligible.  Caller holds
-+// `g_mutex`.
-+static void policy_pool_sync_base_locked(int device) {
-+    if (!g_pool_enabled) {
-+        return;
-+    }
-+    if (device < 0 || device >= (int) g_policy_dev.size()) {
-+        return;
-+    }
-+    policy_dev_t & pd = g_policy_dev[device];
-+    if (pd.desc == nullptr || pd.n == 0) {
-+        return;
-+    }
-+    device_guard dg(device);
-+    std::vector<moe_cache_policy_desc> host((size_t) pd.n);
-+    if (cudaMemcpy(host.data(), pd.desc, (size_t) pd.n * sizeof(moe_cache_policy_desc),
-+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-+        (void) cudaGetLastError();
-+        return;
-+    }
-+    bool changed = false;
-+    for (int i = 0; i < pd.n; i++) {
-+        table_t & t = g_tables[pd.ids[(size_t) i]];
-+        if (host[(size_t) i].pool_base != t.policy_pool_base || host[(size_t) i].pool_slot != t.pool_slot_dev ||
-+            host[(size_t) i].pool_slots != t.policy_pool_slots) {
-+            host[(size_t) i].pool_base  = t.policy_pool_base;
-+            host[(size_t) i].pool_slot  = t.pool_slot_dev;
-+            host[(size_t) i].pool_slots = t.policy_pool_slots;
-+            changed = true;
-+        }
-+    }
-+    if (changed) {
-+        (void) cudaMemcpy(pd.desc, host.data(), (size_t) pd.n * sizeof(moe_cache_policy_desc),
-+                          cudaMemcpyHostToDevice);
-+    }
-+}
 +
-+bool moe_cache_policy_flush(int device, void * stream) {
-+    if (!g_enabled || device < 0) {
-+        return false;
-+    }
-+    std::lock_guard<std::mutex> lock(g_mutex);
-+    if (device >= (int) g_policy_dev.size()) {
-+        g_policy_dev.resize(device + 1);
-+    }
-+    policy_dev_t & pd = g_policy_dev[device];
-+    pd.tokens++;
-+    if (g_devpolicy) {
-+        policy_pool_attach_locked(device);
-+        build_policy_descs_locked(device);
-+    }
-+    // Prompt-routing seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): the first decode-band flush after the prefill
-+    // tally is non-empty bulk-admits the prompt's hottest experts.  This is INDEPENDENT of the admission
-+    // engine: with the host expert pool on, `t.policy` is off for every table, but the device tally
-+    // (`moe_cache_tally_prefill`) is still collected and both the arena seed and the pool must rank from
-+    // it.  A true return means the device-policy state must resync from the (now seeded) host mirrors.
-+    if (g_prefill_seed && g_devmap) {
-+        if (seed_prefill_lazy_locked(device, stream) && g_devpolicy) {
-+            build_policy_descs_locked(device);
-+        }
-+    }
-+    if (g_devpolicy && pd.desc != nullptr && pd.shape_dev != nullptr && pd.n > 0) {
-+        // Target 1: publish the pool base + this token's expert->pool-slot map before the kernel.  The
-+        // map is snapshotted after the seed so seeded experts are included.
-+        policy_pool_sync_base_locked(device);
-+        policy_pool_snapshot_locked(device, stream);
-+        for (int i = 0; i < pd.n; i++) {
-+            table_t & t = g_tables[pd.ids[(size_t) i]];
-+            pd.shape_host[(size_t) i] = t.policy_pending ? (int32_t) (t.policy_n_used * t.policy_n_tok) : 0;
-+            t.policy_pending = false;
-+        }
-+        device_guard dg(device);
-+        (void) cudaMemcpyAsync(pd.shape_dev, pd.shape_host.data(), (size_t) pd.n * sizeof(int32_t),
-+                               cudaMemcpyHostToDevice, (cudaStream_t) stream);
-+        const int threads = 256;
-+        const int admit_arg = g_admit;
-+        moe_cache_policy_kernel<<<pd.n, threads, 0, (cudaStream_t) stream>>>(
-+            pd.desc, pd.shape_dev, pd.n, admit_arg, (int) g_touch, (int) g_period,
-+            0, g_fill ? 1 : 0, g_prov_evict ? 1 : 0);
-+    }
-+    return true;
-+}
 +
-+// When a layer's gate+up pair is redirected, the SAME kernel can build the layer's routed-`down`
-+// table's remap too: the gate+up op runs before the down op, all three read the same routing, and the
-+// down's own slot map is handed to the kernel (so the result is correct even if a role's map diverges).
-+// The down redirect then skips its own - now redundant - launch this pass.  `remap_fresh` is cleared by
-+// the per-table promotion after the graph, so eager and capture/replay both see a consistent decision.
-+static bool moe_cache_sibling_down(const ggml_tensor * op, int device,
-+                                   const int32_t ** slot2, int32_t ** remap2, int32_t ** used3) {
-+    const int layer = name_layer(op);
-+    if (layer < 0) {
-+        return false;
-+    }
-+    std::lock_guard<std::mutex> lock(g_mutex);
-+    for (table_t & t : g_tables) {
-+        if (t.layer != layer || t.device != device) {
-+            continue;
-+        }
-+        if (t.role.find("down_exps") == std::string::npos) {
-+            continue;
-+        }
-+        if (!(t.devmap && t.arena != nullptr && t.slots > 0 && t.slot_dev != nullptr &&
-+              t.remap_dev != nullptr && t.used_dev != nullptr)) {
-+            return false;   // a registered down role that cannot be served: do not fold
-+        }
-+        t.remap_fresh = true;
-+        if (slot2)  *slot2  = t.slot_dev;
-+        if (remap2) *remap2 = t.remap_dev;
-+        if (used3)  *used3  = t.used_dev;
-+        return true;
-+    }
-+    return false;
-+}
 +
 +bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate,
 +                              const ggml_tensor * ids, int device, void * stream,
@@ -11306,67 +9734,31 @@ index 000000000..0896855d0
 +    void *    remap = nullptr;
 +    int64_t   ns = 0, nu = 0, nt = 0;
 +    size_t    eb = 0;
-+    moe_cache_devmap dm{};
-+    if (!moe_cache_get_table(op, src0, device, &arena, &ns, &eb, &remap, &nu, &nt, &dm)) {
++    if (!moe_cache_get_table(op, src0, device, &arena, &ns, &eb, &remap, &nu, &nt)) {
 +        return false;
 +    }
-+    // Resolve the gate lane BEFORE the up remap launch: when BOTH lanes are device-remap tables the
-+    // gate table's used-list write is folded into the up kernel (one launch for both tables), because
-+    // the fused kernel reads the up table's remap for both lanes and the gate's remap VALUE is unused.
++    // Resolve the gate lane first so a shape mismatch is caught before either lane is redirected.
 +    void *    gate_arena = nullptr;
 +    void *    gr         = nullptr;
 +    bool      gate_ok    = false;
 +    int64_t   gnu = 0, gnt = 0;
-+    moe_cache_devmap gdm{};
 +    if (gate != nullptr) {
 +        void *  ga = nullptr;
 +        int64_t gs = 0;
 +        size_t  geb = 0;
-+        gate_ok = moe_cache_get_table(op, gate, device, &ga, &gs, &geb, &gr, &gnu, &gnt, &gdm);
++        gate_ok = moe_cache_get_table(op, gate, device, &ga, &gs, &geb, &gr, &gnu, &gnt);
 +        if (!gate_ok) {
 +            return false;   // never leave one lane redirected and the other reading a stale copy
 +        }
 +        gate_arena = ga;
 +    }
-+    // Device-remap mode: build the remap on the device from the routing + the device slot map.  The
-+    // scheduler took this input over without populating the copied table, so this MUST succeed.  The
-+    // gate+up redirect (`gate != nullptr`) also builds the layer's routed `down` remap in the same
-+    // kernel (see `moe_cache_sibling_down`), so the down redirect can skip its own launch this pass.
-+    int32_t * gate_used2 = nullptr;
-+    if (dm.slot_dev != nullptr) {
-+        if (!g_kslot) {
-+            if (gate_ok && gdm.slot_dev != nullptr && gdm.used_dev != nullptr && gr != nullptr) {
-+                gate_used2 = gdm.used_dev;
-+            }
-+            if (!dm.remap_fresh) {
-+                const int32_t * slot2  = nullptr;
-+                int32_t *       remap2 = nullptr;
-+                int32_t *       used3  = nullptr;
-+                if (gate != nullptr) {
-+                    (void) moe_cache_sibling_down(op, device, &slot2, &remap2, &used3);
-+                }
-+                moe_cache_launch_remap(ids->data, ids->nb[0], ids->nb[1], &dm, ids->ne[0], ids->ne[1],
-+                                       (int32_t *) remap, stream, gate_used2, slot2, remap2, used3);
-+            }
-+        }
-+        nu = ids->ne[0];
-+        nt = ids->ne[1];
-+    }
 +    // remap == nullptr is the identity fast path: the raw routing ids already index the arena.
 +    if (remap != nullptr && (nu != ids->ne[0] || nt != ids->ne[1])) {
 +        return false;
 +    }
-+    // An eager (non-devmap) gate remap must match the up shape (unchanged semantics).
-+    if (gate_ok && gr != nullptr && gdm.slot_dev == nullptr && (gnu != nu || gnt != nt)) {
++    // A gate remap must match the up shape (both lanes read the same routing).
++    if (gate_ok && gr != nullptr && (gnu != nu || gnt != nt)) {
 +        return false;   // never leave one lane redirected and the other reading a stale copy
-+    }
-+    // The gate lane's remap VALUE is unused by the fused kernel, but the deferred promotion is per
-+    // table and needs the gate table's routing.  When the up lane is not a device-remap table there is
-+    // nothing to fold the write into, so launch the standby gate remap (it also fills the used-list).
-+    if (gate_ok && gdm.slot_dev != nullptr && gdm.used_dev != nullptr && gr != nullptr &&
-+        gate_used2 == nullptr) {
-+        moe_cache_launch_remap(ids->data, ids->nb[0], ids->nb[1], &gdm, ids->ne[0], ids->ne[1],
-+                               (int32_t *) gr, stream);
 +    }
 +    *src0_cpy = *src0;
 +    src0_cpy->data   = arena;
@@ -11385,69 +9777,6 @@ index 000000000..0896855d0
 +    return true;
 +}
 +
-+void moe_cache_read_check(const ggml_tensor * weight_cpy, const ggml_tensor * ids, void * stream) {
-+    if (!g_enabled || weight_cpy == nullptr || ids == nullptr) {
-+        return;
-+    }
-+    std::lock_guard<std::mutex> lock(g_mutex);
-+    const auto it = g_alias_to_id.find(weight_cpy);
-+    if (it == g_alias_to_id.end()) {
-+        return;
-+    }
-+    table_t & t = g_tables[it->second];
-+    if (t.policy) {
-+        return;   // host mirrors are stale under the device-side policy; the remap is built on the device
-+    }
-+    if (t.remap_dev == nullptr || t.remap_n_used <= 0) {
-+        return;
-+    }
-+    const int64_t n_used = ids->ne[0];
-+    const int64_t n_tok  = ids->ne[1];
-+    if (n_used != t.remap_n_used || n_tok != t.remap_n_tok) {
-+        GGML_LOG_ERROR("%s: SHAPE layer=%d role=%s ids=(%lld,%lld) remap=(%lld,%lld)\n",
-+                       __func__, t.layer, t.role.c_str(), (long long) n_used, (long long) n_tok,
-+                       (long long) t.remap_n_used, (long long) t.remap_n_tok);
-+        return;
-+    }
-+    (void) cudaStreamSynchronize((cudaStream_t) stream);
-+    // D2H the op's own routing (the device tensor), then compare it to the routing the hook consumed
-+    // and to the staged remap.  Reading `ids->data` on the host is only valid for host-mapped buffers,
-+    // so copy explicitly.
-+    const size_t id_bytes = (size_t) ids->nb[1] * (size_t) (ids->ne[1] > 0 ? ids->ne[1] : 1);
-+    std::vector<int32_t> idbuf(id_bytes / sizeof(int32_t) + 1, -1);
-+    (void) cudaMemcpy(idbuf.data(), ids->data, id_bytes, cudaMemcpyDeviceToHost);
-+    const char * ib = (const char *) idbuf.data();
-+    std::vector<int32_t> r((size_t) n_used * n_tok, -1);
-+    (void) cudaMemcpy(r.data(), t.remap_dev, (size_t) n_used * n_tok * sizeof(int32_t), cudaMemcpyDeviceToHost);
-+    std::vector<uint8_t> rd((size_t) t.expert_bytes);
-+    int bad = 0;
-+    for (int64_t tok = 0; tok < n_tok; tok++) {
-+        for (int64_t j = 0; j < n_used; j++) {
-+            const int32_t e_dev = *(const int32_t *) (ib + (size_t) tok * ids->nb[1] + (size_t) j * ids->nb[0]);
-+            const int32_t e_hook = t.hook_experts[(size_t) tok * n_used + j];
-+            const int32_t rv = r[(size_t) tok * n_used + j];
-+            if (e_dev != e_hook && bad++ < 6) {
-+                GGML_LOG_ERROR("%s: ROUTE layer=%d role=%s tok=%lld j=%lld dev=%d hook=%d\n",
-+                               __func__, t.layer, t.role.c_str(), (long long) tok, (long long) j, e_dev, e_hook);
-+            }
-+            const auto m = t.expert_slot.find(e_dev);
-+            const int32_t expect = (m != t.expert_slot.end()) ? m->second : -1;
-+            if (rv != expect && bad++ < 6) {
-+                GGML_LOG_ERROR("%s: STALE layer=%d role=%s tok=%lld j=%lld e=%d remap=%d map=%d\n",
-+                               __func__, t.layer, t.role.c_str(), (long long) tok, (long long) j, e_dev, rv, expect);
-+                continue;
-+            }
-+            if (rv >= 0 && rv < t.slots && t.host != nullptr) {
-+                (void) cudaMemcpy(rd.data(), (const char *) t.arena + (size_t) rv * t.expert_bytes,
-+                                  t.expert_bytes, cudaMemcpyDeviceToHost);
-+                if (memcmp(rd.data(), (const char *) t.host + (size_t) e_dev * t.expert_bytes, t.expert_bytes) != 0 && bad++ < 6) {
-+                    GGML_LOG_ERROR("%s: BYTES layer=%d role=%s tok=%lld j=%lld e=%d slot=%d\n",
-+                                   __func__, t.layer, t.role.c_str(), (long long) tok, (long long) j, e_dev, rv);
-+                }
-+            }
-+        }
-+    }
-+}
 +
 +void moe_cache_init(int device) {
 +    {
@@ -11476,29 +9805,8 @@ index 000000000..0896855d0
 +void moe_cache_report() {
 +    if (!g_enabled) {
 +        return;
-+    }    std::lock_guard<std::mutex> lock(g_mutex);
-+    // Device-side policy: the host counters are stale (the kernel owns them).  D2H each per-device
-+    // descriptor array and copy its cumulative counters back so the report and `h` are meaningful.
-+    for (int d = 0; d < (int) g_policy_dev.size(); d++) {
-+        policy_dev_t & pd = g_policy_dev[(size_t) d];
-+        if (pd.desc == nullptr || pd.n <= 0) {
-+            continue;
-+        }
-+        device_guard dg(d);
-+        std::vector<moe_cache_policy_desc> host((size_t) pd.n);
-+        if (cudaMemcpy(host.data(), pd.desc, (size_t) pd.n * sizeof(moe_cache_policy_desc),
-+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-+            (void) cudaGetLastError();
-+            continue;
-+        }
-+        for (int i = 0; i < pd.n; i++) {
-+            table_t & t = g_tables[pd.ids[(size_t) i]];
-+            t.hits      = host[(size_t) i].acc_hits;
-+            t.misses    = host[(size_t) i].acc_misses;
-+            t.fills     = host[(size_t) i].acc_fills;
-+            t.evictions = host[(size_t) i].acc_evict;
-+        }
 +    }
++    std::lock_guard<std::mutex> lock(g_mutex);
 +    int64_t hits = 0, misses = 0, fills = 0, evictions = 0;
 +    int n_tables = 0, n_slots = 0;
 +    int64_t dev_slots[GGML_CUDA_MAX_DEVICES]  = {0};
@@ -11562,10 +9870,7 @@ index 000000000..0896855d0
 +                  __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);    if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
 +        const int64_t acc   = g_acc_hits + g_acc_fills + g_acc_colds;
 +        const int64_t bytes = g_fill_bytes + g_cold_bytes;
-+        const int64_t tokens = (n_tables > 0 && g_promote_calls > 0) ? g_promote_calls / n_tables : 0;
-+        GGML_LOG_INFO("%s: remap-kernel launches=%lld (~%.1f/token)\n",
-+                      __func__, (long long) g_remap_launches,
-+                      tokens > 0 ? (double) g_remap_launches / (double) tokens : 0.0);
++        const int64_t tokens = (n_tables > 0 && g_takeover > 0) ? g_takeover / n_tables : 0;
 +        GGML_LOG_INFO("%s: expert access: hits=%lld fills=%lld colds=%lld (hit=%.2f%% fill=%.2f%% cold=%.2f%%)\n",
 +                      __func__, (long long) g_acc_hits, (long long) g_acc_fills, (long long) g_acc_colds,
 +                      100.0 * (double) g_acc_hits / (double) acc, 100.0 * (double) g_acc_fills / (double) acc,
@@ -11588,153 +9893,7 @@ index 000000000..0896855d0
 +// self-test: synthetic table, known pattern, fill + byte-verify.  Does not need a model.
 +// ---------------------------------------------------------------------------------------------
 +
-+// ---------------------------------------------------------------------------------------------
-+// Device-policy vs host-policy parity self-test (item A1).
-+//
-+// Byte-identity cannot catch an admission-policy divergence (a wrong victim still computes correct
-+// output), so this replays a deterministic synthetic routing sequence through BOTH `access_locked` and
-+// `moe_cache_policy_kernel` and compares the resulting residency, counters, occupancy and clock.  One
-+// scenario per call; `prefill` seeds experts 0..slots-1 as provisional (the newest logic).
-+// ---------------------------------------------------------------------------------------------
-+static bool devpolicy_selftest_case(const char * name, bool prefill) {
-+    const int    n_experts = 64;
-+    const int    slots     = 16;
-+    const int    n_used    = 8;
-+    const int    steps     = 512;
-+    const int    threads   = 256;
-+    const size_t eb        = 256;
 +
-+    int prev = 0;
-+    (void) cudaGetDevice(&prev);
-+    if (g_device >= 0) { (void) cudaSetDevice(g_device); }
-+
-+    std::vector<uint8_t> host((size_t) n_experts * eb);
-+    for (int e = 0; e < n_experts; e++) {
-+        for (size_t i = 0; i < eb; i++) {
-+            host[(size_t) e * eb + i] = (uint8_t) (e * 13 + i);
-+        }
-+    }
-+    void * arena = nullptr;
-+    if (cudaMalloc(&arena, (size_t) slots * eb) != cudaSuccess) {
-+        (void) cudaGetLastError();
-+        if (g_device >= 0) { (void) cudaSetDevice(prev); }
-+        return false;
-+    }
-+
-+    table_t t;
-+    t.layer = -1; t.role = "selftest"; t.n_experts = n_experts; t.expert_bytes = eb; t.host_bytes = eb;
-+    t.slots = slots; t.allocated = true;
-+    t.host = host.data(); t.host_dev = host.data(); t.arena = arena; t.device = g_device; t.cold_safe = true;
-+    t.identity = false; t.policy = true;
-+    t.slot_expert.assign(slots, -1); t.slot_prov.assign(slots, 0);
-+    t.count.assign(n_experts, 0); t.ghost.assign(n_experts, 0); t.last.assign(n_experts, 0);
-+    if (prefill) {
-+        for (int i = 0; i < slots; i++) { t.slot_expert[i] = i; t.expert_slot[i] = i; t.slot_prov[i] = 1; }
-+    }
-+
-+    int32_t * d_slot_expert = nullptr, * d_slot = nullptr, * d_count = nullptr, * d_ghost = nullptr;
-+    int32_t * d_last = nullptr, * d_used = nullptr, * d_shape = nullptr;
-+    uint8_t * d_prov = nullptr;
-+    moe_cache_policy_desc * d_desc = nullptr;
-+    auto alloc = [](void ** p, size_t bytes) { return cudaMalloc(p, bytes) == cudaSuccess; };
-+    bool aok = alloc((void **) &d_slot_expert, (size_t) slots * 4) && alloc((void **) &d_slot, (size_t) n_experts * 4) &&
-+               alloc((void **) &d_count, (size_t) n_experts * 4) && alloc((void **) &d_ghost, (size_t) n_experts * 4) &&
-+               alloc((void **) &d_last, (size_t) n_experts * 4) && alloc((void **) &d_used, (size_t) n_used * 4) &&
-+               alloc((void **) &d_shape, 4) && alloc((void **) &d_prov, (size_t) slots) &&
-+               alloc((void **) &d_desc, sizeof(moe_cache_policy_desc));
-+    if (!aok) {
-+        (void) cudaGetLastError();
-+        (void) cudaFree(arena);
-+        if (g_device >= 0) { (void) cudaSetDevice(prev); }
-+        return false;
-+    }
-+
-+    {
-+        std::vector<int32_t> se((size_t) slots, -1), sm((size_t) n_experts, -1);
-+        for (int s = 0; s < slots; s++) { se[(size_t) s] = t.slot_expert[s]; }
-+        for (const auto & kv : t.expert_slot) { sm[(size_t) kv.first] = kv.second; }
-+        (void) cudaMemcpy(d_slot_expert, se.data(), (size_t) slots * 4, cudaMemcpyHostToDevice);
-+        (void) cudaMemcpy(d_slot, sm.data(), (size_t) n_experts * 4, cudaMemcpyHostToDevice);
-+        (void) cudaMemcpy(d_count, t.count.data(), (size_t) n_experts * 4, cudaMemcpyHostToDevice);
-+        (void) cudaMemcpy(d_ghost, t.ghost.data(), (size_t) n_experts * 4, cudaMemcpyHostToDevice);
-+        (void) cudaMemcpy(d_last, t.last.data(), (size_t) n_experts * 4, cudaMemcpyHostToDevice);
-+        (void) cudaMemcpy(d_prov, t.slot_prov.data(), (size_t) slots, cudaMemcpyHostToDevice);
-+        const int32_t shape0 = n_used;
-+        (void) cudaMemcpy(d_shape, &shape0, 4, cudaMemcpyHostToDevice);
-+    }
-+    moe_cache_policy_desc desc;
-+    memset(&desc, 0, sizeof(desc));
-+    desc.slot_expert = d_slot_expert; desc.slot = d_slot; desc.count = d_count; desc.ghost = d_ghost;
-+    desc.last = d_last; desc.slot_prov = d_prov; desc.used = d_used;
-+    desc.arena = arena; desc.host_dev = host.data(); desc.host_bytes = eb; desc.src_off = 0;
-+    desc.expert_bytes = eb; desc.host_pitch = 0; desc.clock = 0; desc.last_decay = 0;
-+    desc.n_experts = n_experts; desc.slots = slots; desc.occupied = (int32_t) t.expert_slot.size();
-+    desc.split_axis = -1;
-+    (void) cudaMemcpy(d_desc, &desc, sizeof(desc), cudaMemcpyHostToDevice);
-+
-+    const int admit_arg = g_admit;
-+    uint32_t rng = 0x12345678u;
-+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng; };
-+    std::vector<int32_t> used((size_t) n_used);
-+    for (int step = 0; step < steps; step++) {
-+        for (int j = 0; j < n_used; j++) {
-+            used[(size_t) j] = (next() % 100 < 60) ? (int32_t) (next() % 16) : (int32_t) (next() % n_experts);
-+        }
-+        for (int j = 0; j < n_used; j++) {
-+            bool cold = false;
-+            (void) access_locked(t, used[(size_t) j], nullptr, used.data(), n_used, &cold);
-+        }
-+        (void) cudaMemcpy(d_used, used.data(), (size_t) n_used * 4, cudaMemcpyHostToDevice);
-+        // do_fill=0: the parity test only checks the admission policy, and a kernel-side fill would read
-+        // the selftest's pageable host buffer over UVA (which can fault/hang).
-+        moe_cache_policy_kernel<<<1, threads, 0, 0>>>(d_desc, d_shape, 1, admit_arg, (int) g_touch,
-+                                                      (int) g_period, 0, 0, g_prov_evict ? 1 : 0);
-+    }
-+    (void) cudaDeviceSynchronize();
-+
-+    std::vector<int32_t> dse((size_t) slots, -2), dsm((size_t) n_experts, -2), dc((size_t) n_experts, 0);
-+    std::vector<int32_t> dg((size_t) n_experts, 0);
-+    uint8_t dp_dummy = 0; (void) dp_dummy;
-+    moe_cache_policy_desc rd;
-+    memset(&rd, 0, sizeof(rd));
-+    (void) cudaMemcpy(dse.data(), d_slot_expert, (size_t) slots * 4, cudaMemcpyDeviceToHost);
-+    (void) cudaMemcpy(dsm.data(), d_slot, (size_t) n_experts * 4, cudaMemcpyDeviceToHost);
-+    (void) cudaMemcpy(dc.data(), d_count, (size_t) n_experts * 4, cudaMemcpyDeviceToHost);
-+    (void) cudaMemcpy(dg.data(), d_ghost, (size_t) n_experts * 4, cudaMemcpyDeviceToHost);
-+    (void) cudaMemcpy(&rd, d_desc, sizeof(rd), cudaMemcpyDeviceToHost);
-+    int mism = 0;
-+    for (int s = 0; s < slots; s++) { if (dse[(size_t) s] != t.slot_expert[s]) { mism++; } }
-+    for (int e = 0; e < n_experts; e++) {
-+        const int32_t hs = (t.expert_slot.count(e) != 0) ? t.expert_slot[e] : -1;
-+        if (dsm[(size_t) e] != hs || dc[(size_t) e] != (int32_t) t.count[(size_t) e] ||
-+            dg[(size_t) e] != (int32_t) t.ghost[(size_t) e]) { mism++; }
-+    }
-+    const bool ok = mism == 0 && rd.acc_hits == t.hits && rd.acc_misses == t.misses && rd.clock == t.clock &&
-+                    rd.last_decay == t.last_decay;
-+    GGML_LOG_WARN("%s: %s: %s slots=%d resident=%zu hits(host=%lld dev=%lld) misses(host=%lld dev=%lld) "
-+                  "clock(host=%lld dev=%lld) mismatches=%d\n",
-+                  __func__, ok ? "PASS" : "FAIL", name, slots, t.expert_slot.size(),
-+                  (long long) t.hits, (long long) rd.acc_hits, (long long) t.misses, (long long) rd.acc_misses,
-+                  (long long) t.clock, (long long) rd.clock, mism);
-+
-+    (void) cudaFree(d_slot_expert); (void) cudaFree(d_slot); (void) cudaFree(d_count);
-+    (void) cudaFree(d_ghost); (void) cudaFree(d_last); (void) cudaFree(d_used);
-+    (void) cudaFree(d_shape); (void) cudaFree(d_prov); (void) cudaFree(d_desc); (void) cudaFree(arena);
-+    if (g_device >= 0) { (void) cudaSetDevice(prev); }
-+    return ok;
-+}
-+
-+static void moe_cache_devpolicy_selftest() {
-+    if (!g_devpolicy) {
-+        GGML_LOG_WARN("%s: skipped (MOE_EXPERT_CACHE_DEVPOLICY off)\n", __func__);
-+        return;
-+    }
-+    device_guard dg(g_device);
-+    const bool a = devpolicy_selftest_case("empty", false);
-+    const bool b = devpolicy_selftest_case("provisional-prefill", true);
-+    GGML_LOG_WARN("%s: %s (empty=%s provisional=%s)\n", __func__, (a && b) ? "PASS" : "FAIL",
-+                  a ? "PASS" : "FAIL", b ? "PASS" : "FAIL");
-+}
 +
 +void moe_cache_selftest() {
 +    if (!g_enabled) {
@@ -11800,19 +9959,16 @@ index 000000000..0896855d0
 +        g_fill = fill_env_prev;
 +    }
 +
-+    // item A1: device-policy vs host-policy parity (only when the device policy is enabled).
-+    moe_cache_devpolicy_selftest();
-+
 +    if (g_device >= 0) {
 +        (void) cudaSetDevice(prev);
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..03ebc45c9
+index 000000000..794524039
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,283 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -11839,9 +9995,6 @@ index 000000000..03ebc45c9
 +//                              an op over)
 +//   MOE_EXPERT_CACHE_RESERVE_MIB=R  VRAM held back from the arena (default 1024; the arena is sized
 +//                              from *free* memory, so `--fit` need not know about it)
-+//   MOE_EXPERT_CACHE_DEVMAP=0  disable the device-side remap + deferred promotion (default 1)
-+//   MOE_EXPERT_CACHE_DEVPOLICY=0  disable the device-side LFRU admission (default 1, needs DEVMAP)
-+//   MOE_EXPERT_CACHE_KSLOT=0   disable the in-kernel slot lookup (default 1, needs DEVMAP)
 +//   MOE_EXPERT_CACHE_PREFILL_SEED=0  disable the prompt-routing seed (default 1)
 +//   MOE_EXPERT_CACHE_PREFILL_SEED_N=N  cap the seeded experts/table (0 = all slots)
 +//   MOE_EXPERT_CACHE_PROVISIONAL=0  disable reclaiming pre-filled/seed slots before first hit
@@ -11874,24 +10027,12 @@ index 000000000..03ebc45c9
 +// source: the scheduler asks the backend through the `moe_cache_band` iface hook.
 +int moe_cache_max_tok_dev(int device);
 +int moe_cache_max_tok();   // the current device's band
++
 +#define MOE_EXPERT_CACHE_MAX_TOK (moe_cache_max_tok())
 +
 +struct moe_cache_alias {
 +    void * ptr;        // device-usable address; nullptr if unknown
 +    bool   resident;   // true iff backed by a VRAM slot
-+};
-+
-+// Device-side remap (wip/moe-expert-cache, gentle-curve follow-up).  A partial-residency table cannot
-+// keep `slot == expert`, so the remap is needed - but it can be built ON THE DEVICE from the routing
-+// ids and a device `expert -> slot` map, which removes the per-layer host ids readback (and the full
-+// device synchronize it forces) from the decode loop.  `moe_cache_get_table` fills this when the table
-+// is in device-remap mode; the caller then launches `moe_cache_launch_remap` before dispatching.
-+struct moe_cache_devmap {
-+    const int32_t * slot_dev;   // device int32[n_experts]: expert -> slot, or -1 (serve cold)
-+    int32_t *       used_dev;   // device int32[n_experts*n_tok]: the raw routing the remap kernel read
-+    int             n_experts;
-+    int             n_res;      // first COLD-encoded id (== the resident slot count)
-+    bool            remap_fresh;// true when an earlier redirect this pass already built this remap
 +};
 +
 +bool moe_cache_enabled();
@@ -11950,7 +10091,7 @@ index 000000000..03ebc45c9
 +size_t moe_cache_evict_slab_range(int device, void * lo, void * hi);
 +
 +// OPEN 2 debug validator: `MOE_EXPERT_CACHE_VALIDATE=1` checks the structural invariants every consumer
-+// relies on (slot/arena consistency, `g_arena_bytes`, remap/identity/devmap coherence) and logs any
++// relies on (slot/arena consistency, `g_arena_bytes`, remap/identity coherence) and logs any
 +// violation; `=2` additionally D2H-reads each resident slot's head and flags a non-finite f16 scale --
 +// the precondition of the repeated-`/` MMQ over-read corruption.  A no-op when the env var is unset, so
 +// a normal run pays nothing.  Call it after anything that changes the arena (a stand-down, a release,
@@ -11977,6 +10118,14 @@ index 000000000..03ebc45c9
 +// a partially-failed cache (any allocation failed, or a budget below one expert) must stand its fusions
 +// down wholesale and let the per-op path run.  Returns false before sizing and for an empty cache.
 +bool moe_cache_has_arena();
++
++// Per-table form of the fusion guard: true when THIS table can serve the cache-aware fused path, i.e.
++// it is an identity table (fully resident; `moe_cache_take_over` serves it with the raw ids).  The
++// global `moe_cache_has_arena()` requires ALL tables, so one evicted table flips the arithmetic of
++// every other table in the graph; this lets a resident table keep the fused path while only the
++// unserveable op(s) stand down.  `op` is the `MUL_MAT_ID` (for the layer suffix), `weight` is the
++// tensor the fused call site would redirect (the scheduler's copy or the original).
++bool moe_cache_table_serves(const struct ggml_tensor * op, const struct ggml_tensor * weight, int device);
 +
 +// wip/slab-ring-region: the deferred arena sizing has run.  The slab's H2D-ring hole must stay ARMED
 +// through sizing, so the auto-sized arena never allocates its highest tables into the hole (a disarm
@@ -12043,16 +10192,6 @@ index 000000000..03ebc45c9
 +                           size_t ids_nb0, size_t ids_nb1, void * stream,
 +                           int device, size_t slice_off, int split_axis);
 +
-+// Device-side prefill tally (MOE_EXPERT_CACHE_PREFILL_SEED=1).  Called from `ggml_cuda_mul_mat_id` for a
-+// prefill (`ids->ne[1] > MOE_EXPERT_CACHE_MAX_TOK`) MUL_MAT_ID: histograms the prompt's routing into a
-+// per-table device counter so the first decode-band policy flush can bulk-admit the hot experts as
-+// provisional slots.  This is the `-sm tensor` path, where the scheduler's block-06 staging intercepts
-+// the prefill upload before `moe_cache_update_host`.  No-op when the seed is off or the table is unknown.
-+// `op` is the MUL_MAT_ID output (name carries the layer); `weight` is the op's expert weight; `ids` is the
-+// device routing (strided).
-+bool moe_cache_tally_prefill(const struct ggml_tensor * op, const struct ggml_tensor * weight,
-+                             const struct ggml_tensor * ids, int device, void * stream);
-+
 +// Host-weight expert gather (B2, session 15).  For a `-ncmoe` `MUL_MAT_ID` prefill whose expert upload is
 +// NOT staged, copy only the routed experts from the host master into the scheduler's device `input_cpy`,
 +// on the device, instead of reading the routing back to the host and copying per-run.  Independent of the
@@ -12071,40 +10210,13 @@ index 000000000..03ebc45c9
 +// cache-managed (caller uses the normal path).
 +bool moe_cache_get_table(const struct ggml_tensor * op, const struct ggml_tensor * weight_cpy, int device,
 +                         void ** arena, int64_t * n_slots,
-+                         size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok,
-+                         struct moe_cache_devmap * dm = nullptr);
-+
-+// Launch the tiny remap-build kernel: remap[i] = slot_dev[ids[i]] (or n_res + ids[i] for a cold
-+// expert).  Runs on `stream`; capture-safe.  `used2` folds a second table's used-list write into the
-+// same launch; `slot2`/`remap2`/`used3` build a sibling (the layer's routed `down`) from its own slot
-+// map so the caller can skip that sibling's separate launch (see `moe_cache_redirect_fused`).
-+void moe_cache_launch_remap(const void * ids, size_t nb0, size_t nb1,
-+                            const struct moe_cache_devmap * dm, int64_t n_used, int64_t n_tok,
-+                            int32_t * remap_dev, void * stream, int32_t * used2 = nullptr,
-+                            const int32_t * slot2 = nullptr, int32_t * remap2 = nullptr,
-+                            int32_t * used3 = nullptr);
++                         size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok);
 +
 +// Structural takeover for the decode/verify band: true when the table is cache-managed and the consumer
-+// can read the arena without the host routing - an identity table (raw ids) or a device-remap table.
-+// `need_promote` tells the scheduler whether to record the routing for the deferred promotion pass.
-+bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, int device,
-+                         bool * need_promote);
-+
-+// Deferred promotion, called from the scheduler AFTER the graph is launched (one sync per token, not one
-+// per layer).  Runs the LFRU admission + fills for the used experts and refreshes the device slot map.
-+// `ids` is the contiguous host copy (`n_used x n_tok` int32, strided by ids_nb0/ids_nb1).
-+bool moe_cache_promote_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
-+                            const int32_t * ids, int64_t n_used, int64_t n_tok,
-+                            size_t ids_nb0, size_t ids_nb1, void * stream, int device);
-+
-+// Device-side admission policy (MOE_EXPERT_CACHE_DEVPOLICY=1, default off).  Runs the LFRU admission +
-+// eviction + fill decision for every device-remap table of `device` in ONE batched kernel launch per
-+// token, replacing the per-table host promotion.  The per-table `moe_cache_promote_host` calls have
-+// already recorded each table's shape for this token; this flushes them.  A no-op when the policy is
-+// off.  The kernel updates the device `expert -> slot` map in place and copies admitted experts from
-+// the pinned host alias into the arena slots, so no used-list / fill-list readback is needed.  Returns
-+// true when it ran (or there was nothing to do).
-+bool moe_cache_policy_flush(int device, void * stream);
++// can read the arena without the host routing (an identity table, served with the raw ids).  Every other
++// table takes the eager host-routing path (`moe_cache_update_host`), which materializes the remap on the
++// host and republishes it before the graph.
++bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, int device);
 +
 +// wip/moe-expert-cache: redirect a fused decode MoE (gate+up+GLU) onto the cache arenas.  When the
 +// routed up table (`src0`) and the gate table (`gate`) are both cache-managed for the current routing,
@@ -12136,23 +10248,6 @@ index 000000000..03ebc45c9
 +// every id is a resident slot (the 1a contract).
 +bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
 +                        size_t * cold_channel_bytes, size_t * cold_row_bytes);
-+
-+// B3 (MOE_EXPERT_CACHE_KSLOT=1, opt-in): resolve the device slot map and used-list for the table whose
-+// arena is `arena`, so the MoE ids consumer can compute `channel = slot_dev[ids[i]]` in-kernel (cold
-+// encoding `n_res + e`) and write the raw routing into `*used_dev` itself, instead of reading a
-+// materialized remap buffer.  Returns false for the identity path, the eager host-promotion path and
-+// any non-arena pointer, in which case the consumer keeps its current behaviour.  When `g_kslot` is off
-+// (the default) this is always false, so the caller is unchanged.  `used_gate_dev` is a convenience: a
-+// second lookup by the gate arena, for the fused gate+up lane's used-list.
-+bool moe_cache_get_slot(const void * arena, const int32_t ** slot_dev, int32_t ** used_dev, int32_t * n_experts);
-+
-+// True when the B3 in-kernel slot lookup (MOE_EXPERT_CACHE_KSLOT=1) is active.  The redirect sites use
-+// it to skip building a remap buffer; the consumer kernel finds the slot map by arena itself.
-+bool moe_cache_kslot_active();
-+
-+// Bring-up diagnostic (env MOE_EXPERT_CACHE_READCHECK=1): at op-read time, compare the staged remap
-+// against the live expert->slot map and report any divergence (a stale remap or a wrong table).
-+void moe_cache_read_check(const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, void * stream);
 +
 +void moe_cache_init(int device);   // lazy, per device; safe to call repeatedly
 +void moe_cache_selftest();         // synthetic arena fill/verify
@@ -13987,10 +12082,10 @@ index 87ee096fa..ff8e07b98 100644
  };
  
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 158a15bb8..d03675690 100644
+index 158a15bb8..5af50e92e 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -1085,7 +1085,18 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+@@ -1085,7 +1085,17 @@ static ggml_backend_i ggml_backend_rpc_interface = {
      /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
      /* .event_record            = */ ggml_backend_rpc_event_record,
      /* .event_wait              = */ ggml_backend_rpc_event_wait,
@@ -14003,13 +12098,12 @@ index 158a15bb8..d03675690 100644
      /* .graph_optimize          = */ NULL,
 +    /* .moe_cache_update        = */ NULL,
 +    /* .moe_cache_take_over     = */ NULL,
-+    /* .moe_cache_promote       = */ NULL,
 +    /* .moe_cache_band          = */ NULL,
 +    /* .moe_cache_gather        = */ NULL,
  };
  
  ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
-@@ -2265,6 +2276,14 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+@@ -2265,6 +2275,14 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
      /* .event_new            = */ ggml_backend_rpc_device_event_new,
      /* .event_free           = */ ggml_backend_rpc_device_event_free,
      /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,

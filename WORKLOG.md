@@ -1,5 +1,61 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-10 (r40) -- DEVMAP removal + the non-devmap WIP fixes folded into the delivery
+
+**Release `v16-a55e952b8-r40`** (base `a55e952b8`, canonical block-15 tip
+`fdecb4d337b2e945e204e7217873a1eeea20d361`, net tree
+`73c371a2f453489dccdcea73ed22216b27cb9a28`; `n_blocks` 16; `validate-set.sh` green -- strict 16/16
+`git am`, reconstructed tree == `release.json`).  Folds the DEVMAP (device-remap) experiment out of the
+delivery for good, plus the validated non-devmap fixes.  `patches/` was regenerated from a canonical fork
+rebuilt at the base (`scripts/apply-all.sh`) -- **do not hand-edit**.
+
+**The removal is an amendment to block 06, not a later "remove" block.**  Block 06 used to create the whole
+device-remap machinery (the `moe_cache_*` slot map, `moe_cache_promote_host`, `moe_cache_policy_flush`,
+`moe_cache_get_slot`, the prefill tally, and the `MOE_EXPERT_CACHE_DEVMAP`/`_DEVPOLICY`/`_DEVPOLICY_SPLIT`/
+`_KSLOT`/`_DEV_EAGER` knobs).  It is stripped at block 06 against block 06's own content; the KSLOT hunks
+are dropped from block 13; and the devmap leftovers (the level-4 validator, `CACHE_STANDDOWN_*`,
+`CACHE_REDIR_DEBUG`, the in-place staging globals, the dead `slot_dev`/`g_promote_calls`/`g_remap_launches`/
+`MOE_HOST_POOL_POLICY` state) are gone.  Every block 00-15 is now free of the device-remap symbols:
+`grep -E 'DEVMAP|g_devmap|KSLOT|g_kslot|DEVPOLICY|g_devpolicy|slot_dev|used_dev|DEV_EAGER'` over `ggml/`
+`src/` `common/` is empty at every block.  The eager host-routing path (materialized remap) is the sole
+`-sm tensor` split policy.
+
+**Non-devmap WIP fixes kept** (hard-won, folded into blocks 06/15): the **per-table fusion guard**
+(`moe_cache_table_serves`, the issue **#50** repair -- block 06 no longer carries the global
+`moe_cache_has_arena()` guard after this fold), the **narrow-2 slab** MTP-draft COMPUTE-aliasing fix, the
+**`-ncmoe` host-expert offload** option, the level-3 slot-content validator, the `MOE_EXPERT_CACHE_ADMIT`/
+`_TOUCH`/`_COLD_UVA` knobs, `GGML_CUDA_CACHE_GEOM_DEBUG` and the `test-logits-width-probe` changes.
+
+**Why the device path was dropped.**  Its divergence was never the map: `ROCBLAS_USE_HIPBLASLT=0` makes the
+budget sweep and the `n_rs_seq` 0-vs-3 A/B pure -- a layout-sensitive hipBLASLt solution flip (issue #67 /
+ROCm/rocm-libraries#12126).  Disabling hipBLASLt costs ~12-17 % prefill on gfx1201/ROCm 7.14 and ROCm
+10.1.0 does not fix it.  Paying that to keep a ~14 % decode path smaller than the prefill loss is not worth
+it.  Detail: `wip/moe-verify-fusions/FINDINGS-devmap-removal.md`; the fold procedure:
+`wip/moe-verify-fusions/HANDOVER-delivery-fold.md`.
+
+**Gates on the reconstructed delivery tree** (gfx1201, 2x R9700, `-sm tensor`, `--fit on`, 32 358-token
+prompt):
+
+| gate | result |
+|---|---|
+| qwen4exp `none` vs `draft-mtp n3` | **None** (pure) |
+| budget sweep `MOE_EXPERT_CACHE_MIB` 8000 vs 14000 | **None** (pure) |
+| MTP n3 (1000 tok) | prefill **1585.2** t/s, decode **72.36** t/s, acc **0.77017** |
+| plain (1000 tok) | prefill **1471.8** t/s, decode **41.73** t/s |
+| `scripts/gate-prefill-logits.sh` | **PASS** mean KLD **0.000707**, same-top-p **98.755 %** |
+| `test-backend-ops -o MUL_MAT_ID` | **931/931** |
+| `test-backend-ops -o FLASH_ATTN_QSA` | **26/26** |
+| `test-recurrent-state-rollback` | **PASS** (max diff 0) |
+| coherence (`Qwen3.5-4B-Q8_0`, seed 42) | identical to the WIP build |
+
+MTP/plain are within run-to-run noise of the pre-removal `DEVMAP=0` baseline (MTP 1587.0 / 72.56 /
+0.77017; plain 1471.9 / 41.80) and the split geometry is unchanged (`expert_bytes < host_bytes`,
+`src_off != 0`).
+
+**Superseded records:** `wip/moe-verify-fusions/HANDOVER-devmap-consistency.md`,
+`FINDINGS-devmap-generation-fix.md` and the device-path sections of `FINDINGS-single-seq-rollback.md` are
+kept for the record but no longer describe the delivery.  `TODO.md` #50 is resolved.
+
 ## 2026-10-10 (r39) -- PROMOTION: the H2D staging ring moves INSIDE the movable-boundary slab (block 06 + block 15)
 
 **Release `v16-a55e952b8-r39`** (base `a55e952b8`, canonical block-15 tip
