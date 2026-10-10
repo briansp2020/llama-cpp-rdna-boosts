@@ -1,4 +1,4 @@
-From c2863e0b1f21afcca1373e6adc8a4dd5374a92b4 Mon Sep 17 00:00:00 2001
+From 51a2d41c2b6f321d52bc775c961fcfdf517d5b94 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
@@ -8,7 +8,7 @@ Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
  common/common.cpp                             |    3 +
  common/speculative.cpp                        |    1 +
  ggml/include/ggml.h                           |    7 +-
- ggml/src/ggml-cuda/gated_delta_net.cu         |   99 ++
+ ggml/src/ggml-cuda/gated_delta_net.cu         |  105 ++
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu |  702 ++++++++++++
  .../src/ggml-cuda/gated_delta_net_chunked.cuh |   58 +
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu |  996 ++++++++++++++++
@@ -27,7 +27,7 @@ Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
  src/llama-model.cpp                           |    5 +
  src/models/delta-net-base.cpp                 |   29 +-
  tests/test-backend-ops.cpp                    |  132 ++-
- 22 files changed, 3095 insertions(+), 15 deletions(-)
+ 22 files changed, 3101 insertions(+), 15 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
@@ -85,7 +85,7 @@ index 224bdef92..5a3d66a99 100644
      // DSA lightning indexer
      //
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..d7a0d42c9 100644
+index 1b431a724..3cd542560 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -94,7 +94,7 @@ index 1b431a724..d7a0d42c9 100644
  #include "ggml-cuda/common.cuh"
  
  template <int S_v, bool KDA, bool keep_rs_t>
-@@ -286,6 +287,104 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +287,110 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
@@ -188,10 +188,16 @@ index 1b431a724..d7a0d42c9 100644
 +                    GGML_LOG_WARN("%s: chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
 +                }
 +            } else if (K == 1) {
-+                if (launch_chunked(cache ? cache->data : nullptr, 0)) {
-+                    return;
++                // Multi-sequence ubatch: the kernel choice must not depend on how many sequences
++                // share the ubatch, or a sequence's logits depend on its neighbours.  Use the same
++                // per-token threshold as the single-sequence branch above; the whole-batch chunked
++                // path is then only taken for batches a solo decode would also chunk.
++                if (n_tokens > GDN_CHUNKED_MIN_TOKENS) {
++                    if (launch_chunked(cache ? cache->data : nullptr, 0)) {
++                        return;
++                    }
++                    GGML_LOG_WARN("%s: chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
 +                }
-+                GGML_LOG_WARN("%s: chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
 +            }
 +        }
 +    }

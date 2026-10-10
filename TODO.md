@@ -111,6 +111,19 @@ devices), the draft/target device placement, and whether the per-op graph captur
 
 ### 52. Multi-sequence MTP is non-deterministic: a rollback reads a recurrent snapshot the last batch did not write — CORRECTNESS
 
+**PARTIALLY RESOLVED, DELIVERED in `v16-a55e952b8-r42` (2026-10-12).** Part 1 is fixed in **block 02**:
+`ggml_cuda_op_gated_delta_net_impl` took the whole-batch chunked kernel for `n_seqs > 1 && K == 1`
+unconditionally while the solo path took the sequential kernel, so a sequence's GDN result depended on its
+co-resident sequences; the multi-sequence branch now shares the single-sequence `n_tokens >
+GDN_CHUNKED_MIN_TOKENS` gate. The **remaining component C** (a unified-KV/attention state dependence that
+survives no co-batching at all, `MOE_EXPERT_CACHE_MIB=0`, and the part-1 fix) is still open; it is a
+separate root from the recurrent rollback (the `seq_rm` boundary warning is a false positive: the probe is
+bit-exact at the production verify width). A companion batching fix was prototyped and is decode-cost-free
+but breaks `llama-perplexity` at `n_seq >= 4`, so it was held. Handover:
+`wip/moe-verify-fusions/HANDOVER-multiseq-residual.md`; probes:
+`wip/moe-verify-fusions/tools/test-recurrent-state-multiseq.cpp`, `session-multiseq-instrumentation.diff`.
+The text below is the original finding.
+
 **Working home: `wip/moe-verify-fusions/`** (found 2026-10-12 while investigating the single-sequence
 divergence — see [`HANDOVER-single-seq-rollback.md`](wip/moe-verify-fusions/HANDOVER-single-seq-rollback.md)).
 

@@ -1,5 +1,39 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-12 (r42) -- block 02: the multi-sequence GDN kernel choice is shape-consistent (TODO #52, part 1)
+
+**Release `v16-a55e952b8-r42`** (base `a55e952b8`, canonical block-15 tip
+`a3c13e9ca76717d8dd9b6020fca2b35bcd2c46b6`, net tree `eafc03875b2c894bda7d8081d362b234a55a9c54`);
+16 blocks; `scripts/validate-set.sh` green. Amends **block 02** (`gated_delta_net.cu`) only.
+
+**The bug (found while investigating issue #134 / TODO #52).** The GDN dispatch
+(`ggml_cuda_op_gated_delta_net_impl`) took the **whole-batch chunked** kernel for `n_seqs > 1 && K == 1`
+**unconditionally**, while the same sequence decoded alone with `n_tokens <= GDN_CHUNKED_MIN_TOKENS` took
+the **sequential** kernel. The two kernels are not bit-identical, so on any path with `n_rs_seq == 0`
+(`--spec-type none`, or `GGML_FORCE_N_RS_SEQ=0`) a sequence's logits depended on the sequences that
+happened to share its ubatch. The minimal two-sequence probe
+(`wip/moe-verify-fusions/tools/test-recurrent-state-multiseq.cpp`) shows the co-batched arm diverging
+from the solo arm at the `GATED_DELTA_NET` op, and `GGML_CUDA_GDN_CHUNKED=0` restoring bit-identity.
+
+**The fix.** The `n_seqs > 1` branch now uses the same `n_tokens > GDN_CHUNKED_MIN_TOKENS` gate as the
+single-sequence branch, so the kernel choice depends only on `(n_tokens, K, n_rs_batch)` and not on how
+many sequences share the ubatch. Large multi-sequence prefills keep the chunked path (both arms chunk,
+so the choice stays shape-consistent). No new environment variable; no perf impact on the single-sequence
+decode path (`n_tokens == 1` never reaches the block).
+
+**Validation (gfx1201).** `test-recurrent-state-depth` unchanged (130 baseline failures, phase A 1..7
+PASS); the probe is bit-identical solo vs co-batch for K=1/4/16/32 on Qwen3.5-4B and the Flash-Next GSQ
+target; coherence `1c5d32ac537d`; prefill-logit KLD 0.000707 / same-top-p 98.755 % (PASS);
+`scripts/validate-set.sh` green.
+
+**Not in this release (the rest of #52, tracked as C).** A second, batching-level component remains: with
+no cross-sequence ubatching at all, cache off, and this fix, the server plain gate is still not
+byte-reproducible, so a unified-KV/attention state dependence is involved. A companion batching change
+(force one sequence per ubatch for multi-token batches) makes the probe shapes consistent and is
+**decode-cost-free** (batched-bench TG unchanged, prefill faster), but it breaks `llama-perplexity` at
+`n_seq >= 4` (PPL 8.51 -> 2097), so it was **held** rather than shipped. Handover:
+`wip/moe-verify-fusions/HANDOVER-multiseq-residual.md`.
+
 ## 2026-10-12 (r41) -- block 12: the hybrid NCCL init is EAGER again; `-sm tensor -ncmoe` is MTP-pure (TODO #53)
 
 **Release `v16-a55e952b8-r41`** (base `a55e952b8`, canonical block-15 tip

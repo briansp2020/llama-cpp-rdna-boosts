@@ -1,0 +1,225 @@
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index b842e5d47..5a6e059e8 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -387,10 +387,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
+                     GGML_LOG_WARN("%s: chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
+                 }
+             } else if (K == 1) {
+-                if (launch_chunked(cache ? cache->data : nullptr, 0)) {
+-                    return;
++                // Multi-sequence ubatch: the kernel choice must not depend on how many sequences
++                // share the ubatch, or a sequence's logits depend on its neighbours.  Use the same
++                // per-token threshold as the single-sequence branch above; the whole-batch chunked
++                // path is then only taken for batches a solo decode would also chunk.
++                if (n_tokens > GDN_CHUNKED_MIN_TOKENS) {
++                    if (launch_chunked(cache ? cache->data : nullptr, 0)) {
++                        return;
++                    }
++                    GGML_LOG_WARN("%s: chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
+                 }
+-                GGML_LOG_WARN("%s: chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2c1855da4..140f01b8d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4145,6 +4145,48 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         nb1, nb2, nb3, stream);
+ }
+ 
++// WIP-ONLY (2026-10-12, TODO #52 bisect): hash a node's output columns immediately after its
++// launch.  Requires graph capture OFF.  NOT FOR DELIVERY.
++static void ggml_cuda_dump_node_hash(ggml_backend_cuda_context * cuda_ctx, ggml_tensor * t, int idx) {
++    static const char * filt = getenv("LLAMA_DUMP_CUDA");
++    if (filt == nullptr || filt[0] == '\0' || t == nullptr || t->buffer == nullptr || t->data == nullptr) {
++        return;
++    }
++    const bool all = (filt[0] == '*' && filt[1] == '\0');
++    if (!all) {
++        if (t->name == nullptr) {
++            return;
++        }
++        if (filt[0] == '=') {
++            if (strcmp(t->name, filt + 1) != 0) {
++                return;
++            }
++        } else if (strstr(t->name, filt) == nullptr) {
++            return;
++        }
++    }
++    // the buffer readback copies on cudaStreamPerThread; order it against the compute stream
++    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++    const char * nm = (t->name != nullptr && t->name[0] != '\0') ? t->name : "(unnamed)";
++    const size_t col = std::min<size_t>(ggml_row_size(t->type, t->ne[0]), (size_t) (1u << 20));
++    const int64_t n_tok = std::min<int64_t>(t->ne[1], 32);
++    const int64_t n_seq = std::min<int64_t>(t->ne[2], 2);
++    for (int64_t seq = 0; seq < n_seq; ++seq) {
++        for (int64_t tok = 0; tok < n_tok; ++tok) {
++            std::vector<uint8_t> buf(col);
++            ggml_backend_tensor_get(t, buf.data(), (size_t) tok * t->nb[1] + (size_t) seq * t->nb[2], col);
++            uint64_t h = 1469598103934665603ull;
++            for (size_t j = 0; j < col; ++j) {
++                h = (h ^ buf[j]) * 1099511628211ull;
++            }
++            GGML_LOG_WARN("CUDADUMP id=%d %-44s op=%-20s ne=[%lld,%lld,%lld,%lld] tok=%lld seq=%lld hash=%016llx\n",
++                    idx, nm, ggml_op_name(t->op),
++                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
++                    (long long) tok, (long long) seq, (unsigned long long) h);
++        }
++    }
++}
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+     switch (dst->op) {
+         case GGML_OP_ARGMAX:
+@@ -8279,6 +8321,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ }
+ 
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key) {
++    if (getenv("LLAMA_DUMP_CUDA")) {
++        static int dbg_batch = 0;
++        GGML_LOG_WARN("CUDADUMP-ENTER batch=%d dev=%d n_nodes=%d use_graph=%d first=%s\n",
++                dbg_batch++, cuda_ctx->device, cgraph->n_nodes, (int) use_cuda_graph,
++                cgraph->n_nodes > 0 ? cgraph->nodes[0]->name : "-");
++    }
+     int64_t t_ev = g_cgc_on ? ggml_time_us() : 0;
+     bool graph_evaluated_or_captured = false;
+ 
+@@ -8494,6 +8542,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
++                if (getenv("LLAMA_DUMP_CUDA") != nullptr) {
++                    ggml_cuda_dump_node_hash(cuda_ctx, node, i);
++                }
+                 if (op_timing) {
+                     CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
+                     op_nodes.emplace_back(node, i, false);
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 1b3d70627..6687a7f66 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <cassert>
+ #include <cstring>
++#include <cstdlib>
+ #include <algorithm>
+ #include <sstream>
+ 
+@@ -599,6 +600,26 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
+         return {};
+     }
+ 
++    // WIP MEASUREMENT KNOB -- NOT FOR DELIVERY (2026-10-12, TODO #52 investigation).
++    //   =1: force one sequence per ubatch always (the cost probe)
++    //   =2: force one sequence per ubatch only when a sequence contributes >1 token, so the
++    //       single-token decode band keeps its cross-sequence weight reuse
++    static const int force_mode = getenv("GGML_FORCE_SEQ_UBATCH") ? atoi(getenv("GGML_FORCE_SEQ_UBATCH")) : 0;
++    if (force_mode && n_seqs > 1) {
++        bool split = true;
++        if (force_mode == 2) {
++            split = false;
++            for (uint32_t s = 0; s < n_seqs && !split; ++s) {
++                uint32_t unused = 0;
++                for (int32_t idx : seq_set_map[cur_seq_set[s]]) { if (!used[idx]) { unused++; } }
++                if (unused > 1) { split = true; }
++            }
++        }
++        if (split) {
++            n_seqs = 1;
++        }
++    }
++
+     // the current batch index of each sequence set
+     std::vector<int32_t> cur_idx(n_seqs, 0);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 270e7aa88..ea0893b30 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1703,6 +1703,60 @@ bool llama_context::set_adapter_cvec(
+     // one), so 512 MiB is comfortably below anything worth reclaiming.
+     static const size_t GGML_DROP_RESERVE_SLACK_BYTES = (size_t) 512 << 20;
+ 
++// WIP-ONLY diagnostic (2026-10-12, TODO #52 multi-sequence determinism bisect).  NOT FOR DELIVERY.
++// LLAMA_DUMP_GRAPH="substr1,substr2" (or "*") hashes the named compute-graph tensors right after
++// the graph runs, so two arms can be diffed tensor-by-tensor.
++static void llama_dump_graph_hashes(ggml_cgraph * gf, uint32_t ub_n_tokens, uint32_t ub_n_seqs, uint32_t ub_n_seq_tokens) {
++    static const char * spec = getenv("LLAMA_DUMP_GRAPH");
++    if (spec == nullptr || spec[0] == '\0' || gf == nullptr) {
++        return;
++    }
++    std::vector<std::string> filters;
++    {
++        std::string s(spec);
++        size_t p = 0;
++        while (p <= s.size()) {
++            size_t q = s.find(',', p);
++            if (q == std::string::npos) { q = s.size(); }
++            if (q > p) { filters.push_back(s.substr(p, q - p)); }
++            p = q + 1;
++        }
++    }
++    LLAMA_LOG_WARN("LLAMADUMP-BATCH n_tokens=%u n_seqs=%u n_seq_tokens=%u\n", ub_n_tokens, ub_n_seqs, ub_n_seq_tokens);
++    const int n_nodes = ggml_graph_n_nodes(gf);
++    for (int i = 0; i < n_nodes; ++i) {
++        ggml_tensor * t = ggml_graph_node(gf, i);
++        if (t == nullptr || t->name == nullptr || t->buffer == nullptr || t->data == nullptr) {
++            continue;
++        }
++        bool match = false;
++        for (const auto & f : filters) {
++            if (f == "*" || strstr(t->name, f.c_str()) != nullptr) { match = true; break; }
++        }
++        if (!match) {
++            continue;
++        }
++        // per-(token,seq) hash of the column over ne[0] (embd); ne[1] = tokens, ne[2] = seqs
++        const size_t col = std::min<size_t>(ggml_row_size(t->type, t->ne[0]), (size_t) (1u << 20));
++        const int64_t n_tok = std::min<int64_t>(t->ne[1], 32);
++        const int64_t n_seq = std::min<int64_t>(t->ne[2], 2);
++        for (int64_t tok = 0; tok < n_tok; ++tok) {
++            for (int64_t seq = 0; seq < n_seq; ++seq) {
++                std::vector<uint8_t> buf(col);
++                ggml_backend_tensor_get(t, buf.data(), (size_t) tok * t->nb[1] + (size_t) seq * t->nb[2], col);
++                uint64_t h = 1469598103934665603ull;
++                for (size_t j = 0; j < col; ++j) {
++                    h = (h ^ buf[j]) * 1099511628211ull;
++                }
++                LLAMA_LOG_WARN("LLAMADUMP %-44s op=%-20s ne=[%lld,%lld,%lld,%lld] tok=%lld seq=%lld hash=%016llx\n",
++                        t->name, ggml_op_name(t->op),
++                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
++                        (long long) tok, (long long) seq, (unsigned long long) h);
++            }
++        }
++    }
++}
++
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+@@ -1953,6 +2007,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
++    llama_dump_graph_hashes(res->get_gf(), ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seq_tokens);
++
+     n_tokens_prev = ubatch.n_tokens;
+     ret = GGML_STATUS_SUCCESS;
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index cd036742b..de736ce0e 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -150,6 +150,7 @@ endif ()
+ 
+ llama_build(test-recurrent-state-rollback.cpp)
+ llama_build(test-recurrent-state-depth.cpp)
++llama_build(test-recurrent-state-multiseq.cpp)
+ llama_build(test-logits-width-probe.cpp)
+ llama_build(test-save-load-state.cpp)
+ 
