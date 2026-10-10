@@ -9,6 +9,16 @@
 The task is to repair the device path, re-measure it against the new default, and decide whether to
 re-enable it.  A second, independent task (35B-A3B Q8_0 split-path validation) is in §9.**
 
+> **2026-10-10 session result — READ [`FINDINGS-devmap-generation-fix.md`](FINDINGS-devmap-generation-fix.md)
+> FIRST.**  The residency-generation repair (§4 preferred) is implemented and the level-4 validator is
+> clean, but it does **not** make `DEVMAP=1` pure: the budget sweep still diverges (64) and `none` vs `n3`
+> still diverges (9), invariant across `PREFILL_SEED`/`KSLOT`/`ADMIT`/`DEVPOLICY`.  The residual is a
+> graph/cold-classification effect, not a stale map.  Per §8 the device path does **not** clearly beat the
+> eager path on both decode and prefill (plain decode ~14 % faster, MTP prefill ~4-7 % slower) → **keep
+> `DEVMAP=0` the default and `DEVMAP=1` opt-in**.  §9's premise is stale: the 35B's tables are **already
+> split** under `-sm tensor -ncmoe 99`, and with the split active the 35B `none` vs `n3` diverges at 82.  Do
+> not serve the 35B split.  All numbers are in the new findings file.
+
 ---
 
 ## 0. Session kickoff prompt (paste this into the fresh session)
@@ -153,6 +163,13 @@ from the others), *pass 2* builds the remap from the **final** map (`moe_cache_u
 
 ### Candidate repairs (pick one, prove it)
 
+> **Result (2026-10-10):** candidate 1 (residency generation) was implemented.  It closes the stale-map
+> window (the guard fires once per run, on the arming token; the level-4 validator is clean once the
+> guard-declined/unserved tables are excluded) but does **not** make the device path pure.  See
+> [`FINDINGS-devmap-generation-fix.md`](FINDINGS-devmap-generation-fix.md) §1/§3.  Candidate 2 (eager
+> pre-graph promotion) is the only remaining structural difference and is the likely repair, but it
+> reintroduces the host routing readback the device path exists to remove.
+
 1. **Generation guard (preferred).**  Add a residency generation incremented on **every** slot-map
    mutation (host `access_locked`, the seed fill, the stand-down/rearm, the device policy kernel), publish
    it alongside `slot_dev`, and make `moe_cache_get_table` / the take-over **reject** (fall back to the
@@ -268,6 +285,18 @@ prefill** — i.e. roughly a wash overall.  So the honest framing for the mainta
 
 This is a decision for the maintainer after §4 + the re-measurement, not a foregone conclusion.
 
+> **Result (2026-10-10):** measured, interleaved and warm, 1000-token decode + 32k prefill, GSQ +
+> shared Q8_0 MTP head, 2 GPU `-sm tensor`, `ce`, MIB=14000 (two runs each):
+>
+> | config | plain decode t/s | MTP prefill t/s | MTP acceptance |
+> |---|---:|---:|---:|
+> | `DEVMAP=0` | 41.78 / 41.81 | 1303.8 / 1587.6 | 0.77017 |
+> | `DEVMAP=1` | 47.84 / 47.94 | 1249.0 / 1250.2 | 0.81776 |
+>
+> The device path is faster on decode but slower on prefill and is not pure, so **it does not clearly beat
+> the eager path on both**: keep `DEVMAP=0` the default and `DEVMAP=1` opt-in.  (The MTP-`n3` decode delta
+> is acceptance-confounded by the divergent trajectory; the plain row is the acceptance-immune one.)
+
 ## 9. Second task — qwen35moe (35B-A3B Q8_0) split-path validation
 
 The 35B-A3B currently registers its host expert tables **whole/mirrored** under `-sm tensor -ncmoe`
@@ -285,6 +314,16 @@ perf win, but it is exactly the path this bug lives in, so it must be validated 
   HSA `MEMORY_APERTURE_VIOLATION` (`k_get_rows_float_vec`) — use 2 GPUs, or a smaller `-ncmoe`, or a smaller
   context.  Use `NCMOE=99` to force every expert host-resident when measuring the split geometry, and
   re-check `--fit`/arena sizing.
+
+> **Result (2026-10-10):** the premise is **stale** — with the current tree the 35B's host expert tables are
+> already **split** under `-sm tensor -ncmoe 99` (`expert_bytes < host_bytes`, `src_off != 0`, layer 0
+> `ffn_gate_exps` 278528/835584 vs `host_bytes` 1114112, `ffn_down_exps` `host_pitch=544`).  Nothing needs
+> forcing.  With the split active the 35B `none` vs `draft-mtp n3` **diverges at 82** (MIB8000 and MIB14000,
+> default `DEVMAP=0`, `ce`) — the §5c split-path defect on a second model.  The `GGML_META_SPLIT_COPY=0`
+> mirrored control made the embedded-MTP acceptance collapse to **0.01102**, so the mirrored 35B is not a
+> usable reference; the split-vs-mirrored perf is recorded in
+> [`FINDINGS-devmap-generation-fix.md`](FINDINGS-devmap-generation-fix.md) §5.  **Do not serve the 35B
+> split until the split-path divergence is fixed.**
 
 ## 10. Pointers
 

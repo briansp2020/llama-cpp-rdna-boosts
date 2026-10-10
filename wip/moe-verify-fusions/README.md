@@ -3,13 +3,17 @@
 **Status: OPEN (opened 2026-10-10).**  Not part of the delivery; nothing here may be applied to the fork
 without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md`).
 
-> **NEXT SESSION: read [`HANDOVER-devmap-consistency.md`](HANDOVER-devmap-consistency.md) end to end.**
-> The plain-vs-MTP divergence is root-caused and the non-divergent fix is in the working tree
-> (`MOE_EXPERT_CACHE_DEVMAP=0` default); the remaining task is to repair the device-remap path's
-> generation consistency, re-measure, and run the 35B-A3B Q8_0 split validation.  Earlier handovers
-> ([`HANDOVER-single-seq-rollback.md`](HANDOVER-single-seq-rollback.md)) and the evidence
-> ([`FINDINGS-single-seq-rollback.md`](FINDINGS-single-seq-rollback.md)) remain for context; the sibling
-> **multi-sequence non-determinism** is `TODO.md` #52.
+> **NEXT SESSION: read [`FINDINGS-devmap-generation-fix.md`](FINDINGS-devmap-generation-fix.md) and
+> [`HANDOVER-devmap-consistency.md`](HANDOVER-devmap-consistency.md) end to end.**
+>
+> **2026-10-10 session: the residency-generation repair is in (WIP) and the level-4 validator is clean, but
+> `DEVMAP=1` is STILL not pure — budget sweep 64, `none` vs `n3` 9, invariant across `PREFILL_SEED`/`KSLOT`/
+> `ADMIT`/`DEVPOLICY`; the residual is a graph/cold-classification effect, not a stale map.  The default
+> `DEVMAP=0` is pure on every check (2-GPU/1-GPU budget sweeps, `n_rs_seq`, field `none` vs `n3`, level-4
+> 0/0).  Per §8 the fixed device path does not clearly beat the eager path on both decode and prefill
+> (plain decode ~14 % faster, MTP prefill ~4-7 % slower) → keep `DEVMAP=0` default, `DEVMAP=1` opt-in.  §9:
+> the 35B-A3B tables are already split under `-sm tensor -ncmoe 99` (the `§5e` "mirrored" premise is stale),
+> and the split diverges at 82 — do not serve the 35B split.  Full numbers: the new findings file.**
 >
 > **2026-10-12 session (later): the single-sequence divergence is ROOT-CAUSED AND FIXED (WIP).**  The
 > device-remap path built its remap from a `slot_dev` snapshot that is not the generation the arena fills
