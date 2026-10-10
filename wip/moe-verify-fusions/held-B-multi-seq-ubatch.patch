@@ -1,0 +1,45 @@
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 1b3d70627..87dcec92e 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <cassert>
+ #include <cstring>
++#include <cstdlib>
+ #include <algorithm>
+ #include <sstream>
+ 
+@@ -599,6 +600,32 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
+         return {};
+     }
+ 
++    // [TAG_MULTI_SEQ_UBATCH_PURITY]
++    // A ubatch that carries more than one token for a sequence changes that sequence's forward
++    // shape (GEMM M, flash-attn n_q, GDN kernel family) relative to the same sequence decoded on
++    // its own, and the kernels are only guaranteed bit-uniform inside the single-sequence width
++    // band.  Emit one sequence per ubatch whenever a sequence contributes more than one token, so
++    // a sequence's result never depends on the sequences that happen to be co-resident; the
++    // single-token decode band keeps its cross-sequence weight reuse.
++    // LLAMA_MULTI_SEQ_UBATCH=0 is the A/B kill-switch.
++    static const bool multi_seq_ubatch = [] {
++        const char * e = getenv("LLAMA_MULTI_SEQ_UBATCH");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    if (multi_seq_ubatch && n_seqs > 1) {
++        bool one_seq = false;
++        for (uint32_t s = 0; s < n_seqs && !one_seq; ++s) {
++            uint32_t n_unused = 0;
++            for (int32_t idx : seq_set_map[cur_seq_set[s]]) {
++                if (!used[idx]) { ++n_unused; }
++            }
++            if (n_unused > 1) { one_seq = true; }
++        }
++        if (one_seq) {
++            n_seqs = 1;
++        }
++    }
++
+     // the current batch index of each sequence set
+     std::vector<int32_t> cur_idx(n_seqs, 0);
+ 
