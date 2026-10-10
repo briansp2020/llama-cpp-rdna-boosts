@@ -5,10 +5,16 @@
 set -u
 BUILD=$1; TAG=$2; MODE=${3:-all}
 M=${M:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}
-D=${D:-/llm/models/Qwen3.8/Flash-Next/IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf}
+# `D-` (not `:-`): an explicitly EMPTY D means "use the model's embedded MTP head" (no draft model).
+D=${D-/llm/models/Qwen3.8/Flash-Next/IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf}
 PROMPT=${PROMPT:-/tmp/srr/mixed30k.txt}
 PORT=${PORT:-8963}
 NP=${NP:-256}
+NCMOE=${NCMOE:-48}
+CTX=${CTX:-204800}
+UB=${UB:-6144}
+SMD=""
+[ -n "$D" ] && SMD="--spec-draft-model $D"
 LOGD=/tmp/srr; mkdir -p $LOGD
 export LD_LIBRARY_PATH=/opt/rocm-7.14.1-gfx120X/lib:${LD_LIBRARY_PATH:-}
 export HIP_VISIBLE_DEVICES=${GPUS:-0,1}
@@ -16,7 +22,7 @@ export HIP_VISIBLE_DEVICES=${GPUS:-0,1}
 run() { # label extra-args...
   local label=$1; shift
   "$BUILD/bin/llama-server" -v -m "$M" \
-    -sm tensor -ncmoe 48 -ub 6144 -b 6144 -c 204800 --no-kv-unified \
+    -sm tensor -ncmoe "$NCMOE" -ub "$UB" -b "$UB" -c "$CTX" --no-kv-unified \
     -ctk q8_0 -ctv q8_0 -fa on -t 8 --fit on \
     "$@" --host 127.0.0.1 --port $PORT --no-webui --cache-ram 0 \
     > $LOGD/ws_${TAG}_${label}.out 2> $LOGD/ws_${TAG}_${label}.err &
@@ -45,9 +51,9 @@ PY
 }
 
 [ "$MODE" = all -o "$MODE" = none ] && run none --spec-type none
-[ "$MODE" = all -o "$MODE" = n1 ] && run n1 --spec-type draft-mtp --spec-draft-model "$D" --spec-draft-n-max 1
-[ "$MODE" = all -o "$MODE" = n3 ] && run n3 --spec-type draft-mtp --spec-draft-model "$D" --spec-draft-n-max 3
-[ "$MODE" = all -o "$MODE" = n7 ] && run n7 --spec-type draft-mtp --spec-draft-model "$D" --spec-draft-n-max 7
+[ "$MODE" = all -o "$MODE" = n1 ] && run n1 --spec-type draft-mtp $SMD --spec-draft-n-max 1
+[ "$MODE" = all -o "$MODE" = n3 ] && run n3 --spec-type draft-mtp $SMD --spec-draft-n-max 3
+[ "$MODE" = all -o "$MODE" = n7 ] && run n7 --spec-type draft-mtp $SMD --spec-draft-n-max 7
 
 if [ "$MODE" = all ]; then
 python3 - "$TAG" <<'PY'

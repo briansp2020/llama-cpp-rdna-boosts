@@ -53,6 +53,38 @@ prompt.
 * The probe tests only the **streaming** host-expert path (it never arms the expert-cache arena), so the
   arena path — `mul_mat_vec_q_moe` reading the cache via the slot remap — is the untested surface.
 
+## 3b. The decisive control: the divergence is qwen4exp-specific
+
+Maintainer's control: a **non-qwen4exp MoE with the cache engaged and MTP**, on one GPU.  The
+Qwen3.6-35B-A3B Q4_K_M (22.7 GB, embedded `qwen35moe.nextn` MTP head) on one R9700 with `-ncmoe 20`
+(so the host-expert cache is live) and the same 32k `mixed30k` prompt:
+
+```
+M=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf D="" \
+GPUS=0 NCMOE=20 CTX=40960 ./widthsweep.sh ~/llama.cpp/build-rocm-hybrid q35q4b
+#   none vs n1: first-diff None
+#   none vs n3: first-diff None
+#   none vs n7: first-diff None        (256 tokens each, acceptance 0.94/0.80/0.57)
+```
+
+**Byte-identical.**  So the expert cache, the rejection rollback, the hybrid/spec machinery and the
+embedded-MTP path are all sound in general; the divergence lives in the **qwen4exp-specific** layers.
+
+Cross-checks that bound the qwen4exp cause:
+
+* the width-probe (dense **and** sparse QSA, `NCMOE=48`, `-sm tensor`, P=2500 > the 2051 indexer
+  threshold) is **PASS** → not a qwen4exp forward-pass width dependence;
+* `LLAMA_QSA_SPARSE_FA=0` (dense QSA) still diverges (n1@64, n3@84, n7@112) → not the sparse indexer;
+* `GGML_CUDA_GDN_CHUNKED=0` still diverges (n1@112, n3@59) → not the chunked-GDN kernel;
+* cache off (`MOE_EXPERT_CACHE_MIB=0`) → n1/n3 pure (n7@147) → the cache is involved;
+* `test-recurrent-state-rollback` **PASS** (max diff 0) → the plain recurrent rollback is exact for its
+  scenario.
+
+The remaining surface is the qwen4exp **recurrent/conv rewind combined with the live expert cache** —
+qwen4exp is the only tested model with recurrent (GDN) layers, and the cache is the only remaining
+differentiator the control removes.  (The maintainer notes this exact area — MTP rewind with qwen4exp
+and chunked GDN — was historically the hardest to get right.)
+
 ## 4. What this implies for the fix (recommended next steps)
 
 1. **Extend the probe to run with the expert cache arena armed** (two contexts, or a cache-warmed
