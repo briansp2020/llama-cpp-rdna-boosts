@@ -9,7 +9,10 @@ without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md
 > split compute.  The hybrid init is eager again, so `-ncmoe 99` + auto cache is `none == n1 == n3 == n7`
 > (short) and `none == n3` (long), `-sm layer` and qwen4exp are pure, and perf is neutral.  Full record:
 > `WORKLOG.md` 2026-10-12 (r41); `patches/README.md` block 12.  This campaign stays open for **#51** (3-GPU
-> MTP) and **#52** (multi-sequence MTP).
+> MTP) and **#52** (multi-sequence MTP).  **#52 has a self-contained handover** —
+> [`HANDOVER-multiseq-mtp.md`](HANDOVER-multiseq-mtp.md), cold-start prompt
+> [`PROMPT-multiseq-mtp.md`](PROMPT-multiseq-mtp.md): a verify rollback that crosses a batch boundary (the
+> §27 invariant) while another sequence's prefill owns the last ubatch.
 
 > **DELIVERED in `v16-a55e952b8-r40` (2026-10-10).**  The DEVMAP removal **and** the non-devmap WIP fixes
 > are folded into the block set: block 06 no longer creates the device-remap machinery, block 13's KSLOT
