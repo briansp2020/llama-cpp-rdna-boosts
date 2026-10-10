@@ -14,6 +14,16 @@ without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md
 > [`PROMPT-multiseq-mtp.md`](PROMPT-multiseq-mtp.md): a verify rollback that crosses a batch boundary (the
 > §27 invariant) while another sequence's prefill owns the last ubatch.
 
+> **UPDATE 2026-10-12 (r42): the reading above is refuted.**  A minimal two-sequence probe is bit-exact at
+> the production verify width (the `seq_rm` boundary warning is a false positive), and the real first root
+> was a **GDN kernel-choice inconsistency** for `n_seqs > 1 && K == 1`, **DELIVERED in
+> `v16-a55e952b8-r42`** (block 02).  Two follow-ups remain, tracked as **B** (a held batching change that
+> breaks `llama-perplexity` at `n_seq >= 4`) and **C** (a unified-KV/attention state dependence that
+> survives no co-batching, cache-off and the r42 fix): handover
+> [`HANDOVER-multiseq-bc.md`](HANDOVER-multiseq-bc.md), cold-start prompt
+> [`PROMPT-multiseq-bc.md`](PROMPT-multiseq-bc.md).  The `HANDOVER-multiseq-mtp.md` §3/§5 lead is
+> superseded; keep it for its evidence tables only.
+
 > **DELIVERED in `v16-a55e952b8-r40` (2026-10-10).**  The DEVMAP removal **and** the non-devmap WIP fixes
 > are folded into the block set: block 06 no longer creates the device-remap machinery, block 13's KSLOT
 > hunks are dropped, and the leftovers are gone (every block is free of the devmap symbols).  The eager

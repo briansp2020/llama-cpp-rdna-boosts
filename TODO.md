@@ -120,7 +120,7 @@ survives no co-batching at all, `MOE_EXPERT_CACHE_MIB=0`, and the part-1 fix) is
 separate root from the recurrent rollback (the `seq_rm` boundary warning is a false positive: the probe is
 bit-exact at the production verify width). A companion batching fix was prototyped and is decode-cost-free
 but breaks `llama-perplexity` at `n_seq >= 4`, so it was held. Handover:
-`wip/moe-verify-fusions/HANDOVER-multiseq-residual.md`; probes:
+`wip/moe-verify-fusions/HANDOVER-multiseq-bc.md`; probes:
 `wip/moe-verify-fusions/tools/test-recurrent-state-multiseq.cpp`, `session-multiseq-instrumentation.diff`.
 The text below is the original finding.
 

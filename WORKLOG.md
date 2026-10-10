@@ -32,7 +32,7 @@ byte-reproducible, so a unified-KV/attention state dependence is involved. A com
 (force one sequence per ubatch for multi-token batches) makes the probe shapes consistent and is
 **decode-cost-free** (batched-bench TG unchanged, prefill faster), but it breaks `llama-perplexity` at
 `n_seq >= 4` (PPL 8.51 -> 2097), so it was **held** rather than shipped. Handover:
-`wip/moe-verify-fusions/HANDOVER-multiseq-residual.md`.
+`wip/moe-verify-fusions/HANDOVER-multiseq-bc.md`.
 
 ## 2026-10-12 (r41) -- block 12: the hybrid NCCL init is EAGER again; `-sm tensor -ncmoe` is MTP-pure (TODO #53)
 
