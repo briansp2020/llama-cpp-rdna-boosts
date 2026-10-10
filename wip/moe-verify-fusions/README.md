@@ -3,14 +3,15 @@
 **Status: OPEN (opened 2026-10-10).**  Not part of the delivery; nothing here may be applied to the fork
 without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md`).
 
-> **NEXT SESSION: read [`FINDINGS-devmap-removal.md`](FINDINGS-devmap-removal.md) FIRST.**  DEVMAP has been
-> **removed from the code base** (2026-10-10): the eager host-routing path is the only `-sm tensor` split
-> policy; it is MTP-pure on qwen4exp (`none == n3`), budget-sweep-pure, and within noise of the old
-> `DEVMAP=0` perf.  `TODO.md` #50 is resolved.  The removal diff is `remove-devmap.diff`; the delivery
-> `patches/`/`release.json` are **not yet regenerated** (the next delivery step).  Do **not** reintroduce
-> any `*DEVMAP*`/`*KSLOT*`/`*DEVPOLICY*` device slot-map path (see `ENVIRONMENT.md`'s REMOVED note).
-> Earlier device-path records (`HANDOVER-devmap-consistency.md`, `FINDINGS-single-seq-rollback.md`,
-> `FINDINGS-devmap-generation-fix.md`) are kept for the record but are superseded.
+> **NEXT SESSION: read [`HANDOVER-delivery-fold.md`](HANDOVER-delivery-fold.md) FIRST** (option B — fold the
+> devmap removal **and** the non-devmap WIP fixes into the delivery blocks).  Then
+> [`FINDINGS-devmap-removal.md`](FINDINGS-devmap-removal.md) for the removal + acceptance record.  DEVMAP has
+> been **removed from the working tree** (2026-10-10): the eager host-routing path is the only `-sm tensor`
+> split policy; it is MTP-pure on qwen4exp (`none == n3`), budget-sweep-pure, and within noise of the old
+> `DEVMAP=0` perf.  `TODO.md` #50 is resolved.  The removal diff is `remove-devmap.diff`; the WIP delta since
+> block 15 is `wip-since-block15.diff`; the delivery `patches/`/`release.json` are **not yet regenerated**.
+> Do **not** reintroduce any `*DEVMAP*`/`*KSLOT*`/`*DEVPOLICY*` device slot-map path (see `ENVIRONMENT.md`'s
+> REMOVED note).
 >
 > **2026-10-12 session (later): the single-sequence divergence is ROOT-CAUSED AND FIXED (WIP).**  The
 > device-remap path built its remap from a `slot_dev` snapshot that is not the generation the arena fills
