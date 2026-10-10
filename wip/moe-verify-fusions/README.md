@@ -3,11 +3,19 @@
 **Status: OPEN (opened 2026-10-10).**  Not part of the delivery; nothing here may be applied to the fork
 without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md`).
 
-> **NEXT SESSION: read [`HANDOVER-single-seq-rollback.md`](HANDOVER-single-seq-rollback.md) end to end.**
-> It narrows the single-sequence plain-vs-MTP divergence to the **qwen4exp recurrent/conv rewind with a
-> live expert cache**, refutes the old verify-width-kernel hypothesis, records the full negative matrix,
-> and gives the code map + the teacher-forced-replay instrument to use next.  The sibling **multi-sequence
-> non-determinism** is `TODO.md` #52.
+> **NEXT SESSION: read [`HANDOVER-devmap-consistency.md`](HANDOVER-devmap-consistency.md) end to end.**
+> The plain-vs-MTP divergence is root-caused and the non-divergent fix is in the working tree
+> (`MOE_EXPERT_CACHE_DEVMAP=0` default); the remaining task is to repair the device-remap path's
+> generation consistency, re-measure, and run the 35B-A3B Q8_0 split validation.  Earlier handovers
+> ([`HANDOVER-single-seq-rollback.md`](HANDOVER-single-seq-rollback.md)) and the evidence
+> ([`FINDINGS-single-seq-rollback.md`](FINDINGS-single-seq-rollback.md)) remain for context; the sibling
+> **multi-sequence non-determinism** is `TODO.md` #52.
+>
+> **2026-10-12 session (later): the single-sequence divergence is ROOT-CAUSED AND FIXED (WIP).**  The
+> device-remap path built its remap from a `slot_dev` snapshot that is not the generation the arena fills
+> mutate; defaulting to the eager host-routing path (`DEVMAP=0`) makes every divergent pair byte-identical
+> at ~3 % MTP-decode / 0 % plain-decode cost, MTP prefill faster.  See
+> [`HANDOVER-devmap-consistency.md`](HANDOVER-devmap-consistency.md) and `FINDINGS-…` §5b-§5g.
 >
 > **2026-10-12 session: the slab-resident narrow-2 layout is IMPLEMENTED and functionally validated** —
 > no alias, and the exact token streams agree with the quick fix once the cache/fusion confound is
