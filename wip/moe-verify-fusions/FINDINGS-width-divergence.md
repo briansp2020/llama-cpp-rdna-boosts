@@ -85,6 +85,43 @@ qwen4exp is the only tested model with recurrent (GDN) layers, and the cache is 
 differentiator the control removes.  (The maintainer notes this exact area — MTP rewind with qwen4exp
 and chunked GDN — was historically the hardest to get right.)
 
+## 3c. Multi-sequence control (PR #124's reporter scenario): our tree is unstable too
+
+The PR #124 reporter's test — two concurrent greedy `/completion` requests (`-np 2`, `--kv-unified`),
+A long (256 tokens) keeps decoding after B short (96) finishes — run on **our r39+narrow-2 build with no
+gather skip** (`tools/multiseq.sh`, GSQ + shared Q8_0 MTP, 2 GPU):
+
+```
+A_solo  256 68e7690aa07a     B_solo   96 bb1f48c7d87e
+A_conc1 256 ab4c87bdddbc     B_conc1  96 4742a82f994f
+A_conc2 256 ca64778b6314     B_conc2  96 5a67e565e819
+A_conc3 256 a1446705a718     B_conc3  96 911c61aaabdc
+A_conc vs A_solo first-diff: 8/8/8 ; A_conc2 vs A_conc1: 58 ; A_conc3 vs A_conc1: 9
+```
+
+Every concurrent repetition differs, and the concurrent output differs from the solo output — i.e. **our
+tree reproduces the reporter's instability without PR #124**.  Controls:
+
+* identical under `GGML_CUDA_ALLREDUCE=ce` (the deterministic AR) → not the all-reduce;
+* `GGML_CUDA_GDN_CHUNKED=0` does **not** fix it (reps still differ) → not the chunked-GDN kernel alone.
+
+And the run logs the exact condition the reporter saw (pre-existing, not caused by their PR):
+
+```
+seq_rm: rollback crossed a batch boundary: seq 1 rollback=2 but the last batch decoded 6136 tokens
+        (last pos 18419, n_rs_seq=3, n_rs_batch=4). ... the restored state is wrong
+```
+
+So the multi-sequence MTP path has a **pre-existing rollback correctness hole**: a rejection rollback
+can land while the last decoded batch was a large (prefill) batch, and the recurrent snapshot path then
+reads a snapshot that batch did not write.  `GGML_CUDA_GDN_CHUNKED=0` removes the *substance* of that
+hole for the sequential kernel but the instability remains, so there is a second, batching-level part.
+
+This is independent of PR #124 (it is in our tree, which is the reporter's "reference" shape) and it
+does **not** by itself explain the single-sequence divergence (the single-sequence width sweeps never
+emit this warning).  But it is the same surface the user's hypothesis names: the rewind reads state the
+verify did not write.
+
 ## 4. What this implies for the fix (recommended next steps)
 
 1. **Extend the probe to run with the expert cache arena armed** (two contexts, or a cache-warmed
