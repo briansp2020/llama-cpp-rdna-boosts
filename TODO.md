@@ -6,10 +6,13 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r32`, 2026-10-08):** the delivery is the **16-patch set** against
-fork point **`a55e952b8`**, canonical tip `6a443a1b50f29e321ecae05997faa046b88705ab`, net tree
-**`8798d38b8e2c649d5aacba3a84d1dd108fe31526`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
-reproduces the tree).  `release.json` is the source of truth.  r32 fixes the two bugs found during the
+**Current state (release `v16-a55e952b8-r41`, 2026-10-12):** the delivery is the **16-patch set** against
+fork point **`a55e952b8`**, canonical tip `a89ffa2735d2141293ed5472beab6746a47fbbf7`, net tree
+**`46c4ce7a6a00aa6c6931c5a89faf847dde19fd34`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
+reproduces the tree).  r41 makes block 12's hybrid NCCL init **eager** again (the r34 lazy mid-run init was
+what made `-sm tensor -ncmoe` MTP-impure under the auto cache; the internal AR is bit-exact), so the 35B-A3B
+`-ncmoe 99` + auto-cache field is `none == n1 == n3 == n7` and `none == n3` on the long field, and
+qwen4exp stays pure (**#53 closed**).  The previous paragraph records the r32 state.  `release.json` is the source of truth.  r32 fixes the two bugs found during the
 PR #115 review: **#48** the post-prefill re-reserve now uses the current ubatch's sequence count so a
 multi-sequence decode does not build a zero-token attention graph (block 06), and **#49** the meta
 split-state computation is pre-warmed bottom-up so a >1200-node `src` chain no longer overflows the
@@ -145,6 +148,16 @@ with a matrix (2-seq × prefill-in-flight × `GGML_CUDA_GDN_CHUNKED`) and re-che
 scenario before that PR is ever merged.
 
 ### 53. 35B-A3B (`qwen35moe`) is not bit-pure under `-sm tensor` + `-ncmoe` (MTP and plain forward) — CORRECTNESS
+
+**RESOLVED (2026-10-12), DELIVERED in `v16-a55e952b8-r41`.**  The cause was **not** the internal
+host-staged all-reduce (the AR is bit-exact: `out == local0 + local1` on every call) but block 12's
+**lazy `ncclCommInitAll`** (r34): the mid-run init perturbs the layout/state and flips a near-tie in the
+upstream split compute, so the AR *input* differs (`b2ee…` lazy vs `86cb…` eager/RCCL) while the output is
+identical.  Making the hybrid init **eager** again makes it bit-identical to pure RCCL and restores the
+product path: 35B-A3B `-ncmoe 99` + auto cache `none == n1 == n3 == n7` (short) and `none == n3` (long),
+`-sm layer` pure, qwen4exp pure; perf is neutral (auto-cache long field MTP n3 172.1 t/s, plain 83.5).
+Full record: `WORKLOG.md` 2026-10-12 (r41); `patches/README.md` block 12.  The cache-off / `-ncmoe 0`
+(upstream-shaped) paths are pure too, but are not the product.  The text below is the original finding.
 
 **Working home: `wip/moe-verify-fusions/`** (opened 2026-10-10; handover:
 [`HANDOVER-35b-tensor-impurity.md`](wip/moe-verify-fusions/HANDOVER-35b-tensor-impurity.md)).

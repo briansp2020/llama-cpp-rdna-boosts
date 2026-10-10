@@ -19,7 +19,11 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r40`**: the device-remap (`DEVMAP`/`DEVPOLICY`/`KSLOT`/`DEV_EAGER`) experiment is
+**`v16-a55e952b8-r41`** (canonical block-15 tip `a89ffa273`, net tree
+`46c4ce7a6a00aa6c6931c5a89faf847dde19fd34`): **block 12's hybrid NCCL init is eager again** — the r34
+lazy mid-run `ncclCommInitAll` perturbed the `-sm tensor -ncmoe` split compute and broke MTP purity under
+the expert cache; eager init is bit-identical to pure RCCL and restores it (**TODO #53**).  Before it,
+**`v16-a55e952b8-r40`** (as shipped, tip `b8d1e2988`): the device-remap (`DEVMAP`/`DEVPOLICY`/`KSLOT`/`DEV_EAGER`) experiment is
 **removed from the code base** — block 06 no longer creates it, so the eager host-routing path is the sole
 `-sm tensor` split policy — and the non-devmap WIP fixes ride with it (the per-table fusion guard that
 resolves **issue #50**, the narrow-2 slab MTP-aliasing fix, and `-ncmoe` host-expert offload).  The device

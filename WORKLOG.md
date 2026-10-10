@@ -1,5 +1,69 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-12 (r41) -- block 12: the hybrid NCCL init is EAGER again; `-sm tensor -ncmoe` is MTP-pure (TODO #53)
+
+**Release `v16-a55e952b8-r41`** (base `a55e952b8`, canonical block-15 tip
+`a89ffa2735d2141293ed5472beab6746a47fbbf7`, net tree `46c4ce7a6a00aa6c6931c5a89faf847dde19fd34`);
+16 blocks; `scripts/validate-set.sh` green (strict 16/16 `git am`, reconstructed tree == `release.json`).
+Amends **block 12** to bring `ncclCommInitAll` up **eagerly** in the hybrid path, reverting r34's lazy
+deferral, because the **mid-run** init is what made `-sm tensor -ncmoe` non-deterministic.  `patches/` was
+regenerated from a canonical fork rebuilt at the base (`scripts/apply-all.sh`) -- **do not hand-edit**.
+
+**Root cause (TODO #53): the internal all-reduce was innocent.**  The handover had root-caused the 35B-A3B
+`qwen35moe` field impurity to the internal host-staged AR.  The decisive instrument (`GGML_AR3_DBG`,
+dumping the pre-AR local partial and the post-AR output per device and checking `out == local0 + local1`)
+shows the AR is **bit-exact**: 0 mismatches on 2400/2400 `none`-arm and 1680/1680 `n3`-arm decode ARs
+(F32 wire).  What differs between the diverging and pure configurations is the AR **input** -- the first
+main-request decode AR input is `b2ee7f62b406c328` under the shipped (lazy) hybrid and `86cb27d83b28eba1`
+under both eager hybrid and pure RCCL, while the AR output is the exact sum in all three.  So the AR is
+downstream of the divergence.
+
+The trigger is **block 12's lazy NCCL init** (r34).  Forcing hybrid to init NCCL eagerly (an otherwise
+byte-identical build) reproduces pure RCCL **bit-for-bit**.  Isolation: routing the small tensors to RCCL's
+`ncclFloat` branch while keeping the pipeline allocated (`GGML_WIP_AR_NOINTERNAL`) stays **impure**, and
+freeing the pipeline's CE scratch, enabling peer access eagerly, holding a dummy VRAM reservation,
+draining the comm streams before the lazy init and `GGML_CUDA_SLAB=0` all fail to restore purity.  Only
+removing the mid-run init does: RCCL's init side effects perturb the layout/state, which flips a near-tie
+in the upstream split compute.  Iterating RCCL's init mid-forward is exactly what r34 introduced to avoid
+`ncclCommInitAll`'s decode-only slowdown of the internal pipeline (2x R9700 78 -> 46 t/s, 3x 67 -> 22).
+
+**The fix.**  `ggml_backend_cuda_comm_init_hybrid` now calls `ggml_backend_cuda_comm_init_nccl` eagerly;
+the `nccl_lazy`/`nccl_tried` fields and the dispatch-time lazy block are removed (the `ce` path no longer
+clears a flag).  The dispatch still routes small tensors to the internal pipeline, so `GGML_CUDA_ALLREDUCE`
+semantics are unchanged; the only behavioural difference is *when* RCCL comes up.  On any run with a
+prefill -- i.e. every expert-cache run -- RCCL was initialised during the prefill anyway, so the target
+path is perf-neutral.
+
+**The §8 fallback would not have worked.**  "Route the GDN/MTP small-tensor ARs through RCCL" makes no
+difference (the `NOINTERNAL` result above); `GGML_CUDA_ALLREDUCE=nccl` is pure only because it disables
+the lazy init, not because smalls go to RCCL.
+
+**Gates on the reconstructed delivery tree** (gfx1201, 2x R9700, `--fit on`):
+
+| gate | result |
+|---|---|
+| 35B-A3B Q8_0 `-sm tensor -ncmoe 99` short field (`none` vs `n1`/`n3`/`n7`) | **None / None / None** (pure) |
+| 35B-A3B Q8_0 long field, **auto cache** `none` vs `n3` | **None** (pure) |
+| 35B-A3B Q8_0 `-sm layer` `none` vs `n3` | **None** (pure) |
+| 35B-A3B Q8_0 long field, auto cache, MTP n3 (2000 tok) | prefill **3108** t/s, decode **172.1** t/s, acc **0.87485** |
+| 35B-A3B Q8_0 long field, auto cache, plain (2000 tok) | prefill **3526** t/s, decode **83.5** t/s |
+| qwen4exp (GSQ + shared MTP) `none` vs `n3`, auto cache | **None** (pure); plain 52.6 t/s, MTP n3 51.1 t/s |
+| qwen4exp quant-coherence (IQ3_XXS/IQ4_NL/IQ4_XS/Q4_K_M) | **PASS** (0 `////`, gather ON == OFF) |
+| `scripts/gate-prefill-logits.sh` | **PASS** mean KLD **0.000707**, same-top-p **98.755 %** |
+| `test-backend-ops -o MUL_MAT_ID` | **931/931** |
+| `test-backend-ops -o FLASH_ATTN_QSA` | **26/26** |
+| `test-recurrent-state-rollback` (Qwen3.5-4B-Q8_0) | **PASS** (max diff 0) |
+| coherence (`Qwen3.5-4B-Q8_0`, seed 42) | **`1c5d32ac537d`** (unchanged) |
+
+MTP/plain are within run-to-run noise of the eager reference measured during the investigation
+(35B auto-cache MTP n3 171.4 t/s; qwen4exp 52.8 / 51.2 t/s).  The `test-recurrent-state-rollback` abort on
+GSQ + `-sm tensor -ncmoe 48` is **pre-existing** (reproduces identically on the r40 tree) and unrelated.
+
+**Records.**  Full investigation: `wip/moe-verify-fusions/HANDOVER-35b-internal-ar.md`; TODO #53 closed.
+The `-sm tensor -ncmoe 99` + auto-cache path was MTP-impure under r34-r40 (`none` vs `n3` first-diff 82 on
+the long field) and is pure again here; the cache-off/`-ncmoe 0` paths (upstream-shaped) are pure too but
+are not the product path.
+
 ## 2026-10-10 (r40) -- DEVMAP removal + the non-devmap WIP fixes folded into the delivery
 
 **Release `v16-a55e952b8-r40`** (base `a55e952b8`, canonical block-15 tip

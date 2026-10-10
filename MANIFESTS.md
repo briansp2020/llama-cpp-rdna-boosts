@@ -5,8 +5,13 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r40`** (canonical block-15 tip `fdecb4d337b2`, net tree
-`73c371a2f453489dccdcea73ed22216b27cb9a28`): the device-remap (`DEVMAP`/`DEVPOLICY`/`KSLOT`/`DEV_EAGER`)
+**`a55e952b8`**, released as **`v16-a55e952b8-r41`** (canonical block-15 tip `a89ffa273`, net tree
+`46c4ce7a6a00aa6c6931c5a89faf847dde19fd34`): **block 12's hybrid NCCL init is eager again** — the r34
+lazy mid-run `ncclCommInitAll` perturbed the `-sm tensor -ncmoe` split compute and broke MTP purity under
+the expert cache; eager init is bit-identical to pure RCCL and restores it (TODO #53).  Before it,
+**`v16-a55e952b8-r40`** (canonical block-15 tip `fdecb4d337b2`, net tree
+`73c371a2f453489dccdcea73ed22216b27cb9a28`; as shipped the block-15 probe fix moved the tip to
+`b8d1e2988`, tree `1745cf9b`): the device-remap (`DEVMAP`/`DEVPOLICY`/`KSLOT`/`DEV_EAGER`)
 experiment is **removed from the code base** (block 06 never creates it) together with the non-devmap WIP
 fixes (the per-table fusion guard for issue #50, the narrow-2 slab MTP-aliasing fix, `-ncmoe` host-expert
 offload).  Before it, **`v16-a55e952b8-r38`** (canonical block-15 tip `849c04161`, net tree
