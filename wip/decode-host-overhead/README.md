@@ -48,7 +48,9 @@ The exact top-k fast path scans the whole vocabulary (248k on qwen4exp) for ever
 block max / NaN loop was scalar (no float max reduction without fast-math).  A full block now goes through
 `_mm256_max_ps` plus an unordered-compare NaN flag.  The block max is only a filter, and a NaN still sends the caller
 to the full path, so the selection is the same.  `__attribute__((target("avx2")))` with a
-`__builtin_cpu_supports("avx2")` check; the scalar loop remains the fallback.
+`__builtin_cpu_supports("avx2")` check (`IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)` on Windows, where
+clang with the MSVC ABI does not link the compiler-rt symbol that check needs - fix and report by @DanoPTT); the scalar
+loop remains the fallback.
 
 ## Results on r37 (2 x R9700 / gfx1201, PCIe 5.0 x8 each, ROCm 10.0)
 

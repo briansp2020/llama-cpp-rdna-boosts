@@ -1,4 +1,4 @@
-From 178bb844ca9414c74ff18cdfd4bcee4f2a8c04f0 Mon Sep 17 00:00:00 2001
+From ab4690dca70896086289168bd23c5b204c73a21c Mon Sep 17 00:00:00 2001
 From: briansp2020 <bsp2020@gmail.com>
 Date: Fri, 9 Oct 2026 09:52:44 +0000
 Subject: [PATCH 3/3] common_sampler S2 fast path: AVX2 block prefilter (block
@@ -9,16 +9,19 @@ per-64 block max/NaN loop was scalar (no float max reduction without fast-math):
 in a perf profile.  Same selection: the block max is only a filter and a NaN still sends the caller to the full
 path.  Runtime AVX2 check, scalar fallback.
 
+On Windows the AVX2 check uses IsProcessorFeaturePresent: clang with the MSVC ABI does not link
+compiler-rt, so __builtin_cpu_supports left __cpu_model undefined (fix and report by DanoPTT).
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- common/sampling.cpp | 45 +++++++++++++++++++++++++++++++++++++++++----
- 1 file changed, 41 insertions(+), 4 deletions(-)
+ common/sampling.cpp | 60 ++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 56 insertions(+), 4 deletions(-)
 
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 8fbc4db60..17243df86 100644
+index 8fbc4db60..fe82adfd4 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
-@@ -109,6 +109,39 @@ struct ring_buffer {
+@@ -109,6 +109,54 @@ struct ring_buffer {
      std::vector<T> data;
  };
  
@@ -46,10 +49,25 @@ index 8fbc4db60..17243df86 100644
 +    bm = r;
 +    bn = _mm256_movemask_ps(nan) != 0;
 +}
++#ifdef _WIN32
++// clang with the MSVC ABI does not link compiler-rt, so __builtin_cpu_supports leaves __cpu_model undefined.
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++static bool topk_block_scan_avx2_ok() {
++    static const bool ok = IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE) != 0;
++    return ok;
++}
++#else
 +static bool topk_block_scan_avx2_ok() {
 +    static const bool ok = __builtin_cpu_supports("avx2");
 +    return ok;
 +}
++#endif
 +#else
 +static void topk_block_scan_avx2(const float *, float &, bool &) {}
 +static bool topk_block_scan_avx2_ok() { return false; }
@@ -58,7 +76,7 @@ index 8fbc4db60..17243df86 100644
  struct common_sampler {
      common_params_sampling params;
  
-@@ -152,10 +185,14 @@ struct common_sampler {
+@@ -152,10 +200,14 @@ struct common_sampler {
              const int i1 = std::min(i0 + B, n_vocab);
              float bm = -INFINITY;
              bool  bn = false;
