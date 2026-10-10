@@ -98,6 +98,44 @@ Suspects to start from: the 3-way tensor-split verify gather (the 4-token verify
 devices), the draft/target device placement, and whether the per-op graph capture re-fires on 3 GPUs
 (`graphs reused` is 267 on 3 GPUs vs 246/270 on 2).  Details: `archive/work/slab-ring-region/HANDOVER.md` §4.3.1.
 
+### 52. Multi-sequence MTP is non-deterministic: a rollback reads a recurrent snapshot the last batch did not write — CORRECTNESS
+
+**Working home: `wip/moe-verify-fusions/`** (found 2026-10-12 while investigating the single-sequence
+divergence — see [`HANDOVER-single-seq-rollback.md`](wip/moe-verify-fusions/HANDOVER-single-seq-rollback.md)).
+
+**Symptom.**  `llama-server -np 2 --kv-unified --spec-type draft-mtp`, two concurrent greedy requests (A
+long keeps decoding after B short finishes): the output is **not reproducible across identical
+repetitions**, and the long request differs when concurrent vs solo.  This violates the per-sequence
+independence the delivery already asserts (`test-recurrent-state-rollback`'s "seq-1-only decode
+independent of seq 0", max diff 0).
+
+**Reproduced on our r39 + narrow-2 build with NO PR #124 skip**, so it is **not** caused by PR #124
+(whose reporter's "reference" is our tree's shape).  The run logs the invalid-rollback condition, verbatim:
+
+```
+seq_rm: rollback crossed a batch boundary: seq 1 rollback=2 but the last batch decoded 6136 tokens
+        (last pos 18419, n_rs_seq=3, n_rs_batch=4). ... the restored state is wrong
+```
+
+i.e. a verify rejection rollback lands while the last decoded batch was a large prefill batch, and the
+recurrent snapshot path reads a snapshot that batch never wrote (§27's invariant).
+
+**Controls run (all on 2 GPU, GSQ + shared Q8_0 MTP):** identical under `GGML_CUDA_ALLREDUCE=ce` (so not
+the all-reduce); `GGML_CUDA_GDN_CHUNKED=0` removes the snapshot substance but the instability **survives**
+(so there is a second, batching-level component); concurrent repetitions still differ.  Note the warning
+is emitted **once per process** (a `static` flag), so a later occurrence is silent — do not rely on the
+log alone.
+
+**Reproducer:** `wip/moe-verify-fusions/tools/multiseq.sh <build_dir> <tag>` (env `GPUS`/`M`/`D`), e.g.
+`GPUS=0,1 ./multiseq.sh ~/llama.cpp/build-rocm-hybrid msq`.
+
+**Fix direction (not yet chosen):** the §27 invariant — *every batch that can be rolled back into must
+run the kernel that writes the snapshots it will read*.  Either (a) never present a verify rollback whose
+`last_ubatch_nseq_tokens > n_rs_batch` (server/batching), (b) write the pre-batch plane for the chunked
+prefill when a rollback can follow it, or (c) pin the rollback into the batch's own snapshot.  Confirm
+with a matrix (2-seq × prefill-in-flight × `GGML_CUDA_GDN_CHUNKED`) and re-check the reporter's PR #124
+scenario before that PR is ever merged.
+
 ### 48. The MoE expert cache corrupts a wide MTP-export consumer (G7) — CORRECTNESS
 
 **ROOT-CAUSED, FIXED, GATED 2026-10-09 (WIP patch).**  The handover's alias/take-over hypothesis was

@@ -3,6 +3,12 @@
 **Status: OPEN (opened 2026-10-10).**  Not part of the delivery; nothing here may be applied to the fork
 without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md`).
 
+> **NEXT SESSION: read [`HANDOVER-single-seq-rollback.md`](HANDOVER-single-seq-rollback.md) end to end.**
+> It narrows the single-sequence plain-vs-MTP divergence to the **qwen4exp recurrent/conv rewind with a
+> live expert cache**, refutes the old verify-width-kernel hypothesis, records the full negative matrix,
+> and gives the code map + the teacher-forced-replay instrument to use next.  The sibling **multi-sequence
+> non-determinism** is `TODO.md` #52.
+>
 > **2026-10-12 session: the slab-resident narrow-2 layout is IMPLEMENTED and functionally validated** —
 > no alias, and the exact token streams agree with the quick fix once the cache/fusion confound is
 > controlled.  The numeric acceptance gate (handover §4.2) turned out to be confounded by the **open
