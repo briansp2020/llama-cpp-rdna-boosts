@@ -10,6 +10,33 @@ surface.
 
 ---
 
+> **2026-10-12 (second session) RESULT — the rewind hypothesis below is REFUTED.**  A single-context
+> rewind probe (`tools/rrewind.cpp`) compares, at the same position and starting state, a plain
+> single-token decode against a `[t_k, junk x3]` verify batch + rejection rollback, checking both the
+> row-0 logits and the serialized state bytes.  It is **PURE (0 logit / 0 state mismatches)** on the exact
+> configuration the divergence needs — 2 GPU `-sm tensor`, partial expert cache (`-sm tensor` + qwen4exp),
+> and even with the cache resident set moved between the two paths.  The divergence is therefore **not**
+> the KV/GDN-ssm/GDN-conv/QSA rewind.  The controlled matrix shows it is a **cache-residency / graph-
+> planning** effect: qwen4exp + 2 devices + `-sm tensor` + a partial cache; it disappears on 1 GPU, on 3
+> GPU full residency, on `-sm layer`, and with the cache off, and it is qwen4exp-specific (the 35B-A3B
+> control is pure even at 2-GPU tensor partial).  The plain arm is itself cache-sensitive (`none`
+> cache-on vs cache-off first-diff 103), so there is no cache-invariant "plain reference".  This is
+> `TODO.md` **#50**, not a rewind bug.  Full evidence, matrix, tools and reproducers:
+> [`FINDINGS-single-seq-rollback.md`](FINDINGS-single-seq-rollback.md).  Section §6 (#52) below still
+> stands as a separate, genuine recurrent-rollback-boundary bug.
+>
+> **Follow-on (same session): the divergence is the target's `n_rs_seq` (0 vs 3) graph × the expert cache.**
+> A temporary `GGML_FORCE_N_RS_SEQ=<n>` pins the snapshot depth independently of `--spec-type`; with
+> everything else identical, `n_rs_seq=0` vs `3` is **bit-identical with the cache off** and **flips the
+> argmax (first-diff 59, ~1.6-nat top-2 shift) with the cache on**, independent of the fusions
+> (`DISABLE_FUSION` still diverges) and the slab (`GGML_CUDA_SLAB=0` still diverges).  The plain arm is
+> `n_rs_seq=0`, the MTP arm is `n_rs_seq=3`.  So the lead is not the rollback but **the snapshot-armed
+> graph's cache-band MoE arithmetic not being bit-identical to the snapshot-free graph's** — the repair
+> target.  The directed `#50` per-table fusion guard was implemented this session (see
+> `FINDINGS-single-seq-rollback.md` §6) and is a no-op for this divergence.
+
+---
+
 ## 1. TL;DR
 
 The original campaign item (c) was "the plain-vs-MTP verify-width divergence (`none != n1 != n3 != n7`)".

@@ -17,6 +17,17 @@ without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md
 > 0.685).  Full evidence, numbers and open questions: [`RESULTS-slab-narrow2.md`](RESULTS-slab-narrow2.md).
 > The layout is in the `~/llama.cpp` working tree; `patches/` and `release.json` are untouched.
 >
+> **2026-10-12 (second session) result: the single-sequence "rewind restores wrong state" lead is
+> REFUTED.**  A single-context rewind probe (`tools/rrewind.cpp`) is **PURE** (0 logit / 0 serialized-state
+> mismatches) on the exact divergent config (2 GPU `-sm tensor` + qwen4exp + partial cache), and the
+> controlled matrix localises the plain-vs-MTP divergence to **cache-residency/graph-planning**
+> (qwen4exp + 2 devices + `-sm tensor` + a partial cache): it disappears on 1 GPU, 3-GPU full residency,
+> `-sm layer`, and cache-off, and the 35B-A3B control is pure even at 2-GPU tensor partial.  The plain
+> arm is itself cache-sensitive, so the divergence is `TODO.md` **#50**, not the recurrent rewind.  See
+> [`FINDINGS-single-seq-rollback.md`](FINDINGS-single-seq-rollback.md) and the amended
+> [`HANDOVER-single-seq-rollback.md`](HANDOVER-single-seq-rollback.md).  `TODO.md` #52 (multi-sequence)
+> remains a separate recurrent-rollback-boundary bug.
+>
 > **2026-10-11 session result:** the cache-band routed-MMVQ path's problem was located: `ggml_cuda_slab_work_alloc`
 > hands a single NARROW base to **every** narrow compute view, and with MTP there are **two** live compute
 > buffers (the target's verify view *and* the draft context's), so they aliased at slab base 0.  A quick fix

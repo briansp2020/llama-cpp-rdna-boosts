@@ -8,8 +8,11 @@ have to rebuild it from the prose in `../README.md`.
 | `field.sh` | the r38 §5.5 field arm: `llama-server`, `-sm tensor -ncmoe 48 -ub 6144 -b 6144 -c 204800 --no-kv-unified -ctk/-ctv q8_0 -fa on -t 8 --fit on --spec-type draft-mtp --spec-draft-n-max 3`, a small warm-up request, then a ~32 k-token prefill + 1000 MTP tokens.  Forces `GGML_CUDA_ALLREDUCE=ce` (the only **deterministic** AR, 2-GPU-only) |
 | `field3.sh` | the same **without** the forced AR — i.e. the 3-GPU production default (hybrid).  Use for `GPUS=0,1,2` |
 | `field_nospec.sh` | `field3.sh` with `--spec-type none` and no draft model — the **plain** decode baseline (`#51`'s control) |
+| `arm.sh` | one arbitrary `llama-server` arm (`arm.sh <build_dir> <tag> -- <server args...>`) dumping `return_tokens`, for arms `widthsweep.sh` does not cover (e.g. per-arm cache budgets, fusion switches, `-sm layer`).  env `SM` selects the split mode |
+| `rollback-replay.cpp` | the mstep-style **two-context** teacher-forced replay (plain pass vs verify+rollback pass) with the expert cache armed (`NCMOE`/`CACHE`/`SPLIT`) |
+| `rrewind.cpp` | the **single-context** rewind probe: at each position decode the same token plainly and via a `[t_k, junk x3]` verify batch + rejection rollback, comparing row-0 logits and serialized state bytes.  `POLLUTE=N` moves the cache resident set between the two paths.  The instrument that refuted the rewind hypothesis (`../FINDINGS-single-seq-rollback.md`) |
 
-All three are env-overridable:
+All are env-overridable:
 
 ```bash
 export M=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
