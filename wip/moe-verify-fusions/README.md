@@ -14,6 +14,12 @@ without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md
 > folded result).  Do **not** reintroduce any `*DEVMAP*`/`*KSLOT*`/`*DEVPOLICY*` device slot-map path (see
 > `ENVIRONMENT.md`'s REMOVED note).
 >
+> **NEXT (35B only): read [`HANDOVER-35b-tensor-impurity.md`](HANDOVER-35b-tensor-impurity.md) FIRST.**
+> `Qwen3.6-35B-A3B-Q8_0` is **not bit-pure under `-sm tensor` + `-ncmoe`** (field `none` vs `draft-mtp n3`
+> first-diff **8**; the plain forward is width-impure — `test-logits-width-probe` FAIL 0.888).  `-sm layer`
+> is pure (the reference arm).  `qwen4exp` is **fixed in r40 — do not reopen it**.  Full evidence matrix,
+> reproducers, suspects, tooling gotchas and acceptance gates in the handover.  Tracked as `TODO.md` #53.
+>
 > **2026-10-12 session (later): the single-sequence divergence is ROOT-CAUSED AND FIXED (WIP).**  The
 > device-remap path built its remap from a `slot_dev` snapshot that is not the generation the arena fills
 > mutate; defaulting to the eager host-routing path (`DEVMAP=0`) makes every divergent pair byte-identical

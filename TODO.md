@@ -144,6 +144,28 @@ prefill when a rollback can follow it, or (c) pin the rollback into the batch's 
 with a matrix (2-seq × prefill-in-flight × `GGML_CUDA_GDN_CHUNKED`) and re-check the reporter's PR #124
 scenario before that PR is ever merged.
 
+### 53. 35B-A3B (`qwen35moe`) is not bit-pure under `-sm tensor` + `-ncmoe` (MTP and plain forward) — CORRECTNESS
+
+**Working home: `wip/moe-verify-fusions/`** (opened 2026-10-10; handover:
+[`HANDOVER-35b-tensor-impurity.md`](wip/moe-verify-fusions/HANDOVER-35b-tensor-impurity.md)).
+
+**Symptom.**  `Qwen3.6-35B-A3B-Q8_0` (embedded `qwen35moe.nextn` MTP head), `-sm tensor -ncmoe 99`, 2 GPU:
+`--spec-type none` vs `--spec-type draft-mtp --spec-draft-n-max 3` **diverges at token 8**; the same model
+under **`-sm layer` is bit-identical**.  Cache-independent (`MOE_EXPERT_CACHE_MIB=0` still diverges).
+
+**The plain forward pass is width-impure** (no MTP, no cache): `test-logits-width-probe` on the 35B with
+`NCMOE=99 SPLIT=tensor` gives `width_purity=FAIL (worst maxdiff 0.888169)` (W=1 hash `705d290898cf0699`,
+W=2..8 `9577d960c75cb4bb`).  It needs the **Meta split of the host-resident expert weights**: `-sm layer`,
+all-GPU, 1 GPU and `GGML_META_SPLIT_COPY=0` (mirrored) are all PASS.
+
+**Narrowed:** `GGML_CUDA_DISABLE_MWR=1` and `GGML_CUDA_DISABLE_MOE_DOWN_FOLD=1` each make the **probe**
+PASS (the width selects MWR at W=1 vs the mmvq down fold at W>=2).  But the **field** is not fixed by
+`DISABLE_MWR` (still first-diff 8) and only *moves* with `DISABLE_FUSION=1` (8 -> 72) — so expect two
+overlapping `-sm tensor`+`-ncmoe` effects.  `qwen4exp` is unaffected and stays fixed.
+
+**Not the cause:** the expert cache, the MTP machinery per se, chunked GDN, sparse QSA, the shared-expert
+down gate alone, the mmvq MoE band / MMQ routed / weighted-down / GLU->Q8_1 / norm->Q8_1 paths.
+
 ### 48. The MoE expert cache corrupts a wide MTP-export consumer (G7) — CORRECTNESS
 
 **ROOT-CAUSED, FIXED, GATED 2026-10-09 (WIP patch).**  The handover's alias/take-over hypothesis was
