@@ -34,6 +34,16 @@ surface.
 > graph's cache-band MoE arithmetic not being bit-identical to the snapshot-free graph's** — the repair
 > target.  The directed `#50` per-table fusion guard was implemented this session (see
 > `FINDINGS-single-seq-rollback.md` §6) and is a no-op for this divergence.
+>
+> **ROOT CAUSE + FIX (same session, later):** the divergence lives in the **device-remap path**
+> (`MOE_EXPERT_CACHE_DEVMAP=1`, default since session 19).  `DEVMAP=0` — the eager host-routing remap path
+> — makes every divergent pair byte-identical (2-GPU budget sweep, 1-GPU budget sweep, `n_rs_seq` 0 vs 3,
+> and the field `none` vs `draft-mtp n3`).  The device path builds its remap from a `slot_dev` snapshot
+> that is not the generation the arena fills mutate, so a slot can be refilled under it and the read
+> returns the wrong expert (validator: `slot_dev` holds a positive slot for an expert the authoritative
+> map says is not resident).  The **fix in the working tree flips the default to `DEVMAP=0`**; measured
+> cost ~3 % MTP decode / 0 plain decode, MTP prefill faster.  Diff: `session-devmap-fix.diff`.  Full
+> evidence: `FINDINGS-single-seq-rollback.md` §5b-§5g.
 
 ---
 

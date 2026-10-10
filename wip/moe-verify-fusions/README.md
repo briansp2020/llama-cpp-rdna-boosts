@@ -17,16 +17,20 @@ without the maintainer's go-ahead (see the WIP and promotion rules in `AGENTS.md
 > 0.685).  Full evidence, numbers and open questions: [`RESULTS-slab-narrow2.md`](RESULTS-slab-narrow2.md).
 > The layout is in the `~/llama.cpp` working tree; `patches/` and `release.json` are untouched.
 >
-> **2026-10-12 (second session) result: the single-sequence "rewind restores wrong state" lead is
-> REFUTED.**  A single-context rewind probe (`tools/rrewind.cpp`) is **PURE** (0 logit / 0 serialized-state
-> mismatches) on the exact divergent config (2 GPU `-sm tensor` + qwen4exp + partial cache), and the
-> controlled matrix localises the plain-vs-MTP divergence to **cache-residency/graph-planning**
-> (qwen4exp + 2 devices + `-sm tensor` + a partial cache): it disappears on 1 GPU, 3-GPU full residency,
-> `-sm layer`, and cache-off, and the 35B-A3B control is pure even at 2-GPU tensor partial.  The plain
-> arm is itself cache-sensitive, so the divergence is `TODO.md` **#50**, not the recurrent rewind.  See
-> [`FINDINGS-single-seq-rollback.md`](FINDINGS-single-seq-rollback.md) and the amended
-> [`HANDOVER-single-seq-rollback.md`](HANDOVER-single-seq-rollback.md).  `TODO.md` #52 (multi-sequence)
-> remains a separate recurrent-rollback-boundary bug.
+> **2026-10-12 (second session) result: ROOT-CAUSED AND FIXED (WIP).**  The single-sequence
+> plain-vs-MTP divergence is **not** the recurrent rewind and **not** the fusion guard.  Chain:
+> the rewind is exact (single-context `rrewind` is PURE on the divergent config); the divergence is the
+> target's `n_rs_seq` (0 vs 3) graph × the expert cache; it is confined to **split expert tables**
+> (`GGML_META_SPLIT_COPY=1`) in **devmap** mode (identity mode, mirrored copies, `-sm layer` and cache-off
+> are pure); and the root cause is the **device-remap path** (`MOE_EXPERT_CACHE_DEVMAP=1`, default) —
+> it builds its remap from a `slot_dev` snapshot that is not the generation the arena fills mutate, so a
+> slot can be refilled under it and the routed read returns the wrong expert.  **The fix (WIP, in the
+> `~/llama.cpp` working tree, saved as `session-devmap-fix.diff`) is to default to the eager host-routing
+> remap path** (`DEVMAP=0`); every divergent pair becomes byte-identical, and the cost is ~3 % on MTP
+> decode / 0 on plain decode.  The device path stays opt-in pending a generation-consistency repair.
+> Full evidence, matrix, validators and reproducers: [`FINDINGS-single-seq-rollback.md`](FINDINGS-single-seq-rollback.md)
+> §5b-§5g; amended [`HANDOVER-single-seq-rollback.md`](HANDOVER-single-seq-rollback.md).  `TODO.md` #52
+> (multi-sequence) remains a separate recurrent-rollback-boundary bug.
 >
 > **2026-10-11 session result:** the cache-band routed-MMVQ path's problem was located: `ggml_cuda_slab_work_alloc`
 > hands a single NARROW base to **every** narrow compute view, and with MTP there are **two** live compute

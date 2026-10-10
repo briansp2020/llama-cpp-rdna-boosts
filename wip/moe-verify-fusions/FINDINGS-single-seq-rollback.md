@@ -304,6 +304,45 @@ residency, per the source comment).
 The user's instinct — “host-based” vs device work on misses — pointed at exactly the right axis: the
 **host** remap path is the correct one; the *device* remap optimization is what regressed it.
 
+## 5g. THE FIX (WIP): default to the eager remap path
+
+`g_devmap` default flipped from 1 to 0 (`moe-expert-cache.cu`): the delivery now uses the **eager
+host-routing remap** (the two-pass, documented-correct path) by default, with the device-remap path kept
+behind `MOE_EXPERT_CACHE_DEVMAP=1` for A/B and for its future repair.  Diff:
+`session-devmap-fix.diff` (cumulative working-tree diff, supersedes `session-narrow2.diff`).
+
+### Validation (all with the fix, `DEVMAP` default)
+
+| check | result |
+|---|---|
+| 2 GPU split-table budget sweep MIB8000 vs MIB14000 | **None** (was 59) |
+| `n_rs_seq` 0 vs 3, cache on MIB=14000 | **None** (was 59) |
+| 1 GPU budget sweep MIB8000 vs MIB14000 | **None** (was 64) |
+| field `none` vs `draft-mtp n-max 3`, 2 GPU tensor (32 k prompt, 128 tok) | **None** (was idx 9) |
+| cache-off width probe, GSQ `NCMOE=48` tensor | `d81701810d2a6c34`, **PASS** (unchanged) |
+| 4B Q8_0 coherence | coherent, 101 t/s gen |
+
+### Performance (1000-token decode, 32 k prefill, 2 GPU tensor, ce, GSQ + shared MTP head)
+
+| config | decode t/s | acceptance | prefill t/s |
+|---|---:|---:|---:|
+| MTP n3, `DEVMAP=0` (new default), 2 runs | **72.45 / 72.57** | 0.77017 | 1580 / 1579 |
+| MTP n3, `DEVMAP=1` (old), 2 runs | 74.71 / 74.88 | 0.78676 | 1263 / 1264 |
+| plain, `DEVMAP=0` | 54.78 | — | 1844 |
+| plain, `DEVMAP=1` | 54.82 | — | 1845 |
+
+So the cost of the fix is **~3 % on MTP decode** (72.5 vs 74.8 t/s), **zero on plain decode**, and the MTP
+prefill is actually *faster* (the eager path clears `slot_dirty`, so the cache-aware prefill staging
+engages).  This is far below the +22 % the source comment attributed to the device path.  The acceptance
+difference is the (buggy) trajectory, not a quality signal.
+
+### Remaining work (to recover the device path)
+
+The device path must be made generation-consistent before it is re-enabled: the remap it builds must come
+from the same `slot_dev` generation the fills produced.  Concretely: clear/`memset` `slot_dev` on every
+host-map mutation (the stand-down already does), have the device policy publish a host-visible generation,
+and reject the device-remap take-over (or rebuild the remap) when the generations differ.
+
 ## 6. Repair / stand-down recommendation
 
 * The rewind needs **no** repair (and no stand-down): nothing in the recurrent/GDN/QSA state path is
