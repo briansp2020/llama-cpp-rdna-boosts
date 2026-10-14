@@ -1,0 +1,78 @@
+From 4177ed1e3eee9a4f14c52d363de95c145abdeb53 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Wed, 14 Oct 2026 06:18:18 +0000
+Subject: [PATCH] ggml-backend-meta: send only whole-row ranges (plus the MMQ
+ tail pad) from set_tensor_async to the sync setter
+
+r54 hands every row-aligned range of a segmented tensor straight to the sync setter.  The loader's pinned
+async-upload chunks (`-lm none`) also start row-aligned at offset 0, but end mid-row, so the first chunk of an
+axis-0 split tensor reaches the setter's `size % row_stride == 0` assert, e.g. blk.12.ssm_out.weight (Q6_K,
+5040-byte rows, 1 MiB chunk) when loading Qwen3.8-Flash-Next IQ3_XXS with -sm tensor.  On axis 1 such a chunk
+would not assert: its partial last row would be taken for the MMQ tail pad, the next chunk would start the
+accumulator, and the flush from offset 0 would overwrite the first chunk's rows with zeros.
+
+Now only whole rows go direct (plus, on axis 1, exactly the `min(row, 512)` pad copy_experts appends), and never
+while the tensor is accumulating.  The accumulator records its first offset, checks that its chunks are
+contiguous, and flushes from that first offset.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend-meta.cpp | 22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 6ad3c8668..7c88f92b5 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2187,6 +2187,8 @@ struct ggml_backend_meta_context {
+     struct async_set_accum {
+         const ggml_tensor *  tensor = nullptr;
+         std::vector<uint8_t> data;
++        size_t               lo     = 0; // offset of the first accumulated chunk; earlier rows went direct
++        size_t               next   = 0; // offset the next chunk must start at (the loader's chunks are contiguous)
+     };
+     async_set_accum async_set;
+ 
+@@ -2327,7 +2329,14 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+         } else if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+             row_stride = tensor->nb[2];
+         }
+-        if (row_stride > 0 && offset % row_stride == 0) {
++        // Only whole rows (plus, along axis 1, exactly the scheduler's `min(row, 512)` MMQ pad) go direct: a loader
++        // chunk that starts on a row boundary but ends mid-row would otherwise reach the sync setter, which asserts
++        // (axis 0) or places the partial row as a pad (axis 1).  Once a tensor is accumulating, every chunk joins it.
++        ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
++        auto & accum = ctx->async_set;
++        const size_t tail = row_stride > 0 ? size % row_stride : 0;
++        if (row_stride > 0 && offset % row_stride == 0 && accum.tensor != tensor &&
++                (tail == 0 || (split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 && tail == std::min<size_t>(row_stride, 512)))) {
+             ggml_backend_tensor_set(tensor, data, offset, size);
+             return;
+         }
+@@ -2335,16 +2344,19 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+             ggml_backend_tensor_set(tensor, data, 0, size);
+             return;
+         }
+-        ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+-        auto & accum = ctx->async_set;
+         if (accum.tensor != tensor) {
+             accum.tensor = tensor;
+             accum.data.resize(total);
++            accum.lo = offset;
++            accum.next = offset;
+         }
+-        GGML_ASSERT(offset + size <= accum.data.size());
++        GGML_ASSERT(offset == accum.next && offset + size <= accum.data.size());
+         memcpy(accum.data.data() + offset, data, size);
++        accum.next = offset + size;
+         if (offset + size == total) {
+-            ggml_backend_tensor_set(tensor, accum.data.data(), 0, total);
++            // the rows before `lo` were uploaded directly (whole rows), so `lo` is on a row boundary
++            GGML_ASSERT(row_stride == 0 ? accum.lo == 0 : accum.lo % row_stride == 0);
++            ggml_backend_tensor_set(tensor, accum.data.data() + accum.lo, accum.lo, total - accum.lo);
+             accum = {};
+         }
+         return;
+-- 
+2.53.0
+
