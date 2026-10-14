@@ -1,0 +1,463 @@
+From 29d515fe090580789046650281bc9bfa9bf1cdcb Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Wed, 14 Oct 2026 04:01:40 +0000
+Subject: [PATCH] llama: a second scheduler for the MTP draft context's graphs
+ with outputs (LLAMA_DRAFT_SCHED2)
+
+The draft context alternates a no-output ingest graph and a 1-token draft-step graph every cycle.  Graph reuse needs
+the scheduler's split/allocation state to belong to the graph, so with one scheduler both were rebuilt every cycle
+(~0.5 ms host, mostly ggml_backend_sched_alloc_graph).  The graphs with outputs now run on a second scheduler that is
+swapped into `sched` for the duration of a decode/encode, so both graphs stay allocated and are reused.
+
+The meta (tensor-split) backend keeps the external views of a buffer in a rotating pair of containers that assumes one
+live graph; a rebuild cleared the views of the other graph (GGML_ASSERT(bcj.nodes[i]) in graph_compute).  Each
+scheduler now selects its own view slot (ggml_backend_meta_set_view_slot), with its own rotating pair.
+
+LLAMA_DRAFT_SCHED2=0 restores the single scheduler.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml-backend.h           |  8 ++++
+ ggml/src/ggml-backend-impl.h          |  5 +++
+ ggml/src/ggml-backend-meta.cpp        | 57 ++++++++++++++++++++++-----
+ ggml/src/ggml-backend.cpp             |  7 ++++
+ ggml/src/ggml-cuda/ggml-cuda-arena.cu |  2 +-
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu  | 14 ++++++-
+ ggml/src/ggml-cuda/ggml-cuda-vmm.h    |  2 +
+ ggml/src/ggml-cuda/ggml-cuda.cu       |  6 +++
+ src/llama-context.cpp                 | 46 +++++++++++++++++++++
+ src/llama-context.h                   | 11 ++++++
+ 10 files changed, 146 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index c38dbcde3..d2b7da0c6 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -90,6 +90,10 @@ extern "C" {
+     // No-op for a backend without a slab.
+     GGML_API void                  ggml_backend_dev_slab_compute_narrow2(ggml_backend_dev_t dev, bool enable);
+ 
++    // allocate this context's COMPUTE buffers outside the slab and without the chunk quantization (a buffer the
++    // slab never serves, e.g. the MTP draft's second scheduler).  No-op for a backend without a slab.
++    GGML_API void                  ggml_backend_dev_slab_compute_plain(ggml_backend_dev_t dev, bool enable);
++
+     // OPEN 2 (TODO #42): the size of the device's movable-boundary slab WORK region, or 0 when it has no
+     // slab.  `llama_context` uses it to right-size the compute reserve to the observed workload.
+     GGML_API size_t                ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev);
+@@ -494,6 +498,10 @@ extern "C" {
+     // returns true if the device was created by ggml_backend_meta_device()
+     GGML_API bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
+ 
++    // Select the view slot (0 or 1) of the meta buffers' external views.  A context that keeps two graphs allocated at
++    // once (two schedulers) gives each its own slot, set around the graph's allocation, inputs, compute and outputs.
++    GGML_API void ggml_backend_meta_set_view_slot(int slot);
++
+     // number of "simple" devices wrapped by a meta device
+     GGML_API size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t dev);
+ 
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index dd50b3b76..e9387af3c 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -398,6 +398,11 @@ extern "C" {
+         // so every backend that does not set them is zero-initialized.
+         void (*moe_cache_set_host_pool)(ggml_backend_dev_t dev, bool on);
+         void (*moe_cache_set_host_source)(ggml_backend_dev_t dev, const void * tensor_data, const char * path, size_t offs, int n_experts, size_t host_bytes, size_t total_bytes);
++
++        // (optional) allocate this context's COMPUTE buffers outside the slab and without the chunk
++        // quantization: for a buffer the slab never serves (the MTP draft's second scheduler).  Appended like
++        // the fields above, so backends that do not set it are zero-initialized.
++        void (*slab_compute_plain)(ggml_backend_dev_t dev, bool enable);
+     };
+ 
+     struct ggml_backend_device {
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 6ad3c8668..31e637080 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -262,6 +262,14 @@ static void ggml_backend_meta_device_slab_compute_narrow2(ggml_backend_dev_t dev
+     }
+ }
+ 
++static void ggml_backend_meta_device_slab_compute_plain(ggml_backend_dev_t dev, bool enable) {
++    // forward to the simple devices: the meta device owns no slab of its own
++    ggml_backend_meta_device_context * ctx = (ggml_backend_meta_device_context *) dev->context;
++    for (ggml_backend_dev_t d : ctx->simple_devs) {
++        ggml_backend_dev_slab_compute_plain(d, enable);
++    }
++}
++
+ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .get_name             = */ ggml_backend_meta_device_get_name,
+     /* .get_description      = */ ggml_backend_meta_device_get_description,
+@@ -290,6 +298,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .slab_compute_narrow2 = */ ggml_backend_meta_device_slab_compute_narrow2,
+     /* .moe_cache_set_host_pool   = */ nullptr,
+     /* .moe_cache_set_host_source = */ nullptr,
++    /* .slab_compute_plain   = */ ggml_backend_meta_device_slab_compute_plain,
+ };
+ 
+ bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
+@@ -542,6 +551,16 @@ struct ggml_backend_meta_simple_tensor_container {
+     ggml_backend_meta_simple_tensor_container() {}
+ };
+ 
++// The external views of a buffer live in a rotating pair of containers that assumes ONE live graph: a rebuild
++// clears the container the previous graph used.  A second live graph (a second scheduler of the same context)
++// selects its own view slot, so the two graphs keep separate pairs and do not clear each other's views.
++static int g_meta_view_slot = 0;
++
++void ggml_backend_meta_set_view_slot(int slot) {
++    GGML_ASSERT(slot >= 0 && slot < 2);
++    g_meta_view_slot = slot;
++}
++
+ struct ggml_backend_meta_buffer_context {
+     // FIXME
+     // Most tensors can simply be stored statically in their own buffer.
+@@ -550,10 +569,13 @@ struct ggml_backend_meta_buffer_context {
+     // Current solution: rotating set of 2 "compute" containers to hold external views, works correctly for llama.cpp.
+     // Long-term: tie the lifetime of external views to the meta backend executing the graph instead,
+     //     currently not possible due to graph-external operations in the backend scheduler.
++    // stc_compute[slot][2]: one rotating pair per view slot (see g_meta_view_slot); slot 1 is created on first use
++    static constexpr int n_view_slots = 2;
+     ggml_backend_meta_simple_tensor_container stc_static;
+-    ggml_backend_meta_simple_tensor_container stc_compute[2];
+-    int stc_compute_index      = 0;
+-    int stc_compute_index_next = 0;
++    ggml_backend_meta_simple_tensor_container stc_compute[n_view_slots][2];
++    int stc_compute_index     [n_view_slots] = {0};
++    int stc_compute_index_next[n_view_slots] = {0};
++    ggml_init_params stc_compute_params;
+     std::vector<ggml_backend_buffer_ptr> bufs;
+ 
+     // FIXME
+@@ -601,8 +623,11 @@ struct ggml_backend_meta_buffer_context {
+             ggml_backend_meta_simple_tensor_container & stc_static,
+             ggml_backend_meta_simple_tensor_container & stc_compute_0,
+             ggml_backend_meta_simple_tensor_container & stc_compute_1,
++            const ggml_init_params & stc_compute_params,
+             const std::vector<ggml_backend_buffer_t> & bufs)
+-            : stc_static(std::move(stc_static)), stc_compute{std::move(stc_compute_0), std::move(stc_compute_1)} {
++            : stc_static(std::move(stc_static)), stc_compute_params(stc_compute_params) {
++        stc_compute[0][0] = std::move(stc_compute_0);
++        stc_compute[0][1] = std::move(stc_compute_1);
+         this->bufs.reserve(bufs.size());
+         for (ggml_backend_buffer_t buf : bufs) {
+             this->bufs.emplace_back(buf);
+@@ -613,7 +638,18 @@ struct ggml_backend_meta_buffer_context {
+         if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
+             return stc_static;
+         }
+-        return stc_compute[stc_compute_index];
++        return compute_container(stc_compute_index[g_meta_view_slot]);
++    }
++
++    // container `index` of the current view slot, created on the slot's first use
++    ggml_backend_meta_simple_tensor_container & compute_container(int index) {
++        const int slot = g_meta_view_slot;
++        if (slot > 0 && stc_compute[slot][0].ctxs.empty()) {
++            for (auto & stc : stc_compute[slot]) {
++                stc = ggml_backend_meta_simple_tensor_container(stc_compute_params, (int) bufs.size());
++            }
++        }
++        return stc_compute[slot][index];
+     }
+ };
+ 
+@@ -1655,7 +1691,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
+     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+-    buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
++    buf_ctx->stc_compute_index[g_meta_view_slot] = buf_ctx->stc_compute_index_next[g_meta_view_slot];
+     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
+ }
+ 
+@@ -2068,7 +2104,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_usage(gg
+         GGML_ASSERT(bufs.back() != nullptr);
+         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
+     }
+-    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
++    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, params, bufs);
+ 
+     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
+ }
+@@ -2101,7 +2137,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
+     ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts);
+ 
+     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
+-    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
++    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, params_compute, bufs);
+ 
+     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
+     for (int i = 0; i < n_tensors; i++) {
+@@ -2776,8 +2812,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         }
+         for (ggml_backend_buffer_t buf : used_buffers) {
+             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
+-            buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
+-            ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
++            const int slot = g_meta_view_slot;
++            buf_ctx->stc_compute_index_next[slot] = buf_ctx->stc_compute_index[slot] ^ 1;
++            ggml_backend_meta_simple_tensor_container & stc = buf_ctx->compute_container(buf_ctx->stc_compute_index_next[slot]);
+             for (ggml_context_ptr & ctx : stc.ctxs) {
+                 ggml_reset(ctx.get());
+             }
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 322e448ce..6746f5a83 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -346,6 +346,13 @@ void ggml_backend_dev_slab_compute_narrow2(ggml_backend_dev_t dev, bool enable)
+     dev->iface.slab_compute_narrow2(dev, enable);
+ }
+ 
++void ggml_backend_dev_slab_compute_plain(ggml_backend_dev_t dev, bool enable) {
++    if (dev == nullptr || dev->iface.slab_compute_plain == nullptr) {
++        return;
++    }
++    dev->iface.slab_compute_plain(dev, enable);
++}
++
+ size_t ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev) {
+     // OPEN 2 (TODO #42): 0 when this backend has no movable-boundary slab (or never set the hook), which is
+     // how the caller tells "no slab to reclaim the wide layout with" from "slab, and it is this wide".
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-arena.cu b/ggml/src/ggml-cuda/ggml-cuda-arena.cu
+index 585f80de5..e8ea36db0 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-arena.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-arena.cu
+@@ -47,7 +47,7 @@ size_t ggml_backend_cuda_buffer_type_get_compute_chunk_bytes(ggml_backend_buffer
+     // whole units, so it makes sense only when the slab is in use.  With no slab (a dense model) it just
+     // inflates small buffers -- a 178 MiB layout becomes 512 MiB -- so fall back to the percentage margin,
+     // which is the pre-slab behaviour.  This is what removes the dense +739 MiB of issue #120.
+-    if (!ggml_cuda_slab_enabled()) {
++    if (!ggml_cuda_slab_enabled() || ggml_cuda_slab_compute_plain()) {
+         return 0;
+     }
+     return chunk_mib * 1024 * 1024;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index f2257358b..410386380 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -176,6 +176,10 @@ static bool g_slab_compute_enabled = true;
+ // Set/cleared around the draft's reserve and alloc_graph calls by `llama_context`.
+ static bool g_slab_compute_narrow2 = false;
+ 
++// when true, the COMPUTE buffer being allocated is one the slab never serves (the MTP draft's second scheduler):
++// it bypasses the slab and the chunk quantization.  Set/cleared around that allocation by `llama_context`.
++static bool g_slab_compute_plain = false;
++
+ // `GGML_CUDA_SLAB_NARROW2=0` is the A/B arm: the draft's compute buffers then bypass the slab entirely
+ // (raw cudaMalloc), which is the session's quick fix.  Default on.
+ static bool ggml_cuda_slab_narrow2_enabled() {
+@@ -1098,7 +1102,15 @@ void ggml_cuda_slab_arm() {
+ }
+ 
+ bool ggml_cuda_slab_compute_enabled() {
+-    return g_slab_compute_enabled;
++    return g_slab_compute_enabled && !g_slab_compute_plain;
++}
++
++void ggml_cuda_slab_set_compute_plain(bool enable) {
++    g_slab_compute_plain = enable;
++}
++
++bool ggml_cuda_slab_compute_plain() {
++    return g_slab_compute_plain;
+ }
+ 
+ void ggml_cuda_slab_set_compute_narrow2(bool enable) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index 7ab668f15..7eb8a726a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -90,5 +90,7 @@ void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
+ void   ggml_cuda_slab_arm();
+ bool   ggml_cuda_slab_compute_enabled();
+ void   ggml_cuda_slab_set_compute_narrow2(bool enable);
++void   ggml_cuda_slab_set_compute_plain(bool enable);
++bool   ggml_cuda_slab_compute_plain();
+ size_t ggml_cuda_slab_headroom_bytes();
+ void   ggml_cuda_slab_set_narrow_floor(int device, size_t bytes);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 87b3ca1e2..d35d443f1 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6240,6 +6240,11 @@ static void ggml_backend_cuda_device_slab_compute_narrow2(ggml_backend_dev_t dev
+     ggml_cuda_slab_set_compute_narrow2(enable);
+ }
+ 
++static void ggml_backend_cuda_device_slab_compute_plain(ggml_backend_dev_t dev, bool enable) {
++    GGML_UNUSED(dev);
++    ggml_cuda_slab_set_compute_plain(enable);
++}
++
+ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .get_name                = */ ggml_backend_cuda_device_get_name,
+     /* .get_description         = */ ggml_backend_cuda_device_get_description,
+@@ -6268,6 +6273,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .slab_compute_narrow2    = */ ggml_backend_cuda_device_slab_compute_narrow2,
+     /* .moe_cache_set_host_pool   = */ ggml_backend_cuda_device_moe_cache_set_host_pool,
+     /* .moe_cache_set_host_source = */ ggml_backend_cuda_device_moe_cache_set_host_source,
++    /* .slab_compute_plain        = */ ggml_backend_cuda_device_slab_compute_plain,
+ };
+ 
+ // backend reg
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 72cc5139f..39faa00fc 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -971,6 +971,22 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+ }
+ 
++void llama_context::sched_alt_select(bool alt) {
++    if (alt == sched_alt_in_use) {
++        return;
++    }
++    if (alt && !sched_alt) {
++        ggml_backend_sched_ptr sched_main = std::move(sched);
++        sched_new(gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel);
++        sched_alt = std::move(sched);
++        sched     = std::move(sched_main);
++    }
++    std::swap(sched, sched_alt);
++    std::swap(gf_res_prev_active, gf_res_prev_active_alt);
++    sched_alt_in_use = alt;
++    ggml_backend_meta_set_view_slot(alt ? 1 : 0);
++}
++
+ bool llama_context::kq_mask_packed_reachable() const {
+     if (model.hparams.n_pos_per_embd() > 1) {
+         return true;
+@@ -1013,6 +1029,10 @@ void llama_context::sched_reserve() {
+     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+     gf_res_prev_active = nullptr;
+ 
++    GGML_ASSERT(!sched_alt_in_use);
++    sched_alt.reset();
++    gf_res_prev_active_alt = nullptr;
++
+     sched_new(max_nodes, cparams.pipeline_parallel);
+ 
+     llama_memory_context_ptr mctx;
+@@ -1287,6 +1307,7 @@ bool llama_context::memory_update(bool optimize) {
+             }
+         }
+         gf_res_prev_active = nullptr;
++        gf_res_prev_active_alt = nullptr;
+ 
+         if (!mctx->apply()) {
+             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+@@ -1995,6 +2016,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+     }
+ 
++    static const bool draft_sched2 = [] {
++        const char * e = getenv("LLAMA_DRAFT_SCHED2");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    if (draft_sched2 && cparams.ctx_other != nullptr) {
++        sched_alt_select(n_outputs > 0);
++    }
++
+     auto * res = get_gf_res_prev();
+     auto * gf  = res->get_gf();
+ 
+@@ -2039,12 +2068,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         if (is_draft) {
+             for (const auto & d : model.devices) {
+                 ggml_backend_dev_slab_compute_narrow2(d.dev, true);
++                // the second scheduler's small buffer is never served by the slab (narrow-2 holds one view)
++                ggml_backend_dev_slab_compute_plain(d.dev, sched_alt_in_use);
+             }
+         }
+         const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+         if (is_draft) {
+             for (const auto & d : model.devices) {
+                 ggml_backend_dev_slab_compute_narrow2(d.dev, false);
++                ggml_backend_dev_slab_compute_plain(d.dev, false);
+             }
+         }
+         if (!alloc_ok) {
+@@ -2080,6 +2112,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ }
+ 
+ int llama_context::encode(const llama_batch_ext & batch_inp) {
++    // the draft context's second scheduler is swapped into `sched` only while this call runs
++    struct sched_alt_restore {
++        llama_context * ctx;
++        ~sched_alt_restore() { ctx->sched_alt_select(false); }
++    } sched_alt_restore_ { this };
++
+     if (batch_inp.tokens.empty()) {
+         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+         return -1;
+@@ -2319,6 +2357,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ }
+ 
+ int llama_context::decode(const llama_batch_ext & batch_inp) {
++    // the draft context's second scheduler is swapped into `sched` only while this call runs
++    struct sched_alt_restore {
++        llama_context * ctx;
++        ~sched_alt_restore() { ctx->sched_alt_select(false); }
++    } sched_alt_restore_ { this };
++
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -3321,6 +3365,7 @@ ggml_cgraph * llama_context::graph_reserve(
+         }
+     }
+     gf_res_prev_active = nullptr;
++    gf_res_prev_active_alt = nullptr;
+ 
+     // store the n_outputs as it is, and restore it afterwards
+     // TODO: not sure if needed, might simplify in the future by removing this
+@@ -4710,6 +4755,7 @@ void llama_context::opt_epoch_iter(
+ 
+             // the optimizer graph is allocated outside sched, so the next decode must rebuild
+             gf_res_prev_active = nullptr;
++            gf_res_prev_active_alt = nullptr;
+             res->reset();
+ 
+             auto * gf = model.build_graph(gparams);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 2130cca62..c5287b533 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -312,6 +312,9 @@ private:
+     // create a new backend scheduler for a graph of the specified size and register the callbacks below
+     void sched_new(size_t max_nodes, bool parallel);
+ 
++    // swap the second scheduler (and its graph-reuse state) in or out of `sched`, creating it on first use
++    void sched_alt_select(bool alt);
++
+     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+ 
+@@ -406,6 +409,13 @@ private:
+ 
+     ggml_backend_sched_ptr sched;
+ 
++    // The MTP draft context alternates a no-output ingest graph and a 1-token draft-step graph every cycle; with
++    // one scheduler each switch re-splits and re-allocates the graph.  The graphs with outputs run on a second
++    // scheduler, so both stay allocated and are reused.  It is swapped into `sched` only while a decode or encode
++    // runs (LLAMA_DRAFT_SCHED2=0: off).
++    ggml_backend_sched_ptr sched_alt;
++    bool                   sched_alt_in_use = false;
++
+     bool sched_need_reserve = true;
+ 
+     // state of sched_copy_experts, reset before each graph compute
+@@ -452,6 +462,7 @@ private:
+     llm_graph_result_ptr gf_res_reserve;
+ 
+     llm_graph_result * gf_res_prev_active = nullptr;
++    llm_graph_result * gf_res_prev_active_alt = nullptr; // the reuse state of the scheduler not in `sched`
+ 
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+-- 
+2.53.0
+
