@@ -1,0 +1,83 @@
+From a0c1118baa292787682ac7ec9b6d92538ffbe22b Mon Sep 17 00:00:00 2001
+From: "Brian S. Park" <brianspark@hotmail.com>
+Date: Wed, 14 Oct 2026 18:07:17 -0700
+Subject: [PATCH] mmb: 128x256 dense tile only for Q4_K on gfx1100 (RDNA3_0)
+
+On gfx1100 the 128x256 MMB dense tile spills to scratch for most weight
+types (Q6_K 148 B/thread, Q5_K 104, Q3_K 56, BF16 48; Q4_K 0), read from
+the code-object metadata.  With a spilling MMB prefill kernel and the
+spilling head-256 WMMA FA prefill kernel in the same run, the queue
+aborts with HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION (gfx1100, WSL2).
+
+Add a per-arch big_q4k_only flag (set for RDNA3_0) so only Q4_K weights
+keep the 128x256 tile; other types take the 128x128 tile, which does
+not spill.  GGML_CUDA_MMB_TILE still overrides.
+
+r62, Qwen3.8-27B Q4_K_M, RX 7900 XTX, ROCm 10.2 nightly, WSL2,
+llama-bench pp2048 at d0 / d16384:
+  r62                                   aperture fault 4/4
+  this patch                            0/4 faults
+  r62 + GGML_CUDA_MMB_TILE=0            1181 / 953 t/s (3 runs)
+  this patch                            1235 / 989 t/s (3 runs, +4.5 / +3.8 %)
+26k-depth MTP3 greedy text unchanged (MMB is prefill-only, n_tokens >= 512).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmb.cu | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 31613f788..43a4986a7 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1501,6 +1501,7 @@ struct mmb_arch_cfg {
+     int  bf16w          = 1;     // BF16 dense weights
+     int  routed         = 1;     // the routed MoE (MUL_MAT_ID) path + its fused GLU
+     int  dense_geom     = MMB_GEOM_GFX11_SPLIT;  // see mmb_geom_id
++    int  big_q4k_only   = 0;     // 128x256 dense tile only for Q4_K weights (others take 128x128)
+ };
+ 
+ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+@@ -1549,6 +1550,15 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+         // model with IQ4_NL HC gates) does not fit on gfx1100, so end-to-end A/B must be done on
+         // gfx1151/gfx1201 first.  LLAMA_HC_GATEMIX=1 is the opt-in.
+         c.gatemix       = 0;
++        // The 128x256 dense tile spills to scratch on gfx1100 for most weight types (Q6_K 148 B,
++        // Q5_K 104, Q3_K 56, BF16 48 per thread; Q4_K does not), and under WSL a spilling MMB prefill
++        // kernel together with the spilling head-256 WMMA FA kernel faults the queue with
++        // HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION (r62, gfx1100 under WSL2: llama-bench pp2048 4/4
++        // runs, 0/4 with this rule; on r59 a server soak also had 0/8 with GGML_CUDA_MMB=0 and 0/8
++        // with GGML_CUDA_FA_WMMA_256=0).  The 128x128 tile
++        // does not spill; keeping Q4_K on 128x256 is +4.5 % / +3.8 % pp2048 at d0 / d16384 over
++        // 128x128 for every type (Qwen3.8-27B Q4_K_M).
++        c.big_q4k_only  = 1;
+     }
+     // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
+     // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
+@@ -1581,11 +1591,11 @@ static void mmb_cfg_dump_once() {
+     const mmb_arch_cfg & c = mmb_cfg();
+     fprintf(stderr, "MMB_CFG cc=0x%x dense_geom=%d min_t=%d glu_thresh=%d routed_thresh=%d tall=%d "
+                     "tiny_m=%d/%d f32split=%d(min_m=%d,min_k=%d) cache=%d shadow=%d/%dMB "
+-                    "hc16=%d down16=%d gatemix=%d blk16=%d res16=%d glu=%d bf16w=%d iq3xxs_glu=%d routed=%d\n",
++                    "hc16=%d down16=%d gatemix=%d blk16=%d res16=%d glu=%d bf16w=%d iq3xxs_glu=%d routed=%d big_q4k_only=%d\n",
+             cc, c.dense_geom, c.min_t, c.glu_thresh, c.routed_thresh, c.tall_mode,
+             c.tiny_m, c.tiny_tt, c.f32split_mode, c.f32split_min_m, c.f32split_min_k, c.cache_max,
+             c.shadow_mode, c.shadow_cap_mb, c.hc16, c.down16, c.gatemix, c.blk16, c.res16,
+-            c.glu, c.bf16w, c.iq3xxs_glu, c.routed);
++            c.glu, c.bf16w, c.iq3xxs_glu, c.routed, c.big_q4k_only);
+ }
+ 
+ static size_t mmb_cache_max() { static const int v = getenv("GGML_CUDA_MMB_CACHE") ? atoi(getenv("GGML_CUDA_MMB_CACHE")) : mmb_cfg().cache_max; return (size_t) v; }
+@@ -2132,7 +2142,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     }
+     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(src0) : nullptr;
+     static const int tile_ov = getenv("GGML_CUDA_MMB_TILE") ? atoi(getenv("GGML_CUDA_MMB_TILE")) : -1;
+-    const bool big = tile_ov >= 0 ? (tile_ov != 0) : ((M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096));
++    const bool big_ok = !mmb_cfg().big_q4k_only || (!shadow_pre && src0->type == GGML_TYPE_Q4_K);
++    const bool big = tile_ov >= 0 ? (tile_ov != 0) : big_ok && ((M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096));
+     // HC gate (K=320, M=10240).  "producer slots ... 1 = HC gate" -- when the graph marks this
+     // output BF16-only, the gate is written ONCE into the pinned slot 1 and the dsv4_hc_pre
+     // consumer reads that BF16 copy instead of round-tripping the F32 tensor.  The mark alone is
+-- 
+2.43.0
+
