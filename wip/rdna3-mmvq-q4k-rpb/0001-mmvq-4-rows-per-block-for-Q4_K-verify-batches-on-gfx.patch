@@ -1,0 +1,78 @@
+From db32c6070d87550ee2a5cad08c6dc66a083d17a2 Mon Sep 17 00:00:00 2001
+From: "Brian S. Park" <brianspark@hotmail.com>
+Date: Wed, 14 Oct 2026 11:50:24 -0700
+Subject: [PATCH] mmvq: 4 rows per block for Q4_K verify batches on gfx1100
+ (RDNA3_0)
+
+Port of the RDNA4 verify rows-per-block rule (#57) to gfx1100 for Q4_K:
+a 2..8-token verify batch computes 4 weight rows per block, so the q8_1
+activation columns are loaded once per block instead of once per row.
+Each row keeps its own accumulation (thread mapping, K order, warp
+reduction), so output is bit-identical.
+
+The multi-row guard in mmvq.cu (row count must divide, >= 512 blocks)
+now also covers RDNA3_0 and reads the device's own table; RDNA4 is
+unchanged.
+
+gfx1100 (RX 7900 XTX), r62, Qwen3.8-27B Q4_K_M, MTP n-max 3, greedy,
+off/on/off/on (mean of the four requests per arm):
+  400 tokens, prose 59.2 -> 63.7 t/s (+7.6 %), code 69.6 -> 75.1 (+7.8 %)
+  300 tokens at 26k depth 47.9 -> 51.0 t/s (+6.4 %)
+  plain decode at 26k unchanged (34.1..34.3 t/s)
+  greedy text unchanged with and without MTP
+Sweep nwarps 1/2/4/8 x rows 1/2/4: nwarps > 1 changes the K-split order
+and was no faster; rows 4 at nwarps 1 is the best bit-identical point.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq-rdna-params.cuh | 12 ++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu              |  9 +++++----
+ 2 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq-rdna-params.cuh b/ggml/src/ggml-cuda/mmvq-rdna-params.cuh
+index ec5b8677e..a722da7df 100644
+--- a/ggml/src/ggml-cuda/mmvq-rdna-params.cuh
++++ b/ggml/src/ggml-cuda/mmvq-rdna-params.cuh
+@@ -50,7 +50,19 @@ static constexpr __host__ __device__ bool mmvq_decode_grid_loop_type(ggml_type t
+     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS ||
+            type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S;
+ }
++// gfx1100 (RDNA3_0) rows per block for a Q4_K verify batch (ncols_dst 2..8), same row-block
++// decomposition as the RDNA4 rule below: each row's accumulation is unchanged (bit-identical).
++// gfx1100 sweep (nwarps 1/2/4/8 x rows 1/2/4, Qwen3.8-27B Q4_K_M, MTP n-max 3): 4 rows at
++// nwarps 1 is the fastest bit-identical point (~+7 % MTP decode), greedy text unchanged;
++// nwarps > 1 changes the K-split order and was no faster.  The multi-row guard in mmvq.cu is only
++// compiled for types where RDNA4 also takes >1 row: extend it before adding other types here.
++#ifndef GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB
++#define GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB 4
++#endif
+ static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
++    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_Q4_K && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++        return GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB;
++    }
+     if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+         // Multi-row blocks only pay off for one-wave blocks: the 8-wave Q8_0 short-K block
+         // (calc_nwarps_weight) was measured slower at every row count (K = 2880, 8 tokens:
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index fcc871366..bbd6f07e9 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1612,10 +1612,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
+ #if defined(GGML_USE_HIP)
+                 constexpr int c_rpb_weight = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, 1);
+                 if constexpr (c_rpb_weight > 1) {
+-                    // the rows the launch will actually use (Q8_0 short-K: 8-warp blocks take fewer rows)
+-                    const int rpb_w = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false,
+-                        calc_nwarps_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, long_k));
+-                    if (table_id == MMVQ_PARAMETERS_RDNA4 &&
++                    // the rows the launch will actually use (Q8_0 short-K: 8-warp blocks take fewer rows;
++                    // RDNA3_0 Q4_K: GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB)
++                    const int rpb_w = calc_rows_per_block_weight(type, c_ncols_dst, table_id, false,
++                        calc_nwarps_weight(type, c_ncols_dst, table_id, long_k));
++                    if ((table_id == MMVQ_PARAMETERS_RDNA4 || table_id == MMVQ_PARAMETERS_RDNA3_0) && rpb_w > 1 &&
+                         (nrows_x % rpb_w != 0 || nrows_x < rpb_w * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS)) {
+                         if (long_k) {
+                             launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 1>{}, std::true_type{});
+-- 
+2.43.0
+
