@@ -1,0 +1,40 @@
+From 4b6427e18f402c17afd9ec68f938f54bd7b37587 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Thu, 15 Oct 2026 01:58:23 +0000
+Subject: [PATCH] llama: pinned output buffer for a tensor-split (meta) output
+ device
+
+ggml_backend_meta_device_get_host_buffer_type returns nullptr when the simple devices have different host buffer
+types, and the CUDA backend gives each device its own pinned type (they differ only in .device), so under
+-sm tensor output_reserve fell back to the CPU buffer type: the logits / embeddings / MTP hidden-state reads went to
+pageable memory and each blocked the host until the GPU was done.  Use the first simple device's pinned type for the
+output buffer (it is never scheduled on).  LLAMA_OUTPUT_PINNED=0 restores the old behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 72cc5139f..5652eb56e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2866,6 +2866,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+         // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
+         auto * output_dev = model.dev_output();
+         auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
++        // A meta (tensor-split) device has no single host buffer type when its devices each have their own (the CUDA
++        // per-device pinned types differ only in `device`).  The output buffer is never scheduled on, so the first
++        // simple device's pinned type serves it: without it the per-step D2H reads of the outputs land in pageable
++        // memory and each one blocks the host until the GPU is done.
++        static const bool output_pinned = [] { const char * e = getenv("LLAMA_OUTPUT_PINNED"); return e == nullptr || atoi(e) != 0; }();
++        if (output_pinned && output_dev_host_buft == nullptr && output_dev != nullptr && ggml_backend_dev_is_meta(output_dev) &&
++                ggml_backend_meta_dev_n_devs(output_dev) > 0) {
++            output_dev_host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_meta_dev_simple_dev(output_dev, 0));
++        }
+         if (output_dev_host_buft) {
+             buft = output_dev_host_buft;
+         }
+-- 
+2.53.0
+
