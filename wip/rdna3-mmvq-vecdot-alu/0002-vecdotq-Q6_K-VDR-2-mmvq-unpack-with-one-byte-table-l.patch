@@ -1,0 +1,47 @@
+From 50c38a7ba6ac6bb505b4e0cc82fc33920929f891 Mon Sep 17 00:00:00 2001
+From: "Brian S. Park" <brianspark@hotmail.com>
+Date: Wed, 14 Oct 2026 22:32:42 -0700
+Subject: [PATCH 2/2] vecdotq: Q6_K VDR-2 mmvq unpack with one byte-table
+ lookup on HIP (output unchanged)
+
+vec_dot_q6_K_q8_1_impl_mmvq_vdr2 (the RDNA4 / RDNA3_0 Q6_K mmvq path)
+rebuilds each signed 6-bit weight byte as ((vil | 16*h) - 32) with a
+shift, a shift/mask and __vsubss4, which AMD has no packed-byte
+instruction for (about four 16-bit ops per word on gfx1100).
+
+16*h - 32 is one of 0xE0, 0xF0, 0x00, 0x10, all with a zero low nibble,
+so vi = vil | table[h]: one v_perm_b32 lookup of the four 2-bit h
+values and an OR (v_and_or_b32).  Same bytes, so the same result; the
+values never saturate (-32..31).  CUDA keeps __vsubss4.
+
+gfx1100 mul_mat_vec_q_ksplit<Q6_K> hot loop: 4 columns 213 -> 160
+instructions per iteration, 1 column 129 -> 86.  Output unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/vecdotq.cuh | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 6eb39b97b..7a31e363b 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -784,9 +784,15 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq_vdr2(
+ 
+         const int vil = (vl >> (4*(i&1))) & 0x0F0F0F0F;
+ 
++#if defined(GGML_USE_HIP)
++        // vi = (vil | 16*h) - 32 per byte, h = the 2 high bits.  16*h - 32 is one of 0xE0, 0xF0, 0x00, 0x10 (zero low
++        // nibble), so one byte-table lookup and an OR replace the shift/mask and the emulated byte subtract.
++        const int vi = vil | __builtin_amdgcn_perm(0, 0x1000F0E0, (vh >> (4*(i&1))) & 0x03030303);
++#else
+         const int vih = ((vh >> (4*(i&1))) << 4) & 0x30303030;
+ 
+         const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
++#endif // defined(GGML_USE_HIP)
+ 
+         sumf += d8[i&1] * ggml_cuda_mul_small(ggml_cuda_dp4a(vi, u[i], 0), sc); // SIMD dot product
+     }
+-- 
+2.43.0
+
