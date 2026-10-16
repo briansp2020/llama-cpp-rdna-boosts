@@ -1,0 +1,53 @@
+From eebc59465b1bd166353b1475b25e3a4db8ad3f7e Mon Sep 17 00:00:00 2001
+From: "Brian S. Park" <brianspark@hotmail.com>
+Date: Thu, 15 Oct 2026 16:03:32 -0700
+Subject: [PATCH 3/4] mmvq: two rows per block for Q4_K verify batches on
+ gfx1100 with the 32-element dot product (output unchanged)
+
+The 4-row RDNA3_0 Q4_K rule was picked with the 16-element dot product.  With
+vec_dot_q4_K_q8_1_vdr4_dense the per-row work changed and 2 rows is faster;
+rows are independent, so W = 1..8 stay bit-identical and greedy text is
+unchanged from the parent.
+
+gfx1100, Qwen3.8-27B Q4_K_M, rocprofv3 one MTP request, W = 4 kernels,
+4 -> 2 rows: ffn_gate/up 71.4 -> 69.4 us, attn_qkv 41.8 -> 39.3,
+attn_q 48.3 -> 46.5, attn_gate 27.1 -> 26.1; 8 rows is slower everywhere
+(VGPR 190).  Total GPU time per request -1.3 %.
+
+Model A/B against the commit before the 32-element dot product (means of
+4 runs x 2 requests), this commit / the parent's same A/B:
+  MTP code   +4.6 % / +3.7 %      MTP prose  +5.1 % / +4.5 %
+  MTP @ 26k  +7.1 % / +6.4 %      plain      +1.8 % / +1.9 %
+Model logits width probe PASS at P = 256 and 3584.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq-rdna-params.cuh | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq-rdna-params.cuh b/ggml/src/ggml-cuda/mmvq-rdna-params.cuh
+index 6f2641639..fc16fa265 100644
+--- a/ggml/src/ggml-cuda/mmvq-rdna-params.cuh
++++ b/ggml/src/ggml-cuda/mmvq-rdna-params.cuh
+@@ -53,11 +53,14 @@ static constexpr __host__ __device__ bool mmvq_decode_grid_loop_type(ggml_type t
+ // gfx1100 (RDNA3_0) rows per block for a Q4_K verify batch (ncols_dst 2..8), same row-block
+ // decomposition as the RDNA4 rule below: each row's accumulation is unchanged (bit-identical).
+ // gfx1100 sweep (nwarps 1/2/4/8 x rows 1/2/4, Qwen3.8-27B Q4_K_M, MTP n-max 3): 4 rows at
+-// nwarps 1 is the fastest bit-identical point (~+7 % MTP decode), greedy text unchanged;
+-// nwarps > 1 changes the K-split order and was no faster.  The multi-row guard in mmvq.cu is only
+-// compiled for types where RDNA4 also takes >1 row: extend it before adding other types here.
++// nwarps 1 was the fastest bit-identical point (~+7 % MTP decode), greedy text unchanged;
++// nwarps > 1 changes the K-split order and was no faster.  With the 32-element dot product
++// (vec_dot_q4_K_q8_1_vdr4_dense) 2 rows is faster: W = 4 kernel times vs 4 rows, ffn_gate/up
++// 71.4 -> 69.4 us, attn_qkv 41.8 -> 39.3, attn_q 48.3 -> 46.5; 8 rows is slower everywhere.
++// The multi-row guard in mmvq.cu is only compiled for types where RDNA4 also takes >1 row:
++// extend it before adding other types here.
+ #ifndef GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB
+-#define GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB 4
++#define GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB 2
+ #endif
+ static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
+     if (table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_Q4_K && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+-- 
+2.43.0
+

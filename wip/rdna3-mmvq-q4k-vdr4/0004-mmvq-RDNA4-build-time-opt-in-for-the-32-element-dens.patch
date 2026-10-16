@@ -1,0 +1,93 @@
+From cca28a8d4d4476d71b17a6638a50daa5b2121730 Mon Sep 17 00:00:00 2001
+From: "Brian S. Park" <brianspark@hotmail.com>
+Date: Thu, 15 Oct 2026 18:03:48 -0700
+Subject: [PATCH 4/4] mmvq: RDNA4 build-time opt-in for the 32-element dense
+ Q4_K dot product (default off)
+
+-DGGML_HIP_RDNA4_Q4K_DENSE_VDR4 (e.g. via CMAKE_HIP_FLAGS) makes RDNA4 use
+vec_dot_q4_K_q8_1_vdr4_dense for dense Q4_K mmvq too, for an A/B.  One
+build flag gates both sides: the device dot-product choice
+(GGML_CUDA_Q4K_DENSE_VDR4 in vecdotq.cuh) and the host K split
+(get_vdr_mmvq_dense).  Without the flag nothing changes on RDNA4.
+
+With it the K partition changes, so greedy text changes once; decode and
+every verify width share the dot product, so widths stay bit-identical.
+Not run on RDNA4 here (gfx1201 compile check only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq-vecdot.cuh |  2 +-
+ ggml/src/ggml-cuda/mmvq.cu         | 12 +++++++++---
+ ggml/src/ggml-cuda/vecdotq.cuh     | 12 ++++++++++--
+ 3 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq-vecdot.cuh b/ggml/src/ggml-cuda/mmvq-vecdot.cuh
+index 3bb883d0d..ea5cec0a7 100644
+--- a/ggml/src/ggml-cuda/mmvq-vecdot.cuh
++++ b/ggml/src/ggml-cuda/mmvq-vecdot.cuh
+@@ -34,7 +34,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type,
+         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
+         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
+         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
+-#if defined(RDNA3_0)
++#if defined(GGML_CUDA_Q4K_DENSE_VDR4)
+         case GGML_TYPE_Q4_K:    return moe ? vec_dot_q4_K_q8_1_vdr4 : vec_dot_q4_K_q8_1_vdr4_dense;
+ #else
+         case GGML_TYPE_Q4_K:    return moe ? vec_dot_q4_K_q8_1_vdr4 : vec_dot_q4_K_q8_1;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 7c94e3a06..d76697202 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -72,10 +72,16 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+ #endif
+ }
+ 
+-// VDR of the dense mmvq kernels.  get_vec_dot_q_cuda() picks vec_dot_q4_K_q8_1_vdr4_dense for dense Q4_K on RDNA3_0
+-// (device side, by arch macro); the host's K-split arithmetic must use the same VDR, so both sides read it here.
++// VDR of the dense mmvq kernels.  get_vec_dot_q_cuda() picks vec_dot_q4_K_q8_1_vdr4_dense for dense Q4_K on RDNA3_0,
++// and on RDNA4 when built with GGML_HIP_RDNA4_Q4K_DENSE_VDR4 (device side, by arch macro); the host's K-split
++// arithmetic must use the same VDR, so both sides read it here.
+ static constexpr __host__ __device__ int get_vdr_mmvq_dense(ggml_type type, mmvq_parameter_table_id table_id) {
+-    return table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_Q4_K ? VDR_Q4_K_Q8_1_MMVQ_RDNA3_0 : get_vdr_mmvq(type);
++#if defined(GGML_HIP_RDNA4_Q4K_DENSE_VDR4)
++    const bool q4k_dense_vdr4 = table_id == MMVQ_PARAMETERS_RDNA3_0 || table_id == MMVQ_PARAMETERS_RDNA4;
++#else
++    const bool q4k_dense_vdr4 = table_id == MMVQ_PARAMETERS_RDNA3_0;
++#endif
++    return q4k_dense_vdr4 && type == GGML_TYPE_Q4_K ? VDR_Q4_K_Q8_1_MMVQ_RDNA3_0 : get_vdr_mmvq(type);
+ }
+ 
+ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 5a971bd86..0f748d193 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -1199,7 +1199,15 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_vdr4(
+ // gfx1100 (RDNA3_0) dense Q4_K mmvq VDR (vec_dot_q4_K_q8_1_vdr4_dense); see get_vdr_mmvq_dense() in mmvq.cu
+ #define VDR_Q4_K_Q8_1_MMVQ_RDNA3_0 4
+ 
+-#if defined(RDNA3_0)
++// The 32-element dense Q4_K dot product is the default on RDNA3_0.  RDNA4 can opt in at build time for an A/B
++// (-DGGML_HIP_RDNA4_Q4K_DENSE_VDR4, e.g. via CMAKE_HIP_FLAGS); it changes the K partition, so greedy text changes
++// once, and widths stay bit-identical (decode and verify share it).  Device side; the host side is
++// get_vdr_mmvq_dense(), which reads the same build flag.
++#if defined(RDNA3_0) || (defined(RDNA4) && defined(GGML_HIP_RDNA4_Q4K_DENSE_VDR4))
++#define GGML_CUDA_Q4K_DENSE_VDR4
++#endif
++
++#if defined(GGML_CUDA_Q4K_DENSE_VDR4)
+ // gfx1100 (RDNA3_0) dense Q4_K mmvq, 32 elements per call (VDR 4).  The two 16-element chunks of a call belong to
+ // the same two sub-blocks, so each sub-block's 16 products are summed in one integer dot-product chain before its
+ // single scale/convert/fma (|dot1| <= 16*15*127, times the 6-bit scale < 2^21, exact); the mins term uses the same
+@@ -1259,7 +1267,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_vdr4_dense(
+ 
+     return dm4f.x*sumf_d - dm4f.y*sumf_m;
+ }
+-#endif // defined(RDNA3_0)
++#endif // defined(GGML_CUDA_Q4K_DENSE_VDR4)
+ 
+ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+-- 
+2.43.0
+
