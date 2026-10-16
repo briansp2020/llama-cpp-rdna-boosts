@@ -1,0 +1,317 @@
+From 5fffec71807b93a27c3e5a9a8ec3cf97d6b9c409 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 15 Oct 2026 15:33:09 +0000
+Subject: [PATCH] ggml-cuda, qwen4exp: fewer quantize_q8_1 launches in -sm
+ tensor decode
+
+- q8_1_cache_get matches on the canonical row layout (size-1 dims dropped, contiguous dims merged), so the
+  MUL_MAT_ID view [K, 1, n] and the MUL_MAT view [K, n] of one activation share one quantization
+  (GGML_CUDA_Q8_1_CACHE_EXACT=1: old exact-shape match).
+- qwen4exp: the mirrored shared expert is expanded before the MoE, so it sits in the same meta-backend segment as
+  the MoE gate/up (before the MoE AllReduce) and its activation is quantized once for both (LLAMA_SHEXP_FIRST=0).
+- hc_mix_bf16_up_collapse2 writes the Q8_1 of the mixed rows into the quantize cache for its mmvq consumers:
+  contiguous rows per block, per-group row counters, the block completing a group quantizes it exactly as
+  quantize_q8_1 (GGML_HC_MIX_Q8=0: old path and old row mapping).
+
+r68, IQ3_XXS all-VRAM -sm tensor + MTP: quantize_q8_1 224.7 -> 69.2 per verify step per GPU, greedy decode
+148.2 -> 149.8 t/s, seeded 130.6 -> 132.0, same output.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh   | 59 ++++++++++++++++++++++--
+ ggml/src/ggml-cuda/ggml-cuda.cu |  3 ++
+ ggml/src/ggml-cuda/hc-mix.cu    | 81 ++++++++++++++++++++++++++++++---
+ src/models/qwen4exp.cpp         | 31 +++++++++----
+ 4 files changed, 155 insertions(+), 19 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index a09c7fe12..eb011d334 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1669,6 +1669,8 @@ static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & bloc
+ // device allocation inherits the same fail-soft policy.
+ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+ 
++#define GGML_CUDA_HC_Q8_CNT 1024
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+@@ -1786,6 +1788,17 @@ struct ggml_backend_cuda_context {
+     size_t q8_1_arena_size = 0;
+     std::vector<char *> q8_1_arena_retired;
+ 
++    // hc_mix_bf16_up_collapse2 Q8_1 epilogue: per-group row counters, one slice per stream (zeroed once, the
++    // kernel resets every counter it completes)
++    int * hc_q8_cnt = nullptr;
++    int * hc_q8_counters() {
++        if (hc_q8_cnt == nullptr) {
++            CUDA_CHECK(ggml_cuda_device_malloc((void **) &hc_q8_cnt, GGML_CUDA_MAX_STREAMS*GGML_CUDA_HC_Q8_CNT*sizeof(int), device));
++            CUDA_CHECK(cudaMemsetAsync(hc_q8_cnt, 0, GGML_CUDA_MAX_STREAMS*GGML_CUDA_HC_Q8_CNT*sizeof(int), stream()));
++        }
++        return hc_q8_cnt + curr_stream_no*GGML_CUDA_HC_Q8_CNT;
++    }
++
+     // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
+     // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
+     // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
+@@ -1802,13 +1815,53 @@ struct ggml_backend_cuda_context {
+     // Returns the cached buffer for (src1, stream_no, layout) if present,
+     // otherwise allocates a new one from the arena and records it. The buffer
+     // is valid until the next q8_1_cache_clear().
++    // Canonical row layout of a (ne11, ne12, ne13) x (s11, s12, s13) activation: size-1 dims dropped, a dim merged
++    // into the previous one when it continues it contiguously; out = (n, s) pairs, padded with (1, 0).
++    static void q8_1_rows_canon(int64_t ne11, int64_t ne12, int64_t ne13, int64_t s11, int64_t s12, int64_t s13, int64_t out[6]) {
++        const int64_t ne[3] = { ne11, ne12, ne13 };
++        const int64_t st[3] = { s11, s12, s13 };
++        int k = 0;
++        for (int i = 0; i < 3; i++) {
++            if (ne[i] == 1) {
++                continue;
++            }
++            if (k > 0 && st[i] == out[2*(k - 1)]*out[2*(k - 1) + 1]) {
++                out[2*(k - 1)] *= ne[i];
++                continue;
++            }
++            out[2*k] = ne[i];
++            out[2*k + 1] = st[i];
++            k++;
++        }
++        for (; k < 3; k++) {
++            out[2*k] = 1;
++            out[2*k + 1] = 0;
++        }
++    }
++
+     void * q8_1_cache_get(const ggml_tensor * src1, int stream_no, size_t size,
+                           int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
+                           int64_t s11, int64_t s12, int64_t s13, bool & found) {
++        // Match on the row layout rather than the raw shape: the quantized buffer holds the rows in (i13, i12, i11)
++        // order, so two descriptions with the same canonical rows (size-1 dims dropped, contiguous dims merged) are
++        // byte-identical -- e.g. the MUL_MAT_ID view [K, 1, n] and the MUL_MAT view [K, n] of one activation.
++        // GGML_CUDA_Q8_1_CACHE_EXACT=1 restores the exact-shape match (A/B).
++        static const bool exact = getenv("GGML_CUDA_Q8_1_CACHE_EXACT") != nullptr;
++        int64_t c[6];
++        q8_1_rows_canon(ne11, ne12, ne13, s11, s12, s13, c);
+         for (const auto & e : q8_1_cache) {
+-            if (e.src1 == src1 && e.data == src1->data && e.stream_no == stream_no &&
+-                e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
+-                e.s11 == s11 && e.s12 == s12 && e.s13 == s13) {
++            if (e.src1 != src1 || e.data != src1->data || e.stream_no != stream_no || e.ne10 != ne10) {
++                continue;
++            }
++            bool same;
++            if (exact) {
++                same = e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 && e.s11 == s11 && e.s12 == s12 && e.s13 == s13;
++            } else {
++                int64_t ce[6];
++                q8_1_rows_canon(e.ne11, e.ne12, e.ne13, e.s11, e.s12, e.s13, ce);
++                same = memcmp(c, ce, sizeof(c)) == 0;
++            }
++            if (same) {
+                 found = true;
+                 return q8_1_arena + e.offset;
+             }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9500ff03f..a41aff092 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -887,6 +887,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     for (char * p : q8_1_arena_retired) {
+         CUDA_CHECK(cudaFree(p));
+     }
++    if (hc_q8_cnt != nullptr) {
++        CUDA_CHECK(cudaFree(hc_q8_cnt));
++    }
+     h2d_stage_free();
+ 
+     for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 89f349287..d78157356 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -765,7 +765,8 @@ template <int nt>
+ static __global__ void __launch_bounds__(4*32, 1) hc_mix_bf16_up_collapse2(
+         const nv_bfloat16 * w_up, const float * lo, const float * xn, float * dst,
+         const int n_embd, const float inv_hc,
+-        const int64_t lo_stride_t, const int64_t xn_stride_t, const int64_t dst_stride_t) {
++        const int64_t lo_stride_t, const int64_t xn_stride_t, const int64_t dst_stride_t,
++        block_q8_1 * q8, int * q8_cnt, const int64_t q8_stride_t) {
+     constexpr int warp_size = 32;
+     constexpr int hc        = 4;      // one warp per stream
+     constexpr int vblock    = 160;    // the mmvf block for K = hc_lr = 320
+@@ -790,11 +791,18 @@ static __global__ void __launch_bounds__(4*32, 1) hc_mix_bf16_up_collapse2(
+         s_v[j][col2] = v;
+     }
+ 
+-    const int nr = (n_embd - (int) blockIdx.x + (int) gridDim.x - 1) / (int) gridDim.x;   // rows of this block
++    // rows of this block: interleaved (row blockIdx.x + i*gridDim.x), or with the Q8_1 epilogue a contiguous run
++    // (row r0 + i) so a Q8_1 group spans few blocks.  Every row is computed the same way either way.
++    const bool contig = q8 != nullptr;
++    const int  rpb    = (n_embd + (int) gridDim.x - 1) / (int) gridDim.x;
++    const int  r0     = contig ? (int) blockIdx.x*rpb : (int) blockIdx.x;
++    const int  rstep  = contig ? 1 : (int) gridDim.x;
++    const int nr = contig ? max(0, min(rpb, n_embd - r0))
++                          : (n_embd - (int) blockIdx.x + (int) gridDim.x - 1) / (int) gridDim.x;
+ 
+     int wnext[nv];
+     if (nr > 0) {
+-        const int * x2 = (const int *) (w_up + (int64_t) (c*n_embd + blockIdx.x)*(2*ncols2));
++        const int * x2 = (const int *) (w_up + (int64_t) (c*n_embd + r0)*(2*ncols2));
+ #pragma unroll
+         for (int v = 0; v < nv; ++v) {
+             wnext[v] = x2[v*warp_size + lane];
+@@ -809,7 +817,7 @@ static __global__ void __launch_bounds__(4*32, 1) hc_mix_bf16_up_collapse2(
+             wcur[v] = wnext[v];
+         }
+         if (i + 1 < nr) {
+-            const int * x2 = (const int *) (w_up + (int64_t) (c*n_embd + blockIdx.x + (i + 1)*gridDim.x)*(2*ncols2));
++            const int * x2 = (const int *) (w_up + (int64_t) (c*n_embd + r0 + (i + 1)*rstep)*(2*ncols2));
+ #pragma unroll
+             for (int v = 0; v < nv; ++v) {
+                 wnext[v] = x2[v*warp_size + lane];
+@@ -861,7 +869,7 @@ static __global__ void __launch_bounds__(4*32, 1) hc_mix_bf16_up_collapse2(
+     for (int idx = threadIdx.x; idx < nr*nt; idx += blockDim.x) {
+         const int i = idx / nt;
+         const int t = idx % nt;
+-        const int r = blockIdx.x + i*gridDim.x;
++        const int r = r0 + i*rstep;
+         float sum = 0.0f;
+         for (int ih = 0; ih < hc; ++ih) {
+             const float xv = xn[t*xn_stride_t + ih*n_embd + r];
+@@ -872,6 +880,50 @@ static __global__ void __launch_bounds__(4*32, 1) hc_mix_bf16_up_collapse2(
+         const float v = inv_hc * sum;
+         dst[t*dst_stride_t + r] = v;
+     }
++
++    // Q8_1 of the mixed rows for the mmvq consumers (q8 != nullptr), replacing their quantize_q8_1 launch.  The rows
++    // of one Q8_1 block (32 consecutive rows) are spread over 32 blocks, so each block counts the rows it finished
++    // per group and the block that completes a group quantizes it, one warp per group, exactly as quantize_q8_1 does
++    // (same 32-lane reductions, same rounding).  The finisher resets the counter for the next launch.
++    if (q8 != nullptr) {
++        __shared__ int s_fin[HC_UP2_MAXR];
++        __threadfence();
++        __syncthreads();
++        // one atomic per group this block touches (thread i = the block's i-th group), adding its row count
++        if (nr > 0 && (int) threadIdx.x <= (r0 + nr - 1)/QK8_1 - r0/QK8_1) {
++            const int g  = r0/QK8_1 + (int) threadIdx.x;
++            const int lo = max(r0, g*QK8_1);
++            const int hi = min(r0 + nr, (g + 1)*QK8_1);
++            s_fin[threadIdx.x] = atomicAdd(&q8_cnt[g], hi - lo) + (hi - lo) == QK8_1 ? g : -1;
++        } else if ((int) threadIdx.x < HC_UP2_MAXR) {
++            s_fin[threadIdx.x] = -1;
++        }
++        __syncthreads();
++        __threadfence();
++        for (int i = c; i < HC_UP2_MAXR; i += hc) {
++            const int g = s_fin[i];
++            if (g < 0) {
++                continue;
++            }
++            for (int t = 0; t < nt; ++t) {
++                const float xi = dst[t*dst_stride_t + g*QK8_1 + lane];
++                float amax = fabsf(xi);
++                float sum  = xi;
++                amax = warp_reduce_max<QK8_1>(amax);
++                sum  = warp_reduce_sum<QK8_1>(sum);
++                const float  d = amax / 127.0f;
++                const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++                block_q8_1 * y = q8 + t*q8_stride_t + g;
++                y->qs[lane] = q;
++                if (lane == 0) {
++                    y->ds = make_half2(d, sum);
++                }
++            }
++            if (lane == 0) {
++                q8_cnt[g] = 0;
++            }
++        }
++    }
+ }
+ 
+ static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * comb = nullptr) {
+@@ -934,6 +986,22 @@ static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tenso
+                 (const float *) x->data, (const float *) w_norm->data, xn, (block_q8_1 *) nullptr, (int) n_embd, eps,
+                 hc_dim, hc_dim, (int64_t) 0);
+     }
++    // Q8_1 of the mixed output straight into the quantize cache, for the mmvq matmuls over it (see the up kernel).
++    // GGML_HC_MIX_Q8=0 leaves it to their quantize_q8_1 (A/B).
++    static const bool up_q8 = !getenv("GGML_HC_MIX_Q8") || atoi(getenv("GGML_HC_MIX_Q8")) != 0;
++    block_q8_1 * q8 = nullptr;
++    int * q8_cnt = nullptr;
++    const int64_t q8_stride_t = n_embd / QK8_1;
++    static const bool up_v2_q8 = !getenv("GGML_HC_UP_V2") || atoi(getenv("GGML_HC_UP_V2")) != 0;
++    if (up_q8 && up_v2_q8 && GGML_PAD(n_embd, MATRIX_ROW_PADDING) == n_embd && n_embd / QK8_1 <= GGML_CUDA_HC_Q8_CNT) {
++        bool found = false;
++        void * p = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, n_tokens*q8_stride_t*sizeof(block_q8_1),
++                                      n_embd, n_tokens, 1, 1, mixed_stride_t, mixed_stride_t*n_tokens, mixed_stride_t*n_tokens, found);
++        if (!found) {
++            q8     = (block_q8_1 *) p;
++            q8_cnt = ctx.hc_q8_counters();
++        }
++    }
+     // A batch wider than the kernels' template band (9-16 tokens: several concurrent speculative streams) runs as
+     // chunks of at most HC_FUSED_MAX_TOKENS tokens.  Every token is computed independently (its own xn / lo / output
+     // rows, located by the per-token strides), so a chunk is bit-identical to the same tokens in one launch, and the
+@@ -972,7 +1040,8 @@ static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tenso
+                                    : (int) std::min<int64_t>(n_embd, 448);
+             const ggml_cuda_kernel_launch_params launch_params = {dim3(nblk), dim3(hc*32), 0, stream};
+ #define HC_BF16_UP(NT) do { if (up_v2) { ggml_cuda_kernel_launch(hc_mix_bf16_up_collapse2<NT>, launch_params, \
+-            (const nv_bfloat16 *) w_up->data, lo_c, xn_c, mixed_c, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, mixed_stride_t); } else { \
++            (const nv_bfloat16 *) w_up->data, lo_c, xn_c, mixed_c, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, mixed_stride_t, \
++            q8 ? q8 + t0*q8_stride_t : nullptr, q8_cnt, q8_stride_t); } else { \
+             ggml_cuda_kernel_launch(hc_mix_bf16_up_collapse<NT>, launch_params, \
+             (const nv_bfloat16 *) w_up->data, lo_c, xn_c, mixed_c, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, mixed_stride_t); } } while (0)
+             switch (nt_c) {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index db19e2c62..b986d2879 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -2620,6 +2620,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+ 
++    // The shared expert is mirrored under -sm tensor while the MoE output is a partial sum: expanding the shared
++    // expert first keeps it in the same meta-backend segment as the MoE (before the MoE AllReduce), so its Q8_1
++    // activation is quantized once for both instead of again after the segment boundary.  Node order only;
++    // LLAMA_SHEXP_FIRST=0 restores the old order (A/B).
++    static const bool shexp_first = [] { const char * e = getenv("LLAMA_SHEXP_FIRST"); return e == nullptr || atoi(e) != 0; }();
++    ggml_tensor * ffn_shexp = nullptr;
++    if (model.layers[il].ffn_up_shexp != nullptr) {
++        ffn_shexp =
++            build_ffn(cur,
++                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
++                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
++                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
++                NULL,
++                LLM_FFN_SILU, LLM_FFN_PAR, il);
++        cb(ffn_shexp, "ffn_shexp", il);
++        if (shexp_first) {
++            ggml_build_forward_expand(gf, ffn_shexp);
++        }
++    }
++
+     ggml_tensor * moe_out =
+         build_moe_ffn(cur,
+             model.layers[il].ffn_gate_inp,
+@@ -2638,16 +2658,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+     cb(moe_out, "ffn_moe_out", il);
+ 
+     // shared experts, as in the Qwen3Next reference
+-    if (model.layers[il].ffn_up_shexp != nullptr) {
+-        ggml_tensor * ffn_shexp =
+-            build_ffn(cur,
+-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+-                NULL,
+-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+-        cb(ffn_shexp, "ffn_shexp", il);
+-
++    if (ffn_shexp != nullptr) {
+         // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
+         ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+         cb(shared_gate, "shared_expert_gate", il);
+-- 
+2.53.0
+
