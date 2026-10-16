@@ -1,0 +1,225 @@
+From 2b1dd3e656183828ee2443ab1bcce52570024e82 Mon Sep 17 00:00:00 2001
+From: "Brian S. Park" <brianspark@hotmail.com>
+Date: Fri, 16 Oct 2026 07:37:22 -0700
+Subject: [PATCH 2/2] cuda: the attention-output FWHT also writes the next
+ matmul Q8_1 input
+
+With a quantized V cache the attention output goes FLASH_ATTN_EXT,
+RESHAPE, Hadamard MUL_MAT (fwht_cuda), RESHAPE, output projection; on
+the mmvq path that projection first runs quantize_q8_1 over the FWHT
+output.  Have the FWHT kernel also write those Q8_1 blocks into the
+quantize cache (same reduction and rounding as quantize_q8_1), so the
+projection finds them and skips its quantize launch.  The F32 output is
+still written.  GGML_CUDA_DISABLE_FWHT_Q8_1 turns it off.
+Bit-identical output.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/fwht.cu               | 63 ++++++++++++++++++++----
+ ggml/src/ggml-cuda/fwht.cuh              |  5 +-
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 46 +++++++++++++++++
+ 3 files changed, 102 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fwht.cu b/ggml/src/ggml-cuda/fwht.cu
+index fafc4ae0b..1b9652ec9 100644
+--- a/ggml/src/ggml-cuda/fwht.cu
++++ b/ggml/src/ggml-cuda/fwht.cu
+@@ -5,9 +5,11 @@
+ // wide FWHT blocks use one row per thread block with this many threads
+ #define GGML_CUDA_FWHT_BLOCK_NT 256
+ 
+-template <int N, typename T>
++// has_q8_1: also write the rows as Q8_1 blocks to y (the quantize cache of an mmvq matmul over dst, whose rows the
++// FWHT rows tile), with the same reduction and rounding as quantize_q8_1
++template <int N, typename T, bool has_q8_1 = false>
+ __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+-__global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale) {
++__global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale, block_q8_1 * y) {
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+@@ -30,6 +32,30 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
+     for (int i = 0; i < el_w; ++i) {
+         dst[i * warp_size + lane] = reg[i];
+     }
++
++    if constexpr (has_q8_1) {
++#pragma unroll
++        for (int i = 0; i < el_w; ++i) {
++            const int64_t i_cont = r * N + i * warp_size + lane;
++            const int64_t ib     = i_cont / QK8_1;
++            const int     iqs    = i_cont % QK8_1;
++
++            const float xi = reg[i];
++            float amax = fabsf(xi);
++            float sum  = xi;
++
++            amax = warp_reduce_max<QK8_1>(amax);
++            sum  = warp_reduce_sum<QK8_1>(sum);
++
++            const float  d = amax / 127.0f;
++            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++
++            y[ib].qs[iqs] = q;
++            if (iqs == 0) {
++                y[ib].ds = make_half2(d, sum);
++            }
++        }
++    }
+ }
+ 
+ // Wide blocks: one row per thread block instead of per warp, so each thread keeps N/NT
+@@ -114,7 +140,7 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
+ }
+ 
+ template <typename T>
+-static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
++static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, block_q8_1 * y) {
+     const int     n    = src->ne[0];
+     const int64_t rows = ggml_nrows(src);
+ 
+@@ -136,22 +162,39 @@ static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_t
+ 
+     switch (n) {
+         case 64:
+-            ggml_cuda_kernel_launch(fwht_cuda<64, T>, launch_params, src_d, dst_d, rows, scale);
++            if (y != nullptr) {
++                ggml_cuda_kernel_launch(fwht_cuda<64, T, true>, launch_params, src_d, dst_d, rows, scale, y);
++            } else {
++                ggml_cuda_kernel_launch(fwht_cuda<64, T>, launch_params, src_d, dst_d, rows, scale, y);
++            }
+             return true;
+         case 128:
+-            ggml_cuda_kernel_launch(fwht_cuda<128, T>, launch_params, src_d, dst_d, rows, scale);
++            if (y != nullptr) {
++                ggml_cuda_kernel_launch(fwht_cuda<128, T, true>, launch_params, src_d, dst_d, rows, scale, y);
++            } else {
++                ggml_cuda_kernel_launch(fwht_cuda<128, T>, launch_params, src_d, dst_d, rows, scale, y);
++            }
+             return true;
+         case 256:
+-            ggml_cuda_kernel_launch(fwht_cuda<256, T>, launch_params, src_d, dst_d, rows, scale);
++            if (y != nullptr) {
++                ggml_cuda_kernel_launch(fwht_cuda<256, T, true>, launch_params, src_d, dst_d, rows, scale, y);
++            } else {
++                ggml_cuda_kernel_launch(fwht_cuda<256, T>, launch_params, src_d, dst_d, rows, scale, y);
++            }
+             return true;
+         case 512:
+-            ggml_cuda_kernel_launch(fwht_cuda<512, T>, launch_params, src_d, dst_d, rows, scale);
++            if (y != nullptr) {
++                ggml_cuda_kernel_launch(fwht_cuda<512, T, true>, launch_params, src_d, dst_d, rows, scale, y);
++            } else {
++                ggml_cuda_kernel_launch(fwht_cuda<512, T>, launch_params, src_d, dst_d, rows, scale, y);
++            }
+             return true;
+         default:
+             break;
+     }
+ 
+     // wide blocks: one row per thread block
++    GGML_ASSERT(y == nullptr);
+     {
+         constexpr int nt = GGML_CUDA_FWHT_BLOCK_NT;
+ 
+@@ -192,7 +235,7 @@ bool ggml_cuda_op_mul_mat_use_fwht(const struct ggml_tensor * op) {
+            ggml_are_same_shape(b, op);
+ }
+ 
+-bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
++bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, void * q8_1) {
+     GGML_ASSERT(ggml_are_same_shape(src, dst));
+     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+         return false;
+@@ -203,9 +246,9 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
+ 
+     switch (src->type) {
+         case GGML_TYPE_F32:
+-            return ggml_cuda_op_fwht_impl<float>(ctx, src, dst);
++            return ggml_cuda_op_fwht_impl<float>(ctx, src, dst, (block_q8_1 *) q8_1);
+         case GGML_TYPE_F16:
+-            return ggml_cuda_op_fwht_impl<half>(ctx, src, dst);
++            return ggml_cuda_op_fwht_impl<half>(ctx, src, dst, (block_q8_1 *) q8_1);
+         default:
+             return false;
+     }
+diff --git a/ggml/src/ggml-cuda/fwht.cuh b/ggml/src/ggml-cuda/fwht.cuh
+index b2040a8f8..74a06cc32 100644
+--- a/ggml/src/ggml-cuda/fwht.cuh
++++ b/ggml/src/ggml-cuda/fwht.cuh
+@@ -44,5 +44,6 @@ static __device__ __forceinline__ void ggml_cuda_fwht_warp(const T * src, const
+ 
+ bool ggml_cuda_op_mul_mat_use_fwht(const struct ggml_tensor * op);
+ 
+-// Returns whether the Fast Walsh-Hadamard transform could be used.
+-bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst);
++// Returns whether the Fast Walsh-Hadamard transform could be used.  q8_1: also write dst as Q8_1 blocks there
++// (rows of up to 512 elements; dst rows padded to MATRIX_ROW_PADDING are not handled).
++bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, void * q8_1 = nullptr);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 24a856edb..463232ef9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -935,6 +935,48 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope_fwht(const ggml_cgraph * cgr
+     return true;
+ }
+ 
++// Hadamard MUL_MAT (run as fwht_cuda) feeding an mmvq matmul through a RESHAPE (the attention-output rotation in
++// front of the output projection): the FWHT kernel also writes the matmul's Q8_1 activation into the quantize
++// cache, so the matmul skips its quantize_q8_1 launch.  The F32 output is still written.  Returns 1 (the RESHAPE
++// is a no-op) when fused.  GGML_CUDA_DISABLE_FWHT_Q8_1 turns it off.
++static int ggml_cuda_fwht_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
++    static const bool disabled = getenv("GGML_CUDA_DISABLE_FWHT_Q8_1") != nullptr;
++    if (disabled || i + 2 >= cgraph->n_nodes) {
++        return 0;
++    }
++    ggml_tensor *       had     = cgraph->nodes[i];
++    const ggml_tensor * reshape = cgraph->nodes[i + 1];
++    const ggml_tensor * mm      = cgraph->nodes[i + 2];
++    if (had->op != GGML_OP_MUL_MAT || !ggml_cuda_op_mul_mat_use_fwht(had) || had->src[1]->type != GGML_TYPE_F32 ||
++        reshape->op != GGML_OP_RESHAPE || reshape->src[0] != had ||
++        mm->op != GGML_OP_MUL_MAT || mm->src[1] != reshape || !ggml_is_quantized(mm->src[0]->type) ||
++        !ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
++        return 0;
++    }
++    // the FWHT rows (one warp each) tile the matmul's unpadded, contiguous activation rows
++    const int64_t n    = had->ne[0];
++    const int64_t ne10 = reshape->ne[0];
++    if ((n != 64 && n != 128 && n != 256 && n != 512) || ne10 % n != 0 || ne10 % MATRIX_ROW_PADDING != 0 ||
++        !ggml_is_contiguous(reshape)) {
++        return 0;
++    }
++
++    // the mmvq launcher's key and layout: the view root of src1 (here the Hadamard output) and src1's shape
++    const size_t  ts          = ggml_type_size(reshape->type);
++    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++    const size_t  q8_1_size   = reshape->ne[3]*reshape->ne[2] * reshape->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
++    bool cached = false;
++    void * y = ctx.q8_1_cache_get(had, ctx.curr_stream_no, q8_1_size,
++                                  ne10, reshape->ne[1], reshape->ne[2], reshape->ne[3],
++                                  reshape->nb[1]/ts, reshape->nb[2]/ts, reshape->nb[3]/ts, cached);
++    if (cached) {
++        return 0;
++    }
++    // the cache entry now exists, so it must be filled
++    GGML_ASSERT(ggml_cuda_op_fwht(ctx, had->src[1], had, y));
++    return 1;
++}
++
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                                int                                       node_idx,
+                                std::initializer_list<enum ggml_op>       ops,
+@@ -2249,6 +2291,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+         return fused_node_count - 1;
+     }
+ 
++    if (const int n_fwht_q8_1 = ggml_cuda_fwht_q8_1_try_fuse(*cuda_ctx, cgraph, i)) {
++        return n_fwht_q8_1;
++    }
++
+     if (ggml_cuda_should_fuse_rms_norm_mul_rope_fwht(cgraph, i)) {
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr, cgraph->nodes[i + 4]);
+         return 4;
+-- 
+2.43.0
+
