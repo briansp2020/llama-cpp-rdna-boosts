@@ -1,0 +1,166 @@
+From 02855f90b767e4e9bf2a4bf717b2581baba3597e Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 17 Oct 2026 22:26:59 +0000
+Subject: [PATCH] cuda: the GDN q and k l2 norms (two RMS_NORM + SCALE over one
+ tensor) in one launch
+
+build_gdn_l2_norm normalizes q and k with an RMS_NORM + SCALE each; both read views of the same conv output with the
+same shape, strides, eps and scale, so they ran as two identical rms_norm_f32<256, false, false, true> launches.  One
+rms_norm_scale_pair_f32 launch now takes both (blocks [0, nrows) the first pair, [nrows, 2*nrows) the second) with the
+same per-row body, so each output is bit-identical.  Only no-op nodes may sit between the pairs, and the second must
+not read the first's output.  GGML_CUDA_DISABLE_NORM_PAIR=1 restores two launches.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 25 ++++++++
+ ggml/src/ggml-cuda/norm.cu               | 76 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/norm.cuh              |  3 +
+ 3 files changed, 104 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 463232ef9..220241563 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -2332,6 +2332,31 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     }
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
++        // a second RMS_NORM + SCALE over a view of the same tensor with the same shape, strides, eps and scale (the GDN
++        // q / k l2 norm), separated only by no-op nodes: both in one launch.  GGML_CUDA_DISABLE_NORM_PAIR=1: off.
++        static const bool norm_pair_off = getenv("GGML_CUDA_DISABLE_NORM_PAIR") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_NORM_PAIR")) != 0;
++        const ggml_tensor * x0 = node->src[0];
++        int j = i + 2;
++        while (!norm_pair_off && j < cgraph->n_nodes && (cgraph->nodes[j]->op == GGML_OP_VIEW || cgraph->nodes[j]->op == GGML_OP_RESHAPE ||
++                cgraph->nodes[j]->op == GGML_OP_PERMUTE || cgraph->nodes[j]->op == GGML_OP_TRANSPOSE || cgraph->nodes[j]->op == GGML_OP_NONE)) {
++            ++j;
++        }
++        if (!norm_pair_off && j + 1 < cgraph->n_nodes && ggml_cuda_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
++            const ggml_tensor * n1 = cgraph->nodes[j];
++            const ggml_tensor * x1 = n1->src[0];
++            bool same = x0->type == GGML_TYPE_F32 && x1->type == GGML_TYPE_F32 && x0->view_src && x0->view_src == x1->view_src &&
++                        x0->ne[0] < 1024 && memcmp(node->op_params, n1->op_params, sizeof(float)) == 0 &&
++                        memcmp(cgraph->nodes[i + 1]->op_params, cgraph->nodes[j + 1]->op_params, 2 * sizeof(float)) == 0;
++            for (int k = 0; same && k < 4; ++k) {
++                same = x0->ne[k] == x1->ne[k] && x0->nb[k] == x1->nb[k];
++            }
++            // the second pair must not read the first one's output (it reads a view of the shared parent)
++            same = same && x1 != cgraph->nodes[i + 1] && x1->view_src != cgraph->nodes[i + 1];
++            if (same) {
++                ggml_cuda_op_rms_norm_scale_pair_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[j], cgraph->nodes[j + 1]);
++                return j + 1 - i;
++            }
++        }
+         ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+         return 1;
+     }
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 74de5629c..1d74a53a5 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -202,6 +202,54 @@ static __global__ void rms_norm_f32(const float * x,
+     }
+ }
+ 
++// Two RMS_NORM + SCALE pairs in one launch (the GDN q and k l2 norms of build_gdn_l2_norm): blocks [0, nrows) take
++// (x0, dst0), blocks [nrows, 2*nrows) take (x1, dst1).  The per-row body is rms_norm_f32<block_size, false, false, true>'s
++// (same reduction, same `scale_out * (scale * x)`), so each output is bit-identical to its own launch.
++template <int block_size>
++static __global__ void rms_norm_scale_pair_f32(const float * x0, float * dst0, const float * x1, float * dst1,
++        const int ncols, const int nrows, const int nchannels, const int nsamples,
++        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
++        const float eps, const float scale_out) {
++    ggml_cuda_pdl_lc();
++    const int  pair = blockIdx.x >= nrows;
++    const int  row  = blockIdx.x - pair*nrows;
++    const int  tid  = threadIdx.x;
++    const float * x   = pair ? x1   : x0;
++    float       * dst = pair ? dst1 : dst0;
++
++    extern __shared__ float s_sum[];
++
++    ggml_cuda_pdl_sync();
++
++    for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
++        for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
++            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
++            float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
++
++            float tmp = 0.0f; // partial sum for thread in warp
++
++            for (int col = tid; col < ncols; col += block_size) {
++                const float xi = xc[col];
++                tmp += xi * xi;
++            }
++
++            // sum up partial sums
++            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++            const float mean = tmp / ncols;
++            const float scale = rsqrtf(mean + eps);
++
++            for (int col = tid; col < ncols; col += block_size) {
++                dstc[col] = scale_out * (scale * xc[col]);
++            }
++
++            if constexpr (block_size > WARP_SIZE) {
++                __syncthreads();
++            }
++        }
++    }
++}
++
+ // rms_norm followed by ggml_scale (build_gdn_l2_norm: the GDN q/k l2 norm).  The norm output is
+ // rounded exactly as rms_norm_f32 writes it, and the scale is applied as scale_f32 does
+ // (s * v + b), so the result is bit-identical to the two kernels it replaces.
+@@ -897,6 +945,34 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
+     rms_norm_f32_cuda<true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
+ }
+ 
++void ggml_cuda_op_rms_norm_scale_pair_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm0, ggml_tensor * scale0,
++        ggml_tensor * norm1, ggml_tensor * scale1) {
++    const ggml_tensor * x0 = norm0->src[0];
++    const ggml_tensor * x1 = norm1->src[0];
++    GGML_ASSERT(x0->type == GGML_TYPE_F32 && x1->type == GGML_TYPE_F32);
++    GGML_ASSERT(scale0->type == GGML_TYPE_F32 && scale1->type == GGML_TYPE_F32);
++
++    float eps;
++    memcpy(&eps, norm0->op_params, sizeof(float));
++    float scale;
++    memcpy(&scale, (const float *) scale0->op_params + 0, sizeof(float));
++
++    const size_t ts0 = ggml_type_size(x0->type);
++    GGML_ASSERT(x0->nb[0] == ts0);
++    const int64_t s01 = x0->nb[1] / ts0;
++    const int64_t s02 = x0->nb[2] / ts0;
++    const int64_t s03 = x0->nb[3] / ts0;
++    const int ncols = (int) x0->ne[0], nrows = (int) x0->ne[1], nchannels = (int) x0->ne[2], nsamples = (int) x0->ne[3];
++    GGML_ASSERT(ncols < 1024);
++
++    const dim3 blocks_num(2*nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
++    const dim3 block_dims(256, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), ctx.stream()};
++    ggml_cuda_kernel_launch(rms_norm_scale_pair_f32<256>, launch_params,
++        (const float *) x0->data, (float *) scale0->data, (const float *) x1->data, (float *) scale1->data,
++        ncols, nrows, nchannels, nsamples, s01, s02, s03, eps, scale);
++}
++
+ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
+     float eps = 0.0f;
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index b5f827ff4..9fb6a3921 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -10,6 +10,9 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
+ 
++void ggml_cuda_op_rms_norm_scale_pair_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm0, ggml_tensor * scale0,
++        ggml_tensor * norm1, ggml_tensor * scale1);
++
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               dst,
+                                      ggml_tensor *               mul_tensor,
+-- 
+2.53.0
+
