@@ -4,7 +4,7 @@ The fused `rms_norm_mul_rope_f32` kernel from #172 now also handles `GGML_ROPE_T
 - On the Qwen3.x models, this puts the `RMS_NORM, MUL, ROPE (+ KV-rotation FWHT)` chain on the fused kernel.
 - That chain is currently three launches per rope (`rms_norm_f32`, `rope_multi`, `fwht_cuda<256>`); with the patch it is one.
 
-One format-patch on `v12-097cf33d9-r80` (tree `873d0335`); applied tree `c80bf818`.
+Two format-patches on `v12-097cf33d9-r80` (tree `873d0335`): 0001 the M-RoPE fusion (applied tree `c80bf818`), 0002 a BF16 guard it needs (applied tree after both `955009dd`).
 
 ## What changes
 
@@ -109,5 +109,30 @@ Two alternated rounds per arm. Decode is the mean of 4 × 400-token greedy runs 
 
 - `n_offs != 0` and VISION stay on the unfused path, as before.
 - Partial rotation is not unit-tested. The `RMS_NORM_MUL_ROPE` cases rotate the whole row (`n_dims == ne0`), so the untouched tail beyond `n_dims` is never exercised there. Both test models do exercise it: they rotate 64 of 256 head dims (sections `[11, 11, 10, 0]`), so the hash, probe and KLD gates above go through that tail.
-- Only `-ub 2048` / `-b 2048` and q8_0 KV were measured end to end; f16 KV goes through the same rope code.
+- Only `-ub 2048` / `-b 2048` were measured end to end. q8_0, f16 and bf16 KV are covered (see the 0002 section below).
 - With this in, #173's K/V cache write fold would see the M-RoPE chain too. That PR is not part of this one.
+
+## 0002: keep BF16 caches off the 5-op fusion
+
+This was found while testing 0001 on a 7900 XTX.
+- `ggml_cuda_should_fuse_rope_set_rows` admits a BF16 `SET_ROWS`, because rope's own set_rows path writes BF16.
+- The 5-op `RMS_NORM, MUL, ROPE, VIEW, SET_ROWS` fusion then runs `ggml_cuda_op_rms_norm_mul_rope_fused`, which writes F32 / F16 rows only and otherwise hits `GGML_ABORT`.
+- On plain r80 that path is reached by NEOX qk-norm models such as Qwen3-30B-A3B with `-ctk bf16`. 0001 also lets the Qwen3.x IMROPE models reach it.
+- 0002 declines the 5-op match for a BF16 `SET_ROWS`, so the `RMS_NORM + MUL + ROPE` fusion and the plain `SET_ROWS` take it. It also adds the BF16 set_rows type to the `RMS_NORM_MUL_ROPE` test cases. Those two cases pass with or without the guard, so they do not reproduce the abort; the end-to-end runs below do.
+
+One R9700, `-ctk` / `-ctv` as listed, greedy 400 tokens, prose / code:
+
+| model | KV | r80 | r80 + 0001 | r80 + 0001 + 0002 |
+|---|---|---|---|---|
+| Qwen3.8-27B Q4_K_M | bf16 | `d12cdeede326` / `dcd93c8965ce` | aborts (`rope.cu:1087`) | `d12cdeede326` / `dcd93c8965ce` |
+| Qwen3.6-35B-A3B Q4_K_M | bf16 | `37833b1a9cc7` / `efab539d2cf4` | aborts (`rope.cu:1087`) | `37833b1a9cc7` / `efab539d2cf4` |
+| Qwen3-30B-A3B Q4_K_M | bf16 | aborts (`rope.cu:1050`) | aborts (`rope.cu:1087`) | runs: `0707c64c3787` / `60b6ba8b01df` |
+| 27B / 35B-A3B / 30B-A3B | f16 | `9ed70fb699ad` / `597053375912`, `3e1448132123` / `0a5baa6fc299`, `26076a9177d5` / `ec51bd69b95f` | same | same |
+| 27B / 35B-A3B / 30B-A3B | q8_0 | `d12cdeede326` / `e8a93c816237`, `0eedd580608a` / `365e3058e68f`, `744db56ea1c8` / `6bb5966d061f` | same | same |
+
+- The f16 rows also cover the 5-op path that 0001 opens for f16 caches: it is bit-identical.
+- `test-backend-ops -o RMS_NORM_MUL_ROPE` passes 298/298 on r80 and on r80 + 0001 + 0002.
+- On the 7900 XTX (gfx1100, WSL2), r80 + 0001 + 0002 matched plain r80 for q8_0, f16 and bf16 KV:
+  - 27B plain decode, and 27B with `draft-mtp` n-max 3 with the same acceptance;
+  - Qwen3-30B-A3B plain decode.
+- On that box, 0001 alone aborted at `rope.cu:1087` with bf16 on both 27B and 30B-A3B, and both run with 0002.
