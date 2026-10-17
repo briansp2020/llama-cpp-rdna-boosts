@@ -1,4 +1,4 @@
-From 315ef0ee5acedd0f27a8519e35a4fccaf2f325f4 Mon Sep 17 00:00:00 2001
+From 04405daf978ccec7e715559a8f42b27b0be4bda7 Mon Sep 17 00:00:00 2001
 From: "Brian S. Park" <brianspark@hotmail.com>
 Date: Fri, 16 Oct 2026 14:02:14 -0700
 Subject: [PATCH] cuda: fold the q8_0 K and V cache writes into the rope + FWHT
@@ -28,10 +28,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 188 insertions(+), 34 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 463232ef9..9ec9f5209 100644
+index 5acffdc44..133657743 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -935,6 +935,84 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope_fwht(const ggml_cgraph * cgr
+@@ -938,6 +938,84 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope_fwht(const ggml_cgraph * cgr
      return true;
  }
  
@@ -116,7 +116,7 @@ index 463232ef9..9ec9f5209 100644
  // Hadamard MUL_MAT (run as fwht_cuda) feeding an mmvq matmul through a RESHAPE (the attention-output rotation in
  // front of the output projection): the FWHT kernel also writes the matmul's Q8_1 activation into the quantize
  // cache, so the matmul skips its quantize_q8_1 launch.  The F32 output is still written.  Returns 1 (the RESHAPE
-@@ -2295,6 +2373,13 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2300,6 +2378,13 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
          return n_fwht_q8_1;
      }
  
@@ -131,7 +131,7 @@ index 463232ef9..9ec9f5209 100644
          ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr, cgraph->nodes[i + 4]);
          return 4;
 diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
-index e4b1b2acf..96e342e4d 100644
+index 6ed719fef..2264045d4 100644
 --- a/ggml/src/ggml-cuda/rope.cu
 +++ b/ggml/src/ggml-cuda/rope.cu
 @@ -3,6 +3,7 @@
@@ -170,17 +170,18 @@ index e4b1b2acf..96e342e4d 100644
  static __global__ void rms_norm_mul_rope_f32(
          const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
          const int64_t s01, const int64_t s02, const int64_t s03,
-@@ -764,7 +780,8 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -764,8 +780,9 @@ static __global__ void rms_norm_mul_rope_f32(
          const rope_corr_dims corr_dims, const float theta_scale,
          const float * freq_factors,
          const int64_t * row_indices, const int set_rows_stride,
--        const bool is_neox, const float fwht_scale) {
-+        const bool is_neox, const float fwht_scale, const rope_kv_q8_0 kv_args) {
+-        const bool is_neox, const float fwht_scale,
++        const bool is_neox, const float fwht_scale, const rope_kv_q8_0 kv_args,
+         const mrope_sections sections, const int mrope) {
 +    static_assert(!kv || fwht_n > 0, "the KV-cache writes need the FWHT path");
      ggml_cuda_pdl_lc();
      const int row = blockIdx.x;
      const int tid = threadIdx.x;
-@@ -784,6 +801,15 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -785,6 +802,15 @@ static __global__ void rms_norm_mul_rope_f32(
              const uint32_t mul_sample  = fastmodulo(sample,  mul_nsamples_packed);
              const float * mulc = mul + mul_sample*mul_s03 + mul_channel*mul_s02 + mul_row*mul_s01;
  
@@ -196,7 +197,7 @@ index e4b1b2acf..96e342e4d 100644
              float tmp = 0.0f;
  
              for (int col = tid; col < ncols; col += block_size) {
-@@ -846,9 +872,18 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -877,9 +903,18 @@ static __global__ void rms_norm_mul_rope_f32(
                  if (tid < warp_size) {
                      float reg[fwht_n / warp_size];
                      ggml_cuda_fwht_warp<fwht_n, warp_size>(s_row, fwht_scale, reg, tid);
@@ -217,21 +218,21 @@ index e4b1b2acf..96e342e4d 100644
                      }
                  }
              }
-@@ -877,7 +912,7 @@ static void rms_norm_mul_rope_cuda(
+@@ -908,7 +943,7 @@ static void rms_norm_mul_rope_cuda(
          const rope_corr_dims corr_dims,
          const float * freq_factors,
          const int64_t * row_indices, const int set_rows_stride,
--        const bool is_neox, const int fwht_n, const float fwht_scale, cudaStream_t stream) {
-+        const bool is_neox, const int fwht_n, const float fwht_scale, const rope_kv_q8_0 & kv, cudaStream_t stream) {
+-        const bool is_neox, const int fwht_n, const float fwht_scale,
++        const bool is_neox, const int fwht_n, const float fwht_scale, const rope_kv_q8_0 & kv,
+         const mrope_sections sections, const int mrope, cudaStream_t stream) {
      GGML_ASSERT(ncols % 2 == 0);
  
-     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
-@@ -900,19 +935,28 @@ static void rms_norm_mul_rope_cuda(
+@@ -932,19 +967,28 @@ static void rms_norm_mul_rope_cuda(
                      x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                      mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                      n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
--                    freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale);
-+                    freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv);
+-                    freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, sections, mrope);
++                    freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv, sections, mrope);
              };
              const bool has_ff = freq_factors != nullptr;
 -            switch (fwht_n) {
@@ -262,35 +263,35 @@ index e4b1b2acf..96e342e4d 100644
      }
  
      if (ncols < 1024) {
-@@ -923,13 +967,13 @@ static void rms_norm_mul_rope_cuda(
+@@ -955,13 +999,13 @@ static void rms_norm_mul_rope_cuda(
                  x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                  mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                  n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
--                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale);
-+                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv);
+-                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, sections, mrope);
++                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv, sections, mrope);
          } else {
              ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<256, true, D>, launch_params,
                  x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                  mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                  n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
--                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale);
-+                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv);
+-                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, sections, mrope);
++                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv, sections, mrope);
          }
      } else {
          const dim3 block_dims(1024, 1, 1);
-@@ -939,19 +983,20 @@ static void rms_norm_mul_rope_cuda(
+@@ -971,19 +1015,20 @@ static void rms_norm_mul_rope_cuda(
                  x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                  mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                  n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
--                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale);
-+                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv);
+-                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, sections, mrope);
++                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv, sections, mrope);
          } else {
              ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<1024, true, D>, launch_params,
                  x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                  mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                  n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
--                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale);
-+                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv);
+-                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, sections, mrope);
++                freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv, sections, mrope);
          }
      }
  }
@@ -302,7 +303,7 @@ index e4b1b2acf..96e342e4d 100644
      const ggml_tensor * x = rms_norm->src[0];
      const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
  
-@@ -979,6 +1024,24 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+@@ -1011,6 +1056,24 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
          fwht_scale = 1 / sqrtf(fwht_n);   // as in ggml_cuda_op_fwht_impl
      }
  
@@ -327,20 +328,20 @@ index e4b1b2acf..96e342e4d 100644
      if (set_rows != nullptr) {
          dst_d           = set_rows->data;
          dst_type        = set_rows->type;
-@@ -1038,14 +1101,14 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+@@ -1075,14 +1138,14 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
              (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
              mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
              n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
--            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, stream);
-+            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, kv, stream);
+-            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, sections, mrope, stream);
++            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, kv, sections, mrope, stream);
      } else if (dst_type == GGML_TYPE_F16) {
          rms_norm_mul_rope_cuda((const float *) x->data, (half *) dst_d,
              x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps,
              (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
              mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
              n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
--            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, stream);
-+            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, kv, stream);
+-            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, sections, mrope, stream);
++            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, kv, sections, mrope, stream);
      } else {
          GGML_ABORT("fatal error");
      }
@@ -409,5 +410,5 @@ index c140c0873..7e43bc490 100644
 +
  void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 -- 
-2.43.0
+2.53.0
 

@@ -4,13 +4,58 @@ Thank you for the issue #67 work that made the address-selected rope fusions rou
 replace; this patch keeps to that rule.  It does for a q8_0 cache with the KV rotation on what the existing rope ->
 set_rows fusion does for f16 / f32 caches, in the rope kernel that already runs the FWHT (#172).  Bit-identical.
 
-**Stacked:** one format-patch on top of `v12-097cf33d9-r71` + #172 (kv-rot-fwht-fusion, 0001..0002) + #171
-(q8-decode-small-kernels, 0001..0002), applied in that order (applied tree `01067997`).  It needs #172's fused kernel
-and reuses #171's q8_0 group quantize.  5 files (`rope.cu`, `rope.cuh`, `set-rows.cu`, `set-rows.cuh`,
-`ggml-cuda-try-fuse.cu`), +188 / -34.  Not arch-specific; `GGML_CUDA_DISABLE_ROPE_FWHT_SET_ROWS` turns it off.
+**Stacked (updated for r80):** one format-patch on top of `v12-097cf33d9-r80` + #175 (mrope-rope-fusion, 0001..0002), applied in that order (applied tree `67245faf`).  #171 and #172 are in r78; #175 brings the fused rope + FWHT kernel to the M-RoPE / IMROPE models, which is what lets this fold fire on Qwen3.x.  Same 5 files, +188 / -34, unchanged in substance from the r71 version (rebased).  `GGML_CUDA_DISABLE_ROPE_FWHT_SET_ROWS` turns it off.
+
+The r71 measurements below are kept for the record; the r80 results on Qwen3.x are in the next section.
 
 **Hardware: RX 7900 XTX (gfx1100, RDNA3, 24 GB)**, Ryzen 7 9800X3D, Windows 11 + WSL2 (Ubuntu 24.04), ROCm 10.2 nightly
 `20261013-38325106112` (HIP 7.17.26405) in a container.  All speed numbers below are from this box under WSL2, except the RDNA4 section (labelled there).
+
+## r80 on Qwen3.x (on #175)
+
+Setup:
+- R9700 (gfx1201), native Linux, HIP runtime 7.15.26333.
+- r80 + #175 (`s80p`) against r80 + #175 + this patch (`s80kv`), same build dir.
+- Models: Qwen3.6-35B-A3B Q4_K_M, plain decode; Qwen3.8-27B Q4_K_M with its own MTP head (`draft-mtp` n-max 3).
+- Server settings: `-c 65536 -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -ub 2048 -b 2048`.
+
+These are the re-entry conditions from your review.
+
+**The matcher fires.** A `rocprofv3` trace of 1-GPU 35B-A3B decode, the same greedy work on both builds:
+
+| kernel | r80 + #175 | + this patch |
+|---|---|---|
+| `k_set_rows_q8_0_group` | 32,120 × 1.46 µs | — |
+| `rms_norm_mul_rope_f32<256, false, float, 256>` | 32,120 × 3.15 µs | Q: 16,060 × 3.23 µs; K with the cache writes: 16,060 × 4.91 µs |
+
+All 32,120 cache-write launches are gone. qwen35 / qwen35moe build attention through the non-iSWA `build_attn`, which expands K last, so the K cache write follows the K rotation, as the matcher requires.
+
+**Greedy hashes** (400 tokens, prose / code) are identical to r80 + #175 and to plain r80:
+
+| model | config | prose / code |
+|---|---|---|
+| 35B-A3B | 1 GPU: patched / kill switch / `GGML_CUDA_GRAPH_OPT=1`; 2 GPU `-sm layer` | `0eedd580608a` / `365e3058e68f` |
+| 35B-A3B | 2 GPU `-sm tensor` | `c0cf0739bdab` / `930bcf1f4405` |
+| 27B MTP | 1 GPU: the same arms; 2 GPU `-sm layer` | `d12cdeede326` / `e8a93c816237` |
+| 27B MTP | 2 GPU `-sm tensor` | `7cfb359d5c5d` / `dcd93c8965ce` |
+
+The gates above ran with this patch on #175 0001. The final stack, on #175 0001 + 0002 (the BF16 guard), was re-checked with greedy hashes on 1 GPU for q8_0, f16 and bf16 KV on both models plus Qwen3-30B-A3B. All matched plain r80, apart from the 30B-A3B bf16 case, which plain r80 cannot run.
+
+**`test-logits-width-probe`** (1 GPU): PASS with worst maxdiff 0 at P=256 and P=3584 on both models. The W8 and row-0 hashes are identical to plain r80 (35B-A3B `251c193d7b72cf34` / `f172e67372ec2698`; 27B `498b73a62646b535` / `aa42818af2333c50`).
+
+**Prefill-logit** (wikitext-2 test 16 × 2048, against bases recorded from stock r80): mean KLD 0.000000 on both models, at the stock-vs-stock floor (max 0.000058 / 0.000065, same top p 99.994 %).
+
+**`test-backend-ops`**: `SET_ROWS` 159/159, `ROPE` 450/450, `RMS_NORM_MUL_ROPE` 296/296.
+
+**Decode**, two alternated rounds, each the mean of 8 × 400-token greedy runs:
+
+| config | r80 + #175 | + this patch | change |
+|---|---|---|---|
+| 35B-A3B, 1 GPU | 125.03 t/s | 125.70 t/s | +0.5 % (kill switch: 125.01) |
+| 27B MTP, 1 GPU | 67.17 t/s | 67.61 t/s | +0.7 % |
+| 35B-A3B, 2 GPU `-sm tensor` | 131.97 t/s | 132.55 t/s | +0.4 % |
+
+31.5k prefill is flat. We only have two GPUs, so there is no 3-GPU number.
 
 ## What it does
 
@@ -74,7 +119,7 @@ Dense: 38.76 / 38.78 -> 38.63 / 38.85 t/s (flat, within noise).
 
 ## Limitations
 
-- Needs #172 and #171 first; happy to rebase it onto whichever release folds them.
+- Needs #175 first (and #171 / #172, which are in r78).
 - q8_0 caches with the rotation only; other cache types keep the existing rope -> set_rows fusion or the plain path.
 - Measured on gfx1100 (WSL2) and gfx1201 (native Linux).
 
