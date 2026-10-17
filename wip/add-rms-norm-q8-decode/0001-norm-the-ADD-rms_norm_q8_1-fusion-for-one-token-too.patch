@@ -1,0 +1,34 @@
+From fca3093e24914a061d3a4e43754f6ec1636bd422 Mon Sep 17 00:00:00 2001
+From: "Brian S. Park" <brianspark@hotmail.com>
+Date: Fri, 16 Oct 2026 15:20:10 -0700
+Subject: [PATCH] norm: the ADD + rms_norm_q8_1 fusion for one token too
+
+The residual ADD in front of an RMS_NORM whose product feeds an mmvq
+matmul was folded into the norm kernel only for verify widths 2..8: for
+one token, the attention residual ADD is already folded into the output
+projection epilogue.  The FFN residual ADD after an MoE block is not (it
+follows moe_weighted_reduction), so it ran as its own k_bin_bcast launch
+every layer.  Allow one row as well.  Same kernel and arithmetic as the
+verify band; bit-identical.  GGML_CUDA_FUSE_ADD_RMS_Q8=0 turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/norm.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 2de7014e3..45a813dc9 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1125,7 +1125,7 @@ int ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
+     static const bool fuse_add_rms_q8 = getenv("GGML_CUDA_FUSE_ADD_RMS_Q8") == nullptr || atoi(getenv("GGML_CUDA_FUSE_ADD_RMS_Q8")) != 0;
+     ggml_tensor * node = cgraph->nodes[i];
+     if (!fuse_add_rms_q8 || node->op != GGML_OP_ADD || i + 2 >= cgraph->n_nodes ||
+-            node->ne[1] <= 1 || node->ne[1] > MMVQ_MAX_BATCH_SIZE ||
++            node->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+             cgraph->nodes[i + 1]->op != GGML_OP_RMS_NORM || cgraph->nodes[i + 1]->src[0] != node ||
+             cgraph->nodes[i + 2]->op != GGML_OP_MUL || cgraph->nodes[i + 2]->src[0] != cgraph->nodes[i + 1]) {
+         return 0;
+-- 
+2.43.0
+
