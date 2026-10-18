@@ -1,0 +1,318 @@
+From d5212126affb83c42a508959661af1c879b24fc3 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 18 Oct 2026 17:20:53 +0000
+Subject: [PATCH 1/2] cuda: copy the async graph inputs of a graph with one
+ kernel (GGML_CUDA_ASYNC_INPUT_BATCH=1)
+
+With GGML_CUDA_ASYNC_INPUT=1 every small graph input is its own cudaMemcpyAsync from the pinned ring plus an event
+record, so the GPU runs one blit kernel and one marker per input before each graph can start.  With
+GGML_CUDA_ASYNC_INPUT_BATCH=1 the uploads are queued per device and copied by one kernel on the compute stream when the
+next graph starts (ggml_cuda_async_input_wait), reading the mapped ring.  The kernel is ordered after any older per-copy
+uploads (d.ev) and, like each per-copy upload, waits for the last graph on the device (done_ev).  Any other buffer or
+backend access, including synchronize and free_buffer, first drains the queue through the old per-copy path and orders
+cudaStreamPerThread after the last batch kernel; an upload that overlaps a queued one, or a full queue (64), drains too,
+and a ring wrap also waits for the last batch kernel.  The copy is byte-exact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 153 ++++++++++++++++++++++++++++++--
+ 1 file changed, 147 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ad7f556da..320b486a9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -953,8 +953,11 @@ struct ggml_backend_cuda_buffer_context {
+     }
+ };
+ 
++static void ggml_cuda_async_input_drain(int device);   // GGML_CUDA_ASYNC_INPUT_BATCH, defined with the async input ring below
++
+ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
++    ggml_cuda_async_input_drain(ctx->device);   // a queued upload into this buffer must not run after it is freed
+     delete ctx;
+ }
+ 
+@@ -993,6 +996,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_async_input_drain(ctx->device);
+     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+@@ -1013,6 +1017,12 @@ struct ggml_cuda_async_input_dev {
+     int64_t     hits    = 0;
+     cudaEvent_t done_ev  = nullptr;   // recorded on the compute stream when a graph_compute returns
+     bool        has_done = false;
++    // GGML_CUDA_ASYNC_INPUT_BATCH: uploads queued until the next graph on this device (ring offsets, mapped ring pointer)
++    struct queued { char * dst; size_t off; size_t size; };
++    std::vector<queued> q;
++    char *       ring_dev  = nullptr;
++    cudaEvent_t  flush_ev  = nullptr;   // recorded after the last batch kernel: the ring is free once it completes
++    bool         has_flush = false;
+ };
+ static ggml_cuda_async_input_dev g_async_input[GGML_CUDA_MAX_DEVICES];
+ // Opt-in (default OFF): the synchronous path blocks the host on every small graph-input copy, which is a
+@@ -1024,6 +1034,78 @@ static const bool g_async_input_on = [] {
+ static constexpr size_t GGML_CUDA_ASYNC_INPUT_MAX  = 1u << 20;
+ static constexpr size_t GGML_CUDA_ASYNC_INPUT_RING = 16u << 20;
+ 
++static const bool g_async_input_batch = [] {
++    const char * e = getenv("GGML_CUDA_ASYNC_INPUT_BATCH");
++    return e != nullptr && atoi(e) != 0;
++}();
++static constexpr int GGML_CUDA_AIN_BATCH = 64;
++struct ggml_cuda_ain_batch {
++    int          n;
++    char *       dst[GGML_CUDA_AIN_BATCH];
++    const char * src[GGML_CUDA_AIN_BATCH];
++    unsigned int size[GGML_CUDA_AIN_BATCH];
++};
++// blockIdx.x = the upload, blockIdx.y = a 64 KiB chunk of it; byte-exact copy from the mapped pinned ring
++static __global__ void ggml_cuda_ain_batch_kernel(const ggml_cuda_ain_batch b) {
++    const int i = blockIdx.x;
++    if (i >= b.n) {
++        return;
++    }
++    char * __restrict__       d = b.dst[i];
++    const char * __restrict__ s = b.src[i];
++    const size_t n  = b.size[i];
++    for (size_t c0 = (size_t) blockIdx.y * 65536; c0 < n; c0 += (size_t) gridDim.y * 65536) {
++        const size_t c1 = c0 + 65536 < n ? c0 + 65536 : n;
++        if ((((uintptr_t) (d + c0)) | ((uintptr_t) (s + c0)) | (c1 - c0)) % 16 == 0) {
++            for (size_t k = c0 + 16 * threadIdx.x; k < c1; k += 16 * blockDim.x) {
++                *(int4 *) (d + k) = *(const int4 *) (s + k);
++            }
++        } else {
++            for (size_t k = c0 + threadIdx.x; k < c1; k += blockDim.x) {
++                d[k] = s[k];
++            }
++        }
++    }
++}
++
++// the old path for one upload already in the ring (caller holds d.mtx)
++static void ggml_cuda_async_input_copy_locked(ggml_cuda_async_input_dev & d, void * dst, const char * slot, size_t size) {
++    if (d.has_done) {
++        // the previous graph on this device may still read this input: copy only after it (a GPU-side wait)
++        CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, d.done_ev, 0));
++    }
++    CUDA_CHECK(cudaMemcpyAsync(dst, slot, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
++    CUDA_CHECK(cudaEventRecord(d.ev, cudaStreamPerThread));
++    d.pending = true;
++}
++
++// issue the queued uploads through the old per-copy path, in order (caller holds d.mtx)
++static void ggml_cuda_async_input_drain_locked(ggml_cuda_async_input_dev & d) {
++    for (const auto & e : d.q) {
++        ggml_cuda_async_input_copy_locked(d, e.dst, d.ring + e.off, e.size);
++    }
++    d.q.clear();
++}
++
++// any access to a CUDA buffer other than a graph-input upload or a graph compute calls this first
++static void ggml_cuda_async_input_drain(int device) {
++    if (!g_async_input_batch || device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return;
++    }
++    ggml_cuda_async_input_dev & d = g_async_input[device];
++    std::lock_guard<std::mutex> lock(d.mtx);
++    if (!d.q.empty() || d.has_flush) {
++        ggml_cuda_set_device(device);
++    }
++    if (d.has_flush) {
++        // the synchronous path shares cudaStreamPerThread with the old-path uploads: keep it after the last batch kernel too
++        CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, d.flush_ev, 0));
++    }
++    if (!d.q.empty()) {
++        ggml_cuda_async_input_drain_locked(d);
++    }
++}
++
+ static bool ggml_cuda_async_input_set(int device, void * dst, const void * src, size_t size) {
+     ggml_cuda_async_input_dev & d = g_async_input[device];
+     std::lock_guard<std::mutex> lock(d.mtx);
+@@ -1036,22 +1118,45 @@ static bool ggml_cuda_async_input_set(int device, void * dst, const void * src,
+             return false;
+         }
+         d.cap = GGML_CUDA_ASYNC_INPUT_RING;
++        if (g_async_input_batch) {
++            void * dp = nullptr;
++            if (cudaHostGetDevicePointer(&dp, d.ring, 0) == cudaSuccess &&
++                cudaEventCreateWithFlags(&d.flush_ev, cudaEventDisableTiming) == cudaSuccess) {
++                d.ring_dev = (char *) dp;
++                GGML_LOG_INFO("%s: device %d: batched graph-input uploads on (GGML_CUDA_ASYNC_INPUT_BATCH=1)\n", __func__, device);
++            } else {
++                (void) cudaGetLastError();
++                d.ring_dev = nullptr;
++            }
++        }
+     }
+     const size_t need = (size + 255) & ~(size_t) 255;
+     if (d.head + need > d.cap) {
++        ggml_cuda_async_input_drain_locked(d);
+         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));   // every copy out of the ring has completed
++        if (d.has_flush) {
++            CUDA_CHECK(cudaEventSynchronize(d.flush_ev));          // and every batch kernel that read it
++        }
+         d.head = 0;
+     }
+     char * slot = d.ring + d.head;
+     d.head += need;
+     memcpy(slot, src, size);
+-    if (d.has_done) {
+-        // the previous graph on this device may still read this input: copy only after it (a GPU-side wait)
+-        CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, d.done_ev, 0));
++    if (d.ring_dev != nullptr && size <= 0xffffffffu) {
++        char * const dc = (char *) dst;
++        for (const auto & e : d.q) {
++            if (dc < e.dst + e.size && e.dst < dc + size) {   // overlaps a queued upload: keep the write order
++                ggml_cuda_async_input_drain_locked(d);
++                break;
++            }
++        }
++        if ((int) d.q.size() >= GGML_CUDA_AIN_BATCH) {
++            ggml_cuda_async_input_drain_locked(d);
++        }
++        d.q.push_back({ dc, (size_t) (slot - d.ring), size });
++    } else {
++        ggml_cuda_async_input_copy_locked(d, dst, slot, size);
+     }
+-    CUDA_CHECK(cudaMemcpyAsync(dst, slot, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+-    CUDA_CHECK(cudaEventRecord(d.ev, cudaStreamPerThread));
+-    d.pending = true;
+     if (d.hits++ == 0) {
+         GGML_LOG_INFO("%s: device %d: async graph-input uploads on (GGML_CUDA_ASYNC_INPUT=1 enables)\n", __func__, device);
+     }
+@@ -1087,6 +1192,28 @@ static void ggml_cuda_async_input_wait(int device, cudaStream_t stream) {
+         CUDA_CHECK(cudaStreamWaitEvent(stream, d.ev, 0));
+         d.pending = false;
+     }
++    if (!d.q.empty()) {
++        // after the wait above: an older old-path copy to the same bytes must land first.  Like each old-path copy, wait for
++        // the last graph on this device (it may run on another stream and still read these inputs).
++        if (d.has_done) {
++            CUDA_CHECK(cudaStreamWaitEvent(stream, d.done_ev, 0));
++        }
++        ggml_cuda_ain_batch b;
++        b.n = (int) d.q.size();
++        size_t mx = 0;
++        for (int i = 0; i < b.n; ++i) {
++            b.dst[i]  = d.q[i].dst;
++            b.src[i]  = d.ring_dev + d.q[i].off;
++            b.size[i] = (unsigned int) d.q[i].size;
++            mx = std::max(mx, d.q[i].size);
++        }
++        const unsigned int ny = (unsigned int) std::min<size_t>(16, std::max<size_t>(1, (mx + 65535) / 65536));
++        ggml_cuda_ain_batch_kernel<<<dim3(b.n, ny), 256, 0, stream>>>(b);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaEventRecord(d.flush_ev, stream));
++        d.has_flush = true;
++        d.q.clear();
++    }
+ }
+ 
+ // One reused pinned chunk per device for the bounce of pageable host copies (ggml_cuda_bounce_min).  The caller holds
+@@ -1149,6 +1276,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+         ggml_cuda_async_input_set(ctx->device, (char *) tensor->data + offset, data, size)) {
+         return;
+     }
++    ggml_cuda_async_input_drain(ctx->device);
+     // see ggml_cuda_bounce_min (the context checkpoint restore).  A model weight is NOT special: a
+     // WEIGHTS buffer is just a destination.  The exemption here used to keep the loader's mmap/pinned
+     // uploads on the direct path, but it also let a genuinely pageable source reach the bare
+@@ -1177,6 +1305,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_async_input_drain(ctx->device);
+     // see ggml_cuda_bounce_min (the server's context checkpoint save)
+     std::unique_lock<std::mutex> lock;
+     char * pin = nullptr;
+@@ -1199,6 +1328,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_async_input_drain(ctx->device);
+     // NEVER H2D straight from a (potentially pageable) host pointer with a 2-D copy: on ROCm a
+     // pageable-source `hipMemcpy2DAsync` is pathologically slow AND can fault ("Page not present").
+     // It crashed the `-sm tensor` + host-expert load, whose master is the pageable `CPU_REPACK`
+@@ -1235,6 +1365,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_async_input_drain(ctx->device);
+     // A 2-D D2H into pageable memory is slow on ROCm even when small (~57 us per call on gfx1201): under -sm tensor the
+     // server's prompt-cache save reads every split KV / recurrent-state row range this way, thousands of calls per slot.
+     // Pack the rows into the pinned chunk and scatter them on the host instead (see ggml_cuda_bounce_min).
+@@ -1263,6 +1394,8 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+     if (ggml_backend_buffer_is_cuda(src->buffer)) {
+         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
+         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
++        ggml_cuda_async_input_drain(src_ctx->device);
++        ggml_cuda_async_input_drain(dst_ctx->device);
+         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
+         // in which case a same-device copy (not a peer copy) is required
+         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+@@ -1288,6 +1421,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_async_input_drain(ctx->device);
+     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+@@ -3739,6 +3873,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
++    ggml_cuda_async_input_drain(cuda_ctx->device);
+ 
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+@@ -3748,6 +3883,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
++    ggml_cuda_async_input_drain(cuda_ctx->device);
+ 
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+@@ -3758,6 +3894,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
++    ggml_cuda_async_input_drain(cuda_ctx->device);
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
+@@ -3848,6 +3985,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
++    ggml_cuda_async_input_drain(cuda_ctx->device);
+ 
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+@@ -3860,6 +3998,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+         return false;
+     }
++    ggml_cuda_async_input_drain(((ggml_backend_cuda_context *) backend_src->context)->device);
++    ggml_cuda_async_input_drain(((ggml_backend_cuda_context *) backend_dst->context)->device);
+ 
+     if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+         return false;
+@@ -3917,6 +4057,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+ 
+ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
++    ggml_cuda_async_input_drain(cuda_ctx->device);
+ 
+     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,118 @@
+From ec6eaf492c716325c2d7704e06a3822d1e2929e7 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 18 Oct 2026 18:40:51 +0000
+Subject: [PATCH 2/2] cuda: record the async-input done event lazily, at the
+ next upload (GGML_CUDA_ASYNC_INPUT_LAZY_DONE)
+
+GGML_CUDA_ASYNC_INPUT records done_ev on the compute stream after every graph_compute, but only an input upload reads
+it, while a decode step runs hundreds of graph_computes per device; each record is a marker packet the GPU processes
+between graphs.  The graph_compute now only marks it pending with its stream, and the next upload (a per-copy upload or
+the batch kernel) records it there first: later on the same stream, so it still covers the last graph.
+Default on with GGML_CUDA_ASYNC_INPUT_BATCH=1 (with per-copy uploads alone it measured ~1 % slower on one GPU);
+GGML_CUDA_ASYNC_INPUT_LAZY_DONE=0 / 1 overrides.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 46 +++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 320b486a9..5ef66d379 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -876,6 +876,8 @@ static bool ggml_cuda_graph_capture_active() {
+     return ggml_cuda_lock_counter.load(std::memory_order_relaxed) > 0;
+ }
+ 
++static void ggml_cuda_async_input_flush_done(int device, cudaStream_t stream);   // GGML_CUDA_ASYNC_INPUT_LAZY_DONE, below
++
+ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     ggml_cuda_mmb_release_all();
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+@@ -907,6 +909,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+         if (s.buf != nullptr) { CUDA_CHECK(hipHostFree(s.buf)); }
+     }
+     splice_pin_ring.clear();
++    // a lazy done event still pending on one of these streams is recorded before the stream goes away
++    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
++        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
++            if (streams[i][j] != nullptr) {
++                ggml_cuda_async_input_flush_done(i, streams[i][j]);
++            }
++        }
++    }
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+             if (streams[i][j] != nullptr) {
+@@ -1017,6 +1027,12 @@ struct ggml_cuda_async_input_dev {
+     int64_t     hits    = 0;
+     cudaEvent_t done_ev  = nullptr;   // recorded on the compute stream when a graph_compute returns
+     bool        has_done = false;
++    // Lazy done event (GGML_CUDA_ASYNC_INPUT_LAZY_DONE; default on with GGML_CUDA_ASYNC_INPUT_BATCH=1): a graph_compute
++    // only marks it pending, and the next upload records it on that graph's stream.  Only uploads read it, while a decode
++    // step runs hundreds of graph_computes per device, each record a marker packet the GPU processes between graphs.
++    // Recorded later on the same stream, it covers at least the same work, so an upload still waits for the last graph.
++    bool         done_pending = false;
++    cudaStream_t done_stream  = nullptr;
+     // GGML_CUDA_ASYNC_INPUT_BATCH: uploads queued until the next graph on this device (ring offsets, mapped ring pointer)
+     struct queued { char * dst; size_t off; size_t size; };
+     std::vector<queued> q;
+@@ -1070,6 +1086,11 @@ static __global__ void ggml_cuda_ain_batch_kernel(const ggml_cuda_ain_batch b) {
+ 
+ // the old path for one upload already in the ring (caller holds d.mtx)
+ static void ggml_cuda_async_input_copy_locked(ggml_cuda_async_input_dev & d, void * dst, const char * slot, size_t size) {
++    if (d.done_pending) {
++        CUDA_CHECK(cudaEventRecord(d.done_ev, d.done_stream));
++        d.done_pending = false;
++        d.has_done     = true;
++    }
+     if (d.has_done) {
+         // the previous graph on this device may still read this input: copy only after it (a GPU-side wait)
+         CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, d.done_ev, 0));
+@@ -1177,11 +1198,31 @@ struct ggml_cuda_async_input_done_guard {
+             d.done_ev = nullptr;
+             return;
+         }
++        // default on only with GGML_CUDA_ASYNC_INPUT_BATCH=1: with per-copy uploads alone it measured ~1 % slower on one GPU
++        static const bool lazy = getenv("GGML_CUDA_ASYNC_INPUT_LAZY_DONE") ? atoi(getenv("GGML_CUDA_ASYNC_INPUT_LAZY_DONE")) != 0 : g_async_input_batch;
++        if (lazy) {
++            d.done_pending = true;
++            d.done_stream  = stream;
++            return;
++        }
+         CUDA_CHECK(cudaEventRecord(d.done_ev, stream));
+         d.has_done = true;
+     }
+ };
+ 
++static void ggml_cuda_async_input_flush_done(int device, cudaStream_t stream) {
++    if (!g_async_input_on) {
++        return;
++    }
++    ggml_cuda_async_input_dev & d = g_async_input[device];
++    std::lock_guard<std::mutex> lock(d.mtx);
++    if (d.done_pending && d.done_stream == stream) {
++        CUDA_CHECK(cudaEventRecord(d.done_ev, d.done_stream));
++        d.done_pending = false;
++        d.has_done     = true;
++    }
++}
++
+ static void ggml_cuda_async_input_wait(int device, cudaStream_t stream) {
+     if (!g_async_input_on) {
+         return;
+@@ -1195,6 +1236,11 @@ static void ggml_cuda_async_input_wait(int device, cudaStream_t stream) {
+     if (!d.q.empty()) {
+         // after the wait above: an older old-path copy to the same bytes must land first.  Like each old-path copy, wait for
+         // the last graph on this device (it may run on another stream and still read these inputs).
++        if (d.done_pending) {
++            CUDA_CHECK(cudaEventRecord(d.done_ev, d.done_stream));
++            d.done_pending = false;
++            d.has_done     = true;
++        }
+         if (d.has_done) {
+             CUDA_CHECK(cudaStreamWaitEvent(stream, d.done_ev, 0));
+         }
+-- 
+2.53.0
+
