@@ -1,0 +1,46 @@
+From 9c2443878096989a045cb6c097f7cd81777f65ab Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 19 Oct 2026 14:45:37 +0000
+Subject: [PATCH] ggml-backend: split at a second consumer of MoE weights the
+ split already stages
+
+A cache-managed routed op whose expert weights are already an input of the
+current split (a second MUL_MAT_ID consumer of the same weights, e.g.
+qwen4exp's full-row MTP export tail next to the gathered logits tail on a
+prompt chunk that drops rows) now starts a new split.  The later split
+re-registers the weights as its own input (existing code), so each consumer
+is staged for its own routing, which is ready by then.  With both consumers
+in one split, sched_copy_input took the general full-table path and copied
+the last layer's whole expert tables for every such chunk whenever that
+layer's experts are host-resident (the -ncmoe tail-first placement).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 37531ee18..5b65d63fa 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1884,7 +1884,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                                 ggml_backend_offload_op(sched->backends[cur_backend_id], node);
+                             if (cache_op) {
+                                 const int L = moe_name_layer(src);
+-                                if (!(cur_moe_layer >= 0 && L == cur_moe_layer)) {
++                                // a second consumer of weights this split already stages (its routing is
++                                // computed inside this split) gets a split of its own
++                                bool staged_here = false;
++                                for (int k = 0; k < split->n_inputs; k++) {
++                                    if (split->inputs[k] == src) {
++                                        staged_here = true;
++                                        break;
++                                    }
++                                }
++                                if (!(cur_moe_layer >= 0 && L == cur_moe_layer) || staged_here) {
+                                     need_new_split  = true;   // first routed op of a new layer
+                                     next_moe_layer  = L;
+                                 }
+-- 
+2.53.0
+
