@@ -2,11 +2,13 @@
 
 Batches the device reads of a context state save. The server's context checkpoint of a recurrent / hybrid model reads one sequence's cells of every recurrent-state tensor, about 75 small ranges. Under `-sm tensor` each range was one synchronous read per device, so one checkpoint paid about 150 device syncs and bounce copies. The server takes a checkpoint before each prompt chunk, so every follow-up turn paid this before its first token.
 
-One format-patch on `v12-097cf33d9-r91` (tree `90507dfb`); applied tree `0f2a1218`. Patch sha256 `55e46bab…`.
+One format-patch on `v12-097cf33d9-r95` (tree `51296947`); applied tree `9472155a`. Patch sha256 `904ff3e1…`.
+
+Updated for r95: the patch now adds `#include <algorithm>` to `src/llama-context.cpp` (for the `std::find` in `llama_state_sync_all`, which only built on r91 through an indirect include). The rest of the patch is unchanged and applies to r95 as it did to r91. The gates were re-run on r95 (below); the timing tables are still the r91 ones.
 
 ## What changes
 
-`src/llama-context.cpp` / `.h`, `ggml/src/ggml-backend-meta.cpp`, +141 / −56:
+`src/llama-context.cpp` / `.h`, `ggml/src/ggml-backend-meta.cpp`, +142 / −56:
 - `llama_io_write_host` queues every deferred read as `ggml_backend_tensor_get_async` on the backend that owns the tensor's buffer, into one pinned staging buffer kept by the context. It then synchronizes each backend once and copies to the caller's buffer.
 - The old synchronous path stays for:
   - a state larger than `LLAMA_STATE_ASYNC_MAX_MIB` (default 256, so a whole-slot save never pins gigabytes);
@@ -87,6 +89,19 @@ Turn 3 is bimodal on this config, around 1300 or 1600 ms in both arms, so its me
 
 On our hybrid Flash-Next build (r91 + our patches, IQ3_S, `-ncmoe 47`, `-sm tensor`, MTP draft), the same change gave turns 1-3 −26 / −45 / −47 ms (6 paired samples each), with identical output. Four concurrent streams there went +3.5 % (3 pairs, CI +1.0 to +6.1), and decode and prefill were unchanged.
 
-## Not tested
+## Re-run on r95
 
-`-sm layer` and 4 concurrent streams on stock r91: with this config both hit the r87 abort reported in #187.
+Stock r95 against r95 + the patch, one server per arm and config. G1L is G1 with `-sm layer` in place of `-sm tensor`, which r94's #187 fix made testable.
+
+| config | greedy prose / code (both arms) | restore check | restored request, stock → patch |
+|---|---|---|---|
+| G1 | `a7a81f01b3bc` / `4bb43e3339c8` | same as fresh, both arms | 167.5 → 153.0 ms |
+| G1L | `946ffc37b143` / `e2f7603679a0` | same as fresh, both arms | 79.4 → 82.9 ms |
+| G2 | `047fd057911b` / `231119399578` | same as fresh, both arms | 36.9 → 36.4 ms |
+| G3 | `c0cf0739bdab` / `930bcf1f4405` | same as fresh, both arms | 51.0 → 42.9 ms |
+
+- The G1, G2 and G3 hashes are the r91 ones.
+- On G1L there is little to gain: the 4-turn chat is 4 to 55 ms faster per turn with the patch (one server per arm), but the restored request reads 3.5 ms slower (two samples per arm).
+- G1 with 4 concurrent streams on the patched build: 3 of 3 rounds clean.
+- The G1 time-to-first-token runs are not used: the stock server started cold again (31.5k prefill 1602 t/s against 2055).
+- Faults: none in 9 servers.

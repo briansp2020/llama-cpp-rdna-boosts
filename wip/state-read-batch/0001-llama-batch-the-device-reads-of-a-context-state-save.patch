@@ -1,4 +1,4 @@
-From 5db24348097517f27035fa826272527938cf0363 Mon Sep 17 00:00:00 2001
+From 571b055c4326e4f1c2a86b3e979dbc88957339e8 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 20 Oct 2026 01:52:35 +0000
 Subject: [PATCH] llama: batch the device reads of a context state save
@@ -27,9 +27,9 @@ Restores keep the synchronous path: batched they measured no faster.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  ggml/src/ggml-backend-meta.cpp |  84 ++++++++++----------------
- src/llama-context.cpp          | 105 ++++++++++++++++++++++++++++++++-
+ src/llama-context.cpp          | 106 ++++++++++++++++++++++++++++++++-
  src/llama-context.h            |   8 +++
- 3 files changed, 141 insertions(+), 56 deletions(-)
+ 3 files changed, 142 insertions(+), 56 deletions(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
 index 26c6dc44f..a6543b589 100644
@@ -169,10 +169,18 @@ index 26c6dc44f..a6543b589 100644
  
  static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6848daa23..2d151e483 100644
+index 6848daa23..555a3544b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -3851,12 +3851,74 @@ private:
+@@ -15,6 +15,7 @@
+ #include "llama-sampler.h"
+ #include "llama.h"
+ 
++#include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -3851,12 +3852,74 @@ private:
      size_t size_written = 0;
  };
  
@@ -248,7 +256,7 @@ index 6848daa23..2d151e483 100644
          // Each ggml_backend_tensor_get is a synchronous device copy with a fixed cost (tens of us on ROCm), and a sequence's
          // KV cells are often many short ranges (concurrent decoding interleaves the slots' cells a few tokens at a time), so
          // the deferred reads of one tensor whose gaps are at most LLAMA_STATE_GET_MERGE_GAP bytes (default 256 KiB, 0 = off)
-@@ -3950,6 +4012,8 @@ private:
+@@ -3950,6 +4013,8 @@ private:
          size_t offset;
      };
      std::vector<write_info> winfos;
@@ -257,7 +265,7 @@ index 6848daa23..2d151e483 100644
  };
  
  class llama_io_read_host : public llama_io_read_i {
-@@ -4365,6 +4429,41 @@ private:
+@@ -4365,6 +4430,41 @@ private:
      const llama_memory_buffers & mbufs;
  };
  
@@ -299,7 +307,7 @@ index 6848daa23..2d151e483 100644
  size_t llama_context::state_get_size() {
      llama_io_write_dummy io(false);
      try {
-@@ -4376,7 +4475,7 @@ size_t llama_context::state_get_size() {
+@@ -4376,7 +4476,7 @@ size_t llama_context::state_get_size() {
  }
  
  size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
@@ -308,7 +316,7 @@ index 6848daa23..2d151e483 100644
      try {
          return state_write_data(io);
      } catch (const std::exception & err) {
-@@ -4416,7 +4515,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
+@@ -4416,7 +4516,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
          io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
      } else {
