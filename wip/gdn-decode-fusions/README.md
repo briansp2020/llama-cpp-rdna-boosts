@@ -90,7 +90,7 @@ The gates above ran on the patches before one last guard in 0003, which keeps th
 | 27B MTP, 2 GPU `-sm tensor` | 106.15 t/s | 107.00 t/s | +0.8 % |
 
 - 31.5k prefill is flat on 1 GPU (27B 1148 → 1153, 35B-A3B 4575 → 4582 t/s). The 2 GPU prefill numbers moved by more between rounds than between arms.
-- On our own Flash-Next build (IQ3_S, 2 GPU `-sm tensor`, `--n-cpu-moe 47`), paired 5-round A/Bs gave decode +0.56 % for 0001 + 0002 and +0.89 % (95 % CI +0.50 to +1.28 %) for 0003, with identical output. Those runs predate 0002's overlap check.
+- On our own Flash-Next build (IQ3_S, 2 GPU `-sm tensor`, `--n-cpu-moe 47`), paired 5-round A/Bs with identical output gave decode +0.56 % for 0001, +0.32 % for 0002 (95 % CI −0.17 to +0.81 %, with `GGML_CUDA_CONV_FUSION_MULTI=1`) and +0.89 % (95 % CI +0.50 to +1.28 %) for 0003. The 0001 and 0003 runs predate 0002's overlap check. (An earlier version of this line gave +0.56 % for 0001 + 0002; that run did not set `GGML_CUDA_CONV_FUSION_MULTI=1`, so 0002 never ran in it.)
 
 ## Limits
 
