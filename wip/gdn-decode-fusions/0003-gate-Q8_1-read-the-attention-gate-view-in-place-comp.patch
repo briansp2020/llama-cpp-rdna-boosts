@@ -1,0 +1,354 @@
+From fbd91dcc29a10cfc9898f868c3c6995ca29571ce Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Wed, 21 Oct 2026 06:22:23 +0000
+Subject: [PATCH 3/3] gate -> Q8_1: read the attention gate view in place;
+ compute the GDN output norm in the kernel
+
+Two launches fewer per layer on the decode / verify band, both bit-identical:
+- Attention output gate: CONT(gate half of each Q head) -> SIGMOID -> MUL ->
+  matmul.  The gate -> Q8_1 kernel already takes row strides, so it reads the
+  row-strided view directly and the CONT launches nothing (it is an exact copy).
+  GGML_CUDA_FUSE_CONT_GATE_Q8_1=0 turns it off.
+- GDN output: RMS_NORM(xn) * w is skipped at its node and computed by the gate
+  kernel (unary_gated_q8_1_norm_kernel), one 128-wide row per 256-thread block
+  exactly as rms_norm_f32<256, true> runs it.  Both nodes take the decision from
+  the same predicate (ggml_cuda_gdn_norm_gate_match).  The context records the
+  skipped norm and its gate node; the attention-gate fusion leaves a pending
+  norm alone, and a skip whose gate node is passed or never reached aborts.
+  The match also checks that no node in between writes over the norm's input
+  or weight.  GGML_CUDA_FUSE_GDN_NORM_GATE=0 turns it off.
+
+(A two-rows-per-block version of the norm kernel was 1 ulp off in some rows.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh            |   3 +
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 152 +++++++++++++++++++++++
+ ggml/src/ggml-cuda/unary.cu              |  80 ++++++++++--
+ ggml/src/ggml-cuda/unary.cuh             |   3 +-
+ 4 files changed, 230 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index a34ba3e34..44dc05de1 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1851,6 +1851,9 @@ struct ggml_backend_cuda_context {
+     // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
+     // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
+     const ggml_tensor * glu_q8_1_node = nullptr;
++    // GDN output norm (RMS_NORM + MUL) skipped at its node; the gate -> Q8_1 kernel computes it (ggml_cuda_gdn_norm_gate_*)
++    const ggml_tensor * gdn_norm_pending = nullptr;
++    int                 gdn_norm_gate_at = -1;   // the gate node that computes it
+     const ggml_tensor * glu_q8_1_mm   = nullptr;
+     std::vector<q8_1_cache_entry> q8_1_cache;
+     size_t q8_1_arena_pos = 0;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 4230ee67c..d69a93f24 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -1433,6 +1433,144 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx,
+     return false;
+ }
+ 
++static int ggml_cuda_count_uses(const ggml_cgraph * cgraph, const ggml_tensor * t) {
++    int uses = 0;
++    for (int j = 0; j < cgraph->n_nodes; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            if (n->src[s] == t || (n->src[s] && n->src[s]->view_src == t)) {
++                uses++;
++            }
++        }
++    }
++    return uses;
++}
++
++// CONT(view) -> UNARY -> MUL -> decode matmul (the qwen4exp attention output gate: the gate half of each Q head):
++// the gate -> Q8_1 kernel reads the row-strided view itself, so the CONT launches nothing.  The CONT is an exact
++// copy, so the result is bit-identical.  GGML_CUDA_FUSE_CONT_GATE_Q8_1=0: off.  Returns the extra nodes consumed.
++static int ggml_cuda_cont_gate_q8_1_try_fuse(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
++    static const bool fuse = getenv("GGML_CUDA_FUSE_CONT_GATE_Q8_1") == nullptr || atoi(getenv("GGML_CUDA_FUSE_CONT_GATE_Q8_1")) != 0;
++    const ggml_tensor * c = cgraph->nodes[i];
++    if (!fuse || c->op != GGML_OP_CONT || c->type != GGML_TYPE_F32 || i + 2 >= cgraph->n_nodes) {
++        return 0;
++    }
++    ggml_tensor * un  = cgraph->nodes[i + 1];
++    ggml_tensor * mul = cgraph->nodes[i + 2];
++    const ggml_tensor * v = c->src[0];
++    if (un->op != GGML_OP_UNARY || un->src[0] != c || ggml_get_unary_op(un) != GGML_UNARY_OP_SIGMOID ||
++            !v || v->type != GGML_TYPE_F32 || v->nb[0] != sizeof(float) || !ggml_is_contiguous_1(v) ||
++            ggml_nelements(v) != ggml_nelements(c) || !ggml_is_contiguous(c) ||
++            !ggml_cuda_can_fuse(cgraph, i + 1, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID })) {
++        return 0;
++    }
++    const ggml_tensor * other = mul->src[0] == un ? mul->src[1] : mul->src[0];
++    // a skipped GDN norm is computed only at its own gate node (ggml_cuda_gdn_norm_gate_try_fuse)
++    if (!other || other == cuda_ctx->gdn_norm_pending || other->type != GGML_TYPE_F32 || !ggml_is_contiguous(other) ||
++            ggml_nelements(other) != ggml_nelements(c) ||
++            !ggml_are_same_shape(other, c) || ggml_cuda_count_uses(cgraph, c) != 1) {
++        return 0;
++    }
++    const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, i + 2, mul);
++    if (mm == nullptr) {
++        return 0;
++    }
++    ggml_cuda_op_unary_mul_q8_1(*cuda_ctx, un, mul, mm, v);
++    return cgraph->nodes[i + 3] == mm ? 2 : 3;
++}
++
++// GDN output: RMS_NORM(xn) -> MUL(w) at r, r+1, and later UNARY(sigmoid)(z) -> MUL(norm, .) -> decode matmul at s, s+1.
++// Returns r when the gate -> Q8_1 kernel at s can compute the norm itself (same decision at both nodes), -1 otherwise.
++static int ggml_cuda_gdn_norm_gate_match(const ggml_cgraph * cgraph, int s) {
++    static const bool fuse = getenv("GGML_CUDA_FUSE_GDN_NORM_GATE") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_NORM_GATE")) != 0;
++    if (!fuse || s < 2 || s + 1 >= cgraph->n_nodes) {
++        return -1;
++    }
++    const ggml_tensor * un  = cgraph->nodes[s];
++    const ggml_tensor * mul = cgraph->nodes[s + 1];
++    if (un->op != GGML_OP_UNARY || ggml_get_unary_op(un) != GGML_UNARY_OP_SIGMOID || un->type != GGML_TYPE_F32 ||
++            mul->op != GGML_OP_MUL || (mul->src[0] != un && mul->src[1] != un) ||
++            !ggml_cuda_can_fuse(cgraph, s, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID })) {
++        return -1;
++    }
++    const ggml_tensor * nm = mul->src[0] == un ? mul->src[1] : mul->src[0];
++    int m = -1;
++    for (int j = s - 1; j >= 1 && j >= s - 32; --j) {
++        if (cgraph->nodes[j] == nm) { m = j; break; }
++    }
++    if (m < 1) {
++        return -1;
++    }
++    const ggml_tensor * rn = cgraph->nodes[m - 1];
++    const ggml_tensor * w  = nm->src[1];
++    const ggml_tensor * xn = rn->src[0];
++    const ggml_tensor * z  = un->src[0];
++    if (nm->op != GGML_OP_MUL || rn->op != GGML_OP_RMS_NORM || nm->src[0] != rn || rn->type != GGML_TYPE_F32 ||
++            nm->type != GGML_TYPE_F32 || !w || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != 128 ||
++            ggml_nelements(w) != 128 || !xn || xn->type != GGML_TYPE_F32 || xn->ne[0] != 128 || xn->nb[0] != sizeof(float) ||
++            xn->ne[3] != 1 || !ggml_are_same_shape(rn, nm) || !ggml_are_same_shape(nm, z) || !ggml_is_contiguous(nm) ||
++            !ggml_is_contiguous(z) || ggml_nelements(mul) % 256 != 0 || ggml_nelements(mul) != ggml_nelements(z) ||
++            ggml_cuda_count_uses(cgraph, rn) != 1 || ggml_cuda_count_uses(cgraph, nm) != 1) {
++        return -1;
++    }
++    // nothing between the norm and the gate writes over its input or weight
++    const uintptr_t xlo = (uintptr_t) xn->data;
++    const uintptr_t xhi = xlo + (size_t) (xn->ne[1] - 1)*xn->nb[1] + (size_t) (xn->ne[2] - 1)*xn->nb[2] + 128*sizeof(float);
++    for (int j = m + 1; j < s; ++j) {
++        const ggml_tensor * t = cgraph->nodes[j];
++        if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE ||
++                t->op == GGML_OP_NONE || !t->data) {
++            continue;
++        }
++        const uintptr_t lo = (uintptr_t) t->data, hi = lo + ggml_nbytes(t);
++        if ((lo < xhi && xlo < hi) || (lo < (uintptr_t) w->data + 128*sizeof(float) && (uintptr_t) w->data < hi)) {
++            return -1;
++        }
++    }
++    if (ggml_cuda_find_mul_q8_1_matmul(cgraph, s + 1, mul) == nullptr) {
++        return -1;
++    }
++    return m - 1;
++}
++
++// At the RMS_NORM: skip RMS_NORM + MUL when the gate kernel below will compute them.  GGML_CUDA_FUSE_GDN_NORM_GATE=0: off.
++static int ggml_cuda_gdn_norm_gate_skip(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
++    const ggml_tensor * rn = cgraph->nodes[i];
++    if (rn->op != GGML_OP_RMS_NORM || i + 1 >= cgraph->n_nodes) {
++        return 0;
++    }
++    for (int s = i + 2; s < cgraph->n_nodes && s <= i + 32; ++s) {
++        const ggml_tensor * t = cgraph->nodes[s];
++        if (t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID && ggml_cuda_gdn_norm_gate_match(cgraph, s) == i) {
++            if (cuda_ctx->gdn_norm_pending != nullptr) {
++                GGML_ABORT("GDN norm %s was skipped but never computed", cuda_ctx->gdn_norm_pending->name);
++            }
++            cuda_ctx->gdn_norm_pending = cgraph->nodes[i + 1];
++            cuda_ctx->gdn_norm_gate_at = s;
++            return 1;
++        }
++    }
++    return 0;
++}
++
++// At the gate: the skipped norm computed by the gate -> Q8_1 kernel.  Returns the extra nodes consumed.
++static int ggml_cuda_gdn_norm_gate_try_fuse(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int s) {
++    const ggml_tensor * un = cgraph->nodes[s];
++    if (cuda_ctx->gdn_norm_pending == nullptr || un->op != GGML_OP_UNARY) {
++        return 0;
++    }
++    const int r = ggml_cuda_gdn_norm_gate_match(cgraph, s);
++    if (r < 0 || cgraph->nodes[r + 1] != cuda_ctx->gdn_norm_pending) {
++        return 0;
++    }
++    cuda_ctx->gdn_norm_pending = nullptr;
++    cuda_ctx->gdn_norm_gate_at = -1;
++    ggml_tensor * mul = cgraph->nodes[s + 1];
++    const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, s + 1, mul);
++    ggml_cuda_op_unary_mul_q8_1(*cuda_ctx, cgraph->nodes[s], mul, mm, nullptr, cgraph->nodes[r]);
++    return cgraph->nodes[s + 2] == mm ? 1 : 2;
++}
++
+ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -1442,6 +1580,20 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     if (ggml_cuda_cache_blocks_fusion(cuda_ctx, cgraph, i)) {
+         return 0;
+     }
++    // a skipped GDN norm whose gate node was passed (taken by another fusion) or left in an earlier graph
++    if (cuda_ctx->gdn_norm_pending != nullptr && (i == 0 || i > cuda_ctx->gdn_norm_gate_at)) {
++        GGML_ABORT("GDN norm %s was skipped but its gate node was never reached", cuda_ctx->gdn_norm_pending->name);
++    }
++    // ahead of every other matcher, so the skip and the gate decide on the same nodes
++    if (const int n_gdn_norm_skip = ggml_cuda_gdn_norm_gate_skip(cuda_ctx, cgraph, i)) {
++        return n_gdn_norm_skip;
++    }
++    if (const int n_gdn_norm_gate = ggml_cuda_gdn_norm_gate_try_fuse(cuda_ctx, cgraph, i)) {
++        return n_gdn_norm_gate;
++    }
++    if (const int n_cont_gate = ggml_cuda_cont_gate_q8_1_try_fuse(cuda_ctx, cgraph, i)) {
++        return n_cont_gate;
++    }
+ 
+     // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
+     static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 681a30487..3346e2c7f 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -506,13 +506,63 @@ static __global__ void unary_gated_q8_1_op_kernel(const T * x, const T * g, bloc
+     }
+ }
+ 
++// unary_gated_q8_1_op_kernel whose `other` operand is the GDN output norm, RMS_NORM(xn) * w over 128-wide rows, computed
++// here instead of by rms_norm_f32<256, true>: a 256-thread block holds rows 2b and 2b+1 (warps 0-3, 4-7).  rms_norm_f32
++// puts 0 + x*x on threads 0..127 and 0 on 128..255, butterflies each warp, then butterflies the 8 warp sums (lanes 8..31
++// the 0 sentinel); here the row's 4 warp sums sit in lanes 0..3 and 0 in the rest: the same values in the same lanes,
++// so the same mean, scale and (scale * x) * w.  The product and the Q8_1 block are unary_gated_q8_1_op_kernel's.
++// k % 256 == 0, so no thread leaves before the barrier.
++template <float (*op)(float)>
++static __global__ void unary_gated_q8_1_norm_kernel(const float * x, const int64_t o0, const float * xn, const int nh,
++        const int64_t sn1, const int64_t sn2, const float * w, const float eps, block_q8_1 * y,
++        const int64_t k, const int64_t row_len) {
++    // one 128-wide row per 256-thread block, as rms_norm_f32<256, true> runs it: threads 128..255 only reduce
++    ggml_cuda_pdl_lc();
++    const int64_t r   = blockIdx.x;
++    const int     tid = threadIdx.x;
++    extern __shared__ float s_sum[];
++    const float * xc = xn + (r / nh)*sn2 + (r % nh)*sn1;
++    float tmp = 0.0f;
++    for (int col = tid; col < 128; col += 256) {
++        const float xi = xc[col];
++        tmp += xi * xi;
++    }
++    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
++    const float mean  = tmp / 128;
++    const float scale = rsqrtf(mean + eps);
++    if (tid >= 128) {
++        return;
++    }
++    const int64_t i = r*128 + tid;
++    const float g = scale * xc[tid] * w[tid];
++    const float v = op(x[r * o0 + tid]) * g;
++
++    const int lane = tid % 32;
++    const int64_t blocks_per_row = (GGML_PAD(row_len, MATRIX_ROW_PADDING)) / QK8_1;
++    const int64_t ib = (i / row_len) * blocks_per_row + (i % row_len) / QK8_1;
++
++    float amax = fabsf(v);
++    float sum = v;
++    amax = warp_reduce_max<32>(amax);
++    sum  = warp_reduce_sum<32>(sum);
++
++    const float  d = amax / 127.0f;
++    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
++
++    y[ib].qs[lane] = q;
++    if (lane == 0) {
++        y[ib].ds = make_half2(d, sum);
++    }
++}
++
+ // Elementwise gating MUL (unary * other) feeding a single mmvq matmul: write
+ // the Q8_1 quantized product into the per-graph arena; the matmul launcher
+ // finds it via the cache and skips its own quantize.
+ template <float (*op)(float)>
+ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
+                                              ggml_tensor * unary_node, ggml_tensor * mul_node,
+-                                             const ggml_tensor * mm) {
++                                             const ggml_tensor * mm, const ggml_tensor * unary_view = nullptr,
++                                             const ggml_tensor * norm = nullptr) {
+     const ggml_tensor * src1 = mm->src[1]; // the activation the matmul quantizes
+     cudaStream_t stream = ctx.stream();
+     const size_t ts_src1 = ggml_type_size(src1->type);
+@@ -539,7 +589,8 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
+         return; // already quantized elsewhere; the F32 output is unused
+     }
+ 
+-    const ggml_tensor * unary_src = unary_node->src[0];
++    // unary_view: read the unary operand from this (row-strided) view instead of its CONT copy (unary_node->src[0])
++    const ggml_tensor * unary_src = unary_view ? unary_view : unary_node->src[0];
+     const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+ 
+     GGML_ASSERT(unary_src->type == GGML_TYPE_F32 && other_src->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32);
+@@ -548,11 +599,26 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
+     const int64_t k  = ggml_nelements(mul_node);
+     const int64_t nc = unary_src->ne[0];
+     const int64_t unary_stride = unary_src->nb[1];
+-    const int64_t other_stride = other_src->nb[1];
++    const int64_t other_stride = unary_view ? nc*(int64_t) sizeof(float) : other_src->nb[1];
++    GGML_ASSERT(!unary_view || ggml_is_contiguous(other_src));
+ 
+     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+     const int64_t row_len = mm->src[1]->ne[0]; // the matmul's quantize row (flat per channel)
++    if (norm) {
++        // other_src = MUL(RMS_NORM(xn), w), not computed (ggml_cuda_gdn_norm_gate_skip)
++        const ggml_tensor * xn = norm->src[0];
++        const ggml_tensor * w  = other_src->src[1];
++        float eps;
++        memcpy(&eps, norm->op_params, sizeof(float));
++        GGML_ASSERT(nc == 128 && k % 128 == 0 && unary_stride == 128*(int64_t) sizeof(float));
++        const ggml_cuda_kernel_launch_params lpn = ggml_cuda_kernel_launch_params((dim3) (k/128), 256, 32*sizeof(float), stream);
++        ggml_cuda_kernel_launch(unary_gated_q8_1_norm_kernel<op>, lpn,
++                (const float *) unary_src->data, (int64_t) 128, (const float *) xn->data, (int) xn->ne[1],
++                (int64_t) (xn->nb[1] / sizeof(float)), (int64_t) (xn->nb[2] / sizeof(float)), (const float *) w->data, eps,
++                (block_q8_1 *) y, k, row_len);
++        return;
++    }
+     ggml_cuda_kernel_launch(unary_gated_q8_1_op_kernel<op, float>, lp,
+             (const float *) unary_src->data, (const float *) other_src->data, (block_q8_1 *) y,
+             k, nc, unary_stride / sizeof(float), other_stride / sizeof(float), row_len, (float *) nullptr);
+@@ -560,11 +626,11 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
+ 
+ void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
+                                  ggml_tensor * unary_node, ggml_tensor * mul_node,
+-                                 const ggml_tensor * mm) {
++                                 const ggml_tensor * mm, const ggml_tensor * unary_view, const ggml_tensor * norm) {
+     switch (ggml_get_unary_op(unary_node)) {
+-        case GGML_UNARY_OP_SILU:      ggml_cuda_op_unary_mul_q8_1_impl<op_silu>(ctx, unary_node, mul_node, mm); break;
+-        case GGML_UNARY_OP_SIGMOID:   ggml_cuda_op_unary_mul_q8_1_impl<op_sigmoid>(ctx, unary_node, mul_node, mm); break;
+-        case GGML_UNARY_OP_SOFTPLUS:  ggml_cuda_op_unary_mul_q8_1_impl<op_softplus>(ctx, unary_node, mul_node, mm); break;
++        case GGML_UNARY_OP_SILU:      ggml_cuda_op_unary_mul_q8_1_impl<op_silu>(ctx, unary_node, mul_node, mm, unary_view, norm); break;
++        case GGML_UNARY_OP_SIGMOID:   ggml_cuda_op_unary_mul_q8_1_impl<op_sigmoid>(ctx, unary_node, mul_node, mm, unary_view, norm); break;
++        case GGML_UNARY_OP_SOFTPLUS:  ggml_cuda_op_unary_mul_q8_1_impl<op_softplus>(ctx, unary_node, mul_node, mm, unary_view, norm); break;
+         default: GGML_ABORT("unsupported unary op");
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index 5640285ef..83bbecae5 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -100,7 +100,8 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
+ 
+ void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
+                                  ggml_tensor * unary_node, ggml_tensor * mul_node,
+-                                 const ggml_tensor * mm);
++                                 const ggml_tensor * mm, const ggml_tensor * unary_view = nullptr,
++                                 const ggml_tensor * norm = nullptr);
+ 
+ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
+ 
+-- 
+2.53.0
+
