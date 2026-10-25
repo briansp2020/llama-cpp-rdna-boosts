@@ -2,7 +2,12 @@
 
 ## Base (2026-10-24 re-base)
 
-Every candidate here was cut against `097cf33d9`, except `pr210-server-prompt-cache-lazy/`, which is cut against the current base `3f03b1772`.  After the `v14-3f03b1772-r127` re-base, each
+**The delivery base moved again at r138 (`v15-6050b467c-r138`, base `6050b467c`, 2026-10-25) and nothing here
+has been re-cut for it.**  The paragraphs below are the r127-era status and still name `3f03b1772`: treat
+"applies cleanly" as *that* base's result and re-check with `git apply --check` against the current
+`release.json.base` before handing a candidate to anyone.  Nothing in `upstream/` is part of the delivery.
+
+Every candidate here was cut against `097cf33d9`, except `pr210-server-prompt-cache-lazy/`, which is cut against `3f03b1772`.  After the `v14-3f03b1772-r127` re-base, each
 sub-directory's README carries a **Re-base status** line: 9 patches still apply cleanly
 (`git apply --check`) to `3f03b1772` but have not been re-validated there, and 8 need a re-cut.  None of
 this blocks a release — nothing in `upstream/` is part of the delivery.

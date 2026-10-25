@@ -16,11 +16,16 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 | canonical chain | `release.json .tip` / `.tree` |
 | release identity | `release.json .release` (`v<blocks>-<base>-r<N>`) |
 
-**The base is fixed by a re-base.**  The last one is `v14-3f03b1772-r127`: it replayed the set from
-`097cf33d9` (2026-10-12) onto **`3f03b1772`** (2026-10-24) — 261 upstream commits, including a chunked GDN
-prefill kernel, a MoE cache rewritten to SLRU, chunked CUDA graphs, a 4 GiB pinned-host cap, a fused QSA
-mask op and reworked MMQ/MMVQ tuning.  Between re-bases every `rN` is a **block amendment** at the same base
-(the current release, `v14-3f03b1772-r136`, is one: idle-slot parking in the server KV cache, which
+**The base is fixed by a re-base.**  The last one is `v15-6050b467c-r138`: it replayed the set from
+`3f03b1772` (2026-10-24) onto **`6050b467c`** (2026-10-25) — 21 upstream commits, 98 files.  Small but
+semantic: it carries a **fused FFN gate/up+GLU MMQ kernel (#29948, NVIDIA-only)** that duplicates block 08's
+RDNA fused gate path (both now ship, arch-disjoint, on one dispatch) and a **merged-tensor qwen4exp HC
+layout (#31028)** that subsumes block 11's two-GEMM down/inject pair.  The previous re-base was
+`v14-3f03b1772-r127`: `097cf33d9` (2026-10-12) onto `3f03b1772` (2026-10-24), 261 upstream commits,
+including a chunked GDN prefill kernel, a MoE cache rewritten to SLRU, chunked CUDA graphs, a 4 GiB
+pinned-host cap, a fused QSA mask op and reworked MMQ/MMVQ tuning.  Between re-bases every `rN` is a
+**block amendment** at the same base
+(the release `v14-3f03b1772-r136` was one: idle-slot parking in the server KV cache, which
 changes no kernel), so the block
 series and its recorded trees stay comparable.  A re-base is a deliberate event with its own `WORKLOG.md`
 entry and a record in [`archive/docs/baseline-history.md`](archive/docs/baseline-history.md).

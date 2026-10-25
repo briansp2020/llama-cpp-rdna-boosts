@@ -23,6 +23,17 @@ is the signature of a stub, not of a campaign.
 | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED (2026-09-26) — rebased and building, fully RDNA4-gated, but **gate 2 failed** (the fp8 4B is 0.69x Q8_0 where cllm had 1.16x, because the delivery's MMB/GEMM work made Q8_0 +32 % and the fp8 WMMA path did not follow).  Resume actions are in `PLAN.md`.  Not closed — paused behind the delivery work |
 | [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | genuine CPU/GPU overlap for the expert misses (the Strata shape) | OPEN / scoping (TODO #36) — **work in flight**: the note refutes the earlier "cannot be done" verdict for the interleaved shape and sets out the pipeline to try |
 
+**Shipped (r138, 2026-10-25, no block renumbered — the whole set re-based).**  The campaign record (it never
+needed a `wip/` staging area: it ran as one session against the released chain) is
+[`archive/work/rebase-2026-10b/`](../archive/work/rebase-2026-10b/README.md): the 15-block set was
+replayed from `3f03b1772` (2026-10-24) onto **`6050b467c`** (2026-10-25, 21 upstream commits) and shipped as
+**`v15-6050b467c-r138`**.  It is small but semantic: upstream #29948's fused FFN gate/up+GLU MMQ duplicates
+block 08's RDNA fused gate path (both now ship, arch-disjoint, on one dispatch) and #31028's merged-tensor
+qwen4exp HC layout subsumes block 11's two-GEMM down/inject pair.  Prefill-logit KLD 0.000531 / top-p
+98.863 %, per-block build gate 15/15, `plain == draft-mtp` byte-identical on the dense/MoE/Flash-Next arms.
+The per-collision table and the two process lessons are in that directory's `README.md` / `DECISIONS.md`;
+see `WORKLOG.md` 261025.008.
+
 **Shipped (r127, 2026-10-24, no block renumbered — the whole set re-based).**  `rebase-2026-10/` left
 `wip/` for [`archive/work/rebase-2026-10/`](../archive/work/rebase-2026-10/README.md): the 14-block set was
 replayed from `097cf33d9` (2026-10-12) onto **`3f03b1772`** (2026-10-24, 261 upstream commits) and shipped as

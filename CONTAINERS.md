@@ -238,7 +238,7 @@ git tag -a v<blocks>-<base-sha>-r<N> -m "rdna-boosts v<blocks>-<base-sha>-r<N>"
 git push origin main v<blocks>-<base-sha>-r<N>
 ```
 
-**Release naming.**  One tag per release, `v<blocks>-<base-sha>-r<N>` (e.g. `v14-3f03b1772-r128`), where `N` is
+**Release naming.**  One tag per release, `v<blocks>-<base-sha>-r<N>` (e.g. `v15-6050b467c-r138`), where `N` is
 that base's revision: `r1` is the release that lands the re-base and `r2`,
 `r3`, ... each later release on the same base.  `release.json.release` must be
 exactly the tag — `validate.yml` checks the manifest, and
@@ -417,7 +417,7 @@ builds; the log is `~/.cache/rdna-containers/build-<tag>.log`.  `FORCE_TAG=<tag>
 To build a release immediately instead of waiting for cron:
 
 ```bash
-FORCE_TAG=v14-3f03b1772-r128 ~/bin/rdna-container-watch.sh
+FORCE_TAG=v15-6050b467c-r138 ~/bin/rdna-container-watch.sh
 ```
 
 The primary box can keep using `scripts/build-containers.sh` directly for a manual or

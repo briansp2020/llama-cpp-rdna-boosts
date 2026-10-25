@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
-**15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`3f03b1772`** as of
-`v15-3f03b1772-r137`; the base is the 2026-10-24 re-base), one
+**15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
+`v15-6050b467c-r138`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -523,7 +523,9 @@ must be **bit-identical** to what it replaces at the widths it serves.
   **RDNA3_0 per-shape `nwarps`** (`Q4_0/Q4_1/Q5_0/Q5_1` narrow at every row count, `Q8_0` narrow for
   `2048 <= M <= 8192`), forwarded to every fusion that reproduces a dense weight launch
   (`GREEDY-PURITY.md` §19 addendum).
-* `mmq.cuh` / `mmq.cu`: the fused MoE gate+up+GLU MMQ prefill, the routed-compact dispatch, `mul_mat_q_pair`,
+* `mmq.cuh` / `mmq.cu`: the fused MoE gate+up+GLU MMQ prefill (**`has_gate`**, the RDNA arm — upstream
+  #29948's interleaved **`has_fusion`** arm ships beside it, NVIDIA-only, and `static_assert(!(has_fusion &&
+  has_gate))` keeps them from ever being on together; r138), the routed-compact dispatch, `mul_mat_q_pair`,
   the FP4/gate precision contract, and the Q6_K compact-J path.
 * `moe-weighted-reduction.cu`: the MoE weighted-down reduction (+ column-blocked band epilogue).
 * `norm.cu` / `quantize.cu` / `unary.cu`: `rms_norm`→Q8_1 folds, the verify-band q8_1 cache, scale-unary,
@@ -1066,6 +1068,12 @@ slab/dispatcher/ring code of its own beyond the arms implemented in its own TUs.
 
 **Contents.**
 
+* **The HC down/inject pairs are one tensor (r138, upstream #31028).**  `create_merged(
+  LLM_TENSOR_HC_{ATTN,FFN}_DOWN_INJECT, …)` accepts the converter's merged weight and `build_hc_mix(…,
+  w_down_inject, …)` does **one** GEMM for both products (the delivery's earlier form emitted two and
+  relied on `bf16_src1_cache`).  The separate tensors are still accepted — the loader falls back when the
+  merged tensor is absent — and the **MTP branch stays the delivery's own** attention (QSA top-k +
+  derived visibility), not upstream's `build_layer_attn(...)`/fused-mask path.
 * **qwen4exp** (`src/models/qwen4exp.cpp`, `src/llama-memory-hybrid-idx.cpp`): QSA sparse attention and the
   fused indexer top-k/score (`indexer-topk.cu`, `lightning-indexer`), hyper-connections (`hc-mix.cu`,
   `hyperconn.cu`), the managed lazy reader, PLE n-gram loading, the MTP draft head, and the **keys-only

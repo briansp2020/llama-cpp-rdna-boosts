@@ -162,11 +162,11 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
 
 - **`llama-cli` MUST be run with `--single-turn`** (plus `--no-display-prompt` for scripted output).
   Without it, the interactive chat loop blocks forever. Wrap potentially blocking commands in `timeout`.
-- **Apply method:** all 14 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
+- **Apply method:** all 15 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
   `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
 - **Naming (V2.1):** the current set is **15 blocks, 00-14** (block 14 is the temporary `-sm relaxed-tensor`
   block, see `patches/README.md`; release `release.json .release` —
-  `v14-3f03b1772-r132` at the 2026-10-24 re-base; the value lives in `release.json`, never here).  Every `block NN`
+  `v15-6050b467c-r138` at the 2026-10-25 re-base; the value lives in `release.json`, never here).  Every `block NN`
   reference elsewhere in this file that is not one of the V2.1 numbers below is the **pre-V2.1 16-block
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,
   **03** chunked GDN, **04** BF16 KV, **05** FA band/native/derived, **06** MMB, **07** k-quant,
@@ -729,6 +729,25 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   a single-token-tuned kernel changes. `GREEDY-PURITY.md` §36.
 - **The high-power pin regressed** (`~/bin/high-power`: tg -5-7 %, pp -15-18 % on RCCL/hybrid paths).
   Servers run **unpinned**, 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default.
+- **There are TWO fused gate/up+GLU MMQ arms in one dispatch, and they are arch-disjoint (r138, block 08).**
+  Upstream #29948's arm (`has_fusion`: gate rows interleaved into the weight tile by the loader, GLU in the
+  MMA write-back, `I_dst = I/2`) is **NVIDIA-only by construction** — its predicate ends in
+  `turing_mma_available()` and its write-back depends on the MMA accumulator layout — and the delivery's
+  arm (`has_gate`: the matmul runs twice into two accumulators, GLU in registers, `J` capped per type) is
+  the **RDNA** one.  Both live in `mul_mat_q_process_tile`/`mul_mat_q`/`mul_mat_q_case` as *separate*
+  template parameters, with `static_assert(!(has_fusion && has_gate))` making "one fused path at a time" a
+  build error, and a single J selector (`ggml_cuda_mmq_select_J`, which upstream's
+  `ggml_cuda_mmq_get_J_best` now delegates to).  Do not "simplify" this to one arm: enabling the interleaved
+  arm on RDNA is unvalidated and order-dependent, and dropping the delivery's arm loses the RDNA prefill win
+  (pp2048 +5.3 % gfx1151 / +9.4 % gfx1100).  `ggml_cuda_should_fuse_mul_mat_q` is non-static and declared in
+  `ggml-cuda-try-fuse.cuh` because block 10's moved dispatcher calls it.  Record:
+  `archive/work/rebase-2026-10b/DECISIONS.md`.
+- **qwen4exp's `hc_*_down`/`hc_*_inject` pairs are ONE tensor since r138 (upstream #31028).**
+  `create_merged(LLM_TENSOR_HC_{ATTN,FFN}_DOWN_INJECT, …)` accepts the converter's merged weight and
+  `build_hc_mix(…, w_down_inject, …)` does **one** GEMM for both products; the old separate tensors are
+  still accepted (the loader falls back when the merged tensor is absent, which is why pre-r138 GGUFs keep
+  loading).  A `build_hc_mix` caller must pass `layer.hc_*_down_inject` — a call that omits it compiles
+  against the old 7-argument form and silently reads the wrong weight.
 - **The set applies whitespace-clean** (`apply-all.sh`, no git whitespace warnings).
 
 ## Common tasks

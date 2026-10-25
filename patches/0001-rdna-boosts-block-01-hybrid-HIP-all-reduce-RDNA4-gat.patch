@@ -1,4 +1,4 @@
-From cfe79fb3f2cff85c3bf211dea92315045d2973a5 Mon Sep 17 00:00:00 2001
+From 98bc39b3d9b136b5ed651e67b7a749c7c3f9846a Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 01/14] rdna-boosts: block 01: hybrid HIP all-reduce
@@ -1894,7 +1894,7 @@ index 76205d323..a2e1f41dd 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index cbc47bcc3..621e690ce 100644
+index df052501f..f7f46083a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1042,21 +1042,129 @@ struct ggml_backend_cuda_comm_context {
@@ -2574,7 +2574,7 @@ index cbc47bcc3..621e690ce 100644
  }
  
  // host buffer type
-@@ -4804,6 +5281,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4872,6 +5349,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
  #ifdef USE_CUDA_GRAPH
          if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture

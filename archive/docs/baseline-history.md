@@ -4,6 +4,34 @@ Historical baseline records, checkpoint cuts, drift fixes, validation records, o
 
 ---
 
+### Re-base (2026-10-25): `3f03b1772` -> `6050b467c` -- 21 upstream commits, two of them duplicating delivery work
+
+Shipped as **`v15-6050b467c-r138`** (base tree `cb3251e177`, tip `abb8f76b2b`, tree `35090ba36c`,
+15 blocks, numbering unchanged).  One day of upstream, but dense:
+
+* **#29948 fused FFN gate/up + GLU in MMQ** restructures the same kernel block 08 fuses for RDNA
+  (`mmq-load-tiles.cuh` gains `x_gate` and `has_fusion`, `mul_mat_q_process_tile` gains leading
+  `x_gate`/`glu_op`/`glu_limit`, `I_dst = I/2`, a new `util_funcs` dispatch and `mul_mat_q_switch_fusion`).
+  Its arm is NVIDIA-only (`ggml_cuda_mul_mat_q_fusion_matches` ends in `turing_mma_available()`; the
+  write-back assumes the MMA accumulator layout), so **both arms ship, arch-disjoint, on one dispatch**:
+  upstream's `has_fusion` and the delivery's `has_gate`, with `static_assert(!(has_fusion && has_gate))`.
+* **#31028 qwen merge tensors on convert** merges qwen4exp's `hc_*_down` + `hc_*_inject` into one GGUF
+  tensor and one GEMM; the delivery adopted it for that block's HC path (loader keeps the separate-tensor
+  fallback), while the MTP branch stays the delivery's own QSA/derived-visibility code.
+* Upstream factored the MMQ J-tile choice into `ggml_cuda_mmq_get_J_best()`; the delivery's
+  `ggml_cuda_mmq_select_J()` is a strict superset and is now the implementation, with upstream's helper
+  delegating to it (`GGML_CUDA_MMQ_J_MAX` moved inside it, so both call sites honour the cap).
+* Block 10's moved dispatcher required the 3-way merge with the **pre-move** tree as the base; using the
+  rebased block-09 tree drops upstream's new arm silently (0 conflicts, feature missing).
+
+Gates: per-block build **15/15**; prefill-logit **KLD 0.000531 / same-top-p 98.863 %** against the
+r137-recorded base (no re-record needed); `FLASH_ATTN_EXT` 6450/6450, `GATED_DELTA_NET` 55/55, all
+MUL_MAT/MUL_MAT_ID/QSA/TOP_K_MASK/HC_MIX families pass; `plain == draft-mtp` byte-identical on dense Q8_0
+3-GPU tensor, 35B-A3B 2-GPU `-ncmoe 40` and Flash-Next 3-GPU `-ncmoe 48`; MTP Protocol A 1.81x/2.34x/
+2.47x/2.71x.  Greedy text differs from the r137 build on every arm -- expected on a base move, and decided
+by the prefill-logit gate.  Not re-validated: gfx1151/gfx1100 (open item in `TODO.md`).  Campaign record:
+`archive/work/rebase-2026-10b/`.
+
 ### Checkpoint cut (2026-08-29): master `cc83d7b48` - cross-architecture consolidation bookend
 
 Master moved 4 commits past `d7bd3bfca` to `cc83d7b48` (sycl --fit

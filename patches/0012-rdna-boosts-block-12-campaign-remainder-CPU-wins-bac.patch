@@ -1,4 +1,4 @@
-From 9b6db28a49ecbc00ccaf9986cf9fa808493420a7 Mon Sep 17 00:00:00 2001
+From 1749be1a609204817228979120e5b3ec0f15e638 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/14] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -1817,7 +1817,7 @@ index 98f30a455..2c4952b02 100644
          // Establish the fixed narrow floor: the first reserve smaller than the boundary (the
          // prefill -> decode drop re-reserves the decode/verify layout there).  Its ring region then sits
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 0c7ed7516..d53331802 100644
+index 7acc377fe..cb26c7e33 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3236,6 +3236,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
@@ -1898,7 +1898,7 @@ index 0c7ed7516..d53331802 100644
  //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
  //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
  //}
-@@ -4258,6 +4329,10 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -4313,6 +4384,10 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_DUP:
              ggml_cuda_dup(ctx, dst);
              break;
@@ -1909,7 +1909,7 @@ index 0c7ed7516..d53331802 100644
          case GGML_OP_CPY:
              ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
              break;
-@@ -4657,6 +4732,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -4712,6 +4787,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
      }
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
@@ -1934,7 +1934,7 @@ index 0c7ed7516..d53331802 100644
      CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
  }
  
-@@ -7028,6 +7121,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -7096,6 +7189,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -1943,7 +1943,7 @@ index 0c7ed7516..d53331802 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -7438,6 +7533,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -7506,6 +7601,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
      moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
  }
  
@@ -1963,7 +1963,7 @@ index 0c7ed7516..d53331802 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -7572,6 +7680,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -7640,6 +7748,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
      /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
      /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,
@@ -4469,7 +4469,7 @@ index b49bcbda8..58058ec6b 100644
  
  static struct ggml_tensor * ggml_add_impl(
 diff --git a/include/llama.h b/include/llama.h
-index 35be8d526..b08013bd4 100644
+index 40c83e87c..a44b1db46 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -227,7 +227,12 @@ extern "C" {
@@ -4487,7 +4487,7 @@ index 35be8d526..b08013bd4 100644
  
      enum llama_context_type {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 7d613926b..73c4c7424 100644
+index f191dbd10..40dffcded 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,3 +1,6 @@
@@ -4636,7 +4636,7 @@ index 7d613926b..73c4c7424 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -1734,6 +1853,12 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+@@ -1735,6 +1854,12 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
  
      GGML_ASSERT(lid <= model.hparams.n_layer());
  
@@ -4649,7 +4649,7 @@ index 7d613926b..73c4c7424 100644
      cparams.embeddings_layer_inp[lid] = enable;
  
      // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
-@@ -1968,6 +2093,43 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1969,6 +2094,43 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          }
      }
  
@@ -4693,7 +4693,7 @@ index 7d613926b..73c4c7424 100644
      // wip/slab-ring-region: the H2D staging ring is one meta-unit with the WIDE (prefill) compute layout.
      // It is armed for a wide pass (>= the staging gate floor, 64 tokens) and disarmed for a narrow one, so
      // a decode-only stretch returns its hole to the arena.  This runs BEFORE the drop's cache re-arm, so a
-@@ -1976,14 +2138,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1977,14 +2139,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // while the ring is used on every wide pass.  `ring_set` is a no-op when the state already matches.
      if (!model.moe_host_expert_bytes.empty() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
          const bool ring_arm = ubatch.n_tokens >= 64;
@@ -4729,7 +4729,7 @@ index 7d613926b..73c4c7424 100644
      }
      if (drop_now) {
          ggml_backend_sched_drop_buffers(sched.get());
-@@ -1996,9 +2179,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1997,9 +2180,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          // wip/slab-ring-region: measure the narrow (decode/verify) layout BEFORE allocating it, so the slab
          // can pin its narrow floor AHEAD of the cache's deferred sizing (which runs later in this same pass).
          // `split_only` + a `sizes` array is a size-only reserve (no allocation); the real reserve follows.
@@ -4743,7 +4743,7 @@ index 7d613926b..73c4c7424 100644
                                narrow_sizes, kq_mask_packed_reachable()) != nullptr) {
                  size_t narrow_bytes = 0;
                  for (int i = 0; i < 16; i++) {
-@@ -2018,7 +2204,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2019,7 +2205,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                  }
              }
          }
@@ -4752,7 +4752,7 @@ index 7d613926b..73c4c7424 100644
          if (!narrow_ok) {
              LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
                      " growth may not fit next to the MoE expert cache arena\n", __func__);
-@@ -3185,6 +3371,22 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
+@@ -3186,6 +3372,22 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
              ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
              GGML_ASSERT(backend != nullptr);
  
@@ -4775,7 +4775,7 @@ index 7d613926b..73c4c7424 100644
              if (lf_layer_dev.empty()) {
                  const size_t n_layers = cparams.embeddings_layer_inp.size();
                  lf_layer_dev.assign(n_layers, nullptr);
-@@ -3716,15 +3918,130 @@ private:
+@@ -3718,15 +3920,130 @@ private:
      size_t size_written = 0;
  };
  
@@ -4910,7 +4910,7 @@ index 7d613926b..73c4c7424 100644
          }
      }
  
-@@ -3767,13 +4084,59 @@ private:
+@@ -3769,13 +4086,59 @@ private:
          size_t offset;
      };
      std::vector<write_info> winfos;
@@ -4971,7 +4971,7 @@ index 7d613926b..73c4c7424 100644
          // flush the reads
          for (const auto & rinfo : rinfos) {
              ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
-@@ -3813,6 +4176,7 @@ public:
+@@ -3815,6 +4178,7 @@ public:
  
  private:
      const uint8_t * ptr;
@@ -4979,7 +4979,7 @@ index 7d613926b..73c4c7424 100644
      size_t buf_size = 0;
      size_t size_read = 0;
  
-@@ -4182,6 +4546,43 @@ private:
+@@ -4184,6 +4548,43 @@ private:
      const llama_memory_buffers & mbufs;
  };
  
@@ -5023,7 +5023,7 @@ index 7d613926b..73c4c7424 100644
  size_t llama_context::state_get_size() {
      llama_io_write_dummy io(false);
      try {
-@@ -4193,7 +4594,7 @@ size_t llama_context::state_get_size() {
+@@ -4195,7 +4596,7 @@ size_t llama_context::state_get_size() {
  }
  
  size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
@@ -5032,7 +5032,7 @@ index 7d613926b..73c4c7424 100644
      try {
          return state_write_data(io);
      } catch (const std::exception & err) {
-@@ -4203,7 +4604,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+@@ -4205,7 +4606,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
  }
  
  size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
@@ -5041,7 +5041,7 @@ index 7d613926b..73c4c7424 100644
      try {
          return state_read_data(io);
      } catch (const std::exception & err) {
-@@ -4233,7 +4634,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
+@@ -4235,7 +4636,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
          io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
      } else {
@@ -5050,7 +5050,7 @@ index 7d613926b..73c4c7424 100644
      }
  
      try {
-@@ -4251,7 +4652,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -4253,7 +4654,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
      std::unique_ptr<llama_io_read_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
          // create a temporary io to read the magic and the src seq_id
@@ -5059,7 +5059,7 @@ index 7d613926b..73c4c7424 100644
  
          uint32_t magic_read;
          io->read(&magic_read, sizeof(magic_read));
-@@ -4266,7 +4667,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -4268,7 +4669,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
  
          io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
      } else {
@@ -5068,7 +5068,7 @@ index 7d613926b..73c4c7424 100644
      }
  
      try {
-@@ -5060,7 +5461,16 @@ llama_context * llama_init_from_model(
+@@ -5062,7 +5463,16 @@ llama_context * llama_init_from_model(
  
          return ctx;
      } catch (const std::exception & err) {
@@ -5174,7 +5174,7 @@ index 77471bc25..e9a4c78fc 100644
  LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
  // returns the number of extracted layers from target model
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 144decfd8..a9482af51 100644
+index 71da32dbd..e50f1c7c2 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -419,6 +419,8 @@ void llama_kv_cache::clear(bool data) {
@@ -5540,7 +5540,7 @@ index 144decfd8..a9482af51 100644
                  //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                  return { };
              }
-@@ -1333,7 +1610,8 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
+@@ -1331,7 +1608,8 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
      for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
          const auto & cells = v_cells[sinfo.strm[s]];
  
@@ -5735,7 +5735,7 @@ index 961dd74ef..7997a0117 100644
 +    return true;
 +}
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index ce96be4ff..16c1bf97e 100644
+index 0f1f705f2..c3eb1948d 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -40,11 +40,32 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
@@ -5773,7 +5773,7 @@ index ce96be4ff..16c1bf97e 100644
  const char * llama_file_version_name(llama_fver version) {
      switch (version) {
          case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
-@@ -591,10 +612,19 @@ llama_model_loader::llama_model_loader(
+@@ -593,10 +614,19 @@ llama_model_loader::llama_model_loader(
      this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
      this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
  
@@ -5794,7 +5794,7 @@ index ce96be4ff..16c1bf97e 100644
  
      if (!fname.empty()) {
          // Load the main GGUF
-@@ -1426,8 +1456,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1428,8 +1458,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                          // the device this layer is assigned to.
                          if (op == GGML_OP_MUL_MAT_ID && buft_list_layer != nullptr && !buft_list_layer->empty()) {
                              ggml_backend_dev_t layer_dev = buft_list_layer->front().first;
@@ -5804,7 +5804,7 @@ index ce96be4ff..16c1bf97e 100644
                              if (layer_host_buft != nullptr &&
                                      weight_buft_supported(hparams, t_meta, op, layer_host_buft, layer_dev)) {
                                  buft = layer_host_buft;
-@@ -1447,7 +1476,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1449,7 +1478,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                          if (buft == nullptr && tensor_host_buft && op == GGML_OP_MUL_MAT_ID) {
                              for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
                                  ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -5837,10 +5837,10 @@ index d13253e84..0870f80e0 100644
      bool no_alloc;
      bool load_mtp;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 1d77143d9..4df3788e5 100644
+index e3cfbceb1..bdf35e1f4 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1997,7 +1997,47 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1999,7 +1999,47 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
          const bool is_resident    = ctx_key.resident;
  
@@ -5889,7 +5889,7 @@ index 1d77143d9..4df3788e5 100644
              GGML_ASSERT(!ml.no_alloc);
              const size_t max_size = ggml_get_max_tensor_size(ctx);
  
-@@ -2551,6 +2591,42 @@ size_t llama_model::max_host_weight_tensor_bytes() const {
+@@ -2553,6 +2593,42 @@ size_t llama_model::max_host_weight_tensor_bytes() const {
      return max_bytes;
  }
  
@@ -5932,7 +5932,7 @@ index 1d77143d9..4df3788e5 100644
  uint64_t llama_model::n_elements() const {
      return pimpl->n_elements;
  }
-@@ -3582,6 +3658,17 @@ int32_t llama_model_n_swa(const llama_model * model) {
+@@ -3585,6 +3661,17 @@ int32_t llama_model_n_swa(const llama_model * model) {
      return model->hparams.n_swa;
  }
  
@@ -5951,10 +5951,10 @@ index 1d77143d9..4df3788e5 100644
  uint32_t llama_model_n_cls_out(const struct llama_model * model) {
      return model->hparams.n_cls_out;
 diff --git a/src/llama-model.h b/src/llama-model.h
-index b1ef80858..5f409bf15 100644
+index b6e0560a1..cab5d2b98 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -648,8 +648,12 @@ struct llama_device {
+@@ -656,8 +656,12 @@ struct llama_device {
  };
  
  struct llama_meta_device_get_split_state_userdata {
@@ -5969,7 +5969,7 @@ index b1ef80858..5f409bf15 100644
  };
  
  struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
-@@ -890,6 +894,11 @@ struct llama_model {
+@@ -898,6 +902,11 @@ struct llama_model {
      // `slots x this`.
      size_t max_host_weight_tensor_bytes() const;
  
@@ -5997,7 +5997,7 @@ index ddea45b44..27ffe5bbf 100644
              throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
          }
 diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
-index e15af6afd..bedac4d60 100644
+index 8b6d6abdb..696812526 100644
 --- a/src/models/dflash.cpp
 +++ b/src/models/dflash.cpp
 @@ -3,6 +3,50 @@
@@ -6051,7 +6051,7 @@ index e15af6afd..bedac4d60 100644
  
  void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
  
-@@ -569,8 +613,25 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
+@@ -578,8 +622,25 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
      const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
      const int64_t row_used   = top_k + top_k * top_k;
  
@@ -6079,7 +6079,7 @@ index e15af6afd..bedac4d60 100644
      ggml_tensor * unary       = ggml_reshape_2d(ctx0,
              ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
      ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
-@@ -841,18 +902,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+@@ -850,18 +911,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
      };
  
      // KV cache injection
@@ -6100,7 +6100,7 @@ index e15af6afd..bedac4d60 100644
          // fuse the target features through the encoder
          ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
          inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
-@@ -1121,18 +1174,10 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
+@@ -1130,18 +1183,10 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
      llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
  
      // KV cache injection: fused target features from the encoder

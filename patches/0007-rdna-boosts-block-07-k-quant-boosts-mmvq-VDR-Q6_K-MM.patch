@@ -1,4 +1,4 @@
-From 24c177376bede802ab5f311297be01585d8e7eaa Mon Sep 17 00:00:00 2001
+From 407f61517b060ac6150f0019f348a01a37c640ac Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 07/14] rdna-boosts: block 07: k-quant boosts (mmvq VDR, Q6_K
@@ -66,10 +66,10 @@ index cb5d89baf..b63d5efc3 100644
  int ggml_cuda_get_device();
  
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e630e7795..e06967d11 100644
+index 4bbcd978a..68ca593c0 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -5475,13 +5475,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5543,13 +5543,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  
@@ -88,10 +88,10 @@ index e630e7795..e06967d11 100644
          if (graph_compatible) {
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
-index 2c7f4cd0a..a02898f59 100644
+index 4951db72e..8a71f73be 100644
 --- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
 +++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
-@@ -66,18 +66,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -68,18 +68,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              const int v3 = ggml_hip_perm(0x000001FF, 0x000001FF, q3_indices);
  #else
              // unpack crumbs into nibble indices
@@ -120,7 +120,7 @@ index 2c7f4cd0a..a02898f59 100644
  #endif // defined(GGML_USE_HIP)
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-@@ -1154,11 +1154,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1174,11 +1174,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[l]];
              const uint32_t signs = unpack_ksigns(aux32 >> (7 * l));
  
@@ -134,7 +134,7 @@ index 2c7f4cd0a..a02898f59 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
              x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid0;
-@@ -1217,11 +1215,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1239,11 +1237,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l] & 0x1FF];
              const uint32_t signs = unpack_ksigns(q2[l] >> 9);
  
@@ -148,7 +148,7 @@ index 2c7f4cd0a..a02898f59 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
              x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid_l;
-@@ -1285,11 +1281,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1309,11 +1305,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
          for (int l = 0; l < QR2_S; ++l) {
              const int * grid_pos = (const int *)(iq2s_grid + (qs[l] | ((qh << (8-2*l)) & 0x300)));
  
@@ -163,7 +163,7 @@ index 2c7f4cd0a..a02898f59 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
              x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid_l;
-@@ -1351,11 +1345,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1377,11 +1371,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              const int2 grid_pos = make_int2(iq3xxs_grid[q3[2*l+0]], iq3xxs_grid[q3[2*l+1]]);
              const uint32_t signs = unpack_ksigns(aux32 >> (7*l));
  
@@ -177,7 +177,7 @@ index 2c7f4cd0a..a02898f59 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
              x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid_l;
-@@ -1420,11 +1412,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1448,11 +1440,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                  iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
                  iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
  
@@ -303,28 +303,28 @@ index a75dd046e..29ebe24fa 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index c89db9290..11600e9ec 100644
+index 1de9e7357..45be9f6ea 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
-@@ -203,7 +203,17 @@ void ggml_cuda_mul_mat_q(
+@@ -138,7 +138,17 @@ static int ggml_cuda_mmq_get_J_best(
+     int J_best        = 0;
+     int ntiles_J_best = INT_MAX;
  
-         int ntiles_J_best = INT_MAX;
- 
--        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
-+        // GGML_CUDA_MMQ_J_MAX caps the maximum tile width considered (block 04's A/B perf knob,
-+        // re-expressed for upstream #29953's J_best selection; a value < 8 is ignored).
-+        int J_cap = 128;
-+        if (const char * env = getenv("GGML_CUDA_MMQ_J_MAX")) {
-+            const int v = atoi(env);
-+            if (v >= 8) {
-+                J_cap = std::min(J_cap, v);
-+            }
+-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
++    // GGML_CUDA_MMQ_J_MAX caps the maximum tile width considered (block 04's A/B perf knob;
++    // a value < 8 is ignored).  Both call sites select through this helper.
++    int J_cap = 128;
++    if (const char * env = getenv("GGML_CUDA_MMQ_J_MAX")) {
++        const int v = atoi(env);
++        if (v >= 8) {
++            J_cap = std::min(J_cap, v);
 +        }
++    }
 +
-+        for (int J = 8; J <= J_cap && ntiles_J_best > 1; J += 8) {
-             const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
-             if (config.type == GGML_TYPE_COUNT) {
-                 continue;
++    for (int J = 8; J <= J_cap && ntiles_J_best > 1; J += 8) {
+         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+         if (config.type == GGML_TYPE_COUNT) {
+             continue;
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
 index 752d28c4f..a89bf70ac 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
@@ -1589,10 +1589,10 @@ index d5ff93b91..10f31e3e3 100644
      const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
      return d * sumi;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 37b208881..657eaaedc 100644
+index 660afa273..4e9cc0833 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11225,6 +11225,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11236,6 +11236,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -1605,7 +1605,7 @@ index 37b208881..657eaaedc 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -12967,9 +12973,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -13005,9 +13011,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -1641,7 +1641,7 @@ index 37b208881..657eaaedc 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -12977,8 +13007,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -13015,8 +13045,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  

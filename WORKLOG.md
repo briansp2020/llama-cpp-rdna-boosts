@@ -1,5 +1,49 @@
 # WORKLOG - dated delivery records
 
+## 261025.008 (r138) -- re-base onto `6050b467c` (upstream 2026-10-25; 21 commits)
+
+**Release:** `v15-6050b467c-r138`.  Base **`6050b467c`** (base tree `cb3251e177`), canonical tip
+`abb8f76b2b13c324760795c38eebe24f569a51e4`, tree `35090ba36cbe2aae9bde9de47bb4a8c14286bada`, **15 blocks**,
+numbering unchanged (no block merged, split or renumbered; block 14 is still the temporary
+`-sm relaxed-tensor` block).  `scripts/validate-set.sh` green (checksums, fresh-tarball **strict 15/15**
+`git am`, applied tree == recorded tree); per-block build gate **15/15**; prefill-logit gate **PASS**
+(KLD **0.000531** / same-top-p **98.863 %** against the r137-recorded base — no re-record needed);
+op tests `FLASH_ATTN_EXT` **6450/6450**, `GATED_DELTA_NET` 55/55, `MUL_MAT`, `MUL_MAT_ID`,
+`FLASH_ATTN_QSA`, `TOP_K_MASK`, `HC_MIX` all pass; `plain == draft-mtp` **byte-identical** on dense
+Qwen3.5-4B Q8_0 3 GPU tensor, 35B-A3B UD-Q4_K_M 2 GPU `-ncmoe 40` (the host-expert/slab arm) and
+Qwen3.8 Flash-Next GSQ-IQ3_XXS 3 GPU `-ncmoe 48` with the MTP head; MTP Protocol A (27B UD-Q4_K_XL,
+1 GPU, `-n 2000`) R **1.81x** / P **2.34x** / C **2.47x** / K **2.71x** (r137: 1.81 / 2.41 / 2.47 / 2.70).
+
+### Why (the gap is one day, but dense)
+
+21 upstream commits, 98 files.  Two of them duplicate delivery work, so this was a **semantic** re-base,
+not a mechanical `git am`:
+
+* **#29948 fused FFN gate/up + GLU in MMQ** is the same feature as block 08's prefill gate fusion — but
+  NVIDIA-only by construction (its predicate ends in `turing_mma_available()`; its write-back relies on the
+  MMA accumulator layout).  **Both paths now ship, arch-disjoint, on one dispatch**: upstream's machinery
+  is adopted verbatim (`has_fusion`, `x_gate`/`glu_op`/`glu_limit` as leading kernel args, the interleaved
+  loader rows, `I_dst = I/2`, `mul_mat_q_switch_fusion`), the delivery's two-pass arm rides as a second
+  template parameter `has_gate`, and `static_assert(!(has_fusion && has_gate))` makes "one fused path at a
+  time" a build error.  RDNA keeps the arm it validated; NVIDIA keeps upstream's.
+* **#31028 qwen merge tensors on convert** subsumes block 11's two-GEMM `hc_*_down`/`hc_*_inject`: adopted
+  (one GEMM for both products, converter-compatible, with the loader's separate-tensor fallback kept).
+  The MTP branch stays the delivery's own (QSA top-k + derived visibility) — protected, and re-gated.
+
+Also: upstream factored the MMQ J-tile selection into `ggml_cuda_mmq_get_J_best()`; the delivery's
+`ggml_cuda_mmq_select_J()` is a strict superset (routed-compact bands, `GGML_Q6_COMPACT_J`, the fused-gate
+register cap, `GGML_CUDA_MMQ_J_MAX`), so upstream's helper is now a delegate to it and the J cap moved
+inside the selector (both call sites honour it).  Block 10's moved dispatcher needed the documented
+**pre-move** 3-way merge (`git merge-file` against the old chain's block 09) — using the rebased block-09
+tree instead looks "unchanged" and silently drops upstream's new arm.  Full per-collision table, the
+gate numbers and the process lessons (a fix must be committed by the block that owns the code, and
+`git add -A` during a conflicted rebase stages unresolved files) are in
+`archive/work/rebase-2026-10b/` (`README.md`, `DECISIONS.md`).
+
+Shipped unchanged from r137: every block's feature set and numbering.  Greedy text differs from the r137
+build on every arm — expected on a base move (upstream changed rope and MMQ), and decided by the
+prefill-logit gate, not a cross-build text diff.
+
 ## 261025.007 (r137) -- block 14: `-sm relaxed-tensor` (a TEMPORARY local relaxation; flint/mellum/mistral4 can tensor-split)
 
 **Release:** `v15-3f03b1772-r137`.  Base `3f03b1772` (base tree `14370bd49a`), canonical tip `e8bd52069`,
