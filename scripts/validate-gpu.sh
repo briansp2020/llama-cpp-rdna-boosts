@@ -45,7 +45,18 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
-REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Installed copies live OUTSIDE the checkout (the worker installs to ~/bin, like the container
+# watcher), so "the directory above the script" is not the repo there: fall back to the
+# conventional clone location and fail loudly rather than fetching in $HOME.
+_default_repo() {
+    local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+    if git -C "$here" rev-parse --git-dir >/dev/null 2>&1; then printf '%s' "$here"; return; fi
+    if git -C "$HOME/llama-cpp-rdna-boosts" rev-parse --git-dir >/dev/null 2>&1; then
+        printf '%s' "$HOME/llama-cpp-rdna-boosts"; return
+    fi
+    printf '%s' "$here"
+}
+REPO="${REPO:-$(_default_repo)}"
 LLAMA_REPO="${LLAMA_REPO:-$HOME/llama-ci}"
 STATE_DIR="${STATE_DIR:-$HOME/.cache/rdna-validate}"
 JOBS="${JOBS:-$(nproc)}"
@@ -97,7 +108,8 @@ if [ -e "$CI_LOCK" ] && command -v flock >/dev/null; then
     fi
 fi
 
-cd "$REPO" || die "not a checkout: $REPO"
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "not a git checkout: $REPO (set REPO=)"
+cd "$REPO" || die "cannot enter $REPO"
 git fetch --quiet --tags origin || die "git fetch failed in $REPO"
 
 if [ -z "$REV" ]; then
