@@ -1,5 +1,42 @@
 # WORKLOG - dated delivery records
 
+## 261025.010 (r138) -- gfx1100 and gfx1151 validated; `TODO` #105 closed
+
+The r138 re-base was gated on gfx1201 only.  Both other validated arches are now done, from a **fresh apply of
+the released patch set** on each box (`git checkout 6050b467c`, local branch deleted, `scripts/apply-all.sh`),
+which also re-verifies the apply flow and `release.json` off this box.  Full tables:
+[`benchmarks/2026-10-25-r138-arch-validation.md`](benchmarks/2026-10-25-r138-arch-validation.md).
+
+| | fingon (gfx1100, RX 7900 XTX, ROCm 10.1.0) | halo (gfx1151, Strix Halo APU, ROCm 10.1.0) |
+|---|---|---|
+| apply at `6050b467c` | strict 15/15, tree == `release.json.tree` | same |
+| build r138 / r137 | 7m08s / 2m45s, 0 errors | 8m59s / 2m53s, 0 errors |
+| op tests | `FLASH_ATTN_EXT` 6450/6450, `GATED_DELTA_NET` 55/55, `FLASH_ATTN_QSA` **23/23**, `MUL_MAT` 2445/2445, `MUL_MAT_ID` 931/931, `TOP_K_MASK` 28/28, `HC_MIX` 30/30 | same except `FLASH_ATTN_QSA` **26/26** |
+| `test-llama-archs` | qwen4exp 3/3, deepseek4 3/3, glm5-next 2/2 | same |
+| pp2048 / tg128 r138 vs r137 | 1143.38 / 42.80 vs 1141.83 / 42.70 | 3254.22 / 43.96 vs 3252.73 / 43.98 |
+| band gate 512/128 (npl 1,4,8) | pp +0/-0.2/+0.2 %, tg +0.1/+0.1/+0.1 % | pp +1.0/+1.1/-0.5 %, tg 0.0/-0.1/-0.2 % |
+
+**Both arches: parity, no regression.**  (`FLASH_ATTN_QSA` has 23 cases on gfx1100 vs 26 elsewhere — an
+arch-gated case list, all passing, above the 18/18 floor.)
+
+**Block 03 on gfx1151** — the only arch where both chunked GDN kernels are eligible.  Ours vs upstream's MMA
+arm (`GGML_CUDA_GDN_CHUNKED=0`), qwen35 4B Q8_0 `pp2048`, interleaved: **3274.02 / 3162.72 / 3297.87** vs
+**3206.63 / 3165.44 / 3191.81**, median **+2.6 %** for ours (r127 measured +3.2 % there).  Prefill-logit A/B on
+the same arm (qwen35 9B Q8_0, ctx 512 x 40): **KLD 0.000056 / same-top-p 99.657 %** — PASS, so our kernel and
+upstream's MMA agree at the logits level on RDNA3.5.
+
+**Not covered:** Flash-Next `plain == draft-mtp` on gfx1151 — that box has only 130 GiB (`Q4_K_M`) and 96 GiB
+(`IQ4_XS`) Flash-Next quants against 113 GiB available RAM, and the change in question (#31028, one-GEMM HC) is
+arch-independent graph code.  It is covered instead by `test-llama-archs -a qwen4exp` on both arches (which
+exercises the HC graph incl. the Meta path) plus the byte-identical Flash-Next arm on gfx1201.
+
+**Tooling fix found here:** `gate-prefill-logits.sh` labelled a run with the enclosing *checkout's* HEAD, so a
+halo run of the r138 binary was labelled `e8bd52069` (r137, still checked out from the baseline build).  It now
+takes the commit from the binary (`llama-perplexity --version`, which writes to stderr) and falls back to the
+checkout HEAD; re-verified locally (`build=6d3f1983d`, KLD 0.000531 / 98.863 %).
+
+`TODO.md` #105 is closed by this entry (it is not restated as a TODO item).
+
 ## 261025.009 (r138) -- throughput A/B of the re-base against r137 (post-tag)
 
 The r138 re-base was gated for **correctness** (per-block build 15/15, prefill-logit KLD 0.000531 / top-p

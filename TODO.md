@@ -28,27 +28,6 @@ Accepted limitations that are deliberately **not** fixed are listed at the end �
 
 ---
 
-## 105. The r138 re-base is unvalidated on gfx1151 (RDNA3.5) and gfx1100 (RDNA3_0) — PLATFORM VALIDATION
-
-**Status: open, accepted limitation (r138, `v15-6050b467c-r138`).**  Not a suspected defect.  The re-base was
-gated on gfx1201 only: per-block build 15/15, prefill-logit KLD 0.000531 / same-top-p 98.863 %,
-`FLASH_ATTN_EXT` 6450/6450, `GATED_DELTA_NET` 55/55, `plain == draft-mtp` byte-identical on the dense, MoE
-`-ncmoe 40` and Flash-Next arms, MTP Protocol A 1.81x/2.34x/2.47x/2.71x.  Two of the re-base's semantic
-changes are arch-sensitive and were not exercised off RDNA4:
-
-* **block 08 now carries two fused gate/up+GLU arms** — upstream #29948's `has_fusion` (NVIDIA-only by its
-  own predicate) and the delivery's `has_gate` (RDNA).  Only the gfx1201 prefill exercised `has_gate`; the
-  RDNA3_5/RDNA3_0 `J_max_gate` caps and the arm's eligibility were not re-measured.
-* **block 11's `build_hc_mix` now does one GEMM for `hc_*_down` + `hc_*_inject`** (upstream #31028), so the
-  qwen4exp HC path changed shape.
-
-What to run on `halo` (gfx1151, `BUILD_DIR=build-r138` override — `build-rocm` is the live server build):
-the GDN A/B (`GGML_CUDA_GDN_CHUNKED=0` is the upstream MMA arm; interleave, quote the second run), the
-prefill-logit A/B on qwen35 9B Q8_0, `test-backend-ops -o FLASH_ATTN_EXT/GATED_DELTA_NET/FLASH_ATTN_QSA`,
-Flash-Next `plain == draft-mtp` (the HC/one-GEMM arm) and a dense-4B `pp2048` before/after against the r137
-build to confirm the fused-gate prefill win did not move.  gfx1100 has the same set plus `llama-batched-bench
--npl 1,4,8` (block 08's `nwarps` rules are RDNA3_0-specific).
-
 ## 103. The ~30x collapse when the last few MiB of VRAM are in use has no root cause — PERFORMANCE (diagnosis)
 
 **Status: open, not understood (r135, found while investigating issue #219).**  On a single gfx1201 with the

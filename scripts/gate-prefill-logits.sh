@@ -276,10 +276,22 @@ run_ppl() {
 mean_kld()  { sed -n 's/^Mean[[:space:]]*KLD:[[:space:]]*\([-0-9.][0-9.]*\).*/\1/p' "$1" | head -1; }
 same_topp() { sed -n 's/^Same top p:[[:space:]]*\([0-9.][0-9.]*\).*/\1/p' "$1" | head -1; }
 final_ppl() { sed -n 's/.*Final estimate: *PPL *= *\([0-9.][0-9.]*\).*/\1/p' "$1" | head -1; }
-# A human-readable build reference: the fork checkout's HEAD when one encloses the
-# binary, else the wrapper's own hash (llama-perplexity prints no build line).
+# A build reference that identifies the BINARY, not the checkout beside it.
+#   `llama-perplexity --version` prints `version: ... (build N, commit <sha>)`, so ask the binary first;
+#   falling back to the enclosing checkout's HEAD is wrong whenever a build dir was configured from a
+#   different commit than the one checked out now (r138 hit exactly that: the gate labelled an r138 run
+#   `e8bd52069` because the tree had been switched to build r137 afterwards).  Last resort: the binary's
+#   hash, which is always correct but not human-readable.
 build_ref() {
-    local dir
+    local dir ver commit
+    # --version goes to stderr (it is a GGML log line), so capture 2>&1.
+    if ver="$(cd "$(dirname "$LLAMA_PPL")" 2>/dev/null && timeout 60 ./"$(basename "$LLAMA_PPL")" --version 2>&1)"; then
+        commit="$(printf '%s\n' "$ver" | sed -n 's/.*commit \([0-9a-f]\{7,\}\).*/\1/p' | head -1)"
+        if [ -n "$commit" ]; then
+            printf '%s\n' "$commit"
+            return
+        fi
+    fi
     dir="$(cd "$(dirname "$LLAMA_PPL")/../.." 2>/dev/null && pwd)"
     if [ -n "$dir" ] && git -C "$dir" rev-parse --short=12 HEAD >/dev/null 2>&1; then
         git -C "$dir" rev-parse --short=12 HEAD
