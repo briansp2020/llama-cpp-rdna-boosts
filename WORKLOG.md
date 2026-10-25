@@ -1,5 +1,33 @@
 # WORKLOG - dated delivery records
 
+## 261025.009 (r138) -- throughput A/B of the re-base against r137 (post-tag)
+
+The r138 re-base was gated for **correctness** (per-block build 15/15, prefill-logit KLD 0.000531 / top-p
+98.863 %, op families, `plain == draft-mtp` on three arms, MTP Protocol A) but **no throughput measurement
+was taken for the changes it makes** — including the two adoptions (upstream #31028's one-GEMM qwen4exp HC
+path, #29948's `has_fusion` plumbing), the hand-merged MMQ tiling geometry in block 00 and a restructured
+`rope.cu`.  That gap was flagged and then closed with an interleaved r137-vs-r138 A/B; full method, builds
+and both reps are in [`benchmarks/2026-10-25-r138-rebase-ab.md`](benchmarks/2026-10-25-r138-rebase-ab.md).
+
+**Result: no regression on any arm; dense prefill is 1.4-2.3 % faster.  No follow-up release.**  r137 was
+rebuilt from `e8bd52069` with the *same* configure and the same pinned `GGML_CUDA_FA_QUANTS` set as the
+shipped build (its binaries are kept in `~/llama-scratch/build-b137/bin` for the next A/B).
+
+* Band gate (27B UD-Q4_K_XL, 3 GPU tensor, 512/128): pp **+2.3 % / +1.5 % / +1.2 %** at npl 1/4/8, tg
+  **+1.2 % / +1.7 % / 0.0 %**.
+* Dense prefill: pp2048 **+1.4 %**, pp8192 **+1.8 %** — the row that covers the hand-merged tiling (upstream's
+  column-innermost grid, which is there for L2 weight-tile reuse).
+* The fused prefill arm is still live on r138: pp2048 **1883.92** (default) vs **1778.46**
+  (`GGML_CUDA_DISABLE_FUSION=1`), i.e. the gate+up+GLU MMQ arm is worth **+5.9 %** and repeatable to ±2 t/s.
+* qwen4exp Flash-Next (`-ncmoe 48`): pp512/pp2048/tg128 **neutral** (within ±1.5-6 % noise) — the
+  one-GEMM HC adoption is recorded as *adopted for converter compatibility, measured neutral*, not a win.
+* 35B-A3B `-ncmoe 40`: pp512 −0.7 % (noise), tg128 +0.4 %.
+* Protocol A decode (already measured in the campaign): 1.81/2.34/2.47/2.71x vs 1.81/2.41/2.47/2.70x.
+
+Still open: gfx1151/gfx1100 (`TODO.md` #105).  `AGENTS.md`'s release checklist now states that a re-base is a
+decode **and** prefill change, so the band gate + an rNN-1 prefill A/B are required before the tag — the
+omission this session made.
+
 ## 261025.008 (r138) -- re-base onto `6050b467c` (upstream 2026-10-25; 21 commits)
 
 **Release:** `v15-6050b467c-r138`.  Base **`6050b467c`** (base tree `cb3251e177`), canonical tip

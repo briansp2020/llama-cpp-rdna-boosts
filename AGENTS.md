@@ -83,7 +83,7 @@ amendment, or a note in the relevant record).
 | `patches/` | **the delivery set** (0000-0014: block 00 + blocks 01-14) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
 | `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out). **Index: `scripts/README.md`** |
 | `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
-| `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
+|  `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
 | `prompts/` | versioned, hash-stable test prompts; sizes/token counts/**sha256** in `prompts/README.md`. A shipped prompt is **never edited in place** (add a new file); a result is only valid against the prompt hash it names |
 | `wip/` | **ACTIVE** exploration docs/tools — **NOT part of the delivery**; see the WIP rule. Each campaign is a self-contained handover under its own `README.md` (no `wip/README.md`); the open set is indexed in `wip/CAMPAIGNS.md` |
 | `beta/` | **promotion-candidate patches** staged for a beta test — **NOT part of the delivery**. Each candidate is `<name>/` with `README.md` (what/why/status), `BETA-TESTING.md` (the tester's apply + gate checklist) and `<name>.patch` cut against the current `release.json` tree. Nothing here is applied by default: `scripts/apply-all.sh --include-beta` applies `beta/*/*.patch` on top of the verified release tree for a tester. A confirmed or refuted candidate moves to `archive/work/` and is recorded in `WORKLOG.md` |
@@ -818,6 +818,16 @@ cache sits at ~14/30 GiB with hundreds of cleanups, so the previous release's bl
 before the next one and every re-base pays a cold ladder.  On a box with the disk, 60 GiB keeps two
 release ladders resident.
 
+- **A re-base is a decode AND prefill change: measure throughput before the tag, not only correctness
+  (r138).**  The per-block build, the prefill-logit KLD and the op tests prove the kernels are *faithful*;
+  none of them measures speed, and a re-base can change launch geometry without changing logits (r138's
+  hand-merged MMQ tiling, the qwen4exp one-GEMM HC path, rope).  Before tagging, run the stock-relative band
+  gate (`llama-batched-bench -npp 512 -ntg 128 -npl 1,4,8`) **and** an rNN-1-vs-rNN prefill A/B
+  (`llama-bench -p 2048,8192 -n 0`) on a build pair configured identically — including the same
+  `GGML_CUDA_FA_QUANTS` set (see the next bullet; a differing set alone changes greedy text).  Keep the
+  previous release's binaries (`build-<tag>/bin`) so the A/B does not need a rebuild.  Record in
+   `benchmarks/` + a `WORKLOG.md` entry.  r138's A/B:
+  `benchmarks/2026-10-25-r138-rebase-ab.md` (no regression; dense prefill +1.4-2.3 %).
 - **The per-block ladder's cost is ONE translation unit, and it is a test (r138, measured).**
   `tests/test-backend-ops.cpp` is 14.4k lines in a single TU and takes **5m13s** to compile cold at
   `-j20` (a `src/*.cpp` TU is ~5 s).  The gate's default target set is `all`, and a re-base changes that
