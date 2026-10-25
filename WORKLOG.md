@@ -1,5 +1,80 @@
 # WORKLOG - dated delivery records
 
+## 261025.007 (r137) -- block 14: `-sm relaxed-tensor` (a TEMPORARY local relaxation; flint/mellum/mistral4 can tensor-split)
+
+**Release:** `v15-3f03b1772-r137`.  Base `3f03b1772` (base tree `14370bd49a`), canonical tip `e8bd52069`,
+tree `5d6a19af59bc36a3442bbb5c7b368450c29a1a1e`, **15 blocks**.  `scripts/validate-set.sh` green
+(checksums, fresh-tarball **strict 15/15** `git am`, applied tree == recorded tree); per-block build gate
+**1/1** with `--changed-from` the r136 tip (only block 14's delta, 8 s at the long-lived path); coherence
+**byte-identical to the r136 build** on four arms (dense 4B 1 GPU; dense 4B 3 GPU `-sm tensor`; 35B-A3B
+UD-Q4_K_M 2 GPU `-sm tensor -ncmoe 40`, the host-expert arm; flint Q8_0 2 GPU `-sm layer`); prefill-logit
+gate **KLD 0.000000 / same-top-p 99.980 %**; adaptive-MTP four axes (Protocol A, 27B UD-Q4_K_XL, 1 GPU,
+`-n 3000`, `--spec-draft-n-max 3`, reasoning pinned) acceptance **R 0.54420 / P 0.83041 / C 0.87435 /
+K 0.99200**, MTP vs plain **1.81x / 2.41x / 2.47x / 2.70x**, and the P/C decode text **byte-identical
+r136 vs r137** (5975 chars sha `2928e6d6ea55`; 13151 chars sha `4187f8fae610`, `ROCBLAS_USE_HIPBLASLT=0`);
+`scripts/check-gpu-faults.sh` clean.  **No existing block renumbered, merged or split**; block 14 is a new
+commit on top of block 13, and deleting its patch returns the r136 tree.
+
+### What it is, and why it is separate
+
+Upstream #30861 gives the MoE down projection a per-`[expert, token]` amax rescale: it pools the whole
+matmul row (`ggml_pool_1d(abs(cur), POOL_MAX, k = s = n_ff_exp)`) and divides/undoes `cur` by a power of
+two derived from it.  Under `--split-mode tensor` the MoE intermediate is split on axis 0, so **no device
+holds a complete row**; #31081 removed the Meta `POOL_1D` case (it claimed `MIRRORED`, which is false) and
+denied `-sm tensor` for `flint`, `mellum` and `mistral4`.  Flint Q8_0 (39.39 GiB, 95.1 % in the split expert
+tables) therefore could not run tensor-split at all.
+
+Block 14 adds a split mode instead of a blanket deny.  `-sm relaxed-tensor` places the weights exactly as
+`-sm tensor` places them (zero extra VRAM: 20.66 GiB/device at 2 GPUs, 14.42 at 3) and admits one new split
+state, `GGML_BACKEND_SPLIT_AXIS_PER_DEVICE` — same shape on every device, **its own values** on each.
+`handle_pool_1d` produces it for a whole-row `POOL_MAX` over an axis-0 split; `handle_bin_bcast` lets it be
+consumed elementwise/broadcast; every copy/gather/reconcile/read-back path aborts with a message.  The
+delayed-reduce MUL-chain in `ggml_backend_meta_graph_compute` accepts it **so the all-reduce stays after
+each device's own undo** — that ordering is what makes the per-device value cancel (an `e` that is a power
+of two commutes with the sum, and `e_local <= e_global` keeps at least the reference's f16 headroom).  With
+the undo on the wrong side of the reduce the result would be wrong **and silent**, because the shipped
+divisor (1024) leaves `e = 1` unless a row max exceeds 1024.
+
+**It is deliberately temporary.**  The maintainer's read of the upstream PRs is that this will be replaced
+by a better implementation, so the block is kept separate, is **not** a supported feature of the delivery,
+has **no `upstream/` candidate**, and is tracked as `TODO` #104 with an explicit "drop the block when
+upstream fixes it" instruction.  Deleting `patches/0014-*.patch` restores the r136 tree exactly.
+
+### Validation of the mechanism (why `e = 1` is not enough)
+
+Greedy text alone cannot prove this path: at the shipped divisor `e` is 1 nearly everywhere, so a wrong and
+a right ordering agree.  With the amax divisor forced to 1 (temporary local change, not shipped) an
+instrumented `POOL_1D` shows each device pooling its **own 256-wide slice** (`iw=256`, not 512) and the
+per-device maxima differing on ~half of the ~185 calls per run, and with `e` differing on ~half the layers
+the text still matches `-sm layer` exactly (prose 0.0836/2.0/1.0/8.0 style splits).  Flint 2 GPU
+`-sm relaxed-tensor`: **77.9 t/s** generation vs **59.5** for `-sm layer` (short decode-only run — not a
+depth-16384 measurement, which is not claimed).  A non-amax arch (Qwen3.5-4B) is byte-identical under
+`tensor` and `relaxed-tensor`, i.e. the mode is a no-op without the amax node.
+
+### Limitations (recorded, not fixed)
+
+Exact on RDNA/HIP; **not** equivalent on a backend whose in-kernel `src1` rescale is non-linear (Vulkan's
+clamp-into-fp16-range, #30656), which is why it is an opt-in mode and not part of `-sm tensor`.  No
+`-ncmoe`/expert-cache arm (the arena still refuses tensor-like modes, as for `tensor`).  `mellum` and
+`mistral4` are enabled by the same change but **unvalidated** (no model on hand; `mistral4` was denied
+before the amax rescale, so it may still hit an unrelated path).  No draft/MTP run against these arches.
+`-sm tensor` keeps upstream's strict behaviour; its error message now names the new mode.
+
+### Gates not re-run, and why
+
+The stock-relative `llama-batched-bench -npl 1,4,8` arm was **not** re-run: no decode, verify, mmvq or FA
+kernel changed (the r136 result stands), and block 14's only new code path requires a Meta device, which a
+single-GPU arm never creates.  The four-axis acceptance values differ from the r136 entry within the
+per-start hipBLASLt spread (`GREEDY-PURITY.md` §44 — the source of every file the draft uses is
+byte-identical between the two builds; K matches to the last digit); the bit-level check for this release
+is the pinned cross-release **text** comparison above.
+
+### Docs
+
+`patches/README.md` (block 14 section + index row, temporary-status banner), `README.md` (block table +
+count), `MANIFESTS.md` (15 blocks, apply order), `BASELINE.md`, `TODO.md` #104, `GREEDY-PURITY.md` §58.
+`ENVIRONMENT.md` unchanged (no environment variable: the mode is a CLI/split-mode value).
+
 ## 261025.006 (r136) -- PR #225: park the resident idle slots at the top of a unified KV cache
 
 **Release:** `v14-3f03b1772-r136`.  Base `3f03b1772` (base tree `14370bd49a`), canonical tip `43505eac8`,

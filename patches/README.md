@@ -1,8 +1,9 @@
 # The delivery patches — what each block is and what it does
 
-**14 blocks** (block 00 + blocks 01-13) against `release.json.base` (**`3f03b1772`** as of
-`v14-3f03b1772-r128`; the base is the 2026-10-24 re-base and r128 is a block amendment at that base), one
-`git am` commit each.  This file
+**15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`3f03b1772`** as of
+`v15-3f03b1772-r137`; the base is the 2026-10-24 re-base), one
+`git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
+rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
 purity notes that constrain it.  It is **not** a changelog — the release-by-release record is
 [`../WORKLOG.md`](../WORKLOG.md), the apply order and verification contract is
@@ -20,12 +21,12 @@ and every environment variable is catalogued in [`../ENVIRONMENT.md`](../ENVIRON
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout "$(jq -r .base /path/to/rdna-boosts/release.json)"
-bash /path/to/rdna-boosts/scripts/apply-all.sh .          # creates branch rdna-boosts, 14 commits
+bash /path/to/rdna-boosts/scripts/apply-all.sh .          # creates branch rdna-boosts, 15 commits
 bash /path/to/rdna-boosts/scripts/apply-all.sh --include-beta .   # + beta/*/*.patch (NOT the release tree)
 ```
 
 All blocks with **`git am`**, in order.  `git apply` on the concatenated series silently drops hunks; the
-manual equivalent is `git am patches/000[0-9]-*.patch patches/001[0-3]-*.patch`.  `apply-all.sh` asserts
+manual equivalent is `git am patches/000[0-9]-*.patch patches/001[0-4]-*.patch`.  `apply-all.sh` asserts
 the applied tree equals `release.json.tree` on the strict path.
 
 ## Block index
@@ -49,6 +50,7 @@ only as a rough shape.
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache | +11776 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency) | +3223 / −747 | 38 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
+| 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
 infrastructure split out of `ggml-cuda.cu` (slab/arena/try-fuse TUs) and block 11 is the qwen4exp
@@ -1496,6 +1498,66 @@ flip a near-tie — the same property the untrimmed build already shows between 
 trim's share), `-sm tensor` (subset head is Meta-mirrored — **the draft matmul is duplicated per device, so the
 trim only pays when `N * n_devices < n_vocab`**; see "Device count" above), `--fit` (subset not estimated), the
 purity band (above).  Detail and numbers: `../archive/work/spec-draft-mtp-vocab/README.md` §5.
+
+## Block 14 — `-sm relaxed-tensor` for the MoE amax arches (**TEMPORARY**, expect removal)
+
+> **Status: temporary, local, and NOT a supported feature of the delivery.**  This block exists so `flint`,
+> `mellum` and `mistral4` can run `-sm tensor` today.  It relaxes a split-state rule upstream deliberately
+tightened (PR #31081) and is expected to be **replaced or dropped** when upstream lands a real fix — the
+> delivery is not committing to this mode.  Nothing else in the set depends on it: deleting patch `0014`
+> restores exactly the r136 tree, and `-sm tensor` keeps upstream's strict behaviour either way.
+> Read the limitations before using it; treat it as a stop-gap, not as a feature.
+
+**Why upstream refuses.**  `llm_graph_context::build_amax_src1_f16()` (`src/llama-graph.cpp`) gives the MoE
+down projection a per-`[expert, token]` rescale: it takes the max of the whole matmul row
+(`ggml_pool_1d(abs(cur), POOL_MAX, k = s = n_ff_exp)`), divides `cur` by a power of two derived from it, and
+multiplies the down-projection result back by the same value to restore f16/Q8 headroom.  Under
+`--split-mode tensor` the MoE intermediate is split on axis 0 (`n_ff_exp`), so **no device holds a complete
+row** and each one can only compute the max of its own slice.  #30861 handled `POOL_1D` by reporting the
+result `MIRRORED`; that claim is false (the values differ), so #31081 removed the case and denied
+`-sm tensor` for the three arches.
+
+**What this block does instead of a blanket deny.**  A new split state,
+`GGML_BACKEND_SPLIT_AXIS_PER_DEVICE`: same shape and element positions on every device, **its own values**
+on each.  `handle_pool_1d` produces it for a whole-row `POOL_MAX` over an axis-0 split (anything else keeps
+the old reject), `handle_bin_bcast` lets it be consumed elementwise and broadcast, and every path that would
+copy, gather, reconcile or read it back **aborts with a message** instead of silently returning one device's
+value.  `-sm relaxed-tensor` (`LLAMA_SPLIT_MODE_RELAXED_TENSOR`, `relaxed-tensor` in `--help`) is that
+permission; every "is this the tensor path?" site goes through `llm_split_mode_is_tensor_like()`.
+
+**Why it is exact, and the one piece that is easy to get wrong.**  The reduce point must stay **after** the
+per-device undo, i.e. each device applies its own `e` to its own partial and only then is the cross-device
+sum taken.  That is the delayed-reduce MUL-chain in `ggml_backend_meta_graph_compute`, and it only works
+because it accepts `PER_DEVICE` next to `MIRRORED`; if it stops matching, the all-reduce lands on the
+`mul_mat_id` output and **one device's `e` is applied to the summed result**— wrong, and invisible whenever
+every `e` happens to be 1 (which is the common case: the shipped divisor is 1024, so `e > 1` needs a row max
+above 1024).  Given the ordering, `e` is a power of two and `e_local <= e_global` (a local max cannot exceed
+the global one), so the scaling commutes with the sum and each device keeps at least the reference's f16
+headroom.
+
+**Cost.**  Zero VRAM: the weights are placed exactly as `-sm tensor` places them (Flint Q8_0, 39.39 GiB:
+95.1 % is the expert tables, which stay split — 20.66 GiB/device at 2 GPUs, 14.42 GiB at 3).  The only
+per-device tensor is the rescale factor, `[1, n_expert_used, n_tokens]` per MoE layer, in the existing
+compute buffer.
+
+**Limitations — do not read this block as general `-sm tensor` support.**
+
+| limitation | detail |
+|---|---|
+| not bit-identical everywhere | exact on RDNA/HIP (Q8_1's block scale is `max/127`, so a power-of-two factor passes through). A backend whose in-kernel `src1` rescale is **non-linear** (Vulkan's clamp-into-fp16-range, #30656) sees genuinely different values. Not validated outside ROCm |
+| no `-ncmoe`/expert-cache arm | the MoE expert arena still refuses tensor-like modes, so `relaxed-tensor` inherits that (as `tensor` does) |
+| `mellum`/`mistral4` unvalidated | enabled by the same change, no model on hand. `mistral4` was denied *before* the amax rescale, so it may still hit an unrelated unsupported path |
+| no MTP/draft coverage | no draft was run against these arches under this mode |
+| it is not a purity claim | the mode is *permitted*, not *promised*: `PER_DEVICE` is an assertion that the graph consumes the tensor only in the sound way, and any other consumer aborts |
+
+**Validation (r137).**  Flint Q8_0, 2× R9700: `-sm relaxed-tensor` runs at 77.9 t/s generation vs 59.5 for
+`-sm layer` (short decode-only run, not a depth-16384 measurement), greedy text **byte-identical** to
+`-sm layer` and to itself at 3 GPUs.  With the amax divisor forced to 1 (so `e != 1`), an instrumented pool
+kernel confirms each device pools its own 256-wide slice and the per-device maxima differ on ~half of the
+~185 calls per run, and the text still matches `-sm layer` exactly.  A non-amax arch (Qwen3.5-4B) is
+byte-identical under `tensor` and `relaxed-tensor`, so the mode is a no-op without the amax node;
+`ggml_pool_1d` has exactly one producer in the graph, so the state is unreachable from any other arch.
+Purity notes: `GREEDY-PURITY.md` §58.
 
 ## Dated history
 

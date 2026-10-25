@@ -1,7 +1,7 @@
-From 1f47eaca693cab8ad57db045af1f59df247aa05d Mon Sep 17 00:00:00 2001
+From 9792583451673beeed87a196ee8afa2a96b2ead5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
-Subject: [PATCH 04/13] rdna-boosts: block 04: BF16 KV cache and native-BF16
+Subject: [PATCH 04/14] rdna-boosts: block 04: BF16 KV cache and native-BF16
  flash attention
 
 Sources: old 03 (whole block).

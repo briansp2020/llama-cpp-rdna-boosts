@@ -12,7 +12,7 @@ release history here — this file is the policy layer, not the log.
 ## What this repo is
 
 A **delivery repo**. It packages the RDNA/ROCm work of the [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp)
-fork (`rdna-boosts` branch) as a **14-block set (V2.1)** (block 00 + blocks 01-13) that applies to a clean
+fork (`rdna-boosts` branch) as a **15-block set (V2.1)** (block 00 + blocks 01-14) that applies to a clean
 llama.cpp checkout at the fork point named in `release.json`. This repo is NOT the fork: the fork
 lives at `~/llama.cpp`; its `rdna-boosts` branch is re-cut from `patches/` on every release and
 force-pushed to the personal fork so it never goes stale (see the Pushing policy). `patches/` is the
@@ -80,7 +80,7 @@ amendment, or a note in the relevant record).
 | `BASELINE.md` | fork point, what the patches are, how they are cut, drift policy. Its dated baseline/re-base records are in `archive/docs/baseline-history.md` |
 | `TODO.md` | **forward-looking only**: open items, items waiting on someone else, accepted limitations, parked ideas. A closed item is one `WORKLOG.md` entry — never a TODO entry. `#NN` numbers are permanent handles and are never reused |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims); dated narratives/evidence are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
-| `patches/` | **the delivery set** (0000-0013: block 00 + blocks 01-13) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
+| `patches/` | **the delivery set** (0000-0014: block 00 + blocks 01-14) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
 | `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean `all` build per block commit), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out). **Index: `scripts/README.md`** |
 | `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
@@ -164,7 +164,8 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   Without it, the interactive chat loop blocks forever. Wrap potentially blocking commands in `timeout`.
 - **Apply method:** all 14 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
   `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
-- **Naming (V2.1):** the current set is **14 blocks, 00-13** (release `release.json .release` —
+- **Naming (V2.1):** the current set is **15 blocks, 00-14** (block 14 is the temporary `-sm relaxed-tensor`
+  block, see `patches/README.md`; release `release.json .release` —
   `v14-3f03b1772-r132` at the 2026-10-24 re-base; the value lives in `release.json`, never here).  Every `block NN`
   reference elsewhere in this file that is not one of the V2.1 numbers below is the **pre-V2.1 16-block
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,

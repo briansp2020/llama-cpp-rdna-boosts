@@ -119,6 +119,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§55** | a quantize cache keyed on a root tensor must match the pointer it fills from, and validate its read range | fix (r132, PR #218) |
 | **§56** | a per-arch dispatch decision keys on the running device, and the pass that consults it selects its own | fix (r132, PR #218) |
 | **§57** | parking the idle slots restores the save-and-clear attention range for a request that runs alone | doctrine (r136, PR #225) |
+| **§58** | a per-device scalar is sound only if its inverse is applied to that device's own partial *before* the reduction — a mode, not a default | doctrine, temporary (r137, block 14; `TODO` #104) |
 
 ---
 
@@ -1538,3 +1539,47 @@ Windows, and the PR's switch-time table was not independently re-measured.
 
 Record: `patches/README.md` (block 12), `ENVIRONMENT.md` §15, `archive/work/server-park-idle-slots/`,
 `WORKLOG.md` 261025.006, PR #225.
+
+
+## 58. A per-device scalar is sound only if its inverse lands on that device's partial before the reduce (r137, block 14) — TEMPORARY
+
+**Status: doctrine for a temporary block.**  `-sm relaxed-tensor` exists only so `flint`/`mellum`/`mistral4`
+can tensor-split; it is expected to be dropped when upstream fixes the MoE amax under a tensor split
+(`TODO` #104).  The rule below is what makes it sound, and it applies to any future "replicated tensor whose
+values differ per device" `PER_DEVICE` state.
+
+**The graph shape.**  `build_amax_src1_f16` takes the max of a whole matmul row and divides `cur` by a
+power of two `e` derived from it, undoing it on the down-projection output.  Under a tensor split no device
+holds a complete row (`n_ff_exp` is split on axis 0), so each device's `e` is the max of its own slice.  The
+claim is that `sum_d W_d . (x_d / e_d) * e_d == sum_d W_d . x_d` **exactly**: `e_d` is a power of two, so the
+scaling commutes with the sum and with the Q8_1 block quantization (whose block scale is `max/127`), and
+`e_d <= e_global` (a local max cannot exceed the global one) means every device keeps at least the
+reference's f16 headroom.
+
+**The rule.**  That equality only holds if the multiply by `e_d` is part of the device's own subgraph, i.e.
+if the reduce point stays **after** the per-device undo.  In the Meta backend that is the delayed-reduce
+MUL-chain in `ggml_backend_meta_graph_compute`, and it must accept `PER_DEVICE` next to `MIRRORED`.  If it
+stops matching, the all-reduce lands on the `mul_mat_id` output and the multiply then uses **one** device's
+`e` on the **summed** partial.  That failure mode is silent in the common case: with the shipped divisor
+(1024) `e = 1` unless a row max exceeds 1024, so a broken ordering and a correct one produce identical
+output on ordinary prompts.  **Verify this mechanism with `e != 1` forced** (the r137 check temporarily
+lowered the divisor to 1), not with the shipped one.
+
+**What is permitted.**  The state may be produced only by `handle_pool_1d` for a whole-row `POOL_MAX` over
+an axis-0 split (a windowed pool would change the output *shape* per device).  It may be consumed only
+elementwise/broadcast on the device that produced it (`div` into `cur`, `mul` out of the down projection).
+Every copy, gather, reconcile or read-back path aborts.  Anything else is `MIRRORED` semantics misapplied,
+which is exactly what upstream #31081 removed.
+
+**Scope.**  Exact on RDNA/HIP.  A backend whose in-kernel `src1` rescale is **non-linear** (Vulkan's
+clamp-into-fp16-range, #30656) is not equivalent, which is why this is an opt-in mode and not part of
+`-sm tensor`.  `ggml_pool_1d` has exactly one producer in the llama graph, so the state is unreachable from
+any arch that does not build the amax rescale.
+
+**Evidence (r137, gfx1201, ROCm 10.1.0).**  Flint Q8_0 2x R9700: greedy text byte-identical to `-sm layer`
+and to itself at 3 GPUs; with the amax divisor forced to 1, an instrumented pool kernel shows each device
+pooling its own 256-wide slice with the per-device maxima differing on ~half of the ~185 calls per run, and
+the text still matches `-sm layer` exactly.  Qwen3.5-4B (no amax node) is byte-identical under `tensor` and
+`relaxed-tensor`.  `scripts/check-gpu-faults.sh` clean.
+
+Record: `patches/README.md` (block 14), `WORKLOG.md` 261025.007, `TODO` #104.

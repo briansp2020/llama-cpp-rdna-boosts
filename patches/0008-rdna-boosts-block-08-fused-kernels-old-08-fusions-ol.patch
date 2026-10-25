@@ -1,7 +1,7 @@
-From 547d5ef4834c36024c2ba0bc6e0cf898469388dd Mon Sep 17 00:00:00 2001
+From c63c0fd03716adc7e0cc9b012d7e9f5cf8881c4a Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
-Subject: [PATCH 08/13] rdna-boosts: block 08: fused kernels (old-08 fusions +
+Subject: [PATCH 08/14] rdna-boosts: block 08: fused kernels (old-08 fusions +
  old-13 fused MoE + old-15 PR57/63)
 
 Merged from the planned 08 fused-prefill and 09 fused-moe: the two are not

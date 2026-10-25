@@ -10,9 +10,10 @@ current delivery.
 
 ## Current delivery
 
-14 blocks (`block 00` + `blocks 01-13`) against `release.json.base`, canonical chain `release.json.tip` /
-`.tree`.  `scripts/validate-set.sh` is green (checksums, then a strict 14/14 apply on a fresh tarball,
-tree equality).  Each block is **one** `git am` commit and the series is **linear**: apply in order, never
+15 blocks (`block 00` + `blocks 01-14`) against `release.json.base`, canonical chain `release.json.tip` /
+`.tree`.  `scripts/validate-set.sh` is green (checksums, then a strict 15/15 apply on a fresh tarball,
+tree equality).  **Block 14 is temporary** (`-sm relaxed-tensor`, a local relaxation of an upstream rule,
+not a supported feature) -- keep it separate and expect to drop it.  Each block is **one** `git am` commit and the series is **linear**: apply in order, never
 reorder, never insert.
 
 ## Apply order
@@ -33,6 +34,7 @@ reorder, never insert.
 | 11 | `0011-…-block-11-qwen4exp-…` | qwen4exp | model, hyper-connections, QSA/indexer, lazy reader, indexer cache (r109 split of the old block 10) |
 | 12 | `0012-…-block-12-campaign-remainder-…` | campaign remainder | CPU wins, backend iface fills, DFlash (incl. the r130 prompt-ingest tail), FA build grouping, mmap reclaim, batched state restore, server prompt-cache residency, idle-slot parking (r136) |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-…` | MTP draft vocabulary subset | **opt-in** (`--spec-draft-mtp-vocab N`), default off; draft-only |
+| 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | `-sm relaxed-tensor` (TEMPORARY) | a local relaxation of upstream #31081: tensor split with a per-device MoE amax scalar, for `flint`/`mellum`/`mistral4`.  **Not a supported feature**; delete this patch to return to the r136 tree |
 
 `rdna-boosts-all.patch` (repo root) is the entire net as ONE patch.  It is a convenience for a one-off
 build at the fork point; it is **not** the reviewable increment and not a substitute for the per-block
@@ -43,7 +45,7 @@ flow.
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout "$(jq -r .base /path/to/rdna-boosts/release.json)"
-bash /path/to/rdna-boosts/scripts/apply-all.sh .     # strict 14/14 git am, tree checked vs release.json
+bash /path/to/rdna-boosts/scripts/apply-all.sh .     # strict 15/15 git am, tree checked vs release.json
 ```
 
 `scripts/apply-all.sh` is the only supported flow.  **Do not `git apply` the concatenated series** — it

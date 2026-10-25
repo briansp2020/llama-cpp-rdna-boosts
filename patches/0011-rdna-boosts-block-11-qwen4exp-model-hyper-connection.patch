@@ -1,7 +1,7 @@
-From 6b1a8ad7817a728f3bdc1665a85e6e4a9c53a2a3 Mon Sep 17 00:00:00 2001
+From 69be7fe7a633391a286c4fd8d5e50e39599ef9c0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
-Subject: [PATCH 11/13] rdna-boosts: block 11: qwen4exp (model,
+Subject: [PATCH 11/14] rdna-boosts: block 11: qwen4exp (model,
  hyper-connections, lazy reader, QSA/indexer)
 
 The qwen4exp (Qwen3.8-Flash-Next) architecture support, split out of the old

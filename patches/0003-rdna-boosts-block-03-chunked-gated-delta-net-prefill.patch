@@ -1,7 +1,7 @@
-From 5552d30bb78ad4101568bd1bf741b381bd2f409e Mon Sep 17 00:00:00 2001
+From b4af5e7dc36b5acc70a358c9607c2a8f39f6cf6c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
-Subject: [PATCH 03/13] rdna-boosts: block 03: chunked gated-delta-net prefill
+Subject: [PATCH 03/14] rdna-boosts: block 03: chunked gated-delta-net prefill
 
 Sources: old 02 (whole block).
 
