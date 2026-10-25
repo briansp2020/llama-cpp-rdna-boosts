@@ -29,6 +29,23 @@
 #   tree scripts/scratch-tree.sh maintains) and never give a release arm its own worktree path.
 #   reliable method.  ccache makes it fast (only the per-block delta recompiles).
 #
+#   WHAT COSTS THE 35 MINUTES (measured 2026-10-25, r138 re-base, gfx1201, -j20):
+#   the default target set is `all`, and one of its TUs dominates everything else:
+#     tests/test-backend-ops.cpp  5m13s  (14.4k lines, one TU, compiles serially)
+#     src/llama-context.cpp          5s
+#   A re-base changes that test TU through the base (and blocks 04/05/07 edit it), so the ladder
+#   sees ~4 *distinct* contents of it, i.e. ~21 of the ~35 minutes are spent compiling a test
+#   binary that says nothing about whether a block's delivery code is sound.  Measured full
+#   ladder: 2101s cold, 95s once every block tree is in ccache.
+#
+#   Two profiles, both honest:
+#     * GATE_TARGETS_FAST (release flow): the libraries + the shipped binaries.  The op tests are
+#       run separately at the tip (`test-backend-ops -o ...`), which is where they can actually
+#       fail, so nothing is lost except "the test TU compiles in every intermediate tree".
+#     * `all` (the r2 standard, the default here): use it when a commit touches tests/ or a
+#       shared header, or once for a re-base when you want the strongest statement.
+#   Do NOT read a fast-profile pass as "every target builds in every block" — it is not that claim.
+#
 # Usage:
 #   ./gate-per-block-build.sh [options]
 #
@@ -50,6 +67,16 @@
 #                                subject in BASE..REV (release speedup: pass the
 #                                previous release tip); the tip is always built so
 #                                the final combination stays compiler-verified
+#   --fast                       build the release profile per commit instead of
+#                                `all`: ggml-hip, llama, llama-cli, llama-server,
+#                                llama-bench, llama-perplexity.  Drops the test and
+#                                example/tool binaries; their coverage is the tip's
+#                                own gates (the release flow builds the tip with
+#                                `all` once and runs `test-backend-ops -o ...`
+#                                there).  See the COST note for the measured reason
+#                                (one test TU is 5m13s cold, and a re-base gives it
+#                                ~4 distinct contents, i.e. ~21 of ~35 minutes)
+#   --targets "T1 T2 ..."        an explicit target list (default: `all`)
 #   --list-only                  print the commits that would be built, then exit
 #
 # Exit: 0 = every commit built, 1 = at least one failed, 2 = usage/prereq error.
@@ -69,6 +96,12 @@ GPU_TARGETS="${GPU_TARGETS:-gfx1201}"
 KEEP_GOING=0
 LIST_ONLY=0
 CHANGED_FROM=""
+# The release profile: the libraries plus the binaries the delivery actually ships/uses.  It drops the
+# test and example/tool binaries, whose coverage is the tip's own gates (the release flow builds the
+# tip with `all` once, and `test-backend-ops -o ...` runs there).
+GATE_TARGETS_FAST="ggml-hip llama llama-cli llama-server llama-bench llama-perplexity"
+TARGETS="${GATE_TARGETS:-all}"
+TARGETS_GIVEN=0
 BASE=""
 TIP=""
 
@@ -85,6 +118,8 @@ while [ $# -gt 0 ]; do
         --gpu-target) GPU_TARGETS="$2"; shift 2 ;;
         --keep-going) KEEP_GOING=1; shift ;;
         --changed-from) CHANGED_FROM="$2"; shift 2 ;;
+        --targets)    TARGETS="$2"; TARGETS_GIVEN=1; shift 2 ;;
+        --fast)       TARGETS="$GATE_TARGETS_FAST"; TARGETS_GIVEN=1; shift ;;
         --list-only)  LIST_ONLY=1; shift ;;
         -h|--help)    usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 2 ;;
@@ -128,7 +163,7 @@ fi
 
 LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rboosts-per-block.XXXXXX")"
 ORIG_REF="$(git -C "$REPO" symbolic-ref -q --short HEAD || git -C "$REPO" rev-parse HEAD)"
-echo "==> per-block build gate: $BASE..$TIP in $REPO"
+echo "==> per-block build gate: $BASE..$TIP in $REPO (targets: $TARGETS)"
 echo "    logs: $LOG_DIR   build dir: $REPO/$BUILD_DIR   jobs: $JOBS"
 [ -n "$CHANGED_FROM" ] && echo "    changed-from: $CHANGED_FROM (blocks whose own delta is unchanged are skipped; the tip is always built)"
 
@@ -204,7 +239,7 @@ for c in "${selected[@]}"; do
         [ "$KEEP_GOING" = 0 ] && break
         continue
     fi
-    if cmake --build "$REPO/$BUILD_DIR" --target all -j "$JOBS" -- -k \
+    if cmake --build "$REPO/$BUILD_DIR" --target $TARGETS -j "$JOBS" -- -k \
             > "$LOG_DIR/${total}.build.log" 2>&1; then
         echo "    BUILD OK ($(( $(date +%s) - t_blk0 ))s)"
         ok=$((ok+1))
@@ -220,7 +255,14 @@ done
 git -C "$REPO" checkout -q "$ORIG_REF" 2>/dev/null || true
 
 echo
-echo "==> result: $ok/$total built, $failed failed in $(( $(date +%s) - t_gate0 ))s (build dir wiped per commit)"
+if [ "$TARGETS" = "all" ]; then
+    echo "==> result: $ok/$total built, $failed failed in $(( $(date +%s) - t_gate0 ))s (build dir wiped per commit)"
+else
+    echo "==> result: $ok/$total built, $failed failed in $(( $(date +%s) - t_gate0 ))s (build dir wiped per commit)"
+    echo "    profile: --fast (NOT the r2 'all' standard): tests/ and the example/tool binaries are"
+    echo "    not built here -- the tip's own release gates cover them (build the tip with 'all' once"
+    echo "    and run test-backend-ops there)"
+fi
 echo "    (a first block that took minutes on an otherwise unchanged tree means ccache has never seen"
 echo "     this --repo path: rerun on the long-lived checkout, see the COST note in this script)"
 if [ "$failed" -ne 0 ]; then
@@ -229,5 +271,9 @@ if [ "$failed" -ne 0 ]; then
     exit 1
 fi
 rm -rf "$LOG_DIR"
-echo "    all $total block commits build the all target"
+if [ "$TARGETS" = "all" ]; then
+    echo "    all $total block commits build the all target"
+else
+    echo "    all $total block commits build the release target profile"
+fi
 exit 0

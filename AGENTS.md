@@ -81,7 +81,7 @@ amendment, or a note in the relevant record).
 | `TODO.md` | **forward-looking only**: open items, items waiting on someone else, accepted limitations, parked ideas. A closed item is one `WORKLOG.md` entry — never a TODO entry. `#NN` numbers are permanent handles and are never reused |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims); dated narratives/evidence are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
 | `patches/` | **the delivery set** (0000-0014: block 00 + blocks 01-14) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
-| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean `all` build per block commit), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out). **Index: `scripts/README.md`** |
+| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out). **Index: `scripts/README.md`** |
 | `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
 | `prompts/` | versioned, hash-stable test prompts; sizes/token counts/**sha256** in `prompts/README.md`. A shipped prompt is **never edited in place** (add a new file); a result is only valid against the prompt hash it names |
@@ -813,7 +813,24 @@ cd ~/llama.cpp && ~/bin/build-llama-rocm          # default BUILD_DIR=build-rocm
 `max_size = 5 GiB` is far too small once one source tree carries several `GGML_CUDA_FA_*` instantiation
 sets: `scripts/gate-per-block-build.sh` then misses on nearly every FA translation unit and evicts the
 entries the next block needs (measured 2026-10-21: block 05 went from ~45 min at 5 GiB to ~7 min after
-`ccache --max-size=30G`).  Set it once per box.
+`ccache --max-size=30G`).  Set it once per box — and note it is **not** the whole story (r138): the
+cache sits at ~14/30 GiB with hundreds of cleanups, so the previous release's block trees are evicted
+before the next one and every re-base pays a cold ladder.  On a box with the disk, 60 GiB keeps two
+release ladders resident.
+
+- **The per-block ladder's cost is ONE translation unit, and it is a test (r138, measured).**
+  `tests/test-backend-ops.cpp` is 14.4k lines in a single TU and takes **5m13s** to compile cold at
+  `-j20` (a `src/*.cpp` TU is ~5 s).  The gate's default target set is `all`, and a re-base changes that
+  TU through the base and through blocks 04/05/07, so the ladder sees ~4 *distinct* contents of it:
+  ~21 of the ~35 minutes are spent compiling a test binary that says nothing about whether a block's
+  delivery code is sound.  Measured full ladder: **2101 s cold, 95 s warm**; `--fast`
+  (`ggml-hip llama llama-cli llama-server llama-bench llama-perplexity`) is **78 s warm** and skips the
+  cold test-TU compiles entirely.  **The release flow uses `--fast`, and covers the rest at the tip**:
+  build the tip with `all` once (the normal `~/bin/build-llama-rocm` build does) and run
+  `test-backend-ops -o …` there.  `--fast` is *not* the r2 "every block builds `all`" claim and its
+  result line says so — use plain `all` when a commit touches `tests/` or a shared header, or when the
+  strongest statement is wanted.  An ordinary release does not pay the ladder at all: pass
+  `--changed-from <previous tip>` (r137: 1 block, **8 s**).
 
 - **Never give an arm its own source path: ccache keys on it (measured 2026-10-25).**  The same r132
   content rebuilt in a **new** worktree path costs **5m56s wall / 85 CPU-min, all misses**; the same

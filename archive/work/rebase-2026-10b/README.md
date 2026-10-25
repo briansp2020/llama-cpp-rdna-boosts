@@ -77,6 +77,16 @@ policy, and both fused gate/up paths are arch-disjoint so the NVIDIA arm is upst
    know an attribution fix did not change the delivery — check it, because the gate's verdict changes while
    the artifact must not.
 
+## Follow-up this campaign produced: the ladder's cost is one test TU
+
+`gate-per-block-build.sh` gained `--fast` (release profile: `ggml-hip llama llama-cli llama-server
+llama-bench llama-perplexity`) and the release flow now uses it, because the measurement above showed
+**where** the 2101 s goes: `tests/test-backend-ops.cpp` is one 14.4k-line TU that costs **5m13s** cold
+(a `src/*.cpp` TU is ~5 s), and a re-base gives the ladder ~4 distinct contents of it.  So ~21 of the
+~35 minutes were a test binary that cannot fail on delivery code.  `--fast` is 78 s warm, and the
+dropped coverage is restored at the tip (build `all` once, run `test-backend-ops -o …`).  The default
+stays `all` (the r2 standard) and the result line names the profile it used.
+
 ## Where the work lived
 
 * `~/llama-scratch`, branch `fixchain` (pre-fix chains: `rb2`, and the intermediate amends
