@@ -1,4 +1,4 @@
-From d43d6634c195927f6b57c8dd44d0470784c7136d Mon Sep 17 00:00:00 2001
+From 43505eac87fda225a27bc4fac4b4d6f4a445cb1f Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/13] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -83,7 +83,7 @@ index 4c2e0fa63..5a3a44ff5 100644
          {"--spec-draft-n-min"}, "N",
          string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
 diff --git a/common/common.cpp b/common/common.cpp
-index a4a45e891..215f07b69 100644
+index 255ddc886..2ee605be6 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1290,7 +1290,8 @@ common_init_result::common_init_result(common_params & params, bool model_only,
@@ -97,7 +97,7 @@ index a4a45e891..215f07b69 100644
          cparams_dft.n_rs_seq = 0;
  
 diff --git a/common/common.h b/common/common.h
-index eef808c72..1c45ab40e 100644
+index df8caafba..ec1dd017b 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -360,6 +360,9 @@ struct common_params_speculative_draft {

@@ -1,5 +1,81 @@
 # WORKLOG - dated delivery records
 
+## 261025.006 (r136) -- PR #225: park the resident idle slots at the top of a unified KV cache
+
+**Release:** `v14-3f03b1772-r136`.  Base `3f03b1772` (base tree `14370bd49a`), canonical tip `43505eac8`,
+tree `0c372dd2316a8c988086a0236b4664cb03a1adc2`, 14 blocks.  `scripts/validate-set.sh` green (checksums,
+fresh-tarball **strict 14/14** `git am`, applied tree == recorded tree); per-block build gate **2/2** with
+`--changed-from pre-r136` (block 12's delta changed, the tip is always rebuilt); prefill-logit gate
+**KLD 0.000000 / same-top-p 99.980 %**; adaptive-MTP four axes (Protocol A, 27B UD-Q4_K_XL, 1 GPU,
+`-n 3000`, `--spec-draft-n-max 3`, reasoning pinned) acceptance **R 0.53158 / P 0.78686 / C 0.86744 /
+K 0.99200**, MTP vs plain **1.79x / 2.31x / 2.46x / 2.70x**, and P/C text byte-identical (`6450` chars
+sha `5fee404b9957`; `13145` chars sha `13a522e90425`); coherence vs the r135 build byte-identical on
+dense 4B 1 GPU and 3 GPU `-sm tensor` (the timing line filtered).  **No block renumbered, merged or split.**  The whole change
+is a fold inside **block 12** (8 files: `common/common.cpp|h`, `src/llama-ext.h`, `src/llama-kv-cache.cpp|h`,
+`src/llama-kv-cells.h`, `src/llama-memory.cpp`, `tools/server/server-context.cpp`); block 13's patch is
+regenerated because its parent tree changed, not because its content did.  Two new env vars
+(`LLAMA_SERVER_PARK_IDLE_SLOTS`, on; `LLAMA_KV_PARK_DEBUG`, diagnostic) and no kernel or dispatch change.
+
+Reported by **@overdoingism** (PR #225, `wip/server-park-idle-slots`; the PR text says it was written with
+Claude).  This entry records the promotion and the delivery's own gates, not a re-statement of the PR.
+
+### What it fixes, and the change
+
+#210 (r130) keeps an idle slot's KV resident in a unified cache.  A request that then runs alone no longer
+starts in an empty cache: its cells land after the resident ones and its attention range (`n_kv`) covers
+them.  Flash attention's KV tiling and split depend on the cell indices and on `n_kv`, so near-ties can
+resolve the other way (the reporter's 4/16 repeat test; our own 13/32 with the same-slot schedule).
+
+Block 12 now has a staging API, `llama_memory_seq_park()` / `llama_memory_can_park()` (`llama-ext.h`):
+`seq_park` moves a sequence's cells to the top of a unified cache, below the sequences parked before it,
+copying the K/V rows on the device and moving the cell state (`llama_kv_cells::mv`, including `seq_pos` and
+the extension).  New cells are taken only below the lowest parked cell (`find_slot`) and `get_n_kv()` stops
+there too, so a sequence in the low cells attends over the same range, at the same cell indices, as when
+the idle slots are saved and cleared.  `seq_unpark` moves a parked sequence back to the lowest free run, and
+`park_compact` keeps the parked stack together.  Parking is refused unless the cache has one stream,
+unshared cells, a non-transposed V and no sliding window.  The server parks idle slots when a task starts
+and unparks the slots that run (`LLAMA_SERVER_PARK_IDLE_SLOTS`, on unless `0`, together with the lazy idle
+slots and `--kv-unified`); a cache that cannot park keeps #210 unchanged and says so once.
+
+A slot whose cells are not one run of its own (shared through `seq_cp`, for example a cached prompt-prefix
+restore) cannot be parked.  It is saved and cleared by default, which is the lazy-off output.  **Delivery
+fix on top of the PR:** with `--no-cache-idle-slots` there is no saved copy to restore and the lazy idle
+slots are meant to stay resident, so such a slot is now left resident instead of being cleared.  The
+fallback still logs at INFO; the `--no-cache-idle-slots` case logs at DBG.
+
+### Accuracy of the PR's claims (our measurements)
+
+Gfx1201, ROCm 10.1.0, 27B UD-Q4_K_XL + DFlash2-Q4_K_M, 4 slots, `-c 131072 --kv-unified -fa on -ctk/ctv q8_0`,
+16 varied prompts, two rounds, `cache_prompt: false`:
+
+| arm | rounds identical | parking == lazy-off |
+|---|---|---|
+| parking (default) | **16/16** | **32/32** |
+| `LLAMA_SERVER_LAZY_IDLE_SLOTS=0` | 16/16 | -- |
+| `LLAMA_SERVER_PARK_IDLE_SLOTS=0` (#210) | 13/16 | 13/32 |
+
+With `cache_prompt: true` and a shared prompt prefix (the prefix restore creates cells shared through
+`seq_cp`), both parking and lazy-off measure 12/16 across rounds and still agree **32/32**; the fallback is
+by design, not a defect, and it is why the reporter's "no fallback fired" is workload-specific.  The
+reporter's 16/16 is likewise their request set: the round-to-round disagreement that remains with
+`cache_prompt: true` is present in the lazy-off arm too, so it is not introduced by parking.
+
+Other arms: `-fa off` (V transposed) and Gemma-4 E4B (sliding window) report parking as unsupported and
+are text-identical with the switch on and off; dense Qwen3.5-4B (hybrid attention/recurrent) has
+parking on == lazy-off 16/16; 2 GPU `-sm tensor` on the 4B works with no parking failure.  The reporter did
+not cover multi-GPU, MoE with the expert cache, vision or more than 4 slots; the 2-GPU tensor smoke is the
+extent of our coverage there.  We did **not** independently re-measure the PR's switch-time table
+(0.85 s #210 / 0.90 s parking / 2.01 s lazy at 40K); the correctness comparison above is the gate.  The
+adaptive-MTP four-axis numbers above are the release gate, not a parking measurement (llama-cli never
+calls `seq_park`).
+
+### Records
+
+`patches/README.md` (block 12), `MANIFESTS.md` (row 12), `ENVIRONMENT.md` §15, `GREEDY-PURITY.md` §57 (and
+the §38 note), `archive/work/server-park-idle-slots/` (the PR as submitted plus our evidence).  The
+`rdna-boosts` fork branch is refreshed to the canonical tip and force-pushed to the personal fork; the
+container worker picks the tag up as usual.
+
 ## 261025.005 (r135) -- issue #219: a device VRAM budget, and an over-budget `--fit` that says so
 
 **Release:** `v14-3f03b1772-r135`.  Base `3f03b1772` (base tree `14370bd49a`), canonical tip `d43d6634c`,

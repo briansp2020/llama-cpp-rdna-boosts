@@ -20,8 +20,8 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 `097cf33d9` (2026-10-12) onto **`3f03b1772`** (2026-10-24) — 261 upstream commits, including a chunked GDN
 prefill kernel, a MoE cache rewritten to SLRU, chunked CUDA graphs, a 4 GiB pinned-host cap, a fused QSA
 mask op and reworked MMQ/MMVQ tuning.  Between re-bases every `rN` is a **block amendment** at the same base
-(the current release, `v14-3f03b1772-r135`, is one: an opt-in device free-VRAM budget at the
-allocation choke point plus an over-budget `--fit` diagnostic, neither of which changes a kernel), so the block
+(the current release, `v14-3f03b1772-r136`, is one: idle-slot parking in the server KV cache, which
+changes no kernel), so the block
 series and its recorded trees stay comparable.  A re-base is a deliberate event with its own `WORKLOG.md`
 entry and a record in [`archive/docs/baseline-history.md`](archive/docs/baseline-history.md).
 

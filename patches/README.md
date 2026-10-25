@@ -1224,6 +1224,28 @@ had no other home.
   default and covers both arms.  Measured on gfx1201: conversation switch at 11.5K tokens 0.5 -> 0.2-0.3 s
   (same text), the overflow case 8.3 s recompute -> 0.5 s restore with 4 tokens evaluated, 4-slot concurrent
   storm 13/13 requests green.  Record: `archive/work/server-prompt-cache-lazy/`.
+* **Idle-slot parking** (r136, PR #225, `archive/work/server-park-idle-slots/`): #210's resident idle slots
+  change a request's `n_kv` and cell indices, so a sequence that runs alone no longer sees the empty-cache
+  attention layout and near-ties can flip (the reporter's 4/16 repeat test; our same-slot schedule measured
+  13/32 against lazy-off).  `llama_memory_seq_park(mem, seq_id, park)` (`llama-ext.h`, implemented in
+  `llama-kv-cache.cpp` + `llama-memory.cpp`) moves a sequence's cells to the top of a unified cache, below
+  the previously parked sequences, with a device copy of the K/V rows and the cell state
+  (`llama_kv_cells::mv`, including `seq_pos` and the extension); `seq_unpark` moves one back to the lowest
+  free run and `park_compact` keeps the stack together.  New cells are only taken below the lowest parked
+  cell (`find_slot`) and `get_n_kv()` stops there, so a running sequence attends over the same range at the
+  same indices as with the idle slots saved and cleared.  `llama_memory_can_park()` requires one stream,
+  cells no other cache shares, V not transposed and no sliding window.  The server parks idle slots at task
+  start and unparks the processing ones (`LLAMA_SERVER_PARK_IDLE_SLOTS`, on unless `0`, with the lazy idle
+  slots and `--kv-unified`); a cache that cannot park keeps #210 and logs once.  A slot whose cells are not
+  one run of its own (shared through `seq_cp`, e.g. a cached prefix restore) is saved and cleared, which
+  is the lazy-off output.  **The delivery fix on top of the PR:** with `--no-cache-idle-slots` it is left
+  resident instead (there is no saved copy to restore, and that flag means the lazy slots stay resident).
+  Measured (gfx1201, 27B UD-Q4_K_XL + DFlash2, 4 slots, `--kv-unified`, q8_0 KV, 16 prompts two rounds,
+  `cache_prompt: false`): parking **16/16** and **32/32** equal to `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`, while
+  `LLAMA_SERVER_PARK_IDLE_SLOTS=0` is 13/16 and 13/32.  `-fa off`, a sliding-window model and a cache that
+  cannot park are text-identical with the switch on/off; hybrid attention/recurrent is 16/16 equal to
+  lazy-off; 2 GPU `-sm tensor` works.  `GREEDY-PURITY.md` §57.  The reporter did not cover MoE with the
+  expert cache, vision, more than 4 slots or Windows, and we did not re-measure the switch-time table.
 * **The batched state save and restore** (r96, PR #189; restore r119, PR #209): `llama_io_write_host`
   queues its deferred reads as `ggml_backend_tensor_get_async` into one pinned staging buffer kept by the
   context, synchronizes each backend once, then copies to the caller's buffer.  A recurrent model's

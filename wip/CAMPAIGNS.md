@@ -38,6 +38,15 @@ chunked CUDA graphs moved our AR-stage hook to the last chunk's capture, and the
 record (`README.md`, `STATE.md`, `DECISIONS.md`, `GOTCHAS.md`, the surveys) is preserved under
 `archive/work/rebase-2026-10/`; see `WORKLOG.md` 261024.008.
 
+**Promoted (r136, 2026-10-25, block 12).**  PR #225 (`@overdoingism`, `wip/server-park-idle-slots/`) left
+`wip/` for [`archive/work/server-park-idle-slots/`](../archive/work/server-park-idle-slots/RESOLUTION.md):
+`llama_memory_seq_park()` parks the resident idle slots at the top of a unified KV cache and moves the
+running slot to the low cells, so a request that runs alone sees the same `n_kv` and cell indices as with
+`LLAMA_SERVER_LAZY_IDLE_SLOTS=0` (27B + DFlash2, 4 slots, `cache_prompt: false`: 16/16 rounds and 32/32
+equal to lazy-off, against 13/16 and 13/32 for #210).  `LLAMA_SERVER_PARK_IDLE_SLOTS` is on unless `0`;
+a cache that cannot park keeps #210.  The delivery added the `--no-cache-idle-slots` fallback (leave the
+slot resident instead of clearing it).  `GREEDY-PURITY.md` §57, `WORKLOG.md` 261025.006.
+
 **Promoted (r133, 2026-10-25, block 05).**  PR #223 (`@overdoingism`, `wip/fa-band-skip/`) left `wip/` for
 [`archive/work/fa-band-skip/`](../archive/work/fa-band-skip/README.md): the fully-masked KV-group skip now
 reaches the **decode/verify band** as well as prefill, so a resident idle conversation no longer taxes the

@@ -114,6 +114,11 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§50** | a draft length is a verify width *and* a memory-tier parameter: with host experts served by the arena, a verify batch wider than the cache band leaves VRAM and streams the routed experts from host on every step | doctrine (r123, TODO #59 closed) |
 | **§51** | a kernel-config row keyed on one tile dimension also configures every query width that reaches that tile: a decode/verify-band row must not be reachable from prefill | doctrine (`TODO` #97/#98, 2026-10-24) |
 | **§52** | an op with no test case has no oracle: `HC_COMBINE` ran 0/0 in `test-backend-ops`, so a wrong fused residual combine was invisible to every gate — the op and the default-on fusion that consumes it are covered since r128 | fix (r128, TODO #100 closed) |
+| **§53** | a draft with a window on every layer never reads the prompt rows before the window; skipping their ingest is exact | doctrine/fix (r130) |
+| **§54** | a fill of an input the graph may not consume is guarded on `buffer`, never on the pointer | fix (r131, PR #222) |
+| **§55** | a quantize cache keyed on a root tensor must match the pointer it fills from, and validate its read range | fix (r132, PR #218) |
+| **§56** | a per-arch dispatch decision keys on the running device, and the pass that consults it selects its own | fix (r132, PR #218) |
+| **§57** | parking the idle slots restores the save-and-clear attention range for a request that runs alone | doctrine (r136, PR #225) |
 
 ---
 
@@ -736,6 +741,11 @@ concurrent-server text hash as a purity gate or a bisection oracle.  The reporte
 start-to-start flip (surviving `--no-kv-unified`) is **not** this root, was not reproduced on Linux, and is
 tracked as TODO #67.  Record:
 `archive/work/kv-cell-offset-nondeterminism/RESOLUTION.md`.
+
+**One-at-a-time serving since r136:** `LLAMA_SERVER_PARK_IDLE_SLOTS` (default on) parks the resident idle
+slots at the top of a unified cache and moves the running slot to the low cells, so a request that runs
+alone sees the same range and cell indices as with the idle slots saved and cleared.  That restores the
+sequential case only; a concurrent batch still changes the kernel/reduction order.  See §57.
 
 ## 39. A decode-only fusion must match the standalone launch it replaces
 
@@ -1492,3 +1502,39 @@ numbers are the only mixed-arch measurements).
 
 Record: `patches/README.md` (block 06), `MANIFESTS.md` (per-block row 06), `archive/work/pr213-pr218-r132/`,
 `WORKLOG.md` 261025.001, PR #218.
+
+---
+
+## 57. Parking the idle slots restores the save-and-clear attention range for a request that runs alone
+
+**Claim.**  A unified KV cache makes a sequence's attention result depend on the cells of every resident
+sequence (`§38`): the FA tiling/split reads `n_kv` and the cell indices.  `LLAMA_SERVER_LAZY_IDLE_SLOTS`
+(r130) keeps idle slots resident, which made that placement dependence reach plain sequential serving: the
+same 16 requests sent one at a time in two rounds agreed on 4/16 in the reporter's test (13/32 in ours).
+Parking the idle slots at the top of the cache and moving the running slot to the low cells (`seq_park` /
+`seq_unpark`) gives the running slot the same range and indices as when the idle slots are saved and
+cleared, so it reproduces the `LLAMA_SERVER_LAZY_IDLE_SLOTS=0` output.
+
+**Rule.**  `LLAMA_SERVER_PARK_IDLE_SLOTS` (on unless `0`) is part of the lazy-idle-slot path and applies
+only to a `--kv-unified` cache.  A cache can park only when it has one stream, cells no other cache shares,
+V not transposed and no sliding window (`llama_memory_can_park()`); anything else keeps #210 unchanged and
+logs once.  New cells (`find_slot`) and `get_n_kv()` stop below the lowest parked cell, and every path that
+moves or removes cells keeps the parked ranges honest (`park_refresh` on `seq_rm`/`seq_keep`; `seq_cp`
+gives parking up).  An idle slot whose cells are not one run of its own (shared through `seq_cp`, e.g. a
+cached prefix restore) cannot be parked: it is saved and cleared by default, or left resident with
+`--no-cache-idle-slots`, so the output stays the lazy-off output either way.  Do not claim determinism for
+concurrent decoding: parking does not change batch composition (§38).
+
+**Evidence (r136, gfx1201, ROCm 10.1.0).**  27B UD-Q4_K_XL + DFlash2-Q4_K_M, 4 slots, `-c 131072
+--kv-unified -fa on -ctk/ctv q8_0`, 16 varied prompts, two rounds, `cache_prompt: false`: parking
+**16/16** rounds and **32/32** equal to lazy-off; parking off (#210) **13/16** and **13/32**.  With
+`cache_prompt: true` and a shared prefix (cells shared by `seq_cp`), both parking and lazy-off are 12/16
+across rounds and still 32/32 equal; the fallback is by design.  Dense Qwen3.5-4B (hybrid) parking ==
+lazy-off 16/16; 2 GPU `-sm tensor` on the 4B has no parking failure; `-fa off` (V transposed) and
+Gemma-4 E4B (sliding window) report parking unsupported and are text-identical on/off.  The prefill-logit
+gate on the release build is KLD 0.000000 / 99.980 %, and the 4B coherence is byte-identical to r135 on
+1 GPU and 3 GPU `-sm tensor`.  The reporter did not cover MoE with the expert cache, vision, >4 slots or
+Windows, and the PR's switch-time table was not independently re-measured.
+
+Record: `patches/README.md` (block 12), `ENVIRONMENT.md` §15, `archive/work/server-park-idle-slots/`,
+`WORKLOG.md` 261025.006, PR #225.

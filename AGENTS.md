@@ -541,6 +541,14 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   op-test oracle is the **decode-width packed-hole** case set (`mask_hole=1`, `nb` 1/2/3/8, f16/bf16/q8_0);
   mutating the kernel's group test to skip one visible group fails all 14 of those cases.  Do not widen the
   gate to the tile kernel without that family's own hole cases and a measurement.  `GREEDY-PURITY.md` §37.
+- **Idle-slot parking is the sequential-reproducibility fix for #210's lazy idle slots (r136, PR #225, block 12).**
+  `LLAMA_SERVER_PARK_IDLE_SLOTS` (on unless `0`, with the lazy idle slots and `--kv-unified`) parks idle slots at
+  the top of a unified cache and moves the running slot to the low cells, so `n_kv` and the cell indices match the
+  save-and-clear layout; new cells and `get_n_kv()` stop below the parked stack.  It requires one stream, cells no
+  other cache shares, V not transposed and no sliding window; anything else keeps #210 and logs once.  A slot whose
+  cells are not one run (shared through `seq_cp`, e.g. a cached prefix) falls back to save-and-clear, or stays
+  resident with `--no-cache-idle-slots`.  It does **not** make concurrent decoding deterministic (that is §38).
+  `LLAMA_KV_PARK_DEBUG=1` logs every move and refusal.  `GREEDY-PURITY.md` §57.
 - **The band's two query-width blocks must share one geometry (r134, issue #224, block 05).**  A band block
   splits each Q column's KV rows `np = nwarps*cols_per_warp/ncols` ways (`cols_per_warp` is 16 for the RDNA4
   256-dim WMMA tiles), so the 32-column block (widths 1..4, 8 warps) is `np = 4` and the 64-column block

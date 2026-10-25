@@ -1,0 +1,742 @@
+From e2bbb8a19af8cf77b557bbfb2c220f5c89136d21 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:43:05 +0800
+Subject: [PATCH] server, kv-cache: park the resident idle slots at the top of
+ a unified KV cache (LLAMA_SERVER_PARK_IDLE_SLOTS)
+
+#210 keeps an idle slot's context resident in a unified KV cache instead of saving and clearing it when a new task
+starts.  A sequence that then runs alone no longer starts in an empty cache: its cells land after the resident ones, and
+its attention range (n_kv) covers them too.  Flash attention's KV tiling and split depend on the cell indices and on n_kv,
+so near-ties resolve differently.  Two one-at-a-time rounds of the same 16 requests agreed on 4/16 with resident idle
+slots, and on 16/16 with LLAMA_SERVER_LAZY_IDLE_SLOTS=0 (gfx1201, Qwen3.8-27B + DFlash2, 4 slots).
+
+The KV cache can now park a sequence.  llama_memory_seq_park() (staging API in llama-ext.h) moves its cells to the top of
+the cache, below the sequences parked before it, with a device copy of the K/V rows and the cell state.  New cells are
+only taken below the lowest parked cell, and get_n_kv() stops below it.  Parking and unparking keep the parked sequences
+together at the top.  llama_memory_can_park() tells whether a cache supports it: one stream, cells it does not share,
+V not transposed, no sliding window.
+
+When a task starts, the server parks the idle slots and moves the slots that run back to the low cells.  A sequence that
+runs alone then sits in the same cells and attends over the same range as when the idle slots are saved and cleared, so
+it gives the same output, and the switch stays a device copy instead of a round trip through the host prompt cache.
+- An idle slot that cannot be parked (its cells are not one run, or there is no room) is saved and cleared as before.
+- A slot that cannot come back down frees room by clearing the least recently used idle slots.
+- A KV cache that does not support parking keeps #210's lazy idle slots unchanged.
+- The draft context is not parked: it does not decide the output, and a sliding-window draft cache reuses its cells.
+
+LLAMA_SERVER_PARK_IDLE_SLOTS=0 keeps #210's behaviour; LLAMA_KV_PARK_DEBUG=1 logs every move and every refusal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/common.cpp               |   9 +
+ common/common.h                 |   7 +
+ src/llama-ext.h                 |  12 ++
+ src/llama-kv-cache.cpp          | 292 +++++++++++++++++++++++++++++++-
+ src/llama-kv-cache.h            |  30 ++++
+ src/llama-kv-cells.h            |  33 ++++
+ src/llama-memory.cpp            |  63 +++++++
+ tools/server/server-context.cpp |  52 ++++++
+ 8 files changed, 491 insertions(+), 7 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index 215f07b69..2ee605be6 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1959,6 +1959,15 @@ void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, lla
+     }
+ }
+ 
++bool common_memory::seq_park(llama_seq_id seq_id, bool park) const {
++    llama_synchronize(ctx_tgt);
++    return llama_memory_seq_park(llama_get_memory(ctx_tgt), seq_id, park);
++}
++
++bool common_memory::can_park() const {
++    return llama_memory_can_park(llama_get_memory(ctx_tgt));
++}
++
+ void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
+     common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
+     if (ctx_dft) {
+diff --git a/common/common.h b/common/common.h
+index 1c45ab40e..ec1dd017b 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1143,6 +1143,13 @@ struct common_memory {
+     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
+     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
++
++    // llama_memory_seq_park() on the target context (synchronized first).  The draft context is left as it is: the draft
++    // does not decide the output, and a draft with a sliding window (DFlash2) has a small cache that reuses its cells
++    bool seq_park(llama_seq_id seq_id, bool park) const;
++
++    // llama_memory_can_park() of the target context
++    bool can_park() const;
+ };
+ 
+ //
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index a7d528f6f..e9a4c78fc 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -105,6 +105,18 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
+ // the backend buffers that a state write of this memory would touch - empty caches report none
+ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
+ 
++// Parking (unified KV cache).  park = true moves the cells of an idle sequence to the top of the attention cache(s) of
++// mem: the sequences that are decoded keep the low cells, and attend over the same range at the same cell indices as
++// in a cache that holds nothing else, so their results no longer depend on what is parked.  park = false moves a
++// parked sequence back to the lowest free cells.  Returns false, changing nothing, when the move is not possible
++// (a split cache, shared or fragmented cells, no room); a memory without an attention cache returns true.  The K/V data
++// are copied on the device, so synchronize the context first.
++LLAMA_API bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park);
++
++// Whether the attention cache(s) of mem support parking at all (see llama_memory_seq_park): a unified cache whose cells
++// no other cache shares, with V not transposed and no sliding window.  A memory without an attention cache: true.
++LLAMA_API bool llama_memory_can_park(llama_memory_t mem);
++
+ // Turn the KV cache attention rotation on or off for the contexts created from this model.
+ // Useful for testing purposes.
+ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 144decfd8..a9482af51 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -419,6 +419,8 @@ void llama_kv_cache::clear(bool data) {
+         v_heads[s] = 0;
+     }
+ 
++    parked.clear();
++
+     if (data) {
+         for (auto & [_, buf] : ctxs_bufs) {
+             ggml_backend_buffer_clear(buf.get(), 0);
+@@ -467,6 +469,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+         if (new_head != cells.size() && new_head < head) {
+             head = new_head;
+         }
++
++        if (parked.count(seq_id) > 0) {
++            park_refresh();
++        }
+     } else {
+         // match any sequence
+         for (uint32_t s = 0; s < n_stream; ++s) {
+@@ -493,6 +499,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+                 head = new_head;
+             }
+         }
++
++        if (!parked.empty()) {
++            park_refresh();
++        }
+     }
+ 
+     return true;
+@@ -507,6 +517,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
+     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
+ 
++    if (parked.count(seq_id_src) > 0 || parked.count(seq_id_dst) > 0) {
++        parked.clear(); // a copy out of (or into) the parked cells: give up parking rather than hide cells from the range
++    }
++
+     const auto s0 = seq_to_stream[seq_id_src];
+     const auto s1 = seq_to_stream[seq_id_dst];
+ 
+@@ -611,12 +625,257 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+         }
+     }
+ 
++    if (!parked.empty()) {
++        park_refresh();
++    }
++
+     // If we freed up a slot, set head to it so searching can start there.
+     if (new_head != cells.size() && new_head < head) {
+         head = new_head;
+     }
+ }
+ 
++// LLAMA_KV_PARK_DEBUG=1: log every park, unpark and compaction move, and why a park or an unpark is refused
++static bool llama_kv_park_debug() {
++    static const bool v = getenv("LLAMA_KV_PARK_DEBUG") != nullptr && atoi(getenv("LLAMA_KV_PARK_DEBUG")) != 0;
++    return v;
++}
++
++uint32_t llama_kv_cache::park_bound() const {
++    uint32_t res = v_cells[0].size();
++    for (const auto & [seq_id, range] : parked) {
++        res = std::min(res, range.first);
++    }
++    return res;
++}
++
++void llama_kv_cache::park_refresh() {
++    const auto & cells = v_cells[0];
++    for (auto it = parked.begin(); it != parked.end(); ) {
++        uint32_t lo = it->second.second;
++        uint32_t hi = it->second.first;
++        for (uint32_t i = it->second.first; i < it->second.second; ++i) {
++            if (!cells.is_empty(i) && cells.seq_has(i, it->first)) {
++                lo = std::min(lo, i);
++                hi = i + 1;
++            }
++        }
++        if (lo >= hi) {
++            it = parked.erase(it);
++        } else {
++            it->second = { lo, hi };
++            ++it;
++        }
++    }
++}
++
++void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
++    if (src == dst || n == 0) {
++        return;
++    }
++
++    auto & cells = v_cells[0];
++
++    // copy in chunks no longer than the distance, from the end when moving up and from the start when moving down, so
++    // that no chunk overwrites cells that have not been moved yet
++    const uint32_t dist  = src > dst ? src - dst : dst - src;
++    const uint32_t chunk = std::min(n, dist);
++
++    ggml_init_params params = {
++        /*.mem_size   =*/ 4*layers.size()*ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++
++    for (uint32_t done = 0; done < n; done += chunk) {
++        const uint32_t len = std::min(chunk, n - done);
++        const uint32_t off = dst > src ? n - done - len : done;
++
++        ggml_context_ptr ctx { ggml_init(params) };
++
++        for (const auto & layer : layers) {
++            for (ggml_tensor * t : { layer.k, layer.v }) {
++                if (t == nullptr) {
++                    continue;
++                }
++                ggml_tensor * a = ggml_view_2d(ctx.get(), t, t->ne[0], len, t->nb[1], (size_t) (src + off)*t->nb[1]);
++                ggml_tensor * b = ggml_view_2d(ctx.get(), t, t->ne[0], len, t->nb[1], (size_t) (dst + off)*t->nb[1]);
++                GGML_ASSERT(ggml_backend_view_init(a) == GGML_STATUS_SUCCESS);
++                GGML_ASSERT(ggml_backend_view_init(b) == GGML_STATUS_SUCCESS);
++                ggml_backend_tensor_copy(a, b);
++            }
++        }
++
++        if (dst > src) {
++            for (uint32_t i = len; i-- > 0; ) {
++                cells.mv(src + off + i, dst + off + i);
++            }
++        } else {
++            for (uint32_t i = 0; i < len; ++i) {
++                cells.mv(src + off + i, dst + off + i);
++            }
++        }
++    }
++}
++
++// the cells of seq_id in stream 0, when they form one run that holds no other sequence: [lo, hi); else lo == hi
++static std::pair<uint32_t, uint32_t> llama_kv_cache_seq_run(const llama_kv_cells & cells, llama_seq_id seq_id);
++
++void llama_kv_cache::park_compact() {
++    std::vector<std::pair<uint32_t, llama_seq_id>> order;
++    for (const auto & [seq_id, range] : parked) {
++        order.emplace_back(range.first, seq_id);
++    }
++    std::sort(order.rbegin(), order.rend());
++
++    const auto & cells = v_cells[0];
++
++    uint32_t top = cells.size();
++    for (const auto & [lo_old, seq_id] : order) {
++        GGML_UNUSED(lo_old);
++        const auto [lo, hi] = llama_kv_cache_seq_run(cells, seq_id);
++        if (lo == hi) {
++            break; // not one run any more: leave the rest where it is
++        }
++        const uint32_t n = hi - lo;
++        if (hi != top) {
++            // between this sequence and the ones above it there are only free cells: the region above lo up to top
++            // holds no active cell (those are all below the lowest parked one) and no other parked sequence
++            park_move(lo, top - n, n);
++            if (llama_kv_park_debug()) {
++                LLAMA_LOG_WARN("%s: seq %d [%u, %u) -> [%u, %u)\n", __func__, seq_id, lo, hi, top - n, top);
++            }
++        }
++        parked[seq_id] = { top - n, top };
++        top -= n;
++    }
++}
++
++static std::pair<uint32_t, uint32_t> llama_kv_cache_seq_run(const llama_kv_cells & cells, llama_seq_id seq_id) {
++    uint32_t lo = 0;
++    uint32_t hi = 0;
++    uint32_t n  = 0;
++    for (const auto & [pos, i] : cells.seq_pos_get(seq_id)) {
++        GGML_UNUSED(pos);
++        if (cells.seq_count(i) != 1) {
++            return { 0, 0 };
++        }
++        lo = n == 0 ? i : std::min(lo, i);
++        hi = n == 0 ? i + 1 : std::max(hi, i + 1);
++        n++;
++    }
++    return n == hi - lo ? std::make_pair(lo, hi) : std::make_pair(0u, 0u);
++}
++
++bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
++    if (!can_park()) {
++        return false;
++    }
++    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
++        return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
++    }
++
++    auto & cells = v_cells[0];
++
++    const auto [lo, hi] = llama_kv_cache_seq_run(cells, seq_id);
++    if (lo == hi) {
++        if (llama_kv_park_debug() && !cells.seq_pos_get(seq_id).empty()) {
++            LLAMA_LOG_WARN("%s: seq %d: its %zu cells are not one run of its own\n", __func__, seq_id, cells.seq_pos_get(seq_id).size());
++        }
++        return cells.seq_pos_get(seq_id).empty(); // nothing to park, or a run that cannot move
++    }
++
++    park_compact();
++
++    const uint32_t n     = hi - lo;
++    const uint32_t bound = park_bound();
++    if (n > bound) {
++        return false;
++    }
++    const uint32_t dst = bound - n;
++
++    // the target run must hold nothing but free cells and cells of the run itself
++    for (uint32_t i = dst; i < bound; ++i) {
++        if (!cells.is_empty(i) && (i < lo || i >= hi)) {
++            if (llama_kv_park_debug()) {
++                LLAMA_LOG_WARN("%s: seq %d [%u, %u): cell %u of the target [%u, %u) is taken (seq %d)\n", __func__, seq_id, lo, hi,
++                        i, dst, bound, cells.seq_count(i) == 1 ? cells.seq_get(i) : -1);
++            }
++            return false;
++        }
++    }
++
++    park_move(lo, dst, n);
++    parked[seq_id] = { dst, bound };
++    if (llama_kv_park_debug()) {
++        LLAMA_LOG_WARN("%s: seq %d [%u, %u) -> [%u, %u)\n", __func__, seq_id, lo, hi, dst, bound);
++    }
++
++    auto & head = v_heads[0];
++    head = std::min(head, lo);
++
++    return true;
++}
++
++bool llama_kv_cache::seq_unpark(llama_seq_id seq_id) {
++    const auto it = parked.find(seq_id);
++    if (it == parked.end()) {
++        return true;
++    }
++
++    auto & cells = v_cells[0];
++
++    const auto [lo, hi] = llama_kv_cache_seq_run(cells, seq_id);
++    if (lo == hi) {
++        return false;
++    }
++    const uint32_t n = hi - lo;
++
++    const auto range = it->second;
++    parked.erase(it);
++    const uint32_t bound = park_bound();
++
++    // the lowest run of n cells below the remaining parked ones that holds nothing but free cells and cells of the run
++    uint32_t dst = 0;
++    uint32_t len = 0;
++    for (uint32_t i = 0; i < bound && len < n; ++i) {
++        if (cells.is_empty(i) || (i >= lo && i < hi)) {
++            if (len == 0) {
++                dst = i;
++            }
++            len++;
++        } else {
++            len = 0;
++        }
++    }
++    if (len < n) {
++        if (llama_kv_park_debug()) {
++            LLAMA_LOG_WARN("%s: seq %d [%u, %u): no run of %u free cells below %u\n", __func__, seq_id, lo, hi, n, bound);
++        }
++        parked[seq_id] = range;
++        return false;
++    }
++
++    park_move(lo, dst, n);
++    if (llama_kv_park_debug()) {
++        LLAMA_LOG_WARN("%s: seq %d [%u, %u) -> [%u, %u)\n", __func__, seq_id, lo, hi, dst, dst + n);
++    }
++
++    park_compact();
++
++    return true;
++}
++
++bool llama_kv_cache::seq_parked(llama_seq_id seq_id) const {
++    return parked.count(seq_id) > 0;
++}
++
++bool llama_kv_cache::can_park() const {
++    // shared cells (another cache reads them), a transposed V, or a sliding-window cache, which reuses the cells that fall
++    // out of a sequence's window -- another sequence's included -- so it cannot keep cells off limits
++    return n_stream == 1 && other == nullptr && v_cells_impl.use_count() == 1 && !v_trans && n_swa == 0;
++}
++
+ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+@@ -799,6 +1058,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
+ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+     llama_kv_cache::slot_info_vec_t res;
+ 
++    // a batch for a parked sequence (the caller did not seq_unpark() it): parking is given up, so that the attention
++    // range (get_n_kv) never stops below cells of a sequence in the batch.  No data move here: a decode may be in flight
++    if (!parked.empty()) {
++        for (const auto & ubatch : ubatches) {
++            for (uint32_t s = 0; s < ubatch.n_seqs_unq && !parked.empty(); ++s) {
++                if (parked.count(ubatch.seq_id_unq[s]) > 0) {
++                    LLAMA_LOG_WARN("%s: a batch for parked seq %d: parking is given up\n", __func__, ubatch.seq_id_unq[s]);
++                    parked.clear();
++                }
++            }
++        }
++    }
++
+     struct state_t {
+         slot_info sinfo; // slot info for the ubatch
+ 
+@@ -1051,14 +1323,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+ 
+         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+ 
++        // with parked sequences (seq_park), the search covers only the cells below them
++        const uint32_t n_cells = parked.empty() ? cells.size() : park_bound();
++
+         // if we have enough unused cells before the current head ->
+         //   better to start searching from the beginning of the cache, hoping to fill it
+-        if (head_cur > cells.get_used() + 2*n_tokens) {
++        if (head_cur > cells.get_used() + 2*n_tokens || head_cur >= n_cells) {
+             head_cur = 0;
+         }
+ 
+-        if (n_tokens > cells.size()) {
+-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
++        if (n_tokens > n_cells) {
++            if (n_cells == cells.size()) {
++                LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
++            }
+             return { };
+         }
+ 
+@@ -1069,8 +1346,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+         const uint32_t n_test = cont ? n_tokens : 1;
+ 
+         while (true) {
+-            if (head_cur + n_test > cells.size()) {
+-                n_tested += cells.size() - head_cur;
++            if (head_cur + n_test > n_cells) {
++                n_tested += n_cells - head_cur;
+                 head_cur = 0;
+                 continue;
+             }
+@@ -1128,7 +1405,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+                 res.idxs[s].clear();
+             }
+ 
+-            if (n_tested >= cells.size()) {
++            if (n_tested >= n_cells) {
+                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
+                 return { };
+             }
+@@ -1333,7 +1610,8 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
+     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+         const auto & cells = v_cells[sinfo.strm[s]];
+ 
+-        const uint32_t used = cells.used_max_p1();
++        // parked sequences (seq_park) sit above every sequence that is decoded, so the range stops below them
++        const uint32_t used = parked.empty() ? cells.used_max_p1() : cells.used_max_p1_below(park_bound());
+         const uint32_t pad  = prefill && GGML_PAD(used, n_pad_cur) > n_pad_prefill_from ? n_pad_prefill : n_pad_cur;
+ 
+         result = std::max(std::min(cells.size(), std::max(pad, GGML_PAD(used, pad))), result);
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 4667c447c..563631163 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -5,6 +5,7 @@
+ #include "llama-kv-cells.h"
+ #include "llama-memory.h"
+ 
++#include <map>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -141,6 +142,19 @@ public:
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
++
++    // parking (unified cache only): the cells of an idle sequence move to the top of the cache, stacked below the
++    // sequences parked before it, and new cells are only taken below the lowest parked cell.  get_n_kv() stops below it
++    // too, so a sequence in the low cells attends over the same range, at the same cell indices, as in a cache that
++    // holds nothing else -- its results do not depend on what is parked.  seq_unpark() moves a parked sequence back
++    // to the lowest free run.  Both return false, changing nothing, when the move is not possible (not unified, the
++    // cells are shared or not contiguous, no room).  The K/V data are copied on the device.
++    bool seq_park  (llama_seq_id seq_id);
++    bool seq_unpark(llama_seq_id seq_id);
++    bool seq_parked(llama_seq_id seq_id) const;
++
++    // whether this cache supports parking at all: one stream, cells it does not share, V not transposed, no sliding window
++    bool can_park() const;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+ 
+@@ -331,6 +345,22 @@ private:
+ 
+     std::vector<kv_layer> layers;
+ 
++    // parked sequences (stream 0 of a unified cache): [first cell, last cell + 1), see seq_park()
++    std::map<llama_seq_id, std::pair<uint32_t, uint32_t>> parked;
++
++    // the lowest parked cell, or the cache size
++    uint32_t park_bound() const;
++
++    // drops parked entries whose sequence is gone and narrows the others to the cells they still hold
++    void park_refresh();
++
++    // moves cells [src, src + n) to [dst, dst + n) on stream 0, K/V data and cell state, overlap-safe
++    void park_move(uint32_t src, uint32_t dst, uint32_t n);
++
++    // moves the parked sequences up so that they sit together at the top of the cache, in their order: a sequence that
++    // leaves the stack would otherwise leave a hole that the next one to come down cannot use
++    void park_compact();
++
+     // model layer id -> KV cache layer id
+     std::unordered_map<int32_t, int32_t> map_layer_ids;
+ 
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index 9c0d51e4e..e6d40c6b4 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -7,6 +7,7 @@
+ #include <cassert>
+ #include <cstring>
+ #include <limits>
++#include <iterator>
+ #include <set>
+ #include <vector>
+ 
+@@ -102,6 +103,38 @@ public:
+         return has_shift;
+     }
+ 
++    // the index of the last used cell below lim + 1, 0 if none (the attention range when cells from lim up are parked)
++    uint32_t used_max_p1_below(uint32_t lim) const {
++        const auto it = used.lower_bound(lim);
++        return it == used.begin() ? 0 : *std::prev(it) + 1;
++    }
++
++    // move the non-empty cell isrc to the empty cell idst: its sequences, position, extension and shift go with it
++    void mv(uint32_t isrc, uint32_t idst) {
++        assert(isrc < pos.size());
++        assert(idst < pos.size());
++
++        assert(pos[idst] == -1);
++        assert(pos[isrc] != -1);
++
++        seq_pos_rm(isrc);
++
++        pos  [idst] = pos  [isrc];
++        ext  [idst] = ext  [isrc];
++        shift[idst] = shift[isrc];
++        seq  [idst] = seq  [isrc];
++
++        pos  [isrc] = -1;
++        ext  [isrc].reset();
++        shift[isrc] = 0;
++        seq  [isrc].reset();
++
++        used.erase (isrc);
++        used.insert(idst);
++
++        seq_pos_add(idst);
++    }
++
+     // move cell isrc to idst (used during defrag)
+     //void mv(uint32_t isrc, uint32_t idst) {
+     //    assert(isrc < pos.size());
+diff --git a/src/llama-memory.cpp b/src/llama-memory.cpp
+index 961dd74ef..7997a0117 100644
+--- a/src/llama-memory.cpp
++++ b/src/llama-memory.cpp
+@@ -2,6 +2,11 @@
+ 
+ #include "llama-ext.h"
+ #include "llama-io.h"
++#include "llama-kv-cache.h"
++#include "llama-kv-cache-iswa.h"
++#include "llama-memory-hybrid.h"
++#include "llama-memory-hybrid-iswa.h"
++#include "llama-memory-recurrent.h"
+ 
+ #include <set>
+ #include <vector>
+@@ -90,3 +95,61 @@ std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t
+ 
+     return std::vector<ggml_backend_buffer_t>(writer.buffers.begin(), writer.buffers.end());
+ }
++
++// the attention caches of a memory: a KV cache, both caches of an iswa cache, or the attention part of a hybrid;
++// false for a memory type that parking does not know (a recurrent memory has none: true with an empty list)
++static bool llama_memory_attn_caches(llama_memory_t mem, std::vector<llama_kv_cache *> & kvs) {
++    kvs.clear();
++    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
++        kvs = { kv };
++    } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
++        kvs = { iswa->get_base(), iswa->get_swa() };
++    } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
++        kvs = { hyb->get_mem_attn() };
++    } else if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
++        kvs = { hyb_iswa->get_mem_attn()->get_base(), hyb_iswa->get_mem_attn()->get_swa() };
++    } else if (!dynamic_cast<llama_memory_recurrent *>(mem)) {
++        return false;
++    }
++    return true;
++}
++
++bool llama_memory_can_park(llama_memory_t mem) {
++    std::vector<llama_kv_cache *> kvs;
++    if (!llama_memory_attn_caches(mem, kvs)) {
++        return false;
++    }
++    for (auto * kv : kvs) {
++        if (kv != nullptr && !kv->can_park()) {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park) {
++    std::vector<llama_kv_cache *> kvs;
++    if (!llama_memory_attn_caches(mem, kvs)) {
++        return false;
++    }
++
++    // all or nothing: undo the caches already moved when a later one cannot move
++    std::vector<bool> moved(kvs.size(), false);
++    for (size_t i = 0; i < kvs.size(); ++i) {
++        if (kvs[i] == nullptr) {
++            continue;
++        }
++        const bool was = kvs[i]->seq_parked(seq_id);
++        if (!(park ? kvs[i]->seq_park(seq_id) : kvs[i]->seq_unpark(seq_id))) {
++            for (size_t j = 0; j < i; ++j) {
++                if (moved[j]) {
++                    park ? kvs[j]->seq_unpark(seq_id) : kvs[j]->seq_park(seq_id);
++                }
++            }
++            return false;
++        }
++        moved[i] = kvs[i]->seq_parked(seq_id) != was;
++    }
++
++    return true;
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 3b2fc2dfe..bc6622f51 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1128,6 +1128,19 @@ private:
+         return e == nullptr || atoi(e) != 0;
+     }();
+ 
++    // LLAMA_SERVER_PARK_IDLE_SLOTS (on unless 0, with the lazy idle slots above): when a task starts, the resident idle
++    // slots are parked at the top of the KV cache (llama_memory_seq_park, a device copy) and the slots that run are moved
++    // to the low cells.  A sequence that runs alone then sits in the same cells and attends over the same range as when
++    // the idle slots are saved and cleared, so its output no longer depends on which other conversations stay resident.
++    // An idle slot that cannot be parked is saved to the prompt cache and cleared, as without lazy idle slots.  A KV cache
++    // that does not support parking at all (a sliding window, cells shared with a draft model, no flash attention) keeps the
++    // lazy idle slots as they are (park_supported).
++    const bool park_idle_slots = [] {
++        const char * e = getenv("LLAMA_SERVER_PARK_IDLE_SLOTS");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    int park_supported = -1; // -1: not asked yet
++
+     server_metrics metrics;
+ 
+     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
+@@ -1946,6 +1959,41 @@ private:
+         }
+     }
+ 
++    // park_idle_slots: the idle slots go up first, so the low cells are free, then the slots that run come down
++    void park_idle_slots_for_launch() {
++        if (park_supported < 0) {
++            park_supported = !slots.empty() && slots[0].mem.can_park() ? 1 : 0;
++            SRV_INF("idle slot parking: %s\n", park_supported ? "on" : "not supported by this KV cache, the idle slots stay where they are");
++        }
++        if (!park_supported) {
++            return;
++        }
++        for (auto & slot : slots) {
++            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
++                continue;
++            }
++            if (!slot.mem.seq_park(slot.id, true)) {
++                SLT_INF(slot, "%s", "cannot park the idle slot: saving it to the prompt cache and clearing it\n");
++                if (prompt_cache && params_base.cache_idle_slots && slot.prompt_save(*prompt_cache)) {
++                    prompt_cache->update();
++                }
++                slot.prompt_clear();
++            }
++        }
++        for (auto & slot : slots) {
++            if (!slot.is_processing()) {
++                continue;
++            }
++            // no room below the parked slots: those go to the prompt cache, least recently used first
++            while (!slot.mem.seq_park(slot.id, false)) {
++                if (!try_clear_idle_slots(&slot)) {
++                    SLT_WRN(slot, "%s", "cannot move the parked context back down (the KV cache gives parking up)\n");
++                    break;
++                }
++            }
++        }
++    }
++
+     // return true if at least one slot has been cleared
+     // TODO: improve logic
+     //       - smarter decision which slot to clear (LRU or longest prompt?)
+@@ -3096,6 +3144,10 @@ private:
+                         break; // drop the task
+                     }
+ 
++                    if (lazy_idle_slots && park_idle_slots && params_base.kv_unified) {
++                        park_idle_slots_for_launch();
++                    }
++
+                     if (params_base.cache_idle_slots && !lazy_idle_slots) {
+                         for (auto & slot : slots) {
+                             if (!slot.is_processing()) {
+-- 
+2.43.0
+

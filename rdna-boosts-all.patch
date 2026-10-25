@@ -188,7 +188,7 @@ index 9706b3ac5..5a3a44ff5 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index 3237c0fa7..215f07b69 100644
+index 3237c0fa7..2ee605be6 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -7,6 +7,7 @@
@@ -586,7 +586,23 @@ index 3237c0fa7..215f07b69 100644
  
      llama_model * model = res->model();
      if (model == NULL) {
-@@ -1690,6 +1990,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1659,6 +1959,15 @@ void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, lla
+     }
+ }
+ 
++bool common_memory::seq_park(llama_seq_id seq_id, bool park) const {
++    llama_synchronize(ctx_tgt);
++    return llama_memory_seq_park(llama_get_memory(ctx_tgt), seq_id, park);
++}
++
++bool common_memory::can_park() const {
++    return llama_memory_can_park(llama_get_memory(ctx_tgt));
++}
++
+ void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
+     common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
+     if (ctx_dft) {
+@@ -1690,6 +1999,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.split_mode      = params.split_mode;
      mparams.load_mode       = params.load_mode;
      mparams.lazy_mode = params.lazy_mode;
@@ -601,7 +617,7 @@ index 3237c0fa7..215f07b69 100644
      mparams.tensor_split    = params.tensor_split;
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
-@@ -1712,7 +2020,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1712,7 +2029,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -611,7 +627,7 @@ index 3237c0fa7..215f07b69 100644
  
      return mparams;
  }
-@@ -1723,6 +2032,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1723,6 +2041,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.n_ctx             = params.n_ctx;
      cparams.n_seq_max         = params.n_parallel;
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
@@ -621,7 +637,7 @@ index 3237c0fa7..215f07b69 100644
      cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
      cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
      cparams.n_batch           = params.n_batch;
-@@ -1749,6 +2061,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1749,6 +2070,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.op_offload        = !params.no_op_offload;
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
@@ -630,7 +646,7 @@ index 3237c0fa7..215f07b69 100644
      cparams.type_k = params.cache_type_k;
      cparams.type_v = params.cache_type_v;
 diff --git a/common/common.h b/common/common.h
-index 70d6a671f..1c45ab40e 100644
+index 70d6a671f..ec1dd017b 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -20,6 +20,7 @@
@@ -813,7 +829,21 @@ index 70d6a671f..1c45ab40e 100644
  
  struct llama_model_params   common_model_params_to_llama  (      common_params & params);
  struct llama_context_params common_context_params_to_llama(const common_params & params);
-@@ -1261,6 +1333,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
+@@ -1071,6 +1143,13 @@ struct common_memory {
+     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
+     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
++
++    // llama_memory_seq_park() on the target context (synchronized first).  The draft context is left as it is: the draft
++    // does not decide the output, and a draft with a sliding window (DFlash2) has a small cache that reuses its cells
++    bool seq_park(llama_seq_id seq_id, bool park) const;
++
++    // llama_memory_can_park() of the target context
++    bool can_park() const;
+ };
+ 
+ //
+@@ -1261,6 +1340,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
  inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
      // keep strings alive and avoid leaking memory by storing them in a static list
      static std::list<std::string> buft_override_strings;
@@ -69445,10 +69475,10 @@ index 0c260f7b6..192fa9f97 100644
      enum llama_rope_scaling_type rope_scaling_type;
      enum llama_pooling_type pooling_type;
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 933cb8013..a7d528f6f 100644
+index 933cb8013..e9a4c78fc 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
-@@ -89,6 +89,17 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
+@@ -89,11 +89,34 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
  
  LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
  
@@ -69466,7 +69496,24 @@ index 933cb8013..a7d528f6f 100644
  LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
  
  // the backend buffers that a state write of this memory would touch - empty caches report none
-@@ -103,6 +114,12 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
+ 
++// Parking (unified KV cache).  park = true moves the cells of an idle sequence to the top of the attention cache(s) of
++// mem: the sequences that are decoded keep the low cells, and attend over the same range at the same cell indices as
++// in a cache that holds nothing else, so their results no longer depend on what is parked.  park = false moves a
++// parked sequence back to the lowest free cells.  Returns false, changing nothing, when the move is not possible
++// (a split cache, shared or fragmented cells, no room); a memory without an attention cache returns true.  The K/V data
++// are copied on the device, so synchronize the context first.
++LLAMA_API bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park);
++
++// Whether the attention cache(s) of mem support parking at all (see llama_memory_seq_park): a unified cache whose cells
++// no other cache shares, with V not transposed and no sliding window.  A memory without an attention cache: true.
++LLAMA_API bool llama_memory_can_park(llama_memory_t mem);
++
+ // Turn the KV cache attention rotation on or off for the contexts created from this model.
+ // Useful for testing purposes.
+ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+@@ -103,6 +126,12 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
  // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
  LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
  
@@ -69479,7 +69526,7 @@ index 933cb8013..a7d528f6f 100644
  // Select which appended NextN block the DECODER_MTP graph runs (offset past
  // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
  // chain multiple trained NextN heads. Default 0 (first head).
-@@ -139,6 +156,18 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
+@@ -139,6 +168,18 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
  // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
  LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
  
@@ -69498,7 +69545,7 @@ index 933cb8013..a7d528f6f 100644
  LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
  
  //
-@@ -147,11 +176,20 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+@@ -147,11 +188,20 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
  
  LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
  
@@ -70863,7 +70910,7 @@ index f8caae9d6..3909c4990 100644
          for (const auto & layer : layers) {
              ggml_backend_tensor_copy(layer.kv_stream[ssrc], layer.kv_stream[sdst]);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 6f0e3f7f7..144decfd8 100644
+index 6f0e3f7f7..a9482af51 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -62,6 +62,29 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -70919,7 +70966,16 @@ index 6f0e3f7f7..144decfd8 100644
  
          ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
          ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
-@@ -424,7 +449,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -394,6 +419,8 @@ void llama_kv_cache::clear(bool data) {
+         v_heads[s] = 0;
+     }
+ 
++    parked.clear();
++
+     if (data) {
+         for (auto & [_, buf] : ctxs_bufs) {
+             ggml_backend_buffer_clear(buf.get(), 0);
+@@ -424,7 +451,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
  
          uint32_t new_head = cells.size();
  
@@ -70930,7 +70986,18 @@ index 6f0e3f7f7..144decfd8 100644
              if (!cells.pos_in(i, p0, p1)) {
                  continue;
              }
-@@ -448,7 +475,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -440,6 +469,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+         if (new_head != cells.size() && new_head < head) {
+             head = new_head;
+         }
++
++        if (parked.count(seq_id) > 0) {
++            park_refresh();
++        }
+     } else {
+         // match any sequence
+         for (uint32_t s = 0; s < n_stream; ++s) {
+@@ -448,7 +481,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
  
              uint32_t new_head = cells.size();
  
@@ -70940,7 +71007,307 @@ index 6f0e3f7f7..144decfd8 100644
                  if (!cells.pos_in(i, p0, p1)) {
                      continue;
                  }
-@@ -834,7 +862,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+@@ -465,6 +499,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+                 head = new_head;
+             }
+         }
++
++        if (!parked.empty()) {
++            park_refresh();
++        }
+     }
+ 
+     return true;
+@@ -479,6 +517,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
+     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
+ 
++    if (parked.count(seq_id_src) > 0 || parked.count(seq_id_dst) > 0) {
++        parked.clear(); // a copy out of (or into) the parked cells: give up parking rather than hide cells from the range
++    }
++
+     const auto s0 = seq_to_stream[seq_id_src];
+     const auto s1 = seq_to_stream[seq_id_dst];
+ 
+@@ -583,12 +625,257 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+         }
+     }
+ 
++    if (!parked.empty()) {
++        park_refresh();
++    }
++
+     // If we freed up a slot, set head to it so searching can start there.
+     if (new_head != cells.size() && new_head < head) {
+         head = new_head;
+     }
+ }
+ 
++// LLAMA_KV_PARK_DEBUG=1: log every park, unpark and compaction move, and why a park or an unpark is refused
++static bool llama_kv_park_debug() {
++    static const bool v = getenv("LLAMA_KV_PARK_DEBUG") != nullptr && atoi(getenv("LLAMA_KV_PARK_DEBUG")) != 0;
++    return v;
++}
++
++uint32_t llama_kv_cache::park_bound() const {
++    uint32_t res = v_cells[0].size();
++    for (const auto & [seq_id, range] : parked) {
++        res = std::min(res, range.first);
++    }
++    return res;
++}
++
++void llama_kv_cache::park_refresh() {
++    const auto & cells = v_cells[0];
++    for (auto it = parked.begin(); it != parked.end(); ) {
++        uint32_t lo = it->second.second;
++        uint32_t hi = it->second.first;
++        for (uint32_t i = it->second.first; i < it->second.second; ++i) {
++            if (!cells.is_empty(i) && cells.seq_has(i, it->first)) {
++                lo = std::min(lo, i);
++                hi = i + 1;
++            }
++        }
++        if (lo >= hi) {
++            it = parked.erase(it);
++        } else {
++            it->second = { lo, hi };
++            ++it;
++        }
++    }
++}
++
++void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
++    if (src == dst || n == 0) {
++        return;
++    }
++
++    auto & cells = v_cells[0];
++
++    // copy in chunks no longer than the distance, from the end when moving up and from the start when moving down, so
++    // that no chunk overwrites cells that have not been moved yet
++    const uint32_t dist  = src > dst ? src - dst : dst - src;
++    const uint32_t chunk = std::min(n, dist);
++
++    ggml_init_params params = {
++        /*.mem_size   =*/ 4*layers.size()*ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++
++    for (uint32_t done = 0; done < n; done += chunk) {
++        const uint32_t len = std::min(chunk, n - done);
++        const uint32_t off = dst > src ? n - done - len : done;
++
++        ggml_context_ptr ctx { ggml_init(params) };
++
++        for (const auto & layer : layers) {
++            for (ggml_tensor * t : { layer.k, layer.v }) {
++                if (t == nullptr) {
++                    continue;
++                }
++                ggml_tensor * a = ggml_view_2d(ctx.get(), t, t->ne[0], len, t->nb[1], (size_t) (src + off)*t->nb[1]);
++                ggml_tensor * b = ggml_view_2d(ctx.get(), t, t->ne[0], len, t->nb[1], (size_t) (dst + off)*t->nb[1]);
++                GGML_ASSERT(ggml_backend_view_init(a) == GGML_STATUS_SUCCESS);
++                GGML_ASSERT(ggml_backend_view_init(b) == GGML_STATUS_SUCCESS);
++                ggml_backend_tensor_copy(a, b);
++            }
++        }
++
++        if (dst > src) {
++            for (uint32_t i = len; i-- > 0; ) {
++                cells.mv(src + off + i, dst + off + i);
++            }
++        } else {
++            for (uint32_t i = 0; i < len; ++i) {
++                cells.mv(src + off + i, dst + off + i);
++            }
++        }
++    }
++}
++
++// the cells of seq_id in stream 0, when they form one run that holds no other sequence: [lo, hi); else lo == hi
++static std::pair<uint32_t, uint32_t> llama_kv_cache_seq_run(const llama_kv_cells & cells, llama_seq_id seq_id);
++
++void llama_kv_cache::park_compact() {
++    std::vector<std::pair<uint32_t, llama_seq_id>> order;
++    for (const auto & [seq_id, range] : parked) {
++        order.emplace_back(range.first, seq_id);
++    }
++    std::sort(order.rbegin(), order.rend());
++
++    const auto & cells = v_cells[0];
++
++    uint32_t top = cells.size();
++    for (const auto & [lo_old, seq_id] : order) {
++        GGML_UNUSED(lo_old);
++        const auto [lo, hi] = llama_kv_cache_seq_run(cells, seq_id);
++        if (lo == hi) {
++            break; // not one run any more: leave the rest where it is
++        }
++        const uint32_t n = hi - lo;
++        if (hi != top) {
++            // between this sequence and the ones above it there are only free cells: the region above lo up to top
++            // holds no active cell (those are all below the lowest parked one) and no other parked sequence
++            park_move(lo, top - n, n);
++            if (llama_kv_park_debug()) {
++                LLAMA_LOG_WARN("%s: seq %d [%u, %u) -> [%u, %u)\n", __func__, seq_id, lo, hi, top - n, top);
++            }
++        }
++        parked[seq_id] = { top - n, top };
++        top -= n;
++    }
++}
++
++static std::pair<uint32_t, uint32_t> llama_kv_cache_seq_run(const llama_kv_cells & cells, llama_seq_id seq_id) {
++    uint32_t lo = 0;
++    uint32_t hi = 0;
++    uint32_t n  = 0;
++    for (const auto & [pos, i] : cells.seq_pos_get(seq_id)) {
++        GGML_UNUSED(pos);
++        if (cells.seq_count(i) != 1) {
++            return { 0, 0 };
++        }
++        lo = n == 0 ? i : std::min(lo, i);
++        hi = n == 0 ? i + 1 : std::max(hi, i + 1);
++        n++;
++    }
++    return n == hi - lo ? std::make_pair(lo, hi) : std::make_pair(0u, 0u);
++}
++
++bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
++    if (!can_park()) {
++        return false;
++    }
++    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
++        return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
++    }
++
++    auto & cells = v_cells[0];
++
++    const auto [lo, hi] = llama_kv_cache_seq_run(cells, seq_id);
++    if (lo == hi) {
++        if (llama_kv_park_debug() && !cells.seq_pos_get(seq_id).empty()) {
++            LLAMA_LOG_WARN("%s: seq %d: its %zu cells are not one run of its own\n", __func__, seq_id, cells.seq_pos_get(seq_id).size());
++        }
++        return cells.seq_pos_get(seq_id).empty(); // nothing to park, or a run that cannot move
++    }
++
++    park_compact();
++
++    const uint32_t n     = hi - lo;
++    const uint32_t bound = park_bound();
++    if (n > bound) {
++        return false;
++    }
++    const uint32_t dst = bound - n;
++
++    // the target run must hold nothing but free cells and cells of the run itself
++    for (uint32_t i = dst; i < bound; ++i) {
++        if (!cells.is_empty(i) && (i < lo || i >= hi)) {
++            if (llama_kv_park_debug()) {
++                LLAMA_LOG_WARN("%s: seq %d [%u, %u): cell %u of the target [%u, %u) is taken (seq %d)\n", __func__, seq_id, lo, hi,
++                        i, dst, bound, cells.seq_count(i) == 1 ? cells.seq_get(i) : -1);
++            }
++            return false;
++        }
++    }
++
++    park_move(lo, dst, n);
++    parked[seq_id] = { dst, bound };
++    if (llama_kv_park_debug()) {
++        LLAMA_LOG_WARN("%s: seq %d [%u, %u) -> [%u, %u)\n", __func__, seq_id, lo, hi, dst, bound);
++    }
++
++    auto & head = v_heads[0];
++    head = std::min(head, lo);
++
++    return true;
++}
++
++bool llama_kv_cache::seq_unpark(llama_seq_id seq_id) {
++    const auto it = parked.find(seq_id);
++    if (it == parked.end()) {
++        return true;
++    }
++
++    auto & cells = v_cells[0];
++
++    const auto [lo, hi] = llama_kv_cache_seq_run(cells, seq_id);
++    if (lo == hi) {
++        return false;
++    }
++    const uint32_t n = hi - lo;
++
++    const auto range = it->second;
++    parked.erase(it);
++    const uint32_t bound = park_bound();
++
++    // the lowest run of n cells below the remaining parked ones that holds nothing but free cells and cells of the run
++    uint32_t dst = 0;
++    uint32_t len = 0;
++    for (uint32_t i = 0; i < bound && len < n; ++i) {
++        if (cells.is_empty(i) || (i >= lo && i < hi)) {
++            if (len == 0) {
++                dst = i;
++            }
++            len++;
++        } else {
++            len = 0;
++        }
++    }
++    if (len < n) {
++        if (llama_kv_park_debug()) {
++            LLAMA_LOG_WARN("%s: seq %d [%u, %u): no run of %u free cells below %u\n", __func__, seq_id, lo, hi, n, bound);
++        }
++        parked[seq_id] = range;
++        return false;
++    }
++
++    park_move(lo, dst, n);
++    if (llama_kv_park_debug()) {
++        LLAMA_LOG_WARN("%s: seq %d [%u, %u) -> [%u, %u)\n", __func__, seq_id, lo, hi, dst, dst + n);
++    }
++
++    park_compact();
++
++    return true;
++}
++
++bool llama_kv_cache::seq_parked(llama_seq_id seq_id) const {
++    return parked.count(seq_id) > 0;
++}
++
++bool llama_kv_cache::can_park() const {
++    // shared cells (another cache reads them), a transposed V, or a sliding-window cache, which reuses the cells that fall
++    // out of a sequence's window -- another sequence's included -- so it cannot keep cells off limits
++    return n_stream == 1 && other == nullptr && v_cells_impl.use_count() == 1 && !v_trans && n_swa == 0;
++}
++
+ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+@@ -771,6 +1058,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
+ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+     llama_kv_cache::slot_info_vec_t res;
+ 
++    // a batch for a parked sequence (the caller did not seq_unpark() it): parking is given up, so that the attention
++    // range (get_n_kv) never stops below cells of a sequence in the batch.  No data move here: a decode may be in flight
++    if (!parked.empty()) {
++        for (const auto & ubatch : ubatches) {
++            for (uint32_t s = 0; s < ubatch.n_seqs_unq && !parked.empty(); ++s) {
++                if (parked.count(ubatch.seq_id_unq[s]) > 0) {
++                    LLAMA_LOG_WARN("%s: a batch for parked seq %d: parking is given up\n", __func__, ubatch.seq_id_unq[s]);
++                    parked.clear();
++                }
++            }
++        }
++    }
++
+     struct state_t {
+         slot_info sinfo; // slot info for the ubatch
+ 
+@@ -834,7 +1134,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
      return res;
  }
  
@@ -70949,7 +71316,7 @@ index 6f0e3f7f7..144decfd8 100644
      // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
      if (other) {
          return true;
-@@ -844,16 +872,16 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
+@@ -844,16 +1144,16 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
  
      auto * sched = lctx->get_sched();
  
@@ -70970,7 +71337,7 @@ index 6f0e3f7f7..144decfd8 100644
  
              assert(ssrc < n_stream);
              assert(sdst < n_stream);
-@@ -976,12 +1004,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -976,12 +1276,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                  LLAMA_LOG_DEBUG("\n%s\n", ss.c_str());
              }
  
@@ -70986,7 +71353,50 @@ index 6f0e3f7f7..144decfd8 100644
              }
          }
      }
-@@ -1176,8 +1204,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+@@ -1023,14 +1323,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+ 
+         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+ 
++        // with parked sequences (seq_park), the search covers only the cells below them
++        const uint32_t n_cells = parked.empty() ? cells.size() : park_bound();
++
+         // if we have enough unused cells before the current head ->
+         //   better to start searching from the beginning of the cache, hoping to fill it
+-        if (head_cur > cells.get_used() + 2*n_tokens) {
++        if (head_cur > cells.get_used() + 2*n_tokens || head_cur >= n_cells) {
+             head_cur = 0;
+         }
+ 
+-        if (n_tokens > cells.size()) {
+-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
++        if (n_tokens > n_cells) {
++            if (n_cells == cells.size()) {
++                LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
++            }
+             return { };
+         }
+ 
+@@ -1041,8 +1346,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+         const uint32_t n_test = cont ? n_tokens : 1;
+ 
+         while (true) {
+-            if (head_cur + n_test > cells.size()) {
+-                n_tested += cells.size() - head_cur;
++            if (head_cur + n_test > n_cells) {
++                n_tested += n_cells - head_cur;
+                 head_cur = 0;
+                 continue;
+             }
+@@ -1100,7 +1405,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+                 res.idxs[s].clear();
+             }
+ 
+-            if (n_tested >= cells.size()) {
++            if (n_tested >= n_cells) {
+                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
+                 return { };
+             }
+@@ -1176,8 +1481,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
                  cells.ext_set(idx, ext);
              }
  
@@ -70997,7 +71407,7 @@ index 6f0e3f7f7..144decfd8 100644
              }
          }
      }
-@@ -1282,17 +1310,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1282,17 +1587,34 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -71027,14 +71437,15 @@ index 6f0e3f7f7..144decfd8 100644
          const auto & cells = v_cells[sinfo.strm[s]];
  
 -        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
-+        const uint32_t used = cells.used_max_p1();
++        // parked sequences (seq_park) sit above every sequence that is decoded, so the range stops below them
++        const uint32_t used = parked.empty() ? cells.used_max_p1() : cells.used_max_p1_below(park_bound());
 +        const uint32_t pad  = prefill && GGML_PAD(used, n_pad_cur) > n_pad_prefill_from ? n_pad_prefill : n_pad_cur;
 +
 +        result = std::max(std::min(cells.size(), std::max(pad, GGML_PAD(used, pad))), result);
      }
  
      return result;
-@@ -1369,16 +1413,16 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
+@@ -1369,16 +1691,16 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
  
      k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
  
@@ -71054,7 +71465,7 @@ index 6f0e3f7f7..144decfd8 100644
      }
  
      // store the current K values into the cache
-@@ -1401,20 +1445,20 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
+@@ -1401,20 +1723,20 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
      // we can merge dims 0 and 1
      GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_head) == v_cur->nb[1]);
  
@@ -71078,7 +71489,7 @@ index 6f0e3f7f7..144decfd8 100644
          }
  
          return ggml_set_rows(ctx, v, v_cur, v_idxs);
-@@ -1767,12 +1811,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1767,12 +2089,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      const int64_t n_kv     = dst->ne[0];
@@ -71094,7 +71505,7 @@ index 6f0e3f7f7..144decfd8 100644
  
      // see llama_non_causal_type
      // only the SWA cache (or the SWA layers of a single cache) become non-causal
-@@ -1790,7 +1834,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1790,7 +2112,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
          /*.n_swa            =*/ n_swa,
          /*.swa_type         =*/ swa_type,
          /*.n_kv             =*/ n_kv,
@@ -71103,7 +71514,7 @@ index 6f0e3f7f7..144decfd8 100644
          /*.n_tps            =*/ n_tps,
      };
  
-@@ -1805,6 +1849,178 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1805,6 +2127,178 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
      //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
  }
  
@@ -71282,7 +71693,7 @@ index 6f0e3f7f7..144decfd8 100644
  void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
      const int64_t n_tokens = ubatch->n_tokens;
  
-@@ -2249,8 +2465,8 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
+@@ -2249,8 +2743,8 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
                  io.write(&ext, sizeof(ext));
              }
  
@@ -71293,7 +71704,7 @@ index 6f0e3f7f7..144decfd8 100644
              }
          }
      }
-@@ -2259,10 +2475,10 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
+@@ -2259,10 +2753,10 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
  void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
      const auto & cells = v_cells[cr.strm];
  
@@ -71306,7 +71717,7 @@ index 6f0e3f7f7..144decfd8 100644
      io.write(&n_layer, sizeof(n_layer));
      io.write(&n_rot_k, sizeof(n_rot_k));
      io.write(&n_rot_v, sizeof(n_rot_v));
-@@ -2292,7 +2508,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
+@@ -2292,7 +2786,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
          }
      }
  
@@ -71315,7 +71726,7 @@ index 6f0e3f7f7..144decfd8 100644
          for (const auto & layer : layers) {
              const uint32_t il = layer.il;
  
-@@ -2556,12 +2772,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -2556,12 +3050,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -71330,7 +71741,7 @@ index 6f0e3f7f7..144decfd8 100644
      io.read(&n_layer, sizeof(n_layer));
      io.read(&n_rot_k_ref, sizeof(n_rot_k_ref));
      io.read(&n_rot_v_ref, sizeof(n_rot_v_ref));
-@@ -2576,7 +2792,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -2576,7 +3070,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          return false;
      }
  
@@ -71339,7 +71750,7 @@ index 6f0e3f7f7..144decfd8 100644
          LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
          return false;
      }
-@@ -2873,7 +3089,7 @@ bool llama_kv_cache_context::apply() {
+@@ -2873,7 +3367,7 @@ bool llama_kv_cache_context::apply() {
      }
  
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
@@ -71348,7 +71759,7 @@ index 6f0e3f7f7..144decfd8 100644
  
      return true;
  }
-@@ -2948,6 +3164,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
+@@ -2948,6 +3442,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
      kv->set_input_kq_mask(dst, ubatch, causal_attn);
  }
  
@@ -71366,10 +71777,18 @@ index 6f0e3f7f7..144decfd8 100644
      kv->set_input_pos_bucket(dst, ubatch);
  }
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 9bfb8f231..4667c447c 100644
+index 9bfb8f231..563631163 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
-@@ -114,7 +114,10 @@ public:
+@@ -5,6 +5,7 @@
+ #include "llama-kv-cells.h"
+ #include "llama-memory.h"
+ 
++#include <map>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -114,7 +115,10 @@ public:
          const  layer_reuse_cb & reuse,
          const  layer_share_cb & share,
          // a model can hold more than one cache, so the tensor names have to stay unique
@@ -71381,7 +71800,27 @@ index 9bfb8f231..4667c447c 100644
  
      ~llama_kv_cache() = default;
  
-@@ -190,7 +193,7 @@ public:
+@@ -138,6 +142,19 @@ public:
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
++
++    // parking (unified cache only): the cells of an idle sequence move to the top of the cache, stacked below the
++    // sequences parked before it, and new cells are only taken below the lowest parked cell.  get_n_kv() stops below it
++    // too, so a sequence in the low cells attends over the same range, at the same cell indices, as in a cache that
++    // holds nothing else -- its results do not depend on what is parked.  seq_unpark() moves a parked sequence back
++    // to the lowest free run.  Both return false, changing nothing, when the move is not possible (not unified, the
++    // cells are shared or not contiguous, no room).  The K/V data are copied on the device.
++    bool seq_park  (llama_seq_id seq_id);
++    bool seq_unpark(llama_seq_id seq_id);
++    bool seq_parked(llama_seq_id seq_id) const;
++
++    // whether this cache supports parking at all: one stream, cells it does not share, V not transposed, no sliding window
++    bool can_park() const;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+ 
+@@ -190,7 +207,7 @@ public:
      // graph_build API
      //
  
@@ -71390,7 +71829,7 @@ index 9bfb8f231..4667c447c 100644
  
      // get views of the current state of the cache
      ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-@@ -236,6 +239,14 @@ public:
+@@ -236,6 +253,14 @@ public:
      void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
      void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
  
@@ -71405,7 +71844,7 @@ index 9bfb8f231..4667c447c 100644
      void set_input_k_rot(ggml_tensor * dst) const;
      void set_input_v_rot(ggml_tensor * dst) const;
  
-@@ -274,6 +285,9 @@ private:
+@@ -274,6 +299,9 @@ private:
      // required padding
      const uint32_t n_pad = 1;
  
@@ -71415,7 +71854,30 @@ index 9bfb8f231..4667c447c 100644
      // SWA
      const uint32_t n_swa = 0;
  
-@@ -432,6 +446,12 @@ public:
+@@ -317,6 +345,22 @@ private:
+ 
+     std::vector<kv_layer> layers;
+ 
++    // parked sequences (stream 0 of a unified cache): [first cell, last cell + 1), see seq_park()
++    std::map<llama_seq_id, std::pair<uint32_t, uint32_t>> parked;
++
++    // the lowest parked cell, or the cache size
++    uint32_t park_bound() const;
++
++    // drops parked entries whose sequence is gone and narrows the others to the cells they still hold
++    void park_refresh();
++
++    // moves cells [src, src + n) to [dst, dst + n) on stream 0, K/V data and cell state, overlap-safe
++    void park_move(uint32_t src, uint32_t dst, uint32_t n);
++
++    // moves the parked sequences up so that they sit together at the top of the cache, in their order: a sequence that
++    // leaves the stack would otherwise leave a hole that the next one to come down cannot use
++    void park_compact();
++
+     // model layer id -> KV cache layer id
+     std::unordered_map<int32_t, int32_t> map_layer_ids;
+ 
+@@ -432,6 +476,12 @@ public:
      void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
      void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
  
@@ -71428,6 +71890,57 @@ index 9bfb8f231..4667c447c 100644
      void set_input_k_rot(ggml_tensor * dst) const;
      void set_input_v_rot(ggml_tensor * dst) const;
  
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index 9c0d51e4e..e6d40c6b4 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -7,6 +7,7 @@
+ #include <cassert>
+ #include <cstring>
+ #include <limits>
++#include <iterator>
+ #include <set>
+ #include <vector>
+ 
+@@ -102,6 +103,38 @@ public:
+         return has_shift;
+     }
+ 
++    // the index of the last used cell below lim + 1, 0 if none (the attention range when cells from lim up are parked)
++    uint32_t used_max_p1_below(uint32_t lim) const {
++        const auto it = used.lower_bound(lim);
++        return it == used.begin() ? 0 : *std::prev(it) + 1;
++    }
++
++    // move the non-empty cell isrc to the empty cell idst: its sequences, position, extension and shift go with it
++    void mv(uint32_t isrc, uint32_t idst) {
++        assert(isrc < pos.size());
++        assert(idst < pos.size());
++
++        assert(pos[idst] == -1);
++        assert(pos[isrc] != -1);
++
++        seq_pos_rm(isrc);
++
++        pos  [idst] = pos  [isrc];
++        ext  [idst] = ext  [isrc];
++        shift[idst] = shift[isrc];
++        seq  [idst] = seq  [isrc];
++
++        pos  [isrc] = -1;
++        ext  [isrc].reset();
++        shift[isrc] = 0;
++        seq  [isrc].reset();
++
++        used.erase (isrc);
++        used.insert(idst);
++
++        seq_pos_add(idst);
++    }
++
+     // move cell isrc to idst (used during defrag)
+     //void mv(uint32_t isrc, uint32_t idst) {
+     //    assert(isrc < pos.size());
 diff --git a/src/llama-lazy-reader.cpp b/src/llama-lazy-reader.cpp
 new file mode 100644
 index 000000000..9f9779b8c
@@ -73241,6 +73754,84 @@ index 08489a4be..5711521f5 100644
      void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
  
      // computed before each graph build
+diff --git a/src/llama-memory.cpp b/src/llama-memory.cpp
+index 961dd74ef..7997a0117 100644
+--- a/src/llama-memory.cpp
++++ b/src/llama-memory.cpp
+@@ -2,6 +2,11 @@
+ 
+ #include "llama-ext.h"
+ #include "llama-io.h"
++#include "llama-kv-cache.h"
++#include "llama-kv-cache-iswa.h"
++#include "llama-memory-hybrid.h"
++#include "llama-memory-hybrid-iswa.h"
++#include "llama-memory-recurrent.h"
+ 
+ #include <set>
+ #include <vector>
+@@ -90,3 +95,61 @@ std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t
+ 
+     return std::vector<ggml_backend_buffer_t>(writer.buffers.begin(), writer.buffers.end());
+ }
++
++// the attention caches of a memory: a KV cache, both caches of an iswa cache, or the attention part of a hybrid;
++// false for a memory type that parking does not know (a recurrent memory has none: true with an empty list)
++static bool llama_memory_attn_caches(llama_memory_t mem, std::vector<llama_kv_cache *> & kvs) {
++    kvs.clear();
++    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
++        kvs = { kv };
++    } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
++        kvs = { iswa->get_base(), iswa->get_swa() };
++    } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
++        kvs = { hyb->get_mem_attn() };
++    } else if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
++        kvs = { hyb_iswa->get_mem_attn()->get_base(), hyb_iswa->get_mem_attn()->get_swa() };
++    } else if (!dynamic_cast<llama_memory_recurrent *>(mem)) {
++        return false;
++    }
++    return true;
++}
++
++bool llama_memory_can_park(llama_memory_t mem) {
++    std::vector<llama_kv_cache *> kvs;
++    if (!llama_memory_attn_caches(mem, kvs)) {
++        return false;
++    }
++    for (auto * kv : kvs) {
++        if (kv != nullptr && !kv->can_park()) {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park) {
++    std::vector<llama_kv_cache *> kvs;
++    if (!llama_memory_attn_caches(mem, kvs)) {
++        return false;
++    }
++
++    // all or nothing: undo the caches already moved when a later one cannot move
++    std::vector<bool> moved(kvs.size(), false);
++    for (size_t i = 0; i < kvs.size(); ++i) {
++        if (kvs[i] == nullptr) {
++            continue;
++        }
++        const bool was = kvs[i]->seq_parked(seq_id);
++        if (!(park ? kvs[i]->seq_park(seq_id) : kvs[i]->seq_unpark(seq_id))) {
++            for (size_t j = 0; j < i; ++j) {
++                if (moved[j]) {
++                    park ? kvs[j]->seq_unpark(seq_id) : kvs[j]->seq_park(seq_id);
++                }
++            }
++            return false;
++        }
++        moved[i] = kvs[i]->seq_parked(seq_id) != was;
++    }
++
++    return true;
++}
 diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
 index 4d1cd31e9..b2f3698a2 100644
 --- a/src/llama-mmap.cpp
@@ -83225,7 +83816,7 @@ index 56d1ea5fe..f725f769f 100644
  | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
  | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a5cba1d71..3b2fc2dfe 100644
+index a5cba1d71..bc79a3031 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -408,6 +408,11 @@ struct server_slot {
@@ -83266,7 +83857,7 @@ index a5cba1d71..3b2fc2dfe 100644
      }
  
      json to_json(bool only_metrics = false) const {
-@@ -1096,6 +1120,14 @@ private:
+@@ -1096,6 +1120,27 @@ private:
  
      std::unique_ptr<server_prompt_cache> prompt_cache;
  
@@ -83278,10 +83869,23 @@ index a5cba1d71..3b2fc2dfe 100644
 +        return e == nullptr || atoi(e) != 0;
 +    }();
 +
++    // LLAMA_SERVER_PARK_IDLE_SLOTS (on unless 0, with the lazy idle slots above): when a task starts, the resident idle
++    // slots are parked at the top of the KV cache (llama_memory_seq_park, a device copy) and the slots that run are moved
++    // to the low cells.  A sequence that runs alone then sits in the same cells and attends over the same range as when
++    // the idle slots are saved and cleared, so its output no longer depends on which other conversations stay resident.
++    // An idle slot that cannot be parked is saved to the prompt cache and cleared, as without lazy idle slots.  A KV cache
++    // that does not support parking at all (a sliding window, cells shared with a draft model, no flash attention) keeps the
++    // lazy idle slots as they are (park_supported).
++    const bool park_idle_slots = [] {
++        const char * e = getenv("LLAMA_SERVER_PARK_IDLE_SLOTS");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    int park_supported = -1; // -1: not asked yet
++
      server_metrics metrics;
  
      // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-@@ -1198,10 +1230,8 @@ private:
+@@ -1198,10 +1243,8 @@ private:
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
  
          const bool has_mmproj = !params.mmproj.path.empty();
@@ -83294,7 +83898,7 @@ index a5cba1d71..3b2fc2dfe 100644
          const bool has_spec = has_draft || spec_mtp;
  
          if (callback_state) {
-@@ -1287,7 +1317,7 @@ private:
+@@ -1287,7 +1330,7 @@ private:
              params_base.load_progress_callback_user_data = &load_progress_text;
          }
  
@@ -83303,7 +83907,7 @@ index a5cba1d71..3b2fc2dfe 100644
  
          model_tgt = llama_init->model();
          ctx_tgt   = llama_init->context();
-@@ -1327,7 +1357,7 @@ private:
+@@ -1327,7 +1370,7 @@ private:
                  params_dft.load_progress_callback           = load_progress_callback;
                  params_dft.load_progress_callback_user_data = &load_progress_spec;
  
@@ -83312,7 +83916,7 @@ index a5cba1d71..3b2fc2dfe 100644
                  model_dft = spec_init->model();
                  ctx_dft   = spec_init->context();
  
-@@ -1864,9 +1894,21 @@ private:
+@@ -1864,9 +1907,21 @@ private:
  
                  const int64_t t_start = ggml_time_us();
  
@@ -83335,7 +83939,7 @@ index a5cba1d71..3b2fc2dfe 100644
                      ret->prompt_clear();
                  }
  
-@@ -1879,18 +1921,63 @@ private:
+@@ -1879,18 +1934,105 @@ private:
          return ret;
      }
  
@@ -83360,6 +83964,48 @@ index a5cba1d71..3b2fc2dfe 100644
 +            SLT_INF(slot, "%s", "retrying the prompt cache restore\n");
 +            if (slot.prompt_load(*prompt_cache, tokens)) {
 +                return true;
++            }
++        }
++    }
++
++    // park_idle_slots: the idle slots go up first, so the low cells are free, then the slots that run come down
++    void park_idle_slots_for_launch() {
++        if (park_supported < 0) {
++            park_supported = !slots.empty() && slots[0].mem.can_park() ? 1 : 0;
++            SRV_INF("idle slot parking: %s\n", park_supported ? "on" : "not supported by this KV cache, the idle slots stay where they are");
++        }
++        if (!park_supported) {
++            return;
++        }
++        for (auto & slot : slots) {
++            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
++                continue;
++            }
++            if (!slot.mem.seq_park(slot.id, true)) {
++                // with --no-cache-idle-slots the lazy idle slots are left resident (there is no saved copy to
++                // restore), so a slot that cannot be parked must stay resident too -- clearing it here would
++                // throw its KV away and change the behaviour the flag was chosen for
++                if (!params_base.cache_idle_slots) {
++                    SLT_DBG(slot, "%s", "cannot park the idle slot: leaving it resident (--no-cache-idle-slots)\n");
++                    continue;
++                }
++                SLT_INF(slot, "%s", "cannot park the idle slot: saving it to the prompt cache and clearing it\n");
++                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
++                    prompt_cache->update();
++                }
++                slot.prompt_clear();
++            }
++        }
++        for (auto & slot : slots) {
++            if (!slot.is_processing()) {
++                continue;
++            }
++            // no room below the parked slots: those go to the prompt cache, least recently used first
++            while (!slot.mem.seq_park(slot.id, false)) {
++                if (!try_clear_idle_slots(&slot)) {
++                    SLT_WRN(slot, "%s", "cannot move the parked context back down (the KV cache gives parking up)\n");
++                    break;
++                }
 +            }
 +        }
 +    }
@@ -83400,16 +84046,20 @@ index a5cba1d71..3b2fc2dfe 100644
          for (auto & slot : slots) {
              if (slot.is_processing()) {
                  continue;
-@@ -3009,7 +3096,7 @@ private:
+@@ -3009,7 +3151,11 @@ private:
                          break; // drop the task
                      }
  
 -                    if (params_base.cache_idle_slots) {
++                    if (lazy_idle_slots && park_idle_slots && params_base.kv_unified) {
++                        park_idle_slots_for_launch();
++                    }
++
 +                    if (params_base.cache_idle_slots && !lazy_idle_slots) {
                          for (auto & slot : slots) {
                              if (!slot.is_processing()) {
                                  SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-@@ -3908,6 +3995,10 @@ private:
+@@ -3908,6 +4054,10 @@ private:
  
                          slot.state = SLOT_STATE_PROCESSING_PROMPT;
  
@@ -83420,7 +84070,7 @@ index a5cba1d71..3b2fc2dfe 100644
                          SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                  slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
  
-@@ -4859,7 +4950,12 @@ private:
+@@ -4859,7 +5009,12 @@ private:
                              SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                          }
  
