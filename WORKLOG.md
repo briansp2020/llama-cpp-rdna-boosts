@@ -59,6 +59,7 @@ maxdiff 0 on q8_0/f16/bf16.  `MANIFESTS.md` blocks 05/06 now name the requiremen
 | width purity, `plain` vs `draft-dflash`, `-n 512`, `-c 12288` | **identical in all 9 arms** (`KV` f16/bf16/q8_0 x `n_max` 3/5/7): f16 `2416d85188b1`, bf16 `bb0612faf7f5`, q8_0 `7181badffbcc` |
 | the same at a 131072-cell FA range (2 GPU `-sm layer`) | plain == draft == wide == two-tile (`664 chars 63b6b7cf6fdf`) |
 | `test-logits-width-probe`, `P=4096`, `KV=q8_0/f16/bf16` | **PASS, worst maxdiff 0** (the r126 row: FAIL 0.199764 / 0.206944) |
+| the same probe on a **GQA-12** head-256 model (Flash-Next, `RS=from_w`, 2 GPU `-sm layer`, `-ncmoe 40`, q8_0) | **PASS, worst maxdiff 0** (GQA 8 has no model here: `TODO.md` #102) |
 | `test-backend-ops -o FLASH_ATTN_EXT` | **6414/6414** |
 | `plain == draft-dflash` cost, wide vs `GGML_HIP_FA_BAND_WIDE=0` | parity: 8K 75.2/74.6 vs 75.0/74.9 t/s; 131072-cell 61.0/60.6 vs 60.9/60.8; W=8 MoE arm 164.5/166.6 vs 166.3/164.9, text byte-identical (`80309046174e`) |
 | kernel level (`test-backend-ops perf`, kv 16384, q8_0, head 256 GQA 6) | `n_q` 5: 163.3 (wide) vs 167.3 us; `n_q` 8: 174.0 vs 170.0 — +-2.5 % |

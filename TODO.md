@@ -17,6 +17,7 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.
 
 | # | subject | kind | status |
 |---|---|---|---|
+| **102** | the band's width purity has no head-256 **GQA-8** arm | platform validation | open, accepted limitation (r134, issue #224).  The r134 guard is width-only (`np`, `nbatch_fa/K2/V2`, `nstages_target`, `Q_in_reg` on the two band rows), and it is measured at **GQA 6** (dense 27B: `test-logits-width-probe P=4096`, maxdiff 0) and **GQA 12** (Flash-Next `RS=from_w`, 2 GPU `-sm layer -ncmoe 40`, q8_0, maxdiff 0); no head-256 GQA-8 model exists in the fleet.  What to run if one appears: the same probe at `P >= 4096` (`KV=q8_0/f16`) plus `plain == draft-*` at `-n 512` |
 | **79** | RDNA3_0 verify-band fusions: no multi-device measurement, and gfx1101/gfx1102 untested | platform validation | open (shipped default-on in r95; needs a 2+ card gfx1100 box).  `ssh fingon` is single-RDNA3 (`ROCm0`; its second rocm-smi entry is an iGPU and is not a HIP device), so it does **not** cover the multi-device arm — it validates single-GPU gfx1100 only.  gfx1101/gfx1102 still have no hardware |
 | **70** | harden the expert-cache re-arm / wide-aux growth against a starved arena | robustness | open |
 | **36** | genuine CPU/GPU overlap for the MoE misses | performance | open, scoping (`wip/moe-cpu-overlap/`) |
@@ -24,6 +25,20 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
 ---
+
+## 102. The band's width purity has no head-256 GQA-8 model arm — PLATFORM VALIDATION
+
+**Status: open, accepted limitation (r134, issue #224).**  Not a suspected defect.  The r134 fix restores the
+band's per-column KV split (`np = nwarps*cols_per_warp/ncols`) as one geometry across query widths 1..8, and
+a `static_assert` on the two band rows makes a config divergence a build error.  `ncols2 = 8` folds a GQA
+group of up to 8 in one pass (and 9..12 in two), so the geometry does not depend on the ratio; the guard is
+width-only.  Measured: `test-logits-width-probe` at `P=4096` on **GQA 6** (dense 27B, q8_0/f16/bf16) and on
+**GQA 12** (Flash-Next, `RS=from_w`, 2 GPU `-sm layer`, `-ncmoe 40`, q8_0) — both maxdiff 0.  No head-256
+GQA-8 model exists in the fleet, so ratio 8 itself is unmeasured.
+
+What to run if one appears: the probe at `P >= 4096` with `KV=q8_0` and `f16` (plus `SPLIT=tensor` for the
+multi-device arm), and `plain == draft-dflash/draft-mtp` at `-n 512`.  A failure would look like a row-0 hash
+split between W=4 and W=5 (the shape the r126 geometry produced).
 
 ## 79. RDNA3_0 verify-band fusions: the multi-device arm and gfx1101/gfx1102 are unmeasured — PLATFORM VALIDATION
 

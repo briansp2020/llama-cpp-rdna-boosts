@@ -41,6 +41,10 @@ now `P + W + 8` and a purity run must pass `P >= 4096`:
 | r126 geometry (8-warp table row for widths 5..8) | PASS (blind) | **FAIL**, worst maxdiff **0.199764**, row-0 hash splits between W=4 and W=5 | **FAIL**, 0.206944 |
 | r134 (band-only 16-warp row) | PASS | **PASS**, worst maxdiff **0** | **PASS**, 0 |
 
+A head-256 **GQA-12** model (Flash-Next, `RS=from_w`, 2 GPU `-sm layer`, `-ncmoe 40`, q8_0) also passes at
+`P=4096` with maxdiff 0.  GQA-8 has no model in the fleet (`TODO.md` #102); the fold is a single pass for
+ratio 8 and the guard is width-only, so the arm is a platform-validation gap, not a suspected defect.
+
 `KV=bf16` at `P=4096` passes with maxdiff 0 on r134 (W=8 hash `0f2bd74ffe4268bd`; q8_0 `6c3835e0a9eacccb`,
 f16 `1fbee7ab473371c0`).  The `static_assert` added next to the band rows (same `np`, `nbatch_fa/K2/V2`,
 `nstages_target`, `Q_in_reg`) refuses to compile a build with the r126 row re-selected, so the config half of
