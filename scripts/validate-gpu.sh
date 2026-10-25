@@ -242,6 +242,13 @@ else
 fi
 
 # --- 5. record --------------------------------------------------------------------------------
+# A partial run must NOT mark the rev validated: that would make the next cron pass skip a rev
+# that was never fully gated (hit during the first radiance bring-up).
+if [ "$SKIP_LADDER" = 1 ] || [ "$SKIP_OPTESTS" = 1 ] || [ "$SKIP_KLD" = 1 ]; then
+    say "RESULT   : PASS (PARTIAL -- a step was skipped, so no up-to-date marker was written)"
+    log "$short partially validated (summary: $SUMMARY)"
+    exit 0
+fi
 echo "$REV" > "$STATE_DIR/last-ok"
 rm -f "$fail_file"
 ls -1d "$STATE_DIR"/runs/*/ 2>/dev/null | sort | head -n -"$KEEP_RUNS" | xargs -r rm -rf
