@@ -12,7 +12,7 @@ whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning va
 
 It ships as **14 patches** (block 00 + blocks 01-13) for a clean llama.cpp checkout at the fork point
 **`3f03b1772`** (upstream master).  Each block is one `git am` commit, and the series is linear (a block
-assumes its predecessors), so the set is applied whole.  The current release is **`v14-3f03b1772-r134`**: the release
+assumes its predecessors), so the set is applied whole.  The current release is **`v14-3f03b1772-r135`**: the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
 [`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,

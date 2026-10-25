@@ -1,5 +1,107 @@
 # WORKLOG - dated delivery records
 
+## 261025.005 (r135) -- issue #219: a device VRAM budget, and an over-budget `--fit` that says so
+
+**Release:** `v14-3f03b1772-r135`.  Base `3f03b1772` (base tree `14370bd49a`), canonical tip `d43d6634c`,
+tree `84dae2bec130cf7a46ccad1e2d2835d3fc3e8683`, 14 blocks.  `scripts/validate-set.sh` green (checksums,
+fresh-tarball **strict 14/14** `git am`, applied tree == recorded tree); per-block build gate green for
+**block 09** (the only block whose delta moved; blocks 10-13 are SHA-only rewrites) plus the tip.  **No
+block renumbered, merged or split**; all three changes are folds inside **block 09** (3 files,
+`ggml-cuda/ggml-cuda.cu` + `ggml-cuda/moe-expert-cache.cu` + `common/fit.cpp`).  One new env var
+(`GGML_CUDA_MIN_FREE_MIB`, opt-in/off) and no default changed.  No kernel, dispatch row or default-on
+path changed, so the prefill-logit gate does not apply; the coherence gate and a 27B MTP arm were run.
+
+Reported by **@xxyygt** (issue #219; the original budget report is #216).
+
+### What the report actually is
+
+A 16 GiB RX 9070 XT (gfx1201, HIP 7.1.1 on Windows 11) running the 11.29 GiB
+`Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp` + `mmproj-BF16` + adaptive MTP at
+`-c 65536 -b 4096 -ub 1024 --flash-attn on -ctk q4_0 -ctv q4_0 -ngl 99`.  A `/v1/chat/completions`
+request carrying `tools` and a 24 005-character system prompt (nothing else: filler text, `你好`, two trivial
+tool schemas) faults at the **second 4096-token prefill batch** (`progress = 0.28`), either as
+`ROCm error: unspecified launch failure` in `ggml_backend_cuda_synchronize` or as a **bugcheck 0x7E inside
+`dxgkrnl.sys`** (minidump + the exact request body: `github.com/xxyygt/crash-219-minidump`).  After the fault
+the GPU is dead for the rest of the Windows session, so every bisect step costs a reboot.
+
+### What we measured (gfx1201, ROCm 10.1.0, one R9700 at 32 GiB)
+
+The reporter's **exact model, exact flags and exact request body**, with a `hipMalloc` holder process
+pinning part of the card so the free VRAM matches a 16 GiB card:
+
+| arm (same request, `14765` prompt tokens) | free VRAM at start | result |
+|---|---|---|
+| 16 GiB-class card, comfortable | 15.46 GiB | **clean**, prefill 1127 t/s, decode 53 t/s, 3/3 requests |
+| true requirement, no pressure (sampled `mem_info_vram_used`) | 18.5 GiB | **peak 15.07 GiB** of device memory |
+| 0.6 GiB below that | 14.46 GiB | clean but zero headroom (peak == the whole budget) |
+| 1.0 GiB below that | 14.06 GiB | 384 s instead of 13 s (35 t/s prefill, 1.5-3 t/s decode) and then `ROCm error: out of memory` on the next larger prompt |
+
+So the config needs **~15.1 GiB**, i.e. 94-100 % of a 16 GiB card before the Windows desktop takes its
+share.  This is a budget failure, not a tool-call defect: the tool path adds no device work (a plain
+`/completion` of the same body peaks higher), and the "69.5 K tokens at 563 t/s" control the reporter
+quoted runs at `-c 131072` on the legacy endpoint, i.e. a different cell.
+
+**On Linux the same state does not fault**, which is why this is a delivery *guard* and not a kernel fix:
+the allocation fails (a clean `ROCm error: out of memory` abort, no driver fault) or, in a narrow band,
+the driver evicts resident weight pages and the run silently collapses to ~1/30 speed.  On Windows/WDDM
+an over-committing allocation is **not** refused at all, so the process keeps running until a GPU access
+reaches a paged allocation, and that is the bugcheck.  `--list-devices` still reporting ~16 GiB free after
+the fault is the same mechanism seen from userspace.
+
+### The change
+
+1. **`GGML_CUDA_MIN_FREE_MIB`** (block 09, default `0` = off): a free-VRAM floor at
+   `ggml_cuda_device_malloc`, the single choke point.  A refused allocation returns
+   `cudaErrorMemoryAllocation`, so the existing fail-soft chain runs unchanged and the run fails with a
+   message that names the budget.  It is **skipped while the movable-boundary slab is armed** (the slab
+   parks nearly all free VRAM by design, so a floor there would refuse legitimate outside-the-slab
+   allocations).  Verified at the 16 GiB emulation: `GGML_CUDA_MIN_FREE_MIB=1024` turns the silent
+   30x-or-abort band into a deterministic `refusing a 453.54 MiB device allocation ... it would leave
+   1330.00 MiB free, below the budget of 1024 MiB` at context creation, and an unlimited-budget run of
+   the same config is byte-for-byte unaffected.
+2. **`--fit` says the numbers when it cannot help** (block 09, `common/fit.cpp`).  When the free-memory
+   target cannot be met and the context is pinned by the user, the fit used to end with one
+   `W ... failed to fit params ...: n_gpu_layers already set by user to 99, abort` line after the INFO
+   breakdown.  It now prints an ERROR block: projected vs. free vs. target margin, the shortfall, the
+   context's size and MiB per 1024 tokens, and either "about N fewer context tokens would fit" or "even
+   the smallest context cannot make this fit: lower `-ngl`".  On the reporter's shape the fit already
+   knew the answer (`need to reduce device memory by 3124 MiB`) and nothing acted on it.  Nothing is
+   changed automatically and nothing is refused: `--fit` still only adjusts arguments the user did not pin.
+3. **`moe_cache_release_arena()` only reports a release when it freed something** (block 09).  On a dense
+   model it logged `released the MoE expert cache arena (0.0 MiB) ... experts come from the host` and
+   returned true, which reads as "the slab/arena was involved" in a failure that has no arena at all.
+   Same class as the r125 gated flat draft reserve (issue #216).
+
+### Gates
+
+| gate | result |
+|---|---|
+| `scripts/validate-set.sh` | green: 14 patch files + `rdna-boosts-all.patch` verify, strict 14/14 `git am`, tree `84dae2bec1` |
+| per-block build gate (`--changed-from 58120d4e3`) | block 09 + the tip build the `all` target (the other 12 blocks' deltas are unchanged) |
+| coherence, 4B Q8_0 same-seed text (1 GPU), repeated | stable across repeats; no kernel, dispatch row or default changed, and the new floor has no live code path unless `GGML_CUDA_MIN_FREE_MIB` is set |
+| 27B GSQ-RCO-IQ3_S + adaptive MTP n3, 2 GPU `-sm tensor`, q4_0 KV | coherent, generation 86.4 t/s |
+| the reporter's exact request + flags + model, 16 GiB emulation, **release binary** | 3/3 clean, prompt eval **1140 t/s** (14765 tokens), decode 80 t/s, peak **15.07 GiB** on the unconstrained arm |
+| `GGML_CUDA_MIN_FREE_MIB=1024` at the same emulation | refuses at context creation with the budget message (no 30x, no abort) |
+| the same arm with the budget unset | unchanged (`13.1 s` for the same request, same output) |
+| `scripts/check-gpu-faults.sh --since "4 hours ago"` | clean (no GPU fault in any of the edge runs) |
+
+### Open, recorded rather than fixed
+
+* The ~30x collapse in the narrow band where the model + KV leave only a few MiB free (14.06 GiB here)
+  has no root cause yet: the weights stay in VRAM (`rocm-smi --showpids` confirms 15.08 GiB), the FA
+  staging fallback is *not* it (forcing `GGML_CUDA_FA_STAGE_MAX_MB=0` on a roomy card is 13.3 s), and the
+  workspace-pool flush + graph invalidation explain a fraction of it, not 30x.  It is harmless on Linux
+  and unreachable with a budget set, but it is not understood - `TODO.md` #103.
+* The Windows fault itself cannot be reproduced off Windows.  The reporter has one distinguishing test to
+  run (issue #219): the same request at `-c 32768` **and** `GGML_CUDA_MIN_FREE_MIB=1536` in a fresh
+  process.  A clean start (or a clean OOM) confirms the budget mechanism; a fault there means something
+  else on the chat path and needs `-lv 4` from them.
+
+### Docs
+
+`patches/README.md` (block 09), `ENVIRONMENT.md` (`GGML_CUDA_MIN_FREE_MIB`), `README.md`/`BASELINE.md`/
+`TODO.md` (current-release pointer), `TODO.md` #103 (`wip`-free, no stub), this entry.
+
 ## 261025.004 (r134) -- issue #224: the band's 64-column block gets its own geometry, so widths 5..8 reduce like widths 1..4
 
 **Release:** `v14-3f03b1772-r134`.  Base `3f03b1772` (base tree `14370bd49a`), canonical tip `58120d4e3`,

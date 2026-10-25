@@ -1,4 +1,4 @@
-From f40af49238993c298762a9003153b24f7c072059 Mon Sep 17 00:00:00 2001
+From 4e83d36ab40bb88d2053cd6cd3802e54a7a7ca56 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/13] rdna-boosts: block 09: host-resident MoE (iface,
@@ -232,7 +232,7 @@ Co-authored-by: Brian <bsp2020@gmail.com>
  common/common.h                               |   58 +-
  common/draft-reserve.cpp                      |  223 +
  common/draft-reserve.h                        |   44 +
- common/fit.cpp                                |  456 +-
+ common/fit.cpp                                |  499 +-
  common/fit.h                                  |    7 +
  common/speculative.cpp                        |   96 +-
  common/speculative.h                          |   31 +-
@@ -253,10 +253,10 @@ Co-authored-by: Brian <bsp2020@gmail.com>
  ggml/src/ggml-cuda/cpy-batch.cu               |  109 +
  ggml/src/ggml-cuda/cpy-batch.cuh              |    9 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   87 +
- ggml/src/ggml-cuda/ggml-cuda.cu               | 2527 +++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 2579 +++++++-
  ggml/src/ggml-cuda/mmvq.cu                    |  275 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 5542 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 5548 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  323 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
@@ -291,7 +291,7 @@ Co-authored-by: Brian <bsp2020@gmail.com>
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 65 files changed, 14911 insertions(+), 524 deletions(-)
+ 65 files changed, 15011 insertions(+), 525 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -1106,7 +1106,7 @@ index 000000000..8e65564b6
 +                                                   ggml_type type_k,
 +                                                   ggml_type type_v);
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 7a0300829..abc03c26b 100644
+index 7a0300829..a3f9ef205 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -27,6 +27,84 @@ class common_params_fit_exception : public std::runtime_error {
@@ -1620,6 +1620,56 @@ index 7a0300829..abc03c26b 100644
      std::vector<std::string> dev_names;
      {
          dev_names.reserve(nd);
+@@ -453,6 +895,49 @@ static void common_params_fit_impl(
+                 }
+             } else {
+                 LOG_TRC("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
++
++                // The free-memory target cannot be met and the context is not ours to change, so the fit
++                // ends here with the run still over budget.  Say so at ERROR with the arithmetic and the
++                // ways out: this is issue #219's state (a 16 GiB card asked for more than it has), where
++                // one W line was read as harmless and the run went on to a device fault.
++                int64_t sum_margin = 0;
++                if (nd == 0) {
++                    sum_margin = margins[0];
++                } else {
++                    for (size_t id = 0; id < nd; id++) {
++                        sum_margin += margins[id];
++                    }
++                }
++                int64_t ctx_mib = 0;
++                if (nd == 0) {
++                    ctx_mib = dmds_full.back().mb.context;
++                } else {
++                    for (size_t id = 0; id < nd; id++) {
++                        ctx_mib += dmds_full[id].mb.context;
++                    }
++                }
++                const int64_t shortfall   = -global_surplus;
++                const int64_t mib_per_1k  = cparams->n_ctx > 0 ? ctx_mib * 1024 / cparams->n_ctx : 0;
++                LOG_ERR("%s: the requested configuration does NOT fit in device memory\n", __func__);
++                LOG_ERR("%s:   projected %" PRId64 " MiB used vs. %" PRId64 " MiB free, target margin %" PRId64
++                        " MiB -> over budget by %" PRId64 " MiB\n",
++                        __func__, sum_projected_used/MiB, sum_free/MiB, sum_margin/MiB, shortfall/MiB);
++                LOG_ERR("%s:   the context is fixed at %" PRIu32 " by the user (%" PRId64 " MiB, about %" PRId64
++                        " MiB per 1024 tokens), so --fit will not reduce it\n",
++                        __func__, (uint32_t) cparams->n_ctx, ctx_mib/MiB, mib_per_1k);
++                if (shortfall < ctx_mib) {
++                    LOG_ERR("%s:   about %" PRId64 " fewer context tokens would fit; lower -c, lower -ngl, or\n"
++                            "%s:   unset -c/-ngl so --fit can choose.  Running over budget ends in an\n"
++                            "%s:   allocator out-of-memory abort, and on Windows/WDDM a paged device\n"
++                            "%s:   allocation can fault the GPU instead of failing cleanly\n",
++                            __func__, shortfall * 1024 / std::max<int64_t>(1, mib_per_1k), __func__, __func__, __func__);
++                } else {
++                    LOG_ERR("%s:   even the smallest context cannot make this fit: lower -ngl (offload fewer\n"
++                            "%s:   layers) or use a smaller quant.  Running over budget ends in an\n"
++                            "%s:   allocator out-of-memory abort, and on Windows/WDDM a paged device\n"
++                            "%s:   allocation can fault the GPU instead of failing cleanly\n",
++                            __func__, __func__, __func__, __func__);
++                }
+             }
+         }
+     }
 diff --git a/common/fit.h b/common/fit.h
 index 824d386b0..9b171b54b 100644
 --- a/common/fit.h
@@ -6953,7 +7003,7 @@ index 000000000..8005b57b4
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
 +void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index ae143c344..e231228ab 100644
+index ae143c344..cbf5a1791 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -33,6 +33,7 @@
@@ -6972,11 +7022,12 @@ index ae143c344..e231228ab 100644
  #include <memory>
  #include <mutex>
  #include <cstdarg>
-@@ -189,7 +191,16 @@ static int ggml_cuda_op_offload_min_batch() {
+@@ -189,8 +191,67 @@ static int ggml_cuda_op_offload_min_batch() {
      return min_batch;
  }
  
 -static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+-    ggml_cuda_set_device(device);
 +// Issue/TODO #42: shared device-allocation helper.  It yields the lowest-priority MoE expert-cache
 +// arena when an allocation cannot otherwise be satisfied, so EVERY device allocation inherits the same
 +// fail-soft policy (defined in ggml-cuda.cu).  The slab query is declared here because the slab itself
@@ -6986,11 +7037,62 @@ index ae143c344..e231228ab 100644
 +
 +cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
 +
++// Opt-in device budget: refuse an allocation that would leave the device with less than
++// GGML_CUDA_MIN_FREE_MIB free (0 = off, the default).  The failure is reported exactly like a driver
++// out-of-memory, so every fail-soft path above it (the MoE arena's shrink/release, the workspace pool's
++// flush, the FA staging stand-down) runs unchanged and the run ends with a clear message.
++//
++// WHY: on Windows/WDDM a device allocation that over-commits is NOT refused -- it is paged into shared
++// system memory and the loss surfaces later, as `unspecified launch failure` or a bugcheck inside dxgkrnl
++// (issue #219: a 16 GiB card, a 12 GiB model and -c 65536).  `cudaMemGetInfo` still reports the real
++// budget there, so a floor set below the card's usable VRAM keeps the process off that path.  On Linux
++// the same config does not fault: it aborts with `ROCm error: out of memory`, or (with the last hundred
++// MiB held by weights/KV) runs 30x slower because the driver evicts resident weight pages to GTT.  Either
++// way the floor makes the outcome deterministic instead.
++//
++// Skipped while the movable-boundary slab is armed: the slab parks nearly all of the device's free VRAM
++// by design, so a floor read from `cudaMemGetInfo` would refuse every legitimate outside-the-slab
++// allocation on an MoE config.
++static bool ggml_cuda_min_free_refuses(size_t size, int device) {
++    // read the value once: a cached getenv() pointer is not safe on Windows (the CRT buffer is reused)
++    static const long long floor_mib = [] {
++        const char * env = getenv("GGML_CUDA_MIN_FREE_MIB");
++        return env != nullptr ? atoll(env) : 0;
++    }();
++    if (floor_mib <= 0 || ggml_cuda_slab_enabled()) {
++        return false;
++    }
++    size_t f = 0;
++    size_t t = 0;
++    if (cudaMemGetInfo(&f, &t) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;   // fail-soft: never invert a working run on a driver hiccup
++    }
++    const size_t floor = (size_t) floor_mib << 20;
++    if (f >= size + floor) {
++        return false;
++    }
++    static bool warned = false;
++    if (!warned) {
++        warned = true;
++        GGML_LOG_WARN("%s: refusing a %.2f MiB device allocation on device %d: it would leave %.2f MiB free, "
++                      "below the GGML_CUDA_MIN_FREE_MIB budget of %lld MiB.  Lower the context / -ngl, or "
++                      "lower the budget.  (Reported as an out-of-memory error; the fail-soft paths above "
++                      "this point still run.)\n",
++                      __func__, size / 1024.0 / 1024.0, device, f / 1024.0 / 1024.0, floor_mib);
++    }
++    return true;
++}
++
 +cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
-     ggml_cuda_set_device(device);
++    ggml_cuda_set_device(device);   // the floor reads the free VRAM of the CURRENT device
++    if (ggml_cuda_min_free_refuses(size, device)) {
++        return cudaErrorMemoryAllocation;
++    }
      cudaError_t err;
      if (ggml_cuda_unified_memory_enabled()) {
-@@ -216,6 +227,58 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
+         err = cudaMallocManaged(ptr, size);
+@@ -216,6 +277,58 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
      } else {
          err = cudaMalloc(ptr, size);
      }
@@ -7049,7 +7151,7 @@ index ae143c344..e231228ab 100644
      return err;
  }
  
-@@ -356,7 +419,24 @@ static ggml_cuda_device_info ggml_cuda_init() {
+@@ -356,7 +469,24 @@ static ggml_cuda_device_info ggml_cuda_init() {
  
          info.default_tensor_split[id] = total_vram;
          total_vram += device_vram;
@@ -7074,7 +7176,7 @@ index ae143c344..e231228ab 100644
          info.devices[id].nsm        = prop.multiProcessorCount;
          info.devices[id].smpb       = prop.sharedMemPerBlock;
          info.devices[id].warp_size  = prop.warpSize;
-@@ -458,9 +538,1123 @@ const ggml_cuda_device_info & ggml_cuda_info() {
+@@ -458,9 +588,1123 @@ const ggml_cuda_device_info & ggml_cuda_info() {
      return info;
  }
  
@@ -8198,7 +8300,7 @@ index ae143c344..e231228ab 100644
  struct ggml_cuda_pool_leg : public ggml_cuda_pool {
      static const int MAX_BUFFERS = 256;
  
-@@ -473,10 +1667,18 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+@@ -473,10 +1717,18 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
  
      ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
      size_t pool_size = 0;
@@ -8217,7 +8319,7 @@ index ae143c344..e231228ab 100644
      }
  
      ~ggml_cuda_pool_leg() {
-@@ -495,6 +1697,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+@@ -495,6 +1747,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                  b.size = 0;
              }
          }
@@ -8225,7 +8327,7 @@ index ae143c344..e231228ab 100644
      }
  
      // captured CUDA graphs can still use freed buffers, so they must be captured again
-@@ -533,6 +1736,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+@@ -533,6 +1786,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                          if (!best_diff) {
                              void * ptr = b.ptr;
                              *actual_size = b.size;
@@ -8233,7 +8335,7 @@ index ae143c344..e231228ab 100644
                              b.ptr = nullptr;
                              b.size = 0;
                              return ptr;
-@@ -545,6 +1749,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+@@ -545,6 +1799,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
              ggml_cuda_buffer& b = buffer_pool[ibest];
              void * ptr = b.ptr;
              *actual_size = b.size;
@@ -8241,7 +8343,7 @@ index ae143c344..e231228ab 100644
              b.ptr = nullptr;
              b.size = 0;
              return ptr;
-@@ -553,7 +1758,23 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+@@ -553,7 +1808,23 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
          size_t look_ahead_size = (size_t) (1.05 * size);
          look_ahead_size = 256 * ((look_ahead_size + 255)/256);
          ggml_cuda_set_device(device);
@@ -8266,7 +8368,7 @@ index ae143c344..e231228ab 100644
          if (err == cudaErrorMemoryAllocation) {
              (void)cudaGetLastError();
              const size_t cached_bytes = pool_size;
-@@ -583,6 +1804,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+@@ -583,6 +1854,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
              if (b.ptr == nullptr) {
                  b.ptr = ptr;
                  b.size = size;
@@ -8274,7 +8376,7 @@ index ae143c344..e231228ab 100644
                  return;
              }
          }
-@@ -763,6 +1985,10 @@ static std::mutex ggml_cuda_lock;
+@@ -763,6 +2035,10 @@ static std::mutex ggml_cuda_lock;
  static std::condition_variable ggml_cuda_lock_cv;
  static std::atomic<int> ggml_cuda_lock_counter;
  
@@ -8285,7 +8387,7 @@ index ae143c344..e231228ab 100644
  ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      ggml_cuda_mmb_release_all();
      std::unique_lock<std::mutex> lock(ggml_cuda_lock);
-@@ -774,6 +2000,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -774,6 +2050,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      for (char * p : q8_1_arena_retired) {
          CUDA_CHECK(cudaFree(p));
      }
@@ -8293,7 +8395,7 @@ index ae143c344..e231228ab 100644
      if (copy_event != nullptr) {
          CUDA_CHECK(cudaEventDestroy(copy_event));
      }
-@@ -798,6 +2025,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -798,6 +2075,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
  struct ggml_backend_cuda_buffer_context {
      int device;
      void * dev_ptr = nullptr;
@@ -8307,7 +8409,7 @@ index ae143c344..e231228ab 100644
      std::string name;
  
      ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-@@ -806,6 +2040,12 @@ struct ggml_backend_cuda_buffer_context {
+@@ -806,6 +2090,12 @@ struct ggml_backend_cuda_buffer_context {
      }
  
      ~ggml_backend_cuda_buffer_context() {
@@ -8320,7 +8422,7 @@ index ae143c344..e231228ab 100644
          CUDA_CHECK(cudaFree(dev_ptr));
      }
  };
-@@ -854,10 +2094,170 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+@@ -854,10 +2144,170 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
      CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
  }
  
@@ -8491,7 +8593,7 @@ index ae143c344..e231228ab 100644
      CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
      CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
  }
-@@ -866,6 +2266,19 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+@@ -866,6 +2316,19 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
      ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
  
      ggml_cuda_set_device(ctx->device);
@@ -8511,7 +8613,7 @@ index ae143c344..e231228ab 100644
      CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
      CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
  }
-@@ -957,6 +2370,25 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+@@ -957,6 +2420,25 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
      ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
  
      ggml_cuda_set_device(ctx->device);
@@ -8537,7 +8639,7 @@ index ae143c344..e231228ab 100644
      CUDA_CHECK(cudaMemcpy2DAsync(
          data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
      CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-@@ -1044,6 +2476,93 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -1044,6 +2526,93 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -8631,7 +8733,7 @@ index ae143c344..e231228ab 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -1069,8 +2588,56 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
+@@ -1069,8 +2638,56 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
      return size;
  }
  
@@ -8690,7 +8792,7 @@ index ae143c344..e231228ab 100644
      /* .alloc_buffer        = */ ggml_backend_cuda_buffer_type_alloc_buffer,
      /* .alloc_buffer_n      = */ NULL,
      /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
-@@ -1078,6 +2645,9 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+@@ -1078,6 +2695,9 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
      /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
      /* .get_alloc_size_n    = */ NULL,
      /* .is_host             = */ NULL,
@@ -8700,7 +8802,7 @@ index ae143c344..e231228ab 100644
  };
  
  ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
-@@ -1936,23 +3506,41 @@ static size_t ggml_backend_cuda_host_buffer_type_get_max_size(ggml_backend_buffe
+@@ -1936,23 +3556,41 @@ static size_t ggml_backend_cuda_host_buffer_type_get_max_size(ggml_backend_buffe
      return 4ull*1024*1024*1024;
  }
  
@@ -8758,7 +8860,7 @@ index ae143c344..e231228ab 100644
  }
  
  //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
-@@ -2353,13 +3941,13 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+@@ -2353,13 +3991,13 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
      }
  }
  
@@ -8777,7 +8879,7 @@ index ae143c344..e231228ab 100644
      const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
      const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
  
-@@ -2497,88 +4085,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+@@ -2497,88 +4135,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
  // and leave the matmul itself unchanged.  Their kernels are row-generic, so on RDNA4 the verify band
  // (2..8 tokens) takes them too; the quantized values are the ones quantize_q8_1 would write, so W = 1..8
  // stay bit-identical.  GGML_CUDA_FUSE_Q8_1_VERIFY=0 turns it off.
@@ -8866,7 +8968,7 @@ index ae143c344..e231228ab 100644
  
  static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_TENSOR_BINARY_OP_LOCALS
-@@ -2689,6 +4195,62 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -2689,6 +4245,62 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      GGML_ASSERT(src1->type == GGML_TYPE_F32);
      GGML_ASSERT(dst->type  == GGML_TYPE_F32);
  
@@ -8929,7 +9031,7 @@ index ae143c344..e231228ab 100644
      GGML_TENSOR_BINARY_OP_LOCALS
  
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -3295,6 +4857,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -3295,6 +4907,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
          return false;
      }
  
@@ -8939,7 +9041,7 @@ index ae143c344..e231228ab 100644
      if (backend_src != backend_dst) {
          // copy on src stream
          // compare the backing physical devices: distinct virtual devices may share one physical GPU,
-@@ -3349,6 +4914,27 @@ static bool ggml_cuda_graph_debug_enabled() {
+@@ -3349,6 +4964,27 @@ static bool ggml_cuda_graph_debug_enabled() {
  
  static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
  
@@ -8967,7 +9069,7 @@ index ae143c344..e231228ab 100644
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
-@@ -3380,14 +4966,82 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -3380,14 +5016,82 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
      return use_cuda_graph;
  }
  
@@ -9053,7 +9155,7 @@ index ae143c344..e231228ab 100644
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
      if (cgraph->uid != 0 &&
-@@ -3429,6 +5083,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+@@ -3429,6 +5133,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
  }
  
  static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGraph_t cuda_graph) {
@@ -9082,7 +9184,7 @@ index ae143c344..e231228ab 100644
  #if CUDART_VERSION >= 12000
      cudaGraphExecUpdateResultInfo result_info;
      cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &result_info);
-@@ -4012,12 +5688,12 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+@@ -4012,12 +5738,12 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
  }
  
  // returns whether the write (out) nodes overwrite the read nodes in operation
@@ -9097,7 +9199,7 @@ index ae143c344..e231228ab 100644
      auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
          const int64_t a_start = (int64_t) a->data;
          const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
-@@ -4508,11 +6184,130 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -4508,11 +6234,130 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  }
  
  // try and fuse nodes and return the number of nodes to skip
@@ -9228,7 +9330,7 @@ index ae143c344..e231228ab 100644
  
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
      static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
-@@ -4521,24 +6316,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4521,24 +6366,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -9262,7 +9364,7 @@ index ae143c344..e231228ab 100644
      }
  
      if (node->op == GGML_OP_MUL) {
-@@ -5242,13 +7028,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5242,13 +7078,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  break;
              }
  
@@ -9290,7 +9392,7 @@ index ae143c344..e231228ab 100644
                  fused_mul_mat_vec = true;
                  fused_node_count  = 3;
                  break;
-@@ -5410,6 +7208,95 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5410,6 +7258,95 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -9386,7 +9488,7 @@ index ae143c344..e231228ab 100644
      // mul_mat + add, with an optional view (reshape) node between the matmul and the add
      for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
          const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
-@@ -5660,7 +7547,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5660,7 +7597,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      return 0;
  }
  
@@ -9395,7 +9497,7 @@ index ae143c344..e231228ab 100644
      bool graph_evaluated_or_captured = false;
  
      // per-op timing instrumentation (env-gated, diagnostic only)
-@@ -5996,7 +7883,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5996,7 +7933,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  }
  
  #ifdef USE_CUDA_GRAPH
@@ -9404,7 +9506,7 @@ index ae143c344..e231228ab 100644
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
      if (graph->instances.empty()) {
-@@ -6016,6 +7903,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6016,6 +7953,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
      ggml_cuda_set_device(cuda_ctx->device);
@@ -9413,7 +9515,7 @@ index ae143c344..e231228ab 100644
  
      ggml_cuda_mmb_begin_graph();
  
-@@ -6025,7 +7914,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6025,7 +7964,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
@@ -9422,7 +9524,7 @@ index ae143c344..e231228ab 100644
  
      // op timing instruments each node with stream events, which is not possible during capture
      const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
-@@ -6039,6 +7928,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6039,6 +7978,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      if (!op_timing && graph->is_enabled()) {
          const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
          if (graph_compatible) {
@@ -9440,7 +9542,7 @@ index ae143c344..e231228ab 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -6065,6 +7965,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6065,6 +8015,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instances.empty();
                  }
              }
@@ -9448,7 +9550,7 @@ index ae143c344..e231228ab 100644
          }
      }
  #endif // USE_CUDA_GRAPH
-@@ -6257,7 +8158,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6257,7 +8208,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  
  #ifdef USE_CUDA_GRAPH
@@ -9457,7 +9559,7 @@ index ae143c344..e231228ab 100644
      const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
  #else
      const bool use_cuda_graph = false;
-@@ -6499,6 +8400,180 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6499,6 +8450,180 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -9638,7 +9740,7 @@ index ae143c344..e231228ab 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -6515,7 +8590,18 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -6515,7 +8640,18 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -9657,7 +9759,7 @@ index ae143c344..e231228ab 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -6785,8 +8871,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -6785,8 +8921,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -9668,7 +9770,7 @@ index ae143c344..e231228ab 100644
  }
  
  // TODO: move these functions here
-@@ -7290,6 +9376,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -7290,6 +9426,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -9685,7 +9787,7 @@ index ae143c344..e231228ab 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -7324,6 +9420,137 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -7324,6 +9470,137 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -9823,7 +9925,7 @@ index ae143c344..e231228ab 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -7340,6 +9567,27 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -7340,6 +9617,27 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -9851,7 +9953,7 @@ index ae143c344..e231228ab 100644
  };
  
  // backend reg
-@@ -7519,6 +9767,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -7519,6 +9817,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -10186,10 +10288,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..ec00ce957
+index 000000000..a005bbaf3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,5542 @@
+@@ -0,0 +1,5548 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -13865,6 +13967,12 @@ index 000000000..ec00ce957
 +        t.slot_dirty = true;
 +    }
 +    g_enabled = false;
++    if (freed_b == 0) {
++        // Nothing was actually released, so there is nothing to report and no point in the caller's retry
++        // (a dense model has no expert table at all: log-only noise of the same class as r125's gated
++        // "flat draft reserve" line, issue #216).
++        return false;
++    }
 +    GGML_LOG_WARN("%s: released the MoE expert cache arena (%.1f MiB) to satisfy a compute allocation; "
 +                  "the expert cache is disabled for the rest of this run (experts come from the host)\n",
 +                  __func__, (double) freed_b / (1024.0 * 1024.0));

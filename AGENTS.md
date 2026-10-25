@@ -502,6 +502,16 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   build.  Use the file's `moe_cache_min_i64`/`moe_cache_max_i64` (block 09); `std::min` on `int`/`size_t` is
   fine.  Other HIP TUs still contain the int64_t pattern and compile on the reporter's toolchain, so sweeping
   them is **not** sanctioned (TODO #95, accepted limitation — fix a named TU only from a Windows build log).
+- **An over-budget config is reported, never silently repaired, and Windows cannot be fixed from here
+  (r135, issue #219).**  `--fit` prints the arithmetic at ERROR when it cannot meet its target and the user
+  pinned `-c` / `-ngl` (`common/fit.cpp`), and `GGML_CUDA_MIN_FREE_MIB` is the only mechanism that *enforces*
+  a device budget: an opt-in free-VRAM floor at `ggml_cuda_device_malloc` that fails an allocation like a
+  driver OOM so the fail-soft chain still runs.  It is **skipped while the movable-boundary slab is armed**
+  (the slab parks nearly all free VRAM by design), so no `-ncmoe` MoE config changes.  On Windows/WDDM an
+  over-committing device allocation is not refused at all (it pages to shared memory and the GPU faults,
+  `dxgkrnl` bugcheck); on Linux the same state aborts with `ROCm error: out of memory` or, in a narrow band,
+  collapses to ~1/30 speed (TODO #103).  Never read a Linux "it works at 0 MiB free" run as evidence that a
+  16 GiB Windows card can run the config.
 - **A compute buffer that cannot grow must never abort; the MoE arena is what yields (r20).**
   `GGML_COMPUTE_BUFFER_MARGIN_PCT` (default **10**, `0` disables) pads each COMPUTE buffer allocation so a
   runtime graph's slightly larger layout (+3.3 % measured) does not force a free-then-allocate-larger

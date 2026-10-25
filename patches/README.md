@@ -579,6 +579,29 @@ whatever VRAM is left.
 
 **Contents.**
 
+* **A device allocation budget, and an over-budget `--fit` that says so (r135, issue #219).**  Two things,
+  both at the *decision* layer rather than in a kernel:
+  * `GGML_CUDA_MIN_FREE_MIB` (opt-in, default `0` = off) is a device-wide free-VRAM floor inside
+    `ggml_cuda_device_malloc`, the single choke point every device allocation shares: an allocation that
+    would leave less than the budget free returns `cudaErrorMemoryAllocation` exactly like a driver OOM, so
+    the existing fail-soft chain (arena shrink/release, pool flush + retry, FA staging stand-down) runs
+    unchanged and the run ends with a message instead of consuming the last bytes.  It exists because a
+    **Windows/WDDM** allocation that over-commits is *not* refused: it is paged into shared system memory and
+    the loss surfaces later as `unspecified launch failure` or a bugcheck inside `dxgkrnl` (issue #219: a
+    16 GiB 9070 XT, the 11.29 GiB GSQ-RCO-IQ3_S 27B + mmproj + MTP at `-c 65536`).  `cudaMemGetInfo` still
+    reports the real budget there, so a floor below the card's usable VRAM keeps the process off that path.
+    **Inert while the movable-boundary slab is armed** (the slab parks nearly all free VRAM by design), so an
+    `-ncmoe` MoE run is unchanged; it is a *budget*, never a reservation.
+  * `common/fit.cpp`'s failure path now prints an ERROR block with the arithmetic (projected vs. free vs.
+    target margin, the shortfall, the context's MiB and MiB/1024 tokens) and the ways out, instead of the one
+    `W common_fit_params: failed to fit params ...: n_gpu_layers already set by user to 99, abort` line that
+    read as harmless.  It also distinguishes "lower `-c` by about N tokens" from "even the smallest context
+    cannot make this fit, lower `-ngl`".  Nothing is changed automatically and nothing is refused: the
+    numbers are the fit's own, and `--fit` still only adjusts arguments the user did not pin.
+* `moe_cache_release_arena()` only reports a release when it actually freed bytes (r135): on a dense model
+  it logged `released the MoE expert cache arena (0.0 MiB) ... (experts come from the host)` and returned
+  true, which sent a reporter looking for an arena that does not exist (same class as r125's gated flat
+  draft reserve, issue #216).
 * `moe-expert-cache.cu` (~5.1k lines) + `.h`: the cache engine — arena sizing, per-layer uniform slots,
   the slot remap, the routed-MMVQ decode/verify band (`moe_cache_band`), admission/heat policy, the
   persistent cross-run heat map (`MOE_EXPERT_HEATMAP`) and prefill cache staging.

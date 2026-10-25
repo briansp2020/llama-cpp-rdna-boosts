@@ -12,12 +12,13 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 still means the same subject after that item is closed and removed from this file.  New items append.
 
 **Current state:** the **14-block V2.1 set** (block 00 + blocks 01-13) at fork point **`3f03b1772`**
-(the 2026-10-24 re-base), release **`v14-3f03b1772-r134`**.  `release.json` is the source of truth for the
+(the 2026-10-24 re-base), release **`v14-3f03b1772-r135`**.  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.
 
 | # | subject | kind | status |
 |---|---|---|---|
 | **102** | the band's width purity has no head-256 **GQA-8** arm | platform validation | open, accepted limitation (r134, issue #224).  The r134 guard is width-only (`np`, `nbatch_fa/K2/V2`, `nstages_target`, `Q_in_reg` on the two band rows), and it is measured at **GQA 6** (dense 27B: `test-logits-width-probe P=4096`, maxdiff 0) and **GQA 12** (Flash-Next `RS=from_w`, 2 GPU `-sm layer -ncmoe 40`, q8_0, maxdiff 0); no head-256 GQA-8 model exists in the fleet.  What to run if one appears: the same probe at `P >= 4096` (`KV=q8_0/f16`) plus `plain == draft-*` at `-n 512` |
+| **103** | the ~30x collapse at the last few MiB of free VRAM | diagnosis | open (r135, found in issue #219).  At 14.06 GiB free the same 27B + MTP config runs prefill 35 t/s / decode 1.5-3 t/s instead of 1127 / 53 with the weights still resident; not the FA staging fallback and not graph churn alone.  `GGML_CUDA_MIN_FREE_MIB` makes it unreachable; the cause is unrecorded.  Detail in `TODO.md` §103 |
 | **79** | RDNA3_0 verify-band fusions: no multi-device measurement, and gfx1101/gfx1102 untested | platform validation | open (shipped default-on in r95; needs a 2+ card gfx1100 box).  `ssh fingon` is single-RDNA3 (`ROCm0`; its second rocm-smi entry is an iGPU and is not a HIP device), so it does **not** cover the multi-device arm — it validates single-GPU gfx1100 only.  gfx1101/gfx1102 still have no hardware |
 | **70** | harden the expert-cache re-arm / wide-aux growth against a starved arena | robustness | open |
 | **36** | genuine CPU/GPU overlap for the MoE misses | performance | open, scoping (`wip/moe-cpu-overlap/`) |
@@ -25,6 +26,22 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
 ---
+
+## 103. The ~30x collapse when the last few MiB of VRAM are in use has no root cause — PERFORMANCE (diagnosis)
+
+**Status: open, not understood (r135, found while investigating issue #219).**  On a single gfx1201 with the
+27B GSQ-RCO-IQ3_S + mmproj + MTP at `-c 65536`, reducing the free VRAM at process start from 14.46 GiB to
+14.06 GiB turns a 13 s request into a 384 s one (prefill 1127 -> 35 t/s, decode 53 -> 1.5-3 t/s) with
+**zero** device memory left, and the next larger prompt then aborts with `ROCm error: out of memory`.
+Eliminated so far: the weights are still resident (`rocm-smi --showpids` shows 15.08 GiB for the process);
+it is **not** the FA staging stand-down (`GGML_CUDA_FA_STAGE_MAX_MB=0` on a roomy card is still 13.3 s); it
+is **not** graph churn alone (`graphs reused` is 0 in one arm and 65 in another, both slow); the workspace
+pool's flush + retry and the ECC/pool-floor logic account for a fraction, not 30x.  Next step: `-lv 5` on a
+short (2-3 K token) prompt at that budget with the per-op pool debug (`GGML_CUDA_GCDBG`) and a GPU
+busy/clock sample, to separate "the GPU is doing 30x the work" from "the host is stalling 30x".
+
+Harmless on Linux (it terminates or degrades) and unreachable with `GGML_CUDA_MIN_FREE_MIB` set, but it is
+the state the Windows reporter's card spends its life in, so it is worth understanding.
 
 ## 102. The band's width purity has no head-256 GQA-8 model arm — PLATFORM VALIDATION
 
