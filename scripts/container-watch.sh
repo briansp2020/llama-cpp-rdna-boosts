@@ -26,8 +26,14 @@
 #   ROCM_LINES    ROCm release lines          (default "7.14.1 10.1")
 #   BUILD_EXTRA   extra args for build-containers.sh (e.g. "--no-cleanup")
 #   FORCE_TAG     build this tag even if it equals the last-built marker
+#   MAX_ATTEMPTS  failed attempts before this tag stops being retried automatically
+#                 (default 3).  A release that keeps failing must not rebuild forever:
+#                 cron is every 10 min and one build is 10-40 min, so an unfixed
+#                 failure pins the box indefinitely.
+#   KEEP_LOGS     build logs to keep in STATE_DIR (default 10; one is ~8 MB)
 #
-# Exit: 0 = nothing to do or a build succeeded; 1 = a build/push failed.
+# Exit: 0 = nothing to do, a build succeeded, or this tag already failed MAX_ATTEMPTS
+#            times (reported in the log); 1 = a build/push failed and may be retried.
 set -euo pipefail
 
 # cron has a minimal PATH and no login session; rootless podman needs XDG_RUNTIME_DIR.
@@ -51,6 +57,8 @@ STATE_DIR="${STATE_DIR:-$HOME/.cache/rdna-containers}"
 ROCM_LINES="${ROCM_LINES:-7.14.1 10.1}"
 BUILD_EXTRA="${BUILD_EXTRA:-}"
 FORCE_TAG="${FORCE_TAG:-}"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
+KEEP_LOGS="${KEEP_LOGS:-10}"
 
 log() { echo "$(date -Is) $*"; }
 
@@ -84,9 +92,32 @@ if [ "$tag" = "$built" ]; then
     exit 0
 fi
 
-log "new release $tag (last built: ${built:-none}); building"
+# A tag that keeps failing is not retried forever (see MAX_ATTEMPTS).  The counter is per
+# tag, so a new release is always attempted; clearing the file (or FORCE_TAG) revives it.
+FAILED_FILE="$STATE_DIR/failed-$tag"
+attempt=$(( $(cat "$FAILED_FILE" 2>/dev/null || echo 0) + 1 ))
+if [ -f "$FAILED_FILE" ] && [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then
+    log "ERROR: $tag has failed $((attempt - 1)) times; not retrying (fix it, then remove $FAILED_FILE)"
+    exit 0
+fi
+
+log "new release $tag (last built: ${built:-none}); building (attempt $attempt/$MAX_ATTEMPTS)"
+
+# Every failure path counts the same way, so a tag that can never build stops being retried
+# (MAX_ATTEMPTS).  Exits 1 while attempts remain, so cron/`set -e` still reports the failure.
+fail() {
+    echo "$attempt" > "$FAILED_FILE"
+    log "ERROR: $* (attempt $attempt/$MAX_ATTEMPTS); not built"
+    exit 1
+}
+
 git fetch --quiet origin
-git checkout --quiet --force --detach "$tag"
+# A failed checkout must abort: without this the build would run against whatever tree
+# was left checked out and then publish it under the NEW tag -- a wrong image, silently.
+git checkout --quiet --force --detach "$tag" || fail "cannot check out $tag (tree left untouched)"
+want_rev="$(git rev-parse --verify -q "${tag}^{commit}")"
+have_rev="$(git rev-parse --verify -q HEAD)"
+[ "$want_rev" = "$have_rev" ] || fail "$tag resolves to $want_rev but HEAD is $have_rev"
 
 LOG="$STATE_DIR/build-$tag.log"
 # LLAMA_DIR is forwarded so build-containers.sh can borrow the canonical tip when
@@ -100,9 +131,11 @@ LOG="$STATE_DIR/build-$tag.log"
 # release's tree) must never silently block a new release's build -- recreate it.
 if LLAMA_CPP_DIR="$LLAMA_DIR" ./scripts/build-containers.sh --rocm "$ROCM_LINES" --push --prune --force $BUILD_EXTRA >"$LOG" 2>&1; then
     echo "$tag" > "$STATE_DIR/last-built"
+    rm -f "$FAILED_FILE"
+    # Keep the log directory bounded (one build log is ~8 MB).
+    ls -1t "$STATE_DIR"/build-*.log 2>/dev/null | tail -n +$((KEEP_LOGS + 1)) | xargs -r rm -f
     log "$tag pushed (log: $LOG)"
 else
-    log "ERROR: $tag build/push failed (log: $LOG); not marking it built"
     tail -20 "$LOG" >&2 || true
-    exit 1
+    fail "$tag build/push failed (log: $LOG)"
 fi

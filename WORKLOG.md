@@ -1,5 +1,34 @@
 # WORKLOG - dated delivery records
 
+## 261025.011 (r138) -- container watcher: bounded retries, a checked checkout, bounded logs
+
+Inspected the off-host release pipeline on `radiance` (the watcher is the only automated piece there; there is
+no self-hosted Actions runner).  The r138 handover itself was healthy — the watcher saw `v15-6050b467c-r138` at
+15:50, built and pushed both ROCm lines (`latest` moved, `-6050b467c` immutable tags, GHCR prune ran), and the
+50-odd `error`/`failed` lines in its build log are Ubuntu package-install noise.  ccache is working there too
+(**95.71 % direct hits** on the 10.1 line), so the ~30 min is the re-base's genuine content delta, not a cold
+cache.  Three real defects in the unattended path, all fixed in `scripts/container-watch.sh`:
+
+* **An unfixed release was retried forever.**  A failed build did not record the tag, so cron (every 10 min)
+  re-ran a 10-40 minute build indefinitely, pinning the worker.  There is now a per-tag attempt counter
+  (`failed-<tag>`) and `MAX_ATTEMPTS` (**default 3**), after which the watcher logs
+  `ERROR: <tag> has failed N times; not retrying` and stops until the file is removed (or `FORCE_TAG` is
+  used).  A successful build deletes the counter; a *new* tag is always attempted.
+* **A failed tag checkout could have published the wrong image.**  `git checkout --force --detach "$tag"`
+  was unchecked, so on failure the build would have run against whatever tree was left checked out — the
+  previous release — and then recorded the **new** tag as built.  The checkout is now checked, and `HEAD` is
+  verified to be that tag's commit before anything is built.
+* **Build logs grew without bound** — 66 logs / 768 MB on `radiance`.  `KEEP_LOGS` (**default 10**, one log is
+  ~8 MB) prunes them after a successful build; pruned to 10 logs / 84 MB by hand there as well.
+
+Verified without burning a 30-minute rebuild: a stubbed-builder harness (throwaway git origin + repo + stub
+`build-containers.sh`) proves the success path end-to-end (builder invoked as
+`--rocm "7.14.1 10.1" --push --prune --force`, `last-built` written, counter cleared, logs 16 -> 10) and the
+failure path (2 attempts, then the give-up line with the file to remove); a bogus `FORCE_TAG` proves the
+checkout guard aborts before building.  The deployed `~/bin/rdna-container-watch.sh` on `radiance` is the new
+script, and an ordinary run there reports `up to date (v15-6050b467c-r138)`.  No delivery artifact changes (the
+watcher is not in `patches/`), so no re-tag.
+
 ## 261025.010 (r138) -- gfx1100 and gfx1151 validated; `TODO` #105 closed
 
 The r138 re-base was gated on gfx1201 only.  Both other validated arches are now done, from a **fresh apply of

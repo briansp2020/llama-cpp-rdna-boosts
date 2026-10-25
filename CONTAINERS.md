@@ -414,6 +414,23 @@ worker's disk stays bounded; the ROCm base images (~20 GB each) and the ccache
 store (bounded at `CCACHE_MAXSIZE=20G`) are deliberately kept.  A `flock` serialises
 builds; the log is `~/.cache/rdna-containers/build-<tag>.log`.  `FORCE_TAG=<tag>` and
 `BUILD_EXTRA=--no-cleanup` (or the other envs in the script header) override behaviour.
+
+**Failure handling (r138, 2026-10-25).**  Three things the unattended path must get right:
+
+* **A tag is never retried forever.**  The watcher records the attempt count in
+  `~/.cache/rdna-containers/failed-<tag>` and stops retrying after `MAX_ATTEMPTS`
+  (default **3**), logging `ERROR: <tag> has failed N times; not retrying`.  Without
+  this, cron every 10 minutes re-runs a 10-40 minute build indefinitely while a release
+  stays broken, pinning the worker.  A successful build deletes the counter; to revive a
+  given-up tag, remove the `failed-<tag>` file (or use `FORCE_TAG`).  A *new* tag is
+  always attempted.
+* **A failed tag checkout aborts instead of building.**  `git checkout --force --detach
+  <tag>` is checked, and `HEAD` is verified to be that tag's commit.  Unchecked, a
+  checkout failure would build whatever tree was left behind and publish it under the
+  **new** tag — a wrong image, silently.
+* **Build logs are bounded.**  `KEEP_LOGS` (default **10**, one log is ~8 MB) prunes
+  `build-*.log` after a successful build, so `~/.cache/rdna-containers` does not grow
+  without bound (it had reached 67 logs / 768 MB).
 To build a release immediately instead of waiting for cron:
 
 ```bash
