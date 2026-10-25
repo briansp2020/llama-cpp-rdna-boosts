@@ -9,6 +9,10 @@
 #      codeload tarball of release.json.base
 #   4. the reconstructed base tree equals release.json.base_tree
 #   5. the applied tree and commit count equal release.json.tree / n_blocks
+#   6. EVERY block commit's tree is free of conflict markers and carries a block
+#      subject (r138: a resolution slip committed `<<<<<<<` inside block 10's tree and
+#      a fix landed one block late in block 08's tree; both are compile errors only in
+#      that block's own tree, so the tip built fine -- see "per-block build gate")
 #
 # Checks 3-5 are the ones that would have caught the 2026-09-13 CI break (a
 # stale fork point) in a minute instead of after three failed matrix jobs.
@@ -97,5 +101,28 @@ if [ -n "$tree" ]; then
   got="$(git rev-parse HEAD^{tree})"
   [ "$got" = "$tree" ] || fail "applied tree mismatch (have $got, want $tree)"
 fi
+
+# Every block tree, not just the tip: a resolution slip or a misplaced fix shows up as a
+# compile error in ONE block's tree, and the tip can still be perfect (r138 hit both).
+echo "==> scanning every block tree for conflict markers / subject drift"
+# The base is materialized from a tarball, so its commit sha need not exist here; the chain is
+# exactly the last n_blocks commits (the count above already matched).
+chain="$(git rev-list --reverse "HEAD~$n_blocks"..HEAD 2>/dev/null || true)"
+[ -n "$chain" ] || fail "cannot enumerate the applied block chain"
+bad=0
+for c in $chain; do
+  csub="$(git log -1 --format=%s "$c")"
+  case "$csub" in
+    rdna-boosts:*block*) ;;
+    *) echo "FAIL: commit ${c:0:12} is not a block commit: $csub" >&2; bad=1; continue ;;
+  esac
+  hits="$(git grep -I -l -e '^<<<<<<< ' -e '^=======$' -e '^>>>>>>> ' "$c" -- . 2>/dev/null || true)"
+  if [ -n "$hits" ]; then
+    echo "FAIL: conflict markers in $csub (${c:0:12}):" >&2
+    printf '        %s\n' $hits >&2
+    bad=1
+  fi
+done
+[ "$bad" -eq 0 ] || fail "block-chain scan failed (see above)"
 
 echo "==> OK: base $base, $n_blocks blocks, applied tree ${tree:-$got}"
