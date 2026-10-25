@@ -531,6 +531,19 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   op-test oracle is the **decode-width packed-hole** case set (`mask_hole=1`, `nb` 1/2/3/8, f16/bf16/q8_0);
   mutating the kernel's group test to skip one visible group fails all 14 of those cases.  Do not widen the
   gate to the tile kernel without that family's own hole cases and a measurement.  `GREEDY-PURITY.md` §37.
+- **The band's two query-width blocks must share one geometry (r134, issue #224, block 05).**  A band block
+  splits each Q column's KV rows `np = nwarps*cols_per_warp/ncols` ways (`cols_per_warp` is 16 for the RDNA4
+  256-dim WMMA tiles), so the 32-column block (widths 1..4, 8 warps) is `np = 4` and the 64-column block
+  (widths 5..8) is `np = 4` only at 16 warps.  r126 deleted the 16-warp row because it was also the prefill
+  instantiation; leaving widths 5..8 on prefill's 8-warp table row (`np = 2`) is a different reduction and
+  greedy decode with a draft then differs from decode without one (dense head-256 GQA-6, 8K and 110K).  The
+  64-column row is back **band-only**, via the compile-time `band_wide` flag + its own case/fetch-ahead
+  translation units; prefill keeps the 256-thread table row.  A `static_assert` on the two band rows (`np`,
+  `nbatch_fa/K2/V2`, `nstages_target`, `Q_in_reg`) makes a repeat a build error -- do not "simplify" it away.
+  And `test-logits-width-probe` must run at **`P >= 4096`**: the wide block's gate is `K->ne[1] >= 4096` and
+  `K->ne[1]` is the context's used length, so the historical `P=256` run reported PASS without reaching the
+  block (that is how r126..r133 passed).  `GREEDY-PURITY.md` §51,
+  `benchmarks/2026-10-25-fa-band-width-purity.md`.
 - **The movable-boundary slab is MoE-only and must stay that way (r37).** `ggml_cuda_slab_enabled()`
   returns `env_on && g_slab_armed`; `g_slab_armed` is set **only** by the MoE preflight
   (`ggml_backend_cuda_device_moe_cache_preflight`), which `llama_model_moe_cache_preflight` calls only for

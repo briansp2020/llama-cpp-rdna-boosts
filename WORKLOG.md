@@ -1,5 +1,83 @@
 # WORKLOG - dated delivery records
 
+## 261025.004 (r134) -- issue #224: the band's 64-column block gets its own geometry, so widths 5..8 reduce like widths 1..4
+
+**Release:** `v14-3f03b1772-r134`.  Base `3f03b1772` (base tree `14370bd49a`), canonical tip `58120d4e3`,
+tree `d20c8a72cb87fdc0963242b18bb8ef94378bc1ad`, 14 blocks.  `scripts/validate-set.sh` green (checksums,
+fresh-tarball **strict 14/14** `git am`, applied tree == recorded tree); per-block build gate
+**4/4** (blocks 05, 06, 10, 13 — the blocks whose delta moved).  **No block renumbered, merged or split**;
+the change is a fold inside **block 05** (the FA band) plus one inside **block 06** (the width probe).  The
+delta against the r132 tree is **6 files, +214 / -119** (`ggml-cuda/{fattn-mma-f16.cuh,fattn.cu}`,
+`template-instances/fattn-mma-f16-band-wide-*.cu` x2, `template-instances/generate_cu_files.py`,
+`tests/test-logits-width-probe.cpp`).  No new env var, no default changed.  Record:
+`benchmarks/2026-10-25-fa-band-width-purity.md`.
+
+Reported by **@overdoingism** (issue #224, with the r126 bisection and the `GGML_HIP_FA_BAND_WIDE=0` control).
+
+### The defect: r126's deletion was load-bearing for width purity
+
+A band block splits each Q column's KV rows `np = nwarps*cols_per_warp/ncols` ways, with `cols_per_warp` 16
+for the RDNA4 256-dim WMMA tiles.  The 32-column block (widths 1..4, 8 warps) is `np = 4`; the deleted
+`ncols == 64` row was 512 threads (16 warps) and therefore also `np = 4`.  r126 left widths 5..8 on prefill's
+8-warp table row, `np = 2` -- a different reduction over the same KV cells.  On the reporter's shape (dense
+head-256 GQA-6, Qwen3.8-27B UD-Q4_K_XL + DFlash2 `n_max 5`) greedy text with the draft therefore differed
+from plain decode (their first difference: token 325 at 8K, token 142 at 110K), identical with
+`GGML_HIP_FA_BAND_WIDE=0` and on r123.  Reproduced here on the first sentence at 8K (1506 chars
+`7181badffbcc` plain and two-tile vs 1619 `7a3819b47df4` with the draft), so the near-tie is not required to
+see it.
+
+Every gate between r126 and r133 passed because **none of them could see it**: same-seed text only fails on a
+near-tie, the CPU-referenced `FLASH_ATTN_EXT` op cases have a tolerance, and `test-logits-width-probe` never
+reached the block at all (below).
+
+### The fix: TODO #99's instantiation, now required
+
+`ggml_cuda_fattn_mma_get_config_rdna` returns `fattn_mma_config(512, 1, 64, 64, 64, 32, 1, true)` for
+`(256, 256, ncols 64, ncols2 8)` when a new compile-time `band_wide` flag is set, threaded through the config
+getters (host getters require the flag, so a device-style call cannot bind to one inside `__launch_bounds__`),
+the `case` function and the kernel.  `fattn.cu`'s band branch calls `..._case<DKQ, DV, 8, 8, true>`; prefill
+keeps `(256, 2, 64, 128, 128, 64, 1, true)` and its `__launch_bounds__`.  The band's 64-column case and its
+q8_0 fetch-ahead variant are new translation units, emitted by `generate_cu_files.py`, so neither shares a TU
+with prefill's kernel.  `nbatch_combine` stays 32: 16 warps with combine 64 needs 68 KiB of LDS.  The
+fetch-ahead depth's 16-warp/8-warp comment is once again true for the rows it was tuned on.
+
+**The guard is a build error.**  A `static_assert` next to the band rows checks that both split each column
+the same way and share `nbatch_fa/K2/V2`, `nstages_target` and `Q_in_reg`.  Re-selecting the r126 row for the
+band fails to compile (verified by doing exactly that).
+
+**The probe was blind, not absent (block 06).**  `test-logits-width-probe` reported `width_purity=PASS` on
+every r126..r133 arm because the wide launch's gate is `K->ne[1] >= 4096`, `K->ne[1]` is the context's
+**used** length, and the probe prefilled 256 tokens into a fixed `n_ctx = 4096`.  Its `n_ctx` is now
+`P + W + 8` and a purity run must pass `P >= 4096`: at that point the r126 geometry fails (worst maxdiff
+0.199764 on q8_0 K/V; the row-0 hash splits between W=4 and W=5) and the shipped geometry passes with
+maxdiff 0 on q8_0/f16/bf16.  `MANIFESTS.md` blocks 05/06 now name the requirement.
+
+### Gates (gfx1201, ROCm 10.1.0, `~/bin/build-llama-rocm` on the release tree; `ROCBLAS_USE_HIPBLASLT=0`)
+
+| gate | result |
+|---|---|
+| width purity, `plain` vs `draft-dflash`, `-n 512`, `-c 12288` | **identical in all 9 arms** (`KV` f16/bf16/q8_0 x `n_max` 3/5/7): f16 `2416d85188b1`, bf16 `bb0612faf7f5`, q8_0 `7181badffbcc` |
+| the same at a 131072-cell FA range (2 GPU `-sm layer`) | plain == draft == wide == two-tile (`664 chars 63b6b7cf6fdf`) |
+| `test-logits-width-probe`, `P=4096`, `KV=q8_0/f16/bf16` | **PASS, worst maxdiff 0** (the r126 row: FAIL 0.199764 / 0.206944) |
+| `test-backend-ops -o FLASH_ATTN_EXT` | **6414/6414** |
+| `plain == draft-dflash` cost, wide vs `GGML_HIP_FA_BAND_WIDE=0` | parity: 8K 75.2/74.6 vs 75.0/74.9 t/s; 131072-cell 61.0/60.6 vs 60.9/60.8; W=8 MoE arm 164.5/166.6 vs 166.3/164.9, text byte-identical (`80309046174e`) |
+| kernel level (`test-backend-ops perf`, kv 16384, q8_0, head 256 GQA 6) | `n_q` 5: 163.3 (wide) vs 167.3 us; `n_q` 8: 174.0 vs 170.0 — +-2.5 % |
+| prefill (35B-A3B UD Q4_K_M, `llama-bench -p 512`) | d0 **4764** t/s, d98304 **1641** t/s (r126: 4624 / 1632) — r126's win intact, the row is untouched |
+| prefill logits | not run: no prefill kernel, dispatch row or default changed (same row, same throughput) |
+
+The single pass is kept even though it measures at parity here rather than the reporter's 2.2-2.5 % at 110K:
+it is the only geometry that is both pure and one pass over the KV cache, and the reporter's box/config
+measures it faster.
+
+### Docs
+
+`patches/README.md` (block 05: the deleted-row bullet now describes the band-only row, the TUs and the
+`static_assert`), `GREEDY-PURITY.md` §51 (the `np` split as part of the width contract, and "a probe must
+reach the block it probes"), `MANIFESTS.md` (blocks 05/06 gate rows), `ENVIRONMENT.md` (`GGML_HIP_FA_BAND_WIDE`
+now states the geometry and that the two-tile arm is at parity), `archive/work/rdna4-fa-band-wide/README.md`
+(dated addendum superseding its "Declined" verdict), this entry, the benchmark record, and the release strings
+in `README.md`/`BASELINE.md`/`TODO.md`/`AGENTS.md`.
+
 ## 261025.003 (r133) -- PR #223: the decode/verify band skips fully masked KV groups (block 05)
 
 **Release:** `v14-3f03b1772-r133`.  Base `3f03b1772` (base tree `14370bd49a`), canonical tip `368496e40`,

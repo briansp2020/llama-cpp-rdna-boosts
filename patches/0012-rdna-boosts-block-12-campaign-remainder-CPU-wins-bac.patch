@@ -1,4 +1,4 @@
-From 31034d5d91c4a4d3e0860a9c1c6a0093027c9724 Mon Sep 17 00:00:00 2001
+From ce9d7f5d2a9dd4c24a0fcf53678994b173a2b6e2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/13] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -4280,10 +4280,10 @@ index b357a77ac..22deb6928 100644
  // immutable prefill residency snapshot) + the pinned host master, instead of re-uploading every expert
  // over PCIe.  `host_src`/`offset` identify a registered table; `width`/`stride_src`/`n_copies` are the
 diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
-index e4053fe61..6596c6952 100755
+index ef97a03d3..d2b238d8d 100755
 --- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
 +++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
-@@ -101,26 +101,32 @@ for ncols in [8, 16, 32, 64]:
+@@ -114,26 +114,32 @@ for ncols in [8, 16, 32, 64]:
          if ncols2 > ncols:
              continue
          ncols1 = ncols // ncols2

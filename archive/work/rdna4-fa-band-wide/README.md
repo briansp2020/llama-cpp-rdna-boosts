@@ -98,3 +98,17 @@ the prefill-side purity gate.  Declined.  If a decode-bound head-256/GQA-8 model
 `GGML_HIP_FA_BAND_WIDE=0` (the two-tile 16-warp path already exists and is bit-identical) and only then
 consider the one-pass 16-warp variant; the r126 measurement and the two-arm A/B above are the baseline it
 would have to beat.
+
+## Status after r134 (2026-10-25) — implemented, because the deletion broke width purity
+
+The "Declined" verdict above is superseded by issue #224.  Deleting the `ncols == 64` band row left query
+widths 5..8 on prefill's 8-warp row, whose per-column KV split is `np = 2` against the 32-column block's
+`np = 4` — a different reduction, so widths 5..8 were no longer bit-identical to widths 1..4 and greedy decode
+with a DFlash2 draft diverged from plain decode on dense head-256 GQA-6 (Qwen3.8-27B, 8K and 110K prompts).
+The instantiation this record declined is now the fix: the band's 64-column block runs
+`fattn_mma_config(512, 1, 64, 64, 64, 32, 1, true)` through a compile-time `band_wide` flag (its own case +
+fetch-ahead translation units), prefill keeps the 256-thread table row, and a `static_assert` on the two band
+rows makes a repeat a build error.  The "no measured gain" premise held: end to end the wide launch measures
+at parity with the two-tile arm (8K, a 131072-cell FA range, and the W=8 Flash-Next arm above), and the reason
+to ship it is purity, not throughput.  Numbers, the probe's `P >= 4096` coverage fix and the gates:
+`benchmarks/2026-10-25-fa-band-width-purity.md`, `WORKLOG.md` 261025.004.

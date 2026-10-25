@@ -1295,16 +1295,40 @@ MoE-bound decode, and r129 re-measured the premise for a separate band instantia
 (`TODO.md` #99 retired: the shipping 256-thread row beat the existing two-tile 16-warp arm 110.1/110.2 vs
 108.9/107.6 t/s on the W=8 arm, text byte-identical — no decode-bound head-256/GQA-8 workload exists here).
 
+**The band's other end of the same trade: its per-column KV split is part of the width contract (r134, issue
+#224).**  A band block splits each Q column's KV rows `np = nwarps*cols_per_warp/ncols` ways.  The 32-column
+block (widths 1..4) is 8 warps -> `np` 4; leaving widths 5..8 on prefill's 8-warp 64-column row gives `np` 2,
+a different reduction, and widths 5..8 stop being bit-identical to widths 1..4.  Measured on dense head-256
+GQA-6 (Qwen3.8-27B UD-Q4_K_XL + DFlash2 `n_max 5`, 512 greedy tokens, q8_0 KV): greedy text with the draft
+differed from plain decode at token **325** (8K prompt) and **142** (110K), identical with
+`GGML_HIP_FA_BAND_WIDE=0` and on r123 — while every gate in r126..r133 passed.  So the 64-column block runs
+the 16-warp row (`fattn_mma_config(512, 1, 64, 64, 64, 32, 1, true)`, `nbatch_combine` 32 to stay inside the
+64 KiB LDS limit) through its own case instantiation (`band_wide`, `template-instances/fattn-mma-f16-band-wide-*.cu`),
+prefill keeps the 256-thread table row (the paragraph above is unchanged, and `pp512 @ d98304` is still 1641
+t/s), and a `static_assert` on the two band rows (`np`, `nbatch_fa/K2/V2`, `nstages_target`, `Q_in_reg`) turns
+a repeat into a **build error**.  End to end the single pass measures at parity with the two-tile arm (8K
+75.2/74.6 vs 75.0/74.9 t/s; a 131072-cell FA range 61.0/60.6 vs 60.9/60.8; the W=8 MoE arm 164.5/166.6 vs
+166.3/164.9, text byte-identical), so purity costs nothing measurable here.
+
+**A band-width probe must reach the block it is probing.**  `tests/test-logits-width-probe` ran at `P=256`
+for years and never touched widths 5..8: the wide launch's gate is `K->ne[1] >= 4096` and `K->ne[1]` is the
+context's **used** length, so `n_ctx` (a fixed 4096) was irrelevant and the probe's prefix was 256 cells.  That
+is why `width_purity=PASS` was reported on every r126..r133 arm.  The probe's `n_ctx` is now `P + W + 8` and
+a purity run must pass **`P >= 4096`**: at that point the r126 geometry fails (worst maxdiff 0.199764 on q8_0
+K/V, the row-0 hash splitting between W=4 and W=5) and the shipped geometry passes with maxdiff 0.
+
 **Rule.**  A config row that exists for the decode/verify band must be reachable **only** from the band: key
 it on a compile-time band flag (or on a distinct instantiation), never on `ncols`, `n_kv` or `n_q` at
-runtime alone.  Write in the comment which query widths reach the row.  When two regimes share an
+runtime alone.  The band's own widths must also share one geometry -- the per-column KV split (`np`) and the
+KV batch shape -- and a width probe that is meant to see a block must be run above that block's dispatch
+threshold.  Write in the comment which query widths reach the row.  When two regimes share an
 instantiation, the shared row must be the one safe for the wider regime and the band gets its own
 instantiation.  **A row that reaches prefill owes `scripts/gate-prefill-logits.sh`** (changing the row
 changes the KV-row split and combine order -- the family-switch class of §34/§46), plus the band arm's own
 decode/verify A/B so the band's measured gain is not silently traded away.
 
-Record: `TODO.md` #97/#98/#99 (all three closed), `patches/README.md` block 05, `WORKLOG.md` 261024.006 /
-261024.007 / 261024.010.
+Record: `TODO.md` #97/#98/#99 (all closed), issue #224, `patches/README.md` block 05, `WORKLOG.md`
+261024.006 / 261024.007 / 261024.010 / 261025.004, `benchmarks/2026-10-25-fa-band-width-purity.md`.
 
 ## 52. An op with no test case has no oracle — and a default-on fusion needs the pair covered, not just the op
 

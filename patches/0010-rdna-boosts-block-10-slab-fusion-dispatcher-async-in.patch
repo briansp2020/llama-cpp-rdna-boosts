@@ -1,4 +1,4 @@
-From 883bb984e87902e60f2624af355c58bee9831650 Mon Sep 17 00:00:00 2001
+From 1b7d172b9da255d0dc043e1002c791d2d54ef925 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/13] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -20446,10 +20446,10 @@ index 000000000..03ac81bd2
 +    return 0;
 +}
 diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
-index 9b6066f4f..5dae7df4f 100644
+index cc307b321..0df108827 100644
 --- a/tests/test-logits-width-probe.cpp
 +++ b/tests/test-logits-width-probe.cpp
-@@ -31,6 +31,7 @@
+@@ -32,6 +32,7 @@
  #include <cstdio>
  #include <cstdlib>
  #include <cstring>
@@ -20457,7 +20457,7 @@ index 9b6066f4f..5dae7df4f 100644
  #include <string>
  #include <vector>
  
-@@ -79,8 +80,42 @@ int main(int argc, char ** argv) {
+@@ -80,8 +81,42 @@ int main(int argc, char ** argv) {
  
      llama_model_params mp = llama_model_default_params();
      mp.n_gpu_layers = 99;
@@ -20500,7 +20500,7 @@ index 9b6066f4f..5dae7df4f 100644
      const llama_vocab * vocab = llama_model_get_vocab(model);
  
      std::string text;
-@@ -94,7 +129,10 @@ int main(int argc, char ** argv) {
+@@ -95,7 +130,10 @@ int main(int argc, char ** argv) {
  
      const int n_vocab = llama_vocab_n_tokens(vocab);
      const ggml_type kv_type = kv_from_env();
@@ -20512,15 +20512,15 @@ index 9b6066f4f..5dae7df4f 100644
  
      // rows[w-1] = the logits of every row of the W-token batch, in row order
      std::vector<std::vector<float>> rows[NW];
-@@ -104,6 +142,7 @@ int main(int argc, char ** argv) {
-         // n_batch is the max tokens per llama_decode call (the whole prefill batch),
-         // n_ubatch the max per micro-batch -- they are NOT the same knob.
-         cp.n_ctx = 4096; cp.n_batch = P > ubatch ? P : ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
+@@ -110,6 +148,7 @@ int main(int argc, char ** argv) {
+         // P >= 4096 (issue #224: the P=256 run never reached that block, so the gate could not see the
+         // 8-warp row that broke width purity; a P=4096 run fails on it).
+         cp.n_ctx = P + NW + 8; cp.n_batch = P > ubatch ? P : ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
 +        if (const char * q = getenv("NSEQ")) cp.n_seq_max = (uint32_t) atoi(q);
          // Replicate the MTP verify-batch recurrent-state snapshot count: common sets
          // n_rs_seq = draft.n_max, so a W-token batch with n_max = W-1 uses n_rs_seq = W-1.
          {
-@@ -154,13 +193,12 @@ int main(int argc, char ** argv) {
+@@ -160,13 +199,12 @@ int main(int argc, char ** argv) {
      float worst = 0.0f;
      for (int W = 1; W <= NW; ++W) {
          float wmax = 0.0f;

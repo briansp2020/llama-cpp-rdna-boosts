@@ -1,4 +1,4 @@
-From 7c620882fb0f767e89ae1459e3caa21fa0b86ea5 Mon Sep 17 00:00:00 2001
+From 78f129b60de434812b4f1a6a79f0483bc1d71b00 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 06/13] rdna-boosts: block 06: MMB quantized prefill GEMM
@@ -52,6 +52,15 @@ bit-for-bit the previous behaviour (validated here on 3x gfx1201: 12/12 same-see
 prefill-logit KLD 0.000000 on both recorded points, no GPU faults).
 
 Co-authored-by: Slava P. <slavap@users.noreply.github.com>
+
+Fold (r134, issue #224): the width probe's n_ctx is now the prefill length plus the decode
+width instead of a fixed 4096, and a purity run must pass P >= 4096.  The RDNA4 band's
+64-column block (query widths 5..8) is only reachable above the launcher's KV-length gate
+(K->ne[1] >= 4096), and K->ne[1] is the context's used length, so the P=256 default never
+reached that block: the probe reported PASS on every arm while widths 5..8 ran a geometry
+that was not bit-identical to widths 1..4.  At P=4096 the r126 geometry fails it
+(width_purity=FAIL, worst maxdiff 0.199764 on q8_0 K/V, row-0 hash split between W=4 and
+W=5), and the shipped band geometry passes with maxdiff 0.
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu   |   57 +-
  ggml/src/ggml-cuda/mmb.cu         | 2384 +++++++++++++++++++++++++++++
@@ -59,8 +68,8 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  ggml/src/ggml-cuda/mmf32.cu       |  201 +++
  ggml/src/ggml-cuda/mmf32.cuh      |   45 +
  tests/CMakeLists.txt              |    1 +
- tests/test-logits-width-probe.cpp |  185 +++
- 7 files changed, 2903 insertions(+), 3 deletions(-)
+ tests/test-logits-width-probe.cpp |  191 +++
+ 7 files changed, 2909 insertions(+), 3 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/mmb.cu
  create mode 100644 ggml/src/ggml-cuda/mmb.cuh
  create mode 100644 ggml/src/ggml-cuda/mmf32.cu
@@ -2893,10 +2902,10 @@ index 87121524f..ba3ea3850 100644
      # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
 diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
 new file mode 100644
-index 000000000..9b6066f4f
+index 000000000..cc307b321
 --- /dev/null
 +++ b/tests/test-logits-width-probe.cpp
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,191 @@
 +// W = 1..8 logits purity probe -- the delivery's §11 promotion gate item 1
 +// ("`W = 1..8` logits matrix with GGML_CUDA_MMB=1 == off").
 +//
@@ -2916,6 +2925,7 @@ index 000000000..9b6066f4f
 +//
 +// Usage:
 +//   test-logits-width-probe model.gguf text.txt [P=256] [ubatch=512]
++// P >= 4096 is required to cover the RDNA4 band's 64-column block (query widths 5..8, issue #224).
 +// Env: RS=0|from_w|<n>  pins llama_context_params.n_rs_seq (default 0 = plain decode)
 +//      FA=0|1|auto     (default auto)
 +//      KV=f16|bf16|q8_0|q4_0|... (default f16)
@@ -3002,7 +3012,12 @@ index 000000000..9b6066f4f
 +        llama_context_params cp = llama_context_default_params();
 +        // n_batch is the max tokens per llama_decode call (the whole prefill batch),
 +        // n_ubatch the max per micro-batch -- they are NOT the same knob.
-+        cp.n_ctx = 4096; cp.n_batch = P > ubatch ? P : ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
++        // n_ctx must hold the P-token prefill plus the W-row decode.  It also decides whether the RDNA4
++        // band's 64-column block (query widths 5..8) is reachable at all: the launcher's gate is
++        // K->ne[1] >= 4096 and K->ne[1] is the context's USED length, so a width-purity run must pass
++        // P >= 4096 (issue #224: the P=256 run never reached that block, so the gate could not see the
++        // 8-warp row that broke width purity; a P=4096 run fails on it).
++        cp.n_ctx = P + NW + 8; cp.n_batch = P > ubatch ? P : ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
 +        // Replicate the MTP verify-batch recurrent-state snapshot count: common sets
 +        // n_rs_seq = draft.n_max, so a W-token batch with n_max = W-1 uses n_rs_seq = W-1.
 +        {

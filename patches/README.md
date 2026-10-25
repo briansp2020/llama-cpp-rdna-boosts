@@ -298,11 +298,33 @@ almost all of them `template-instances/*.cu`.
   `(256, 2, 64, 128, 128, 64, 1, true)`), which measured **+36 % at d98304, +19 % at d32768, +3 % at d0** and
   puts the delivery 20 % above upstream at depth.  The 32-column band row stays; its dispatch (`n_q <=
   32/ncols2`) can never be prefill, and the comment says so.  The W=5..8 band arm measured unchanged within
-  noise (`-ncmoe 40`, 32k, q8_0 KV, n_max 7: 248.8/239.6 vs 241.2/249.7 t/s), so no separate instantiation was
-  cut; a future one must key on a compile-time band flag, not on `ncols` (`GREEDY-PURITY.md` §51, `TODO.md`
-  #99).  Gates: `FLASH_ATTN_EXT` 6391/6391, prefill-logit PASS at the standard point, and the head-256 shape
-  PASS in `--family-switch` mode against a same-kernel `-ub` control (candidate 0.005073/97.118 vs control
-  0.007251/96.912).  `WORKLOG.md` 261024.007.
+  noise (`-ncmoe 40`, 32k, q8_0 KV, n_max 7: 248.8/239.6 vs 241.2/249.7 t/s).  Gates: `FLASH_ATTN_EXT`
+  6391/6391, prefill-logit PASS at the standard point, and the head-256 shape PASS in `--family-switch` mode
+  against a same-kernel `-ub` control (candidate 0.005073/97.118 vs control 0.007251/96.912).
+  `WORKLOG.md` 261024.007.
+* **The band's 64-column block has its own geometry and instantiation (r134, issue #224).**  The deletion
+  above left query widths 5..8 on *prefill's* 8-warp row, and that row splits a tile's KV rows **2** ways
+  per Q column where the 32-column block splits them **4** (`np = nwarps*cols_per_warp/ncols`).  A different
+  split is a different reduction, so widths 5..8 were no longer bit-identical to widths 1..4: dense
+  head-256 GQA-6 (Qwen3.8-27B UD-Q4_K_XL + DFlash2 `n_max 5`, 512 greedy tokens) differed from plain decode
+  at token 325 (8K prompt) and 142 (110K), and was identical with `GGML_HIP_FA_BAND_WIDE=0`.  The row
+  `fattn_mma_config(512, 1, 64, 64, 64, 32, 1, true)` is back but **band-only**, selected by a new
+  compile-time `band_wide` flag threaded through the config getters, the case function and the kernel:
+  prefill keeps `(256, 2, 64, 128, 128, 64, 1, true)` and its deep-prefill win, and widths 5..8 keep one
+  pass over the KV cache (`nbatch_combine` 32 stays inside the 64 KiB LDS limit at 16 warps).  The band's
+  64-column case + its q8_0 fetch-ahead variant are their own translation units
+  (`template-instances/fattn-mma-f16-band-wide-*.cu`, emitted by `generate_cu_files.py`).  A `static_assert`
+  on the two band rows (same `np`, same `nbatch_fa/K2/V2`, same `nstages_target`, same `Q_in_reg`) makes a
+  repeat a build error rather than a gate failure.  Gates: `test-logits-width-probe` with **`P=4096`** (see
+  block 06 — the historical `P=256` run never reached the block) on `KV=q8_0/f16/bf16` (PASS, maxdiff 0;
+  the r126 geometry fails it at 0.199764), `plain == draft-dflash` at `-n 512` for `n_max` 3/5/7 x
+  `KV=f16/bf16/q8_0` and at `-c 131072`, `FLASH_ATTN_EXT` 6414/6414, `pp512` 4764 t/s and
+  `pp512 @ d98304` 1641 t/s (r126: 4624 / 1632, i.e. the prefill row is untouched), and the wide launch
+  measured at parity with `GGML_HIP_FA_BAND_WIDE=0` end to end (75.2/74.6 vs 75.0/74.9 t/s at 8K;
+  61.0/60.6 vs 60.9/60.8 at a 131072-cell FA range; 164.5/166.6 vs 166.3/164.9 on the W=8 MoE arm) and
+  within +-2.5 % at the kernel level (`kv 16384`, q8_0, `n_q` 5: 163.3 vs 167.3 us; `n_q` 8: 174.0 vs
+  170.0 us).  `GREEDY-PURITY.md` §51, `WORKLOG.md` 261025.004,
+  `benchmarks/2026-10-25-fa-band-width-purity.md`.
 * **Native quantized K/V (V4/V5)**: the sub-F16 quant types (`q8_0`/`q4_0`/`q4_1`/`q5_0`/`q5_1`/`iq4_nl`)
   read the cache natively instead of a whole-cache F16 conversion per decode step — a decode-*depth* win,
   and the margin that lets a high-context MTP config load (`GREEDY-PURITY.md` §34).
