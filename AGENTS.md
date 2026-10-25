@@ -59,7 +59,7 @@ amendment, or a note in the relevant record).
   minutes and contaminates any benchmark running beside it.  Nothing here changes the normal local
   **source** build for testing and development (`~/bin/build-llama-rocm`, Common tasks → "Build the
   fork"), which stays on the primary box.  The local `scripts/build-containers.sh` is for a smoke test or
-  a manual worker-less container build only.  CI no longer builds them (the tag-push matrix took ~5 h and its failure mode was a cold
+  a manual worker-less container build only.  The Actions *gating* workflow no longer builds them (the tag-push matrix took ~5 h and its failure mode was a cold
   retry).  The fork-branch refresh and the worker image push are both part of tagging a release.
 - The `~/llama.cpp` checkout exists to host the block commits and to apply/test the diff set locally.
   Apart from the release-time branch refresh above it is disposable: delete the pre-patched branch and
@@ -904,8 +904,29 @@ the full build locally" means the `podman` image build below, not `cmake --build
 sudo loginctl enable-linger "$(id -un)"     # cron + rootless podman survive logout/reboot
 gh auth login -h github.com                 # classic PAT needs write:packages + delete:packages
 install -m 755 <repo>/scripts/container-watch.sh ~/bin/rdna-container-watch.sh
+install -m 755 <repo>/scripts/validate-gpu.sh    ~/bin/rdna-validate-gpu.sh
 ( crontab -l 2>/dev/null; echo '*/10 * * * * $HOME/bin/rdna-container-watch.sh >> $HOME/.cache/rdna-containers/watch.log 2>&1' ) | crontab -
+( crontab -l 2>/dev/null; echo '*/30 * * * * $HOME/bin/rdna-validate-gpu.sh >> $HOME/.cache/rdna-validate/watch.log 2>&1' ) | crontab -
+# ccache is required for the ladder (no root needed: the static 4.12.3 release binary)
+curl -fsSL -o /tmp/cc.tar.xz https://github.com/ccache/ccache/releases/download/v4.12.3/ccache-4.12.3-linux-x86_64.tar.xz \
+  && tar -xJf /tmp/cc.tar.xz -C /tmp && install -m755 /tmp/ccache-4.12.3-linux-x86_64/ccache ~/.local/bin/ccache \
+  && ~/.local/bin/ccache --max-size=30G
 ```
+
+**CI is three tiers, and "CI" on the worker means the gating job, not the image build.**  Which job a
+change hits depends on the trigger, and the split is what keeps the cheap gate cheap:
+
+| tier | where | what | trigger |
+|---|---|---|---|
+| 1 | `.github/workflows/validate.yml` (hosted, no GPU) | `validate-set.sh`: strict apply on a fresh tarball, tree/count, per-artifact sha256, Windows-path check, **and a scan of every block tree for conflict markers / subject drift** | every push and PR, ~20 s |
+| 2 | `radiance` (`scripts/validate-gpu.sh`, cron every 30 min) | re-applies the set at `origin/main` from scratch, `gate-per-block-build.sh --fast`, the seven op oracles, then `gate-prefill-logits.sh` (records a base on a fresh box, compares after) | every new `origin/main` commit, unattended |
+| 3 | a GPU box, by hand | the release flow: `all` build, coherence, MTP Protocol A, arch sweeps | before a tag |
+
+Tier 2 exists because almost every block is a CUDA/HIP kernel change and a hosted runner has no ROCm, so
+tier 1 cannot compile any of it.  It is the automation behind "a re-base is a decode AND prefill change".
+It holds its own `flock` and **skips while a container build holds the watcher's lock**, so the two worker
+jobs never contend; summaries land in `~/.cache/rdna-validate/runs/<sha>/summary.txt`, and a rev is retried
+at most `MAX_ATTEMPTS` times (3) before the script stops and names the `failed-<sha>` file to remove.
 
 **Primary box: manual container build (only if not using the worker) or a fast smoke:**
 
