@@ -73,7 +73,13 @@ policy, and both fused gate/up paths are arch-disjoint so the NVIDIA arm is upst
    `<<<<<<< HEAD` markers in `llama-context.cpp` (plus a duplicated `is_dsv4` line in `llama-model.cpp`) and
    only the per-block gate saw it — the tip built fine.  Always `grep -rl '^<<<<<<< '` across *every* block
    tree before declaring the chain done, and stage named files, not `-A`.
-3. The tip tree was byte-identical before and after both attribution fixes (`35090ba36c`), which is how you
+3. **A build dir's `GGML_CUDA_FA_QUANTS` is sticky across configures, and it changes greedy text.**
+   The re-base gates ran on the scratch build (`q4_0;q8_0;f16;bf16`) while the recorded prefill-logit base
+   and the fork-branch build use the canonical 8-pair set; the same source tree therefore produced
+   different greedy text with **identical** prefill logits (0.000531 / 98.863 % both times).  The gate
+   passed on both, which is the useful part; the text difference is config, not numerics.  Always compare
+   text within one build dir, and run the prefill-logit gate with the canonical build.
+4. The tip tree was byte-identical before and after both attribution fixes (`35090ba36c`), which is how you
    know an attribution fix did not change the delivery — check it, because the gate's verdict changes while
    the artifact must not.
 

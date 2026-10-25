@@ -843,6 +843,16 @@ release ladders resident.
   The honest budget with that rule: one `.cu` delta 15-30 s, a widely included header (`common.cuh`,
   `ggml-impl.h`) 3-5 min for its dependents, a whole new tree 5-6 min, and a per-block gate run is the
   sum of the selected blocks' own deltas (r132, at the long-lived path: block 06 took 34 s).
+- **A scratch build dir and `~/llama.cpp/build-rocm` can hold different `GGML_CUDA_FA_QUANTS` sets, and
+  that changes greedy text (r138).**  The FA instantiation set is a CMake **cache STRING**, so it keeps
+  whatever the tree's default was when that build dir was first configured: at r138 the two dirs held
+  `q4_0;q4_1;q5_0;q5_1;q8_0;bf16;f16;iq4_nl` (canonical) vs `q4_0;q8_0;f16;bf16` (scratch) from the same
+  source tree.  Different instances ⇒ a different FA kernel for a shape ⇒ different greedy text, with
+  **identical prefill logits** (the gate read KLD 0.000531 / 98.863 % on both).  So: compare text only
+  between builds of the **same** build dir, run the prefill-logit gate with the **canonical** build
+  (`gate-prefill-logits.sh` defaults to `~/llama.cpp/build-rocm/bin/llama-perplexity` for exactly this
+  reason), and never read a cross-build text difference as a numeric change without checking
+  `grep GGML_CUDA_FA_QUANTS <build>/CMakeCache.txt` on both sides.
 
 **`~/bin/build-llama-rocm` (ROCm 10.1.0, `/opt/rocm-10.1.0-gfx120X`) is the canonical build tree.**
 `~/bin/build-llama-rocm-714` is the older ROCm 7.14 tree (its own `BUILD_DIR`, `build-rocm-714`); it is
