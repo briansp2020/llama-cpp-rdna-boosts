@@ -294,7 +294,7 @@ git apply "$R2" && git apply --check "$BETA" && echo "R2->beta OK"
   slots changed) is a possible refinement; low priority.
 - **Do not revive the 75/25 freeze** (net loss; the per-layer pin is a no-op in the serialized
   scheduler).  The serialized scheduler is upstream (`ggml_backend_sched_compute_splits`); the fix for
-  coexistence is `wip/moe-cpu-overlap/`, not this cache.
+  coexistence is `archive/work/moe-cpu-overlap/`, not this cache.
 - **`-sm tensor` vs `-sm layer`:** both reach the hook, but only `-sm tensor` has been measured.
   `-sm layer` + `-ncmoe` may qualify for upstream `pipeline_parallel`; if so, the scheduler uses
   `n_copies>1` — verify the staging/cache still behaves (it is a different path).
@@ -316,4 +316,4 @@ git apply "$R2" && git apply --check "$BETA" && echo "R2->beta OK"
   `archive/work/moe-verify-fusions/{FINDINGS-devmap-removal.md,remove-devmap.diff,wip-since-block15.diff}`.
 - Serialized scheduler: `ggml_backend_sched_compute_splits` (`ggml/src/ggml-backend.cpp`, upstream at
   `097cf33d9`), `llama_context::decode`/`process_ubatch` (upstream).  The per-layer pin becomes useful
-  only once a decode graph can overlap a prefill graph (`wip/moe-cpu-overlap/`).
+  only once a decode graph can overlap a prefill graph (`archive/work/moe-cpu-overlap/`).

@@ -17,7 +17,7 @@ as `wip/prefill-arena-residency/r2-prototype.patch` (227 insertions / 3 files, s
 `2bfdb8263b0b…`), applied **uncommitted** in `~/llama.cpp` and built.  The 75/25 freeze was implemented,
 measured as a net prefill loss with no decode gain, and **dropped** — do not re-add it.  The serialized
 scheduler is the prefill/decode coexistence limit (it is upstream, not ours); the per-layer pin is for
-the future overlap work (`wip/moe-cpu-overlap/`), not for this cache.
+the future overlap work (`archive/work/moe-cpu-overlap/`), not for this cache.
 
 **Your tasks, in order:**
 

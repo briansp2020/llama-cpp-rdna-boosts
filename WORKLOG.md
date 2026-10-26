@@ -1,5 +1,84 @@
 # WORKLOG - dated delivery records
 
+## 261026.001 (r144) -- TODO #36 (CPU/GPU overlap for the MoE misses) is retired by measurement, and the profile it produced ships two diagnostics
+
+**Release:** `v15-6050b467c-r144` (base `6050b467c`, canonical tip `438cbb3c7`, tree
+`b8d08c5186bb5c0d74cc04d3d82ccda4d30120ee`, 15 blocks).  Delta against the r143 tree: **2 files, +71/-1**, all
+in block 09 -- no kernel, no numerics, no default, no allocation.  The release exists to make the
+measurement reproducible: the expert cache's per-token traffic report was unusable (it divided by a
+takeover count that is 0 on the identity path), and the graph state machine had no way to say *why* a
+capture was not being replayed.
+
+### #36 retired: the MoE misses are 0.1-0.4 % of a decode token
+
+O0 was the item's own decision gate ("if the cold read is < 20 % of the token, park this").  Measured on
+2x R9700 (**the PCIe 5.0 x8 root ports**, `HIP_VISIBLE_DEVICES=0,2`), Qwen3.8 Flash-Next IQ4_NL
+(100.4 GB, 512 experts x 10 used, 64.8 GB of expert weights -> 85.4 % slot residency at the auto arena),
+2000-token generations with a frozen heat prior so the arena is warm:
+
+| arm | t/s | ms/token | access hit | expert H2D |
+|---|---:|---:|---:|---:|
+| `-sm tensor`, auto arena (85 % residency) | 35.53 | 28.15 | 99.74 % | 3.3 MiB/tok |
+| `-sm tensor`, `MOE_EXPERT_CACHE_MIB=8192` (25 %) | 34.04 | 29.37 | 98.71 % | -- |
+| `-sm tensor`, `MOE_EXPERT_CACHE_MIB=2048` (6 %, the floor) | 34.44 | 29.04 | 95.66 % | 55 MiB/tok |
+| `-sm layer`, auto arena | 25.73 | 38.86 | 99.48 % | 6.6 MiB/tok |
+
+Shrinking the arena **14x** (17x more miss bytes) costs **0.9 ms of a 28 ms token**: the routing is so
+concentrated that 6 % of the slots still serve 95.7 % of the accesses.  3.3 MiB/token of H2D at this
+link's ~28 GB/s is **0.12 ms/token**.  A CPU worker pool computing the cold experts beside the GPU would
+therefore recover ~0.1 ms (2 ms in the deliberately starved 4 GiB arm) for a change that must break graph
+capture at every `MUL_MAT_ID` and mix CPU numerics into the layer -- so the maintainer retired the item
+outright (2026-10-26) rather than parking it, and the CPU/GPU-overlap feature is **not** implemented.
+Record: `archive/work/moe-cpu-overlap/` (`RESOLUTION.md`, `FINDINGS-2026-10-26.md`).
+
+### What the same profile found: the token is dispatch-bound, and the decode graph never replays
+
+* `GGML_CUDA_GCDBG=1` (200 tokens): `calls=59344 nodes=2451696 host_total=2780.8ms per_node=1.1us
+  per_call=46.9us` -> **297 `graph_compute` calls and 12 258 node dispatches per token, 13.5 ms of host
+  dispatch** in a 28.4 ms token; `CUDAGC_BREAK ev_rest=3610.3ms` of a 5 705 ms decode.
+* `rocprofv3 --hip-trace`: **~124 000 `hipLaunchKernel`/s (~4 100/token)** vs ~14 `hipGraphLaunch`/token.
+* Instrumented `ggml_cuda_graph_compute`: `direct=56171 replay=3152 capture=21 properties_changed=55321`
+  over 200 tokens -- 93 % of calls find the replay identity dirty, so the graph is captured and then
+  never replayed.  `GGML_CUDA_DISABLE_GRAPHS=1` measures the same speed (35.14 vs 35.53 t/s), which is
+  the corroboration.
+* The first differing member (a transient probe) is, in order: the node's **`src[]` object addresses**
+  (the Meta rebuild re-creates its per-device simple tensors -- the same trap the graph *key* was fixed
+  for in r115), then the inline **`name`** (`hc_combine-0` -> `-4`), then a genuine source `data` move.
+  Canonicalising the first two raises the replay count but is **slower** (28.29 vs 35.23 t/s) because the
+  remaining moves then trigger `hipGraphExecDestroy`+`Instantiate` recaptures (~20/token).  Reverted.
+* Second finding, config not code: **`-sm tensor` is +38 % over `-sm layer`** on this shape (35.5 vs
+  25.7 t/s at the same hit rate) -- the per-layer cross-device split costs ~50 graph splits and their
+  handoffs.  Recorded in `COMMUNITY-CONFIG.md`.
+
+Both are scoped as the new campaign **`TODO #107`** (`wip/graph-replay-placement/README.md`: the
+diagnosis, four candidate directions with their costs, the gates, the reference numbers to beat, and the
+instrumentation to rebuild -- including the trap that a change which *enables* captures without removing
+the churn is slower than doing nothing).
+
+### Shipped in r144 (block 09, diagnostics only)
+
+1. **The cache traffic report's denominator.**  `expert H2D traffic ... MiB/token` divided by
+   `g_takeover / n_tables`, which is 0 whenever the hook did not take the input over (the identity fast
+   path) or after r143's teardown dropped the tables -- every run printed `over ~0 tokens = 0.00
+   MiB/token`, so the one number this campaign needed did not exist.  It now divides a decode-band op
+   census (`g_band_ops`, counted at the single place every routed MoE op passes through) by a table count
+   snapshotted **at sizing** (`g_band_n_tables`).  Measured: `over ~194 tokens = 25.38 MiB/token` on a
+   200-token run (25.4 vs 3.3 MiB/token for the same config at 2000 tokens shows how much of a short
+   run's traffic is warmup -- the reason the 2000-token rule exists).
+2. **`GGML_CUDA_GRAPH_TRACE` graph-call census.**  The env already traced the capture state machine; at
+   exit it now also prints `graph_compute calls: direct=... replay=... capture=... properties_changed=...`.
+   Counters only (two increments per call); it is what made the replay finding visible and it is the
+   primary instrument for #107.
+
+### Validation
+
+`scripts/validate-set.sh` strict 15/15 on a fresh tarball (tree `b8d08c51...`); per-block build gate
+`--fast --changed-from 5bc9720a9` **3/3** (it caught the first cut: the counter helper called
+`ggml_cuda_graph_trace()`, which block 10 moves, so block 09's own tree did not compile); prefill-logit
+KLD **0.000531 / 98.863 %** (identical to the recorded base); same-seed greedy text byte-identical to the
+pre-change build (Qwen3.5-4B Q8_0, 2 GPU `-sm tensor`, `ROCBLAS_USE_HIPBLASLT=0`, sha
+`8d89080db6735a30`); `test-backend-ops -o MUL_MAT_ID` OK.
+
 ## 261025.017 (r143) -- the expert cache dropped its tables at model teardown (SIGSEGV), and the reporter's IQ3_S arm closes out r142
 
 **Release:** `v15-6050b467c-r143` (base `6050b467c`, canonical tip `5bc9720a9`, tree

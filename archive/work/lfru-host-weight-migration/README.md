@@ -59,7 +59,7 @@ computed cold tail vs UVA miss, heat-driven weight migration) is still worth pur
 - CPU-computes-misses was measured **negative above a ~1.2 GiB arena** (the loss is scheduler dispatches +
   cross-backend copies, not CPU compute) — see `archive/work/moe-expert-cache/WORKLOG.md`.
 - Genuine CPU/GPU overlap for misses is a separate open campaign
-  ([`moe-cpu-overlap/`](../../../wip/moe-cpu-overlap/README.md), TODO #36) and is the more concrete version of the
+  ([`moe-cpu-overlap/`](../../moe-cpu-overlap/README.md), TODO #36) and is the more concrete version of the
   same "use the CPU for the cold tail" idea.
 - The delivery already has a device-resident slot cache; the LFRU idea's remaining delta is unclear.
 
@@ -77,5 +77,5 @@ computed cold tail vs UVA miss, heat-driven weight migration) is still worth pur
 - `archive/work/moe-expert-cache/WORKLOG.md` (why CPU-misses lost).
 - `src/llama-model-loader.cpp` (`MOE_HOST_POOL_*`), `ggml/src/ggml-cuda/moe-expert-cache.h` (the pool + slot
   cache options), `ENVIRONMENT.md` §§1.2.1/4.
-- [`moe-cpu-overlap/README.md`](../../../wip/moe-cpu-overlap/README.md) (TODO #36 — the live CPU/GPU-overlap
+- [`moe-cpu-overlap/README.md`](../../moe-cpu-overlap/README.md) (TODO #36 — the live CPU/GPU-overlap
   campaign; do not duplicate it).

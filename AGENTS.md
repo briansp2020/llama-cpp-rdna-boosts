@@ -579,6 +579,32 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   its whole run.  A new iface field that appends to `ggml_backend_device_i` goes at the **end** (the
   initializers are positional); a hook that must run at teardown needs a matching call in
   `llama_model_free`/the model lifecycle, not a buffer-free hook.  Single-model runs are unchanged.
+- **The expert cache's per-token traffic figure and the graph-replay census are the two instruments for
+  "where does the time go" (r144); use them before proposing a memory-side optimisation.**  The exit
+  report's `expert H2D traffic … MiB/token` divides a **decode-band op census** (`g_band_ops`) by a table
+  count snapshotted **at sizing** (`g_band_n_tables`) — never by a live `g_tables` walk (`llama_model_free`
+  drops the tables before the report runs, r143) and never by `g_takeover` (0 on the identity fast path).
+  Quote the **2000-token** number: a short run's MiB/token is mostly warmup (25.4 vs 3.3 MiB/token for the
+  same config at 200 vs 2000 tokens).  `GGML_CUDA_GRAPH_TRACE=1` additionally reports
+  `graph_compute calls: direct/replay/capture/properties_changed` — a **captured graph that never replays
+  still logs captures**, so read the census, and confirm with `GGML_CUDA_DISABLE_GRAPHS=1` measuring the
+  same speed.  Measured 2026-10-26 (2x R9700 x8, Flash-Next IQ4_NL, `-sm tensor -ncmoe 48`, 85 %
+  residency): the MoE miss traffic is 3.3 MiB/token = 0.12 ms of a 28.4 ms token (2.0 ms at the 2 048
+  MiB/device floor) — so `TODO #36` (CPU/GPU overlap for the misses) was **retired**, while the token is
+  dispatch-bound: 297 `graph_compute` calls / 12 258 node dispatches per token at 1.1 us/node = 13.5 ms of
+  host time, with 93 % of calls refused replay (`direct=56171 replay=3152 properties_changed=55321` over
+  200 tokens) because the Meta rebuild moves node `src[]` object addresses, then inline `name`, then a
+  genuine source `data` pointer.  Do **not** "fix" that by relaxing the property comparison alone: it
+  enables recaptures (`hipGraphExecDestroy`+`Instantiate` per token on HIP) and measures **slower**
+  (28.3 vs 35.2 t/s).  Campaign, gates and traps: `wip/graph-replay-placement/`, `TODO #107`; records
+  `archive/work/moe-cpu-overlap/`, `WORKLOG.md` 261026.001.
+- **On 2+ devices `-sm tensor` is not just "the tuned path", it is worth tens of percent at low residency
+  (r144).**  2x R9700 on the x8 root ports, Flash-Next IQ4_NL `-ncmoe 48`, 2000-token decode: **35.5 t/s
+  (`tensor`) vs 25.7 (`layer`) = +38 %** at the same expert hit rate (99.74 % vs 99.48 %), so the cost is
+  the per-layer cross-device split and its split/event/handoff boundaries (~50 graph splits/token), not
+  expert residency.  `layer` is the CLI default, so a multi-device `-ncmoe` config must pass
+  `-sm tensor` explicitly; a *dense* cross-device-count text comparison still needs `-sm layer`
+  (see "Greedy text is a per-device-count reference").  `COMMUNITY-CONFIG.md` (the split axis).
 - **The movable-boundary slab is MoE-only and must stay that way (r37).** `ggml_cuda_slab_enabled()`
   returns `env_on && g_slab_armed`; `g_slab_armed` is set **only** by the MoE preflight
   (`ggml_backend_cuda_device_moe_cache_preflight`), which `llama_model_moe_cache_preflight` calls only for

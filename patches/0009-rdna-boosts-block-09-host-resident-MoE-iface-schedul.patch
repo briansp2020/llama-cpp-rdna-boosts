@@ -1,4 +1,4 @@
-From 373736d83a443767361c58f945091854ffb1c682 Mon Sep 17 00:00:00 2001
+From b2cfbda2f78bbdd5ea6106a7531447c522bb4bd6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/14] rdna-boosts: block 09: host-resident MoE (iface,
@@ -253,10 +253,10 @@ Co-authored-by: Brian <bsp2020@gmail.com>
  ggml/src/ggml-cuda/cpy-batch.cu               |  109 +
  ggml/src/ggml-cuda/cpy-batch.cuh              |    9 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   87 +
- ggml/src/ggml-cuda/ggml-cuda.cu               | 2579 +++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 2617 +++++++-
  ggml/src/ggml-cuda/mmvq.cu                    |  275 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 5548 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 5580 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  323 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
@@ -291,7 +291,7 @@ Co-authored-by: Brian <bsp2020@gmail.com>
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 65 files changed, 15011 insertions(+), 525 deletions(-)
+ 65 files changed, 15081 insertions(+), 525 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -7003,7 +7003,7 @@ index 000000000..8005b57b4
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
 +void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 9c3bc8c79..84854feed 100644
+index 9c3bc8c79..b777fb314 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -33,6 +33,7 @@
@@ -9069,7 +9069,7 @@ index 9c3bc8c79..84854feed 100644
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
-@@ -3435,14 +5071,82 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -3435,14 +5071,110 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
      return use_cuda_graph;
  }
  
@@ -9145,6 +9145,34 @@ index 9c3bc8c79..84854feed 100644
 +static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {
 +    static const bool verify_graphs_off = getenv("GGML_CUDA_DISABLE_VERIFY_GRAPHS") != nullptr;
 +    return ggml_cuda_graph_n_tokens(cgraph) > (verify_graphs_off ? 1 : MMVQ_MAX_BATCH_SIZE);
++}
++
++// `GGML_CUDA_GRAPH_TRACE` also reports how each `graph_compute` call was served.  The distinction is
++// the only way to tell "graphs are on" from "graphs are captured and then never replayed": a healthy
++// decode replays for essentially every call, while a large `direct` with a matching `propchg` means the
++// replay identity is churning (see `ggml_cuda_graph_update_required`).  Measured on 2x R9700,
++// Flash-Next IQ4_NL, `-sm tensor -ncmoe 48`: direct=56171 replay=3152 capture=21 propchg=55321 over 200
++// tokens, i.e. 93 % of calls ran the node loop directly and `GGML_CUDA_DISABLE_GRAPHS=1` measured the
++// same speed.  Counters only; they cost two increments per call.
++static int64_t g_gc_n_direct = 0, g_gc_n_replay = 0, g_gc_n_capture = 0, g_gc_n_propchg = 0;
++
++static void ggml_cuda_graph_stats_report() {
++    fprintf(stderr, "%s: graph_compute calls: direct=%lld replay=%lld capture=%lld properties_changed=%lld\n",
++            __func__, (long long) g_gc_n_direct, (long long) g_gc_n_replay, (long long) g_gc_n_capture,
++            (long long) g_gc_n_propchg);
++}
++
++static void ggml_cuda_graph_stats_arm() {
++    // Read the env directly rather than through `ggml_cuda_graph_trace()`: that helper is defined far
++    // below this point in the file (a later block moves it), and this block must compile on its own.
++    static const bool armed = [] {
++        const char * e = getenv("GGML_CUDA_GRAPH_TRACE");
++        if (e != nullptr && e[0] != '\0') {
++            atexit(ggml_cuda_graph_stats_report);
++        }
++        return true;
++    }();
++    (void) armed;
  }
  
  static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -9155,7 +9183,15 @@ index 9c3bc8c79..84854feed 100644
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
      if (cgraph->uid != 0 &&
-@@ -3484,6 +5188,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+@@ -3475,6 +5207,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+         }
+ 
+         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
++            if (!res) { g_gc_n_propchg++; }   // a difference on a graph we already had: replay refused
+             graph->node_props[i] = prop;
+             res = true;
+         }
+@@ -3484,6 +5217,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
  }
  
  static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGraph_t cuda_graph) {
@@ -9184,7 +9220,7 @@ index 9c3bc8c79..84854feed 100644
  #if CUDART_VERSION >= 12000
      cudaGraphExecUpdateResultInfo result_info;
      cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &result_info);
-@@ -4068,12 +5794,12 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+@@ -4068,12 +5823,12 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
  }
  
  // returns whether the write (out) nodes overwrite the read nodes in operation
@@ -9199,7 +9235,7 @@ index 9c3bc8c79..84854feed 100644
      auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
          const int64_t a_start = (int64_t) a->data;
          const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
-@@ -4564,11 +6290,130 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -4564,11 +6319,130 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  }
  
  // try and fuse nodes and return the number of nodes to skip
@@ -9330,7 +9366,7 @@ index 9c3bc8c79..84854feed 100644
  
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
      static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
-@@ -4577,24 +6422,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4577,24 +6451,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -9364,7 +9400,7 @@ index 9c3bc8c79..84854feed 100644
      }
  
      if (node->op == GGML_OP_MUL) {
-@@ -5298,13 +7134,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5298,13 +7163,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  break;
              }
  
@@ -9392,7 +9428,7 @@ index 9c3bc8c79..84854feed 100644
                  fused_mul_mat_vec = true;
                  fused_node_count  = 3;
                  break;
-@@ -5479,6 +7327,95 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5479,6 +7356,95 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -9488,7 +9524,7 @@ index 9c3bc8c79..84854feed 100644
      // mul_mat + add, with an optional view (reshape) node between the matmul and the add
      for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
          const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
-@@ -5729,7 +7666,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5729,7 +7695,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      return 0;
  }
  
@@ -9497,7 +9533,7 @@ index 9c3bc8c79..84854feed 100644
      bool graph_evaluated_or_captured = false;
  
      // per-op timing instrumentation (env-gated, diagnostic only)
-@@ -6065,7 +8002,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -6065,7 +8031,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  }
  
  #ifdef USE_CUDA_GRAPH
@@ -9506,7 +9542,7 @@ index 9c3bc8c79..84854feed 100644
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
      if (graph->instances.empty()) {
-@@ -6085,6 +8022,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6085,6 +8051,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
      ggml_cuda_set_device(cuda_ctx->device);
@@ -9515,7 +9551,7 @@ index 9c3bc8c79..84854feed 100644
  
      ggml_cuda_mmb_begin_graph();
  
-@@ -6094,7 +8033,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6094,7 +8062,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
@@ -9524,7 +9560,7 @@ index 9c3bc8c79..84854feed 100644
  
      // op timing instruments each node with stream events, which is not possible during capture
      const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
-@@ -6108,6 +8047,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6108,6 +8076,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      if (!op_timing && graph->is_enabled()) {
          const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
          if (graph_compatible) {
@@ -9542,7 +9578,7 @@ index 9c3bc8c79..84854feed 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -6134,6 +8084,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6134,10 +8113,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instances.empty();
                  }
              }
@@ -9550,7 +9586,20 @@ index 9c3bc8c79..84854feed 100644
          }
      }
  #endif // USE_CUDA_GRAPH
-@@ -6339,7 +8290,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+ 
++    ggml_cuda_graph_stats_arm();
++    if (!use_cuda_graph) {
++        g_gc_n_direct++;
++    } else if (cuda_graph_update_required) {
++        g_gc_n_capture++;
++    } else {
++        g_gc_n_replay++;
++    }
++
+     if (use_cuda_graph && cuda_graph_update_required) {
+         // Start CUDA graph capture
+         {
+@@ -6339,7 +8328,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  
  #ifdef USE_CUDA_GRAPH
@@ -9559,7 +9608,7 @@ index 9c3bc8c79..84854feed 100644
      const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
  #else
      const bool use_cuda_graph = false;
-@@ -6581,6 +8532,180 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6581,6 +8570,180 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -9740,7 +9789,7 @@ index 9c3bc8c79..84854feed 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -6597,7 +8722,18 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -6597,7 +8760,18 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -9759,7 +9808,7 @@ index 9c3bc8c79..84854feed 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -6867,8 +9003,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -6867,8 +9041,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -9770,7 +9819,7 @@ index 9c3bc8c79..84854feed 100644
  }
  
  // TODO: move these functions here
-@@ -7372,6 +9508,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -7372,6 +9546,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -9787,7 +9836,7 @@ index 9c3bc8c79..84854feed 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -7406,6 +9552,137 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -7406,6 +9590,137 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -9925,7 +9974,7 @@ index 9c3bc8c79..84854feed 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -7422,6 +9699,27 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -7422,6 +9737,27 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -9953,7 +10002,7 @@ index 9c3bc8c79..84854feed 100644
  };
  
  // backend reg
-@@ -7601,6 +9899,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -7601,6 +9937,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -10288,10 +10337,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..a005bbaf3
+index 000000000..d3c048a00
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,5548 @@
+@@ -0,0 +1,5580 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -10685,6 +10734,14 @@ index 000000000..a005bbaf3
 +// Counts the prefill-band ops the device tally has seen, so the pool re-rank can tell "no prefill yet"
 +// (the warmup pass) from "the prompt has been tallied".
 +std::atomic<int64_t>                g_heat_prefill_ops{0};
++// Decode-band `MUL_MAT_ID` census.  A routed expert table is touched once per (layer, role, device) per
++// token, so `g_band_ops / n_tables` is the token count the traffic report divides by.  The previous
++// estimate used `g_takeover / n_tables`, which reads 0 whenever the hook did not take the input over -
++// i.e. on the fully-resident identity fast path and on any band the cache serves without a remap - and
++// printed the unusable `over ~0 tokens = 0.00 MiB/token` the campaign needed (2026-10-26).
++std::atomic<int64_t>                g_band_ops{0};
++// The same census's denominator, snapshotted at sizing (see `alloc_all_locked`).
++std::atomic<int64_t>                g_band_n_tables{0};
 +
 +// ---------------------------------------------------------------------------------------------
 +// TODO #61 P1: the offline routing trace, `MOE_EXPERT_TRACE=<path>`.  Opt-in diagnostic (never
@@ -13456,6 +13513,19 @@ index 000000000..a005bbaf3
 +    }
 +    GGML_LOG_INFO("%s: per-device sizing: %d device(s), arena total %.1f MiB\n",
 +                  __func__, max_dev + 1, (double) g_arena_bytes / (1024 * 1024));
++    // The traffic report's denominator: one routed-MoE op per (layer, role, device) table per token, so
++    // the decode-band census divided by this is the token count.  Snapshotted HERE (sizing) rather than
++    // read from `g_tables` at report time, because `llama_model_free` now drops the tables before the
++    // exit report runs (r143) and the report then had no denominator at all.
++    {
++        int64_t n_band_tables = 0;
++        for (const table_t & t : g_tables) {
++            if (t.slots > 0) {
++                n_band_tables++;
++            }
++        }
++        g_band_n_tables.store(n_band_tables, std::memory_order_relaxed);
++    }
 +    g_uniform_slots = max_dev >= 0 ? slots_d[0] : -1;
 +    // OPEN 2 re-arm: record the per-layer slot count the sizing settled on (all a layer's tables are
 +    // uniform -- checked just above), so `moe_cache_rearm` can re-allocate stood-down tables to it.
@@ -14618,6 +14688,13 @@ index 000000000..a005bbaf3
 +    const int    n_tok  = (int) ids->ne[1];
 +    const bool   prefill_band = n_tok > MOE_EXPERT_CACHE_MAX_TOK;
 +
++    // The one place every routed MoE op passes through, whatever path it then takes (identity, eager
++    // remap, cold, declined), so it is the only honest token census.  Counted before the heat gate: the
++    // traffic report needs it with the heat map off too.
++    if (!prefill_band) {
++        g_band_ops.fetch_add(1, std::memory_order_relaxed);
++    }
++
 +    // TODO #61 P1: the prefill routing never reaches the host on the staged path, so the trace's
 +    // PREFILL records have to come from here.  A prefill ubatch is never CUDA-graph captured, so the
 +    // readback is safe; the whole trace is opt-in and the decode band is traced on the host instead.
@@ -15747,7 +15824,11 @@ index 000000000..a005bbaf3
 +                  __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);    if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
 +        const int64_t acc   = g_acc_hits + g_acc_fills + g_acc_colds;
 +        const int64_t bytes = g_fill_bytes + g_cold_bytes;
-+        const int64_t tokens = (n_tables > 0 && g_takeover > 0) ? g_takeover / n_tables : 0;
++        // One census op per (layer, role, device) table per token; integer division loses at most
++        // (n_band_tables - 1) ops.  The denominator comes from the sizing snapshot, not from the live
++        // table set (which the model teardown has already freed by the time this report runs).
++        const int64_t n_band_tables = g_band_n_tables.load(std::memory_order_relaxed);
++        const int64_t tokens = n_band_tables > 0 ? g_band_ops.load(std::memory_order_relaxed) / n_band_tables : 0;
 +        GGML_LOG_INFO("%s: expert access: hits=%lld fills=%lld colds=%lld (hit=%.2f%% fill=%.2f%% cold=%.2f%%)\n",
 +                      __func__, (long long) g_acc_hits, (long long) g_acc_fills, (long long) g_acc_colds,
 +                      100.0 * (double) g_acc_hits / (double) acc, 100.0 * (double) g_acc_fills / (double) acc,

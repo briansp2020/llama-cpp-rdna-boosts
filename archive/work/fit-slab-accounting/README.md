@@ -48,7 +48,7 @@ each being an emergent "whatever is free afterwards" consumer.
 **Owner handover:** start at **Cold start (read me first)** above, then §0 → §2 → §4.  §2 is the constraint
 that shapes everything; `fingon` operators read §11 before running anything.
 **Related:** `archive/work/moe-cache-autosize/` (the slab + auto-sizing campaign, CLOSED),
-`wip/moe-cpu-overlap/` (TODO #36, a different miss-path question), TODO #47.
+`archive/work/moe-cpu-overlap/` (TODO #36, a different miss-path question), TODO #47.
 
 ---
 

@@ -120,7 +120,7 @@ bandwidth-bound, a staggered split beats the contiguous split at the same host b
   `:1481`/`:1523` (the host-expert byte map).
 * `ggml/src/ggml-backend.cpp:2365` (`sched_stage_issue`), the slab ring region
   (`ggml/src/ggml-cuda/ggml-cuda-slab.cu`), `patches/README.md` block 09.
-* Related campaigns: [`../../wip/moe-cpu-overlap/`](../../wip/moe-cpu-overlap/README.md) (the CPU-vs-GPU overlap
+* Related campaigns: [`../moe-cpu-overlap/`](../moe-cpu-overlap/README.md) (the CPU-vs-GPU overlap
   question — a different axis: it overlaps CPU *compute* of misses; this one overlaps the H2D *upload*
   against device compute), [`../moe-heatmap-persistence/`](../moe-heatmap-persistence/README.md) (the
   expert cache is orthogonal: it decides which *experts* are resident, not which *layers* are host).

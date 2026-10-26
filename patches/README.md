@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r143`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r144`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -45,7 +45,7 @@ only as a rough shape.
 | 06 | `0006-…-block-06-MMB-quantized-prefill-GEMM` | MMB quantized prefill GEMM (+ r132: the per-arch dispatch keys on the running device, not the primary) | +2903 / −3 | 7 |
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard) | +5500 / −440 | 35 |
-| 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying) | +14911 / −524 | 65 |
+| 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters) | +15081 / −525 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`) | +3945 / −754 | 44 |
@@ -916,6 +916,17 @@ serves the host experts (`GREEDY-PURITY.md` §50).
 
 **Gates.**  Host-expert coherence (`-ncmoe`/`-cmoe`, and `cache-on == cache-off` text), `test-llama-archs`,
 `MOE_EXPERT_CACHE_VALIDATE=1`, `scripts/check-gpu-faults.sh` on the run's journal + log.
+
+**Diagnostics (r144).**  The exit report's `expert H2D traffic … MiB/token` divides a **decode-band op
+census** (`g_band_ops`, counted at the one place every routed MoE op passes through, whatever path it
+then takes) by a table count snapshotted **at sizing** (`g_band_n_tables`).  Both matter: the previous
+`g_takeover / n_tables` read 0 on the identity fast path (and after the r143 teardown dropped the
+tables), so every run printed `over ~0 tokens = 0.00 MiB/token`.  Do not "simplify" it back to a live
+`g_tables` walk at report time.  A *short* run's MiB/token is mostly warmup (25.4 vs 3.3 MiB/token for
+the same config at 200 vs 2000 tokens) — quote the 2000-token number.  `GGML_CUDA_GRAPH_TRACE=1` also
+reports how every `graph_compute` call was served (`direct` / `replay` / `capture` /
+`properties_changed`); a large `direct` with a matching `properties_changed` means the replay identity is
+churning (`TODO #107`, `wip/graph-replay-placement/`) — it is not the same as "graphs are on".
 
 ---
 

@@ -415,7 +415,7 @@ kept as history below, **not planned**.
    re-record the Flash-Next map on the r80 build (§3.1).  Field check on that run: arena 15 666.6 MiB,
    38.3 % residency, hit 0.9056 (724 928 / 800 520), identical to r74's 0.9057.
 4. The **PCIe share of misses** (Strata finding 9: the copy engine serves 20–55 % of misses beside the CPU
-   pool) is an *overlap* idea, not a cache idea.  Point it at `wip/moe-cpu-overlap/` rather than here?
+   pool) is an *overlap* idea, not a cache idea.  Point it at `archive/work/moe-cpu-overlap/` rather than here?
 
 ---
 

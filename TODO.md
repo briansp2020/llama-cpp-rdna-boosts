@@ -12,7 +12,7 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 still means the same subject after that item is closed and removed from this file.  New items append.
 
 **Current state:** the **15-block V2.1 set** (block 00 + blocks 01-14) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v15-6050b467c-r143`**.  `release.json` is the source of truth for the
+(the 2026-10-25 re-base), release **`v15-6050b467c-r144`**.  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 
 | # | subject | kind | status |
@@ -21,9 +21,9 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | **103** | the ~30x collapse at the last few MiB of free VRAM | diagnosis | open (r135, found in issue #219).  At 14.06 GiB free the same 27B + MTP config runs prefill 35 t/s / decode 1.5-3 t/s instead of 1127 / 53 with the weights still resident; not the FA staging fallback and not graph churn alone.  `GGML_CUDA_MIN_FREE_MIB` makes it unreachable; the cause is unrecorded.  Detail in `TODO.md` §103 |
 | **79** | RDNA3_0 verify-band fusions: no multi-device measurement, and gfx1101/gfx1102 untested | platform validation | open (shipped default-on in r95; needs a 2+ card gfx1100 box).  `ssh fingon` is single-RDNA3 (`ROCm0`; its second rocm-smi entry is an iGPU and is not a HIP device), so it does **not** cover the multi-device arm — it validates single-GPU gfx1100 only.  gfx1101/gfx1102 still have no hardware |
 | **70** | harden the expert-cache re-arm / wide-aux growth against a starved arena | robustness | open |
-| **36** | genuine CPU/GPU overlap for the MoE misses | performance | open, scoping (`wip/moe-cpu-overlap/`) |
 | **104** | block 14 (`-sm relaxed-tensor`) is a stop-gap, not a feature | temporary upstream modification | open, transient (r137).  It exists so `flint`/`mellum`/`mistral4` can tensor-split while upstream #30861/#31081 leave the MoE amax row max unsplittable.  **Drop the block** when upstream fixes the amax under a tensor split (a real cross-device MAX all-reduce, or the `ggml_prec_set_src(..., GGML_PREC_BF16, 1)` path the graph TODO names) or when its relaxations stop being needed; nothing else depends on it.  Keep it separate, do not let it grow into general `-sm tensor` support.  Limitations: `patches/README.md` (block 14), `GREEDY-PURITY.md` §58 |
 | **106** | issue #214's RDNA2 deep-context prefill residual | platform validation (waiting on the reporter) | open (2026-10-25, r138/r139).  On the reporter's 12 GiB gfx1031 (RDNA2 tile FA, slab declined) the delivery's `pp512` lead over upstream shrinks with depth: +36 % at d0, about even at 80k, -10 % at 120k (his r126 sweep; the r138 re-base does not change his tile path).  Not measurable here: no gfx1030/gfx1031 device.  Candidates are both block 05: the RDNA2 tile table from PR #165/r76 (tuned on a V620 with a different GQA shape), `GGML_CUDA_FATTN_TILE_Q_GLOBAL` (the +30 % figure was shallow), and the `prefill_stages = !RDNA3_5` staging gate.  Next measurement: his r138 `-p 512 -n 0` sweep with `GGML_CUDA_FA_STAGE_MAX_MB=1` as the staging arm.  Detail in §106 |
+| **107** | the decode graph never replays under the Meta backend (placement identity) | performance | open (2026-10-26, r144).  On 2x R9700 (x8) + Flash-Next IQ4_NL (`-sm tensor -ncmoe 48`) a decode token is 28.4 ms of which ~13.5 ms is host dispatch: 297 `graph_compute` calls / 12 258 node dispatches per token at 1.1 us/node, and `GGML_CUDA_GRAPH_TRACE` reports `direct=56171 replay=3152 properties_changed=55321` over 200 tokens (93 % refused, so `GGML_CUDA_DISABLE_GRAPHS=1` measures the same speed).  Causes in order: the Meta rebuild moves node `src[]` object addresses, then inline `name`, then a genuine source `data` move; canonicalising the first two is SLOWER (28.3 vs 35.2 t/s) because recaptures are `hipGraphExecDestroy`+`Instantiate`.  Headroom up to +40 %.  Campaign (plan, gates, traps, instrumentation): `wip/graph-replay-placement/README.md` |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -124,18 +124,6 @@ r86 in `WORKLOG.md` 261019.002; validation arm `MOE_EXPERT_CACHE_VALIDATE=1`.
 graph is now invalidated when the slab work boundary shrinks (block 10, `WORKLOG.md` 261020.004).  That
 covers the observed #187 fault; it does **not** discharge this item, because a re-arm can still change a
 table's arena placement under a graph that is not being dropped.  Keep #70 open.
-
-## 36. Genuine CPU/GPU overlap for the MoE misses (Strata's pipeline shape) — PERFORMANCE (scoping)
-
-
-Opened 2026-10-05.  The delivered cache-on path computes every expert on the GPU (resident from VRAM,
-misses via UVA over PCIe); the cache-off path computes them on the CPU but **serialised** with the GPU
-splits.  Our own CPU-computes-misses arm was correct and negative above a ~1.2 GiB arena (the loss is
-~600 scheduler dispatches + ~3 cross-backend copies per layer/token, not CPU compute; see
-`archive/work/moe-expert-cache/WORKLOG.md`).  Strata's custom engine runs the CPU pool *because* it is not
-under llama.cpp's serial scheduler.  **Next:** O0 — measure how much of a 52 t/s token is the UVA cold
-fraction at 43 % residency; if it is <20 %, park it.  Design space and gates:
-[`wip/moe-cpu-overlap/`](wip/moe-cpu-overlap/README.md).
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 

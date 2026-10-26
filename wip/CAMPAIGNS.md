@@ -21,7 +21,19 @@ is the signature of a stub, not of a campaign.
 | directory | what | status |
 |---|---|---|
 | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED (2026-09-26) — rebased and building, fully RDNA4-gated, but **gate 2 failed** (the fp8 4B is 0.69x Q8_0 where cllm had 1.16x, because the delivery's MMB/GEMM work made Q8_0 +32 % and the fp8 WMMA path did not follow).  Resume actions are in `PLAN.md`.  Not closed — paused behind the delivery work |
-| [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | genuine CPU/GPU overlap for the expert misses (the Strata shape) | OPEN / scoping (TODO #36) — **work in flight**: the note refutes the earlier "cannot be done" verdict for the interleaved shape and sets out the pipeline to try |
+| [`graph-replay-placement/`](graph-replay-placement/README.md) | the decode graph is captured but never replayed under the Meta backend (`-ncmoe` + the cache): make the replay identity stable, or the recapture cheap | OPEN / scoping complete (TODO #107, r144) — measured `direct=56171 replay=3152 properties_changed=55321` over 200 tokens, i.e. 93 % of `graph_compute` calls run the node loop directly (~13.5 ms of host dispatch in a 28.4 ms token, up to +40 % on the table).  The three identity churn causes, four candidate directions, the gates and the instrumentation are in the campaign's `README.md` |
+
+**Retired (2026-10-26, r144 — `TODO #36`, no delivery feature).**  `moe-cpu-overlap/` left `wip/` for
+[`archive/work/moe-cpu-overlap/`](../archive/work/moe-cpu-overlap/RESOLUTION.md) at the maintainer's call:
+O0 (the campaign's own gate, "< 20 % of the token, park it") measured the MoE miss traffic at **0.1-0.4 %
+of a decode token** at the delivered arena (2x R9700 x8 + Flash-Next IQ4_NL, `-ncmoe 48`, 85 % residency,
+2000-token decode) and **7 %** at the 2 048 MiB/device floor — 3.3 vs 55 MiB/token of H2D, i.e. 0.12 ms to
+2.0 ms of a 28.4 ms token — so a CPU worker computing the cold experts beside the GPU would recover ~1 %,
+for a change that must break graph capture at every `MUL_MAT_ID` and mix CPU numerics into the layer.  The
+item was **retired outright, not parked**, and the CPU/GPU overlap was not implemented.  The profile's own
+findings became `TODO #107` (above) and shipped as two r144 diagnostics (the cache's traffic-report
+denominator and the `GGML_CUDA_GRAPH_TRACE` graph-call census).  Evidence:
+[`archive/work/moe-cpu-overlap/FINDINGS-2026-10-26.md`](../archive/work/moe-cpu-overlap/FINDINGS-2026-10-26.md).
 
 **Shipped (r138, 2026-10-25, no block renumbered — the whole set re-based).**  The campaign record (it never
 needed a `wip/` staging area: it ran as one session against the released chain) is
