@@ -24,6 +24,29 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-10-26 — where a 2-GPU out-of-VRAM MoE decode token actually goes (r144, block 09 diagnostics)
+
+**`WORKLOG.md` 261026.001** + [`archive/work/moe-cpu-overlap/FINDINGS-2026-10-26.md`](../archive/work/moe-cpu-overlap/FINDINGS-2026-10-26.md)
+— the O0 measurement that retired `TODO #36` (genuine CPU/GPU overlap for the MoE misses).  2x R9700 on
+the **PCIe 5.0 x8** root ports (`HIP_VISIBLE_DEVICES=0,2`), Qwen3.8 Flash-Next IQ4_NL (100.4 GB, 512
+experts x 10 used -> 64.8 GB of expert weights, 85.4 % slot residency at the auto arena), **2000-token**
+generations with a frozen heat prior:
+
+| arm (`-ncmoe 48`, `-fa 1`, q8_0 KV) | t/s | ms/token | access hit | expert H2D |
+|---|---:|---:|---:|---:|
+| `-sm tensor`, auto arena (85 % residency) | 35.53 | 28.15 | 99.74 % | 3.3 MiB/tok |
+| `-sm tensor`, `MOE_EXPERT_CACHE_MIB=8192` (25 %) | 34.04 | 29.37 | 98.71 % | -- |
+| `-sm tensor`, `MOE_EXPERT_CACHE_MIB=2048` (6 %, the floor) | 34.44 | 29.04 | 95.66 % | 55 MiB/tok |
+| `-sm layer`, auto arena | 25.73 | 38.86 | 99.48 % | 6.6 MiB/tok |
+| `-sm tensor`, `GGML_CUDA_DISABLE_GRAPHS=1` | 35.14 | 28.46 | -- | -- |
+
+Two conclusions worth keeping: **the expert misses are not the cost** (14x smaller arena = 0.9 ms of a
+28 ms token; 3.3 MiB/token of H2D at ~28 GB/s is 0.12 ms), and **the token is dispatch-bound** — 297
+`graph_compute` calls / 12 258 node dispatches per token = 13.5 ms of host time, with the decode graph
+captured but never replayed (93 % `properties_changed`; hence `DISABLE_GRAPHS` costs nothing).  Also:
+`-sm tensor` is **+38 %** over the `-sm layer` CLI default on this shape.  Follow-up: `TODO #107` /
+`wip/graph-replay-placement/`.
+
 ## 2026-10-25 — the expert cache at a model teardown (block 12, r143)
 
 **`WORKLOG.md` 261025.017** — a table whose host master was freed by `llama_model_free` stayed registered,

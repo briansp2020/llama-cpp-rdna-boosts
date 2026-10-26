@@ -77,7 +77,10 @@ the churn is slower than doing nothing).
 `ggml_cuda_graph_trace()`, which block 10 moves, so block 09's own tree did not compile); prefill-logit
 KLD **0.000531 / 98.863 %** (identical to the recorded base); same-seed greedy text byte-identical to the
 pre-change build (Qwen3.5-4B Q8_0, 2 GPU `-sm tensor`, `ROCBLAS_USE_HIPBLASLT=0`, sha
-`8d89080db6735a30`); `test-backend-ops -o MUL_MAT_ID` OK.
+`8d89080db6735a30`); `test-backend-ops -o MUL_MAT_ID` OK.  The adaptive-MTP four-axis gate was **not** re-run: no decode,
+speculative or fusion code changed (a counter and a log line).  The numbers the release is about are
+recorded in [`benchmarks/README.md`](benchmarks/README.md) (2026-10-26) and in the campaign's
+`FINDINGS-2026-10-26.md`.
 
 ## 261025.017 (r143) -- the expert cache dropped its tables at model teardown (SIGSEGV), and the reporter's IQ3_S arm closes out r142
 
