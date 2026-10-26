@@ -81,7 +81,7 @@ amendment, or a note in the relevant record).
 | `TODO.md` | **forward-looking only**: open items, items waiting on someone else, accepted limitations, parked ideas. A closed item is one `WORKLOG.md` entry — never a TODO entry. `#NN` numbers are permanent handles and are never reused |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims); dated narratives/evidence are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
 | `patches/` | **the delivery set** (0000-0014: block 00 + blocks 01-14) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
-| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out). **Index: `scripts/README.md`** |
+| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-park-idle-slots.sh` (the server idle-slot parking gate: park == lazy-off text + the indexer cache moves with the attention cache, issue #227), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out). **Index: `scripts/README.md`** |
 | `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
 |  `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
 | `prompts/` | versioned, hash-stable test prompts; sizes/token counts/**sha256** in `prompts/README.md`. A shipped prompt is **never edited in place** (add a new file); a result is only valid against the prompt hash it names |
@@ -551,7 +551,13 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   other cache shares, V not transposed and no sliding window; anything else keeps #210 and logs once.  A slot whose
   cells are not one run (shared through `seq_cp`, e.g. a cached prefix) falls back to save-and-clear, or stays
   resident with `--no-cache-idle-slots`.  It does **not** make concurrent decoding deterministic (that is §38).
-  `LLAMA_KV_PARK_DEBUG=1` logs every move and refusal.  `GREEDY-PURITY.md` §57.
+  `LLAMA_KV_PARK_DEBUG=1` logs every move and refusal.  **A memory whose second cache mirrors the attention cells
+  parks both or neither (r146, issue #227):** `llama_memory_hybrid_idx` (qwen4exp/glm5-next) moves the QSA indexer
+  cache with the attention cache, refuses when the two no longer mirror (`attn_idx_in_step`), and stales the pool
+  layout + drops the derived pool watermarks (the derived rows are indexed by the block ordinal of the cells in the
+  decode window, which a park changes).  Never park a cache whose cells another cache indexes by cell number without
+  moving that cache — r136 matched hybrid-idx through its `llama_memory_hybrid` base and left the indexer behind,
+  which aborted the server on the model's own guard.  `GREEDY-PURITY.md` §57; gate: `scripts/gate-park-idle-slots.sh`.
 - **The band's two query-width blocks must share one geometry (r134, issue #224, block 05).**  A band block
   splits each Q column's KV rows `np = nwarps*cols_per_warp/ncols` ways (`cols_per_warp` is 16 for the RDNA4
   256-dim WMMA tiles), so the 32-column block (widths 1..4, 8 warps) is `np = 4` and the 64-column block
@@ -877,6 +883,12 @@ run the **prefill-logit gate** as well:
 It requires mean KLD <= 0.005 and same-top-p >= 98 %. Issue #113 (the lossy default-on BF16 chunked
 GDN) passed the coherence gate and was only visible to this one; protocol in
 `benchmarks/prefill-logit-methodology.md`.
+
+A change to the **server**'s idle-slot parking path (the KV-cache parking API, a memory type that carries a
+second cache, `LLAMA_SERVER_PARK_IDLE_SLOTS`) needs `scripts/gate-park-idle-slots.sh` instead: it drives a
+park/unpark request sequence and requires the parking arm to be byte-identical to
+`LLAMA_SERVER_LAZY_IDLE_SLOTS=0`, with the moves traced. Neither of the gates above reaches parking — it
+is inert in `llama-cli`/`llama-bench`/`llama-perplexity` (issue #227 was invisible to both).
 
 ### Regenerate the patches (after fork changes)
 

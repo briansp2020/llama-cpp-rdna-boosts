@@ -118,7 +118,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§54** | a fill of an input the graph may not consume is guarded on `buffer`, never on the pointer | fix (r131, PR #222) |
 | **§55** | a quantize cache keyed on a root tensor must match the pointer it fills from, and validate its read range | fix (r132, PR #218) |
 | **§56** | a per-arch dispatch decision keys on the running device, and the pass that consults it selects its own | fix (r132, PR #218) |
-| **§57** | parking the idle slots restores the save-and-clear attention range for a request that runs alone | doctrine (r136, PR #225) |
+| **§57** | parking the idle slots restores the save-and-clear attention range for a request that runs alone; a memory whose second cache mirrors the attention cells parks both or neither (r146) | doctrine (r136, PR #225; r146, issue #227) |
 | **§58** | a per-device scalar is sound only if its inverse is applied to that device's own partial *before* the reduction — a mode, not a default | doctrine, temporary (r137, block 14; `TODO` #104) |
 | **§59** | a fused window must read a tensor the graph keeps alive for it — the one the emitter pins — never an unpinned ancestor whose last graph use runs *before* the window; and a fusion of a norm must reduce in the *same grouping* as the kernel it replaces, or it is only approximately that kernel | fix (r140 + r141, issue #226) |
 
@@ -1525,7 +1525,15 @@ moves or removes cells keeps the parked ranges honest (`park_refresh` on `seq_rm
 gives parking up).  An idle slot whose cells are not one run of its own (shared through `seq_cp`, e.g. a
 cached prefix restore) cannot be parked: it is saved and cleared by default, or left resident with
 `--no-cache-idle-slots`, so the output stays the lazy-off output either way.  Do not claim determinism for
-concurrent decoding: parking does not change batch composition (§38).
+concurrent decoding: parking does not change batch composition (§38).  **A memory whose second cache
+mirrors the attention cells parks both or neither (r146, issue #227):** `llama_memory_hybrid_idx` (qwen4exp,
+glm5-next) answers `can_park()` / `seq_park()` itself, moves the attention cache and then the indexer
+(undoing the first if the second refuses), and refuses — leaving the slot to the save-and-clear fallback —
+when the two no longer mirror each other (`attn_idx_in_step()`).  A successful move stales the pool layout
+and drops the derived indexer pool's watermarks, because the derived rows are indexed by the block ordinal
+of the cells *in the decode window*, which a park changes.  Never park a cache whose cells another cache
+indexes by cell number without moving that cache: r136 matched `llama_memory_hybrid_idx` through its
+`llama_memory_hybrid` base and left the indexer behind, which aborted the server on the model's own guard.
 
 **Evidence (r136, gfx1201, ROCm 10.1.0).**  27B UD-Q4_K_XL + DFlash2-Q4_K_M, 4 slots, `-c 131072
 --kv-unified -fa on -ctk/ctv q8_0`, 16 varied prompts, two rounds, `cache_prompt: false`: parking
@@ -1537,6 +1545,17 @@ Gemma-4 E4B (sliding window) report parking unsupported and are text-identical o
 gate on the release build is KLD 0.000000 / 99.980 %, and the 4B coherence is byte-identical to r135 on
 1 GPU and 3 GPU `-sm tensor`.  The reporter did not cover MoE with the expert cache, vision, >4 slots or
 Windows, and the PR's switch-time table was not independently re-measured.
+
+**Evidence (r146, issue #227, Flash-Next GSQ-RCO IQ3_XXS + MTP, gfx1201).**  The r145 build aborts with
+`qwen4exp.cpp: GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv())` on the reporter's
+sequence — a ~9.9k prompt completes on slot 0, a short prompt starts on another slot and the parked slot's
+attention cells move while the indexer's stay behind — in **both** `-sm tensor` and `-sm layer`.  With both
+caches moved, the same 4-request sequence (A 10.6k on slot 0; B on slot 1; C back on slot 0, which unparks
+A; D on slot 2 with two slots parked) is byte-identical to `LLAMA_SERVER_LAZY_IDLE_SLOTS=0` on every
+request, in `-sm tensor` (3 GPU, all-VRAM) and `-sm layer` (3 GPU); `LLAMA_SERVER_PARK_IDLE_SLOTS=0`
+differs on 2 of the 4, i.e. the workload does reproduce #210's placement dependence.  Both caches log each
+move under `LLAMA_KV_PARK_DEBUG=1`, and no GPU fault is reported.  `scripts/gate-park-idle-slots.sh` is the
+repeating gate (it fails on r145 with the reported assert).
 
 Record: `patches/README.md` (block 12), `ENVIRONMENT.md` §15, `archive/work/server-park-idle-slots/`,
 `WORKLOG.md` 261025.006, PR #225.

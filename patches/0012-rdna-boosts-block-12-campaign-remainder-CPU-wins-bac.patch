@@ -1,4 +1,4 @@
-From ed46ad9360662949a1ced4e7ca5aab0ea2ca0a37 Mon Sep 17 00:00:00 2001
+From 769f1f311ce0dc2b44712880d1b25a4388865fda Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/14] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -164,11 +164,13 @@ Single-model runs are unchanged: the teardown only adds the drop log lines.
  include/llama.h                               |   12 +-
  src/llama-context.cpp                         |  436 +++-
  src/llama-context.h                           |   22 +
- src/llama-ext.h                               |   15 +
+ src/llama-ext.h                               |   17 +
  src/llama-kv-cache.cpp                        |  292 ++-
  src/llama-kv-cache.h                          |   30 +
  src/llama-kv-cells.h                          |   33 +
- src/llama-memory.cpp                          |   63 +
+ src/llama-memory-hybrid-idx.cpp               |   71 +
+ src/llama-memory-hybrid-idx.h                 |   10 +
+ src/llama-memory.cpp                          |   76 +
  src/llama-model-loader.cpp                    |   41 +-
  src/llama-model-loader.h                      |   12 +-
  src/llama-model.cpp                           |  108 +-
@@ -179,7 +181,7 @@ Single-model runs are unchanged: the teardown only adds the drop log lines.
  tools/server/server-task.cpp                  |   74 +-
  tools/server/server-task.h                    |   11 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 44 files changed, 3933 insertions(+), 754 deletions(-)
+ 46 files changed, 4029 insertions(+), 754 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 5be48e428..4c2e0fa63 100644
@@ -5400,10 +5402,10 @@ index 7559664db..843afe46f 100644
      // env: LLAMA_GRAPH_REUSE_DISABLE
      bool graph_reuse_disable = false;
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 77471bc25..e9a4c78fc 100644
+index 77471bc25..0079595f5 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
-@@ -105,6 +105,18 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
+@@ -105,6 +105,20 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
  // the backend buffers that a state write of this memory would touch - empty caches report none
  LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
  
@@ -5412,17 +5414,19 @@ index 77471bc25..e9a4c78fc 100644
 +// in a cache that holds nothing else, so their results no longer depend on what is parked.  park = false moves a
 +// parked sequence back to the lowest free cells.  Returns false, changing nothing, when the move is not possible
 +// (a split cache, shared or fragmented cells, no room); a memory without an attention cache returns true.  The K/V data
-+// are copied on the device, so synchronize the context first.
++// are copied on the device, so synchronize the context first.  A memory whose second cache mirrors the attention cells
++// (the qwen4exp/glm5-next indexer) moves both, or neither.
 +LLAMA_API bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park);
 +
 +// Whether the attention cache(s) of mem support parking at all (see llama_memory_seq_park): a unified cache whose cells
-+// no other cache shares, with V not transposed and no sliding window.  A memory without an attention cache: true.
++// no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
++// attention cells, that cache as well.  A memory without an attention cache: true.
 +LLAMA_API bool llama_memory_can_park(llama_memory_t mem);
 +
  // Turn the KV cache attention rotation on or off for the contexts created from this model.
  // Useful for testing purposes.
  LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
-@@ -176,6 +188,9 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+@@ -176,6 +190,9 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
  
  LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
  
@@ -5915,29 +5919,142 @@ index 9c0d51e4e..e6d40c6b4 100644
      // move cell isrc to idst (used during defrag)
      //void mv(uint32_t isrc, uint32_t idst) {
      //    assert(isrc < pos.size());
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 58243212c..80bce931a 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -538,6 +538,77 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
+     return mem_idx.get();
+ }
+ 
++bool llama_memory_hybrid_idx::can_park() const {
++    if (!get_mem_attn()->can_park()) {
++        return false;
++    }
++
++    // the indexer mirrors the attention cells, so it has to be parkable too (nullptr when the model has no indexer)
++    return mem_idx == nullptr || mem_idx->can_park();
++}
++
++// Whether the two caches still hold the same cells: same (position, cell) pair for every sequence of the stream.
++// Parking moves whole runs, and park_compact() also moves the sequences parked beside this one, so the whole stream
++// is compared rather than the one sequence being parked.
++bool llama_memory_hybrid_idx::attn_idx_in_step(llama_seq_id seq_id) const {
++    const auto & cells_attn = get_mem_attn()->get_cells(seq_id);
++    const auto & cells_idx  = mem_idx->get_cells(seq_id);
++
++    if (cells_attn.size() != cells_idx.size()) {
++        return false;
++    }
++
++    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
++        if (cells_attn.seq_pos_get(s) != cells_idx.seq_pos_get(s)) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++bool llama_memory_hybrid_idx::seq_park(llama_seq_id seq_id, bool park) {
++    if (!can_park()) {
++        return false;
++    }
++
++    // no indexer: the attention cache is all there is (the same move llama_memory_seq_park() makes for a hybrid)
++    if (mem_idx == nullptr) {
++        return park ? get_mem_attn()->seq_park(seq_id) : get_mem_attn()->seq_unpark(seq_id);
++    }
++
++    // a cache that is already out of step cannot be moved coherently (the attention cache would keep other cells than
++    // the indexer reads): refuse before anything moves, which leaves the caller its save-and-clear fallback
++    if (seq_id >= 0 && seq_id < LLAMA_MAX_SEQ && !attn_idx_in_step(seq_id)) {
++        LLAMA_LOG_WARN("%s: seq %d: the indexer cache does not mirror the attention cache, not parking\n", __func__, seq_id);
++        return false;
++    }
++
++    if (!(park ? get_mem_attn()->seq_park(seq_id) : get_mem_attn()->seq_unpark(seq_id))) {
++        return false;
++    }
++
++    if (!(park ? mem_idx->seq_park(seq_id) : mem_idx->seq_unpark(seq_id))) {
++        // all or nothing: a misaligned pair is worse than a slot that stays where it is
++        if (park) {
++            get_mem_attn()->seq_unpark(seq_id);
++        } else {
++            get_mem_attn()->seq_park(seq_id);
++        }
++
++        return false;
++    }
++
++    // The cells moved under the feet of the state that is derived from them: the pool layout caches each sequence's
++    // (position, cell) pairs, and the derived pool rows are indexed by the block ordinal of the cells in the decode
++    // window, which changes when cells leave or re-enter that window.  Dropping both recomputes them from the moved
++    // cells on the next ubatch (the raw key rows moved with their cells, so nothing else is stale).
++    mem_idx_stale_set(-1, 0);
++    pool_invalidate_all();
++
++    return true;
++}
++
+ void llama_memory_hybrid_idx::set_input_qsa(
+         ggml_tensor * cell_blk,
+         ggml_tensor * blk_cells,
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index d9bf0b884..932953ecf 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -79,6 +79,13 @@ public:
+ 
+     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+ 
++    // Parking (llama_memory_seq_park).  The indexer cache is a cell-for-cell mirror of the attention cache - cell j
++    // is the same token in both, and the model asserts that the two ranges agree - so a park has to move both or
++    // neither.  can_park() asks both caches; seq_park() moves both and refuses (leaving everything where it is) when
++    // they no longer mirror each other, which sends the caller to its save-and-clear fallback.
++    bool can_park() const;
++    bool seq_park(llama_seq_id seq_id, bool park);
++
+     // The model's indexer pool size.
+     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
+ 
+@@ -163,6 +170,9 @@ private:
+     // the position an edit at p0 stales the sequence from
+     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
+ 
++    // whether the indexer cache still holds the attention cache's cells, (position, cell) pair for pair
++    bool attn_idx_in_step(llama_seq_id seq_id) const;
++
+     stale_pos_t mem_idx_stale = stale_pos_clean();
+     //
+     // incremental block-vector cache ("derived cache", qwen4exp QSA decode waste fix)
 diff --git a/src/llama-memory.cpp b/src/llama-memory.cpp
-index 961dd74ef..7997a0117 100644
+index 961dd74ef..8811f49f1 100644
 --- a/src/llama-memory.cpp
 +++ b/src/llama-memory.cpp
-@@ -2,6 +2,11 @@
+@@ -2,6 +2,12 @@
  
  #include "llama-ext.h"
  #include "llama-io.h"
 +#include "llama-kv-cache.h"
 +#include "llama-kv-cache-iswa.h"
 +#include "llama-memory-hybrid.h"
++#include "llama-memory-hybrid-idx.h"
 +#include "llama-memory-hybrid-iswa.h"
 +#include "llama-memory-recurrent.h"
  
  #include <set>
  #include <vector>
-@@ -90,3 +95,61 @@ std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t
+@@ -90,3 +96,73 @@ std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t
  
      return std::vector<ggml_backend_buffer_t>(writer.buffers.begin(), writer.buffers.end());
  }
 +
 +// the attention caches of a memory: a KV cache, both caches of an iswa cache, or the attention part of a hybrid;
 +// false for a memory type that parking does not know (a recurrent memory has none: true with an empty list)
++// note: a hybrid with a second cache that mirrors the attention cells (the qwen4exp/glm5-next indexer) decides for
++//       itself, see the llama_memory_hybrid_idx branch of llama_memory_can_park()/llama_memory_seq_park()
 +static bool llama_memory_attn_caches(llama_memory_t mem, std::vector<llama_kv_cache *> & kvs) {
 +    kvs.clear();
 +    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
@@ -5955,6 +6072,11 @@ index 961dd74ef..7997a0117 100644
 +}
 +
 +bool llama_memory_can_park(llama_memory_t mem) {
++    // a hybrid whose second cache mirrors the attention cells parks both or not at all
++    if (auto * hyb_idx = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
++        return hyb_idx->can_park();
++    }
++
 +    std::vector<llama_kv_cache *> kvs;
 +    if (!llama_memory_attn_caches(mem, kvs)) {
 +        return false;
@@ -5968,6 +6090,11 @@ index 961dd74ef..7997a0117 100644
 +}
 +
 +bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park) {
++    // a hybrid whose second cache mirrors the attention cells (qwen4exp/glm5-next's indexer) moves both together
++    if (auto * hyb_idx = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
++        return hyb_idx->seq_park(seq_id, park);
++    }
++
 +    std::vector<llama_kv_cache *> kvs;
 +    if (!llama_memory_attn_caches(mem, kvs)) {
 +        return false;

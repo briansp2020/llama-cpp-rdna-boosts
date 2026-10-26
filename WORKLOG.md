@@ -1,5 +1,96 @@
 # WORKLOG - dated delivery records
 
+## 261026.003 (r146) -- issue #227: parking moves a mirroring indexer cache with the attention cache (qwen4exp/glm5-next)
+
+**Release:** `v15-6050b467c-r146` (base `6050b467c`, canonical tip `5ba04fa7c`, tree
+`13722383a3a2988214f3faa9ab0d347ce546af9d`, 15 blocks).  Delta against the r145 tree: **4 files,
++98/-2** -- `llama-memory-hybrid-idx.{h,cpp}` (the park decision and the invalidation of what is derived
+from the cells), `llama-memory.cpp` (the dispatch) and `llama-ext.h` (the contract), all in **block 12**.
+No kernel, no allocation and no numerics change: the code is reached only through the server's idle-slot
+parking, and `llama-cli`/`llama-bench`/`llama-perplexity` never call it.
+
+### What issue #227 reports, and what reproduces here
+
+Brian (`@briansp2020`, 2x R9700, r143 then r145, Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS with an MTP draft,
+default 4 slots + unified KV, `-sm tensor -ncmoe 0 -ot per_layer_token_embd.*=CPU -lm none -lzm off`):
+one ~9.9k-token request completes, a short second request lands on another slot, and the server aborts
+
+```
+qwen4exp.cpp: GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv()
+                         && "the indexer cache must track the attention cache cell for cell")
+```
+
+The same on `-sm layer -ts 59,41`, and it disappears with `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`.  Reproduced
+exactly (3 GPU, GSQ-RCO IQ3_XXS, the same flags minus their two-GPU `-ts`), 10.6k prompt:
+
+```
+srv  park_idle_sl: idle slot parking: on
+W seq_park: seq 0 [0, 10651) -> [30309, 40960)          <- the attention cache moved up
+src/models/qwen4exp.cpp:979: GGML_ASSERT(... ) failed    <- the indexer cache did not
+```
+
+**Cause.**  r136's parking (PR #225) collects the caches to move in `llama_memory_attn_caches()`, which
+matched `llama_memory_hybrid_idx` through its `llama_memory_hybrid` base and returned **only**
+`get_mem_attn()`.  qwen4exp's and glm5-next's memory carries a **second** cache, the QSA indexer, that is
+a cell-for-cell mirror of the attention cache: a batch adopts the attention cache's slot layout
+(`heads_idx = heads_attn`), cell `j` is one token in both, `get_n_kv()` drives both views, and
+`qwen4exp.cpp` asserts the two agree.  Parking the attention half alone moved a sequence to the top of
+one cache and left the other at the bottom, so the *next* graph build saw two different `n_kv` values.
+(The half-park is also why `-sm layer` was hit: the guard is arch-independent, it is the memory type that
+matters.)  `llama_kv_cache_dsa` / `_iswa` (deepseek4, glm-dsa) derive from `llama_memory_i` directly and
+were therefore never in the list — they report "parking not supported" and keep #210, unchanged.
+
+### Shipped (block 12)
+
+1. `llama_memory_hybrid_idx::can_park()`: both caches must be parkable (one stream, unshared cells, V not
+   transposed, no sliding window), not just the attention one.
+2. `llama_memory_hybrid_idx::seq_park(seq, park)`: moves the attention cache and then the indexer (a
+   no-op when the model has no indexer, e.g. a GGUF without indexer tensors), and undoes the first if the
+   second refuses.  Before moving it verifies the mirror (`attn_idx_in_step()`: the whole stream's
+   `seq_pos_get()` sets, because `park_compact()` also moves the sequences parked *beside* this one) and
+   **refuses with a warning** when they disagree — the server then takes its existing save-and-clear
+   fallback, so a desynchronised cache can never be parked into worse shape.
+3. A successful move stales the pool layout for every sequence (`mem_idx_stale_set(-1, 0)`) and drops the
+   derived indexer pool's watermarks (`pool_invalidate_all()`).  Both are required, not defensive: the
+   layout caches each sequence's `(position, cell)` pairs, and the derived rows are indexed by the **block
+   ordinal of the cells in the decode window**, which a park changes (a parked sequence's blocks leave the
+   window), so a stale derived row would be read under another block's ordinal — silently wrong, and
+   invisible to the assert.  The raw key/pooled rows move with their cells, so nothing else is stale.
+4. `llama_memory_can_park()` / `llama_memory_seq_park()` dispatch to the memory first; every other type
+   keeps the existing path.  `llama-ext.h` documents the new half of the contract.
+
+### Validation (gfx1201, ROCm 10.1.0, Flash-Next GSQ-RCO IQ3_XXS + MTP, 4 slots, unified KV)
+
+New gate `scripts/gate-park-idle-slots.sh` (below).  It fails on the r145 build with the reported assert
+and passes on this one.  Its 4-request sequence covers the whole lifecycle: A (10.6k, slot 0) parked when
+B (slot 1) launches, C back on slot 0 (**unpark** A, park B), D on slot 2 with two slots parked:
+
+| arm | `-sm tensor` 3 GPU, all-VRAM | `-sm layer` 3 GPU |
+|---|---|---|
+| park (default) vs `LLAMA_SERVER_LAZY_IDLE_SLOTS=0` | **4/4 byte-identical** | **4/4 byte-identical** |
+| `LLAMA_SERVER_PARK_IDLE_SLOTS=0` (#210) vs lazy-off | 2/4 differ | - |
+| moves traced (`LLAMA_KV_PARK_DEBUG=1`) | 6 park + 2 unpark, both caches, identical ranges | 6 park + 2 unpark |
+| `GGML_ASSERT` / refusal / GPU fault | none | none |
+
+That is also the #225 promise restored for qwen4exp: a request that runs alone matches the
+saved-and-cleared output, and the no-parking arm still shows the placement dependence the gate exists to
+detect.  Also run: `scripts/gate-prefill-logits.sh` **0.000000 KLD / 100.000 %** against the r145 base
+(build 24bfbd46c, 27B Q8_0, 40 chunks); `scripts/gate-per-block-build.sh --fast --changed-from
+3226075a6` **2/2** (block 12 + the tip; the first attempt put the hybrid-idx edit in block 11 and the gate
+caught it: block 11 does not build on its own, because the park API it calls lands in block 12); the tip's
+`all` build and the prefill-logit/perplexity binaries on the canonical `build-rocm`;
+`scripts/validate-set.sh` strict 15/15 on a fresh tarball.
+
+### Not run / accepted
+
+* **glm5-next** (the same memory, k-pool indexer variant): no GGUF on this fleet — `TODO` #108, accepted
+  limitation.  The code path is shared and the k-pool layout is invalidated with everything else.
+* **2-GPU arms**: the GSQ-RCO IQ3_XXS tree is 71 GB and the box has 91 GB of RAM, so
+  `-ncmoe`+2 GPU OOM-kills (85 GB of pinned host experts); the split-mode coverage is 3-GPU
+  `tensor`/`layer` instead, which is where the assert fires.
+* The reporter's own build and their 21.6k-token production sequence were not reproduced (our 10.6k arm
+  is the same code path); no Windows run.
+
 ## 261026.002 (r145) -- issue #229: the float4 rms_norm reduction becomes opt-in, the pre-#29720 strided reduction is the default again
 
 **Release:** `v15-6050b467c-r145` (base `6050b467c`, canonical tip `24bfbd46c`, tree

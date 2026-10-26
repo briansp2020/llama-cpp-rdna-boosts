@@ -12,7 +12,7 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 still means the same subject after that item is closed and removed from this file.  New items append.
 
 **Current state:** the **15-block V2.1 set** (block 00 + blocks 01-14) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v15-6050b467c-r145`**.  `release.json` is the source of truth for the
+(the 2026-10-25 re-base), release **`v15-6050b467c-r146`**.  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 
 | # | subject | kind | status |
@@ -24,6 +24,7 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | **104** | block 14 (`-sm relaxed-tensor`) is a stop-gap, not a feature | temporary upstream modification | open, transient (r137).  It exists so `flint`/`mellum`/`mistral4` can tensor-split while upstream #30861/#31081 leave the MoE amax row max unsplittable.  **Drop the block** when upstream fixes the amax under a tensor split (a real cross-device MAX all-reduce, or the `ggml_prec_set_src(..., GGML_PREC_BF16, 1)` path the graph TODO names) or when its relaxations stop being needed; nothing else depends on it.  Keep it separate, do not let it grow into general `-sm tensor` support.  Limitations: `patches/README.md` (block 14), `GREEDY-PURITY.md` §58 |
 | **106** | issue #214's RDNA2 deep-context prefill residual | platform validation (waiting on the reporter) | open (2026-10-25, r138/r139).  On the reporter's 12 GiB gfx1031 (RDNA2 tile FA, slab declined) the delivery's `pp512` lead over upstream shrinks with depth: +36 % at d0, about even at 80k, -10 % at 120k (his r126 sweep; the r138 re-base does not change his tile path).  Not measurable here: no gfx1030/gfx1031 device.  Candidates are both block 05: the RDNA2 tile table from PR #165/r76 (tuned on a V620 with a different GQA shape), `GGML_CUDA_FATTN_TILE_Q_GLOBAL` (the +30 % figure was shallow), and the `prefill_stages = !RDNA3_5` staging gate.  Next measurement: his r138 `-p 512 -n 0` sweep with `GGML_CUDA_FA_STAGE_MAX_MB=1` as the staging arm.  Detail in §106 |
 | **107** | the decode graph never replays under the Meta backend (placement identity) | performance | open (2026-10-26, r144).  On 2x R9700 (x8) + Flash-Next IQ4_NL (`-sm tensor -ncmoe 48`) a decode token is 28.4 ms of which ~13.5 ms is host dispatch: 297 `graph_compute` calls / 12 258 node dispatches per token at 1.1 us/node, and `GGML_CUDA_GRAPH_TRACE` reports `direct=56171 replay=3152 properties_changed=55321` over 200 tokens (93 % refused, so `GGML_CUDA_DISABLE_GRAPHS=1` measures the same speed).  Causes in order: the Meta rebuild moves node `src[]` object addresses, then inline `name`, then a genuine source `data` move; canonicalising the first two is SLOWER (28.3 vs 35.2 t/s) because recaptures are `hipGraphExecDestroy`+`Instantiate`.  Headroom up to +40 %.  Campaign (plan, gates, traps, instrumentation): `wip/graph-replay-placement/README.md` |
+| **108** | parking a mirroring second cache is validated on qwen4exp (and its k-pool arm is not) | platform validation | open, accepted limitation (r146, issue #227).  `llama_memory_hybrid_idx` is shared with **glm5-next**, whose indexer is the `indexer_kpool > 0` (k-pool, `indexer_kpool_by_order`) variant: the same park code moves it and the same invalidation (`mem_idx_stale_set`, `pool_invalidate_all`) covers the pool layout, but no glm5-next GGUF exists on this fleet, so only the qwen4exp arm is measured (`scripts/gate-park-idle-slots.sh`) |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -126,6 +127,13 @@ covers the observed #187 fault; it does **not** discharge this item, because a r
 table's arena placement under a graph that is not being dropped.  Keep #70 open.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
+
+* **Parking a memory whose second cache mirrors the attention cells is validated on qwen4exp only** (TODO
+  #108, r146): `llama_memory_hybrid_idx` also serves glm5-next, whose indexer is the k-pool
+  (`indexer_kpool > 0`) variant.  The park code, its mirror check and its invalidation are arch-agnostic
+  and the k-pool layout is invalidated with everything else, but no glm5-next GGUF exists on this fleet, so
+  only the qwen4exp arm is measured.  `llama_kv_cache_dsa` / `_iswa` (deepseek4, glm-dsa) report parking
+  unsupported by design and keep #210 — they never half-park.
 
 * **A dense `-sm tensor` split is not guaranteed to produce the same greedy text across device counts**
   (AGENTS "Greedy text is a per-device-count reference" was corrected 2026-10-24).  Qwen3.8-27B

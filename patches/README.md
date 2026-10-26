@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r145`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r146`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -48,7 +48,7 @@ only as a rough shape.
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters) | +15081 / −525 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill) | +11976 / −433 | 46 |
-| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`) | +3945 / −754 | 44 |
+| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227) | +4029 / −754 | 46 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
 
@@ -1110,7 +1110,9 @@ slab/dispatcher/ring code of its own beyond the arms implemented in its own TUs.
 * **qwen4exp** (`src/models/qwen4exp.cpp`, `src/llama-memory-hybrid-idx.cpp`): QSA sparse attention and the
   fused indexer top-k/score (`indexer-topk.cu`, `lightning-indexer`), hyper-connections (`hc-mix.cu`,
   `hyperconn.cu`), the managed lazy reader, PLE n-gram loading, the MTP draft head, and the **keys-only
-  indexer cache** (`LLAMA_QSA_KEYS_ONLY`; no V tensor at all — `llama_kv_cache` gains `v_enabled`).
+  indexer cache** (`LLAMA_QSA_KEYS_ONLY`; no V tensor at all — `llama_kv_cache` gains `v_enabled`).  The
+  indexer cache is a cell-for-cell mirror of the attention cache, so anything that **moves** attention cells
+  must move it too — the idle-slot parking of block 12 does (r146, issue #227).
 * **The DFlash/DSpark layer-input tap exports the HC-averaged state** (r121, TODO #94 / issue #211): the
   graph used to publish `t_layer_inp[il] = res_hc`, the **wide** hyper-connection residual (`hc * n_embd` =
   10240 on Flash-Next), while `llama_context::extract_layer_inp()` requires exactly `n_embd` floats per row
@@ -1317,6 +1319,29 @@ had no other home.
   cannot park are text-identical with the switch on/off; hybrid attention/recurrent is 16/16 equal to
   lazy-off; 2 GPU `-sm tensor` works.  `GREEDY-PURITY.md` §57.  The reporter did not cover MoE with the
   expert cache, vision, more than 4 slots or Windows, and we did not re-measure the switch-time table.
+* **A memory whose second cache mirrors the attention cells parks both or neither (r146, issue #227).**
+  `llama_memory_hybrid_idx` (qwen4exp and glm5-next) carries the QSA indexer cache beside the attention
+  cache **cell for cell** — cell `j` is one token in both — and r136's `llama_memory_attn_caches()` matched
+  the memory through its `llama_memory_hybrid` base and parked **only** the attention half.  qwen4exp then
+  aborted on its own guard (`qwen4exp.cpp` `the indexer cache must track the attention cache cell for cell`)
+  the moment a second slot launched on a server with an idle slot parked (2x R9700, issue #227: a 9.9k
+  prompt on slot 0, a short prompt on another slot; `-sm tensor` **and** `-sm layer`).  The memory now
+  answers `llama_memory_can_park()` / `llama_memory_seq_park()` itself: `can_park()` requires both caches,
+  and `seq_park()` moves the attention cache then the indexer (undoing the first if the second refuses),
+  refusing up front — with a warning, which the server turns into its save-and-clear fallback — when the two
+  no longer mirror each other (`attn_idx_in_step()`, compared over the stream's whole `seq_pos` sets, since
+  `park_compact()` also moves the sequences parked beside this one).  A successful move stales the pool
+  layout for every sequence and drops the derived indexer pool's watermarks: the layout caches each
+  sequence's `(position, cell)` pairs, and the derived rows are indexed by the block ordinal of the cells
+  in the **decode window**, which a park changes (`pool_invalidate_all()`), so both are recomputed on the
+  next ubatch.  `llama_memory_attn_caches()` is unchanged for every other memory type; `llama_kv_cache_dsa`
+  / `_iswa` derive from `llama_memory_i` directly, so their indexer was never half-parked (they report
+  "parking not supported" and keep #210).  Measured (Flash-Next GSQ-RCO IQ3_XXS + MTP, 4 slots, 10.6k-token
+  prompt, `-sm tensor` 3 GPU all-VRAM and `-sm layer` 3 GPU): park **==** `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`
+  byte for byte on all four requests (A parked, B on the freed low cells, C unparking A, D with two slots
+  parked), `LLAMA_SERVER_PARK_IDLE_SLOTS=0` differs on two of them, both caches log every move, no GPU
+  fault.  Gate: `scripts/gate-park-idle-slots.sh` (it fails on the r145 build with exactly the reported
+  assert).  `GREEDY-PURITY.md` §57.
 * **The batched state save and restore** (r96, PR #189; restore r119, PR #209): `llama_io_write_host`
   queues its deferred reads as `ggml_backend_tensor_get_async` into one pinned staging buffer kept by the
   context, synchronizes each backend once, then copies to the caller's buffer.  A recurrent model's
