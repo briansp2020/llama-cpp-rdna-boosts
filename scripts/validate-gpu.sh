@@ -37,6 +37,17 @@
 #      KLD_MODEL, KLD_CTX (512), KLD_CHUNKS (40), KLD_BASE_DIR
 #      SKIP_LADDER=1 / SKIP_OPTESTS=1 / SKIP_KLD=1   narrow the run
 #      MAX_ATTEMPTS (3, per rev)         KEEP_RUNS (5)
+#      KLD_ALWAYS=1                      run the prefill-logit gate even when the applied tree
+#                                        did not touch a prefill path (see below)
+#
+# COST (measured on radiance, gfx1151 APU, 16 threads, 2026-10-25)
+#   cold ccache, whole chain       87 min   <- one-time; the FA instantiation sets dominate
+#                                          (blocks 05-12 each compile their own cold, 520-610 s each)
+#   warm, whole chain              89 s     ladder + ~2 min op tests + ~6 min prefill-logit
+#   warm, nothing changed          0        skipped on the delivery CONTENT key, not the commit
+#   warm, one block amended        ~2 min   ladder selects only the changed blocks (--changed-from)
+#   So a release pays ~3-4 min, a docs push pays nothing, and only a change that touches a
+#   prefill kernel also pays the 6 min logit gate.
 #      CI_LOCK (the container watcher's lock)  default $HOME/.cache/rdna-containers/.lock
 #
 # Exit: 0 = validated (or nothing to do / already given up on this rev); 1 = a step failed.
@@ -73,6 +84,11 @@ CI_LOCK="${CI_LOCK:-$HOME/.cache/rdna-containers/.lock}"
 KLD_MODEL="${KLD_MODEL:-/llm/models/Qwen3.5/9B/Q8_0/Qwen3.5-9B-Q8_0.gguf}"
 KLD_CTX="${KLD_CTX:-512}"
 KLD_CHUNKS="${KLD_CHUNKS:-40}"
+KLD_ALWAYS="${KLD_ALWAYS:-0}"
+
+# Paths whose change makes the prefill-logit gate relevant (AGENTS: "any change to a prefill
+# kernel ... or a default-on approximate path").
+PREFILL_RE='^(ggml/src/ggml-cuda/|ggml/src/ggml\.c|src/llama-graph\.cpp|src/models/|src/llama-kv-cache)'
 
 log() { echo "$(date -Is) $*"; }
 die() { log "ERROR: $*"; exit 1; }
@@ -120,9 +136,15 @@ else
 fi
 short="$(git rev-parse --short "$REV")"
 
-last_ok="$(cat "$STATE_DIR/last-ok" 2>/dev/null || true)"
-if [ "$REV" = "$last_ok" ] && [ "$FORCE" -eq 0 ]; then
-    log "up to date ($short already validated)"; exit 0
+# Idempotence is keyed on the delivery CONTENT (base + applied tree), not the commit: a docs or
+# benchmarks push changes origin/main but not the patch set, so it must cost nothing.  The rev is
+# recorded alongside for the summary.
+CONTENT_KEY="$(git show "$REV:release.json" | jq -r '"\(.base):\(.tree):\(.n_blocks)"')"
+last_key="$(cat "$STATE_DIR/last-ok" 2>/dev/null || true)"
+last_rev="$(cat "$STATE_DIR/last-ok-rev" 2>/dev/null || true)"
+if [ "$CONTENT_KEY" = "$last_key" ] && [ "$FORCE" -eq 0 ]; then
+    log "up to date -- delivery content $CONTENT_KEY already validated (at ${last_rev:0:7}); nothing to do"
+    exit 0
 fi
 
 fail_file="$STATE_DIR/failed-$short"
@@ -163,6 +185,19 @@ tree="$(jq -r '.tree'     release.json)"
 n_blocks="$(jq -r '.n_blocks' release.json)"
 say "release  : $(jq -r '.release' release.json)  base=$base  blocks=$n_blocks"
 
+# Keep the PREVIOUS applied chain as a ref before re-applying: `--changed-from` needs it in this
+# repo, and the tree delta old..new decides whether the prefill-logit gate is relevant.
+prev_tip=""
+prev_base=""
+if git -C "$LLAMA_REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    prev_tip="$(git -C "$LLAMA_REPO" rev-parse -q --verify refs/ci/last-applied 2>/dev/null || true)"
+    prev_base="$(cat "$STATE_DIR/last-applied-base" 2>/dev/null || true)"
+fi
+if [ -n "$prev_tip" ] && [ "$prev_base" != "$base" ]; then
+    log "note: base changed ($prev_base -> $base): full ladder, full prefill gate"
+    prev_tip=""
+fi
+
 if [ ! -d "$LLAMA_REPO/.git" ]; then
     say "clone    : $LLAMA_REPO (first run; keep ONE path -- ccache keys on it)"
     git clone --quiet "$(git -C "$REPO" remote get-url origin | sed 's|llama-cpp-rdna-boosts|llama.cpp|')" "$LLAMA_REPO" \
@@ -184,9 +219,10 @@ say "apply    : strict, tree $applied == release.json.tree"
 if [ "$SKIP_LADDER" = 1 ]; then
     say "ladder   : skipped (SKIP_LADDER=1)"
 else
-    if bash "$REPO/scripts/gate-per-block-build.sh" --repo "$LLAMA_REPO" --base "$base" --tip "$tip" \
-            --rocm "$ROCM_DIR" --gpu-target "$GPU_TARGETS" --jobs "$JOBS" --fast --keep-going \
-            >"$RUN/ladder.log" 2>&1; then
+    ladder_args=(--repo "$LLAMA_REPO" --base "$base" --tip "$tip" --rocm "$ROCM_DIR"
+                 --gpu-target "$GPU_TARGETS" --jobs "$JOBS" --fast --keep-going)
+    [ -n "$prev_tip" ] && ladder_args+=(--changed-from "$prev_tip")
+    if bash "$REPO/scripts/gate-per-block-build.sh" "${ladder_args[@]}" >"$RUN/ladder.log" 2>&1; then
         say "ladder   : $(grep -E '^==> result:' "$RUN/ladder.log" | tail -1 | sed 's/^==> result: //')"
     else
         cp "$RUN/ladder.log" "$STATE_DIR/last-ladder-fail.log"
@@ -232,7 +268,17 @@ else
         kld_args+=(--record)
         say "prefill  : no recorded base on this box -> RECORDING one now (later runs compare)"
     fi
-    if LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" bash "$REPO/scripts/gate-prefill-logits.sh" \
+    # Relevance: the prefill-logit gate only means something if the applied tree moved a prefill
+    # kernel (or the base moved, or this box has no base yet).  Otherwise skip -- it is the most
+    # expensive step (~6 min here) and a docs/coverage change does not justify it.
+    if [ -z "$prev_tip" ] || [ "$KLD_ALWAYS" = 1 ]; then
+        kld_want=1
+    else
+        delta="$(git -C "$LLAMA_REPO" diff --name-only "$prev_tip" HEAD 2>/dev/null || echo ALL)"
+        if printf '%s\n' "$delta" | grep -Eq "$PREFILL_RE"; then kld_want=1; else kld_want=0; fi
+        [ "$kld_want" = 1 ] || say "prefill  : skipped (applied tree touched no prefill path; KLD_ALWAYS=1 forces it)"
+    fi
+    if [ "$kld_want" = 1 ] && LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" bash "$REPO/scripts/gate-prefill-logits.sh" \
             "${kld_args[@]}" >"$RUN/kld.log" 2>&1; then
         say "prefill  : $(grep -E 'mean KLD|same top p' "$RUN/kld.log" | tr -s ' ' | tr '\n' ' ')"
     else
@@ -244,12 +290,16 @@ fi
 # --- 5. record --------------------------------------------------------------------------------
 # A partial run must NOT mark the rev validated: that would make the next cron pass skip a rev
 # that was never fully gated (hit during the first radiance bring-up).
-if [ "$SKIP_LADDER" = 1 ] || [ "$SKIP_OPTESTS" = 1 ] || [ "$SKIP_KLD" = 1 ]; then
-    say "RESULT   : PASS (PARTIAL -- a step was skipped, so no up-to-date marker was written)"
+if [ "$SKIP_LADDER" = 1 ] || [ "$SKIP_OPTESTS" = 1 ] || [ "$SKIP_KLD" = 1 ] || [ "${kld_want:-1}" = 0 ]; then
+    say "RESULT   : PASS (a step was skipped, so no up-to-date marker was written -- the next run resumes)"
     log "$short partially validated (summary: $SUMMARY)"
     exit 0
 fi
-echo "$REV" > "$STATE_DIR/last-ok"
+echo "$CONTENT_KEY" > "$STATE_DIR/last-ok"
+echo "$REV"        > "$STATE_DIR/last-ok-rev"
+# The next run diffs against this chain (`--changed-from` + the prefill relevance test).
+git -C "$LLAMA_REPO" update-ref refs/ci/last-applied "$tip"
+echo "$base" > "$STATE_DIR/last-applied-base"
 rm -f "$fail_file"
 ls -1d "$STATE_DIR"/runs/*/ 2>/dev/null | sort | head -n -"$KEEP_RUNS" | xargs -r rm -rf
 say "RESULT   : PASS  ($(date -Is))"
