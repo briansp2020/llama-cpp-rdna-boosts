@@ -1,5 +1,75 @@
 # WORKLOG - dated delivery records
 
+## 261025.015 (r141) -- the combine+norm fusion becomes bit-identical to its chain, and a merged-tensor GGUF can take it
+
+**Release:** `v15-6050b467c-r141` (base `6050b467c`, canonical tip `8701922e9`, tree
+`95792b8241f5d3fabff6e385c0697fc87dde83ca`, 15 blocks).  Delta against the r140 tree: **2 files, +96 / -40**,
+both in block 11 — `ggml/src/ggml-cuda/hyperconn.cu` and `src/models/qwen4exp.cpp`.  **This closes the two
+items the r140 record filed as `TODO` #107 and #108; both are removed from `TODO.md` (the numbers keep
+their meaning as historical handles).**
+
+### #107: the fused combine+norm now reduces the RMS sum in the chain's own grouping
+
+The r140 record measured the fusion 0.018523 mean KLD / 95.588 % same-top-p away from its own unfused chain
+(`GGML_CUDA_DISABLE_HC_COMB=1`), with the same gap on the pre-r138 r135 build (0.021338 / 95.882 %).  The
+cause is the **RMS partial-sum tree**, and it is the whole of the difference: `hc_combine_norm_f32` owned
+three *strided* scalar columns per lane (`col = tid + k*1024`), while the chain's `rms_norm_f32` takes its
+**vec4** path for `n_embd % 4 == 0` with 16-byte-aligned operands, where a lane owns the four columns
+`4*i .. 4*i+3` of `i = tid + k*block_size` (n_embd 2560 -> n4 640 -> `RMS_NORM_LAUNCH(1024, 1, true)`).
+Different per-lane partials -> different `block_reduce` input -> a different `scale`.  The kernel now owns
+the columns the chain's kernel owns (same `a*a + b*b + c*c + d*d` per-lane expression), and keeps the old
+layout for the shapes the chain's own dispatch also sends down its *scalar* path (`n_embd % 4 != 0`, or a
+misaligned destination / gamma).  The `single_block` variant (reachable only through
+`LLAMA_FUSED_HC_COMBINE=0` at `n_tok == 1`) keeps the old layout, documented in place.
+
+| pair (Flash-Next GSQ-IQ3_XXS, `HC_POST=0`, 4 chunks, `--kl-divergence`) | r140 | r141 |
+|---|---:|---:|
+| fused vs `GGML_CUDA_DISABLE_HC_COMB=1`, `-sm tensor` | 0.018523 / 95.588 % | **−0.000000 / 100.000 %** |
+| fused vs chain, `-sm layer -ts 59,41` | — | **0.000000 / 100.000 %** |
+
+End to end that is also a *text* result, not only a logit one: Flash-Next GSQ `-sm layer` greedy 32 tokens,
+`HC_POST=0` fused = unfused = **182 chars sha `a99ccbd97ecb`**.  PPL moves r140 -> r141 from 2.4538 (fused)
+to **2.4546** (= the chain's exact value, `-sm tensor`) and 2.4235 -> **2.4395** (`-sm layer`); the 24-chunk
+reporter command reads **2.4238** in both arms.  The default `DSV4_HC_POST` arm is unchanged at 2.4409.
+
+### #108: a merged-tensor (post-#31028) GGUF takes the fusion again
+
+On the merged layout `inject` is a *strided* view of `lo_inject` (the `hc` rows out of `n_lo + hc`), so
+`sigm->src[0]` was a VIEW and the matcher declined — merged GGUFs ran the chain unfused (the hc-wide
+`REPEAT` materialises) on `-sm layer` / `HC_POST=0`.  Two changes:
+
+* `build_hc_mix`'s merged branch emits `*inject = ggml_cont(view)` — a contiguous `[hc, nt]` copy of the
+  same rows, which `build_hc_combine` already pins.  One `CONT` of `hc x nt` f32 (8 KiB at `nt = 512`)
+  replaces the ~80 MB `REPEAT` materialisation on that path.
+* The repeat-anchored matcher no longer requires `inject` to be a `SCALE`: it takes `sigm->src[0]` and
+  requires it to be F32, contiguous, `hc*n_tok` elements, **pinned** and **`view_src == nullptr`** (a pin on
+  a view does not keep the view's root alive — that is the #226 shape in another form).  Identity op params
+  always; the SCALE folding it used to do is gone, so a *separate-tensor* GGUF is read exactly as r140 read
+  it.  `s2`/`b2` still come from the `scale2` that follows the sigmoid.
+
+**Validation.**  The merged-branch shape itself was exercised on a pre-#31028 GGUF with a temporary arm that
+emulates it exactly (pad the inject rows into a wider tensor, take the `hc` tail back through a strided
+view + `cont`, both arms of the A/B setting it): fused vs chain **−0.000000 / 100.000 %**, PPL 2.4546 =
+the unmodified arm, and `LLAMA_HC_CN_DEBUG=1` shows the windows *firing* at `n_tok = 512` (20 anchors, no
+`dispatch` decline) rather than declining.  The arm was removed before the cut.  The separate-tensor path
+re-measured after the relax: **−0.000000 / 100.000 %** (`-sm tensor`) and **0.000000 / 100.000 %**
+(`-sm layer`).  What is *not* exercised here is the merged **loader** path (`create_merged` + the converter's
+row layout) — it shipped in r138, is upstream's code, and needs a post-#31028 GGUF this fleet still does not
+have; a merged-IQ4_NL conversion was attempted this session and abandoned (the pre-#31028 GGUF carries an
+`blk.48` MTP layer the merged writer mis-handled), so the tensor surgery is recorded here as *not* a
+validated artifact.
+
+### Gates (r141, gfx1201, ROCm 10.1.0)
+
+| gate | result |
+|---|---|
+| KLD pairs above (2 shapes x the fused arm) | **bit-identical** in every arm |
+| same-seed greedy, 7 cells, r140 build vs r141 build | **identical in 6/7** (dense 4B 3-GPU `7e6229b260f6`, 27B UD-Q4_K_XL `55824e640aa0`, 35B-A3B `-ncmoe 24` default/forced-decline/arena `db927eb17f9f`, Flash-Next GSQ `-sm tensor` `8c39335bbceb`); the 7th is the chain arm this release makes bit-identical (`a99ccbd97ecb`, = its own unfused chain) |
+| `gate-prefill-logits.sh` (27B Q8_0, 40 chunks) | **PASS**, mean KLD **0.000531**, same-top-p **98.863 %** — unchanged from the recorded base |
+| `test-backend-ops -o HC_COMBINE,HC_MIX,DSV4_HC_PRE,DSV4_HC_POST,DSV4_HC_COMB` | **88/88** |
+| `scripts/validate-set.sh` | green: checksums OK, fresh-tarball **strict 15/15** `git am`, applied tree == `release.json.tree` |
+| `scripts/gate-per-block-build.sh --changed-from b8c382bbf --fast` | **2/2 built, 0 failed** |
+
 ## 261025.014 (r140) -- issue #226: the combine+norm fusion reads the tensor the model pins, superseding the staged r139
 
 **Release:** `v15-6050b467c-r140` (base `6050b467c`, canonical tip `b8c382bbf`, tree

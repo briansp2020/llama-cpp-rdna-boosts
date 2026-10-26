@@ -1,13 +1,13 @@
 {
-  "release": "v15-6050b467c-r140",
+  "release": "v15-6050b467c-r141",
   "base": "6050b467c",
   "base_tree": "cb3251e17731887f7d17dade0676ddef50bc27e7",
   "n_blocks": 15,
-  "tip": "b8c382bbf",
-  "tree": "446e33f7ceea45c92bf306b7dc1388aef3771df0",
+  "tip": "8701922e9",
+  "tree": "95792b8241f5d3fabff6e385c0697fc87dde83ca",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "468650fe8c10a30b39abd0535693e9300c0df39e14c2810cd154eb823af7247e"
+    "sha256": "4a3caddaf0f63842186209b887260c2d6b11967a9ab2ecb4d7fd6df9c93853b0"
   },
   "patches": {
     "0000-rdna-boosts-block-00-foundation-band-uniformity-Meta.patch": "d0007656b4401998841e16c7a1e8373f8c8b962e0f3157bd612b6e35ccccae97",
@@ -21,9 +21,9 @@
     "0008-rdna-boosts-block-08-fused-kernels-old-08-fusions-ol.patch": "2e77c9ec1cb3dac4934ec87a74e9b51408ee2ae4b8680c40e00ad2d52d8c1055",
     "0009-rdna-boosts-block-09-host-resident-MoE-iface-schedul.patch": "777909b9c8dea4585704296b6cd520af4cad628916f133dcad18b8bd063566f0",
     "0010-rdna-boosts-block-10-slab-fusion-dispatcher-async-in.patch": "25409c63523b8d837635aad789c94fd0dcdad2968db95665a276aa2b37cf80b8",
-    "0011-rdna-boosts-block-11-qwen4exp-model-hyper-connection.patch": "5e0cd7b1c65753030ef3d05c05b2d11a51897fa50a801934c6817700b0aa238c",
-    "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "a89e2cbcba0932bfd6b5c84e3eca53ab40bd49872b751c5a1acb00b131394141",
-    "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "4a5fbefd71e22b6f6b8f972371abd678350a4e063d93db02470aa4aa533744e8",
-    "0014-rdna-boosts-block-14-relaxed-tensor-split-mode-TEMPO.patch": "a2384546a3d97a0e23cfecfd69dd7be1c750b8ea734b031f87fb2f5e1ce26bbe"
+    "0011-rdna-boosts-block-11-qwen4exp-model-hyper-connection.patch": "0462ff3fed01198080448560048e8872a15d62577c67d1e4c92d3acd59a7625e",
+    "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "29d22fd7ff38d99d363d75f4cd5dab7847ae7898ecc6bbacffda6b440031019c",
+    "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "a6607e2b084e8997e2a39ba7e0692dfad5a7b44e4e3cf9aaf7d0ec0583f9d0c1",
+    "0014-rdna-boosts-block-14-relaxed-tensor-split-mode-TEMPO.patch": "98dc07b20567802d1ad1b66e2b34286fef134696b0c8917d126866c01185c4e1"
   }
 }

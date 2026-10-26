@@ -754,7 +754,14 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `GGML_TENSOR_FLAG_OUTPUT`.  The **scale1-anchored A-chain** matcher is deliberately different: its window
   starts *at* `scale1`, so that node is elided and `scale1->src[0]` is the live read — do not unify the two.
   A new emitter that hands a `SCALE` to such a matcher must pin the tensor the matcher reads, or lose the
-  fusion.  `GREEDY-PURITY.md` §59; record `WORKLOG.md` 261025.014.
+  fusion.  **r141 closes the two halves r140 left open:** the fused kernel now owns the same columns in the
+  RMS sum as `rms_norm_f32`'s vec4 path (it was 0.0185 KLD / 95.6 % away from its own chain, now
+  `0.000000 / 100.000 %`, and the fused arm's greedy text is byte-identical to
+  `GGML_CUDA_DISABLE_HC_COMB=1`), and a **merged-tensor** (post-#31028) GGUF takes the fusion again because
+  `build_hc_mix` materialises the inject slice with `ggml_cont` and the matcher accepts a pinned
+  `view_src == nullptr` tensor instead of requiring a `SCALE` (a pin on a *view* does not keep the root
+  alive — test that any new inject shape satisfies it).  `GREEDY-PURITY.md` §59; records `WORKLOG.md`
+  261025.014 / 261025.015.
 - **qwen4exp's `hc_*_down`/`hc_*_inject` pairs are ONE tensor since r138 (upstream #31028).**
   `create_merged(LLM_TENSOR_HC_{ATTN,FFN}_DOWN_INJECT, …)` accepts the converter's merged weight and
   `build_hc_mix(…, w_down_inject, …)` does **one** GEMM for both products; the old separate tensors are

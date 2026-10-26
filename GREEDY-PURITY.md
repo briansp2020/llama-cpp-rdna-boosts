@@ -120,7 +120,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§56** | a per-arch dispatch decision keys on the running device, and the pass that consults it selects its own | fix (r132, PR #218) |
 | **§57** | parking the idle slots restores the save-and-clear attention range for a request that runs alone | doctrine (r136, PR #225) |
 | **§58** | a per-device scalar is sound only if its inverse is applied to that device's own partial *before* the reduction — a mode, not a default | doctrine, temporary (r137, block 14; `TODO` #104) |
-| **§59** | a fused window must read a tensor the graph keeps alive for it — the one the emitter pins — never an unpinned ancestor whose last graph use runs *before* the window | fix (r140, issue #226) |
+| **§59** | a fused window must read a tensor the graph keeps alive for it — the one the emitter pins — never an unpinned ancestor whose last graph use runs *before* the window; and a fusion of a norm must reduce in the *same grouping* as the kernel it replaces, or it is only approximately that kernel | fix (r140 + r141, issue #226) |
 
 ---
 
@@ -1614,10 +1614,34 @@ A-chain** matcher anchors *at* `scale1`, so that node is elided and `scale1->src
 window (and `add`/`mulg`, the only writers, are alias-checked).  Descending is correct there and wrong in
 the repeat-anchored one; both are documented in place so a future "simplification" cannot unify them.
 
-**Evidence (r140, gfx1201, ROCm 10.1.0).**  Qwen3.8-Flash-Next GSQ-RCO-IQ3_XXS (the reporter's pre-#31028
-GGUF), `HC_POST=0`: r139 PPL **2690.39** (chunks 1711.7 / 2932.5 / 3267.4 / 2690.4) -> r140 **2.4538**, the
-default `DSV4_HC_POST` arm unchanged at 2.4409; the 24-chunk run gives **2.4159** against the reporter's
-validated pin (2.4209) and r137 (2.4202); the fix is **bit-identical to that pin's patch on 24/24 chunk
-PPLs**.  `-sm layer -ts 59,41` 2.4850 / 3.7629 / 2.9181 / 2.4235 (their broken arm: 1781.5 / 3135.2).
-6/7 coherence cells byte-identical between the r139 and r140 builds (the 7th is the arm the fix changes).
-Record: `WORKLOG.md` 261025.014, `patches/README.md` (block 11).
+**Second half of the rule: reduce like the kernel you replace (r141).**  Reading the right tensor is not
+enough — the fused combine also *computes the RMS norm*, and a norm's result depends on the summation
+grouping.  `hc_combine_norm_f32` owned three strided scalar columns per lane, while `rms_norm_f32`'s **vec4**
+path (taken for `n_embd % 4 == 0` with aligned operands) gives a lane the four columns `4*i .. 4*i+3` and
+sums them as one `a*a + b*b + c*c + d*d`.  Different partials -> a different `block_reduce` input -> a
+different `scale`.  Measured on Flash-Next GSQ against the unfused chain: **0.018523** mean KLD / 95.588 %
+same-top-p (and 0.021338 / 95.882 % on the pre-r138 r135 build, so it had always been there), which is
+outside this rulebook's 0.005 / 98 % limits even though PPL agreed to 4 dp.  With the kernel owning the
+chain's columns: **−0.000000 / 100.000 %** on `-sm tensor` and **0.000000 / 100.000 %** on
+`-sm layer -ts 59,41`, and the *greedy text* of the fused arm is byte-identical to
+`GGML_CUDA_DISABLE_HC_COMB=1` (182 chars sha `a99ccbd97ecb`).  Ruled out on the way (all measured, all
+unchanged): `GGML_CUDA_MMB=0`, `GGML_CUDA_BF16_SRC1_CACHE=0` (so not the BF16 src1 cache write) and
+`LLAMA_HC_PIN_BLOCK_OUT=1` (so not the `block_out` pool copy); the harness control (chain vs chain with the
+*other* hc fusion disabled) is exactly 0.000000 / 100.000 %.
+
+**Corollary — the pin is per tensor object (r141).**  A pin on a *view* does not keep the view's root alive,
+so the repeat-anchored matcher now requires `inject->view_src == nullptr` as well as the pin.  That is what
+lets a **merged-tensor** (post-#31028) GGUF take the fusion: its `inject` is a strided view of the merged
+GEMM, so `build_hc_mix` materialises it with `ggml_cont` (a plain row copy) and `build_hc_combine` pins the
+result.  The matcher no longer requires `inject` to be a `SCALE` at all — it reads `sigm->src[0]` with
+identity op params, which is what a separate-tensor GGUF hands it too (the r140 shape).
+
+**Evidence (r140 + r141, gfx1201, ROCm 10.1.0).**  Qwen3.8-Flash-Next GSQ-RCO-IQ3_XXS (the reporter's
+pre-#31028 GGUF), `HC_POST=0`: r139 PPL **2690.39** (chunks 1711.7 / 2932.5 / 3267.4 / 2690.4) -> r140
+**2.4538** -> r141 **2.4546** (= the chain's exact value); the default `DSV4_HC_POST` arm is 2.4409
+throughout; the 24-chunk run gives **2.4159** (r140) / **2.4238** (r141, both arms) against the reporter's
+validated pin (2.4209) and r137 (2.4202); the r140 fix was **bit-identical to that pin's patch on 24/24
+chunk PPLs**.  `-sm layer -ts 59,41`: 2.4850 / 3.7629 / 2.9181 / 2.4235 (r140) and 2.4395 fused == chain
+(r141); their broken arm was 1781.5 / 3135.2.  6/7 coherence cells byte-identical across the r139, r140 and
+r141 builds, the 7th being the chain arm each release changes.
+Record: `WORKLOG.md` 261025.014 and 261025.015, `patches/README.md` (block 11).
