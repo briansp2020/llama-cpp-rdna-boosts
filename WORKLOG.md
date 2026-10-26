@@ -1,5 +1,111 @@
 # WORKLOG - dated delivery records
 
+## 261025.014 (r140) -- issue #226: the combine+norm fusion reads the tensor the model pins, superseding the staged r139
+
+**Release:** `v15-6050b467c-r140` (base `6050b467c`, canonical tip `b8c382bbf`, tree
+`446e33f7ceea45c92bf306b7dc1388aef3771df0`, 15 blocks).  This is **r139 + one file**: the r139 tree was
+staged, validated and never tagged (`WORKLOG.md` 261025.013), so this release carries both fixes.  The
+delta against the r139 tree is **1 file, +33 / -9**, all of it in
+`ggml/src/ggml-cuda/hyperconn.cu` (block 11): no kernel, no dispatch order, no default and no allocation
+size changed.
+
+### The bug: a fused window read a tensor whose last graph use precedes the window
+
+Reported by briansp2020 (issue #226) against r138: with `LLAMA_FUSED_DSV4_HC_POST=0` on a **pre-#31028**
+(`hc_attn_down` + `hc_attn_inject` as separate tensors) Qwen3.8-Flash-Next GGUF, perplexity was wrong by
+three orders of magnitude (their chunks 1730/3040/3412/2751, final ~3438, against 2.4131 for the default
+arm).  r137 was fine; `GGML_CUDA_DISABLE_HC_COMB=1` was fine; a one-line `ggml_set_output(inject->src[0])`
+was fine.
+
+The r138 semantic merge of upstream #31028 moved the `1/hc` inject scale out of `build_hc_combine` into
+`build_hc_mix`, so on the separate-tensor path the tensor handed to `build_hc_combine` as `inject` became
+a `GGML_OP_SCALE` node.  The repeat-anchored `hc_combine_norm` matcher then read `inject = scale1->src[0]`
+— the raw GEMM output.  The fused window starts **at the REPEAT**, so `scale1`, the SIGMOID and the second
+SCALE all run standalone *before* it, and the allocator reuses the buffer of the GEMM output (its last
+graph use is `scale1`) for exactly the SIGMOID/SCALE of the same chain.  The fused kernel then read the
+sigmoid output as `inject` and applied the whole chain to it a second time.  `build_hc_combine` pins
+`inject` (`ggml_set_output`) for precisely this reason, and pre-r138 `inject` *was* the raw GEMM output, so
+the pin and the read had drifted one node apart.  A merged-tensor (post-#31028) GGUF never fired the
+matcher at all (`sigm->src[0]` is a strided VIEW, not a SCALE), which is why only that GGUF class broke.
+
+### The fix: read the pinned tensor, with identity op params, and require the pin
+
+`inject = scale1` (which the model pins and which is therefore materialized), with `s1 = 1`, `b1 = 0`
+instead of descending to `scale1->src[0]`.  That is bit-identical by construction (`hc_mul_rn(1,x) = x`,
+`hc_add_rn(x,0) = x`, and the SCALE kernel already stored `s1*x + b1`), and `w_ok` now requires
+`inject->flags & GGML_TENSOR_FLAG_OUTPUT` — an unpinned emitter loses the fusion (correct, just unfused)
+rather than reading a recycled buffer.  The **scale1-anchored A-chain** matcher is deliberately unchanged:
+its window starts *at* `scale1`, so that node is elided and `scale1->src[0]` is genuinely live there (the
+only window writers, `add` and `mulg`, are already alias-checked).  The alias diagnostics now name the
+individual terms (`ov[add:inj=… mulg:…]`) so a declined window is not silent.
+
+The same change is in the report as an acceptable alternative; we took it rather than pinning a second
+tensor.  **Equivalence with the reporter's own patch: 24/24 chunk PPLs identical to every printed digit**
+(2.4928 / 3.7799 / 2.9349 / 2.4538 / … / 2.4159).
+
+### Reproduction and the numbers
+
+2x R9700 (gfx1201, ROCm 10.1.0), Qwen3.8-Flash-Next **GSQ-RCO-IQ3_XXS** (the reporter's own GGUF class:
+separate `hc_*_down`/`hc_*_inject`), `-ctk q8_0 -ctv q8_0 -fa on -t 8`, `ROCBLAS_USE_HIPBLASLT=0`:
+
+| arm (4 chunks, `-c 512 -ub 512 -sm tensor --n-cpu-moe 0 -ot per_layer_token_embd.*=CPU`) | chunks | final |
+|---|---|---:|
+| r139, default (`DSV4_HC_POST` op) | 2.4661 / 3.7320 / 2.9158 / 2.4409 | 2.4409 |
+| r139 + `LLAMA_FUSED_DSV4_HC_POST=0` (the chain) | **1711.7 / 2932.5 / 3267.4 / 2690.4** | **2690.39** |
+| r140, default | 2.4661 / 3.7320 / 2.9158 / 2.4409 | **2.4409** (identical) |
+| r140, `HC_POST=0` | 2.4928 / 3.7799 / 2.9349 / 2.4538 | **2.4538** |
+| r140, `HC_POST=0`, 24 chunks (the reporter's command) | — | **2.4159** (their pin 2.4209, r137 2.4202) |
+| r140, `HC_POST=0`, `-sm layer -ts 59,41` | 2.4850 / 3.7629 / 2.9181 / 2.4235 | 2.4235 (theirs broken: 1781.5 / 3135.2) |
+
+`LLAMA_HC_CN_DEBUG=1` shows the window firing for `n_tok = 512` and names the decline reason for
+`n_tok = 256` (`mulg` overlaps `add` and `res` — pre-existing, unfused and correct).
+
+### Pre-existing, NOT caused by this fix: the fused combine+norm is not logit-identical to the chain
+
+Measured while validating (same GGUF, `HC_POST=0`, `--kl-divergence` against a base recorded from the
+unfused chain, 4 chunks):
+
+| pair | mean KLD | same top p |
+|---|---:|---:|
+| r140 fused vs r140 chain (`GGML_CUDA_DISABLE_HC_COMB=1`) | **0.018523** | 95.588 % |
+| r140 fused vs chain, `GGML_CUDA_MMB=0` | 0.019986 | 95.882 % |
+| r140 fused vs chain, `GGML_CUDA_BF16_SRC1_CACHE=0` | 0.018523 | 95.588 % |
+| **r135** (pre-r138) fused vs chain | **0.021338** | 95.882 % |
+| r140 chain vs chain + `GGML_CUDA_DISABLE_HC_MIX=1` (harness sensitivity control) | −0.000000 | 100.000 % |
+
+The fusion has always differed from its unfused chain at that level (r135 shows the same number), so it
+is **not** a regression from r138/r139/r140 and not a stale-buffer read: it is a small, broad per-token
+difference (median KLD 0.0014, 90th percentile 0.044) of the same order as the r29 BF16 chunked-GDN arm
+that was once flipped off.  Every elementwise expression in the fused kernel is RN-identical to the
+separate kernel it replaces, so the remaining candidate is the grouped RMS reduction's summation order
+(`rms_norm_f32` runs the vec4 path with one `float4` per lane; the fused kernel sums three strided scalars
+per lane), which should be ~1e-6 on `scale` and does not explain the magnitude — so the cause is **open**
+and tracked as `TODO` #106.  It affects the chain path only (`-sm layer`, or `HC_POST=0`); the default
+`-sm tensor` arm uses the `DSV4_HC_POST` op and is unchanged.  `TODO` #107 records the companion finding
+that a **merged-tensor** (post-#31028) GGUF never takes this fusion at all.
+
+### Gates (r140, gfx1201, ROCm 10.1.0)
+
+| gate | result |
+|---|---|
+| same-seed greedy, 7 cells, r139 build vs r140 build (r140 = the r139 chain + this file) | **identical in 6/7**: dense 4B Q8_0 3 GPU `-sm tensor` `7e6229b260f6` (= the recorded r138/r139 hash), 27B UD-Q4_K_XL 2 GPU `55824e640aa0`, 35B-A3B UD-Q4_K_M `-ncmoe 24` `db927eb17f9f` (default, forced slab decline and live arena), Flash-Next GSQ `-sm tensor` `8c39335bbceb`. The 7th is the arm the fix changes: Flash-Next GSQ `-sm layer` (chain) `de61b9b1bed7` vs r139 `e782663bfcde` — r139's chain prefill is the broken one |
+| the reporter's equivalence arm (their one-line pin, old matcher) | 24/24 chunk PPLs identical |
+| prefill-logit gate (`scripts/gate-prefill-logits.sh`, 27B Q8_0, 40 chunks) | **PASS**, mean KLD **0.000531**, same-top-p **98.863 %** — unchanged from the recorded base |
+| `scripts/validate-set.sh` | green: checksums OK, fresh-tarball **strict 15/15** `git am`, applied tree == `release.json.tree` |
+| `scripts/gate-per-block-build.sh --changed-from a45d6acc0 --fast` | **2/2 built, 0 failed** (block 11 347 s, tip 11 s) |
+| `test-backend-ops -o HC_COMBINE,HC_MIX,DSV4_HC_PRE,DSV4_HC_POST,DSV4_HC_COMB` | **88/88** |
+
+### Also in this pass
+
+* `AGENTS.md`'s PCIe bullet said every R9700 sits behind an **x4** host link.  On this box two cards are
+  now **x8** (`00:01.1` root port + `01:00.0` switch uplink, `00:01.3` + `07:00.0`) and only the third is
+  x4 (`00:01.2` + `04:00.0`) — a heterogeneous multi-GPU prefill measurement, so the bullet now records both
+  and says which device index is which.
+* The `HC_CN[repeat] dispatch` debug line prints the individual alias terms; a declined window is now
+  attributable instead of silent.
+* HC op oracles re-run at the tip (88/88); no oracle covers a *backend-side* combine+norm fusion, which is
+  why the PPL/KLD pair above is the evidence for this fix.
+
 ## 261025.013 (r139) -- issue #214: the compute-buffer chunk no longer applies to a declined slab, and the r138 depth sweep
 
 **Release:** `v15-6050b467c-r139` (base `6050b467c`, canonical tip `fb6e02034`, tree

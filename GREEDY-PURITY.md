@@ -120,6 +120,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§56** | a per-arch dispatch decision keys on the running device, and the pass that consults it selects its own | fix (r132, PR #218) |
 | **§57** | parking the idle slots restores the save-and-clear attention range for a request that runs alone | doctrine (r136, PR #225) |
 | **§58** | a per-device scalar is sound only if its inverse is applied to that device's own partial *before* the reduction — a mode, not a default | doctrine, temporary (r137, block 14; `TODO` #104) |
+| **§59** | a fused window must read a tensor the graph keeps alive for it — the one the emitter pins — never an unpinned ancestor whose last graph use runs *before* the window | fix (r140, issue #226) |
 
 ---
 
@@ -1583,3 +1584,40 @@ the text still matches `-sm layer` exactly.  Qwen3.5-4B (no amax node) is byte-i
 `relaxed-tensor`.  `scripts/check-gpu-faults.sh` clean.
 
 Record: `patches/README.md` (block 14), `WORKLOG.md` 261025.007, `TODO` #104.
+
+## 59. A fused window reads a tensor the graph keeps alive for it, never an unpinned ancestor
+
+A backend-side fusion is invisible to the graph allocator: the allocator frees a tensor after its *last
+graph use*, which for a fused window can be a node the fusion then skips or a node that runs *before* the
+window.  So "the fused kernel reads tensor X later than the allocator thinks X dies" is only sound when X
+is guaranteed to stay live, and the only such guarantee in a ggml graph is `GGML_TENSOR_FLAG_OUTPUT`
+(`ggml-alloc` never recycles a pinned tensor) or a tensor the window itself writes (which the alias checks
+cover).
+
+The qwen4exp combine+norm matcher violated that in r138 (issue #226).  The repeat-anchored window starts at
+the `REPEAT`, so the chain's `scale1 -> sigmoid -> scale2` nodes all run standalone **before** it.  The
+matcher read `inject = scale1->src[0]` — the raw GEMM output — whose last graph use is `scale1`, so the
+allocator handed its buffer to the chain's own SIGMOID, and the fused kernel applied the whole scale chain
+to a sigmoid output.  r138's #31028 merge had made `inject` a `SCALE` node (the `1/hc` moved into
+`build_hc_mix`), which is what put a node between the pinned tensor and the read; a `ggml_set_output` on
+the *handed* tensor was still there, one node too late.
+
+**Rule.**  Read the tensor the emitter pins, with **identity** op params if the pinned tensor is the output
+of a chain the matcher would otherwise fold (here: `inject = scale1`, `s1 = 1`, `b1 = 0` — bit-identical,
+because the SCALE kernel already stored `s1*x + b1` and `hc_mul_rn(1,x) = x`, `hc_add_rn(x,0) = x`), and
+**require the pin** (`flags & GGML_TENSOR_FLAG_OUTPUT`): an unpinned emitter must lose the fusion, not read
+a recycled buffer.  An emitter that hands a `SCALE` to such a matcher is the shape that breaks — a new one
+must either pin the tensor the matcher reads or not fuse at all.
+
+The companion case is the reason the rule is stated per-matcher rather than globally: the **scale1-anchored
+A-chain** matcher anchors *at* `scale1`, so that node is elided and `scale1->src[0]` really is live at the
+window (and `add`/`mulg`, the only writers, are alias-checked).  Descending is correct there and wrong in
+the repeat-anchored one; both are documented in place so a future "simplification" cannot unify them.
+
+**Evidence (r140, gfx1201, ROCm 10.1.0).**  Qwen3.8-Flash-Next GSQ-RCO-IQ3_XXS (the reporter's pre-#31028
+GGUF), `HC_POST=0`: r139 PPL **2690.39** (chunks 1711.7 / 2932.5 / 3267.4 / 2690.4) -> r140 **2.4538**, the
+default `DSV4_HC_POST` arm unchanged at 2.4409; the 24-chunk run gives **2.4159** against the reporter's
+validated pin (2.4209) and r137 (2.4202); the fix is **bit-identical to that pin's patch on 24/24 chunk
+PPLs**.  `-sm layer -ts 59,41` 2.4850 / 3.7629 / 2.9181 / 2.4235 (their broken arm: 1781.5 / 3135.2).
+6/7 coherence cells byte-identical between the r139 and r140 builds (the 7th is the arm the fix changes).
+Record: `WORKLOG.md` 261025.014, `patches/README.md` (block 11).

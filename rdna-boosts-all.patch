@@ -38115,10 +38115,10 @@ index 000000000..457eb3e55
 +int  ggml_cuda_hc_combine_mix_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
 new file mode 100644
-index 000000000..73b286212
+index 000000000..85a3953eb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/hyperconn.cu
-@@ -0,0 +1,1119 @@
+@@ -0,0 +1,1143 @@
 +#include "hyperconn.cuh"
 +#include "ggml-backend-impl.h"
 +#include "mmb.cuh"
@@ -38867,7 +38867,18 @@ index 000000000..73b286212
 +                                // chain: scale1(inject) -> sigmoid -> scale2  (scale2 is the w root)
 +                                const ggml_tensor * sigm  = scale2 != nullptr ? scale2->src[0] : nullptr;
 +                                const ggml_tensor * scale1 = sigm   != nullptr ? sigm->src[0]   : nullptr;
-+                                const ggml_tensor * inject = scale1 != nullptr ? scale1->src[0] : nullptr;
++                                // The window starts AT the repeat, so scale1 runs standalone before it and its
++                                // output is materialized: read THAT with identity op params (s1 = 1, b1 = 0),
++                                // which is bit-identical to applying scale1's params to its input.
++                                // NEVER descend to scale1->src[0] (issue #226): that tensor's last graph use is
++                                // scale1, which runs BEFORE the window, so the allocator hands its buffer to the
++                                // SIGMOID and SCALE of this same chain -- both also before the window -- and the
++                                // fused kernel reads them instead of inject.  Reading a materialized tensor is
++                                // only safe while the graph keeps it alive, which the emitter guarantees by
++                                // pinning it (`ggml_set_output(inject)`); w_ok requires that pin.
++                                // (The scale1-anchored A-chain below elides scale1 itself, so it must keep
++                                // reading scale1->src[0] -- there scale1 IS in the window and writes nothing.)
++                                const ggml_tensor * inject = scale1;
 +                                const ggml_tensor * res = add->src[0] == mul ? add->src[1] : add->src[0];
 +                                const ggml_tensor * gamma = nullptr;
 +                                if (root_of(mulg->src[0]) == (const ggml_tensor *) rms) {
@@ -38878,7 +38889,8 @@ index 000000000..73b286212
 +                                const bool w_ok = w != nullptr && scale2 != nullptr && scale1 != nullptr && sigm != nullptr &&
 +                                    scale2->op == GGML_OP_SCALE && scale1->op == GGML_OP_SCALE &&
 +                                    sigm->op == GGML_OP_UNARY && ggml_get_unary_op(sigm) == GGML_UNARY_OP_SIGMOID &&
-+                                    sigm->src[0] == scale1 && scale1->src[0] == inject &&
++                                    sigm->src[0] == scale1 && inject != nullptr &&
++                                    (inject->flags & GGML_TENSOR_FLAG_OUTPUT) &&
 +                                    w->type == GGML_TYPE_F32 && w->ne[0] == 1 && w->ne[1] == hc &&
 +                                    ggml_nelements(w) == hc * n_tok && ggml_is_contiguous(w);
 +                                const bool b_ok = base_root->ne[0] == n_embd && ggml_is_contiguous(base_root) &&
@@ -38917,8 +38929,9 @@ index 000000000..73b286212
 +                                    args.gamma        = gamma;
 +                                    args.out_res      = (ggml_tensor *) add;
 +                                    args.out_xn       = (ggml_tensor *) mulg;
-+                                    args.s1           = ggml_get_op_params_f32(scale1, 0);
-+                                    args.b1           = ggml_get_op_params_f32(scale1, 1);
++                                    // inject IS scale1's output (see above): identity, never its op params
++                                    args.s1           = 1.0f;
++                                    args.b1           = 0.0f;
 +                                    args.s2           = ggml_get_op_params_f32(scale2, 0);
 +                                    args.b2           = ggml_get_op_params_f32(scale2, 1);
 +                                    memcpy(&args.eps, rms->op_params, sizeof(float));
@@ -38928,9 +38941,18 @@ index 000000000..73b286212
 +                                        return p0 < q1 && q0 < p1;
 +                                    };
 +                                    const bool res_inplace = res->data == add->data && ggml_are_same_layout(res, add);
-+                                    const bool alias_ok_but_base = !overlap(add, inject) && (res_inplace || !overlap(add, res)) &&
-+                                        !overlap(mulg, inject) && !overlap(mulg, res) && !overlap(mulg, add) &&
-+                                        !overlap(add, gamma) && !overlap(mulg, gamma);
++                                    // each alias term is kept separately so the debug line can name the one that
++                                    // declined the window (a silent fallback is the difference between "the fusion
++                                    // is not worth it" and "the fusion never fires on this graph")
++                                    const bool ov_add_inj  = overlap(add, inject);
++                                    const bool ov_add_res  = !res_inplace && overlap(add, res);
++                                    const bool ov_mulg_inj = overlap(mulg, inject);
++                                    const bool ov_mulg_res = overlap(mulg, res);
++                                    const bool ov_mulg_add = overlap(mulg, add);
++                                    const bool ov_gam_add  = overlap(add, gamma);
++                                    const bool ov_gam_mulg = overlap(mulg, gamma);
++                                    const bool alias_ok_but_base = !ov_add_inj && !ov_add_res &&
++                                        !ov_mulg_inj && !ov_mulg_res && !ov_mulg_add && !ov_gam_add && !ov_gam_mulg;
 +                                    bool alias_ok = alias_ok_but_base && !overlap(add, base_root) && !overlap(mulg, base_root);
 +                                    // block_out is not pinned: it dies at the repeat, so add or mulg may reuse its buffer.
 +                                    // Nothing in the window runs before the fused kernel, so the base is still intact here:
@@ -38966,9 +38988,11 @@ index 000000000..73b286212
 +                                    const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
 +                                    if (!(alias_ok && supp && canf) && hc_cn_dbg) {
 +                                        static unsigned d2 = 0;
-+                                        if (d2++ < 24) fprintf(stderr, "HC_CN[repeat] dispatch alias=%d supp=%d canf=%d n_tok=%lld hc=%lld %s\n",
++                                        if (d2++ < 24) fprintf(stderr, "HC_CN[repeat] dispatch alias=%d supp=%d canf=%d n_tok=%lld hc=%lld"
++                                            " ov[add:inj=%d res=%d gam=%d mulg:inj=%d res=%d add=%d gam=%d]\n",
 +                                            (int) alias_ok, (int) supp, (int) canf, (long long) n_tok, (long long) hc,
-+                                            ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2) ? "" : "(canf)");
++                                            (int) ov_add_inj, (int) ov_add_res, (int) ov_gam_add,
++                                            (int) ov_mulg_inj, (int) ov_mulg_res, (int) ov_mulg_add, (int) ov_gam_mulg);
 +                                    }
 +                                    if (alias_ok && supp && canf) {
 +                                        ggml_cuda_hc_combine_norm_set_bf16(ctx, args);

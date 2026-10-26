@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r138`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r140`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -47,7 +47,7 @@ only as a rough shape.
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying) | +14911 / −524 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
-| 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache | +11776 / −433 | 46 |
+| 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140: the combine+norm fusion reads the pinned inject, issue #226) | +11899 / −426 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency) | +3223 / −747 | 38 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
@@ -1112,6 +1112,15 @@ slab/dispatcher/ring code of its own beyond the arms implemented in its own TUs.
   `hc_combine_mix` / `hc_mix` / `hc_combine_norm` / `hc_gate_mix` fusion arms, the HC16 planar layout, and
   the graph-optimizer passes they need (the `LLAMA_HC_BLK16` / `LLAMA_HC_RES16` BF16-stream marks and
   their alloc deps — default OFF; the MMB side that consumes the marks is block 10).
+  **The `hc_combine_norm` matcher reads the tensor the model pins (r140, issue #226).**  The repeat-anchored
+  window starts at the `REPEAT`, so `scale1 -> sigmoid -> scale2` run standalone before it; the matcher
+  therefore takes `inject = scale1` — the node `build_hc_combine` pins with `ggml_set_output(inject)` — with
+  identity op params (`s1 = 1`, `b1 = 0`) and **requires** `GGML_TENSOR_FLAG_OUTPUT`.  It must not descend
+  to `scale1->src[0]`: that tensor's last graph use is `scale1`, so the allocator hands its buffer to the
+  chain's own SIGMOID, and r138's #31028 merge (which made `inject` a `SCALE`) did exactly that on a
+  pre-#31028 separate-tensor GGUF — PPL 2690 instead of 2.45.  The separate **scale1-anchored A-chain**
+  matcher keeps `scale1->src[0]` on purpose (its window starts *at* `scale1`, which is elided, so the read
+  is live and `add`/`mulg` are already alias-checked).  `GREEDY-PURITY.md` §59.
 * **The managed lazy reader** (`src/llama-lazy-reader.{cpp,h}`) and the loader's `managed_budget`
   (`LLAMA_LAZY_BUF_MB`, `TENSOR_SKIP_MANAGED`, `lazy_read::add_range`): a fixed-size host arena over the
   PLE n-gram table, clock-LRU, read on demand.  **Off by default** (it measured slower than both the mmap

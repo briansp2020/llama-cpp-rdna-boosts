@@ -1,4 +1,4 @@
-From 515bf6a7ec07816d44f5237dc2c39104c36f2efc Mon Sep 17 00:00:00 2001
+From 0b0e3735ac2904db8f253388c1b3ecdfb6267361 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/14] rdna-boosts: block 10: slab, fusion dispatcher, async
