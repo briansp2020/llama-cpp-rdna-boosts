@@ -56,10 +56,14 @@ greedy cells byte-identical** (Flash-Next GSQ plain `487888b20ddb` and GSQ + `dr
 
 **`gemma-4-E4B-it-Q8_0` with `-sm tensor` on 3 devices aborts** --
 `ggml-backend-meta.cpp:1663: GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
-== sum * tensor->ne[split_state.axis])` (a split-state ratio inconsistency, i.e. some tensor's 3-way split
-cannot be expressed).  1 and 2 devices work; the **r137 build aborts identically**, so it is not a re-base
-regression either.  Reported here rather than filed: nobody runs an 8 GiB model on 3 cards, and the fix is
-a Meta-backend split-state change of its own.
+== sum * tensor->ne[split_state.axis])`.  1 and 2 devices work; the **r137 build aborts identically**, so it
+is not a re-base regression.  The first failing node is `FLASH_ATTN_EXT ne=[256,8,2,1]` (head-dim 256, 8
+heads, so the *result* is split on the head axis 1) whose `cache_k` view arrives split on the **cache-length**
+axis with 2 used rows over 3 devices (`[1,1,0]`), i.e. the head split and the KV split cannot both be
+expressed.  **Maintainer's decision: known, not important** -- E4B is an 8 GiB model and 2-GPU tensor
+(`-sm tensor` on any two cards, or `-sm layer`) is the right shape for it; `-sm relaxed-tensor` would not
+help either, because block 14 relaxes a *value* (the MoE amax row max), not a split-ratio inconsistency, and
+the mode runs the same Meta wrapper and the same FA split derivation.  Not filed.
 
 **Second pre-existing finding, also not this change:** on the **same box, Flash-Next GSQ, 2 GPUs (`0,2`),
 `-sm layer -ts 59,41 -ncmoe 24`**, the process **SIGSEGVs at the end of the run** (the bench result is
