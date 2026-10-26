@@ -278,19 +278,21 @@ else
         if printf '%s\n' "$delta" | grep -Eq "$PREFILL_RE"; then kld_want=1; else kld_want=0; fi
         [ "$kld_want" = 1 ] || say "prefill  : skipped (applied tree touched no prefill path; KLD_ALWAYS=1 forces it)"
     fi
-    if [ "$kld_want" = 1 ] && LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" bash "$REPO/scripts/gate-prefill-logits.sh" \
-            "${kld_args[@]}" >"$RUN/kld.log" 2>&1; then
-        say "prefill  : $(grep -E 'mean KLD|same top p' "$RUN/kld.log" | tr -s ' ' | tr '\n' ' ')"
-    else
-        cp "$RUN/kld.log" "$STATE_DIR/last-kld-fail.log"
-        fail "prefill-logit gate (log: $RUN/kld.log)"
+    if [ "$kld_want" = 1 ]; then
+        if LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" bash "$REPO/scripts/gate-prefill-logits.sh" \
+                "${kld_args[@]}" >"$RUN/kld.log" 2>&1; then
+            say "prefill  : $(grep -E 'mean KLD|same top p' "$RUN/kld.log" | tr -s ' ' | tr '\n' ' ')"
+        else
+            cp "$RUN/kld.log" "$STATE_DIR/last-kld-fail.log"
+            fail "prefill-logit gate (log: $RUN/kld.log)"
+        fi
     fi
 fi
 
 # --- 5. record --------------------------------------------------------------------------------
 # A partial run must NOT mark the rev validated: that would make the next cron pass skip a rev
 # that was never fully gated (hit during the first radiance bring-up).
-if [ "$SKIP_LADDER" = 1 ] || [ "$SKIP_OPTESTS" = 1 ] || [ "$SKIP_KLD" = 1 ] || [ "${kld_want:-1}" = 0 ]; then
+if [ "$SKIP_LADDER" = 1 ] || [ "$SKIP_OPTESTS" = 1 ] || [ "$SKIP_KLD" = 1 ]; then
     say "RESULT   : PASS (a step was skipped, so no up-to-date marker was written -- the next run resumes)"
     log "$short partially validated (summary: $SUMMARY)"
     exit 0
