@@ -147,6 +147,12 @@ HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=12288 MOE_EXPERT_CACHE_DEVMAP=1 \
   for decode while prefill still streams from host.
 * `--fit` knows nothing about the arena (it is allocated from free VRAM after `--fit`), so `-c`/`--fit`
   and a large `MIB` can both claim the same headroom.
+* **A big MoE on 2 cards: pick `-ncmoe` from the RAM budget, not from the card.**  Flash-Next
+  GSQ-RCO IQ3_XXS (71 GB) on 2x R9700, 4 slots / unified KV at `-c 40960`: **`-ncmoe 44`** keeps four
+  layers' experts on the cards and pins **37.8 GB** of host experts (the arena then holds 100 % of them,
+  22.1 + 21.2 GiB of slab per device), which leaves headroom on a 91 GB box; `-ncmoe 48` pins ~85 GB and
+  the OOM killer takes the run (measured 2026-10-26, `WORKLOG.md` 261026.004).  Same rule for any quant:
+  pinned host experts = (n_cpu_moe / n_layer_moe) x the expert bytes, and the arena needs them resident.
 
 ## Verify your build (recommended)
 

@@ -1,5 +1,35 @@
 # WORKLOG - dated delivery records
 
+## 261026.004 (r146 follow-up) -- the parking fix is validated on 2 GPUs too (`-ncmoe 44`)
+
+**No artifact changed** (patches, tree and `release.json` are r146's): this entry completes r146's validation
+matrix.  The r146 entry lists the 2-GPU arms as unmeasurable, because the GSQ-RCO IQ3_XXS tree (71 GB) plus
+`-ncmoe 48` pinned ~85 GB of host experts and the OOM killer took the run on this 91 GiB box.  The fix for
+that is placement, not memory: **`-ncmoe 44`** keeps 4 MoE layers' experts on the cards, so the pinned host
+set is 37 825 MiB and the run has headroom (`free -g`: 70 of 91 GiB free after the gate).  Maintainer's call
+to re-run on 2 cards; `-ncmoe 40` was the fallback and was not needed.
+
+Config: GSQ-RCO IQ3_XXS + MTP draft, 2 GPU, `-ncmoe 44`, 4 slots / unified KV, `-c 40960`,
+`-ot per_layer_token_embd.*=CPU -lm none -lzm off -fa on -t 8`; the MoE expert cache auto-sized to
+**37 825 MiB of 37 825 MiB host experts (100 % residency, identity fast path ON)**, slab 23.25 + 22.38 GiB
+(work 1.19 GiB, arena 22.06 + 21.19 GiB); each arm's teardown drops 132 tables per device, i.e. r143's
+`llama_memory_moe_cache_forget` path is exercised too.
+
+| arm | 2 GPU `-sm tensor` | 2 GPU `-sm layer -ts 59,41` (the reporter's) |
+|---|---|---|
+| park (default) vs `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`, 4 requests | **4/4 byte-identical** | **4/4 byte-identical** |
+| `LLAMA_SERVER_PARK_IDLE_SLOTS=0` (#210) vs lazy-off | 1/4 differs (C) | 2/4 differ (B, C) |
+| moves traced (`LLAMA_KV_PARK_DEBUG=1`) | 6 park + 2 unpark, both caches | 6 park + 2 unpark, both caches |
+| **pre-fix (r145) negative control** | **aborts** at `qwen4exp.cpp:979`, exactly the reported assert, on request B | (not re-run; the 3-GPU layer arm and the 2-GPU tensor arm both abort pre-fix) |
+| `GGML_ASSERT` / refusal / GPU fault (post-fix) | none | none |
+
+So the reporter's own 2-GPU shape reproduces the bug on r145 and is clean on r146, in both split modes.  The
+2-GPU `parkoff` arm agreeing on 3 of 4 requests is not a contradiction: #210's placement dependence is a
+near-tie effect (which cells the running sequence gets), so how many requests flip varies with the config -
+what the gate requires is that the **parking** arm matches lazy-off exactly.
+
+`scripts/check-gpu-faults.sh --since "45 min ago"` over all four arm logs + the kernel journal: clean.
+
 ## 261026.003 (r146) -- issue #227: parking moves a mirroring indexer cache with the attention cache (qwen4exp/glm5-next)
 
 **Release:** `v15-6050b467c-r146` (base `6050b467c`, canonical tip `105ac9d9a`, tree
@@ -87,9 +117,10 @@ caught it: block 11 does not build on its own, because the park API it calls lan
 
 * **glm5-next** (the same memory, k-pool indexer variant): no GGUF on this fleet — `TODO` #108, accepted
   limitation.  The code path is shared and the k-pool layout is invalidated with everything else.
-* **2-GPU arms**: the GSQ-RCO IQ3_XXS tree is 71 GB and the box has 91 GB of RAM, so
-  `-ncmoe`+2 GPU OOM-kills (85 GB of pinned host experts); the split-mode coverage is 3-GPU
-  `tensor`/`layer` instead, which is where the assert fires.
+* **2-GPU arms** (at the time of this entry): the GSQ-RCO IQ3_XXS tree is 71 GB and the box has 91 GB of
+  RAM, so `-ncmoe 48`+2 GPU OOM-kills (85 GB of pinned host experts); the split-mode coverage was 3-GPU
+  `tensor`/`layer` instead, which is where the assert fires.  **Since measured on 2 GPUs with
+  `-ncmoe 44`, in both split modes, with an r145 negative control - see 261026.004.**
 * The reporter's own build and their 21.6k-token production sequence were not reproduced (our 10.6k arm
   is the same code path); no Windows run.
 

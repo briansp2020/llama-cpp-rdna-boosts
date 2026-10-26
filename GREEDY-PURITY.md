@@ -1552,7 +1552,8 @@ sequence — a ~9.9k prompt completes on slot 0, a short prompt starts on anothe
 attention cells move while the indexer's stay behind — in **both** `-sm tensor` and `-sm layer`.  With both
 caches moved, the same 4-request sequence (A 10.6k on slot 0; B on slot 1; C back on slot 0, which unparks
 A; D on slot 2 with two slots parked) is byte-identical to `LLAMA_SERVER_LAZY_IDLE_SLOTS=0` on every
-request, in `-sm tensor` (3 GPU, all-VRAM) and `-sm layer` (3 GPU); `LLAMA_SERVER_PARK_IDLE_SLOTS=0`
+request, in `-sm tensor` (3 GPU, all-VRAM) and `-sm layer` (3 GPU), and on 2 GPU with `-ncmoe 44` in both
+(`-sm layer -ts 59,41` is the reporter's shape); `LLAMA_SERVER_PARK_IDLE_SLOTS=0`
 differs on 2 of the 4, i.e. the workload does reproduce #210's placement dependence.  Both caches log each
 move under `LLAMA_KV_PARK_DEBUG=1`, and no GPU fault is reported.  `scripts/gate-park-idle-slots.sh` is the
 repeating gate (it fails on r145 with the reported assert).

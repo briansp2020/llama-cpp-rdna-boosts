@@ -1337,7 +1337,8 @@ had no other home.
   next ubatch.  `llama_memory_attn_caches()` is unchanged for every other memory type; `llama_kv_cache_dsa`
   / `_iswa` derive from `llama_memory_i` directly, so their indexer was never half-parked (they report
   "parking not supported" and keep #210).  Measured (Flash-Next GSQ-RCO IQ3_XXS + MTP, 4 slots, 10.6k-token
-  prompt, `-sm tensor` 3 GPU all-VRAM and `-sm layer` 3 GPU): park **==** `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`
+  prompt, `-sm tensor` 3 GPU all-VRAM, `-sm layer` 3 GPU, and 2 GPU with `-ncmoe 44` in both split modes):
+  park **==** `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`
   byte for byte on all four requests (A parked, B on the freed low cells, C unparking A, D with two slots
   parked), `LLAMA_SERVER_PARK_IDLE_SLOTS=0` differs on two of them, both caches log every move, no GPU
   fault.  Gate: `scripts/gate-park-idle-slots.sh` (it fails on the r145 build with exactly the reported
