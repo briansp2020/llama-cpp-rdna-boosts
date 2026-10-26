@@ -1,5 +1,84 @@
 # WORKLOG - dated delivery records
 
+## 261025.012 (r139) -- issue #214: the compute-buffer chunk no longer applies to a declined slab, and the r138 depth sweep
+
+**Release:** `v15-6050b467c-r139` (base `6050b467c`, canonical tip `fb6e02034`, tree
+`8dd11bfe094077175c826892fba20b584ab81f79`, 15 blocks).  **Staged and validated, deliberately NOT tagged or pushed yet.**
+The delta against the r138 tree is **3 files, +19 / -0**: `ggml-cuda-arena.{cu,cuh}` and one accessor in
+`ggml-cuda.cu`.  No kernel, no dispatch, no default and no allocation *size on a live slab's later
+allocations* changed.
+
+### The fix: the chunk is for a live slab, not an armed one
+
+The compute-buffer chunk (`GGML_COMPUTE_BUFFER_CHUNK_MIB`, default 256 MiB) exists to keep the movable-boundary
+slab's work region in whole units.  `ggml_cuda_slab_enabled()` is `env_on && g_slab_armed`, and the slab is
+**armed** by the MoE preflight before it is **attempted** at the first compute-buffer allocation.  A decline
+leaves the armed flag set, so a streaming config still rounded its compute buffer up to whole slab units.  On
+the issue #214 reporter's 12 GiB gfx1031 card the layout is 510 MiB: the chunk made it **768 MiB**
+(2 x 256 + one spare), i.e. 258 MiB the run cannot use and the declined slab cannot reclaim.  The allocation
+that *creates* the slab is sized before the answer exists, so a post-decline test cannot catch it either.
+
+The gate is now `ggml_cuda_slab_active(device)` (a new per-buft device accessor,
+`ggml_backend_cuda_buffer_type_device`): the pre-slab percentage margin is used until a slab is live on that
+device, and the chunk applies from the first allocation after it is.  A declined device never reaches that
+state.  Measured (Qwen3.6-35B-A3B UD Q4_K_M, `-ncmoe 24`, `-c 131072`, gfx1201):
+
+| arm | r138 | r139 |
+|---|---:|---:|
+| forced decline (`GGML_CUDA_SLAB_MIN_ARENA_MIB=999999`), compute buffer | 768 MiB | **561 MiB** |
+| same with `GGML_COMPUTE_BUFFER_CHUNK_MIB=0` / both knobs 0 | 561 / 510 MiB | 561 / 510 MiB |
+| live arena (`MOE_EXPERT_CACHE_MIB=4096`), compute buffer | 768 MiB | **561 MiB** |
+| live arena, slab work / arena | 0.75 / 19.38 GiB | 0.56 / 19.56 GiB |
+
+**Gates** (gfx1201, r138 build `~/llama.cpp/build-rocm`, r139 build `~/llama-scratch/build-rocm`, every
+text comparison with `ROCBLAS_USE_HIPBLASLT=0`):
+
+| gate | result |
+|---|---|
+| 35B-A3B, streamed (forced decline) and live arena (`MOE_EXPERT_CACHE_MIB=4096`), greedy seed 42 | r138 == r139, **150 chars sha `4ac3a523160f`** in both arms |
+| dense 4B Q8_0, 3 GPU `-sm tensor` (the standard coherence cell) | r138 == r139, **111 chars sha `7e6229b260f6`** |
+| streaming `d0` / `d120000`, two interleaved reps | r138 1224.8/954.8, 1228.4/956.1 vs r139 1232.9/957.4, 1228.8/952.1 (parity) |
+| live arena `pp512` / `tg128`, `-r 2` | r138 1143.71 / 63.61 vs r139 1141.11 / 64.37 (parity) |
+| per-block build, `--changed-from` the r138 chain tip, `--fast` | **2/2 built, 0 failed** (block 10 and the tip) |
+| `validate-set.sh` | green: checksums OK, fresh-tarball **strict 15/15** `git am`, tree == `release.json.tree` |
+| prefill logits | not run: no prefill kernel, dispatch or default changed; the change is COMPUTE-buffer sizing |
+
+### The r138 depth sweep (issue #214)
+
+Full method, both builds and every table: [`benchmarks/2026-10-25-r138-depth-sweep.md`](benchmarks/2026-10-25-r138-depth-sweep.md).
+Qwen3.6-35B-A3B UD Q4_K_M, one gfx1201, the reporter's `pp512` depth sweep against upstream at r138's fork
+point `6050b467c`:
+
+| regime | d0 | d32768 | d65536 | d98304 | d120000 |
+|---|---:|---:|---:|---:|---:|
+| resident, default flags | +17.8 % | +27.2 % | +21.3 % | +19.8 % | +19.1 % |
+| streaming (`-ncmoe 24`, slab declined), default flags | +18.3 % | +29.9 % | +35.8 % | +42.4 % | +44.6 % |
+| streaming, `-lm none -lzm off` on both arms | -2.1 % | +9.6 % | +20.0 % | +20.6 % | +19.9 % |
+
+**No crossover at depth on r138/gfx1201.**  The resident lead is flat; the streaming lead grows and then
+plateaus.  The default shallow-depth lead is a loader difference, not a kernel one: under `auto` (mmap)
+upstream leaves the `-ncmoe` host experts pageable and prints its own "consider `--load-mode none`" warning,
+while the delivery pins them; pinning the mode on both arms makes d0 parity and leaves the deep lead at
++20 %.  `--lazy-mode` is inert for `qwen35moe` (no `TENSOR_READ_LAZY` tensor; that is qwen4exp/Flash-Next,
+gemma4 and deepseek41).  The r138 streaming arm showed a ~10 % low cluster across runs (842-955 at 120k) while
+upstream was stable (656-661); even the low cluster is +27.5 % over upstream's best deep point, and the spread
+is not the load mode (it persists under `-lm none`), so it is unattributed rather than a result.
+
+### Record correction
+
+`archive/work/deep-prefill-depth-scaling/README.md` said the RDNA2 half was "confirmed good by the reporter"
+on a 2026-10-24 relay.  His posted 2026-10-25 r126 sweep measures the opposite shape on his gfx1031 card
+(lead shrinking from +36 % at d0, about even at 80k, -10 % at 120k).  The record now says RDNA4 is closed by
+r126, the RDNA2 half is **not** confirmed, and the residual is `TODO.md` **#106**.  This is not a defect in
+r126 (his path is the tile kernel; the r126 fix is RDNA4-only) and it is not measurable here.
+
+### Reporter reply
+
+Posted on issue #214: the r138 default-to-default and controlled tables, the no-crossover conclusion on
+gfx1201, the caveat that gfx1030 is unmeasured here, the clamp fix already in r138, the fetch-ahead
+clarification (it is RDNA4-band-only by construction, so it cannot change a gfx1030 run), and the chunk
+finding with its r138 workaround (`GGML_COMPUTE_BUFFER_CHUNK_MIB=0`) and the r139 fix.
+
 ## 261025.011 (r138) -- container watcher: bounded retries, a checked checkout, bounded logs
 
 Inspected the off-host release pipeline on `radiance` (the watcher is the only automated piece there; there is

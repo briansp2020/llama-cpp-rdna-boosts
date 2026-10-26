@@ -1,4 +1,4 @@
-From 79072f5c5e1175ce4f89e443cdd227d2f0d3f358 Mon Sep 17 00:00:00 2001
+From 1f41410229dcc015a3d25f897670d8280251de33 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 08/14] rdna-boosts: block 08: fused kernels (old-08 fusions +

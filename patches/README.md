@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying) | +14911 / −524 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device) | +12083 / −4873 | 75 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache | +11776 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency) | +3223 / −747 | 38 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -303,7 +303,8 @@ almost all of them `template-instances/*.cu`.
   noise (`-ncmoe 40`, 32k, q8_0 KV, n_max 7: 248.8/239.6 vs 241.2/249.7 t/s).  Gates: `FLASH_ATTN_EXT`
   6391/6391, prefill-logit PASS at the standard point, and the head-256 shape PASS in `--family-switch` mode
   against a same-kernel `-ub` control (candidate 0.005073/97.118 vs control 0.007251/96.912).
-  `WORKLOG.md` 261024.007.
+  `WORKLOG.md` 261024.007.  **RDNA4 only:** the reporter's gfx1031 card takes the RDNA2 tile kernel, so
+  this row never applied to him; his depth crossover is still open as `TODO.md` #106.
 * **The band's 64-column block has its own geometry and instantiation (r134, issue #224).**  The deletion
   above left query widths 5..8 on *prefill's* 8-warp row, and that row splits a tile's KV rows **2** ways
   per Q column where the 32-column block splits them **4** (`np = nwarps*cols_per_warp/ncols`).  A different
@@ -932,6 +933,14 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
 * **The slab** (`ggml-cuda-slab.cu`, `ggml-cuda-arena.cu`): one VMM reserve per device split by a movable
   boundary — compute below, MoE arena above, no HIP call at runtime.  Plus the narrow-band learning, the
   wide-phase auxiliary region, pool-wide routing, and the slab transient absorption.
+* **The compute-buffer chunk follows a LIVE slab** (r139, issue #214): `GGML_COMPUTE_BUFFER_CHUNK_MIB`
+  used to key on `ggml_cuda_slab_enabled()` (armed), which stays true after the slab declines at the
+  first compute allocation.  A 12 GiB card that streams its host experts therefore had a 510 MiB
+  layout rounded to 768 MiB (2 x 256 + one spare), 258 MiB the run cannot use.  The chunk is now gated
+  on `ggml_cuda_slab_active(device)` via `ggml_backend_cuda_buffer_type_device()`: the allocation that
+  creates the slab and every allocation on a declined device keep the percentage margin (561 MiB), and
+  a live slab uses the chunk from the first allocation after it exists.  Text byte-identical on the
+  streamed and arena arms, decode/prefill at parity.  `WORKLOG.md` 261025.012.
 * **The block-10 arms of the Q8_1 cache fix** (r132, with block 08): the fused GLU -> Q8_1 site's key walk
   stops at the first pointer change (the fused write is keyed by the matmul's `src1`), and both of this
   block's gated-q8_1 launch arms — the fused norm+gate kernel and the GLU write — validate their sources

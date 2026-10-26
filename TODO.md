@@ -23,10 +23,30 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | **70** | harden the expert-cache re-arm / wide-aux growth against a starved arena | robustness | open |
 | **36** | genuine CPU/GPU overlap for the MoE misses | performance | open, scoping (`wip/moe-cpu-overlap/`) |
 | **104** | block 14 (`-sm relaxed-tensor`) is a stop-gap, not a feature | temporary upstream modification | open, transient (r137).  It exists so `flint`/`mellum`/`mistral4` can tensor-split while upstream #30861/#31081 leave the MoE amax row max unsplittable.  **Drop the block** when upstream fixes the amax under a tensor split (a real cross-device MAX all-reduce, or the `ggml_prec_set_src(..., GGML_PREC_BF16, 1)` path the graph TODO names) or when its relaxations stop being needed; nothing else depends on it.  Keep it separate, do not let it grow into general `-sm tensor` support.  Limitations: `patches/README.md` (block 14), `GREEDY-PURITY.md` §58 |
+| **106** | issue #214's RDNA2 deep-context prefill residual | platform validation (waiting on the reporter) | open (2026-10-25, r138/r139).  On the reporter's 12 GiB gfx1031 (RDNA2 tile FA, slab declined) the delivery's `pp512` lead over upstream shrinks with depth: +36 % at d0, about even at 80k, -10 % at 120k (his r126 sweep; the r138 re-base does not change his tile path).  Not measurable here: no gfx1030/gfx1031 device.  Candidates are both block 05: the RDNA2 tile table from PR #165/r76 (tuned on a V620 with a different GQA shape), `GGML_CUDA_FATTN_TILE_Q_GLOBAL` (the +30 % figure was shallow), and the `prefill_stages = !RDNA3_5` staging gate.  Next measurement: his r138 `-p 512 -n 0` sweep with `GGML_CUDA_FA_STAGE_MAX_MB=1` as the staging arm.  Detail in §106 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
 ---
+
+## 106. Issue #214's RDNA2 deep-context prefill residual — PLATFORM VALIDATION (waiting on the reporter)
+
+**Status: open (2026-10-25, r138/r139).**  On the 12 GiB RX 6700 XT (gfx1031 as gfx1030, RDNA2 tile FA,
+`-ncmoe 24`, slab declined so the experts stream) the reporter's r126 depth sweep shows the delivery's
+`pp512` lead over upstream shrinking with depth: +36 % at d0, about even at 80k, -10 % at 120k.  r126 cannot
+be the cause (his card has no WMMA and takes the tile kernel, so the r126 RDNA4 row never applied to him),
+and the r125 campaign's gfx1201 streaming arm leads at every depth.  The remaining candidates are block 05's
+RDNA2 tile config table (PR #165/r76, tuned on a V620 with a different GQA shape), the
+`GGML_CUDA_FATTN_TILE_Q_GLOBAL` wide-tile Q-from-global read (its +30 % was a shallow measurement), and the
+`prefill_stages = !RDNA3_5` FA staging gate (RDNA2 stages; it was never depth-swept).  A near-full card adds
+the staging-arena refusal: his peak is 12204 of 12272 MiB, so the deep-prefill staging allocation can be
+refused and falls back to the native K/V read, which is a slowdown but is also upstream's path.
+
+This fleet cannot measure it: there is no gfx1030/gfx1031 device, and the only RDNA2 silicon is a gfx1036
+iGPU with a 2 GiB BAR and ~1.8 GiB already used by the desktop.  The reporter's r138 sweep, with
+`GGML_CUDA_FA_STAGE_MAX_MB=1` (force the native K/V read) as the staging arm, is what separates the staging
+gate from the tile table.  The r138 gfx1201 control (no crossover, resident +18..+27 %, streaming +18..+45 %
+with default flags) is [`benchmarks/2026-10-25-r138-depth-sweep.md`](benchmarks/2026-10-25-r138-depth-sweep.md).
 
 ## 103. The ~30x collapse when the last few MiB of VRAM are in use has no root cause — PERFORMANCE (diagnosis)
 
