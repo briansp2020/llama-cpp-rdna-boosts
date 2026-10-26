@@ -1,6 +1,6 @@
 # WORKLOG - dated delivery records
 
-## 261025.012 (r139) -- issue #214: the compute-buffer chunk no longer applies to a declined slab, and the r138 depth sweep
+## 261025.013 (r139) -- issue #214: the compute-buffer chunk no longer applies to a declined slab, and the r138 depth sweep
 
 **Release:** `v15-6050b467c-r139` (base `6050b467c`, canonical tip `fb6e02034`, tree
 `8dd11bfe094077175c826892fba20b584ab81f79`, 15 blocks).  **Staged and validated, deliberately NOT tagged or pushed yet.**
