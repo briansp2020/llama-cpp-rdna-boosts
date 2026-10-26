@@ -1,5 +1,77 @@
 # WORKLOG - dated delivery records
 
+## 261025.017 (r143) -- the expert cache dropped its tables at model teardown (SIGSEGV), and the reporter's IQ3_S arm closes out r142
+
+**Release:** `v15-6050b467c-r143` (base `6050b467c`, canonical tip `5bc9720a9`, tree
+`45691700837c73b8f3d6fe6ae16a2ae5ab879a15`, 15 blocks).  Delta against the r142 tree: **8 files, +212**,
+all in block 12 (the block that owns the moe_cache iface tail) -- no kernel, no default, no allocation size.
+
+### The crash: a table outliving the model that registered it
+
+Found while validating r142 (recorded there as pre-existing): Flash-Next GSQ, 2 GPU, `-sm layer -ts 59,41
+-ncmoe 24` **SIGSEGV'd at the end of the run**.  Diagnosed to the exact pointer this session:
+
+* gdb: `fill_slot_from_host -> hipMemcpyAsync -> __memmove_avx512` with `rdi`/`rsi`/`rdx` = (dst, src,
+  921600) and `si_addr == rsi`, i.e. the **source** read faults; the source is `t.host + expert*hb`.
+* `/proc/self/maps`: that address is in **no VMA at all** -- the host master had been freed.
+* Instrumented registration: the same layer/role appeared as **two different `ggml_tensor*`** (two model
+  generations), and llama-bench's own log showed the sequence `load A -> pp512 -> free A -> load B ->
+  decode B -> alloc_all_locked (deferred sizing) -> fill -> SIGSEGV`.
+
+Root cause: `g_tables` is process-global and keyed by host-master pointers the **model** owns, and nothing
+told the cache when a model went away.  llama-bench reloads a model whenever a test's model params differ
+(here because a `-ts` *list* makes one test per value!), a server reload and any API user that swaps models
+do the same, and `llama_model_free` frees the masters out from under the registered tables.  The deferred
+arena sizing fills **every** registered table, so it filled a dead one.  `--host-experts pool` was broken
+identically (its master is the read-only model mapping, so a host-buffer-free hook could not have fixed it).
+
+**Fix.**  `llama_model_free` now calls `llama_model_moe_cache_forget(model)` -> the new device iface entry
+`moe_cache_forget` (appended at the very end of `ggml_backend_device_i`, the initializers are positional) ->
+`moe_cache_forget_all(device)`: frees each dropped table's arena slice, remap staging, heat mirror, bounce
+ring and **host pool** (that one holds pinned memory), re-points `g_key_to_id`/`g_sem_to_id`/`g_alias_to_id`
+(g_heads_zeroed too, and the per-model preflight accounting) so a reused `ggml_tensor*` registers a fresh
+table instead of inheriting a dead model's geometry, and **un-sizes** the cache.  Un-sizing is half the fix:
+a second model used to inherit `g_sized` and stayed uncached for its whole run.
+
+**Validation.**
+
+| arm (this box, gfx1201, ROCm 10.1.0) | before | after |
+|---|---|---|
+| Flash-Next GSQ-IQ3_XXS, 2 GPU, `-sm layer -ts 59,41 -ncmoe 24`, `-p 512` | **SIGSEGV** (exit 139) after test 1 | both tests complete: **572.54 / 943.73 t/s**, exit 0 |
+| 35B-A3B Q4_K_M, 2 GPU, `-sm layer -ts 59,41 -ncmoe 40 --host-experts pool MOE_HOST_POOL_MIB=4096` | **SIGSEGV** after test 1 (735.78 t/s) | both tests complete: **735.92 / 766.12 t/s**, exit 0 |
+| single-model cache log lines (arena, residency, identity fast path), Flash-Next `-ncmoe 24` | 76 lines | 76 identical lines + the two teardown drop lines |
+| same-seed greedy text | `13406dc51399` / pool `e2dde701fc04` | identical |
+| pp4096 / tg64 (`-sm layer -ts 59,41 -ncmoe 24`) | 570.20 / 40.35 t/s | 569.91 / 40.12 t/s |
+| dense 27B Q4_K_XL (the forget must be a no-op) | -- | pp2048 1879.08 / tg32 47.19 t/s |
+
+Gates: `validate-set.sh` strict 15/15 on a fresh tarball, per-block build **2/2** (`--fast`,
+`--changed-from 01851831e`, 365 s), `gate-prefill-logits.sh` **PASS** 0.000531 / 98.863 % (unchanged),
+`test-backend-ops` HC set 88/88 + `FLASH_ATTN_QSA` 26/26.
+
+### The reporter's IQ3_S arm, on their exact model
+
+Their r142 report left one arm unmeasured ("your IQ3_S production config is not on this box").  It is now:
+`/llm/models/Qwen3.8/27B/GSQ-RCO-IQ3_S/` holds `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` (77.86 GiB, 48 blocks,
+pre-#31028 separate-tensor HC — the reporter's layout).  r141 vs r142, 3 GPU `-sm tensor`, all-VRAM,
+`--load-mode none --lazy-mode off`, interleaved, 2 reps each:
+
+| IQ3_S | r141 | r142 | |
+|---|---:|---:|---:|
+| pp2048 | 2265.84 / 2264.24 | **2338.01 / 2338.91** | **+3.2 %** |
+| pp8192 | 2184.88 / 2178.89 | **2254.81 / 2256.62** | **+3.2 %** |
+| pp31500 | 2133.90 / 2129.21 | **2196.73 / 2199.35** | **+2.9 %** |
+| pp8192, `LLAMA_FUSED_DSV4_HC_POST=0` | 2243.76 / 2239.16 | **2296.00 / 2284.48** | **+2.2 %** |
+| pp31500, `HC_POST=0` | 2193.88 / 2187.62 | **2238.04 / 2238.65** | **+2.2 %** |
+
+Bit-identical: PPL **2.2057** (default arm) / **2.2141** (`HC_POST=0`) in both builds, greedy text 172 chars
+sha `e82e1992943a` identical.  The reporter measured −3.4 % (IQ3_XXS) and −2.5 %/−4.5 % (IQ3_S); we recover
++2.9-3.2 % and +2.2 %, i.e. the same regression, from the other direction (`benchmarks/2026-10-25-qwen4exp-
+hc-inject-adjacency.md` §"The reporter's exact model").
+
+**Also found (not fixed, one observation):** `llama-bench -ts a,b` is not a per-device split but *one test per
+value* — that is what turned a single-model benchmark into a model swap and exposed the crash.  No delivery
+code changes for it; worth knowing before reading a `ts` column.
+
 ## 261025.016 (r142) -- issue #226 follow-up: the qwen4exp HC mixer's inject GEMM sits beside the down GEMM again, restoring +3.4 % prefill
 
 **Release:** `v15-6050b467c-r142` (base `6050b467c`, canonical tip `01851831e`, tree

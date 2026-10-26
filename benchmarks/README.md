@@ -24,6 +24,17 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-10-25 — the expert cache at a model teardown (block 12, r143)
+
+**`WORKLOG.md` 261025.017** — a table whose host master was freed by `llama_model_free` stayed registered,
+and the deferred arena sizing read it: a host memcpy SIGSEGV in `fill_slot_from_host` (reproduced on
+Flash-Next GSQ, 2 GPU `-sm layer -ts 59,41 -ncmoe 24`, where a `-ts` *list* makes llama-bench run one test
+per value and reload the model between them; `--host-experts pool` failed identically).  `llama_model_free`
+now drops the model's tables and un-sizes the cache, so the next model sizes on its own first band pass
+instead of running uncached.  Single-model runs unchanged (same cache lines, same text, pp4096 570.20 ->
+569.91 t/s).  The same record carries the reporter's **IQ3_S** arm for r142: pp8192 **2185 -> 2255 t/s
+(+3.2 %)** at 31.5k **2134 -> 2197 (+2.9 %)**, `HC_POST=0` **+2.2 %**, PPL and greedy text unchanged.
+
 ## 2026-10-25 — qwen4exp HC mixer: the inject GEMM must sit beside the down GEMM (block 11, r142)
 
 **[2026-10-25-qwen4exp-hc-inject-adjacency.md](2026-10-25-qwen4exp-hc-inject-adjacency.md)** —

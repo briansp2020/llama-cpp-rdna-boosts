@@ -565,6 +565,20 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `K->ne[1]` is the context's used length, so the historical `P=256` run reported PASS without reaching the
   block (that is how r126..r133 passed).  `GREEDY-PURITY.md` §51,
   `benchmarks/2026-10-25-fa-band-width-purity.md`.
+- **The expert cache's tables must not outlive the model that registered them (r143).**  `g_tables` is
+  process-global and keyed by host-master pointers the MODEL owns, so `llama_model_free` must drop them
+  before the masters go: `llama_model_moe_cache_forget()` -> the `moe_cache_forget` device iface entry ->
+  `moe_cache_forget_all(device)` frees each dropped table's arena slice, remap staging, heat mirror, bounce
+  ring and host pool, re-points the id maps, forgets the per-model preflight accounting (`g_preflight_device_bytes`,
+  the unregisterable set, the latched floor) and un-sizes the cache.  Without it the deferred arena sizing —
+  which fills **every** registered table — reads a freed master: a host memcpy **SIGSEGV in
+  `fill_slot_from_host`**, measured on Flash-Next GSQ 2 GPU `-sm layer -ts 59,41 -ncmoe 24` (llama-bench
+  frees and reloads the model between tests whose params differ!) and in the same shape under
+  `--host-experts pool` (whose master is the model mapping, so a host-buffer-free hook cannot cover it).
+  Un-sizing matters as much as dropping: a second model used to inherit `g_sized` and stayed uncached for
+  its whole run.  A new iface field that appends to `ggml_backend_device_i` goes at the **end** (the
+  initializers are positional); a hook that must run at teardown needs a matching call in
+  `llama_model_free`/the model lifecycle, not a buffer-free hook.  Single-model runs are unchanged.
 - **The movable-boundary slab is MoE-only and must stay that way (r37).** `ggml_cuda_slab_enabled()`
   returns `env_on && g_slab_armed`; `g_slab_armed` is set **only** by the MoE preflight
   (`ggml_backend_cuda_device_moe_cache_preflight`), which `llama_model_moe_cache_preflight` calls only for

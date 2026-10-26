@@ -1,13 +1,13 @@
 {
-  "release": "v15-6050b467c-r142",
+  "release": "v15-6050b467c-r143",
   "base": "6050b467c",
   "base_tree": "cb3251e17731887f7d17dade0676ddef50bc27e7",
   "n_blocks": 15,
-  "tip": "01851831e",
-  "tree": "810570cad48549af2594242cd64c9f4fad851769",
+  "tip": "5bc9720a9",
+  "tree": "45691700837c73b8f3d6fe6ae16a2ae5ab879a15",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "3572c7a0e31dec5aacb6ce03e9f20f5d92746918a3b775f6e3e31cb449eab8f1"
+    "sha256": "da6cdd746390d013f9aeb62cc4a1b71c3c0cd102d7774ca1d72b2a64708f1734"
   },
   "patches": {
     "0000-rdna-boosts-block-00-foundation-band-uniformity-Meta.patch": "d0007656b4401998841e16c7a1e8373f8c8b962e0f3157bd612b6e35ccccae97",
@@ -22,8 +22,8 @@
     "0009-rdna-boosts-block-09-host-resident-MoE-iface-schedul.patch": "777909b9c8dea4585704296b6cd520af4cad628916f133dcad18b8bd063566f0",
     "0010-rdna-boosts-block-10-slab-fusion-dispatcher-async-in.patch": "25409c63523b8d837635aad789c94fd0dcdad2968db95665a276aa2b37cf80b8",
     "0011-rdna-boosts-block-11-qwen4exp-model-hyper-connection.patch": "18531125711f808091d659c305761770acbfe7cfe31d273ba9897255ae0c1876",
-    "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "16d737249fe19ad896af9a0426975de3a19c36f153558b912ff2d800bc4b93d6",
-    "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "df200a0c7de8b4db679f6eb53b14df0a952a3e3da17ed78cc84cc4e4f8ec1b60",
-    "0014-rdna-boosts-block-14-relaxed-tensor-split-mode-TEMPO.patch": "61dea7bc7754c0e403ba4efcfacdb7892152aae21d69dc9777c2647e102bf3cd"
+    "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "6e5db6853140821eb422cba3f7a6d08a42447363cca183b3642e31839cbd2ad1",
+    "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "c3be44b9bd66799cb857ad5e1e9c50ab06b3031a4bb37f809b6c0a20c76bb686",
+    "0014-rdna-boosts-block-14-relaxed-tensor-split-mode-TEMPO.patch": "340d6f39166852704c58725e88e463de8d91cd087360cd819cbf994ae275b08e"
   }
 }

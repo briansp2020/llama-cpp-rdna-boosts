@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r142`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r143`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -48,7 +48,7 @@ only as a rough shape.
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying) | +14911 / −524 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill) | +11976 / −433 | 46 |
-| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency) | +3223 / −747 | 38 |
+| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`) | +3945 / −754 | 44 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
 
@@ -1417,6 +1417,24 @@ had no other home.
   0.8698 → **0.8948** (5256-token prompt), evictions 18798 → 12402 on the long one; offline (decode band)
   0.9047 → **0.9400** and 0.8347 → **0.9397**.  Greedy text byte-identical (the prior only chooses which
   byte-identical copy is resident) and `gate-prefill-logits.sh` KLD 0.000000 / 100.000 %.
+
+* **The expert cache's tables must not outlive the model that registered them (r143).**  `g_tables` is
+  process-global state keyed by host-master pointers the MODEL owns, and nothing told it when a model went
+  away: `llama_model_free` freed the host masters, and the deferred arena sizing (`alloc_all_locked`, which
+  fills **every** registered table from its master) then read a freed pointer -- a host memcpy **SIGSEGV in
+  `fill_slot_from_host`** from a table whose model no longer existed.  Reproduced on Flash-Next
+  GSQ-IQ3_XXS, 2 GPU `-sm layer -ts 59,41 -ncmoe 24`: llama-bench runs one test per `-ts` value and frees the
+  model between them, so the second test's first band pass died filling the first model's tables (gdb: a
+  `memmove` faulting on a source address that is in **no** `/proc/self/maps` VMA).  `--host-experts pool`
+  crashed the same way -- its master is the read-only model mapping, so a host-buffer-free hook could not
+  have covered it.  `llama_model_free` now calls `llama_model_moe_cache_forget()` -> the new device iface
+  entry `moe_cache_forget` -> `moe_cache_forget_all(device)`, which drops that device's tables (freeing each
+  one's arena slot range, remap staging, heat mirror, bounce ring and **host pool**), re-points every id map
+  so a reused `ggml_tensor*` registers a fresh table instead of inheriting a dead model's geometry, forgets
+  the per-model preflight accounting (`g_preflight_device_bytes`/`_seen`, the unregisterable set, the
+  latched floor) and un-sizes the cache.  Un-sizing is half the fix: a second model used to inherit
+  `g_sized` and therefore stayed **uncached for its whole run**.  Single-model runs are unchanged (the
+  teardown only adds the drop log lines) -- it is a lifecycle rule, not a policy.
 
 **Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `GGML_LF_DFLASH_DEV`, `GGML_LF_FAST_TOPK`,
 `LLAMA_DFLASH_INGEST_TAIL` (r130), `LLAMA_STATE_GET_MERGE_GAP`, `LLAMA_STATE_ASYNC`, `LLAMA_STATE_ASYNC_MAX_MIB`,

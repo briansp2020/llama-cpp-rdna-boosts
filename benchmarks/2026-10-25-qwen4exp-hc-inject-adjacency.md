@@ -81,10 +81,28 @@ Same table on the 2-GPU shape (`HIP_VISIBLE_DEVICES=0,2`, the two x8 uplinks, `-
 The prefill-logit gate alone would *not* have caught the regression (logits are identical, only the number
 of conversions changes) — that is what the trace and the `-p` A/B are for.
 
+## The reporter's exact model (measured 2026-10-25, after r142 shipped)
+
+`/llm/models/Qwen3.8/27B/GSQ-RCO-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` (77.86 GiB, 48 blocks, pre-#31028
+separate-tensor HC — the reporter's production layout), 3 GPU `-sm tensor`, all-VRAM,
+`--load-mode none --lazy-mode off`, interleaved A/B against r141, 2 reps per side:
+
+| test | r141 | r142 | |
+|---|---:|---:|---:|
+| pp2048 | 2265.84 / 2264.24 | **2338.01 / 2338.91** | **+3.2 %** |
+| pp8192 | 2184.88 / 2178.89 | **2254.81 / 2256.62** | **+3.2 %** |
+| pp31500 | 2133.90 / 2129.21 | **2196.73 / 2199.35** | **+2.9 %** |
+| pp8192, `LLAMA_FUSED_DSV4_HC_POST=0` | 2243.76 / 2239.16 | **2296.00 / 2284.48** | **+2.2 %** |
+| pp31500, `HC_POST=0` | 2193.88 / 2187.62 | **2238.04 / 2238.65** | **+2.2 %** |
+
+PPL **2.2057** (default arm) and **2.2141** (`HC_POST=0`) in both builds; greedy text 172 chars
+sha `e82e1992943a` identical.  The reporter's own numbers were −3.4 % (IQ3_XXS) and −2.5 % / −4.5 %
+(IQ3_S) for r138-vs-r137; we measure the recovery as +2.9-3.2 % / +2.2 %.
+
 ## Not covered
 
-* **The reporter's `IQ3_S` production arm** (they measured ~-2.5 % with `HC_POST=0`, ~-4.5 % with the op) —
-  that quant is not on this box; the GSQ-IQ3_XXS arm above is the same model family and GGUF layout.
+* **The reporter's `IQ3_S` production arm** — closed after the release, see "The reporter's exact model"
+  above (it landed on this box the same day).
 * **A merged-tensor (post-#31028) GGUF** — it runs one GEMM for both products, so there is no pair to
   keep adjacent and nothing to fix; still no such GGUF on this fleet (r141 note).
 * The remaining **2280 `xn` conversions** (85 ms in one pp2048 pass) are the single copy the *first* GEMM

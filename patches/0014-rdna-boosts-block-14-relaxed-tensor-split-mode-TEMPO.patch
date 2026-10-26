@@ -1,4 +1,4 @@
-From 01851831ecc981b205d414e9d864716589478990 Mon Sep 17 00:00:00 2001
+From 5bc9720a91d4a063fba565500ff663429735118d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: relaxed-tensor split mode
@@ -113,10 +113,10 @@ index a3f9ef205..29d9dbbd0 100644
          for (ggml_backend_dev_t dev : devs) {
              if (ggml_backend_dev_is_meta(dev)) {
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 53ce09a97..4c22d7052 100644
+index 486556bb9..5d0ba4e7e 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -501,6 +501,18 @@ extern "C" {
+@@ -503,6 +503,18 @@ extern "C" {
          GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
          GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
  
@@ -309,7 +309,7 @@ index 4e2fc1985..abcd80fab 100644
                          id++;
                          idr = id;
 diff --git a/include/llama.h b/include/llama.h
-index 5d155dfab..838a1b24a 100644
+index 679fa7e59..bfe90e29c 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -202,6 +202,15 @@ extern "C" {
@@ -386,7 +386,7 @@ index 884dca647..f72c29d30 100644
  static inline dst_t llama_cast(src_t v) {
      if constexpr (std::is_same_v<src_t, dst_t>) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 27e3f9542..5ebfb0863 100644
+index b17b3c4f3..48da1ecf0 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -382,7 +382,13 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
