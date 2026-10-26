@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r141`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r142`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -47,7 +47,7 @@ only as a rough shape.
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying) | +14911 / −524 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
-| 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226) | +11956 / −427 | 46 |
+| 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency) | +3223 / −747 | 38 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
@@ -1127,6 +1127,19 @@ slab/dispatcher/ring code of its own beyond the arms implemented in its own TUs.
   materialises the inject slice with `ggml_cont` so a post-#31028 GGUF is fusable too — the matcher accepts
   any F32, contiguous, `hc*n_tok`-element, **pinned** `inject` with `view_src == nullptr` (a pin on a view
   does not keep the root alive) and no longer requires a `SCALE`.  `GREEDY-PURITY.md` §59.
+  **The separate-tensor mixer's inject GEMM is emitted next to the down GEMM (r142, issue #226
+  follow-up).**  Both are BF16 GEMMs over the same F32 `xn` (the combine+norm output), and the CUDA BF16
+  GEMM path holds **one** converted src1 (`bf16_src1_cache`, block 10) — so the reuse only happens if
+  nothing converts in between.  #31028's shape emits the inject product *after* the gate product, whose
+  src1 is the silu output and therefore evicts the entry, which converted the whole
+  `[hc*n_embd, n_tok]` tensor twice per mixer: measured on Flash-Next GSQ-IQ3_XXS (3 GPU `-sm tensor`,
+  all-VRAM, pp8192) as 4560 vs 2280 `convert_unary_cont_vec4<float, bf16>` launches (274 vs 85 ms in one
+  pp2048 pass) and **pp8192 2205 -> 2282 t/s (+3.5 %), pp31500 2154 -> 2229 (+3.4 %)**.  The fix emits
+  `lo` and the inject product back to back in the `else` (separate-tensor) branch and expands **both**
+  there — `ggml_build_forward_expand` order, not node creation order, is what lands a node in the graph.
+  The merged path is untouched (it is one GEMM).  Bit-identical: PPL 2.4392 / 2.4370 (both HC_POST arms)
+  and all 24 chunks of the reporter's `--chunks 24` command unchanged, 6/6 same-seed greedy cells
+  byte-identical, fused-vs-chain KLD still 0.000000 / 100.000 %.
 * **The managed lazy reader** (`src/llama-lazy-reader.{cpp,h}`) and the loader's `managed_budget`
   (`LLAMA_LAZY_BUF_MB`, `TENSOR_SKIP_MANAGED`, `lazy_read::add_range`): a fixed-size host arena over the
   PLE n-gram table, clock-LRU, read on demand.  **Off by default** (it measured slower than both the mmap

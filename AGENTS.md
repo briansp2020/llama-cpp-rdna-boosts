@@ -762,6 +762,18 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `view_src == nullptr` tensor instead of requiring a `SCALE` (a pin on a *view* does not keep the root
   alive — test that any new inject shape satisfies it).  `GREEDY-PURITY.md` §59; records `WORKLOG.md`
   261025.014 / 261025.015.
+- **The qwen4exp HC mixer's two BF16 GEMMs share one converted src1, so the model must emit them
+  adjacent (r142, issue #226 follow-up).**  `build_hc_mix`'s separate-tensor branch (pre-#31028 GGUF) runs
+  `hc_down` and the 4-row `hc_inject` over the same F32 `xn`, and the CUDA BF16 GEMM path caches **one**
+  converted src1 (`bf16_src1_cache`, block 10) — so the reuse only happens while nothing converts in
+  between.  Upstream #31028's emission order puts the inject product *after* the gate product (whose src1
+  is the silu output, which evicts the entry), which converted the whole `[hc*n_embd, n_tok]` tensor twice
+  per mixer: measured on Flash-Next GSQ-IQ3_XXS (3 GPU `-sm tensor`, all-VRAM) as 4560 vs 2280
+  `convert_unary_cont_vec4<float, bf16>` launches and **-3.4 % prefill**; the fix emits `lo` and the inject
+  product back to back and expands **both** there (`ggml_build_forward_expand` order, not node creation
+  order, is what lands a node in the graph).  Bit-identical (PPL, all 24 chunks of the reporter's command,
+  6/6 greedy cells), `GGML_CUDA_BF16_SRC1_CACHE=0` is the A/B control.  The merged path is one GEMM and is
+  untouched.  Record: `benchmarks/2026-10-25-qwen4exp-hc-inject-adjacency.md`,
 - **qwen4exp's `hc_*_down`/`hc_*_inject` pairs are ONE tensor since r138 (upstream #31028).**
   `create_merged(LLM_TENSOR_HC_{ATTN,FFN}_DOWN_INJECT, …)` accepts the converter's merged weight and
   `build_hc_mix(…, w_down_inject, …)` does **one** GEMM for both products; the old separate tensors are

@@ -1,5 +1,71 @@
 # WORKLOG - dated delivery records
 
+## 261025.016 (r142) -- issue #226 follow-up: the qwen4exp HC mixer's inject GEMM sits beside the down GEMM again, restoring +3.4 % prefill
+
+**Release:** `v15-6050b467c-r142` (base `6050b467c`, canonical tip `01851831e`, tree
+`810570cad48549af2594242cd64c9f4fad851769`, 15 blocks).  Delta against the r141 tree: **1 file, +25 / -6**,
+`src/models/qwen4exp.cpp` (block 11) -- no kernel, no default, no allocation size, no node added or removed.
+
+The reporter of #226 sent a second, separate finding after r141: on their separate-tensor (pre-#31028)
+Flash-Next GGUF, **r138 was ~3.4 % slower at prefill than r137** (`IQ3_XXS`, all-VRAM, `-sm tensor`,
+31.5k tokens), their kernel trace showing `convert_unary_cont_vec4` 353 -> 981 ms and the new calls being
+F32 -> BF16 conversions of `xn` (`[10240, 2048]`).  Their reading: r137 emitted the `hc_inject` GEMM right
+behind the `hc_down` GEMM, #31028 emits it after the *gate* GEMM, and the backend's per-graph BF16 src1
+cache (block 10) holds **one** converted tensor -- so the second GEMM converts all of `xn` again.  They also
+sent their local fix (restore the r137 order in the fallback) with PPL identical to the last digit.
+
+**Confirmed, root-caused and applied.**  Every claim reproduces here, and the ordering hypothesis is the
+whole of it: r141 puts `hc_attn_down`/`hc_attn_inject` at graph nodes #10/#72 (`GGML_SCHED_DEBUG=2 -v`), r137
+had #9/#10, and the node *set* is identical (3873 nodes) -- a pure permutation, which is why no correctness
+gate could see it.  `rocprofv3 --kernel-trace` over one pp2048 pass counts `convert_unary_cont_vec4<float,
+bf16>` on `xn` (5.24 M elements) **4560 times / 273.9 ms on r141 vs 2280 / 97.3 ms on r137**; the trailing
+`if (inject && !w_down_inject)` block is what broke the adjacency (its src1 for the gate GEMM, the silu
+output, is cached and evicts `xn`).
+
+The fix is the reporter's: in `build_hc_mix`'s separate-tensor branch, build `lo`'s GEMM, **expand it**,
+build the inject GEMM, expand it, and only then scale/silu `lo` -- `ggml_build_forward_expand` order, not
+node creation order, is what lands a node in the graph.  The merged path is one GEMM and is untouched.
+
+| test (Flash-Next GSQ-IQ3_XXS, 3 GPU `-sm tensor`, `--load-mode none --lazy-mode off`, interleaved A/B) | r141 | r142 | |
+|---|---:|---:|---:|
+| pp2048 | 2287.32 | **2359.53** | **+3.2 %** |
+| pp8192 | 2208.12 | **2283.70** | **+3.4 %** |
+| pp31500 | 2158.08 | **2227.83** | **+3.2 %** |
+| pp8192, `GGML_CUDA_BF16_SRC1_CACHE=0` (control: the mechanism) | -- | 2248.67 | (between the two: adjacency still pays ~1.5 % without reuse) |
+| pp8192, 2 GPU (`0,2`, x8+x8) `-ncmoe 24` | 835.5 | 841.7 | +0.7 % |
+| pp8192, `LLAMA_FUSED_DSV4_HC_POST=0` | 2268.0 | 2321.6 | +2.4 % |
+
+**Bit-identical, as a graph-order change must be:** PPL 2.4392 (default arm) and 2.4370 (`HC_POST=0`), each
+the same to the last digit; **all 24 chunk PPLs** of the reporter's `--chunks 24` command identical (final
+2.4202 both arms); the combine+norm fusion vs `GGML_CUDA_DISABLE_HC_COMB=1` still **-0.000000 KLD /
+100.000 % same-top-p** (so the r141 fusion still fires with the new emission order); and **7/7 same-seed
+greedy cells byte-identical** (Flash-Next GSQ plain `487888b20ddb` and GSQ + `draft-mtp n3` the *same*hash, GSQ 2 GPU `-ncmoe 24` `13406dc51399`, IQ4_NL `9bef5c01369c`, 4B `d2ffb97ccb76`, 27B
+`a7aecbf5c5c1`, 35B-A3B `-ncmoe 40` `e2dde701fc04`).
+
+### Gates (r142, gfx1201, ROCm 10.1.0)
+
+| gate | result |
+|---|---|
+| the A/B and the trace above | pp2048/8192/31500 **+3.2 % / +3.4 % / +3.2 %**; `xn` conversions **4560 -> 2280** |
+| `gate-prefill-logits.sh` (27B Q8_0, 40 chunks) | **PASS**, mean KLD **0.000531**, same-top-p **98.863 %** -- unchanged |
+| `test-backend-ops -o HC_COMBINE,HC_MIX,DSV4_HC_PRE,DSV4_HC_POST,DSV4_HC_COMB` | **88/88**; `-o FLASH_ATTN_QSA` 26/26, `-o INDEXER_TOPK` 3/3 |
+| `scripts/validate-set.sh` | green: checksums OK, fresh-tarball **strict 15/15** `git am`, applied tree == `release.json.tree` |
+| `scripts/gate-per-block-build.sh --changed-from 8701922e9 --fast` | **2/2 built, 0 failed** (block 11 + the tip) |
+
+### Found while validating (pre-existing, NOT from this change, not filed)
+
+**`gemma-4-E4B-it-Q8_0` with `-sm tensor` on 3 devices aborts** --
+`ggml-backend-meta.cpp:1663: GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
+== sum * tensor->ne[split_state.axis])` (a split-state ratio inconsistency, i.e. some tensor's 3-way split
+cannot be expressed).  1 and 2 devices work; the **r137 build aborts identically**, so it is not a re-base
+regression either.  Reported here rather than filed: nobody runs an 8 GiB model on 3 cards, and the fix is
+a Meta-backend split-state change of its own.
+
+**Also recorded:** the remaining 2280 `xn` conversions (85 ms per pp2048 pass) are the one copy the first
+GEMM needs; the fused combine+norm could hand it over (`ggml_cuda_hc_combine_norm_set_bf16_src1`), but on
+this model the MMB path already claims the kernel's `out_xn_bf16` slot, so it would need a second slot.
+Measured as the residual, not attempted -- `benchmarks/2026-10-25-qwen4exp-hc-inject-adjacency.md`.
+
 ## 261025.015 (r141) -- the combine+norm fusion becomes bit-identical to its chain, and a merged-tensor GGUF can take it
 
 **Release:** `v15-6050b467c-r141` (base `6050b467c`, canonical tip `8701922e9`, tree

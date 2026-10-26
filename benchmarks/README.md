@@ -24,6 +24,18 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-10-25 — qwen4exp HC mixer: the inject GEMM must sit beside the down GEMM (block 11, r142)
+
+**[2026-10-25-qwen4exp-hc-inject-adjacency.md](2026-10-25-qwen4exp-hc-inject-adjacency.md)** —
+issue #226 follow-up.  The backend's per-graph BF16 src1 cache holds one converted tensor, so the mixer's
+two BF16 GEMMs over the same F32 `xn` only share it while they are **adjacent in the graph**; #31028's
+emission order (inject last, behind the gate GEMM whose src1 evicts the entry) converted
+`[hc*n_embd, n_tok]` twice per mixer.  Flash-Next GSQ-IQ3_XXS, 3 GPU `-sm tensor`, all-VRAM: pp8192
+**2208 -> 2284 t/s (+3.4 %)**, pp2048 +3.2 %, pp31500 **2158 -> 2228 (+3.2 %)**, and the trace shows the
+`convert_unary_cont_vec4<float,bf16>` launches on `xn` **4560 -> 2280** (274 -> 85 ms in one pp2048 pass).
+Bit-identical throughout (PPL to the last digit, 24/24 chunk PPLs, 7/7 greedy cells, fused-vs-chain KLD
+-0.000000 / 100.000 %); `GGML_CUDA_BF16_SRC1_CACHE=0` is the mechanism control.
+
 ## 2026-10-23 — PR #206 promotion: MTP prompt-tail readback skip (block 02, r118)
 
 **[2026-10-23-pr206-mtp-tail-readback-promotion.md](2026-10-23-pr206-mtp-tail-readback-promotion.md)** —
