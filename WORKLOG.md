@@ -52,7 +52,7 @@ greedy cells byte-identical** (Flash-Next GSQ plain `487888b20ddb` and GSQ + `dr
 | `scripts/validate-set.sh` | green: checksums OK, fresh-tarball **strict 15/15** `git am`, applied tree == `release.json.tree` |
 | `scripts/gate-per-block-build.sh --changed-from 8701922e9 --fast` | **2/2 built, 0 failed** (block 11 + the tip) |
 
-### Found while validating (pre-existing, NOT from this change, not filed)
+### Found while validating (pre-existing, NOT from this change, not filed — see the release reply)
 
 **`gemma-4-E4B-it-Q8_0` with `-sm tensor` on 3 devices aborts** --
 `ggml-backend-meta.cpp:1663: GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
@@ -60,6 +60,17 @@ greedy cells byte-identical** (Flash-Next GSQ plain `487888b20ddb` and GSQ + `dr
 cannot be expressed).  1 and 2 devices work; the **r137 build aborts identically**, so it is not a re-base
 regression either.  Reported here rather than filed: nobody runs an 8 GiB model on 3 cards, and the fix is
 a Meta-backend split-state change of its own.
+
+**Second pre-existing finding, also not this change:** on the **same box, Flash-Next GSQ, 2 GPUs (`0,2`),
+`-sm layer -ts 59,41 -ncmoe 24`**, the process **SIGSEGVs at the end of the run** (the bench result is
+printed, then exit 139).  gdb: `fill_slot_from_host -> hipMemcpyAsync -> __memmove_avx512` (inside HIP),
+reached from `alloc_table_locked -> alloc_all_locked` via `moe_cache_update_host`, immediately after the
+late-arena ramp warns *"auto arena ... MiB is below the floor (...) -- too late to disable the cache
+safely (the graphs already reference the tables), so continuing with the small arena"*.  The r141 build
+does it identically (2 runs each side), so it is not r142 and not a re-base regression; it also needs the
+`-ts` imbalance — 2 GPU `-sm layer` without `-ts`, 3 GPU `-sm layer`, and 2 GPU `-sm tensor` are all
+clean.  It does violate the r20 invariant ("a failed ramp leaves the cache disabled rather than
+aborting"), so it is worth a look on its own; not touched here.
 
 **Also recorded:** the remaining 2280 `xn` conversions (85 ms per pp2048 pass) are the one copy the first
 GEMM needs; the fused combine+norm could hand it over (`ggml_cuda_hc_combine_norm_set_bf16_src1`), but on
