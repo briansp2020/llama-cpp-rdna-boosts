@@ -1618,7 +1618,10 @@ the repeat-anchored one; both are documented in place so a future "simplificatio
 enough — the fused combine also *computes the RMS norm*, and a norm's result depends on the summation
 grouping.  `hc_combine_norm_f32` owned three strided scalar columns per lane, while `rms_norm_f32`'s **vec4**
 path (taken for `n_embd % 4 == 0` with aligned operands) gives a lane the four columns `4*i .. 4*i+3` and
-sums them as one `a*a + b*b + c*c + d*d`.  Different partials -> a different `block_reduce` input -> a
+sums them as one `a*a + b*b + c*c + d*d`.  (**r145, issue #229:** which of the two groupings the chain takes
+is now the *numerics selector* of §60 — the **strided** one by default, the vec4 one only under
+`GGML_CUDA_RMS_NORM_VEC=1` — and `hc_combine_norm_f32` follows it.  The rule is "mirror the chain", not
+"mirror the vec4 path".)  Different partials -> a different `block_reduce` input -> a
 different `scale`.  Measured on Flash-Next GSQ against the unfused chain: **0.018523** mean KLD / 95.588 %
 same-top-p (and 0.021338 / 95.882 % on the pre-r138 r135 build, so it had always been there), which is
 outside this rulebook's 0.005 / 98 % limits even though PPL agreed to 4 dp.  With the kernel owning the
@@ -1645,3 +1648,56 @@ chunk PPLs**.  `-sm layer -ts 59,41`: 2.4850 / 3.7629 / 2.9181 / 2.4235 (r140) a
 (r141); their broken arm was 1781.5 / 3135.2.  6/7 coherence cells byte-identical across the r139, r140 and
 r141 builds, the 7th being the chain arm each release changes.
 Record: `WORKLOG.md` 261025.014 and 261025.015, `patches/README.md` (block 11).
+
+## 60. A reduction-order change is a new numerics reference; every fused norm kernel must reduce like the chain, and the delivery's reference is the pre-#29720 strided one
+
+**Claim.**  An RMS-norm sum's *partial-sum grouping* decides its last bits.  Every layer then moves by
+~1 ulp, and greedy MTP draft acceptance is a **discrete** function of that: a payload-dependent amount of
+acceptance can move with no error anywhere.  So a grouping change is not a neutral refactor and not a free
+prefill optimization — it is a new numerics reference, and the reference is whatever the fused kernels
+that stand in for `rms_norm_f32` reproduce.
+
+**What happened (r145, issue #229).**  The r127 re-base adopted upstream
+[#29720](https://github.com/ggml-org/llama.cpp/pull/29720): `rms_norm_f32` gained a float4 path (a lane
+owns the four contiguous columns `4*i .. 4*i+3` of `i = tid + k*block_size`) and took it unconditionally
+for `ncols % 4 == 0` with 16-byte-aligned operands.  The reporter (1x R9700, Windows, ROCm 10.0, graphs
+off, Qwen3.8-27B UD-Q5_K_XL, `draft-mtp n3`) bisected a **−7..−9 % tg** regression to exactly that commit
+and measured that `GGML_CUDA_RMS_NORM_VEC=0` restores r100/r126 bit-for-bit.  Reproduced here in kind:
+Qwen3.8-27B UD-Q4_K_XL, 1 GPU, greedy, `draft-mtp n3`, 5.2 k prompt — with the SSM decode fusions
+disabled (the reporter's carry) **acceptance 0.611 (58.0 t/s) with float4 vs 0.792 (68.7 t/s) with the
+strided reduction**, deterministic over repeats; on the default (fusions on) arm the same change is
+*positive* here (+0.7..+1.3 points of acceptance, 94k and 5k contexts), and at 94k context 58.9 vs
+58.5 t/s.  Both arms are pure in every case (`plain == draft-mtp` byte-identical, so this is **not** a
+draft/verify inconsistency), PPL agrees to 4 dp, and the prefill-logit gate passes at 0.0005 mean KLD —
+i.e. the sign is a coin flip on the payload, which is exactly why it cannot be a shipping default.
+
+**What the re-base also did, silently.**  The delivery's decode-band norm kernels are documented
+*bit-identical* to `rms_norm_f32`: the rms_norm→Q8_1 fold (`rms_norm_q8_1_f32`), `gdn-conv.cu`'s folded
+q/k norms, the GDN norm gate, `rms_norm_scale_pair_f32`, `rms_norm_mul_rope_f32`, and
+`hc_combine_norm_f32` (which r141 had moved *onto* the vec4 grouping).  With float4 as the default, all of
+them became **approximate**: the decode-shape probe
+`scripts/gate-prefill-logits.sh --ab "<fusion env>" --ub 1` measured **0.000511** (fold) / **0.000529**
+(GDN norm pair) / **0.000441** (`rms_norm_mul_rope`) mean KLD where the contract says 0 — and exactly
+**−0.000000 / 100.000 %** for every one of them under the strided reduction.  r141
+(`WORKLOG` 261025.014/015) fixed one of these by aligning it to vec4; the rest were never noticed because
+no gate compares a fusion against its chain at decode widths.
+
+**Rule.**
+1. **One reduction, and it is the strided one by default.**  `ggml_cuda_rms_norm_vec()` (`common.cuh`)
+   is the single selector; `rms_norm_f32`'s dispatch and **every** kernel documented bit-identical to it
+   consult it (`hc_combine_norm_f32` takes it as a launch argument).  Never hard-code the vec4 grouping.
+2. **A new/changed fused norm kernel owes the `--ub 1` KLD probe** against its own disable switch
+   (`GGML_CUDA_DISABLE_NORM_Q8_1`, `GGML_CUDA_DISABLE_NORM_PAIR`, `GGML_CUDA_DISABLE_CONV_FUSION`,
+   `GGML_CUDA_FUSE_GDN_NORM_GATE=0`, `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE`, `GGML_CUDA_DISABLE_HC_COMB`)
+   and must read **0.000000 / 100.000 %**; the same-seed greedy text is the weak instrument here.
+3. **`GGML_CUDA_RMS_NORM_VEC=1` is an A/B arm**, not a shipping mode: it keeps every fusion *on* but makes
+   them approximate (0.0005 KLD), and it re-rolls the acceptance lottery.  Anything measured with it on is
+   not comparable to a recorded MTP/acceptance number.
+4. **Do not "fix" an MTP acceptance report by touching the draft.**  Measure the target's numerics first:
+   if `plain == draft-mtp` holds, the draft/verify band is consistent and the difference is the reduction
+   order (§59, second half), not the draft.
+
+**Evidence.**  The A/B tables (1 GPU and 3 GPU tensor prefill, 35B-A3B, the 94k-context MTP arm, the
+SSM-fusions-off arm, and the per-fusion KLD probes) are in
+[`benchmarks/2026-10-26-rms-norm-float4-ab.md`](benchmarks/2026-10-26-rms-norm-float4-ab.md); the release
+record is `WORKLOG.md` 261026.002 (r145); the switch is `ENVIRONMENT.md` §7.5.

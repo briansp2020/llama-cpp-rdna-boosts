@@ -1,4 +1,4 @@
-From b2cfbda2f78bbdd5ea6106a7531447c522bb4bd6 Mon Sep 17 00:00:00 2001
+From 601fda574064bf56550b55bc196895f6b3f8976c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/14] rdna-boosts: block 09: host-resident MoE (iface,
@@ -6015,7 +6015,7 @@ index 297d9ffc9..01737d1b7 100644
      file(GLOB   SRCS "template-instances/mmq*.cu")
      list(APPEND GGML_SOURCES_CUDA ${SRCS})
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 75be491e2..aa8bac877 100644
+index 673ceb058..c3d5bde0b 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -40,6 +40,17 @@
@@ -6033,10 +6033,10 @@ index 75be491e2..aa8bac877 100644
 +    return on;
 +}
 +
- #define STRINGIZE_IMPL(...) #__VA_ARGS__
- #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
- 
-@@ -143,6 +154,20 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
+ // RMS-norm reduction selector (issue #229) -- a NUMERICS switch, not a tuning knob.  The RMS sum's
+ // partial-sum grouping decides its last bits; every layer then differs by ~1 ulp and greedy MTP draft
+ // acceptance is a discrete function of that, so the grouping is part of the delivery's reference.
+@@ -170,6 +181,20 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
  #endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
  }
  
@@ -6057,7 +6057,7 @@ index 75be491e2..aa8bac877 100644
  #ifdef __CUDA_ARCH_LIST__
  constexpr bool ggml_cuda_has_arch_impl(int) {
      return false;
-@@ -452,10 +477,38 @@ struct ggml_cuda_unroll<1> {
+@@ -479,10 +504,38 @@ struct ggml_cuda_unroll<1> {
      }
  };
  
@@ -6096,7 +6096,7 @@ index 75be491e2..aa8bac877 100644
  #else
  #pragma unroll
      for (int offset = width/2; offset > 0; offset >>= 1) {
-@@ -467,21 +520,37 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
+@@ -494,21 +547,37 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
  
  template<int width = WARP_SIZE>
  static __device__ __forceinline__ float warp_reduce_sum(float x) {
@@ -6134,7 +6134,7 @@ index 75be491e2..aa8bac877 100644
  }
  
  template<int width = WARP_SIZE>
-@@ -527,11 +596,21 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
+@@ -554,11 +623,21 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
  
  template<int width = WARP_SIZE>
  static __device__ __forceinline__ float warp_reduce_max(float x) {
@@ -6156,7 +6156,7 @@ index 75be491e2..aa8bac877 100644
  }
  
  template<typename T, int width = WARP_SIZE>
-@@ -1277,6 +1356,12 @@ static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & bloc
+@@ -1304,6 +1383,12 @@ static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & bloc
  void ggml_cuda_set_device(int device);
  int ggml_cuda_get_device();
  
@@ -6169,7 +6169,7 @@ index 75be491e2..aa8bac877 100644
  struct ggml_cuda_pool {
      virtual ~ggml_cuda_pool() = default;
  
-@@ -1356,6 +1441,10 @@ struct ggml_cuda_graph {
+@@ -1383,6 +1468,10 @@ struct ggml_cuda_graph {
      bool warmup_complete = false;
      uint64_t uid = 0;
      int64_t last_used_time = 0;
@@ -6180,7 +6180,7 @@ index 75be491e2..aa8bac877 100644
      struct node_properties {
          ggml_tensor node;
          void *   node_src_data_ptrs[GGML_MAX_SRC];
-@@ -1522,6 +1611,58 @@ struct ggml_cuda_stream_context {
+@@ -1549,6 +1638,58 @@ struct ggml_cuda_stream_context {
      }
  };
  
@@ -6239,7 +6239,7 @@ index 75be491e2..aa8bac877 100644
  struct ggml_backend_cuda_context {
      int device;
      std::string name;
-@@ -1534,14 +1675,18 @@ struct ggml_backend_cuda_context {
+@@ -1561,14 +1702,18 @@ struct ggml_backend_cuda_context {
  
      int curr_stream_no = 0;
  
@@ -6262,7 +6262,7 @@ index 75be491e2..aa8bac877 100644
          const int64_t time_now = ggml_time_us();
  
          // sweep every 5s, evicting cuda graphs unused for >=10s
-@@ -1556,9 +1701,9 @@ struct ggml_backend_cuda_context {
+@@ -1583,9 +1728,9 @@ struct ggml_backend_cuda_context {
              }
          }
  
@@ -6274,7 +6274,7 @@ index 75be491e2..aa8bac877 100644
          }
          it->second->last_used_time = time_now;
          return it->second.get();
-@@ -1620,6 +1765,12 @@ struct ggml_backend_cuda_context {
+@@ -1647,6 +1792,12 @@ struct ggml_backend_cuda_context {
      char * q8_1_arena = nullptr;
      size_t q8_1_arena_size = 0;
      std::vector<char *> q8_1_arena_retired;
@@ -6287,7 +6287,7 @@ index 75be491e2..aa8bac877 100644
      std::vector<q8_1_cache_entry> q8_1_cache;
      size_t q8_1_arena_pos = 0;
  
-@@ -1646,7 +1797,10 @@ struct ggml_backend_cuda_context {
+@@ -1673,7 +1824,10 @@ struct ggml_backend_cuda_context {
          if (q8_1_arena_pos + size > q8_1_arena_size) {
              const size_t new_size = std::max(size_t(1) << 25, 2*(q8_1_arena_pos + size)); // 32 MiB min
              char * new_arena = nullptr;
@@ -6299,7 +6299,7 @@ index 75be491e2..aa8bac877 100644
              if (q8_1_arena != nullptr) {
                  CUDA_CHECK(cudaMemcpy(new_arena, q8_1_arena, q8_1_arena_pos, cudaMemcpyDeviceToDevice));
                  // Captured CUDA/HIP graphs keep pointers into the old arena, and the multi-token graph that
-@@ -1719,6 +1873,432 @@ struct ggml_backend_cuda_context {
+@@ -1746,6 +1900,432 @@ struct ggml_backend_cuda_context {
  
      ggml_cuda_stream_context concurrent_stream_context;
  
@@ -6732,7 +6732,7 @@ index 75be491e2..aa8bac877 100644
      ~ggml_backend_cuda_context();
  
      cudaStream_t stream(int device, int stream) {
-@@ -1754,6 +2334,38 @@ struct ggml_backend_cuda_context {
+@@ -1781,6 +2361,38 @@ struct ggml_backend_cuda_context {
      // pool
      std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
  
@@ -6771,7 +6771,7 @@ index 75be491e2..aa8bac877 100644
      static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(ggml_backend_cuda_context & ctx, int device, int stream_no);
  
      ggml_cuda_pool & pool(int device) {
-@@ -1937,3 +2549,6 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+@@ -1964,3 +2576,6 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
      kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
      CUDA_CHECK(cudaGetLastError());
  }
@@ -16251,10 +16251,10 @@ index 000000000..e8da0c952
 +void moe_cache_selftest();         // synthetic arena fill/verify
 +void moe_cache_report();           // hit/miss/fill/eviction summary
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index 0f7dae79f..766012521 100644
+index 23fc03161..e2ebe1e8a 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
-@@ -1177,3 +1177,38 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -1180,3 +1180,38 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
  
      l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
  }

@@ -1,4 +1,4 @@
-From a47a980e08633160d6df94f0c42183ba32df9814 Mon Sep 17 00:00:00 2001
+From 8dd9d724224acd87493cf5acff7dccdc9869aff9 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/14] rdna-boosts: block 11: qwen4exp (model,
@@ -77,7 +77,7 @@ TU in block 10; only the code that needs this block's own symbols is here.
  ggml/src/ggml-cuda/ggml-cuda.cu          |  163 ++
  ggml/src/ggml-cuda/hc-mix.cu             | 1400 +++++++++++++
  ggml/src/ggml-cuda/hc-mix.cuh            |    8 +
- ggml/src/ggml-cuda/hyperconn.cu          | 1194 +++++++++++
+ ggml/src/ggml-cuda/hyperconn.cu          | 1195 +++++++++++
  ggml/src/ggml-cuda/hyperconn.cuh         |   77 +
  ggml/src/ggml-cuda/indexer-score.cu      |  702 +++++++
  ggml/src/ggml-cuda/indexer-score.cuh     |   24 +
@@ -107,7 +107,7 @@ TU in block 10; only the code that needs this block's own symbols is here.
  tests/test-backend-ops.cpp               |  455 +++++
  tests/test-lazy-reader.cpp               |  264 +++
  tests/test-llama-archs.cpp               |   12 +-
- 46 files changed, 11976 insertions(+), 433 deletions(-)
+ 46 files changed, 11977 insertions(+), 433 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -4500,10 +4500,10 @@ index 000000000..457eb3e55
 +int  ggml_cuda_hc_combine_mix_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
 new file mode 100644
-index 000000000..0d6a9b53d
+index 000000000..985d9d091
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/hyperconn.cu
-@@ -0,0 +1,1194 @@
+@@ -0,0 +1,1195 @@
 +#include "hyperconn.cuh"
 +#include "ggml-backend-impl.h"
 +#include "mmb.cuh"
@@ -4705,7 +4705,7 @@ index 000000000..0d6a9b53d
 +        uint16_t * __restrict__ out_xn_bf16, const bool store_xn_f32,
 +        const uint16_t * __restrict__ res_in_bf16, uint16_t * __restrict__ res_out_bf16,
 +        const uint16_t * __restrict__ blk_in_bf16,
-+        const int n_embd, const bool bo_hc,
++        const int n_embd, const bool bo_hc, const bool rms_vec,
 +        const float s1, const float b1, const float s2, const float b2, const float eps) {
 +    __shared__ float s_sum[32];
 +
@@ -4731,18 +4731,19 @@ index 000000000..0d6a9b53d
 +    uint16_t *    xh = out_xn_bf16 ? out_xn_bf16 + row * n_embd : nullptr;
 +
 +    // The RMS sum MUST reduce in the same grouping as the unfused chain's `rms_norm_f32`, or the fusion
-+    // is only approximately equal to the chain it replaces (issue #226 follow-up): that kernel takes its
-+    // **vec4** path for n_embd % 4 == 0 with 16-byte-aligned operands, and there a lane owns the four
-+    // columns 4*i .. 4*i+3 of `i = tid + k*block_size`, summing them as one `a*a + b*b + c*c + d*d`
-+    // expression (n_embd 2560 -> n4 640 -> RMS_NORM_LAUNCH(1024, 1, true)).  Owning three strided
-+    // scalars per lane instead gives a different partial-sum tree and a different `scale`, which is a
-+    // real (if small) divergence from the chain -- so mirror the chain's ownership here.  The scalar
-+    // branch keeps the old layout for the shapes the chain's own dispatch also sends down its scalar
-+    // path (n_embd % 4 != 0, or a misaligned destination / gamma).
++    // is only approximately equal to the chain it replaces (issue #226 follow-up), and that grouping is
++    // the delivery's numerics selector (issue #229, ggml_cuda_rms_norm_vec() in common.cuh):
++    //   * default   -> the strided scalar reduction, whose 1024-thread tree this branch reproduces by
++    //                  owning three strided columns per lane (n_embd <= HC_CN_MAX_EMB = 3*HC_CN_BLOCK);
++    //   * GGML_CUDA_RMS_NORM_VEC=1 -> the **vec4** path (n_embd % 4 == 0, 16-byte-aligned operands):
++    //                  a lane owns the four columns 4*i .. 4*i+3 of `i = tid + k*block_size`, summed as
++    //                  one `a*a + b*b + c*c + d*d` (n_embd 2560 -> n4 640 -> block 1024, vpt 1).
++    // Mirror whichever one the chain would take, or the fusion diverges from its own chain by the
++    // measured 0.0185 mean KLD / 95.6 % same-top-p of r140.
 +    float xs[3][4];
 +    float tmp = 0.0f;
-+    const bool vec4 = (n_embd % 4 == 0) && (((uintptr_t) dst & 15) == 0) && (((uintptr_t) xn & 15) == 0) &&
-+        (((uintptr_t) g & 15) == 0);
++    const bool vec4 = rms_vec && (n_embd % 4 == 0) && (((uintptr_t) dst & 15) == 0) &&
++        (((uintptr_t) xn & 15) == 0) && (((uintptr_t) g & 15) == 0);
 +    if (vec4) {
 +        const int n4 = n_embd / 4;
 +#pragma unroll
@@ -4961,7 +4962,7 @@ index 000000000..0d6a9b53d
 +        (const float *) a.block_out->data, (const float *) a.gamma->data,
 +        (float *) a.out_res->data, (float *) a.out_xn->data,
 +        a.out_xn_bf16, a.store_xn_f32, a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
-+        (int) n_embd, a.block_out_hc, a.s1, a.b1, a.s2, a.b2, a.eps);
++        (int) n_embd, a.block_out_hc, ggml_cuda_rms_norm_vec(), a.s1, a.b1, a.s2, a.b2, a.eps);
 +}
 +// try and fuse nodes and return the number of nodes to skip
 +int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_cuda_hc_mix_args & args, enum ggml_op * ops) {

@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r144`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r145`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -44,7 +44,7 @@ only as a rough shape.
 | 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133) | +5092 / −612 | 289 |
 | 06 | `0006-…-block-06-MMB-quantized-prefill-GEMM` | MMB quantized prefill GEMM (+ r132: the per-arch dispatch keys on the running device, not the primary) | +2903 / −3 | 7 |
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
-| 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard) | +5500 / −440 | 35 |
+| 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters) | +15081 / −525 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill) | +11976 / −433 | 46 |
@@ -531,6 +531,19 @@ must be **bit-identical** to what it replaces at the widths it serves.
 * `moe-weighted-reduction.cu`: the MoE weighted-down reduction (+ column-blocked band epilogue).
 * `norm.cu` / `quantize.cu` / `unary.cu`: `rms_norm`→Q8_1 folds, the verify-band q8_1 cache, scale-unary,
   norm-rows, the conv1d/PLE fusions and the shared-expert down gate.
+* **The rms_norm reduction order is a numerics selector, not a knob (r145, issue #229).**
+  `ggml_cuda_rms_norm_vec()` (`common.cuh`) is the single selector; `rms_norm_f32`'s dispatch and every
+  kernel documented bit-identical to it consult it (`hc_combine_norm_f32`, block 11, takes it as a launch
+  argument).  The **default is the pre-#29720 strided scalar reduction** — the reference every recorded
+  MTP/acceptance number and the decode-band fusions were built on; upstream #29720's **float4** grouping
+  (which the r127 re-base made unconditional) is `GGML_CUDA_RMS_NORM_VEC=1`.  The float4 path is worth
+  **+1.0-2.7 % prefill and ~0 % decode**, but it moves MTP draft acceptance by a payload-dependent amount
+  (issue #229: −7..−9 % tg on the reporter's box; +0.7..+1.3 points here on the default arm, and
+  0.611 vs 0.792 acceptance, −18 % t/s, with the SSM decode fusions disabled) and it makes the fused norm
+  kernels *approximate* (0.0005 mean KLD at `-ub 1`, where the contract says 0; exact on the default).
+  Rule and evidence: `GREEDY-PURITY.md` §60,
+  [`../benchmarks/2026-10-26-rms-norm-float4-ab.md`](../benchmarks/2026-10-26-rms-norm-float4-ab.md),
+  `ENVIRONMENT.md` §7.5.
 * **The Q8_1 quantize cache's identity and its source guard (r132).**  The cache is keyed by the **root**
   tensor's identity but the arena is filled from the (possibly offset) **view** pointer, so an offset view
   stored its rows under the root identity and a later op with the same root and the same canonical row

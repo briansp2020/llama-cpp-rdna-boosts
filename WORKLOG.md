@@ -1,5 +1,95 @@
 # WORKLOG - dated delivery records
 
+## 261026.002 (r145) -- issue #229: the float4 rms_norm reduction becomes opt-in, the pre-#29720 strided reduction is the default again
+
+**Release:** `v15-6050b467c-r145` (base `6050b467c`, canonical tip `24bfbd46c`, tree
+`0bb571d4390cadcaebcefcda6370211d0328c2d5`, 15 blocks).  Delta against the r144 tree: **3 files, +58/-16**
+-- `common.cuh` (the selector + its rationale), `norm.cu` (the dispatch consults it) and `hyperconn.cu`
+(`hc_combine_norm_f32` mirrors whichever grouping the chain takes).  No kernel is rewritten, nothing is
+disabled and no allocation changes: the release picks which of two *existing* reductions
+`rms_norm_f32` runs, and it picks the one the delivery is calibrated on.
+
+### What issue #229 reports, and what reproduces here
+
+Upstream [ggml-org/llama.cpp#29720](https://github.com/ggml-org/llama.cpp/pull/29720) (adopted by the r127
+re-base) replaced `rms_norm_f32`'s strided scalar reduction with a **float4** one: a lane owns the four
+contiguous columns `4*i .. 4*i+3` of `i = tid + k*block_size`.  The reporter (1x R9700, Windows, ROCm
+10.0, graphs off, Qwen3.8-27B UD-Q5_K_XL, `draft-mtp n3`) bisected **-7..-9 % tg** to that commit, with
+the whole loss in draft acceptance and `GGML_CUDA_RMS_NORM_VEC=0` restoring r126 bit-for-bit.
+
+Reproduced in kind on gfx1201/ROCm 10.1.0 (Qwen3.8-27B UD-Q4_K_XL, 1 GPU, greedy, `draft-mtp n3`, one
+`/completion` request per arm, `ROCBLAS_USE_HIPBLASLT=0`, every arm bit-reproducible):
+
+| arm | float4 | strided |
+|---|---|---|
+| default fusions, 5.2k ctx, n=512 | 0.90097 (373/414) / 76.68 t/s | 0.88756 (371/418) / 75.41 t/s |
+| default fusions, **94k ctx**, n=512 | 0.75855 (355/468) / 58.94 t/s | 0.75159 (354/471) / 58.51 t/s |
+| **SSM decode fusions off** (the reporter's carry), 5.2k, n=512 | 0.77273 (357/462) / 68.01 t/s | 0.88756 (371/418) / 74.55 t/s |
+
+and prefill/decode (`llama-bench`, `-r 3`): the float4 grouping is worth **+1.9/+2.7/+1.9 %** at pp512/2048/8192
+(1397/1403/1341 vs 1371/1366/1316) and **~0 %** at tg128 (30.89 vs 30.87) on the 27B, +0.9-1.1 % on 3-GPU
+tensor, +1.1-1.4 % on 35B-A3B.  Full tables: `benchmarks/2026-10-26-rms-norm-float4-ab.md`.
+
+**Diagnosis.** A reduction-order change is a *numerics* change: the RMS sum's partial sums group
+differently, every layer moves by ~1 ulp, and greedy draft acceptance is a discrete function of the
+logits, so it moves by a **payload-dependent** amount (positive on our default arm, -18 % on the same
+model with the SSM fusions disabled, -7..-9 % on the reporter's box).  It is **not** a defect and not a
+draft/verify inconsistency: `--spec-type none` and `--spec-type draft-mtp` are byte-identical in every
+arm above, PPL agrees to 4 dp, and the prefill-logit gate sees only a 0.0007 KLD shift.  There is
+therefore no "fix that keeps float4 and repairs MTP": the grouping *is* the cause.  The choice is which
+numerics is the delivery's reference.
+
+### What else the re-base broke, and what this release restores
+
+The re-base made three kernels that the delivery documents as **bit-identical to `rms_norm_f32`** merely
+*approximate*, because they keep the strided reduction the chain no longer took: the rms_norm->Q8_1 fold
+(`rms_norm_q8_1_f32`), the GDN q/k norm pair (`rms_norm_scale_pair_f32`) and `rms_norm_mul_rope_f32`.
+The instrument is `scripts/gate-prefill-logits.sh --ab "<fusion env>" --ub 1` (decode shapes):
+
+| fusion arm | r144 default (float4) | r145 default (strided) |
+|---|---|---|
+| `GGML_CUDA_DISABLE_NORM_Q8_1=1` | 0.000511 / 99.216 % | **-0.000000 / 100.000 %** |
+| `GGML_CUDA_DISABLE_NORM_PAIR=1` | 0.000529 / 98.889 % | **-0.000000 / 100.000 %** |
+| `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1` | 0.000441 / 99.085 % | **-0.000000 / 100.000 %** |
+
+and end to end: under the strided reduction the whole-arm A/B is *exact* (the SSM-fusions-off arm at
+n=512 is byte-identical to the default arm, same 371/418 acceptance, same text `63a2391b2208`), under
+float4 it changes everything.  r141 had aligned `hc_combine_norm_f32` to the vec4 grouping for the same
+reason; it now follows the selector (`vec4` only under `GGML_CUDA_RMS_NORM_VEC=1`, which is what the
+r140/r141 measurement was), and the qwen4exp `GGML_CUDA_DISABLE_HC_COMB=1` A/B is byte-identical again
+(Flash-Next IQ4_NL, 2 GPU tensor `-ncmoe 40`).
+
+### Shipped (block 08 + block 11)
+
+1. `ggml_cuda_rms_norm_vec()` in `common.cuh` -- the single selector, default **off** (strided).
+   `rms_norm_f32`'s dispatch consults it; so does `hc_combine_norm_f32` (as a launch argument).
+2. `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream's float4 grouping for a prefill-only workload or an
+   A/B.  It is a **numerics selector** (`ENVIRONMENT.md` §7.5): with it on, the fused norm kernels are
+   approximate (0.0005 KLD) and no MTP/acceptance number is comparable to a recorded one.
+3. Rule `GREEDY-PURITY.md` §60: one reduction, the strided one by default; a new fused norm kernel owes
+   the `--ub 1` KLD probe against its own disable switch; `=1` is an A/B arm, not a shipping mode; and an
+   MTP acceptance report is diagnosed on the target's numerics first (if `plain == draft-mtp` holds, the
+   band is consistent and the difference is the grouping).
+
+### Validation
+
+`scripts/validate-set.sh` strict 15/15 on a fresh tarball (tree `0bb571d4...`); per-block build gate
+`--fast --changed-from 438cbb3c7` **4/4** (blocks 08, 09, 11, 14 - the trees the rebase touched; 9 s for
+the unchanged block 14); coherence: a reference build of the **previous tip** rebuilt in the same build
+dir gives text byte-identical to this build with `GGML_CUDA_RMS_NORM_VEC=1` (4B Q8_0 3-GPU tensor
+`1c5d32ac537d`, 27B `d55055a5ec80`), and the new default reproduces the strided arm recorded during the
+investigation (27B plain `ab94eb7db4d4`, MTP acceptance 0.79204); prefill-logit gate 0.000737 / 98.784 %
+against the float4 base and then **re-recorded** to 0.000000 / 100.000 % (an intended numerics change, so
+the base moves with it); `test-backend-ops -o RMS_NORM` OK; MTP Protocol A at `-n 3000` (27B Q4_K_XL,
+1 GPU, greedy) prose 29.2 -> 68.8 t/s and code 29.5 -> 73.1 t/s with `plain == draft-mtp` byte-identical
+on both axes, plus the server-harness acceptance rows above; qwen4exp `HC_COMB` A/B identical.
+`ROCBLAS_USE_HIPBLASLT=0` on every fresh-process comparison.
+
+**Not run, deliberately:** a gfx1151/gfx1100 arch sweep (the change is a compile-time-unmodified branch
+selection on the same code path, and the box has no such device this session), and the full four-axis
+adaptive gate (the controller is untouched; acceptance is measured on the server arms above).  The
+container images are built and pushed off-host by the worker watcher on the tag.
+
 ## 261026.001 (r144) -- TODO #36 (CPU/GPU overlap for the MoE misses) is retired by measurement, and the profile it produced ships two diagnostics
 
 **Release:** `v15-6050b467c-r144` (base `6050b467c`, canonical tip `438cbb3c7`, tree

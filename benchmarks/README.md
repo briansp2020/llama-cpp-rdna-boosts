@@ -24,6 +24,20 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-10-26 — the rms_norm float4 reduction is opt-in; the strided reduction is the default again (r145, issue #229)
+
+**`WORKLOG.md` 261026.002** + [`2026-10-26-rms-norm-float4-ab.md`](2026-10-26-rms-norm-float4-ab.md) —
+upstream #29720 (adopted by the r127 re-base) replaced `rms_norm_f32`'s strided scalar reduction with a
+float4 one.  Measured on gfx1201: it is worth **+1.0-2.7 % prefill and ~0 % decode** (27B 1 GPU pp2048
+1403 vs 1366, pp512 1397 vs 1371, pp8192 1341 vs 1316, tg128 30.89 vs 30.87; 35B-A3B pp2048 4976 vs 4922;
+27B 3 GPU tensor pp2048 1990 vs 1972) — but a reduction-order change is a *numerics* change, and MTP draft
+acceptance is a discrete function of it: **+0.7..+1.3 points** on this box's default arm (27B, 5.2 k and
+94 k contexts) versus **0.611 vs 0.792 acceptance, −18 % t/s** on the same model with the SSM decode
+fusions disabled (the shape the issue reporter runs), and **−7..−9 % tg** on his box.  The arms are pure in
+every case (`plain == draft-mtp` byte-identical), so it is a payload-dependent lottery, not a defect.  The
+default is therefore the **strided** reduction (which is also what the decode-band norm fusions are
+bit-identical to); `GGML_CUDA_RMS_NORM_VEC=1` opts into float4.  Rule: `GREEDY-PURITY.md` §60.
+
 ## 2026-10-26 — where a 2-GPU out-of-VRAM MoE decode token actually goes (r144, block 09 diagnostics)
 
 **`WORKLOG.md` 261026.001** + [`archive/work/moe-cpu-overlap/FINDINGS-2026-10-26.md`](../archive/work/moe-cpu-overlap/FINDINGS-2026-10-26.md)

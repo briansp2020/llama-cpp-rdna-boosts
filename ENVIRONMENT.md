@@ -14,6 +14,7 @@ from the code, not from memory (see [Maintaining this file](#maintaining-this-fi
 | **Opt-in** | OFF by default; the feature is not gated or not for production. |
 | **Tuning** | takes a number/string; the default is the validated value. |
 | **Diagnostic** | no effect on the default path — it only logs, dumps, or gates a debug helper. Never set in production. |
+| **Numerics selector** | does not enable/disable a feature: it picks between two *numerically different* implementations of the same op. A change moves every layer by ~1 ulp, i.e. it moves greedy text and MTP acceptance. A/B and bisection only. |
 
 Two idioms are used in the code and they are **not** interchangeable:
 
@@ -609,6 +610,16 @@ see `../WORKLOG.md` 261017.008).
 | `GGML_CUDA_MOE_RPB_SHORT` | unset = on (RDNA4) | **kill-switch / tuning** (r52, block 10) | rows per block for a short-K (`< 8` K-blocks per row) `MUL_MAT_ID` expert GEMM: RDNA4 uses **8** instead of `ceil(8 / K-blocks)` (the Flash-Next q2_0 down split under `-sm tensor` measured 43.0 -> 29.8 us per 4-token verify call).  `0` restores the old rule; `2`/`4`/`8` force a value on any architecture; other values are ignored. |
 | `GGML_CUDA_TOPK_SORTED` | unset = on | **kill-switch** (r52, block 08) | `topk_moe`'s argmax uses DPP lane exchanges (`ggml_cuda_xor_lane`) and per-lane sorted 64-bit keys for the gating outputs (softmax/sigmoid/sqrt-softplus, no bias, no delayed softmax, power-of-2 candidates per lane).  Same ids, weights and order (ties to the lower index).  `0` restores the per-round scan; the argmax rounds drop 7.1 -> 3.8 us per 512-expert/10-used call. |
 | `GGML_CUDA_GRID_STALL_PAD` | on, HIP only (r46, block 15) | kill-switch | `0` disables the gfx1201 grid-size dispatch workaround: a launch whose block count is a multiple of 256 (or work-item count a multiple of 65536) waits ~6-11 us on gfx1201 (ROCm/legacy-rocm-build#6689), so `mul_mat_vec_f`/`mul_mat_vec_q_ksplit`/`mul_mat_vec_q_moe` add one returning block.  Bit-identical; delete the helper and its call sites once AMD ships the fix. |
+
+### 7.5 Numerics selectors
+
+These are not optimizations that can be turned off: they choose which of two numerically different
+implementations of the same reduction runs.  See the `Numerics selector` class above — treat a change in
+one of these as a **new reference**, not as a tuning experiment.
+
+| variable | default | notes |
+|---|---|---|
+| `GGML_CUDA_RMS_NORM_VEC` | **off** (value-gated: `=1` opts in) | (r145, issue #229) Upstream [ggml-org/llama.cpp#29720](https://github.com/ggml-org/llama.cpp/pull/29720), which the r127 re-base adopted, replaced `rms_norm_f32`'s **strided scalar** reduction with a **float4** one (a lane owns the four contiguous columns `4*i .. 4*i+3` of `i = tid + k*block_size`).  Different partial sums ⇒ a different last bit ⇒ every layer moves by ~1 ulp, which is enough to move **MTP draft acceptance** by a payload-dependent amount.  Measured on gfx1201 (Qwen3.8-27B UD-Q4_K_XL, 1 GPU, `q8_0` K/V, greedy, `draft-mtp n3`): the default arm gains **+0.7..+1.3 points** of acceptance (94k and 5k contexts), the same model with the SSM decode fusions disabled **loses 18 % t/s** (acceptance 0.611 vs 0.792), and the issue's reporter measures **−7..−9 % tg** on his box.  It is worth **+1.0-2.7 % prefill and ~0 % decode**: 27B 1 GPU pp512 1397 vs 1371, pp2048 1403 vs 1366, pp8192 1341 vs 1316 (tg128 30.89 vs 30.87); 35B-A3B 1 GPU pp2048 4976 vs 4922; 27B 3 GPU `-sm tensor` pp2048 1990 vs 1972.  So the **strided reduction is the default**: it is the reference every recorded MTP/acceptance number, the adaptive-MTP controller's tuning and the decode-band norm fusions were built on — `rms_norm_q8_1_f32` (the rms_norm→Q8_1 fold), `gdn-conv`'s folded q/k norms, the GDN norm gate, `rms_norm_scale_pair_f32` and `hc_combine_norm_f32` are documented **bit-identical to `rms_norm_f32`**, which only holds while both reduce the same way.  Verified with the decode-shape KLD probe (`scripts/gate-prefill-logits.sh --ab "<fusion env>" --ub 1`): every fusion arm is **0.000000 / 100.000 %** on the default and 0.0005 / 99.2 % with `=1` (the fused arm becomes *approximate*, it is not disabled).  `=1` is an A/B / bisection arm, not a shipping configuration.  Rule: `GREEDY-PURITY.md` §60; numbers: `benchmarks/2026-10-26-rms-norm-float4-ab.md`. |
 
 ---
 

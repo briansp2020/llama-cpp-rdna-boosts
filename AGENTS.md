@@ -700,6 +700,20 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   non-MTP throughput.** `GREEDY-PURITY.md` §19.
 - **MoE decode/verify is byte-identical by default:** the fused shared-expert band serves
   `1 <= nt <= 8` with `nwarps` pinned; `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` is the A/B kill-switch.
+- **The RMS-norm reduction order is a numerics reference, not a knob (r145, issue #229).**
+  `ggml_cuda_rms_norm_vec()` (`common.cuh`) is the single selector: **default OFF = the pre-#29720 strided
+  scalar reduction**, `GGML_CUDA_RMS_NORM_VEC=1` = upstream #29720's float4 grouping (which the r127 re-base
+  had made unconditional).  A reduction-order change moves every layer by ~1 ulp and greedy MTP draft
+  acceptance by a payload-dependent amount (issue #229: -7..-9 % tg on the reporter's box; +0.7..+1.3 points
+  here, but 0.611 vs 0.792 acceptance / -18 % t/s with the SSM decode fusions disabled), so float4 is worth
+  **+1.0-2.7 % prefill and ~0 % decode** and is not a shipping default.  The strided reduction is also what
+  every decode-band fused norm kernel is documented bit-identical to (the rms_norm->Q8_1 fold,
+  `rms_norm_scale_pair_f32`, `rms_norm_mul_rope_f32`, gdn-conv's folded q/k norms, the GDN norm gate,
+  `hc_combine_norm_f32`) - under the float4 default three of them were silently *approximate*
+  (0.0005 mean KLD at `-ub 1` where the contract says 0).  A new fused norm kernel owes that probe
+  (`scripts/gate-prefill-logits.sh --ab "<fusion env>" --ub 1`, must read 0.000000 / 100.000 %), and every
+  kernel standing in for `rms_norm_f32` must consult the selector rather than hard-code a grouping.
+  `GREEDY-PURITY.md` §60; `ENVIRONMENT.md` §7.5; `benchmarks/2026-10-26-rms-norm-float4-ab.md`.
 - **The r25 tensor-split fold (PR #106 minus its patch 0002) has three invariants to keep together:** a
   retired **Q8_1 arena must outlive captured graphs** (`GGML_CUDA_Q8_1_ARENA_FREE_OLD=1` restores the
   `quantize_q8_1` page fault); a graph is **recaptured when the pool / FA-staging / H2D-ring memory it

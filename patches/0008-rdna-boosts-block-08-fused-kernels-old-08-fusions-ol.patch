@@ -1,4 +1,4 @@
-From 953795c14c71815c53fad8d3e4d2589309daba1d Mon Sep 17 00:00:00 2001
+From b2496d980e1ed611af2583e49960cc232e01464c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 08/14] rdna-boosts: block 08: fused kernels (old-08 fusions +
@@ -45,7 +45,7 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
 ---
  ggml/src/ggml-cpu/ops.cpp                     |    8 +
  ggml/src/ggml-cuda/argsort.cu                 |   12 +-
- ggml/src/ggml-cuda/common.cuh                 |  145 ++
+ ggml/src/ggml-cuda/common.cuh                 |  172 ++
  ggml/src/ggml-cuda/gdn-conv.cu                |  135 ++
  ggml/src/ggml-cuda/gdn-conv.cuh               |   16 +
  ggml/src/ggml-cuda/getrows.cu                 |   12 +-
@@ -61,7 +61,7 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  ggml/src/ggml-cuda/moe-weighted-reduction.cuh |    3 +-
  ggml/src/ggml-cuda/norm-gated.cu              |  128 ++
  ggml/src/ggml-cuda/norm-gated.cuh             |   20 +
- ggml/src/ggml-cuda/norm.cu                    |  384 +++-
+ ggml/src/ggml-cuda/norm.cu                    |  391 +++-
  ggml/src/ggml-cuda/norm.cuh                   |    9 +
  ggml/src/ggml-cuda/ple-conv.cu                |  195 ++
  ggml/src/ggml-cuda/ple-conv.cuh               |   16 +
@@ -78,7 +78,7 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  ggml/src/ggml-cuda/unary.cu                   |  231 ++
  ggml/src/ggml-cuda/unary.cuh                  |   12 +
  tests/test-backend-ops.cpp                    |    2 +-
- 35 files changed, 5498 insertions(+), 432 deletions(-)
+ 35 files changed, 5530 insertions(+), 434 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cuh
  create mode 100644 ggml/src/ggml-cuda/mmvq-rdna-params.cuh
@@ -142,10 +142,44 @@ index 101afeba2..8ad5e807d 100644
              ggml_cuda_swap(dst_row[col], dst_row[ixj]);
          }
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index b63d5efc3..75be491e2 100644
+index b63d5efc3..673ceb058 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1591,6 +1591,132 @@ struct ggml_backend_cuda_context {
+@@ -40,6 +40,33 @@
+ #include "vendors/cuda.h"
+ #endif // defined(GGML_USE_HIP)
+ 
++// RMS-norm reduction selector (issue #229) -- a NUMERICS switch, not a tuning knob.  The RMS sum's
++// partial-sum grouping decides its last bits; every layer then differs by ~1 ulp and greedy MTP draft
++// acceptance is a discrete function of that, so the grouping is part of the delivery's reference.
++//
++// Default: the strided scalar reduction upstream used before ggml-org/llama.cpp#29720.  Every recorded
++// MTP/acceptance number, the adaptive-MTP controller's tuning and the decode-band norm fusions
++// (`rms_norm_q8_1_f32`, gdn-conv's folded q/k norms, the GDN norm gate, `rms_norm_scale_pair_f32`) are
++// built on it, and those kernels are documented bit-identical to `rms_norm_f32`, which only holds while
++// both use the same grouping.
++//
++// `GGML_CUDA_RMS_NORM_VEC=1` opts into #29720's float4 grouping: a lane owns the four columns
++// 4*i .. 4*i+3 of i = tid + k*block_size instead of one strided column per step.  Measured on gfx1201
++// (Qwen3.8-27B UD-Q4_K_XL, 1 GPU): +1.0-2.7 % prefill, ~0 % plain decode, and a payload-dependent change
++// in greedy text and MTP draft acceptance -- +0.7..+1.3 points of acceptance on the default arm (94k and
++// 5k contexts), but 0.611 vs 0.792 acceptance (-18 % t/s) with the SSM decode fusions disabled (the
++// shape issue #229 reports) and -7..-9 % tg on the reporter's own box.  With it on, the fused norm
++// kernels above are *approximate* relative to the chain they replace (0.0005 mean KLD at `-ub 1`;
++// measured exactly 0.000000 / 100.000 % on the default).  Every kernel documented as bit-identical to
++// rms_norm_f32 consults this, so an arm stays coherent.
++// GREEDY-PURITY.md §60, ENVIRONMENT.md, patches/README.md (block 08).
++static inline bool ggml_cuda_rms_norm_vec() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_CUDA_RMS_NORM_VEC");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on;
++}
+ #define STRINGIZE_IMPL(...) #__VA_ARGS__
+ #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
+ 
+@@ -1591,6 +1618,132 @@ struct ggml_backend_cuda_context {
          name(GGML_CUDA_NAME + std::to_string(device)) {
      }
  
@@ -278,7 +312,7 @@ index b63d5efc3..75be491e2 100644
      ggml_cuda_stream_context concurrent_stream_context;
  
      ~ggml_backend_cuda_context();
-@@ -1648,6 +1774,20 @@ struct ggml_cuda_mm_fusion_args_host {
+@@ -1648,6 +1801,20 @@ struct ggml_cuda_mm_fusion_args_host {
      const ggml_tensor * gate_bias = nullptr;
      const ggml_tensor * x_scale = nullptr;
      const ggml_tensor * gate_scale = nullptr;
@@ -299,7 +333,7 @@ index b63d5efc3..75be491e2 100644
      ggml_glu_op glu_op;
      float glu_limit = 0.0f;
      const ggml_tensor * shared_up = nullptr;
-@@ -1660,6 +1800,11 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1660,6 +1827,11 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -5647,7 +5681,7 @@ index 000000000..e8b5888dc
 +int  ggml_cuda_norm_rows_match_at (const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);
 +void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m);
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index 3f0ea6f2a..0f7dae79f 100644
+index 3f0ea6f2a..23fc03161 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -1,6 +1,15 @@
@@ -5803,7 +5837,21 @@ index 3f0ea6f2a..0f7dae79f 100644
      static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
      static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
  
-@@ -453,13 +527,13 @@ template <bool do_scale = false>
+@@ -412,8 +486,11 @@ static void rms_norm_f32_dispatch(
+     const float * mul = mul_t ? (const float *) mul_t->data : nullptr;
+     const float * add = add_t ? (const float *) add_t->data : nullptr;
+ 
+-    // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here
+-    bool vec = ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst & 15) == 0;
++    // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here.
++    // `vec` is the float4 grouping ggml-org/llama.cpp#29720 introduced; it is opt-in (issue #229) so that the
++    // delivery's default reduction stays the one every MTP number and every fused norm kernel is built on --
++    // see ggml_cuda_rms_norm_vec() in common.cuh.
++    bool vec = ggml_cuda_rms_norm_vec() && ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst & 15) == 0;
+     vec = vec && ggml_cuda_is_aligned(x_t, 16);
+     if constexpr (do_multiply) {
+         vec = vec && mul_ncols_packed.z == (uint32_t) ncols
+@@ -453,13 +530,13 @@ template <bool do_scale = false>
  static void rms_norm_f32_cuda(
          const ggml_tensor * x_t, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
          const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream,
@@ -5819,7 +5867,7 @@ index 3f0ea6f2a..0f7dae79f 100644
  }
  
  static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
-@@ -488,10 +562,12 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
+@@ -488,10 +565,12 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
                                    const uint32_t add_nchannels,
                                    const uint32_t add_nsamples,
                                    const float    eps,
@@ -5834,7 +5882,7 @@ index 3f0ea6f2a..0f7dae79f 100644
          return;
      }
      const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
-@@ -505,7 +581,7 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
+@@ -505,7 +584,7 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
              blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
              mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
              mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
@@ -5843,7 +5891,7 @@ index 3f0ea6f2a..0f7dae79f 100644
      } else {
          const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
          const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
-@@ -516,7 +592,7 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
+@@ -516,7 +595,7 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
              mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
              mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
              add_t, add_stride_row, add_stride_channel, add_stride_sample,
@@ -5852,7 +5900,7 @@ index 3f0ea6f2a..0f7dae79f 100644
      }
  }
  
-@@ -545,6 +621,58 @@ static void l2_norm_f32_cuda(
+@@ -545,6 +624,58 @@ static void l2_norm_f32_cuda(
      }
  }
  
@@ -5911,7 +5959,7 @@ index 3f0ea6f2a..0f7dae79f 100644
  void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
      const float * src0_d = (const float *) src0->data;
-@@ -569,6 +697,29 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -569,6 +700,29 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
  }
  
@@ -5941,7 +5989,7 @@ index 3f0ea6f2a..0f7dae79f 100644
  void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
      const float * src0_d = (const float *)src0->data;
-@@ -588,6 +739,204 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+@@ -588,6 +742,204 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
      group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
  }
  
@@ -6146,7 +6194,7 @@ index 3f0ea6f2a..0f7dae79f 100644
  void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
      float * dst_d = (float *) dst->data;
-@@ -661,6 +1010,11 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -661,6 +1013,11 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
      GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
      GGML_ASSERT(eps >= 0.0f);
  
@@ -6158,7 +6206,7 @@ index 3f0ea6f2a..0f7dae79f 100644
      const int64_t ne00 = rms_norm_src->ne[0];
      const int64_t ne01 = rms_norm_src->ne[1];
      const int64_t ne02 = rms_norm_src->ne[2];
-@@ -690,7 +1044,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -690,7 +1047,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
                            mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                            /*add_s00*/ 0, 0, 0,
                            0, 0, 0, 0,
