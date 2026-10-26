@@ -79,6 +79,47 @@ gfx1201, the caveat that gfx1030 is unmeasured here, the clamp fix already in r1
 clarification (it is RDNA4-band-only by construction, so it cannot change a gfx1030 run), and the chunk
 finding with its r138 workaround (`GGML_COMPUTE_BUFFER_CHUNK_MIB=0`) and the r139 fix.
 
+## 261025.012 (r138) -- the CI worker's GPU gate, and what it actually costs
+
+`radiance` (a gfx1151 twin of `halo`, used as the CI/CD work-horse) now runs the repo's heavy gating tier.
+Three tiers, stated explicitly in `AGENTS.md` because "CI" had been used for two different jobs:
+
+| tier | where | trigger | cost |
+|---|---|---|---|
+| 1 | `.github/workflows/validate.yml` (hosted, no GPU) | every push/PR | ~20 s |
+| 2 | `scripts/validate-gpu.sh` on `radiance` (cron `*/30`) | a change in the delivery CONTENT | 0.3 s - ~12 min (below) |
+| 3 | a GPU box, by hand | before a tag | hours |
+
+Tier 1 gained a **per-block-tree scan** in `validate-set.sh`: conflict markers and block subjects in
+**every** block commit, not just the tip.  That is exactly the r138 defect class — a resolution slip
+committed `<<<<<<<` inside block 10's tree and a fix landed one block late in block 08 — where the tip is
+clean and only the block's own tree is broken.  Proven by injecting a marker into a middle block tree: the
+scan names that commit.
+
+Tier 2 (`validate-gpu.sh`) materialises the set from scratch at `origin/main`, asserts the applied tree ==
+`release.json.tree`, runs the `--fast` per-block ladder, the seven op oracles and the prefill-logit gate;
+it holds its own `flock`, skips while a container build runs, caps attempts per rev, and prunes runs.
+
+**Cost, measured rather than assumed** (the question was whether this ties the box up for hours):
+
+* **cold ccache, whole chain: 87m37s — one time only.**  The ladder alone was 4882 s and the cost is the FA
+  instantiation sets: blocks 05-12 each compile their own cold (520-610 s each) while blocks 00-04 are
+  10-114 s.  ccache was empty because the box had none installed (installed rootlessly: the static 4.12.3
+  release binary, `--max-size=30G`).
+* **warm ladder, same chain: 89 s** (55x).
+* **unchanged delivery content: 0.3 s** — idempotence is keyed on `base:tree:n_blocks`, so a docs or
+  benchmarks push on `main` costs nothing (the first cut keyed on the commit sha and would have re-validated
+  every push).
+* **warm full run: 5m36s** (ladder 6 s with `--changed-from` the previous applied chain — only the tip
+  rebuilds — plus ~5 min of op oracles).
+* **prefill-logit: ~6 min**, and it now runs only when the applied tree moved a prefill path
+  (`ggml/src/ggml-cuda/`, `ggml/src/ggml.c`, `src/llama-graph.cpp`, `src/models/`, `src/llama-kv-cache*`)
+  or the base moved; `KLD_ALWAYS=1` forces it.
+
+So a release-shaped push costs ~6 min (~12 min if it moves a prefill kernel) and a docs push costs 0.3 s.
+Two self-inflicted bugs were caught by measuring: a legitimate prefill skip fell through into the failure
+branch, and a skip was being treated as a partial run (which withheld the up-to-date marker).
+
 ## 261025.011 (r138) -- container watcher: bounded retries, a checked checkout, bounded logs
 
 Inspected the off-host release pipeline on `radiance` (the watcher is the only automated piece there; there is

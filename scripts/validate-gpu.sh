@@ -41,13 +41,15 @@
 #                                        did not touch a prefill path (see below)
 #
 # COST (measured on radiance, gfx1151 APU, 16 threads, 2026-10-25)
-#   cold ccache, whole chain       87 min   <- one-time; the FA instantiation sets dominate
-#                                          (blocks 05-12 each compile their own cold, 520-610 s each)
-#   warm, whole chain              89 s     ladder + ~2 min op tests + ~6 min prefill-logit
-#   warm, nothing changed          0        skipped on the delivery CONTENT key, not the commit
-#   warm, one block amended        ~2 min   ladder selects only the changed blocks (--changed-from)
-#   So a release pays ~3-4 min, a docs push pays nothing, and only a change that touches a
-#   prefill kernel also pays the 6 min logit gate.
+#   cold ccache, whole chain        87m37   <- ONE-TIME; the FA instantiation sets dominate: the
+#                                            ladder was 4882 s and blocks 05-12 each compile their
+#                                            own set cold (520-610 s per block; 00-04 are 10-114 s)
+#   warm ladder, whole chain        89 s
+#   unchanged delivery content      0.3 s   skipped on base:tree:n_blocks, not on the commit
+#   warm full run (patch set same)  5m36    ladder 6 s (only the tip) + ~5 min op oracles
+#   prefill-logit, when relevant    ~6 min  a 9B Q8_0 base at ctx 512 x 40 chunks
+#   => a release-shaped push costs ~6 min, ~12 min if it moves a prefill kernel, and a docs or
+#      benchmarks push costs 0.3 s.  The cold figure is bring-up only: do not plan around it.
 #      CI_LOCK (the container watcher's lock)  default $HOME/.cache/rdna-containers/.lock
 #
 # Exit: 0 = validated (or nothing to do / already given up on this rev); 1 = a step failed.
