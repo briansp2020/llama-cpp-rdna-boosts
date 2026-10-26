@@ -13,6 +13,10 @@
 #      subject (r138: a resolution slip committed `<<<<<<<` inside block 10's tree and
 #      a fix landed one block late in block 08's tree; both are compile errors only in
 #      that block's own tree, so the tip built fine -- see "per-block build gate")
+#   7. no file the delivery ADDS calls a POSIX-only function outside a
+#      Windows-excluding preprocessor region (issue #231: two `close()` calls added
+#      to moe-expert-cache.cu in r143 are a hard compile error with HIP on Windows,
+#      and no gate on a Linux box can see it -- scripts/check-windows-portability.sh)
 #
 # Checks 3-5 are the ones that would have caught the 2026-09-13 CI break (a
 # stale fork point) in a minute instead of after three failed matrix jobs.
@@ -124,5 +128,12 @@ for c in $chain; do
   fi
 done
 [ "$bad" -eq 0 ] || fail "block-chain scan failed (see above)"
+
+# Windows portability lint (issue #231): a POSIX-only call in a file the delivery adds is a hard
+# compile error with HIP on Windows, and nothing on a Linux box can compile it.  Cheap (~1 s) and
+# scoped to added files, so it is CI-clean by construction; see the script header for the scope.
+echo "==> scanning the files the delivery adds for Windows-hostile POSIX calls"
+bash "$REPO_DIR/scripts/check-windows-portability.sh" --root "$src" --diff-from "HEAD~$n_blocks" \
+  || fail "Windows portability scan failed (see above)"
 
 echo "==> OK: base $base, $n_blocks blocks, applied tree ${tree:-$got}"

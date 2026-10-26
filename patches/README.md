@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r146`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r147`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -48,7 +48,7 @@ only as a rough shape.
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters) | +15081 / −525 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill) | +11976 / −433 | 46 |
-| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227) | +4029 / −754 | 46 |
+| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231) | +4034 / −755 | 46 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
 
@@ -1485,6 +1485,18 @@ had no other home.
   latched floor) and un-sizes the cache.  Un-sizing is half the fix: a second model used to inherit
   `g_sized` and therefore stayed **uncached for its whole run**.  Single-model runs are unchanged (the
   teardown only adds the drop log lines) -- it is a lifecycle rule, not a policy.
+
+* **The host pool's file I/O goes through five portability helpers, and a new call site must too (issue
+  #231).**  The bounded host pool is a POSIX feature; every file call goes through `pool_open_file`,
+  `pool_fd_align`, `pool_pread`, `pool_aligned_alloc` and (r147) `pool_close_file`, whose `_WIN32` versions
+  are no-ops -- the pool never opens a file on Windows, marks itself failed, and a miss is served from the
+  pinned master exactly as if it were disabled.  r143's teardown called `close()` directly in
+  `pool_free_locked` and in `moe_cache_forget_all`'s table drop, which is a hard compile error with HIP on
+  Windows (`close` undeclared; `<unistd.h>` is included only under `#if !defined(_WIN32)`), and r131 and
+  earlier did not have them.  Behaviour on Linux is unchanged (`pool_close_file` is `close`).  No gate on
+  this box can compile it -- there is no Windows runner -- so `scripts/check-windows-portability.sh` lints
+  for it (tier-1 CI, via `validate-set.sh`): a new host-side file call in a file the delivery adds is
+  either guarded on `_WIN32` or gets a sixth helper beside these five.
 
 **Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `GGML_LF_DFLASH_DEV`, `GGML_LF_FAST_TOPK`,
 `LLAMA_DFLASH_INGEST_TAIL` (r130), `LLAMA_STATE_GET_MERGE_GAP`, `LLAMA_STATE_ASYNC`, `LLAMA_STATE_ASYNC_MAX_MIB`,

@@ -51109,10 +51109,10 @@ index 5605bf7a4..10b689844 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..dcd7818fa
+index 000000000..2da25e785
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,6639 @@
+@@ -0,0 +1,6643 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -52024,7 +52024,7 @@ index 000000000..dcd7818fa
 +// ---- wip/host-expert-dio-cache Phase 2: the bounded pinned host tier (L2) -------------------------
 +
 +// Host-pool file I/O portability (issue #130).  The bounded host pool is a POSIX feature; every
-+// file call goes through these four helpers so the Windows build compiles.  There `pool_open_file`
++// file call goes through these five helpers so the Windows build compiles.  There `pool_open_file`
 +// returns -1, the pool marks itself failed, and a miss is served from the pinned master exactly as
 +// if the pool were disabled.  A real Windows pool (ReadFile with an OVERLAPPED offset,
 +// FILE_FLAG_NO_BUFFERING for the DIO mode, _aligned_malloc) would be the proper fix if wanted.
@@ -52034,6 +52034,7 @@ index 000000000..dcd7818fa
 +static void pool_fd_align(int fd, size_t * align) { (void) fd; (void) align; }
 +static pool_ssize_t pool_pread(int fd, void * dst, size_t len, size_t off) { (void) fd; (void) dst; (void) len; (void) off; return -1; }
 +static bool pool_aligned_alloc(size_t align, size_t size, void ** out) { (void) align; (void) size; (void) out; return false; }
++static void pool_close_file(int fd) { (void) fd; }
 +#else
 +typedef ssize_t pool_ssize_t;
 +static int  pool_open_file(const char * path, bool dio) {
@@ -52050,6 +52051,9 @@ index 000000000..dcd7818fa
 +}
 +static bool pool_aligned_alloc(size_t align, size_t size, void ** out) {
 +    return posix_memalign(out, align, size) == 0;
++}
++static void pool_close_file(int fd) {
++    close(fd);
 +}
 +#endif
 +
@@ -52507,7 +52511,7 @@ index 000000000..dcd7818fa
 +        p.base_dev = nullptr;
 +    }
 +    if (p.fd >= 0) {
-+        close(p.fd);
++        pool_close_file(p.fd);
 +        p.fd = -1;
 +    }
 +    (void) cudaGetLastError();   // fail soft: a bad free must not abort a model teardown
@@ -55472,7 +55476,7 @@ index 000000000..dcd7818fa
 +            t.bounce.clear();
 +        }
 +        if (t.src_fd >= 0) {
-+            close(t.src_fd);
++            pool_close_file(t.src_fd);
 +            t.src_fd = -1;
 +        }
 +    }

@@ -1,5 +1,96 @@
 # WORKLOG - dated delivery records
 
+## 261026.005 (r147) -- issue #231: the host pool's fifth portability helper (`pool_close_file`), and a lint that makes the class impossible to miss
+
+**Release:** `v15-6050b467c-r147` (base `6050b467c`, canonical tip `38507e070`, tree
+`8485179335b2e0e5fa1e03f8cca1940560ec147d`, 15 blocks).  Delta against the r146 tree: **1 file, +7/-3** --
+`ggml/src/ggml-cuda/moe-expert-cache.cu`, all in **block 12**.  On Linux the change is a no-op
+(`pool_close_file` *is* `close`), so no kernel, allocation, numerics or heap behaviour moves; the whole
+point is that the file compiles with HIP on Windows again.
+
+### What issue #231 reports
+
+`overdoingism`, HIP on Windows, stock r144 tree: one translation unit fails, `moe-expert-cache.cu` (host
+pass), at two places --
+
+```
+moe-expert-cache.cu:1395:9: error: use of undeclared identifier 'close'; did you mean 'fclose'?
+moe-expert-cache.cu:4360:13: error: use of undeclared identifier 'close'; did you mean 'fclose'?
+```
+
+both added by **r143** (`pool_free_locked` and the table teardown in `moe_cache_forget_all`).  The file
+includes `<unistd.h>` only under `#if !defined(_WIN32)`; every other host-pool file call in it goes
+through the four portability helpers of issue #130 (`pool_open_file`, `pool_fd_align`, `pool_pread`,
+`pool_aligned_alloc`), whose Windows variants do nothing -- the bounded pool never opens a file there, so
+`p.fd` / `t.src_fd` stay -1 and a miss is served from the pinned master.  The two remaining direct
+`close()` calls in the file are inside `#if !defined(_WIN32)` blocks and were always fine.  r131 and
+earlier do not have these calls: the teardown feature brought the break, not the portability contract.
+
+### Shipped (block 12)
+
+A fifth helper beside the other four, exactly as the report proposed: `pool_close_file(fd)` -- empty
+under `_WIN32`, `close(fd)` elsewhere -- and the two call sites route through it.  The comment above the
+helper group now says "five".  Why the empty Windows arm is correct and not a stub: `pool_open_file`
+returns -1 there, `pool_free_locked` and the table drop both test `fd >= 0` first, so the helper is
+unreachable on Windows by construction; it exists so the *call* is compiled, which is the only thing the
+Windows build needs.
+
+### Shipped (delivery tooling, not part of `patches/`) -- the class is now linted in tier 1
+
+A one-off fix would leave the defect class alive, and no gate on this box can reach it: there is no
+Windows runner, and a Linux clang with the wrong branch is silent.  `scripts/check-windows-portability.sh`
+now reports, per file, a call to an unambiguous POSIX-only identifier (`open`, `close`, `pread`,
+`pwrite`, `fsync`, `fdatasync`, `unlink`, `fstat`, `access`, `opendir`/`readdir`, `posix_memalign`,
+`posix_fadvise`, `fallocate`, `ftruncate`, `mkstemp`, `readlink`, `sysconf`, `getpid`, `dlopen`, `mmap`,
+`munmap`, `usleep`, ...) that is **compiled on Windows**: it walks the preprocessor stack and evaluates
+every condition with `_WIN32`/`_MSC_VER` pinned, three-valued for unknown macros, with the platform
+macros (`__linux__`, `__unix__`, `__APPLE__`, `__HAIKU__`, ...) false, and it learns a local predicate
+such as `LLAMA_LAZY_READER_POSIX` from the `#define` that is provably reached on Windows.  Comments and
+string literals are stripped, and a qualified or longer name (`obj.close()`, `Klass::close()`,
+`pool_close_file()`) is not a match, so the lint is reviewable rather than clever.  Scope is deliberately
+the files the delivery **adds** (`git diff --diff-filter=A base..HEAD`): several upstream files it edits
+have module-local names that collide with POSIX ones (hexagon's `mmap(bool)`, vulkan's member `close()`, zDNN's unguarded `sysconf` on a backend Windows never builds), so `--modified-too` exists but is a
+read-the-output sweep, not a CI gate.  `scripts/validate-set.sh` runs it on the freshly applied tree
+(with `--diff-from HEAD~n_blocks`), i.e. `.github/workflows/validate.yml` tier 1, ~1 s, no compiler.
+
+**Negative control (that is the evidence, since there is no Windows compiler here):** pointed at the
+r146 tree the lint reports exactly `moe-expert-cache.cu:1395 close(p.fd)` and `:4360 close(t.src_fd)` --
+the two lines in the report, at the reported line numbers -- and at r147 it reports none across the 282
+files the set adds.  It also has to *not* fire on the delivery's own guarded code, and it does not:
+`llama-lazy-reader.cpp`'s `close`/`pread` sit under `#if LLAMA_LAZY_READER_POSIX`, which the header
+defines as `0` under `#if defined(_WIN32)`.
+
+### Validation (gfx1201, ROCm 10.1.0)
+
+The change cannot move a number on Linux, so the gates are about proving it really is inert:
+
+* **Same-seed greedy text, old vs new build** (both built in the canonical `build-rocm` at the same source
+  path, one `.cu` apart): dense Qwen3.5-4B Q8_0, 3 GPU `-sm tensor`, `-c 4096`, `--seed 42 --temp 0` --
+  **identical**; 35B-A3B UD-Q4_K_M, 2 GPU `-sm tensor -ncmoe 40 --host-experts pool`, 64 tokens --
+  **identical** (only the t/s line differs).  That second arm is the one that matters: the pool opened
+  its GGUF, prewarmed 120 tables and both teardown paths ran (`moe_cache_forget_all: dropped 120
+  expert-cache table(s) (9331.0 MiB of arena)` on device 0 and device 1), so `pool_free_locked`'s
+  `pool_close_file(p.fd)` and the drop's `pool_close_file(t.src_fd)` are genuinely executed, exit 0, no
+  abort, no GPU fault.
+* `scripts/gate-prefill-logits.sh` against the recorded r145 base (27B Q8_0, 40 chunks): **0.000000 mean
+  KLD / 100.000 % same-top-p** -- expected to the digit, and recorded because it is the release gate.
+* `scripts/gate-park-idle-slots.sh` (the release gate that is the only end-to-end exercise of
+  `llama_memory_seq_park`): **PASS**, 6 parks + 2 unparks traced on both caches, park == lazy-off 4/4,
+  and the un-parked arm still differing on 2 of 4 (the workload still reproduces #210).
+* `scripts/gate-per-block-build.sh --fast --changed-from 105ac9d9a`: **2/2** (block 12 + the tip; blocks
+  00-11 and 13 carry byte-identical deltas, so the patch-id selection skipped them).
+* `scripts/validate-set.sh`: strict 15/15 on a fresh tarball, tree equal, and the new portability scan
+  green on the applied tree.
+
+Not run, by design: MTP Protocol A (no decode/fusion change), `test-backend-ops` (no kernel change) and
+the container rebuild (the worker does that from the tag; nothing in an image changes behaviourally).
+
+### Note for the next Windows report
+
+This lint is textual.  It cannot see a missing `#include`, an MSVC type difference, or the
+`std::min<int64_t>` mangled-name clash of issue #217 -- those still need a build log.  What it does mean
+is that "a POSIX call was added outside the `_WIN32` guard" can no longer reach a release.
+
 ## 261026.004 (r146 follow-up) -- the parking fix is validated on 2 GPUs too (`-ncmoe 44`)
 
 **No artifact changed** (patches, tree and `release.json` are r146's): this entry completes r146's validation
