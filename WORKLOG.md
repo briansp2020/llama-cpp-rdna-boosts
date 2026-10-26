@@ -2,8 +2,10 @@
 
 ## 261026.003 (r146) -- issue #227: parking moves a mirroring indexer cache with the attention cache (qwen4exp/glm5-next)
 
-**Release:** `v15-6050b467c-r146` (base `6050b467c`, canonical tip `5ba04fa7c`, tree
-`13722383a3a2988214f3faa9ab0d347ce546af9d`, 15 blocks).  Delta against the r145 tree: **4 files,
+**Release:** `v15-6050b467c-r146` (base `6050b467c`, canonical tip `105ac9d9a`, tree
+`13722383a3a2988214f3faa9ab0d347ce546af9d`, 15 blocks).  The chain was cut on `5ba04fa7c` and re-applied
+from the regenerated patch set at release time (the fork-branch refresh); the re-apply has its own SHAs and
+the same tree, which is the identity `release.json` records.  Delta against the r145 tree: **4 files,
 +98/-2** -- `llama-memory-hybrid-idx.{h,cpp}` (the park decision and the invalidation of what is derived
 from the cells), `llama-memory.cpp` (the dispatch) and `llama-ext.h` (the contract), all in **block 12**.
 No kernel, no allocation and no numerics change: the code is reached only through the server's idle-slot
