@@ -1837,12 +1837,20 @@ happen to be the same length -- +35 % / +52 %, and the penalty grows with the nu
 pass spans.  That is why the gate runs both device counts.
 
 The rule: **the sequences that verify in one step must present the same row count.**  The fix (`LLAMA_SPEC_ALIGN`,
-on) raises every drafting sequence's cap to the deepest cap in the same `draft()` call -- only ever up, and
-never past a sequence's own hard bound -- and cuts the drafts to the shortest one when the lengths still differ
-(a different speculator per slot, or a slot whose own `n_max` is smaller because the response is running out of
-tokens).  The implementation that produced a cut draft is told (`common_speculative_impl::draft_truncated()`),
-so its acceptance statistics count only the positions the target verified.  A slot that drafted **nothing** is
-left alone: cutting its neighbour's good draft to nothing is the worse trade, and that step still splits.
+on) makes that true **inside the drafter whose per-sequence caps created the mismatch**
+(`draft-mtp-adaptive`): every drafting sequence gets the deepest cap in the same `draft()` call, bounded by the
+smallest hard cap in the call (a response running out of tokens) and by the expert cache's band.
+
+It is deliberately NOT a cut of the finished drafts to the shortest, and that was measured rather than assumed:
+r153 shipped that cut and it is a **loss** on the n-gram-first chain, where the lengths differ because of
+CONTENT rather than a cap.  On the reporter's own case (`--spec-type ngram-mod,draft-dflash` + a DFlash2 draft,
+27B, 2 GPU, recall + prose, `-n 200`) the `min` fires on every step whose n-gram match is shorter than the DFlash
+block, truncates the OTHER slot's good draft, and the pair aggregates 65.6 -> 61.7 t/s (-6 %) while the prose
+slot's acceptance falls 74 % -> 50 %: splits 12 -> 1, and the lost proposals cost far more than the removed pass.
+r154 removed it, so a chain of different drafters behaves exactly as before (measured inert: 64.6 vs 64.4 t/s,
+identical draft counts) and `gate-spec-align.sh` gates that arm.  A corollary worth stating: a length mismatch is
+only worth equalizing when a CAP caused it; when the content did, the two drafts are not comparable and the
+second ubatch is the cheaper arm.  A slot that drafted **nothing** is left alone for the same reason.
 
 **The oracle: the promise is PER CONFIG, and that is what makes a two-slot text diff the wrong instrument.**
 Any fix for this must change some slot's verify width (align up, or cut the other slot down), and a verify

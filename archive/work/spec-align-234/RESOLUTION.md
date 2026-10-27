@@ -1,7 +1,8 @@
 # RESOLUTION -- multi-slot verify-batch alignment (issue #234) promoted into blocks 02/09, r153
 
-**Status:** promoted 2026-10-27 in `v15-6050b467c-r153` (blocks 02 + 09; `release.json` tip `1e992529d`,
-tree `672f788c9b`).  Reported by **@overdoingism** in
+**Status:** promoted 2026-10-27 in `v15-6050b467c-r153` (blocks 02 + 09) and **corrected the same day in
+`v15-6050b467c-r154`** (block 02), which removed the generic cut after it measured -6 % on the reporter's other
+chain; see "The r153 cut, and why r154 removed it" below.  `release.json` carries the r154 tip and tree.  Reported by **@overdoingism** in
 [issue #234](https://github.com/stew675/llama-cpp-rdna-boosts/issues/234) with a measurement, an analysis and a
 patch (`0015-6055-spec-align-v1`) cut on two drafters of their own.  The release record is `WORKLOG.md`
 261016.001; the rule is `GREEDY-PURITY.md` §63.
@@ -38,19 +39,14 @@ step with depths 3 and 4 prints `RSPREP prep=1/2 n_tokens=4 ... seq_ids=[0]` fol
 
 ## What shipped
 
-`LLAMA_SPEC_ALIGN` (default **on**, `0` disables), two halves, both inert with a single drafting sequence:
+`LLAMA_SPEC_ALIGN` (default **on**, `0` disables), two pieces, both inert with a single drafting sequence:
 
-1. **Block 02, `align_draft_caps()`**: `draft-mtp-adaptive` raises every drafting sequence's cap to the deepest
-   cap in the same `draft()` call.  The cap only ever moves up, and each sequence keeps its own hard bound
-   (`--spec-draft-n-max`, itself capped by the MTP layer count, and the caller's per-slot `n_draft_max` from
-   the remaining context), so no sequence is ever asked for a depth it would not draft when it runs alone.
-2. **Block 02, `common_speculative_draft()`**: when the lengths still differ, cut the drafts to the shortest
-   one -- the reporter's own suggestion (a), which covers a different implementation on each slot (an n-gram
-   hit on one, an MTP draft on the other; an n-gram match has no cap at all) and a slot whose own `n_max` is
-   smaller.  The implementation that produced the cut draft is told
-   (`common_speculative_impl::draft_truncated()`), so acceptance statistics count only the positions the
-   target actually verified.  A slot that drafted **nothing** is left alone.
-3. **Block 09, the band bound**: the aligned depth is `min(deepest cap in the call, band / n_drafting - 1)`
+1. **Block 02, `align_draft_caps()`**: `draft-mtp-adaptive` gives every sequence it drafts in one call the same
+   cap: the deepest cap among them, bounded by the smallest **hard** cap in the call (`--spec-draft-n-max`, the
+   MTP layer cap and the caller's per-slot `n_draft_max`, which the server lowers as a response runs out of
+   tokens) and by the expert cache's band.  No sequence is ever asked for more than it would draft when it runs
+   alone, and the alignment never touches another implementation's draft (see the r153 cut below).
+2. **Block 09, the band bound**: the aligned depth is `min(deepest cap in the call, band / n_drafting - 1)`
    rows per sequence, read once from `llama_model_moe_cache_band()` after the target context exists.  The band
    is a property of the **whole** verify batch, so a two-slot verify on RDNA4 (band 16) aligns to 7 rows each,
    not 15 each.  A sequence already deeper than that keeps its own cap: the bound may only *widen* a shallow
@@ -76,6 +72,31 @@ step with depths 3 and 4 prints `RSPREP prep=1/2 n_tokens=4 ... seq_ids=[0]` fol
   `common/speculative.cpp`, together with the two pieces their patch does not have: the per-implementation
   "your draft was cut" feedback and the expert-cache band bound.
 
+## The r153 cut, and why r154 removed it
+
+r153 shipped a second half, the reporter's suggestion (a): a generic "cut the finished drafts to the shortest"
+in `common_speculative_draft()`, with `draft_truncated()` telling the implementation so acceptance counted only
+verified positions.  The gate only exercised `draft-mtp-adaptive` (where the align-up makes the cut a no-op), so
+nothing measured it on the case it was written for.  Measured afterwards on the reporter's chain (a)
+(`--spec-type ngram-mod,draft-dflash` + `Qwen3.8-27B-DFlash2-Q4_K_M`, 27B, 2 GPU, recall + prose, `-n 200`,
+`--spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8`):
+
+| arm | pair per-slot | pair agg | split steps |
+|---|---|---:|---:|
+| `LLAMA_SPEC_ALIGN=0` (r152 behaviour) | 132.9 / 87.6 | **65.6** | 12 |
+| `LLAMA_SPEC_ALIGN=1` (r153, with the cut) | 122.3 / 76.2 | **61.7 (-6 %)** | 1 |
+| `LLAMA_SPEC_ALIGN=1` (r154, cut removed) | 126.7 / 82.6 | 64.6 | 12 |
+
+The `min` is the problem: the two drafts are not comparable (a long n-gram match on one slot, a DFlash block on
+the other), and the cut fires on every step whose n-gram match is shorter than the block, truncating the OTHER
+drafter's good draft.  `RSPREP` shows the verify groups collapsing to 6 rows (both slots at ~2 drafted tokens)
+against 6-and-16 in r152, the prose slot's acceptance falling 74 % -> 50 % (231 -> 284 draft tokens for fewer
+accepts), and the removed pass costing far less than the lost proposals.
+
+So r154 removed the cut and `draft_truncated()`, and `gate-spec-align.sh` now gates the mixed-drafter chain as
+**inert** (within 2 %, identical draft counts) so it cannot come back.  The recorded rule: a length mismatch is
+worth equalizing when a **cap** caused it; when the **content** did, the second ubatch is the cheaper arm.
+
 ## Measured after the fix
 
 `scripts/gate-spec-align.sh` (2 GPUs = the x8 root-port pair, 3 GPUs = all three, plus a 35B-A3B `-ncmoe 40`
@@ -83,9 +104,10 @@ host-expert arm), aggregate t/s of the concurrent pair, split decode steps from 
 
 | arm | knob off | knob on | split steps off -> on |
 |---|---:|---:|---|
-| 27B, 2 GPU | 104.8-108.3 | **140.1-140.6** (**+30..34 %**) | 58 -> 0 |
-| 27B, 3 GPU | 86.5-87.0 | **133.1-133.7** (**+54 %**) | 58 -> 0 |
-| 35B-A3B `-ncmoe 40`, 2 GPU | 116.2 | **149.0** (**+28 %**) | 59 -> 1 |
+| 27B, 2 GPU | 103.8-108.3 | **137.9-140.9** (**+30..35 %**) | 58 -> 0 |
+| 27B, 3 GPU | 86.1-87.0 | **133.0-133.7** (**+54..55 %**) | 58 -> 0 |
+| 35B-A3B `-ncmoe 40`, 2 GPU | 115.7-116.3 | **147.7-149.7** (**+28..29 %**) | 58 -> 0 |
+| `ngram-mod,draft-dflash` + DFlash2, 2 GPU | 99.7 | 99.5 (**-0.2 %, inert**) | 24 -> 24 |
 
 The equal-length arm (two identical prompts) is unchanged: -0.4 / -1.4 / -2.1 / +0.2 % (that arm's spread
 between two identical runs is ~12 %, so the gate bounds it at 10 %).  The final gate run also measures a

@@ -452,20 +452,23 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   lengths put the longer one's tail into a SECOND ubatch and the target runs a full extra pass for that step.
   A fixed `--spec-draft-n-max` never exposed it (every slot drafts `n_max`); the adaptive controller's
   **per-sequence** depth makes it the normal case on a multi-slot server (`--parallel >= 2 --kv-unified`).
-  `LLAMA_SPEC_ALIGN` (default on) aligns one `common_speculative_draft()` call: every drafting sequence's cap is
-  raised to the deepest in that call (only up, never past its own bound) and the drafts are cut to the shortest
-  when the lengths still differ, with `draft_truncated()` telling the implementation so acceptance counts only
-  verified positions.  Measured 27B UD-Q4_K_XL greedy `-n 400`, concurrent recall+reasoning pair: **108.1 ->
+  `LLAMA_SPEC_ALIGN` (default on) makes `draft-mtp-adaptive` give every sequence it drafts in one call the same
+  cap: the deepest in the call, bounded by the smallest HARD cap (a response running out of tokens) and by the
+  band.  The alignment is **inside that one drafter**; a generic cut of the finished drafts to the shortest was
+  shipped in r153 and is a **measured loss** (the n-gram-first chain, -6 %, because it truncates the other
+  drafter's good draft), so r154 removed it: a mismatch caused by CONTENT is not worth equalizing, only one a CAP
+  caused.  Measured 27B UD-Q4_K_XL greedy `-n 400`, concurrent recall+reasoning pair: **108.1 ->
   140.6 t/s at 2 GPU (+30 %), 86.9 -> 133.7 at 3 GPU (+54 %)**, 35B-A3B `-ncmoe 40` 116.2 -> 149.0 (+28 %);
   the split decode steps read 58 before and 0 after.  **Padding the shorter sequence is dead** (a padded row
   advances the recurrent state in `mem_recr->prepare`), and **cutting the adaptive depth to the shallowest is the
   wrong direction** (adaptive depth is worth +13 % over a fixed one at equal lengths).  The band applies to the
   whole batch: the aligned depth is `band / n_drafting - 1` rows per sequence (two slots at depth 7 fill the
   RDNA4 band), never lowering a sequence below its own cap.  On a host-expert config a slot that drafted
-  *nothing* is left alone (that step still splits -- the cheaper arm).  Purity: a verify-width change moves
+  *nothing* is left alone (that step still splits -- the cheaper arm).  Gate: `scripts/gate-spec-align.sh` (2 and 3
+  GPUs, host experts, and a mixed-drafter arm that must stay inert).  Purity: a verify-width change moves
   greedy text by itself, so the oracle is the **single-sequence** byte-identity (`n_seq == 1` and every
   single-slot request) plus a same-width control, never a two-slot text diff (`GREEDY-PURITY.md` §63).
-  Gate: `scripts/gate-spec-align.sh` (2 and 3 GPUs + host experts).  Record: `archive/work/spec-align-234/`.
+  Record: `archive/work/spec-align-234/`.
 - **The draft context's KV cache type follows the main `-ctk` / `-ctv` (r125, block 02).**  Upstream gives
   the speculative draft its own type pair (`-ctkd` / `-ctvd`, default f16) and applies it unconditionally;
   since r125 the draft takes the main model's type unless `-ctkd` / `-ctvd` (or

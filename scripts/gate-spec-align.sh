@@ -46,6 +46,17 @@
 #   HARD  * `n_seq == 1` inertness: a single-sequence `llama-cli` run is byte-identical with the knob on and
 #           off (and equal to REF_HASH when one is set).  With one drafting sequence there is nothing to
 #           align, so this is the strongest cheap purity statement the change has.
+#   HARD  * a MIXED-DRAFTER chain is not slower with the knob on: `--spec-type ngram-mod,draft-dflash` with a
+#           DFlash2 draft (the reporter's own case (a)) must stay within REGRESS_MIXED (default 0.98) of the
+#           knob-off arm, with the same draft counts.  This arm exists because the first cut of this fix DID
+#           ship a regression here and no other arm could see it: the generic "cut the drafts to the shortest"
+#           fires on every step whose n-gram match is shorter than the DFlash block, truncates the OTHER
+#           slot's good draft, and measured -6 % (65.6 -> 61.7 t/s) with the prose slot's acceptance falling
+#           74 % -> 50 %.  The alignment now lives inside `draft-mtp-adaptive` and never touches another
+#           implementation's draft, so this arm is inert by construction -- and it is gated so it stays so.
+#           Its split count therefore stays non-zero (that is the point: those steps keep their second ubatch) and
+#           it is judged ONLY by "inert within REGRESS_MIXED, identical draft counts", never by the recovery and
+#           no-split checks the MTP arms are held to.
 #   HARD  * the control arm actually DIVERGED: it must split at least one decode step into several ubatches
 #           (read from the recurrent memory's `RSPREP` trace, `LLAMA_RS_ROLLBACK_DEBUG=1`).  Without that the
 #           gate would pass having measured nothing, so it fails with an explanation instead.
@@ -71,6 +82,9 @@
 #   MODEL         target GGUF           (default: Qwen3.8-27B UD-Q4_K_XL, qwen35 = hybrid attention + SSM,
 #                                        MTP head EMBEDDED -- do NOT pass -md)
 #   NCMOE_MODEL   second target for the host-expert arm (default: 35B-A3B UD-Q4_K_M)
+#   DRAFT_MIXED   DFlash2 draft for the mixed-drafter arm (default: Qwen3.8-27B-DFlash2-Q4_K_M); set
+#                 MIXED_ARM=0 to skip that arm
+#   PROMPT_B_MIXED  its low-acceptance slot (default: prompts/prose-rdna-boosts.txt)
 #   PROMPT_A      the high-acceptance slot (default: prompts/recall.txt, ~1.00 acceptance)
 #   PROMPT_B      the low-acceptance slot  (default: prompts/reasoning.txt, ~0.76)
 #   PROMPT_B_NCMOE  its counterpart on the host-expert model (default: prompts/prose-rdna-boosts.txt; the
@@ -98,6 +112,9 @@ LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}"
 LLAMA_CLI="${LLAMA_CLI:-$(dirname "$LLAMA_SERVER")/llama-cli}"
 MODEL="${MODEL:-/llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf}"
 NCMOE_MODEL="${NCMOE_MODEL:-/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
+DRAFT_MIXED="${DRAFT_MIXED:-/llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-DFlash2-Q4_K_M.gguf}"
+PROMPT_B_MIXED="${PROMPT_B_MIXED:-$REPO_DIR/prompts/prose-rdna-boosts.txt}"
+MIXED_ARM="${MIXED_ARM:-1}"
 PROMPT_A="${PROMPT_A:-$REPO_DIR/prompts/recall.txt}"
 PROMPT_B="${PROMPT_B:-$REPO_DIR/prompts/reasoning.txt}"
 # the host-expert arm needs its own B prompt: qwen35moe emits EOS immediately on reasoning.txt's raw text
@@ -110,10 +127,12 @@ NGEN_SINGLE="${NGEN_SINGLE:-64}"
 NGPU="${NGPU:-2 3}"
 SM="${SM:-tensor}"
 NCMOE="${NCMOE:-40}"
+MIXED_NMAX="${MIXED_NMAX:-5}"
 NCMOE_ARM="${NCMOE_ARM:-1}"
 CTX="${CTX:-32768}"
 RECOVER="${RECOVER:-1.10}"
 REGRESS="${REGRESS:-0.90}"
+REGRESS_MIXED="${REGRESS_MIXED:-0.98}"
 REF_HASH="${REF_HASH:-}"
 PORT="${PORT:-18301}"
 EXTRA_ARGS="${EXTRA_ARGS:--fa on}"
@@ -140,6 +159,10 @@ done
 [ -f "$PROMPT_A" ]     || { echo "ERROR: no prompt at $PROMPT_A" >&2; exit 2; }
 [ -f "$PROMPT_B" ]     || { echo "ERROR: no prompt at $PROMPT_B" >&2; exit 2; }
 [ -f "$PROMPT_B_NCMOE" ] || { echo "ERROR: no prompt at $PROMPT_B_NCMOE" >&2; exit 2; }
+[ -f "$PROMPT_B_MIXED" ] || { echo "ERROR: no prompt at $PROMPT_B_MIXED" >&2; exit 2; }
+if [ "$MIXED_ARM" -eq 1 ] && [ ! -f "$DRAFT_MIXED" ]; then
+    echo "ERROR: no draft at $DRAFT_MIXED (or set MIXED_ARM=0)" >&2; exit 2
+fi
 if [ "$NCMOE_ARM" -eq 1 ] && [ ! -f "$NCMOE_MODEL" ]; then
     echo "ERROR: no model at $NCMOE_MODEL (or set NCMOE_ARM=0)" >&2; exit 2
 fi
@@ -199,7 +222,7 @@ stop_arm() {
 # drive one arm: start the server, warm up, then each prompt alone, the diverging pair and the equal-length
 # pair.  Writes $arm/steps.json.
 #   $1 arm name, $2 devices, $3 model, $4 ncmoe (0 = none), $5 spec type, $6 n_max, $7/$8 the two prompts,
-#   then env assignments
+#   $9 draft model (empty = none), $10 extra spec args (word-split), then env assignments
 run_arm() {
     local arm="$1"; shift
     local devs="$1"; shift
@@ -209,6 +232,8 @@ run_arm() {
     local nmax="$1"; shift
     local pa="$1"; shift
     local pb="$1"; shift
+    local draft="$1"; shift
+    local spec_extra="$1"; shift
     local dir="$KEEPOUT/$arm"
     mkdir -p "$dir"
 
@@ -218,8 +243,8 @@ run_arm() {
         ROCBLAS_USE_HIPBLASLT=0 \
         LLAMA_RS_ROLLBACK_DEBUG=1 \
         "$@" \
-        "$LLAMA_SERVER" -m "$model" \
-        --spec-type "$spec" --spec-draft-n-max "$nmax" \
+        "$LLAMA_SERVER" -m "$model" ${draft:+-md "$draft"} \
+        --spec-type "$spec" --spec-draft-n-max "$nmax" $spec_extra \
         -sm "$SM" -ngl 99 ${ncmoe:+-ncmoe "$ncmoe"} -c "$CTX" -t 8 \
         --parallel 2 --kv-unified --cache-ram 0 \
         --host 127.0.0.1 --port "$PORT" --no-webui $EXTRA_ARGS > "$dir/log.txt" 2>&1 &
@@ -298,9 +323,9 @@ ARMS=""
 for ngpu in $NGPU; do
     devs="$(devs_for "$ngpu")"
     tag="${ngpu}gpu"
-    run_arm "off-$tag" "$devs" "$MODEL" 0 "$SPEC" "$NMAX" "$PROMPT_A" "$PROMPT_B" env LLAMA_SPEC_ALIGN=0 \
+    run_arm "off-$tag" "$devs" "$MODEL" 0 "$SPEC" "$NMAX" "$PROMPT_A" "$PROMPT_B" "" "" env LLAMA_SPEC_ALIGN=0 \
         || { echo "==> FAIL: the knob-off arm did not run"; exit 1; }
-    run_arm "on-$tag"  "$devs" "$MODEL" 0 "$SPEC" "$NMAX" "$PROMPT_A" "$PROMPT_B" env LLAMA_SPEC_ALIGN=1 \
+    run_arm "on-$tag"  "$devs" "$MODEL" 0 "$SPEC" "$NMAX" "$PROMPT_A" "$PROMPT_B" "" "" env LLAMA_SPEC_ALIGN=1 \
         || { echo "==> FAIL: the knob-on arm did not run"; exit 1; }
     ARMS="$ARMS $tag"
 done
@@ -308,16 +333,29 @@ done
 # the host-expert arm: on a -ncmoe config the aligned verify batch must stay inside the expert cache's band
 # (`band / n_drafting - 1` rows per sequence), so this is the arm that exercises that bound
 if [ "$NCMOE_ARM" -eq 1 ]; then
-    run_arm "off-ncmoe" 0,2 "$NCMOE_MODEL" "$NCMOE" "$SPEC" "$NMAX" "$PROMPT_A" "$PROMPT_B_NCMOE" env LLAMA_SPEC_ALIGN=0 \
+    run_arm "off-ncmoe" 0,2 "$NCMOE_MODEL" "$NCMOE" "$SPEC" "$NMAX" "$PROMPT_A" "$PROMPT_B_NCMOE" "" "" env LLAMA_SPEC_ALIGN=0 \
         || { echo "==> FAIL: the knob-off host-expert arm did not run"; exit 1; }
-    run_arm "on-ncmoe"  0,2 "$NCMOE_MODEL" "$NCMOE" "$SPEC" "$NMAX" "$PROMPT_A" "$PROMPT_B_NCMOE" env LLAMA_SPEC_ALIGN=1 \
+    run_arm "on-ncmoe"  0,2 "$NCMOE_MODEL" "$NCMOE" "$SPEC" "$NMAX" "$PROMPT_A" "$PROMPT_B_NCMOE" "" "" env LLAMA_SPEC_ALIGN=1 \
         || { echo "==> FAIL: the knob-on host-expert arm did not run"; exit 1; }
     ARMS="$ARMS ncmoe"
 fi
 
+# the reporter's own chain (a): n-gram-first, so one slot gets a long n-gram match and the other a DFlash
+# block.  The knob must be inert here (see the header).
+if [ "$MIXED_ARM" -eq 1 ]; then
+    for knob in 0 1; do
+        local_name=$([ "$knob" -eq 0 ] && echo off || echo on)
+        run_arm "$local_name-mixed" 0,2 "$MODEL" 0 "ngram-mod,draft-dflash" "$MIXED_NMAX" \
+            "$PROMPT_A" "$PROMPT_B_MIXED" "$DRAFT_MIXED" \
+            "--spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8" env LLAMA_SPEC_ALIGN="$knob" \
+            || { echo "==> FAIL: the mixed-drafter arm did not run"; exit 1; }
+    done
+    ARMS="$ARMS mixed"
+fi
+
 if [ "$FIXED_ARM" -eq 1 ]; then
     # equal draft lengths by construction (a fixed depth), i.e. the pre-fix reference shape
-    run_arm "fixed-2gpu" 0,2 "$MODEL" 0 draft-mtp 3 "$PROMPT_A" "$PROMPT_B" env LLAMA_SPEC_ALIGN=1 \
+    run_arm "fixed-2gpu" 0,2 "$MODEL" 0 draft-mtp 3 "$PROMPT_A" "$PROMPT_B" "" "" env LLAMA_SPEC_ALIGN=1 \
         || { echo "==> FAIL: the fixed-depth reference arm did not run"; exit 1; }
 fi
 
@@ -357,12 +395,13 @@ if [ "$FAULTS" -eq 1 ]; then
     fi
 fi
 
-python3 - "$KEEPOUT" "$RECOVER" "$REGRESS" "$REF_HASH" "$ARMS" "$REPO_DIR" "$FIXED_ARM" "$NGEN" <<'PY'
+python3 - "$KEEPOUT" "$RECOVER" "$REGRESS" "$REGRESS_MIXED" "$REF_HASH" "$ARMS" "$REPO_DIR" "$FIXED_ARM" "$NGEN" <<'PY'
 import json, subprocess, sys
 
 root, recover, regress = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
-ngen = float(sys.argv[8])
-ref_hash, tags, repo, fixed = sys.argv[4], sys.argv[5].split(), sys.argv[6], sys.argv[7] == "1"
+regress_mixed = float(sys.argv[4])
+ref_hash, tags, repo, fixed = sys.argv[5], sys.argv[6].split(), sys.argv[7], sys.argv[8] == "1"
+ngen = float(sys.argv[9])
 
 def load(arm):
     try:
@@ -424,6 +463,8 @@ for tag in tags:
 
 print()
 for tag in tags:
+    if tag == "mixed":
+        continue    # the mixed-drafter chain has its own check below: it must be INERT, not faster
     off, on = load("off-%s" % tag), load("on-%s" % tag)
     if not off or not on or off.get("error") or on.get("error"):
         print("FAIL  %s: missing results" % tag)
@@ -506,6 +547,38 @@ if off and on and not off.get("error") and not on.get("error"):
 elif off or on:
     print("FAIL  ncmoe: missing results")
     fails += 1
+
+# mixed-drafter arm (the reporter's chain (a)): the knob must be INERT, so this is a "no regression" gate
+# rather than a recovery one -- and the draft counts must match, which is what the shipped cut broke
+if "mixed" in tags:
+    off, on = load("off-mixed"), load("on-mixed")
+    if off and on and not off.get("error") and not on.get("error"):
+        ratio = on["pair_agg"] / off["pair_agg"] if off["pair_agg"] else 0.0
+        if ratio < regress_mixed:
+            print("FAIL  mixed: the n-gram-first chain regressed %.1f -> %.1f t/s (%+.1f %%): an alignment that "
+                  "touches another drafter's draft truncates the good one (see the header)"
+                  % (off["pair_agg"], on["pair_agg"], 100 * (ratio - 1)))
+            fails += 1
+        else:
+            print("PASS  mixed: n-gram-first chain %.1f -> %.1f t/s (%+.1f %%, inert); split steps %d -> %d"
+                  % (off["pair_agg"], on["pair_agg"], 100 * (ratio - 1), splits("off-mixed"), splits("on-mixed")))
+        dn = [(k, [x["draft_n"] for x in off[k]] if isinstance(off[k], list) else [off[k]["draft_n"]],
+                 [x["draft_n"] for x in on[k]] if isinstance(on[k], list) else [on[k]["draft_n"]])
+              for k in ("pair", "pair_same")]
+        bad = [k for k, a, b in dn if a != b]
+        if bad:
+            print("FAIL  mixed: the draft counts differ on/off (%s), so the knob is not inert here" % ", ".join(bad))
+            fails += 1
+        else:
+            print("PASS  mixed: identical draft counts on/off (the knob does not touch this chain)")
+        if [k for k in ("alone_a", "alone_b") if text_of(off, k) != text_of(on, k)]:
+            print("FAIL  mixed: a single-slot request's greedy text differs on/off")
+            fails += 1
+        else:
+            print("PASS  mixed: both single-slot requests are byte-identical on/off")
+    else:
+        print("FAIL  mixed: missing results")
+        fails += 1
 
 # n_seq == 1 inertness
 h0, h1 = hashof(0), hashof(1)

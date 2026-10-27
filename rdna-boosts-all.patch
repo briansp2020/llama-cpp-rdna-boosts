@@ -2179,7 +2179,7 @@ index 000000000..1f8e8a6b5
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 4305ac6ac..45b9dcc16 100644
+index 4305ac6ac..9a9c5f995 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -2198,11 +2198,11 @@ index 4305ac6ac..45b9dcc16 100644
      {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
      {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
      {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
-@@ -172,6 +174,34 @@ bool common_speculative_are_compatible(
+@@ -172,6 +174,39 @@ bool common_speculative_are_compatible(
  
  using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
  
-+// TODO #234: cross-sequence verify-batch alignment (see common_speculative_draft()).
++// TODO #234: verify-batch alignment across the sequences drafted in one call (see align_draft_caps()).
 +//
 +// `llama_memory_hybrid::init_batch()` splits a decode batch with `llama_batch_allocr::split_equal()`, which
 +// takes one token per sequence set per round and STOPS when the shortest set runs out.  Every sequence that
@@ -2217,11 +2217,16 @@ index 4305ac6ac..45b9dcc16 100644
 +// the whole difference is the split.  Padding the shorter sequence to the same length is NOT an option: a
 +// padded row advances the recurrent state in `mem_recr->prepare()`.
 +//
-+// So: raise every drafting sequence's cap UP to the deepest cap in the call (never down -- cutting the
-+// high-acceptance slot to the shallowest is the wrong direction), and CUT the drafts to the shortest length
-+// when a different implementation produced them (an n-gram hit on one slot and an MTP draft on the other, or
-+// a slot whose own `n_max` is smaller).  Both halves are inert with a single drafting sequence, which is
-+// every `llama-cli` / MTP gate run.
++// So: a drafter that chooses its own length per sequence (`draft-mtp-adaptive`) aligns its sequences' caps to
++// one width in the call, which is `align_draft_caps()`.  It is deliberately NOT a cut of the finished drafts
++// to the shortest one: that was measured and it is a LOSS wherever the lengths differ because of CONTENT
++// rather than a cap.  On the reporter's own chain (`--spec-type ngram-mod,draft-dflash` with a DFlash2 draft,
++// 27B, 2 GPU, recall + prose, `-n 200`) the `min` cut fires on every step whose n-gram match is shorter than
++// the DFlash block, truncates the OTHER slot's good draft, and the pair aggregates 65.6 -> 61.7 t/s (-6 %)
++// while the prose slot's acceptance falls 74 % -> 50 %: splits 12 -> 1, and the lost proposals cost far more
++// than the removed pass.  The cut is right only for a mismatch a CAP caused (the band bound, or a slot that is
++// running out of tokens), which `align_draft_caps()` handles inside the one drafter whose caps those are.
++// Every part of it is inert with a single drafting sequence, which is every `llama-cli` / MTP gate run.
 +static bool spec_align_enabled() {
 +    static const bool enabled = []() {
 +        const char * env = getenv("LLAMA_SPEC_ALIGN");
@@ -2233,7 +2238,7 @@ index 4305ac6ac..45b9dcc16 100644
  // state of an implementation of speculative decoding
  //
  // each implementation has a unique type and a state that is implementation-specific
-@@ -208,10 +238,23 @@ struct common_speculative_impl {
+@@ -208,10 +243,17 @@ struct common_speculative_impl {
  
      virtual bool process(const common_batch & batch) = 0;
  
@@ -2244,12 +2249,6 @@ index 4305ac6ac..45b9dcc16 100644
  
      virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
  
-+    // optional: the draft this implementation produced for `seq_id` was cut to `n_verified` tokens so that
-+    // every sequence in the verify batch presents the same row count (issue #234).  Implementations that
-+    // keep a per-round draft length for their acceptance statistics must adopt it, or they count positions
-+    // the target never verified.
-+    virtual void draft_truncated(llama_seq_id /*seq_id*/, int32_t /*n_verified*/) {}
-+
 +    // optional: report a partial acceptance that the context could not apply
 +    // (checkpoint-restore path); accept() will not be called for that round
 +    virtual void accept_partial(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) {}
@@ -2257,7 +2256,7 @@ index 4305ac6ac..45b9dcc16 100644
      // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
      virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
      virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
-@@ -989,6 +1032,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -989,6 +1031,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
  
      std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
  
@@ -2272,7 +2271,7 @@ index 4305ac6ac..45b9dcc16 100644
      std::vector<common_sampler_ptr> smpls;
  
      // backend sampler chain per seq, attached to ctx_dft
-@@ -1024,6 +1075,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1024,6 +1074,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
      // block-internal attention
      bool causal_attn = false;
  
@@ -2287,7 +2286,7 @@ index 4305ac6ac..45b9dcc16 100644
      const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
      uint32_t        target_layer_ids_n = 0;
  
-@@ -1079,6 +1138,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1079,6 +1137,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
          }
          mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
  
@@ -2303,7 +2302,7 @@ index 4305ac6ac..45b9dcc16 100644
          if (is_dspark && this->params.p_min > 0.0f) {
              char buf[16] = {};
              const bool has_conf =
-@@ -1093,6 +1161,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1093,6 +1160,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
          LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
          LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                  block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
@@ -2314,7 +2313,7 @@ index 4305ac6ac..45b9dcc16 100644
  
          // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
          // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
-@@ -1141,6 +1213,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1141,6 +1212,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
          }
  
@@ -2344,7 +2343,7 @@ index 4305ac6ac..45b9dcc16 100644
          // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
          llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
          llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
-@@ -1158,6 +1253,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1158,6 +1252,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              llama_sampler_free(backend_chains[seq_id]);
          }
          backend_chains.clear();
@@ -2355,7 +2354,7 @@ index 4305ac6ac..45b9dcc16 100644
      }
  
      void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-@@ -1181,6 +1280,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1181,6 +1279,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
          }
      }
  
@@ -2368,7 +2367,7 @@ index 4305ac6ac..45b9dcc16 100644
      bool process(const common_batch & batch_in) override {
          if (batch_in.size() <= 0) {
              return true;
-@@ -1212,17 +1317,84 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1212,17 +1316,84 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              }
          }
  
@@ -2453,7 +2452,7 @@ index 4305ac6ac..45b9dcc16 100644
              // an M-RoPE image pins all its rows to one position, so a windowed draft
              // cache cannot free cells for it - skip it, the draft can jump over the gap
              const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
-@@ -1281,6 +1453,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1281,6 +1452,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              }
          }
  
@@ -2464,7 +2463,7 @@ index 4305ac6ac..45b9dcc16 100644
          return true;
      }
  
-@@ -1524,8 +1700,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1524,8 +1699,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      std::vector<int>                i_last;
      std::vector<std::vector<float>> chain_h;
  
@@ -2476,25 +2475,27 @@ index 4305ac6ac..45b9dcc16 100644
 +    std::vector<int> n_last;  // [n_seq] drafts attempted in the most recent draft() call; reset once fed back
 +    std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq adaptive depth controller
 +
-+    // issue #234: align the drafting sequences' caps UP so one verify ubatch covers them all, and the
++    // issue #234: align the drafting sequences' caps so one verify ubatch covers them all, and the
 +    // MoE expert-cache verify band (`band`, 0 when no arena is active) that bounds how wide that ubatch
 +    // may get before the cache stops serving the routed experts from VRAM.  `band` is set by the
 +    // expert-cache integration once the arena's real state is known (`llama_model_moe_cache_band()`).
 +    bool    align = true;
 +    int32_t band  = 0;
++    std::vector<int> n_hard;  // [n_seq] the hard cap of this call: --spec-draft-n-max and the caller's n_max
 +
 +    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq, bool adaptive = false, bool align = true)
 +        : common_speculative_impl(adaptive ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
          , params(params.draft)
      {
          auto * ctx_tgt = this->params.ctx_tgt;
-@@ -1537,6 +1726,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1537,6 +1726,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  "MTP input row width must match the target h_nextn width");
          n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
  
 +        this->adaptive = adaptive;
 +        // n_cap/n_last are written by the shared draft loop in both modes
 +        n_cap.assign(n_seq, 0);
++        n_hard.assign(n_seq, 0);
 +        n_last.assign(n_seq, 0);
 +
 +        // issue #234: the verify-band bound of the aligned depth is read once here, after the target context
@@ -2506,7 +2507,7 @@ index 4305ac6ac..45b9dcc16 100644
          SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
          SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
          SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
-@@ -1577,9 +1777,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1577,9 +1778,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
          llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
  
@@ -2528,7 +2529,7 @@ index 4305ac6ac..45b9dcc16 100644
          if (chain_heads) {
              this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
  
-@@ -1590,6 +1801,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1590,6 +1802,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
          this->n_max = this->params.n_max;
  
@@ -2563,7 +2564,7 @@ index 4305ac6ac..45b9dcc16 100644
          pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
  
          i_last.assign(n_seq, -1);
-@@ -1618,6 +1857,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1618,6 +1858,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          // reset here rather than per round, or two identical requests differ
          common_sampler_reset(smpls[seq_id].get());
  
@@ -2577,7 +2578,7 @@ index 4305ac6ac..45b9dcc16 100644
          const int32_t N = (int32_t) prompt.size();
          if (N <= 0) {
              return;
-@@ -1635,6 +1881,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1635,6 +1882,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
      }
  
@@ -2626,7 +2627,7 @@ index 4305ac6ac..45b9dcc16 100644
      bool process(const common_batch & batch_in) override {
          if (batch_in.size() <= 0) {
              return true;
-@@ -1644,6 +1932,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1644,6 +1933,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              return true;
          }
  
@@ -2644,7 +2645,7 @@ index 4305ac6ac..45b9dcc16 100644
          const int32_t n_tokens = batch_in.size();
  
          // remember the first and last batch index for each sequence
-@@ -1683,6 +1982,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1683,6 +1983,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
                  const llama_seq_id seq_id = t.seq_id;
  
@@ -2662,7 +2663,7 @@ index 4305ac6ac..45b9dcc16 100644
                  // vision tokens carry an embedding instead of an id
                  const int32_t idx = t.id != LLAMA_TOKEN_NULL
                      ? batch.add(t.id, t.pos[0], seq_id, false)
-@@ -1698,7 +2008,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1698,7 +2009,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              auto * mem_dft = llama_get_memory(ctx_dft);
  
              bool ok = true;
@@ -2671,7 +2672,7 @@ index 4305ac6ac..45b9dcc16 100644
                  if (chain_heads) {
                      // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                      for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-@@ -1732,12 +2042,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1732,12 +2043,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -2701,7 +2702,7 @@ index 4305ac6ac..45b9dcc16 100644
                  std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
              }
  
-@@ -1766,6 +2091,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1766,6 +2092,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
              n_drafting++;
              drafting[seq_id] = true;
@@ -2709,14 +2710,18 @@ index 4305ac6ac..45b9dcc16 100644
 +            // effective draft cap for this step: adaptive depth (or the user n_max),
 +            // then clamped by the per-call context bound from the server
 +            n_cap[seq_id] = adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max;
++            n_hard[seq_id] = params.n_max;
 +            if (dp.n_max > 0 && dp.n_max < n_cap[seq_id]) {
 +                n_cap[seq_id] = dp.n_max;
++            }
++            if (dp.n_max > 0 && dp.n_max < n_hard[seq_id]) {
++                n_hard[seq_id] = dp.n_max;
 +            }
 +
              // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
              if (!params.probabilistic) {
                  dp.result_q = nullptr;
-@@ -1791,6 +2124,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1791,6 +2129,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              }
          }
  
@@ -2727,7 +2732,7 @@ index 4305ac6ac..45b9dcc16 100644
          int i = 0;
  
          while (n_drafting > 0) {
-@@ -1861,7 +2198,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1861,7 +2203,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                      dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                  }
  
@@ -2736,7 +2741,7 @@ index 4305ac6ac..45b9dcc16 100644
                      drafting[seq_id] = false;
                      n_drafting--;
                      continue;
-@@ -1908,17 +2245,94 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1908,17 +2250,103 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -2752,35 +2757,52 @@ index 4305ac6ac..45b9dcc16 100644
      }
  
 -    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
-+    // issue #234: raise every drafting sequence's draft cap to the deepest cap in this call, so that all of
-+    // them present the same number of rows to the verify batch (see spec_align_enabled() for the why and the
-+    // numbers).  The cap only ever moves UP: a sequence keeps its own hard bound (--spec-draft-n-max, itself
-+    // capped by the MTP layer count, and the caller's per-slot n_draft_max from the remaining context), so no
-+    // sequence is asked for more than it would draft when it runs alone, and a draft is never cut here.
++    // issue #234: give every drafting sequence the same draft cap for this call, so all of them present the
++    // same number of rows to the verify batch (see spec_align_enabled() for the why and the numbers).
 +    //
-+    // On a host-expert config the whole verify batch must stay inside the MoE expert-cache band, or the cache
-+    // stops serving the routed experts from VRAM and streams them from the pinned host master on every step
-+    // (see common_speculative_clamp_ngram_n_max for the measurement).  The aligned depth is therefore bounded
-+    // by `band / n_drafting - 1` rows per sequence; a sequence already deeper than that keeps its own cap,
-+    // because the band bound may only WIDEN a shallow draft, never shorten a deep one -- shortening one here
-+    // would change single-sequence behaviour, which this change must not do.
++    // The aligned width is
++    //   max over the drafting sequences of their cap        (raise a shallow sequence to the deepest one; the
++    //                                                        adaptive depth is worth more than a fixed one)
++    //   bounded by the smallest HARD cap in the call        (--spec-draft-n-max, the MTP layer cap and the
++    //                                                        caller's per-slot n_max, which the server lowers as a
++    //                                                        response runs out of tokens)
++    //   bounded by the expert cache's band                  (the band applies to the WHOLE verify batch, so
++    //                                                        n_drafting sequences may use band / n_drafting - 1
++    //                                                        rows each; see common_speculative_clamp_ngram_n_max)
++    // so no sequence is ever asked for more than it would draft when it runs alone.  Lowering a sequence to
++    // the smallest hard cap (the second bound) is deliberate and is the only case where the width shrinks: it
++    // is transient (a response nearing its end) and it keeps the pair in one ubatch.  This is the ONE place a
++    // verify width is equalized: it never touches another implementation's draft, which is why the generic
++    // "cut the drafts to the shortest" is not here (spec_align_enabled() records what it measured).
 +    void align_draft_caps(const std::vector<bool> & drafting, int n_drafting) {
-+        int n_align = 0;
++        int n_align   = 0;
++        int n_hard_lo = 0;
 +
 +        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-+            if (drafting[seq_id]) {
-+                n_align = std::max(n_align, n_cap[seq_id]);
++            if (!drafting[seq_id]) {
++                continue;
 +            }
++
++            n_align   = std::max(n_align, n_cap[seq_id]);
++            n_hard_lo = n_hard_lo == 0 ? n_hard[seq_id] : std::min(n_hard_lo, n_hard[seq_id]);
++        }
++
++        if (n_hard_lo > 0) {
++            n_align = std::min(n_align, n_hard_lo);
 +        }
 +
 +        if (band > 1) {
 +            n_align = std::min(n_align, std::max(0, band / n_drafting - 1));
 +        }
 +
++        if (n_align <= 0) {
++            return;
++        }
++
 +        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-+            if (drafting[seq_id] && n_align > n_cap[seq_id]) {
-+                SPC_DBG("aligned draft depth seq %d: %d -> %d (band %d, drafting %d)\n",
-+                        (int) seq_id, n_cap[seq_id], n_align, band, n_drafting);
++            if (drafting[seq_id] && n_cap[seq_id] != n_align) {
++                SPC_DBG("aligned draft depth seq %d: %d -> %d (band %d, drafting %d, hard %d)\n",
++                        (int) seq_id, n_cap[seq_id], n_align, band, n_drafting, n_hard_lo);
 +                n_cap[seq_id] = n_align;
 +            }
 +        }
@@ -2809,14 +2831,6 @@ index 4305ac6ac..45b9dcc16 100644
 +        n_last[seq_id] = 0;
 +    }
 +
-+    // issue #234: a draft cut in common_speculative_draft() to the shortest length in the verify batch was
-+    // only verified up to `n_verified` positions, so that is the length the controller compares against
-+    void draft_truncated(llama_seq_id seq_id, int32_t n_verified) override {
-+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq && n_last[seq_id] > n_verified) {
-+            n_last[seq_id] = n_verified;
-+        }
-+    }
-+
 +    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
          if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
              return;
@@ -2833,7 +2847,7 @@ index 4305ac6ac..45b9dcc16 100644
          const int32_t n_rows = verify_h_rows[seq_id];
          if (n_rows <= 0) {
              return;
-@@ -1928,6 +2342,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1928,6 +2356,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          const size_t row_bytes = (size_t) n_embd * sizeof(float);
          std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
      }
@@ -2851,18 +2865,7 @@ index 4305ac6ac..45b9dcc16 100644
  };
  
  // state of self-speculation (simple implementation, not ngram-map)
-@@ -2363,6 +2788,10 @@ struct common_speculative {
-     std::vector<common_speculative_impl *> impl_last;
- 
-     std::vector<double> synth_probs;
-+
-+    // issue #234: align the drafts of the sequences that verify in the same step to one length, so the
-+    // target batch is one ubatch instead of one per distinct draft length (LLAMA_SPEC_ALIGN=0 disables)
-+    bool align = true;
- };
- 
- static common_ngram_map get_common_ngram_map(
-@@ -2414,6 +2843,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
+@@ -2414,6 +2853,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
          case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
          case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
          case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
@@ -2870,7 +2873,7 @@ index 4305ac6ac..45b9dcc16 100644
          case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
          case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
          case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-@@ -2505,6 +2935,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+@@ -2505,6 +2945,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
              case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
@@ -2878,7 +2881,7 @@ index 4305ac6ac..45b9dcc16 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2660,8 +3091,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
+@@ -2660,8 +3101,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
          }
      }
  
@@ -2897,7 +2900,7 @@ index 4305ac6ac..45b9dcc16 100644
      result.n_outputs_max = params.n_parallel;
      result.n_outputs_max_per_seq = 1;
  
-@@ -2701,37 +3140,95 @@ struct common_speculative_init_result::impl {
+@@ -2701,37 +3150,95 @@ struct common_speculative_init_result::impl {
      llama_context_ptr context;
  };
  
@@ -3001,7 +3004,7 @@ index 4305ac6ac..45b9dcc16 100644
          if (model_dft == NULL) {
              LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
              return;
-@@ -2759,6 +3256,15 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2759,6 +3266,15 @@ common_speculative_init_result::common_speculative_init_result(
  
          pimpl->context.reset(ctx_dft);
      }
@@ -3017,7 +3020,7 @@ index 4305ac6ac..45b9dcc16 100644
  }
  
  common_speculative_init_result::~common_speculative_init_result() = default;
-@@ -2771,8 +3277,9 @@ llama_context * common_speculative_init_result::context() {
+@@ -2771,8 +3287,9 @@ llama_context * common_speculative_init_result::context() {
      return pimpl->context.get();
  }
  
@@ -3029,7 +3032,7 @@ index 4305ac6ac..45b9dcc16 100644
  }
  
  common_speculative_output_limits common_speculative_get_output_limits(
-@@ -2801,7 +3308,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2801,7 +3318,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -3045,7 +3048,7 @@ index 4305ac6ac..45b9dcc16 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2814,12 +3328,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2814,12 +3338,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -3056,13 +3059,13 @@ index 4305ac6ac..45b9dcc16 100644
  
      std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
  
-+    // issue #234: read once, used by the MTP caps and by the cross-implementation cut
++    // issue #234: read once, handed to the implementations that choose a per-sequence draft length
 +    const bool align = spec_align_enabled();
 +
      for (const common_speculative_config & config : configs) {
          switch (config.type) {
              case COMMON_SPECULATIVE_TYPE_NONE:
-@@ -2833,7 +3351,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2833,7 +3361,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -3075,15 +3078,7 @@ index 4305ac6ac..45b9dcc16 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-@@ -2899,6 +3421,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
-         /* .impls       = */ std::move(impls),
-         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
-         /* .synth_probs = */ {},
-+        /* .align       = */ align,
-     });
- 
-     const int32_t n_max_configured = common_speculative_n_max(&params);
-@@ -2958,6 +3481,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+@@ -2958,6 +3490,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
      }
  }
  
@@ -3099,89 +3094,7 @@ index 4305ac6ac..45b9dcc16 100644
  bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
      bool result = true;
  
-@@ -2979,6 +3511,11 @@ void common_speculative_draft(common_speculative * spec) {
- 
-     auto & dparams = spec->dparams;
- 
-+    // issue #234: the number of verified draft tokens per sequence, recorded while the result pointer is
-+    // known to be valid.  `common_speculative_draft_params::result` is only assigned for the sequences the
-+    // caller asks to draft, so a sequence that is not drafting has an uninitialized pointer here.
-+    std::vector<int> n_drafted(dparams.size(), 0);
-+
-     {
-         int n_drafting = 0;
- 
-@@ -3039,6 +3576,8 @@ void common_speculative_draft(common_speculative * spec) {
- 
-                     impl->n_gen_drafts++;
-                     impl->n_gen_tokens += result.size();
-+
-+                    n_drafted[seq_id] = (int) result.size();
-                 }
-             }
- 
-@@ -3060,6 +3599,60 @@ void common_speculative_draft(common_speculative * spec) {
-             dp.drafting = false;
-         }
-     }
-+
-+    // issue #234: all sequences that verify in this step must present the same number of rows, or
-+    // llama_batch_allocr::split_equal() splits the target batch by sequence set and the longer draft's tail
-+    // costs a second full pass of the model.  `align_draft_caps()` raises a shallow CAP, which covers the
-+    // per-sequence depths of one implementation; a shorter draft can also come from a different
-+    // implementation (an n-gram hit on one slot, an MTP draft on the other, and an n-gram match has no cap at
-+    // all) or from a slot whose own n_max is smaller (the response is running out of tokens).  Cut the longer
-+    // drafts to the shortest one here, and tell the implementation that produced the draft, so its acceptance
-+    // statistics count the positions the target actually verified.
-+    //
-+    // Cutting can only drop proposals the target would have rejected or proposed again one step later, so it
-+    // cannot change the accepted text; a sequence that produced NO draft is left alone (one slot failing to
-+    // draft while its neighbour holds a good draft must not throw the good draft away -- the split is the
-+    // cheaper arm there).
-+    if (spec->align) {
-+        int n_shortest = -1;
-+        int n_drafts   = 0;
-+
-+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_drafted.size(); ++seq_id) {
-+            if (n_drafted[seq_id] <= 0) {
-+                continue;
-+            }
-+
-+            n_drafts++;
-+
-+            if (n_shortest < 0 || n_drafted[seq_id] < n_shortest) {
-+                n_shortest = n_drafted[seq_id];
-+            }
-+        }
-+
-+        if (n_drafts > 1) {
-+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_drafted.size(); ++seq_id) {
-+                if (n_drafted[seq_id] <= n_shortest) {
-+                    continue;
-+                }
-+
-+                auto & dp = dparams[seq_id];
-+                auto & result = *dp.result;
-+
-+                SPC_DBG("cutting draft of seq %d to %d tokens (verify-batch alignment)\n",
-+                        (int) seq_id, n_shortest);
-+
-+                result.resize(n_shortest);
-+
-+                if (dp.result_q && !dp.result_q->empty()) {
-+                    dp.result_q->resize(n_shortest);
-+                }
-+
-+                if (auto * impl = spec->impl_last[seq_id]) {
-+                    impl->draft_truncated(seq_id, n_shortest);
-+                }
-+            }
-+        }
-+    }
- }
- 
- void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
-@@ -3098,6 +3691,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -3098,6 +3639,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  
@@ -3199,7 +3112,7 @@ index 4305ac6ac..45b9dcc16 100644
  // TODO: support the case of more than one speculative implementations having a state
  bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
      if (spec == nullptr) {
-@@ -3168,3 +3772,49 @@ void common_speculative_print_stats(const common_speculative * spec) {
+@@ -3168,3 +3720,49 @@ void common_speculative_print_stats(const common_speculative * spec) {
                  str_perf.c_str());
      }
  }

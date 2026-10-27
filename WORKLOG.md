@@ -1,6 +1,59 @@
 # WORKLOG - dated delivery records
 
+## 261027.005 (r154) -- issue #234 follow-up: the verify-batch alignment stays inside the drafter whose caps it changes (r153's generic cut was a -6 % regression on the n-gram-first chain)
+
+**Shipped:** `v15-6050b467c-r154` (block **02** amended).  What r153 shipped was correct for the case it was
+measured on (`draft-mtp-adaptive`, +30..34 % at 2 GPUs, +54 % at 3, +28 % on host experts) and **wrong as a
+default for the reporter's other case**.  This entry is that finding and the fix.
+
+**1. The regression.**  r153's block 02 had two halves: `draft-mtp-adaptive` aligning its per-sequence caps UP,
+and a generic "cut the finished drafts to the shortest" in `common_speculative_draft()` (the reporter's own
+suggestion (a), with `draft_truncated()` feeding the cut back so acceptance counts only verified positions).
+The gate only exercised `draft-mtp-adaptive`, where the align-up makes the cut a no-op, so nothing measured the
+second half on its own case.  Measured afterwards on the reporter's chain (a) -- `--spec-type
+ngram-mod,draft-dflash` with `Qwen3.8-27B-DFlash2-Q4_K_M`, 27B UD-Q4_K_XL, 2 GPU, `recall` + `prose`,
+`-n 200`, `--spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8`):
+
+| arm | pair per-slot | pair agg | split steps |
+|---|---|---:|---:|
+| `LLAMA_SPEC_ALIGN=0` (r152 behaviour) | 132.9 / 87.6 | **65.6** | 12 |
+| `LLAMA_SPEC_ALIGN=1` (r153, with the cut) | 122.3 / 76.2 | **61.7 (-6 %)** | 1 |
+
+**The mechanism is the `min`.**  The two drafts are not comparable: one slot holds a long n-gram match, the
+other a DFlash block, and the cut fires on every step whose n-gram match is shorter than the block, truncating
+the OTHER drafter's good draft.  The `RSPREP` trace shows it: r153's verify groups collapse to 6 rows (both
+slots at ~2 drafted tokens) against 6-and-16 rows in r152, the prose slot's acceptance falls 74 % -> 50 %
+(231 -> 284 draft tokens for *fewer* accepts), and the removed pass costs far less than the lost proposals.
+
+**2. The fix.**  The cut and `common_speculative_impl::draft_truncated()` are gone.  The cap alignment stays,
+inside `draft-mtp-adaptive` (the one drafter whose per-sequence caps create the mismatch), and now bounds the
+aligned width by the smallest **hard** cap in the call as well as by the band, so a slot nearing the end of its
+response cannot split the pair either; it sets every drafting sequence's cap to that width, which is the only
+case where a width shrinks and is transient by construction.  A chain of different drafters is now untouched:
+measured inert, **64.6 vs 64.4 t/s** with identical draft counts.
+
+**3. `scripts/gate-spec-align.sh` grows a mixed-drafter arm** (`ngram-mod,draft-dflash` + the DFlash2 draft,
+`MIXED_ARM`/`DRAFT_MIXED`/`PROMPT_B_MIXED`, on by default) which requires that chain to stay within 2 % of its
+knob-off self **with identical draft counts**, and is judged only by that: those steps keep their second ubatch,
+which is the correct behaviour there, so the recovery and no-split checks do not apply to it.
+
+**4. Gates (r154 tree, final run).**  2 GPU **106.2 -> 137.9 t/s (+30 %)**, 3 GPU **86.1 -> 133.2 (+55 %)**,
+35B-A3B `-ncmoe 40` **116.2 -> 148.9 (+28 %)**; the split decode steps 58 -> 0 at all three; the equal-length
+arm +0.5 / -1.3 / +1.2 %; the **mixed-drafter arm inert (-0.2 %, splits 24 -> 24, identical draft counts)**;
+every single-slot request and the `n_seq == 1` `llama-cli` text (`b8775233a93a`) byte-identical on/off; no abort,
+`check-gpu-faults.sh` clean; the fixed `draft-mtp n3` checkpoint measures 144.4 so the aligned adaptive arm is
+within 2 %.  `validate-set.sh` strict 15/15, per-block build 3/3 (blocks 02, 09, tip), coherence
+`1c5d32ac537d` / `627b2ebd7792` == r153, prefill-logit KLD **0.000000 / 100.000 %**.
+
+**5. Recorded rule.**  A length mismatch is worth equalizing when a **cap** caused it (the band, a response
+ending); when the **content** caused it the two drafts are not comparable and the second ubatch is the cheaper
+arm (`GREEDY-PURITY.md` §63).  `TODO.md` #111 now holds only the residual: a slot that drafted *nothing* still
+splits, because truncating its neighbour's good draft to nothing is the worse trade.
+
 ## 261027.004 (r153) -- issue #234: the sequences that verify in one step are aligned into one ubatch (blocks 02 + 09); +30..34 % at 2 GPUs, +54 % at 3, and the fix is device-count independent by construction
+
+**Superseded in part by r154** (``261027.005``): the generic cut described in §2 below measured -6 % on the
+n-gram-first chain and was removed; everything else here stands.
 
 **Shipped:** `v15-6050b467c-r153` (blocks **02** and **09** amended).  `release.json`: tip **`1e992529d`**
 (the fork branch tip, reproduced by `fork-refresh.sh`), tree **`672f788c9b`**, `scripts/validate-set.sh` green

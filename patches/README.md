@@ -180,18 +180,19 @@ token per sequence set per round and **stops when the shortest set runs out**, s
 draft lengths put the longer one's tail into a SECOND ubatch and the target runs a full extra pass for that
 step.  A fixed `--spec-draft-n-max` never produced a difference (every slot drafts `n_max`), which is why this
 survived; the adaptive controller's **per-sequence** depth makes it the normal case on a multi-slot server.
-`draft-mtp-adaptive` now raises every drafting sequence's cap to the deepest cap in the same `draft()` call
-(only ever up: each sequence keeps `--spec-draft-n-max`, the MTP layer cap and the caller's per-slot
-`n_draft_max`), and `common_speculative_draft()` cuts the drafts to the shortest one when the lengths still
-differ (a different speculator per slot, or a slot whose own `n_max` is smaller), telling the implementation
-that its draft was cut (`common_speculative_impl::draft_truncated()`) so acceptance statistics count only
-verified positions.  Measured (27B UD-Q4_K_XL, greedy `-n 400`, concurrent `recall` + `reasoning`): pair
+`draft-mtp-adaptive` gives every drafting sequence the deepest cap in the same `draft()` call, bounded by the
+smallest **hard** cap in the call (`--spec-draft-n-max`, the MTP layer cap and the caller's per-slot
+`n_draft_max`) and by the expert cache's band, so no sequence is ever asked for more than it would draft when it
+runs alone.  The alignment lives **inside that drafter** and never touches another implementation's draft: r153
+also shipped a generic cut of the finished drafts to the shortest, and measured on the n-gram-first chain it is a
+loss (it truncates the other drafter's good draft: 65.6 -> 61.7 t/s, -6 %), so r154 removed it and a chain of
+different drafters is inert again (64.6 vs 64.4 t/s, identical draft counts).  Measured (27B UD-Q4_K_XL, greedy `-n 400`, concurrent `recall` + `reasoning`): pair
 aggregate **104.8-108.3 -> 140.1-140.6 t/s at 2 GPU (+30..34 %)**, **86.5-87.0 -> 133.1-133.7 at 3 GPU
 (+54 %)**, 35B-A3B `-ncmoe 40` **116.2 -> 149.0 (+28 %)**; split decode steps 58 -> 0 at each; equal-length arm
 -0.4..-2.1 %; single-sequence text byte-identical.  The low-acceptance slot of a mixed pair verifies at its
 neighbour's width, which is a new numerics reference for that config rather than a defect: each config is
 deterministic run to run, and `LLAMA_SPEC_ALIGN=0` vs `=1` differ just as `--spec-draft-n-max 4` vs `5` do
-(`GREEDY-PURITY.md` §63).  A slot that drafted nothing is left alone.  Record: `archive/work/spec-align-234/`.
+(`GREEDY-PURITY.md` §63).  Record: `archive/work/spec-align-234/`.
 
 **The draft's KV cache type follows the main `-ctk` / `-ctv` (r125, issue #216).**  Upstream gives the
 speculative draft context its own KV type pair (`--spec-draft-type-k` / `-ctvd`, defaulting to **f16**)
