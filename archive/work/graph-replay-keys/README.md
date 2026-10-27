@@ -130,3 +130,45 @@ Three files, +114/-6, all in **block 09**:
   teardown/stand-down/device-move.
 
 The tree is otherwise r148's.
+
+## 6. Post-ship follow-up (2026-10-27): the relaxed compare offered again, and what was shipped instead
+
+The submitter replied after r149 with the compare half re-cut as an opt-in switch on r149,
+`GGML_CUDA_GRAPH_PROPS_RELAXED=1` (17 lines: blank `src[]`/`view_src`/`buffer` in the property memcpy, and
+add each source's `type` next to the `data`/`ne`/`nb` already compared), on the same shape as #230
+(Flash-Next GSQ-RCO IQ3_S + a Q4_0 MTP head, `-sm tensor --n-cpu-moe 47`), with the criterion this record
+had asked for: a census where the **strict** compare still churns after the per-layer keys.
+
+What they measured (`GGML_CUDA_GRAPH_TRACE`, two 400-token greedy decodes per arm, identical text):
+
+| arm | direct | replay | capture | properties_changed |
+|---|---:|---:|---:|---:|
+| strict (r149 default) | 27339 | 181264 | 1759 | **4129** |
+| relaxed | 23466 | 185610 | 1900 | **242** |
+
+Speed, 4 alternating pairs: prose 97.78 -> 98.25 t/s (+0.49 %, CI −0.91…+1.89), code 103.97 -> 106.67
+(+2.64 %, CI −2.37…+7.65) — neither significant; on their own local stack a 5-pair run gave +0.58 %
+[+0.22, +0.94].  So the criterion's *letter* was met (10³ `properties_changed`) but not its intent.
+
+**Declined again, for two reasons that the numbers, not doctrine, supply:**
+
+1. **The 4129 is the collision's leftovers, not a cost of strictness.**  One failed compare costs exactly
+   one direct call, and their own table shows it: `direct` falls 27339 -> 23466 (Δ 3873) as
+   `properties_changed` falls 4129 -> 242 (Δ 3887).  The whole gain is ~2 % of graph calls not replaying.
+   On our box the same shape measures 340 (plain) / 2054 (MTP) under the strict compare, and the relaxed
+   arm still churns **1588** on the MTP arm (2054 -> 1588, +0.3 %): the residual there is a real property
+   change (the draft's two-scheduler alternation, r120), which relaxing cannot touch.
+2. **The compare's cost was never the churn, it was the copy.**  A decode-only perf window puts
+   `__memcmp_evex_movbe` at 1.41 % of CPU samples *while nothing differs* — the loop's 1048 B zero-filled
+   temp + 328 B `memcpy` + 1048 B `memcmp` per node, run on every `graph_compute` because the scheduler
+   mints a fresh uid per split (so the `uid` early-out cannot fire; the docs' "reused" path is dead code).
+   r158 removes that cost without touching what is compared: in-place compare of the live tensors, only the
+   non-null sources, over a store packed to the sources a node has (−58 % per graph entry, `memcmp` 1.41 ->
+   0.58 %).  Text byte-identical, `replay` census identical, KLD 0.000000 / 100.000 %; no throughput claim
+   (host work is hidden behind the GPU on this box).
+
+Also noted from their data and ours: `GGML_CUDA_GRAPH_PROPS_STRICT` (the PR's own switch) parsed as
+presence, so `=0` enabled it — moot, since neither switch is shipped.
+
+Records: `benchmarks/2026-10-27-graph-replay-props.md` (r158), `WORKLOG.md` 261027.010, block 10 in
+`patches/README.md`, `GREEDY-PURITY.md` §62.

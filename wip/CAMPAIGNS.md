@@ -32,6 +32,10 @@ tensor-split **dense plain** decode still loses 6-9 % (carried as `TODO #109`, w
 `GGML_CUDA_ALLREDUCE=internal` lead).  The campaign record — including the assessment of
 `briansp2020`'s PR #230, which found the diagnosis, and the reasoning for dropping its identity-free
 compare half — is [`archive/work/graph-replay-keys/`](../archive/work/graph-replay-keys/README.md).
+  **r158** then removed that compare's *cost* without touching what it compares (in-place compare over a
+  source-packed store; the graph key built once per call), and declined the identity-free compare a second
+  time when the submitter re-offered it as an opt-in: `archive/work/graph-replay-keys/README.md` §6,
+  `benchmarks/2026-10-27-graph-replay-props.md`.
 
 **Retired (2026-10-26, r144 — `TODO #36`, no delivery feature).**  `moe-cpu-overlap/` left `wip/` for
 [`archive/work/moe-cpu-overlap/`](../archive/work/moe-cpu-overlap/RESOLUTION.md) at the maintainer's call:

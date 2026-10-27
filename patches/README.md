@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r149`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r158`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, and the graph key is built once per call) | +12124 / −4887 | 75 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236) | +4034 / −755 | 46 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -1028,7 +1028,8 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
   `src[]`/`view_src`/`buffer` before the memcmp).  It is worth **0.2-0.3 %** on top of the key
   (`42.6/112.8` vs `42.8/113.1` t/s; `properties_changed` 340/2054 vs 28/1588), and on a 3-device dense
   split it only moves the capture count (1161 -> 915) without changing the outcome, so it is not worth
-  weakening the replay's only safety check.
+  weakening the replay's only safety check.  The *cost* of that compare was instead removed without
+  touching what it compares — see the r158 item in block 10.
 * **Freeing any of a table's device buffers invalidates the captured graphs on that device (r149).**  The
   expert cache hands the MoE kernels **raw device pointers** as launch parameters — the arena slot table,
   the remap staging, the prefill routing staging, and the two heat mirrors — and none of them is a tensor
@@ -1181,6 +1182,30 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
   (the post-prefill drop hands the wide region back to the arena; a captured graph baked its addresses).
   Issue #187: without that invalidation a 4-stream MTP decode replayed a stale `set_rows` source and
   faulted with `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`.
+* **The replay guard compares the live tensors in place, over a source-packed store (r158).**  The guard
+  (`ggml_cuda_graph_update_required`) runs on **every** `graph_compute`, not only after a rebuild: the
+  scheduler mints a fresh `cgraph->uid` per split per compute (upstream #21764,
+  `ggml_backend_sched_split_graph`), and the Meta rebuild mints fresh child uids, so the `uid` early-out
+  cannot fire (verified with `GGML_CUDA_GRAPH_DEBUG=1`: zero "reused" lines on a decode).  Its old form
+  therefore paid, per node per call, a 1048 B `node_properties prop = {}` zero-fill, a
+  `sizeof(ggml_tensor)` (328 B) copy and a 1048 B `memcmp` — measured `__memcmp_evex_movbe` at **1.41 %**
+  of a decode-only profile window (2x R9700, 35B-A3B `-ncmoe 40`).  Now `ggml_cuda_graph_props_match()`
+  compares `cgraph->nodes[i]` **in place** (the same full node header, `src[]`/`view_src`/`buffer` object
+  identity included) and then only the **non-null** sources' `data`/`ne`/`nb`, from a store packed to the
+  sources a node has (`prop_nodes` / `prop_src_off` / `prop_srcs`) — measured: 1.4 sources per node, and
+  70,752 -> 29,840 B per graph entry (**−58 %**, i.e. ~100 MB less host state at the 4526 keys a
+  6000-token session reaches).  `memcmp` 1.41 % -> 0.58 % of the window.  The guard is *not* weakened: the
+  node-header compare is byte-identical to the old one (which is also what makes the packed source run
+  equivalent — a null/non-null layout change already fails it), and with the per-layer keys (r149) the
+  old `src[]`/name churn it used to clean up no longer exists.  Together with it: the graph key is built
+  **once** per call (it was built 2-3×, and `ggml_backend_cuda_graph_optimize` built and discarded one on
+  every call while `GGML_CUDA_GRAPH_OPT` is off — `ggml_cuda_graph_get_key` 0.26 % -> 0.15 %), and
+  `ggml_cuda_graph_check_compability` reads the arch **once** instead of a `cudaGetDevice()` runtime call
+  per `MUL_MAT_ID` node.  **No throughput claim**: on this box the work was hidden behind the GPU (35B-A3B
+  2 GPU +0.15 %, Flash-Next 2 GPU +0.75 % within noise over 6 pairs, 3-device dense and 1-GPU dense flat,
+  even pinned to 2 CPU cores +0.7 %); it is worth what it saves on a host-limited box — CPU time, bus
+  traffic and RAM.  The census is unchanged (`replay` identical in every pair) and greedy text is
+  byte-identical in every arm; prefill-logit KLD 0.000000 / 100.000 %.
 
 **Knobs.**  The slab/cache set listed under block 09, plus `GGML_CUDA_POOL_WIDE[_MIN_MIB]`,
 `GGML_CUDA_SLAB_STATS` / `_GRAPH_TRACE`, `GGML_CUDA_ASYNC_INPUT_BATCH` / `_LAZY_DONE` / `_DEBUG`,

@@ -1,5 +1,67 @@
 # WORKLOG - dated delivery records
 
+## 261027.010 (r158) -- the replay guard compares in place over a source-packed store; the graph key is built once (block 10)
+
+**Release:** `v15-6050b467c-r158` (base `6050b467c`, tip **`217b1c999`**, tree
+**`8851bb0024e547142ec533bd76ec18912539edad`**, 15 blocks; `validate-set.sh` green).  Delta against the r157
+tree: **two files, +129/-54**, `ggml/src/ggml-cuda/{ggml-cuda.cu,common.cuh}` (folded into block 10, the
+block that owns the current shape of the graph-compute path).  No kernel, no numerics, no env var, no
+default, no allocation size — every change is host code in the CUDA/HIP graph-replay bookkeeping.
+
+**1. Why the guard was worth looking at.**  `ggml_cuda_graph_update_required` is the only check that a
+replayed graph still points at the tensors it was captured from, and `cgraph->uid` cannot short-circuit it:
+the scheduler mints a fresh uid per split per compute (upstream #21764) and the Meta rebuild mints fresh
+child uids, so the walk runs on **every** `graph_compute` (verified: `GGML_CUDA_GRAPH_DEBUG=1` prints zero
+"CUDA Graph id … reused" lines on a decode).  Its old form built a `node_properties prop = {}` (1048 B
+zero-fill) + a 328 B `memcpy` + a 1048 B `memcmp` per node, per call, on the hit path where nothing
+differs.  A decode-only perf window put `__memcmp_evex_movbe` at **1.41 %** of CPU samples on the 35B-A3B
+2-GPU host-expert arm.
+
+**2. What shipped.**  (a) `ggml_cuda_graph_props_match()` compares `cgraph->nodes[i]` **in place** and
+stops at the first difference, then compares only the **non-null** sources' `data`/`ne`/`nb`; a
+`ggml_cuda_graph_props_store()` rewrites the store only when the guard says “changed”.  (b) The store is
+packed to the sources a node has (`prop_nodes` / `prop_src_off` / `prop_srcs`) instead of a fixed
+`GGML_MAX_SRC` layout: measured on the largest graph of the run, 67 nodes / 98 sources,
+**70,752 -> 29,840 B (−58 %)** — ~100 MB less host state at the 4526 graph entries a 6000-token Flash-Next
+session reaches.  (c) The graph key is built **once** per call and threaded into `update_required` /
+`evaluate_and_capture` / `set_enabled` (it was built 2-3×), and `ggml_backend_cuda_graph_optimize` no
+longer builds and discards one before its `GGML_CUDA_GRAPH_OPT` early return — dead work on every call in
+the default (opt-out) configuration.  (d) `ggml_cuda_graph_check_compability` reads the device's arch once
+instead of a `cudaGetDevice()` runtime call per `MUL_MAT_ID` node.  Measured after: `memcmp` 1.41 ->
+0.58 %, `get_key` 0.26 -> 0.15 %.
+
+**3. The guard is not weakened** — this is the point.  The node header is still `memcmp`'d verbatim against
+the live tensor (`src[]`/`view_src`/`buffer` object identity included), and the packed source run carries
+the same `data`/`ne`/`nb` values in the same source order, with the null/non-null layout already fixed by
+the header compare.  PR #230's follow-up offered an identity-free compare
+(`GGML_CUDA_GRAPH_PROPS_RELAXED=1`, blanking `src[]`/`view_src`/`buffer`) with a census showing 4129 -> 242
+`properties_changed`; we declined it again — it treats a symptom of the r149 key collision and removes the
+only check that a replay's baked arguments still point where they were captured, and its measured effect
+(its own 4-pair CIs cross zero; +0.2-0.5 % on ours) does not buy that.  The *cost* of the compare was
+removed instead, without changing what it compares.  Their data and the decision are recorded in
+`archive/work/graph-replay-keys/README.md` §4.
+
+**4. No throughput claim, deliberately.**  On this box the work is hidden behind the GPU: 35B-A3B 2 GPU
+`-ncmoe 40` **+0.15 %** (4 pairs), Flash-Next 2 GPU `-ncmoe 48` **+0.75 %** (6 pairs, paired sd 0.63 — not
+significant), 35B-A3B + DFlash2 −0.6 %, Gemma4 E4B + MTP flat, 27B 3-device dense `tg128` flat, 1-GPU
+dense flat, and **+0.7 % even pinned to 2 CPU cores**.  The host enqueues ~240 `graph_compute` calls per
+token in ~1-2 ms against 10-28 ms of GPU work, so it runs ahead.  The value is what a token costs a weaker
+CPU (fewer instructions, less bus traffic) and the RAM it saves — which is why it ships at all, and why
+no t/s figure should be quoted for r158.  Numbers: `benchmarks/2026-10-27-graph-replay-props.md`.
+
+**5. Gates.**  Greedy text byte-identical in every pair (8/8 35B-A3B 2 GPU, 6/6 Flash-Next 2 GPU, 2/2
+35B-A3B + DFlash2, 6/6 Gemma4 E4B + MTP); `replay` census **identical in every pair** (`capture`/
+`properties_changed` vary run-to-run on both builds because the 10 s unused-graph sweep depends on
+wall-clock load time); `test-backend-ops -o MUL_MAT_ID` OK; `gate-prefill-logits.sh` **mean KLD 0.000000 /
+same-top-p 100.000 %**; `validate-set.sh` green; `fork-refresh.sh --build --gates` green.
+
+**Not taken (found while reviewing this path, its own campaign if ever):** the per-call Meta rebuild —
+`ggml_backend_meta_graph_compute` re-splits every compute because the parent uid is fresh, and in the same
+profile window it costs `meta_graph_compute` 1.00 % + `meta_get_split_state` 1.10 % + mutex 2.22 % +
+`malloc`/`free` 1.44 % ≈ 6 % of the window's CPU; and `any_cuda_graph_enabled()`/
+`_has_instance()` are O(#graphs) scans called four times per `MEAN` node (latent — no shipped arch
+dispatches `MEAN`).
+
 ## 261027.009 (r157) -- TODO #110: the device-state path's cost was the pageable bounce per piece, not its views (block 12)
 
 **Release:** `v15-6050b467c-r157` (base `6050b467c`, tip **`c50bfdea0`**, tree

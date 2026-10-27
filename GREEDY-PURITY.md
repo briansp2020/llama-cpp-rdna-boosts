@@ -123,7 +123,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§59** | a fused window must read a tensor the graph keeps alive for it — the one the emitter pins — never an unpinned ancestor whose last graph use runs *before* the window; and a fusion of a norm must reduce in the *same grouping* as the kernel it replaces, or it is only approximately that kernel | fix (r140 + r141, issue #226) |
 | **§60** | a reduction-order change is a new numerics reference: one reduction (the strided one), and every fused norm kernel reduces like the chain it replaces | doctrine (r145, issue #229) |
 | **§61** | a fused op must reproduce the *model's own chain*, not its fused sibling: an intermediate tensor's scale convention belongs to the emitter, so a pair of fused ops that agree with each other can still be wrong — and the arms they select into are the oracle | fix + doctrine (r148, issue #228; the DSV4 pre/post pair re-baselined to a reported arm at r157) |
-| **§62** | a captured graph is pure only while its **key** names every dimension the subgraph varies in and its **property compare** still sees every baked pointer: a cache key is not a guard, and an identity-free compare is not "purity-neutral" — it is the removal of the only check that a replay's baked kernel arguments still point at the tensors they were captured from | doctrine (r149, TODO #107; `archive/work/graph-replay-keys/`) |
+| **§62** | a captured graph is pure only while its **key** names every dimension the subgraph varies in and its **property compare** still sees every baked pointer: a cache key is not a guard, and an identity-free compare is not "purity-neutral" — it is the removal of the only check that a replay's baked kernel arguments still point at the tensors they were captured from. The compare runs on *every* `graph_compute` (its `uid` early-out cannot fire), so its cost is reduced by comparing the live tensors in place over a source-packed store, never by comparing less | doctrine (r149, TODO #107; r158 compare rework; `archive/work/graph-replay-keys/`) |
 | **§63** | a verify batch is only as cheap as its *widest* sequence set: aligning the sequences of one step into one ubatch changes a slot's verify width, so the text-level oracle is the single-sequence arm and a verify-width control, never a two-slot text diff | fix + doctrine (r153, issue #234; `archive/work/spec-align-234/`) |
 | **§64** | a restored state may stand in for a fresh save only because the restore re-establishes *everything* a save would capture: the guard is the position alone, so a new per-checkpoint payload must be restored (or stashed before the keep check), and the path only exists where a restore lands on the checkpoint's own position (a hybrid/recurrent memory) | doctrine (r155, PR #236; `archive/work/server-ckpt-reuse/`) |
 
@@ -1835,6 +1835,18 @@ Two corollaries that cost real time to learn:
   cache hands the MoE kernels its arena slot table, remap staging, routing staging and both heat mirrors
   that way, so freeing any of them must bump `ggml_cuda_graph_mem_freed` — in the *helper* that returns the
   memory, so a new free site cannot forget.
+
+**r158: the guard's cost, not its content.**  The `uid` early-out above cannot fire (the scheduler mints a
+fresh `cgraph->uid` per split per compute, and the Meta rebuild mints fresh child uids), so the compare
+runs on every `graph_compute` — with a 1048 B zero-filled temp, a 328 B `memcpy` and a 1048 B `memcmp` per
+node, per call, on a hit path where nothing differs (`1.41 %` of a decode-only CPU profile).  r158 compares
+`cgraph->nodes[i]` **in place** and only the non-null sources, from a store packed to the sources a node
+has (1.4 per node; 70,752 -> 29,840 B per graph entry).  The compared information is unchanged, which is
+the whole point: PR #230's follow-up later offered the identity-free compare as an opt-in
+(`GGML_CUDA_GRAPH_PROPS_RELAXED=1`, census `properties_changed` 4129 -> 242) and it was declined again —
+the honest read of its own numbers is that the ~10³ changes are the r149 collision's leftovers, each
+costing one direct call, and its 4-pair confidence intervals cross zero.  Thinning the guard is not how to
+get that time back; not doing the redundant work is.
 
 ## 63. A verify batch is only as cheap as its widest sequence set: aligning one step's sequences into one ubatch, and the oracle that can judge it (r153, issue #234)
 

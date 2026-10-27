@@ -714,7 +714,23 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   object address, an allocation pointer, a generation counter) — that is the r115 trap from the other
   direction — and **never** weaken `ggml_cuda_graph_update_required` (an identity-free compare measured
   +0.2-0.3 % and is not shipped; an executable whose baked arguments point at re-placed buffers is a
-  silent wrong-answer bug).  A captured graph bakes **raw device pointers that are not tensor sources**
+  silent wrong-answer bug).  **The guard runs on *every* `graph_compute`, not only after a rebuild** — the
+  scheduler mints a fresh `cgraph->uid` per split per compute (upstream #21764) and the Meta rebuild mints
+  fresh child uids, so its `uid` early-out cannot fire (verified: `GGML_CUDA_GRAPH_DEBUG=1` prints no
+  "reused" lines on a decode).  That is why its per-node cost is a per-token host cost, and since r158 it
+  compares the live tensors **in place** (no temp struct, stop at the first difference) over a store
+  **packed to the sources a node has** (`prop_nodes` / `prop_src_off` / `prop_srcs`; measured 1.4 sources
+  per node, 70,752 -> 29,840 B per graph entry, `memcmp` 1.41 -> 0.58 % of a decode window).  The compared
+  information is unchanged (the node header verbatim, then each non-null source's `data`/`ne`/`nb`) — do
+  not "simplify" it back to a fixed `GGML_MAX_SRC` temp, and do not turn the packed store into a hash: it
+  is the only check that a replay's baked arguments still point where they were captured.  The fold also
+  builds the graph key **once** per call (it was built 2-3×, and `ggml_backend_cuda_graph_optimize` built
+  and discarded one before its `GGML_CUDA_GRAPH_OPT` early return) and reads the device arch **once** in
+  `ggml_cuda_graph_check_compability` instead of a `cudaGetDevice()` per `MUL_MAT_ID` node.  It is
+  hygiene, not a win: on this box the host runs ahead of the GPU, so every arm measures flat (+0.15 % /
+  +0.75 % within noise, +0.7 % even pinned to 2 cores) — the value is CPU time, bus traffic and ~100 MB of
+  RAM on a host-limited box, so do not quote a t/s figure for it.  A captured graph bakes **raw device
+  pointers that are not tensor sources**
   (the expert cache's arena slot table, remap staging, routing staging and both heat mirrors), so freeing
   any of a table's device buffers must bump `ggml_cuda_graph_mem_freed` — put it in the helper that returns
   the memory, not in the caller.  **Known loss:** a **3-device `-sm tensor` qwen35 dense plain** decode is
@@ -724,8 +740,10 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   irrelevant.  That is the r34 "RCCL's presence costs the internal pipeline" effect resurfacing, not a
   property of dense models: Gemma4 31B Q8_0 (dense, 32.6 GB) is +0.8 % at 2 GPUs and flat at 3, 27B at 2
   GPUs is +0.5 %, and a draft hides it (`TODO #109`).  Records
-  `archive/work/graph-replay-keys/` (the PR assessment, the corrected diagnosis) plus
-  `benchmarks/2026-10-26-graph-replay-keys.md` (the numbers).
+  `archive/work/graph-replay-keys/` (the PR assessment, the corrected diagnosis, and r158's
+  compare rework with the follow-up that offered the relaxed compare) plus
+  `benchmarks/2026-10-26-graph-replay-keys.md` (the numbers) and
+  `benchmarks/2026-10-27-graph-replay-props.md` (r158's).
   Read the census as: `direct ≈ 0`, `replay ≈ calls`, `properties_changed` in the tens, `capture` = the
   number of distinct keys (hundreds — one graph per layer per width, not recaptures).
 - **On 2+ devices `-sm tensor` is not just "the tuned path", it is worth tens of percent at low residency
