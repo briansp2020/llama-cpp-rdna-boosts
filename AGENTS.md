@@ -916,6 +916,14 @@ HIP_VISIBLE_DEVICES=0,1,2 ./build/bin/llama-cli -m /llm/models/Qwen3.5/4B/Q8_0/Q
   --seed 42 --temp 0 --no-display-prompt --single-turn
 ```
 
+**Pin `HIP_VISIBLE_DEVICES` for every multi-device arm on this box.**  The 9950X3D's iGPU (gfx1036) is
+enumerated as a HIP device, and the delivery is built for `gfx1201` only, so an arm that lets `-sm tensor`
+pick its devices without the pin aborts at model load with `ROCm error: invalid kernel file`
+(`ggml-cuda.cu:130`) — it looks like a defect in the change under test and is not one.  Use
+`HIP_VISIBLE_DEVICES=0,2` for the x8 pair and `0,1,2` for all three R9700s.  A **1 GPU** arm without the pin
+happens to work (the iGPU is only reached when the split enumerates every device), which is what makes this
+trap so easy to hit only on the 3-GPU arm.
+
 Diff against a known-good build: same-seed output must be IDENTICAL. `GGML_CUDA_ALLREDUCE=nccl` is not
 a bit-identical reference under `-sm tensor` (see Block 01 above); treat it as a smoke comparison.
 
