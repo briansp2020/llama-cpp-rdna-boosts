@@ -141,7 +141,7 @@ BASE="${BASE:-}"
 MODEL="${MODEL:-}"
 MODEL_GIVEN=0
 
-usage() { sed -n '2,101p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d'; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
