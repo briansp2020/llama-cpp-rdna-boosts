@@ -1,5 +1,50 @@
 # WORKLOG - dated delivery records
 
+## 261027.001 (tooling, post-r150) -- one definition for `.tip`, and a deterministic re-cut
+
+**No release, no patch change.**  `release.json` still names `v15-6050b467c-r150` (tip `f0060e159`, tree
+`dda152c10`); this is a delivery-repo tooling and documentation change only, so no new tag and no patch
+regeneration.
+
+### The problem it removes
+
+Every release re-derived `release.json.tip` by hand, and the three SHAs in play are easy to confuse: the
+working chain tip in `~/llama.cpp` (the commits a release is developed on), the re-cut tip that the
+personal fork's `rdna-boosts` branch actually carries, and whatever the last edit left in `release.json`.
+The chain and the re-cut have the **same tree** but different commit ids, because `git am` stamped the
+*wall-clock* committer time (r150's chain tip was `3a08b6d3d`, its re-cut was `f0060e159`).
+
+### Shipped
+
+* **`scripts/apply-all.sh` makes the re-cut deterministic**: the committer identity is pinned to the
+  patch series' author (`From:` of the first patch) and every commit's committer date is stamped from its
+  own author date (`git am --committer-date-is-author-date`).  Verified: two re-cuts in one checkout, a
+  second clone, and a run with `GIT_COMMITTER_NAME`/`_EMAIL` overridden all produce tip **`649f03593`**
+  (tree `dda152c10`, 15 commits).  The script now prints `Applied tip: <sha> (this is the value for
+  release.json .tip / the fork branch tip)` instead of leaving the caller to work it out.
+  **r150 and earlier predate this**, so their recorded tip is the re-cut of the day and the current
+  `apply-all.sh` reproduces their tree but not that id; from the next release the two agree by construction.
+* **`scripts/fork-refresh.sh`** (new) is the fork refresh from the Pushing policy as one command: clean
+  check, leave the branch, delete `rdna-boosts`, re-cut, assert the tree and the commit count, print the
+  tip, and optionally `--build`, `--gates` (coherence + prefill-logit, plus the MTP Protocol A command it
+  cannot parameterise) and `--push` (force-with-lease, with the remote url checked against an allow-list
+  so upstream is not reachable from it).  Tested end to end on a throwaway clone.
+* **`scripts/validate-set.sh` prints the applied tip** and says why it cannot compare it: it builds the
+  base from the commit tarball, so its commit ids differ from upstream's by construction (a commit id
+  includes its parent).  The tree remains the contract there; `fork-refresh.sh` does the tip comparison
+  against a real checkout.
+* **Docs**: a `.tip` rule in `AGENTS.md` (what it means, the three traps, "compare trees, never SHAs"),
+  the Pushing-policy checklist points at `fork-refresh.sh`, `MANIFESTS.md` records the tip print and the
+  reason validate-set cannot check it, `scripts/make-release.sh`'s help states that `--tip` is the fork
+  branch tip, and `scripts/README.md` indexes the new script.
+* **Also cleaned up along the way**: nothing in the patch set or in `ENVIRONMENT.md` changed.
+
+### Validation of the tooling change
+
+`validate-set.sh` green (tree `dda152c10`); `apply-all.sh` determinism as above; `fork-refresh.sh` dry run
+on a throwaway clone (tree match, tip printed, mismatch note for r150's old-style tip); `bash -n` on every
+touched script.
+
 ## 261026.008 (r150) -- issue #232: the Meta backend's simple-tensor container grows instead of aborting
 
 **Release:** `v15-6050b467c-r150` (base `6050b467c`, tip `f0060e159` = the fork's re-cut branch, tree

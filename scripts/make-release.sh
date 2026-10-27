@@ -30,6 +30,14 @@
 # SHA also works -- .github/workflows/docker-ghcr.yml accepts a tag whose base
 # component is a prefix of the recorded base -- but the short form is the
 # convention in the tag history.
+#
+# `tip` is ALWAYS the fork branch tip: the commit the personal fork's `rdna-boosts`
+# branch carries, which is exactly what `scripts/apply-all.sh` prints as
+# "Applied tip: <sha>" (and what `scripts/fork-refresh.sh` checks against this
+# field).  It is NOT the tip of a working chain in $HOME/llama.cpp: those commits
+# have the same tree but different ids.  Since the deterministic re-cut the value
+# is reproducible, so re-cut first (scripts/fork-refresh.sh), then record it here
+# and tag.  See the `.tip` rule in AGENTS.md.
 #   e.g.  ./scripts/make-release.sh \
 #           --base a55e952b8 \
 #           --base-tree "$(git -C ~/llama.cpp rev-parse a55e952b8^{tree})" \

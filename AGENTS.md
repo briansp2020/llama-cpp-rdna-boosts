@@ -43,7 +43,8 @@ amendment, or a note in the relevant record).
 - **Every release MUST refresh the fork's `rdna-boosts` branch.**  Consumers clone the personal fork
   and check out `rdna-boosts` instead of applying the patch set, so a stale branch is what produced
   the 2026-10 Reddit "rdna-boosts is slow" incident (the branch was a month behind).  On every
-  release (and whenever the block set changes), do a clean apply and push the branch:
+  release (and whenever the block set changes) run **`scripts/fork-refresh.sh`** (add `--build
+  --gates` for the full policy, and `--push` to publish once it has confirmed the tree):
   1. In a clean `~/llama.cpp`, check out upstream `master` at the **baseline point** — the `.base`
      commit in `release.json`, never the tip of `master`.
   2. Delete the existing `rdna-boosts` branch and re-create it with `scripts/apply-all.sh` (strict
@@ -51,6 +52,22 @@ amendment, or a note in the relevant record).
   3. Build it and run the coherence + MTP gates and `scripts/gate-prefill-logits.sh`; `scripts/validate-set.sh` must be green.
   4. `git push --force-with-lease origin rdna-boosts` — the **personal fork only**, never upstream;
      never a bare `--force`.
+- **`.tip` means the fork branch tip, and it is the only SHA to record.**  `release.json.tip` names
+  the commit the personal fork's `rdna-boosts` branch carries.  `scripts/apply-all.sh` prints it
+  (`Applied tip: <sha>`), `scripts/fork-refresh.sh` re-checks it against `.tip`, and since the
+  deterministic re-cut (tooling change after r150: `apply-all.sh` pins the committer identity to the
+  patch series' author and stamps each commit's committer date from its own author date) any checkout
+  of `.base` on any machine produces **the same commit ids**, so the value is reproducible.  Three
+  traps, all of which have bitten before:
+  (a) the *working chain* tip in `~/llama.cpp` (the commits a release is developed on) is a
+  **different commit with the same tree** — never record it; (b) a re-cut made before that tooling
+  change (r150 and earlier) was stamped with the re-cut's wall-clock time, so its recorded tip is the
+  commit the branch carries but the current `apply-all.sh` cannot reproduce that id (its tree still
+  matches, which is the contract); (c) `scripts/validate-set.sh` cannot check the tip — it
+  materialises `.base` from the commit tarball into a fresh repository, so its applied commit ids
+  differ by construction (it checks the **tree**; `fork-refresh.sh` checks the tip against a real
+  checkout).  If in doubt: **compare trees, never SHAs**; a matching tree plus a `rdna-boosts` branch
+  whose tip is `.tip` is the whole contract.
 - **Every release MUST also publish the ROCm container images.**  They are built and pushed
   **off-host** by the worker watcher (`scripts/container-watch.sh` on `radiance`), which polls for the
   new release tag and runs `scripts/build-containers.sh --rocm "7.14.1 10.1" --push --prune`; see
@@ -81,7 +98,7 @@ amendment, or a note in the relevant record).
 | `TODO.md` | **forward-looking only**: open items, items waiting on someone else, accepted limitations, parked ideas. A closed item is one `WORKLOG.md` entry — never a TODO entry. `#NN` numbers are permanent handles and are never reused |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims); dated narratives/evidence are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
 | `patches/` | **the delivery set** (0000-0014: block 00 + blocks 01-14) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
-| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-park-idle-slots.sh` (the server idle-slot parking gate: park == lazy-off text + the indexer cache moves with the attention cache, issue #227), `gate-hc-fusions.sh` (the qwen4exp hyper-connection fusion-equivalence gate: all four mix/combine arms must reproduce the unfused chain, once per hc-down weight class, issue #228), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out), `check-windows-portability.sh` (fails on a POSIX-only call outside a Windows-excluding region in a file the delivery adds, issue #231; run by `validate-set.sh`). **Index: `scripts/README.md`** |
+| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback, **deterministic commit ids**), `fork-refresh.sh` (the release-time fork refresh: re-cut, tree/tip check, optional build/gates/push — the `.tip` rule below), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-park-idle-slots.sh` (the server idle-slot parking gate: park == lazy-off text + the indexer cache moves with the attention cache, issue #227), `gate-hc-fusions.sh` (the qwen4exp hyper-connection fusion-equivalence gate: all four mix/combine arms must reproduce the unfused chain, once per hc-down weight class, issue #228), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out), `check-windows-portability.sh` (fails on a POSIX-only call outside a Windows-excluding region in a file the delivery adds, issue #231; run by `validate-set.sh`). **Index: `scripts/README.md`** |
 | `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
 |  `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
 | `prompts/` | versioned, hash-stable test prompts; sizes/token counts/**sha256** in `prompts/README.md`. A shipped prompt is **never edited in place** (add a new file); a result is only valid against the prompt hash it names |

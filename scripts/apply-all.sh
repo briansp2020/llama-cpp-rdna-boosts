@@ -68,11 +68,34 @@ git checkout -q -b "$BRANCH"
 # construction).  On failure, abort (returns the branch to the baseline) and
 # retry the whole series with `git am -3`, warning loudly that merged hunks
 # may differ from the canonical tree.
+#
+# DETERMINISTIC COMMIT IDS (tooling, added after r150): `git am` stamps the *current* committer time and the
+# identity of whoever runs it, so the same patch series at the same base produced a
+# different SHA on every re-cut.  release.json.tip then named a commit no other machine
+# could reproduce, the fork branch carried a third value, and every release re-derived
+# the tip by hand (the "which SHA is the tip?" confusion).  Stamping each commit's
+# committer date from its own author date and pinning the committer identity to the
+# series author makes the applied chain a pure function of (base, patches): every
+# checkout, every machine and every OS user produce the same commit ids, so `.tip` is
+# reproducible and verifiable (validate-set.sh compares it, scripts/fork-refresh.sh
+# prints it).
+SERIES_AUTHOR="$(sed -n 's/^From: //p' "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch | head -1)"
+SERIES_NAME="${SERIES_AUTHOR% <*}"
+SERIES_MAIL="${SERIES_AUTHOR##*<}"
+SERIES_MAIL="${SERIES_MAIL%%>*}"
+[ -n "$SERIES_NAME" ] || SERIES_NAME="rdna-boosts"
+[ -n "$SERIES_MAIL" ] || SERIES_MAIL="ci@rdna-boosts.invalid"
+# forced, not defaulted: an inherited GIT_COMMITTER_* would make the ids depend on the
+# environment again, which is exactly what this block removes
+export GIT_COMMITTER_NAME="$SERIES_NAME"
+export GIT_COMMITTER_EMAIL="$SERIES_MAIL"
+GIT_AM_DET=--committer-date-is-author-date
+
 APPLIED_WITH_3WAY=0
-if ! git am "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch; then
+if ! git am $GIT_AM_DET "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch; then
     echo "strict 'git am' failed at this base; aborting and retrying the series with 'git am -3' (3-way merge)" >&2
     git am --abort >/dev/null 2>&1 || true
-    git am -3 "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch
+    git am $GIT_AM_DET -3 "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch
     APPLIED_WITH_3WAY=1
 fi
 
@@ -103,6 +126,11 @@ if [ -n "$RELEASE_TREE" ] && [ "$APPLIED_WITH_3WAY" -eq 0 ]; then
     fi
     echo "Applied tree matches release.json ($RELEASE_TREE)."
 fi
+# The commit ids are deterministic (see GIT_AM_DET above), so the tip is the value
+# release.json .tip must carry.  Print it rather than leaving the caller to work out
+# which SHA is "the" tip (the chain tip in a working fork is a different commit with
+# the same tree; it must never be recorded).
+echo "Applied tip: $(git rev-parse --short=9 HEAD) (this is the value for release.json .tip / the fork branch tip)"
 
 # ---------------------------------------------------------------------------
 # BETA candidates (explicit opt-in, applied AFTER the release tree was verified)

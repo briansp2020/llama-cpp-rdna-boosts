@@ -57,6 +57,11 @@ silently drops hunks (measured: 30 files / 2483 lines instead of 35 / 6094).  Th
 3. on failure, aborts and retries the series **once** with `git am -3` (3-way against the recorded blob
    ids), warning that the merged tree may differ from the canonical one;
 4. on the strict path, asserts the applied tree equals `release.json.tree` — a stale fork point or a
+   partially regenerated patch set fails here — and prints the applied **tip** (`release.json.tip`, the
+   commit the personal fork's `rdna-boosts` branch carries).  `apply-all.sh` pins the committer
+   identity/date, so a re-cut on a real checkout of `.base` reproduces that tip; `validate-set.sh`
+   itself cannot compare it (it builds `.base` from the commit tarball, so its commit ids differ by
+   construction) — `scripts/fork-refresh.sh` does that comparison.  The `.tip` rule is in `AGENTS.md`.
    partially regenerated set fails here rather than at the build;
 5. `--include-beta` then applies `beta/*/*.patch` on top of the *verified* tree (one commit each).  The
    checkout is then **not** the release tree, which the script reports.

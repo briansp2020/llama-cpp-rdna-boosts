@@ -37,6 +37,7 @@ command -v curl >/dev/null || { echo "ERROR: curl is required" >&2; exit 1; }
 base="$(jq -r '.base' "$MANIFEST")"
 base_tree="$(jq -r '.base_tree // empty' "$MANIFEST")"
 tree="$(jq -r '.tree // empty' "$MANIFEST")"
+tip="$(jq -r '.tip  // empty' "$MANIFEST")"
 n_blocks="$(jq -r '.n_blocks' "$MANIFEST")"
 [ -n "$base" ] && [ "$base" != "null" ] || { echo "ERROR: release.json has no base" >&2; exit 1; }
 
@@ -104,6 +105,16 @@ count="$(git rev-list --count HEAD)"
 if [ -n "$tree" ]; then
   got="$(git rev-parse HEAD^{tree})"
   [ "$got" = "$tree" ] || fail "applied tree mismatch (have $got, want $tree)"
+fi
+# The TREE is the contract (above).  release.json.tip names the commit the personal fork's
+# rdna-boosts branch carries, and applying the set to a REAL checkout of `.base` reproduces
+# it exactly (apply-all.sh pins the committer identity and date).  This script cannot check
+# that: it materialises the base from the commit tarball into a fresh repository, so the
+# base commit id differs from upstream's and, since a commit id includes its parent, every
+# applied commit id differs by construction.  Printed for information; the tip is checked
+# against the real base by scripts/fork-refresh.sh.
+if [ -n "$tip" ]; then
+  echo "==> applied tip $(git rev-parse --short=9 HEAD) (informational: this base is a fresh tarball commit with a fresh date, so the applied ids differ from release.json .tip $tip and from run to run by construction; the tip check lives in scripts/fork-refresh.sh)"
 fi
 
 # Every block tree, not just the tip: a resolution slip or a misplaced fix shows up as a
