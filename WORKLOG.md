@@ -2,10 +2,11 @@
 
 ## 261026.008 (r150) -- issue #232: the Meta backend's simple-tensor container grows instead of aborting
 
-**Release:** `v15-6050b467c-r150` (base `6050b467c`, tip `5122befa0`, tree `3a0c8f3ae663a5129c86e74def5c507ecfc5dbbe`,
-15 blocks, 09 amended).  Delta against the r149 tree: **2 files, +83/-10**, both in **block 09** --
-`ggml/src/ggml-backend-meta.cpp` (the container) and `ggml/src/ggml.c` (the overflow diagnostic).  No kernel, no
-numerics, no default and no allocation-size change on the normal path.
+**Release:** `v15-6050b467c-r150` (base `6050b467c`, tip `3a08b6d3d`, tree `dda152c109c2baf800271da3f9990cd9871db486`,
+15 blocks, blocks 09 and 12 amended).  Delta against the r149 tree: **4 files, +154/-10** --
+`ggml/src/ggml-backend-meta.cpp` + `ggml/include/ggml-backend.h` + `ggml/src/ggml.c` (block 09) and
+`src/llama-kv-cache.cpp` (`park_move`, block 12).  No kernel, no numerics, no default and no
+allocation-size change on the normal path.
 
 ### What was reported
 
@@ -21,7 +22,7 @@ ggml_new_object: not enough space in the context's memory pool (needed 2261360, 
 `needed` is bigger than `available` (`mem_size`) by **exactly one `ggml_tensor` object** (368 B), so a
 `ggml_context` that holds only tensor metadata was *exactly full* and one more tensor was requested.
 
-### Diagnosis: it is the meta backend's compute container of the attention KV buffer
+### Diagnosis: it is the meta backend's compute container of the attention KV buffer (and `park_move` fills it)
 
 `2260992 = 128 * 48 * 368`: the `compute_headroom * n_tensors * size(ggml_tensor)` context that
 `ggml_backend_meta_buffer_type_alloc_buffer_n` builds for a buffer with 48 static tensors, at 128 views each.
@@ -35,9 +36,17 @@ every graph shape contribute.  The container was a single fixed-size context per
 **cliff**: 6144 views for the attention KV buffer, then `ggml_new_object` returned NULL and the CPU-side
 `GGML_ASSERT` aborted the process (the pool `WARN` is not fatal in a `NDEBUG` build).  Measured on this box
 with the server: a 34,970-token context-checkpoint restore registers **432** views of the KV buffer
-(18 cell ranges x 24), a 2-slot 524288-cell unified-cache flow reaches 648 per generation — i.e. a
-long-context restore is ~0.012 views/token, and 258k tokens of restored state is ~3.1k views: two such
-restores plus the graph's own 216 exceed 6144.  The fix is therefore to remove the cliff, not to tune it.
+(18 cell ranges x 24).
+
+**The reported trigger is KV parking, not a restore** (`MrDrMcCoy`'s follow-up, reproduced here):
+`llama_kv_cache::park_move` copies a run in chunks no larger than the *gap* to its destination and
+creates 2 views per (layer, K/V) per chunk, so a nearly-full unified cache (two ~258k-token prompts in
+524288 cells) parks in dozens of tiny chunks — and parking runs between graphs, so nothing reclaimed
+them.  Reproduced at the **default** budget with 2 slots, `-c 32768` and two ~16.3k-token prompts
+(park gap ~100 cells): r149 aborts with `needed 2261360, available 2260992` inside
+`llama_kv_cache::seq_park` -> `park_move`.  So the fix has two halves: stop accumulating those views,
+and remove the cliff for everything else (state restores included — a 258k restore is ~3.1k views, and
+two of them plus the graph's 216 also exceed 6144).
 
 ### Shipped
 
@@ -51,13 +60,23 @@ restores plus the graph's own 216 exceed 6144.  The fix is therefore to remove t
   which is how the path was verified.
 * `ggml_new_object`'s overflow warning now also logs `ctx`, `mem_size`, `n_objects` and the bytes used, so a
   report of this class is diagnosable from the log (the reporter's log could only say "needed/available").
+* **Views created between graph evals go to a caller-owned scratch container**
+  (`ggml_backend_meta_set_scratch_views()` / `ggml_backend_meta_reset_scratch_views()`, the reporter's patch):
+  `park_move` enables it, resets it after each chunk's copies (which are synchronous — a meta buffer has no
+  `.cpy_tensor`, so `ggml_backend_tensor_copy` stages through the host) and disables it, so parking no longer
+  touches the per-generation container at all.  Static tensors still resolve to the static container, and the
+  scratch container grows like every other one.
 * Hardened in the same file while reading it: `get_node_aux()` asserts against its `nodes_aux` pool (its
   ALL_GATHER sibling already did), so an over-budget graph reports instead of writing past the pool
   (TODO #111, closed; unreachable on every recorded config).
 
 ### Validation (3x R9700 gfx1201, ROCm 10.1.0, Flash-Next GSQ-RCO IQ3_XXS)
 
-* **The cliff, before vs after:** `GGML_META_COMPUTE_HEADROOM=1` aborts the r149 build at `sched_reserve`
+* **The reported crash, before vs after (default budget):** 2 slots, `-c 32768`, two ~16.3k-token prompts —
+  r149 aborts in `seq_park`/`park_move` with `needed 2261360, available 2260992`; the growth half alone completes
+  with the attention-KV container grown 6144 -> 12288 (the indexer's 3072 -> 6144); growth + scratch completes
+  with **zero** growth events.  Identical output text on all three.
+* **The cliff in general:** `GGML_META_COMPUTE_HEADROOM=1` aborts the r149 build at `sched_reserve`
   (`needed 27232, available 26864`, the same `GGML_ASSERT(obj_new)`) and runs to completion on this build
   (105 growth events, `llama-cli`), with **byte-identical greedy text** in both arms and against the r149 build
   at the default headroom.
@@ -65,7 +84,10 @@ restores plus the graph's own 216 exceed 6144.  The fix is therefore to remove t
   `PPL = 2.0901 +/- 0.05592` on both builds; same-seed greedy text identical on the 4k-context and
   server flows (e.g. the two ~240k-token prompts of the 524288-cell 2-slot flow, parking + checkpoint
   restores included).
-* **Set:** `validate-set.sh` green on a fresh tarball (15 blocks, tree `3a0c8f3ae`);
+* **Parking semantics:** `gate-park-idle-slots.sh` **PASS** — 6 park / 2 unpark moves traced, park ==
+  `LLAMA_SERVER_LAZY_IDLE_SLOTS=0` byte for byte on all four requests, and the `parkoff` arm still differs
+  (the workload still reproduces #210).
+* **Set:** `validate-set.sh` green on a fresh tarball (15 blocks, tree `dda152c10`);
   `gate-per-block-build.sh --fast --changed-from 947fdf295` **2/2** (block 09, tip).
 
 ### Not done (recorded, not scoped in)

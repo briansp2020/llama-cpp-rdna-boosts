@@ -734,23 +734,37 @@ whatever VRAM is left.
   in the same order and computes the same states (proven with `GGML_META_SS_VERIFY=1`, which recomputes
   every outer hit), and an exhausted arena falls back to the upstream allocator, so nothing is capped.
   `GGML_META_SS_SCRATCH=0` restores the heap containers (A/B and bisection only).
+* **Views created between graph evals get a caller-owned scratch container** (r150, issue #232, the
+  reporter's patch).  `llama_kv_cache::park_move` moves a run in chunks no larger than the gap to its
+  destination and creates 2 views per (layer, K/V) per chunk, so a nearly-full unified cache (two
+  ~258k-token prompts in 524288 cells) parks in dozens of tiny chunks — and parking runs *between*
+  graphs, so those views landed in the per-generation compute container and nothing reclaimed them.
+  `ggml_backend_meta_set_scratch_views(true)` routes views that are not static tensors into
+  `stc_scratch`, and `ggml_backend_meta_reset_scratch_views(buffer)` drops them once the chunk's copies
+  are done (`park_move` does this per chunk, then disables it); the copies are synchronous — a meta
+  buffer has no `.cpy_tensor`, so `ggml_backend_tensor_copy` stages through the host — so no scratch view
+  outlives its reset.  Static tensors still resolve to `stc_static`, so nested-view lookup is unchanged.
+  `gate-park-idle-slots.sh` PASS (park == lazy-off byte for byte on all four requests).  `TODO` #110:
+  `llama_io_read_device`'s state-restore views still take the per-generation container.
 * **A simply-tensor container grows; it is not a fixed budget** (r150, issue #232).  Every Meta buffer
   keeps a "compute" container of per-device *simple tensors* for the tensors a generation registers — a
   graph's own views plus the views an out-of-graph operation creates (`llama_io_read_device` registers one
   per KV cache chunk per layer on a state restore, `llama_kv_cache::park_move` one per move chunk).  The
-  container used to be one context sized `128 * n_static_tensors` views, so a long-context
-  checkpoint/prompt-cache restore could exhaust it: the 48-tensor attention KV buffer budgeted
-  **6144** views (a 2,260,992 B ggml context) and the server aborted in `ggml_new_object` with
-  `not enough space in the context's memory pool (needed 2261360, available 2260992)` — exactly one
-  tensor short of the pool.  A full context is now followed by another one (allocation is
+  container used to be one context sized `128 * n_static_tensors` views, so one generation could exhaust
+  it: the 48-tensor attention KV buffer budgeted **6144** views (a 2,260,992 B ggml context) and the
+  server aborted in `ggml_new_object` with `not enough space in the context's memory pool (needed
+  2261360, available 2260992)` — exactly one tensor short of the pool.  The reported generation was a
+  `park_move` (above); a long-context state restore (~0.012 views/token: 432 for a 35k-token checkpoint)
+  is the other contributor, and any new out-of-graph view source is covered by the growth.  A full context is now followed by another one (allocation is
   `ctx_for_new_tensor()`), and a rebuild resets and **releases** every context in the list, so the budget
   is a first-context size rather than a cliff.  `GGML_META_COMPUTE_HEADROOM` (default 128) overrides that
   size — a diagnostic/testing knob: a smaller value only makes the container grow sooner and never
   changes an output.  `ggml_new_object`'s overflow warning now also logs the context, its `mem_size`,
   its object count and the bytes used, so a report of this class is diagnosable from the log alone.
-  Verified on 3x R9700 + Flash-Next GSQ-RCO IQ3_XXS (`-sm tensor`): `GGML_META_COMPUTE_HEADROOM=1` aborts
-  the r149 build at `sched_reserve` and runs to completion on this build (105 growth events), with
-  byte-identical greedy text in both arms and against the r149 build at the default headroom.
+  Verified on 3x R9700 + Flash-Next GSQ-RCO IQ3_XXS (`-sm tensor`): the park trigger aborts r149 at the
+  default budget and completes here (zero growth with the scratch scoping in place, 6144 -> 12288 without
+  it); `GGML_META_COMPUTE_HEADROOM=1` aborts the r149 build at `sched_reserve` and runs to completion on
+  this build (105 growth events), with byte-identical greedy text in every arm.
 * **The split-state cache hit returns the entry's state instead of copying it** (r132, PR #213).  The hit
   path used to build the state in a named local (`split_state_entry::get()`) and copy it into the return
   slot, which is a ~2 KiB copy in a function that runs for every tensor of every graph allocation under
