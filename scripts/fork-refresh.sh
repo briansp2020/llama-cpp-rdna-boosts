@@ -89,6 +89,10 @@ bash "$REPO_DIR/scripts/apply-all.sh" . | grep -E "applied cleanly|Applied tree|
 # ---- 2. verify -----------------------------------------------------------
 got_tree="$(git rev-parse HEAD^{tree})"
 got_tip="$( git rev-parse --short=9 HEAD)"
+# `.tip` is a full 40-char sha, so compare it as a PREFIX of the abbreviated tip: a string equality
+# here reported "does NOT match" on every correct release (r158 was the first where it was noticed).
+tip_matches=0
+[ -n "$tip" ] && case "$tip" in "$got_tip"*) tip_matches=1 ;; esac
 count="$(git rev-list --count "$base..HEAD")"
 if [ "$got_tree" != "$tree" ]; then
     echo "ERROR: applied tree $got_tree != release.json tree $tree" >&2
@@ -100,8 +104,8 @@ if [ -n "$n_blocks" ] && [ "$count" -ne "$n_blocks" ]; then
 fi
 echo
 echo "    tree : $got_tree  (matches release.json)"
-echo "    tip  : $got_tip  (the fork branch tip; release.json .tip $([ "$got_tip" = "$tip" ] && echo 'matches' || echo "does NOT match: $tip") )"
-if [ "$got_tip" != "$tip" ]; then
+echo "    tip  : $got_tip  (the fork branch tip; release.json .tip $([ "$tip_matches" -eq 1 ] && echo 'matches' || echo "does NOT match: $tip") )"
+if [ "$tip_matches" -ne 1 ]; then
     cat <<EOF
 
     NOTE: a mismatch is expected for a release recorded before the deterministic re-cut
