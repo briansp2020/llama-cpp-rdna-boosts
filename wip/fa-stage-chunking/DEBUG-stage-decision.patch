@@ -1,0 +1,60 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index f8e596e6f..b60e84445 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1551,6 +1551,13 @@ void launch_fattn(
+     const bool q_h2 = false
+ ) {
+     constexpr int ncols = ncols1 * ncols2;
++    {
++        static int enter_n = 0;
++        if (enter_n < 6) {
++            enter_n++;
++            GGML_LOG_WARN("FA_LAUNCH_DBG n_q=%lld n_kv=%lld ncols1=%d\n", (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1], ncols1);
++        }
++    }
+ 
+     const ggml_tensor * Q = dst->src[0];
+     const ggml_tensor * K = dst->src[1];
+@@ -1654,6 +1661,20 @@ void launch_fattn(
+         };
+         stage_hint = (stage_wants_K ? full_bytes(K) : 0) + (stage_wants_V ? full_bytes(V) : 0);
+     }
++    // wip/fa-stage-chunking diagnostic (not for the delivery): why is/ isn't the F16 staging arena used?
++    if (getenv("GGML_CUDA_FA_STAGE_DEBUG") != nullptr) {
++        static int dbg_n = 0;
++        if (dbg_n < 12) {
++            dbg_n++;
++            GGML_LOG_WARN("FA_STAGE_DBG n_q=%lld n_kv=%lld needK=%d needV=%d nativeK=%d nativeV=%d "
++                          "prefill_stages=%d native_width=%d capK=%d capV=%d wantK=%d wantV=%d "
++                          "req=%.1f MiB hint=%.1f MiB\n",
++                (long long) Q->ne[1], (long long) K->ne[1], (int) need_f16_K, (int) need_f16_V,
++                kv_native_K, kv_native_V, (int) prefill_stages, (int) native_width,
++                (int) stage_cap_K, (int) stage_cap_V, (int) stage_wants_K, (int) stage_wants_V,
++                (double) stage_req/1048576.0, (double) stage_hint/1048576.0);
++        }
++    }
+     char * stage_buf = stage_req != 0 ? (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, stage_req, stage_hint) : nullptr;
+     const bool stage_ok = stage_buf != nullptr;
+ 
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index e3a9707f3..a2bc583b8 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -902,6 +902,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+ 
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
++    {
++        static int fa_dbg_n = 0;
++        if (fa_dbg_n < 6) {
++            fa_dbg_n++;
++            GGML_LOG_WARN("FA_DISPATCH_DBG kernel=%d n_q=%lld n_kv=%lld typeK=%d typeV=%d\n",
++                (int) ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst),
++                (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1],
++                (int) dst->src[1]->type, (int) dst->src[2]->type);
++        }
++    }
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
