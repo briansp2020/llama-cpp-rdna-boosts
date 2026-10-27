@@ -47,7 +47,8 @@ read -- so a change to either was invisible to it (this release's own change inc
 the same comparison with `-ctk/-ctv q8_0`, in its own base file (`…-kvq8_0.kld`) with the type pinned in the
 meta, and its candidate log carries `FA_STAGE request=4.0 MiB alloc=16.0 MiB` (the arena is exercised).  Do
 not fold it into the default: the f16 base is the recorded release reference, and a quantized cache is a
-different point (its base PPL is 5.9317 vs 5.9325 at f16).
+different point (its base PPL is 5.9317 vs 5.9325 at f16).  The block's five extra header lines also pushed
+`--help` past `usage()`'s fixed `sed -n 2,101p` range, so it uses the repo's `2,/^set -uo pipefail/` idiom now.
 
 **5. Gates (r156 tree).**  Coherence 4B Q8_0 3 GPU `-sm tensor` **`1c5d32ac537d`** and 35B-A3B UD-Q4_K_M 2 GPU
 `-sm tensor -ncmoe 10` **`627b2ebd7792`** -- both == the r153/r155 build.  `gate-prefill-logits.sh`: f16
