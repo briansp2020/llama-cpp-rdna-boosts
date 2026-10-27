@@ -67,6 +67,10 @@ gate that reaches this code -- `llama-cli`/`llama-bench` never save a state, and
 save/restore goes through `llama_io_write_file`/`read_file`, which never touch `state_stage`.  Recorded in
 `MANIFESTS.md` (gate 8, and the renumbered graph-replay census to 9), `scripts/README.md` and `AGENTS.md`.
 
+**Post-release tooling fix.**  `scripts/gate-state-pipe.sh --help` printed only the first 58 lines of its
+header (fixed to `sed -n '2,/^set -uo/p'`), so `SUFFIX`, `EXTRA_ARGS` and `KEEPOUT` were missing from it.
+No patch, no tag change.
+
 **6. Docs and finding.**  `ENVIRONMENT.md` gains `LLAMA_STATE_PIPE_GROUPS`; `patches/README.md` block 12 gains
 the pipelining bullet and the knob; `AGENTS.md`'s state invariant carries the disjoint-range and
 one-event-per-group rules plus the new gate.  **Recorded, not filed as a TODO (maintainer call):** the
