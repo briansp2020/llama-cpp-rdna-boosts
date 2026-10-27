@@ -2,7 +2,8 @@
 
 ## 261026.008 (r150) -- issue #232: the Meta backend's simple-tensor container grows instead of aborting
 
-**Release:** `v15-6050b467c-r150` (base `6050b467c`, tip `3a08b6d3d`, tree `dda152c109c2baf800271da3f9990cd9871db486`,
+**Release:** `v15-6050b467c-r150` (base `6050b467c`, tip `f0060e159` = the fork's re-cut branch, tree
+`dda152c109c2baf800271da3f9990cd9871db486`; the validated working chain tip was `3a08b6d3d`, same tree,
 15 blocks, blocks 09 and 12 amended).  Delta against the r149 tree: **4 files, +154/-10** --
 `ggml/src/ggml-backend-meta.cpp` + `ggml/include/ggml-backend.h` + `ggml/src/ggml.c` (block 09) and
 `src/llama-kv-cache.cpp` (`park_move`, block 12).  No kernel, no numerics, no default and no
@@ -88,7 +89,11 @@ two of them plus the graph's 216 also exceed 6144).
   `LLAMA_SERVER_LAZY_IDLE_SLOTS=0` byte for byte on all four requests, and the `parkoff` arm still differs
   (the workload still reproduces #210).
 * **Set:** `validate-set.sh` green on a fresh tarball (15 blocks, tree `dda152c10`);
-  `gate-per-block-build.sh --fast --changed-from 947fdf295` **2/2** (block 09, tip).
+  `gate-per-block-build.sh --fast --changed-from 947fdf295` **3/3** (blocks 09, 12, tip).
+* **Fork refresh (the re-cut branch, `f0060e159`, tree `dda152c10`)**: `apply-all.sh` strict `git am`,
+  build green; coherence gate byte-identical to the known-good text (`ade44780`); Protocol A (`-n 3000`,
+  prose prompt) on 27B UD-Q4_K_XL 1 GPU **plain 29.64 t/s / draft-mtp 58.38 t/s, acceptance 0.61660
+  (1946/3156)**; `gate-prefill-logits.sh` KLD 0.000000 / 100.000 %.
 
 ### Not done (recorded, not scoped in)
 
