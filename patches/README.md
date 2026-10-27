@@ -1461,6 +1461,27 @@ had no other home.
   `LLAMA_STATE_ASYNC_READ=0`), with no GPU faults.  Gate: `scripts/gate-state-pipe.sh` (it is the only gate
   that reaches this code: the file-based slot save/restore goes through `llama_io_write_file` /
   `read_file`, which call `ggml_backend_tensor_get`/`set` per tensor and never touch the stage).
+* **The host side of that copy is streamed on two threads** (r152, PR #235): each piece of a group is copied
+  with non-temporal (SSE2) stores over 64-byte-aligned runs, split over `LLAMA_STATE_COPY_THREADS` (default
+  **2**; `1` = one thread but still streamed, `0` = the pre-r152 plain `memcpy` per piece, the A/B arm)
+  threads.  A plain store reads the destination line into the cache first (read-for-ownership) and a
+  streaming store writes straight to memory: that is the whole win on a box whose L3 cannot hold the
+  checkpoint (the submitter's 3900X + DDR4: 150 MiB 19.4 -> 11.8 ms on one thread) and about 0 on this box
+  (9950X3D, 192 MiB of L3, a 164 MiB checkpoint mostly resident), where the **threads** are the win (164 MiB
+  in a 35B-A3B checkpoint's real piece sizes: 6.4 ms plain, 6.4 streamed on one thread, 3.0 on two, 3.3-3.7 on
+  three or four - two is the knee on a dual-channel DDR5 controller).  A worker never crosses a group
+  boundary: a group's stage range may only be read after its event, so a worker in the next group would read
+  a range whose device copy is still in flight (a torn state, not a crash).  States below 16 MiB keep the
+  plain copy, pieces below 64 KiB are copied with `memcpy`, and the streaming store is x86-only
+  (`__SSE2__` / `_M_X64`), so other targets gain only the threads; every streamed run ends with
+  `_mm_sfence()` before its bytes reach the caller (save) or the device (restore).  Measured (gfx1201,
+  prompt-cache restore of a 5246-token hybrid state): the copy itself -12 / -21 / -29 % for a 62.8 / 73.2 /
+  165.3 MiB save and -26 / -30 % for the restore's pack (35B-A3B 2 GPU tensor `-ncmoe 10`), -21 / -22 / -29 %
+  for a 112.6 / 126.6 / 250.9 MiB save (Flash-Next GSQ + MTP 2 GPU `-ncmoe 40`); the server's save+load trace
+  39.9 -> 33.4 ms (35B-A3B 1 GPU), 44.2 -> 40.5 ms (2 GPU tensor) and 79.3 -> 74.9 ms (Flash-Next + MTP).
+  `LLAMA_STATE_TIMING=1` logs the enqueue/copy split of each batched read and write.  Gate:
+  `scripts/gate-state-pipe.sh`, whose `copy0` arm is the plain-`memcpy` A/B, gated byte-for-byte like every
+  other arm.
 * **Build time**: one FA template instantiation TU per `(ncols1, ncols2, head size)` instead of per
   `(ncols1, ncols2)` — same instantiations, grouped so the backend build is no longer one-file-bound.
 * **The expected `--fit` probe failure logs as a warning** (r101, campaign 0012): `--fit` builds the extra
@@ -1602,7 +1623,8 @@ had no other home.
 
 **Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `GGML_LF_DFLASH_DEV`, `GGML_LF_FAST_TOPK`,
 `LLAMA_DFLASH_INGEST_TAIL` (r130), `LLAMA_STATE_GET_MERGE_GAP`, `LLAMA_STATE_ASYNC`, `LLAMA_STATE_ASYNC_MAX_MIB`,
-`LLAMA_STATE_ASYNC_READ`, `LLAMA_STATE_PIPE_GROUPS` (r151),
+`LLAMA_STATE_ASYNC_READ`, `LLAMA_STATE_PIPE_GROUPS` (r151), `LLAMA_STATE_COPY_THREADS` and
+`LLAMA_STATE_TIMING` (r152),
 `GGML_CPU_MOE_OFFLOAD_THREADS`, `GGML_CUDA_SLAB_RING_MIB`, and (r111+, POOL mode) `MOE_HOST_POOL_MIB` /
 `MOE_HOST_POOL_FRAC` / `MOE_HOST_POOL_DIO` / `MOE_HOST_POOL_VERIFY` / `LLAMA_HOST_MASTER_PINNED`, plus
 (r113) `MOE_HOST_POOL_RAM_PCT` (default **85** since r114), (r114) `MOE_HOST_POOL_STAGE_BATCH` and

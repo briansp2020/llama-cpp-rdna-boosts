@@ -1,5 +1,82 @@
 # WORKLOG - dated delivery records
 
+## 261027.003 (r152) -- PR #235: the state copy is streamed on two threads (block 12); -5.5 to -13 % of the server's save+load, and the streaming-store premise is a per-box property
+
+**Shipped:** `v15-6050b467c-r152` (**block 12** amended; the only delivery content change is
+`src/llama-context.cpp`, +154 / -13).  Blocks 00-11 and 13/14 differ from r151 only in their re-cut
+`From`/`index`/`@@` header lines (verified per patch with those lines filtered: every one of them is byte-identical
+outside block 12, so no later block's content moved).
+`release.json`: tip **`b9418b679`** (the fork branch tip, reproduced by a second `apply-all.sh` re-cut), tree
+**`e9993a26e`**, `scripts/validate-set.sh` green (fresh-tarball strict apply 15/15).  PR #235
+(`@overdoingism`) is archived in [`archive/work/state-copy-stream/`](archive/work/state-copy-stream/) with a
+`RESOLUTION.md`.
+
+**1. What it does.**  The r151 pipeline moves a checkpoint's host side one piece (tensor range) at a time with
+a plain `memcpy`.  Each piece is now copied with non-temporal (SSE2) stores over 64-byte-aligned runs, split
+over `LLAMA_STATE_COPY_THREADS` (default **2**; `1` = one thread but still streamed, `0` = the pre-r152 plain
+`memcpy`, the A/B arm) threads *inside one pipe group* - a worker must not cross a group boundary, because a
+group's stage range may only be read after its event (a worker in the next group would read a range whose
+device copy is still in flight: a torn state, not a crash).  The restore's pack takes the same copy, and
+resolves each piece's stage offset once instead of re-deriving it in the queue loop (same addresses; the
+`off = off_g` reset r151 kept is gone).  States below 16 MiB keep the plain copy, pieces below 64 KiB keep the
+`memcpy`, the streaming store is x86-only (`__SSE2__`/`_M_X64`, MSVC x64 included) so other targets gain only
+the threads, and every streamed run ends with `_mm_sfence()` before its bytes reach the caller or the device.
+`LLAMA_STATE_TIMING=1` is the new per-op diagnostic (enqueue / copy+wait / GiB/s, and the restore's
+pack+enqueue).
+
+**2. Reviewed before folding** (detail in the resolution record).  The PR is cut on r150 and **does not apply
+on r151** (its hunk covers the copy-out loop r151 rewrote), so this is a re-cut, not a cherry-pick.  Its
+whole-state `total < 16 MiB` threshold is the wrong shape once the copy is per group, so the decision moved to
+the piece (64 KiB).  Two real corrections to the submitted code: it aligned the destination to the *store*
+width (16 B), which leaves two half-lines carrying partial write-combining buffers (now 64 B), and it fenced
+inside the worker lambda only, so any later caller of `llama_copy_stream` would have handed a DMA stale bytes
+(the fence is in the run copier, so a run is self-fencing and the thread join is the only other ordering).
+Two nits went to the submitter: the save's copy-out and the restore's pack should be reported separately (they
+are different paths with different destinations), and the thread count is not the 5 % afterthought their
+table makes it look like (below).
+
+**3. The mechanism had to be re-derived, and it flips the PR's emphasis.**  Measured on this box (9950X3D,
+**192 MiB of L3**, DDR5) on a 164 MiB copy in a 35B-A3B checkpoint's real piece sizes (30 x 80 KiB, 30 x
+2.6 MiB, 20 x 4.2 MiB): plain `memcpy` 1 thread **6.45 ms**, streaming stores 1 thread **6.47 ms**, plain 2
+threads 5.17 ms, streaming 2 threads **3.56 ms**, streaming 3/4/8 threads 4.45/4.27/3.98 ms.  So the streaming
+store alone is **0 % here** (the destination's lines are mostly resident in L3, so the read-for-ownership a
+plain store pays hits cache) while on the submitter's 3900X + DDR4 (64 MiB of L3) it is the *whole* win
+(19.4 -> 11.8 ms, one thread) - and the threads are worth ~2x on both.  Both halves ship because each is worth
+most on a different box and neither costs anything on the other; the invariant recorded in `AGENTS.md` is that
+neither half may be "simplified" away on the strength of one box's measurement.
+
+**4. Measured** (`scripts/gate-state-pipe.sh`, which now carries a **`copy0`** arm gated byte-for-byte like
+every other arm; prompt-cache restore of a 5246-token hybrid state, 3 cycles per arm):
+
+| config | `copy0` (plain) | default (2 threads) | Δ |
+|---|---:|---:|---:|
+| 35B-A3B UD-Q4_K_M, 1 GPU `-ncmoe 10` | 38.43 ms | **33.37 ms** | **-13.2 %** |
+| 35B-A3B UD-Q4_K_M, 2 GPU `-sm tensor -ncmoe 10` | 44.15 ms | **40.49 ms** | **-8.3 %** |
+| Flash-Next GSQ-RCO IQ3_XXS + shared Q8_0 MTP head, 2 GPU `-sm tensor -ncmoe 40` | 79.30 ms | **74.92 ms** | **-5.5 %** |
+
+(the server's own `prompt cache update took` trace; `copy0` lands on r151's recorded 39.9 / 78.4 ms, which is
+what attributes the delta to this change).  The copy itself, per size class, is -12 / -21 / -29 % for a
+62.8 / 73.2 / 165.3 MiB save, -26 / -30 % for the restore's pack, and -21 / -22 / -29 % for a 112.6 / 126.6 /
+250.9 MiB Flash-Next save.  The restored request's `prompt_ms` medians (INFO only; the arm-to-arm spread on
+this board is 1-3 ms): 65.6 (`pipe`) vs 67.5 (`copy0`) on 1 GPU, 71.5 vs 74.1 on 2 GPU, 119.0 vs 124.2 on
+Flash-Next.
+
+**5. Gates.**  5/5 arms (pipe, copy0, pipe1, read1, sync) on all three arms above: every restored cycle
+byte-identical to `LLAMA_STATE_ASYNC=0`, save side isolated by `LLAMA_STATE_ASYNC_READ=0` and restore side by
+`pipe` vs `read1`, every cycle really restored (`prompt_n` 10 of 5256), no abort, `check-gpu-faults.sh` clean
+on all five logs of every arm.  `test-llama-context` (15 state cases) on 1 GPU and 2 GPU tensor: PASS/FAIL set
+identical between the r151 build and this one (`rf` + `rollback`, this box's slab/VRAM property).  Coherence
+4B Q8_0 3 GPU `1c5d32ac537d` and 35B-A3B 2 GPU `-ncmoe 10` `627b2ebd7792` == the r151 build measured in the
+same session (`ROCBLAS_USE_HIPBLASLT=0`, `extract-generated.py`); prefill-logit KLD **0.000000 / 100.000 %**;
+`gate-park-idle-slots.sh` PASS; `gate-hc-fusions.sh` PASS (7/7 arms, BF16-hc class); per-block build
+`--fast --changed-from dc6a78d5c` 2/2.
+
+**6. Docs.**  `ENVIRONMENT.md` gains `LLAMA_STATE_COPY_THREADS` and `LLAMA_STATE_TIMING`; `patches/README.md`
+block 12 gains the copy bullet and its knob list; `MANIFESTS.md` gains the r152 block-12
+verification row; `AGENTS.md`'s state invariant carries the group-boundary rule, the fence, the 16 MiB / 64 KiB
+thresholds and the "each half wins on a different box" note; `scripts/README.md` and the gate's own header
+describe the new `copy0` arm.
+
 ## 261027.002 (r151) -- PR #233: the batched state copy is pipelined (block 12); -2.9 % on a 1 GPU restore, -3.6 % on Flash-Next + MTP, and a new state-path gate
 
 **Shipped:** `v15-6050b467c-r151` (**block 12** amended; the only delivery content change is

@@ -1,4 +1,4 @@
-From 84fc893e867f4aa174ab70ac66da8094af578811 Mon Sep 17 00:00:00 2001
+From 6bc57ec94fed41ac79eac3a2f5ef061a11576d36 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -201,10 +201,10 @@ index 801dadec6..679fa7e59 100644
          enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
          enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 77ac8e832..c78f01cdb 100644
+index 7da853b69..569414003 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -808,6 +808,22 @@ llama_context::llama_context(
+@@ -814,6 +814,22 @@ llama_context::llama_context(
              }
          }
  
@@ -227,7 +227,7 @@ index 77ac8e832..c78f01cdb 100644
          sched_reserve();
  
          // wip/first-prefill-latency: reserve the wide prefill work region in the slab BEFORE the MoE
-@@ -3805,6 +3821,7 @@ llm_graph_params llama_context::graph_params(
+@@ -3811,6 +3827,7 @@ llm_graph_params llama_context::graph_params(
          /*.prec_policy =*/ &model.prec_policy,
          /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
          /*.samplers    =*/ sampling.samplers,
@@ -235,7 +235,7 @@ index 77ac8e832..c78f01cdb 100644
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
-@@ -5383,6 +5400,7 @@ llama_context_params llama_context_default_params() {
+@@ -5524,6 +5541,7 @@ llama_context_params llama_context_default_params() {
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,

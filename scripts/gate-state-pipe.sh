@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Batched state save / restore gate (LLAMA_STATE_ASYNC, LLAMA_STATE_ASYNC_READ, LLAMA_STATE_PIPE_GROUPS).
+# Batched state save / restore gate (LLAMA_STATE_ASYNC, LLAMA_STATE_ASYNC_READ, LLAMA_STATE_PIPE_GROUPS,
+# LLAMA_STATE_COPY_THREADS).
 #
 # WHY THIS EXISTS
 #   The batched checkpoint copy (r96/PR #189 save, r119/PR #209 restore, block 12) routes a sequence state
@@ -15,6 +16,11 @@
 #   save side and a group-by-group pack on the restore side.  A missed event, a wrong group boundary or a
 #   stage range that overlaps the next group's memcpy produces a TORN state, and a torn KV/GDN state is a
 #   silent wrong answer, not a crash - so the gate's reference is the SYNCHRONOUS path, byte for byte.
+#   That is also what the change of copy MECHANISM needs (r152, PR #235: LLAMA_STATE_COPY_THREADS): the host
+#   side is streamed on worker threads, the save copies each group out after its own event, and a worker that
+#   crossed a group boundary would read a stage range whose device copy is still in flight.  The `copy0` arm
+#   (`LLAMA_STATE_COPY_THREADS=0`, the pre-r152 plain memcpy) is that mechanism's A/B and is gated the same way
+#   as every other arm: byte-identical restored text, cycle by cycle.
 #
 # WHAT IT CHECKS
 #   HARD  * every arm's server survives every request, no GGML_ASSERT / abort in its log, and
@@ -27,6 +33,8 @@
 #           `read1` (LLAMA_STATE_ASYNC_READ=0: batched save, per-tensor synchronous restore) isolates the
 #           SAVE side against `sync`, and `pipe` isolates the RESTORE side against `read1`.  A torn state in
 #           either direction moves the restored text, because a corrupted KV/GDN cell changes the logits.
+#           `copy0` (LLAMA_STATE_COPY_THREADS=0: the plain single-threaded memcpy, everything else the same)
+#           isolates the threaded streaming copy against the rest of the batched path.
 #   INFO  the restored text against a FRESH `cache_prompt:false` prefill of the same prompt, reported as the
 #           number of leading tokens that agree.  It is not gated: the restore prefills only the suffix (one
 #           small ubatch) while the fresh run prefills the whole prompt (512-token ubatches), and that shape
@@ -209,6 +217,8 @@ echo "==> batched state save/restore gate ($SM, $NGPU GPU, -ncmoe $NCMOE, ctx $C
 echo "    model: $(basename "$MODEL")"
 
 run_arm pipe  env LLAMA_STATE_PIPE_GROUPS="$GROUPS_ARM" || { echo "==> FAIL: the pipelining arm did not run"; exit 1; }
+run_arm copy0 env LLAMA_STATE_PIPE_GROUPS="$GROUPS_ARM" LLAMA_STATE_COPY_THREADS=0 \
+    || { echo "==> FAIL: the plain-memcpy copy arm did not run"; exit 1; }
 run_arm pipe1 env LLAMA_STATE_PIPE_GROUPS=1        || { echo "==> FAIL: the unpipelined arm did not run"; exit 1; }
 run_arm read1 env LLAMA_STATE_PIPE_GROUPS="$GROUPS_ARM" LLAMA_STATE_ASYNC_READ=0 \
     || { echo "==> FAIL: the save-only (synchronous restore) arm did not run"; exit 1; }
@@ -225,7 +235,7 @@ fi
 
 fails=0
 
-for arm in pipe pipe1 read1 sync; do
+for arm in pipe copy0 pipe1 read1 sync; do
     log="$KEEPOUT/$arm/log.txt"
     if grep -qE "GGML_ASSERT|terminate called|Segmentation fault|what\(\):" "$log"; then
         echo "FAIL  $arm: the server aborted:"
@@ -237,13 +247,14 @@ done
 if [ "$FAULTS" -eq 1 ]; then
     if [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
         out="$("$REPO_DIR/scripts/check-gpu-faults.sh" --since "30 min ago" \
-                 --log "$KEEPOUT/pipe/log.txt" --log "$KEEPOUT/pipe1/log.txt" \
+                 --log "$KEEPOUT/pipe/log.txt" --log "$KEEPOUT/copy0/log.txt" \
+                 --log "$KEEPOUT/pipe1/log.txt" \
                  --log "$KEEPOUT/read1/log.txt" --log "$KEEPOUT/sync/log.txt" 2>&1)"
         if [ $? -ne 0 ]; then
             echo "FAIL  GPU faults:"; echo "$out" | sed 's/^/      /'
             fails=$((fails + 1))
         else
-            echo "PASS  GPU faults: kernel journal and all four server logs clean"
+            echo "PASS  GPU faults: kernel journal and all five server logs clean"
         fi
     else
         echo "WARN  scripts/check-gpu-faults.sh not found: faults not checked"
@@ -255,7 +266,7 @@ import json, statistics, sys
 
 root, suffix_max = sys.argv[1], int(sys.argv[2])
 arms = {}
-for a in ("pipe", "pipe1", "read1", "sync"):
+for a in ("pipe", "copy0", "pipe1", "read1", "sync"):
     try:
         arms[a] = json.load(open("%s/%s/steps.json" % (root, a)))
     except Exception as e:
@@ -346,10 +357,15 @@ if "pipe" in med and "pipe1" in med:
     print("  pipelined vs unpipelined: %+.2f ms (%+.1f %%)" % (d, pct))
     if d > 0:
         print("  WARN  the pipelining arm is slower here; check the board is otherwise idle before reading it")
+if "pipe" in med and "copy0" in med:
+    d = med["pipe"] - med["copy0"]
+    pct = 100.0 * d / med["copy0"] if med["copy0"] else 0.0
+    print("  threaded streaming copy vs plain memcpy: %+.2f ms (%+.1f %%)" % (d, pct))
+    print("  (INFO only - the per-op copy timings are the low-noise measure; see LLAMA_STATE_TIMING=1)")
 
 print()
 print("server save+load trace (median of 'prompt cache update took', ms):")
-for a in ("pipe", "pipe1", "read1", "sync"):
+for a in ("pipe", "copy0", "pipe1", "read1", "sync"):
     try:
         vals = [float(l.split("took")[1].split("ms")[0])
                 for l in open("%s/%s/log.txt" % (root, a), errors="replace")
