@@ -646,9 +646,13 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   silent wrong-answer bug).  A captured graph bakes **raw device pointers that are not tensor sources**
   (the expert cache's arena slot table, remap staging, routing staging and both heat mirrors), so freeing
   any of a table's device buffers must bump `ggml_cuda_graph_mem_freed` — put it in the helper that returns
-  the memory, not in the caller.  **Known loss:** a 3-device tensor-split **dense plain** decode is 6-9 %
-  slower now that replay works; `GGML_CUDA_ALLREDUCE=internal` removes it, so it is the hybrid NCCL comm
-  layer or the node-level stream overlap a graph cannot express (`TODO #109`).  Records
+  the memory, not in the caller.  **Known loss:** a **3-device `-sm tensor` qwen35 dense plain** decode is
+  6-8 % slower now that replay works (27B Q8_0 `tg128` 41.7 -> 38.6), and the axis is the **comm layer**:
+  `GGML_CUDA_ALLREDUCE=internal` (RCCL never initialised) is **42.2, i.e. +0.9 %**, while `hybrid` and `ce`
+  (which inits hybrid first) both regress, and the per-call arm choice (`GGML_CUDA_AR_SMALL_BYTES`) is
+  irrelevant.  That is the r34 "RCCL's presence costs the internal pipeline" effect resurfacing, not a
+  property of dense models: Gemma4 31B Q8_0 (dense, 32.6 GB) is +0.8 % at 2 GPUs and flat at 3, 27B at 2
+  GPUs is +0.5 %, and a draft hides it (`TODO #109`).  Records
   `archive/work/graph-replay-keys/` (the PR assessment, the corrected diagnosis) plus
   `benchmarks/2026-10-26-graph-replay-keys.md` (the numbers).
   Read the census as: `direct ≈ 0`, `replay ≈ calls`, `properties_changed` in the tens, `capture` = the

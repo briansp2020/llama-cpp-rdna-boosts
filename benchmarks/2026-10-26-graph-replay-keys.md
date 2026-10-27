@@ -77,6 +77,39 @@ So the loss is not *which* all-reduce arm runs per call (routing everything to i
 is the presence of the hybrid/NCCL comm layer, or the node-level stream overlap that a captured graph cannot
 express.  The MoE shapes (the delivery's tuned out-of-VRAM path) are all wins, and a draft hides it.
 
+## Dense, and the comm layer: it is RCCL's *presence*, not the model
+
+The 3-device dense loss above looks like a dense-model cost.  It is not.  Two more dense models and the four
+comm-layer arms:
+
+| 27B Q8_0, 3 GPU `-sm tensor`, `tg128` | r148 | r149 |
+|---|---:|---:|
+| `GGML_CUDA_ALLREDUCE=hybrid` (default) | 41.71 | **38.58** (-7.5 %) |
+| `GGML_CUDA_ALLREDUCE=ce` (runs `comm_init_hybrid` first, so RCCL is up) | 40.70 | **38.59** (-5.2 %) |
+| `GGML_CUDA_ALLREDUCE=nccl` | 38.49 | **35.60** (-7.5 %) |
+| `GGML_CUDA_ALLREDUCE=internal` (RCCL never initialised) | 41.81 | **42.17 (+0.9 %)** |
+
+| dense model | 2 GPU tensor | 3 GPU tensor |
+|---|---|---|
+| 27B Q8_0 | 32.36 -> 32.52 (+0.5 %, `properties_changed` 71630 -> 1290) | 41.7 -> 38.6 (**-7.5 %**) |
+| Gemma4 31B Q8_0 (32.6 GB) | 26.64 -> 26.86 (+0.8 %, `properties_changed` 74690 -> 0) | 34.68 -> 34.58 (flat) |
+| Gemma4 E4B Q8_0 (1 GPU) | 71.2 -> 74.8 (flat on a re-run; the census is `capture=1` on **both** builds, so there is no collision to fix on one device) | n/a |
+
+And the same `ce` arm on the flagship shape is unaffected (`-ncmoe 48`, 2 GPU x8, n1000: plain 37.4 -> 41.8,
+`draft-mtp n3` 106.9 -> 108.7, text identical in both), as is 27B dense at 2 GPUs with `ce` (31.67 -> 32.53,
++2.7 %, text identical).
+
+So: the per-call all-reduce *choice* is irrelevant (`GGML_CUDA_AR_SMALL_BYTES` 0 and 1e9 both leave the
+deficit in place), `ce` regresses exactly like `hybrid` because its init path brings RCCL up too, and only
+`internal` (which never touches RCCL) is clean.  That matches the comment already in
+`ggml_backend_cuda_comm_init_hybrid`: "the cost is RCCL's presence, which r34 measured as a decode-only
+slowdown of the internal pipeline".  r149 does not create the effect; it makes it visible on this arm,
+because before r149 this arm never replayed and the direct node loop is immune.  Carried as `TODO #109`.
+
+Note for anyone re-running the 3-device arms: the Gemma4 31B MTP head is a `gemma4-assistant` model and
+`LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'gemma4-assistant'` refuses the load, so that
+model's draft arm cannot be measured with `-sm tensor` at all (pre-existing, upstream).
+
 ## Purity
 
 `ROCBLAS_USE_HIPBLASLT=0`, greedy, `--seed 42 --temp 0`, `-n 48`: **text byte-identical in 10/10 pairs** —

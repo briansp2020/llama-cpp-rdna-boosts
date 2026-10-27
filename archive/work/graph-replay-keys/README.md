@@ -74,6 +74,13 @@ it (42.2) while `=nccl` is worse still (35.6), and neither `GGML_CUDA_AR_SMALL_B
 the interaction is with the hybrid NCCL comm layer (merely having it initialised), or with the node-level
 stream overlap a captured graph cannot express.  Carried as `TODO #109`.
 
+The axis is the **comm layer**, not the model shape (`TODO #109` has the table): with
+`GGML_CUDA_ALLREDUCE=internal` (RCCL never initialised) that same arm is **42.2 t/s, +0.9 %**, `hybrid` and
+`ce` both regress, `nccl` is worse still, and `GGML_CUDA_AR_SMALL_BYTES` changes nothing, so it is RCCL's
+*presence* (the r34 effect its own eager-init comment records) and not which all-reduce runs per call.
+Dense is not the axis either: Gemma4 31B Q8_0 (dense, 32.6 GB) is +0.8 % at 2 GPUs and flat at 3, and 27B
+at 2 GPUs is +0.5 % with replay working.
+
 Everything else measured flat or better, which is why the key still ships **default-on**:
 
 | arm | stock r148 | + key fix | delta |
