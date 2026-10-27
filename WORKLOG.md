@@ -1,5 +1,79 @@
 # WORKLOG - dated delivery records
 
+## 261027.002 (r151) -- PR #233: the batched state copy is pipelined (block 12); -2.9 % on a 1 GPU restore, -3.6 % on Flash-Next + MTP, and a new state-path gate
+
+**Shipped:** `v15-6050b467c-r151` (**block 12** amended; the only delivery content change is
+`src/llama-context.{cpp,h}`, +135 / -16.  Blocks 00-11 and 13/14 change only in their re-cut `From`/`index`
+lines and the hunk line numbers of `src/llama-context.{cpp,h}`, which block 12 owns -- no later-block code
+changes; verified per patch: 0 non-metadata lines differ for blocks 00-11, and 14 changes hunk offsets only).
+`release.json`: tip **`dc6a78d5c`** (the fork branch tip; the re-cut is deterministic, so a fresh
+`apply-all.sh` at `6050b467c` prints the same id), tree **`e13514007`**, `scripts/validate-set.sh` green
+(fresh-tarball strict apply 15/15).  PR #233 (briansp2020) is archived in
+[`archive/work/state-pipe/`](archive/work/state-pipe/) with a `RESOLUTION.md`.
+
+**1. What it does.**  r96 (#189) batched the deferred state-save reads through one pinned `state_stage`;
+r119 (#209) did the same for the restore's writes.  Both then ran the host memcpy and the device copies back
+to back, so a checkpoint that is ~5.3 ms of memcpy plus ~6.4 ms of DMA paid them serially.  The pieces are
+now cut into up to `LLAMA_STATE_PIPE_GROUPS` (default **8**, `1` = the old copy) size-balanced groups: a
+restore packs a group and queues its async sets before packing the next, and a save records one event per
+**(backend, group)** after that group's copies are queued and copies the group out when its event completes.
+A backend without events (the CPU backend) falls back to the single `llama_state_sync_all` path.  The fold
+keeps the submitter's code as-is and adds the invariant comment (disjoint stage ranges per group; one event
+per group because a re-recorded event moves past the earlier one).
+
+**2. Reviewed before folding** (detail in the resolution record): stage ranges do not overlap; the per-group
+events are created before any copy is queued and fully cover the removed `llama_state_sync_all`; every
+backend that exposes `event_new` also fills `event_record`, so the assert is unreachable; HIP's async
+getters/setters and `event_record` share the main stream, so the event really covers the copies (a copy
+stream would have been the r62 race); teardown frees the cached events after both directions have
+synchronized.  Two submission nits were noted to the submitter: the format-patch carries an **empty
+`wip/state-pipe/README.md`** (so `git am` of it creates a stray empty file; the fold applies the two source
+files only), and `n_state_pipe_events` is a `llama_context` member although only the file-local splitter
+reads it.
+
+**3. Measured** (`scripts/gate-state-pipe.sh`, written for this release: it drives the server's in-memory
+prompt cache, the only path that reaches this code.  Prompt-cache restore of a 5246-token hybrid state,
+`prompts/prose-rdna-boosts.txt` + 3 new tokens, medians of 5 cycles, `prompt_ms` of the restored request):
+
+| config | `PIPE_GROUPS=1` | default 8 | Δ | server save+load trace |
+|---|---:|---:|---:|---:|
+| Flash-Next GSQ-RCO IQ3_S + shared Q8_0 MTP head, 2 GPU `-sm tensor -ncmoe 40` | 134.5 | **129.7 ms** | **-3.6 %** | 81.7 -> 78.4 ms |
+| 35B-A3B UD-Q4_K_M, 1 GPU `-ncmoe 10` | 69.4 | **67.4 ms** | **-2.9 %** | 44.9 -> 39.9 ms |
+| 35B-A3B UD-Q4_K_M, 2 GPU `-sm tensor -ncmoe 10` | 74.4 | 74.1 ms | within noise | - |
+| Flash-Next arm with `LLAMA_STATE_ASYNC=0` (pre-r96/r119) | 168.5 ms | | | 115.5 ms |
+
+The 1 GPU arm lands **below** the pre-r119 synchronous path (71.3 -> 67.4 ms), so the single-device staging
+cost r119 accepted as a limitation is gone.  The submitter's per-config numbers (G1 72.6 -> 66.8, G1L
+79.6 -> 77.4, G2 37.7 -> 32.4, G3 41.2 -> 38.3 on r148) are their box and checkpoint sizes: the direction and
+the ~5 ms Flash-Next magnitude reproduce here, their 2 GPU 35B-A3B gain is inside that arm's noise on this
+box.  **Both PRs' "a few ms per turn" framing understates the relative win on the 1 GPU arm and overstates
+the 2 GPU 35B-A3B one** -- quote the table, not the PR text.
+
+**4. Gates.**  `gate-state-pipe.sh` on the 1 GPU and the Flash-Next + MTP 2 GPU arms: every restored cycle of
+every arm byte-identical to `LLAMA_STATE_ASYNC=0`; the save side isolated by `LLAMA_STATE_ASYNC_READ=0`
+(`read1` == `sync`) and the restore side by `pipe` == `read1`; every cycle really restored (`prompt_n` 10 of
+5256); no abort; `check-gpu-faults.sh` clean on all four logs.  `test-llama-context` (all 15 state cases) on
+35B-A3B 1 GPU and 2 GPU tensor: PASS/FAIL set **identical to the stock r150 build** in every arm (the
+failures are this box's slab/VRAM OOMs -- `rollback` on 1 GPU, `rf` + `rollback` on 2 GPU -- and r150 shows
+the same).  Coherence 4B Q8_0 3 GPU `b065f37593b3` and 35B-A3B 2 GPU `6229d4e6ce30` == r150; prefill-logit
+KLD **0.000000 / 100.000 %**; per-block build 2/2 (`--fast --changed-from f0060e159`: block 12, 10 s; tip,
+9 s).
+
+**5. New gate.**  `scripts/gate-state-pipe.sh`: four arms (`PIPE_GROUPS=8`, `=1`, `LLAMA_STATE_ASYNC_READ=0`,
+`LLAMA_STATE_ASYNC=0`), HARD on cycle-by-cycle text identity against the synchronous arm plus the
+one-direction arms, on the run having actually restored (`prompt_n <= 32`), and on no abort / no GPU fault;
+INFO on the restored-request median and the server's `prompt cache update took` trace.  It is the **only**
+gate that reaches this code -- `llama-cli`/`llama-bench` never save a state, and the file-based slot
+save/restore goes through `llama_io_write_file`/`read_file`, which never touch `state_stage`.  Recorded in
+`MANIFESTS.md` (gate 8, and the renumbered graph-replay census to 9), `scripts/README.md` and `AGENTS.md`.
+
+**6. Docs and finding.**  `ENVIRONMENT.md` gains `LLAMA_STATE_PIPE_GROUPS`; `patches/README.md` block 12 gains
+the pipelining bullet and the knob; `AGENTS.md`'s state invariant carries the disjoint-range and
+one-event-per-group rules plus the new gate.  **Recorded, not filed as a TODO (maintainer call):** the
+file-based `--slot-save-path` save/restore still does one pageable `temp_buffer` + `llama_backend_tensor_get`
+/ `set` per tensor and gains nothing from r96/r119/r151; routing it through the stage is a separate change
+with its own gate (the file format interleaves metadata between the pieces).
+
 ## 261027.001 (tooling, post-r150) -- one definition for `.tip`, and a deterministic re-cut
 
 **No release, no patch change.**  `release.json` still names `v15-6050b467c-r150` (tip `f0060e159`, tree

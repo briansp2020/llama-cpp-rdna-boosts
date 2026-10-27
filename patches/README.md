@@ -1446,6 +1446,21 @@ had no other home.
   2 ms slower because the extra staging copy has no multi-device sync to save, which is accepted for the
   multi-device win.  The file also gains `#include <algorithm>` (the PR #189 patch as submitted does not
   compile without it).
+* **The batched copy is pipelined** (r151, PR #233): the pieces are cut into up to
+  `LLAMA_STATE_PIPE_GROUPS` (default **8**; `1` = the unpipelined copy) size-balanced groups, so the host
+  memcpy into/out of the pinned stage overlaps the device copies of another group.  A restore packs a group
+  and queues its async sets before packing the next (the groups own disjoint stage ranges, so a queued copy
+  is never overwritten); a save records one event per `(backend, group)` after that group's copies are queued
+  and copies the group out as soon as its event completes.  A backend with no events (the CPU backend) falls
+  back to the single `llama_state_sync_all` path, which is also what `LLAMA_STATE_PIPE_GROUPS=1` selects.
+  Measured (gfx1201, prompt-cache restore of a 5246-token hybrid state, medians of 5 cycles): Flash-Next GSQ
+  + MTP head 2 GPU `-sm tensor -ncmoe 40` **134.5 -> 129.7 ms** (-3.6 %), 35B-A3B Q4_K_M 1 GPU
+  **69.4 -> 67.4 ms** (-2.9 %, below the pre-r119 synchronous path's 71.3 ms), 35B-A3B 2 GPU tensor within
+  noise; the server's own save+load trace moves 81.7 -> 78.4 ms and 44.9 -> 39.9 ms.  The restored greedy text
+  is byte-identical to `LLAMA_STATE_ASYNC=0` in every cycle of every arm (the save side isolated by
+  `LLAMA_STATE_ASYNC_READ=0`), with no GPU faults.  Gate: `scripts/gate-state-pipe.sh` (it is the only gate
+  that reaches this code: the file-based slot save/restore goes through `llama_io_write_file` /
+  `read_file`, which call `ggml_backend_tensor_get`/`set` per tensor and never touch the stage).
 * **Build time**: one FA template instantiation TU per `(ncols1, ncols2, head size)` instead of per
   `(ncols1, ncols2)` — same instantiations, grouped so the backend build is no longer one-file-bound.
 * **The expected `--fit` probe failure logs as a warning** (r101, campaign 0012): `--fit` builds the extra
@@ -1587,6 +1602,7 @@ had no other home.
 
 **Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `GGML_LF_DFLASH_DEV`, `GGML_LF_FAST_TOPK`,
 `LLAMA_DFLASH_INGEST_TAIL` (r130), `LLAMA_STATE_GET_MERGE_GAP`, `LLAMA_STATE_ASYNC`, `LLAMA_STATE_ASYNC_MAX_MIB`,
+`LLAMA_STATE_ASYNC_READ`, `LLAMA_STATE_PIPE_GROUPS` (r151),
 `GGML_CPU_MOE_OFFLOAD_THREADS`, `GGML_CUDA_SLAB_RING_MIB`, and (r111+, POOL mode) `MOE_HOST_POOL_MIB` /
 `MOE_HOST_POOL_FRAC` / `MOE_HOST_POOL_DIO` / `MOE_HOST_POOL_VERIFY` / `LLAMA_HOST_MASTER_PINNED`, plus
 (r113) `MOE_HOST_POOL_RAM_PCT` (default **85** since r114), (r114) `MOE_HOST_POOL_STAGE_BATCH` and

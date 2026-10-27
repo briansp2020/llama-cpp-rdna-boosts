@@ -12,7 +12,7 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 still means the same subject after that item is closed and removed from this file.  New items append.
 
 **Current state:** the **15-block V2.1 set** (block 00 + blocks 01-14) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v15-6050b467c-r150`**.  `release.json` is the source of truth for the
+(the 2026-10-25 re-base), release **`v15-6050b467c-r151`**.  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 
 | # | subject | kind | status |

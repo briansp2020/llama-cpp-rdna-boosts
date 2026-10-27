@@ -1,4 +1,4 @@
-From d8eca43b0d2d26f6f9fc3f8356f35e79c3cd6ac7 Mon Sep 17 00:00:00 2001
+From 84fc893e867f4aa174ab70ac66da8094af578811 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -201,7 +201,7 @@ index 801dadec6..679fa7e59 100644
          enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
          enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 40dffcded..f936eeb5e 100644
+index 77ac8e832..c78f01cdb 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -808,6 +808,22 @@ llama_context::llama_context(
@@ -227,7 +227,7 @@ index 40dffcded..f936eeb5e 100644
          sched_reserve();
  
          // wip/first-prefill-latency: reserve the wide prefill work region in the slab BEFORE the MoE
-@@ -3797,6 +3813,7 @@ llm_graph_params llama_context::graph_params(
+@@ -3805,6 +3821,7 @@ llm_graph_params llama_context::graph_params(
          /*.prec_policy =*/ &model.prec_policy,
          /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
          /*.samplers    =*/ sampling.samplers,
@@ -235,7 +235,7 @@ index 40dffcded..f936eeb5e 100644
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
-@@ -5268,6 +5285,7 @@ llama_context_params llama_context_default_params() {
+@@ -5383,6 +5400,7 @@ llama_context_params llama_context_default_params() {
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
@@ -244,10 +244,10 @@ index 40dffcded..f936eeb5e 100644
          /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
          /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 843afe46f..08b68ba25 100644
+index cea82847f..2cc324ba4 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -364,6 +364,9 @@ private:
+@@ -367,6 +367,9 @@ private:
  
      llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
  
