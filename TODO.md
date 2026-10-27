@@ -17,17 +17,66 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 
 | # | subject | kind | status |
 |---|---|---|---|
+| **70** | harden the expert-cache re-arm / wide-aux growth against a starved arena | robustness | open |
 | **102** | the band's width purity has no head-256 **GQA-8** arm | platform validation | open, accepted limitation (r134, issue #224).  The r134 guard is width-only (`np`, `nbatch_fa/K2/V2`, `nstages_target`, `Q_in_reg` on the two band rows), and it is measured at **GQA 6** (dense 27B: `test-logits-width-probe P=4096`, maxdiff 0) and **GQA 12** (Flash-Next `RS=from_w`, 2 GPU `-sm layer -ncmoe 40`, q8_0, maxdiff 0); no head-256 GQA-8 model exists in the fleet.  What to run if one appears: the same probe at `P >= 4096` (`KV=q8_0/f16`) plus `plain == draft-*` at `-n 512` |
 | **103** | the ~30x collapse at the last few MiB of free VRAM | diagnosis | open (r135, found in issue #219).  At 14.06 GiB free the same 27B + MTP config runs prefill 35 t/s / decode 1.5-3 t/s instead of 1127 / 53 with the weights still resident; not the FA staging fallback and not graph churn alone.  `GGML_CUDA_MIN_FREE_MIB` makes it unreachable; the cause is unrecorded.  Detail in `TODO.md` §103 |
-| **79** | RDNA3_0 verify-band fusions: no multi-device measurement, and gfx1101/gfx1102 untested | platform validation | open (shipped default-on in r95; needs a 2+ card gfx1100 box).  `ssh fingon` is single-RDNA3 (`ROCm0`; its second rocm-smi entry is an iGPU and is not a HIP device), so it does **not** cover the multi-device arm — it validates single-GPU gfx1100 only.  gfx1101/gfx1102 still have no hardware |
-| **70** | harden the expert-cache re-arm / wide-aux growth against a starved arena | robustness | open |
-| **104** | block 14 (`-sm relaxed-tensor`) is a stop-gap, not a feature | temporary upstream modification | open, transient (r137).  It exists so `flint`/`mellum`/`mistral4` can tensor-split while upstream #30861/#31081 leave the MoE amax row max unsplittable.  **Drop the block** when upstream fixes the amax under a tensor split (a real cross-device MAX all-reduce, or the `ggml_prec_set_src(..., GGML_PREC_BF16, 1)` path the graph TODO names) or when its relaxations stop being needed; nothing else depends on it.  Keep it separate, do not let it grow into general `-sm tensor` support.  Limitations: `patches/README.md` (block 14), `GREEDY-PURITY.md` §58 |
-| **106** | issue #214's RDNA2 deep-context prefill residual | platform validation (waiting on the reporter) | open (2026-10-25, r138/r139).  On the reporter's 12 GiB gfx1031 (RDNA2 tile FA, slab declined) the delivery's `pp512` lead over upstream shrinks with depth: +36 % at d0, about even at 80k, -10 % at 120k (his r126 sweep; the r138 re-base does not change his tile path).  Not measurable here: no gfx1030/gfx1031 device.  Candidates are both block 05: the RDNA2 tile table from PR #165/r76 (tuned on a V620 with a different GQA shape), `GGML_CUDA_FATTN_TILE_Q_GLOBAL` (the +30 % figure was shallow), and the `prefill_stages = !RDNA3_5` staging gate.  Next measurement: his r138 `-p 512 -n 0` sweep with `GGML_CUDA_FA_STAGE_MAX_MB=1` as the staging arm.  Detail in §106 |
-| **108** | parking a mirroring second cache is validated on qwen4exp (and its k-pool arm is not) | platform validation | open, accepted limitation (r146, issue #227).  `llama_memory_hybrid_idx` is shared with **glm5-next**, whose indexer is the `indexer_kpool > 0` (k-pool, `indexer_kpool_by_order`) variant: the same park code moves it and the same invalidation (`mem_idx_stale_set`, `pool_invalidate_all`) covers the pool layout, but no glm5-next GGUF exists on this fleet, so only the qwen4exp arm is measured (`scripts/gate-park-idle-slots.sh`) |
 | **109** | a replayed graph loses to the direct node loop where the RCCL comm layer is initialised | performance | open (2026-10-26, r149).  Now that decode graphs replay (TODO #107 closed) the captured path loses on **3-device `-sm tensor` qwen35 dense plain decode**: 27B Q8_0 `llama-bench tg128` **41.7 -> 38.6** (Q4_K_XL 52.4 -> 49.1, unchanged at depth 16384).  **The axis is the comm layer, not the model's shape and not the per-call algorithm choice:** with `GGML_CUDA_ALLREDUCE=internal` (RCCL **never initialised**) the same arm is **42.2 (+0.9 %)** on the replaying build, while `hybrid` (41.7 -> 38.6) and `ce` (40.7 -> 38.6, and `ce` runs `comm_init_hybrid` first) both regress, and `nccl` is worse still (38.5 -> 35.6).  `GGML_CUDA_AR_SMALL_BYTES` 0 or 1e9 changes nothing, so it is not which arm runs per call: it is **RCCL's presence**, which the eager-init comment in `ggml_backend_cuda_comm_init_hybrid` already records as an r34 decode-only cost of the internal pipeline — r149 makes it visible on this arm because replay now happens at all.  Not capture churn (one shot per key, the deficit survives `-n 512`), not `GGML_CUDA_GRAPH_CHUNK_SIZE`, not `GGML_CUDA_ASYNC_INPUT`, not `GGML_SCHED_EVENTS`.  **It is not a dense-model property and not a 3-device property:** Gemma4 31B Q8_0 (dense, 32.6 GB) is **+0.8 %** at 2 GPUs (26.64 -> 26.86) and **flat** at 3 (34.68 -> 34.58, and only -0.9 % for `internal` vs `hybrid`), 27B at 2 GPUs is +0.5 % with replay working, and a `draft-mtp` draft hides it at 3 devices (42.8 -> 42.9).  Kill switch: `GGML_CUDA_GRAPH_KEY_WEIGHT=0`.  Next: find what RCCL's init leaves behind that costs a *replayed* graph 5-7 % while the direct node loop is immune (an r34 follow-up, not a r149 regression) |
 | **111** | a multi-slot verify step whose slot drafted NOTHING still splits | performance / accepted limitation | open (2026-10-27, r153/r154, issue #234).  `LLAMA_SPEC_ALIGN` equalizes the draft CAPS of the sequences one `draft-mtp-adaptive` call drafts, but a slot that drafted no tokens this round (the last step of a response, or a drafter that gave up) contributes its sampled row only, so the batch is `n_draft + 1` vs `1` and `split_equal()` still produces a second ubatch there.  Truncating the neighbour's good draft to nothing is the worse trade, so that step keeps splitting (measured: 1 such step per ~200 on the 35B-A3B host-expert arm).  **The cross-drafter case is CLOSED, not deferred**: the generic `min` cut of the finished drafts was shipped in r153 and measured -6 % on the reporter's own n-gram-first chain (65.6 -> 61.7 t/s, prose acceptance 74 % -> 50 %, splits 12 -> 1), so r154 removed it: a length mismatch caused by CONTENT rather than a cap is not worth equalizing.  `scripts/gate-spec-align.sh` now gates that chain (inert within 2 %, identical draft counts).  Record: `archive/work/spec-align-234/` |
 | **112** | VRAM-resident slot snapshots for the server | parked idea | **parked** (2026-10-27, r157) — no work implied.  `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` now copies a sequence state at **14.7 / 17.2 ms** on 2 GPUs (was 2.2 s; `WORKLOG.md` 261027.009), so keeping a slot's snapshot **in VRAM** instead of host RAM is usable for the first time — but nothing calls the arm.  Blockers before a server could: no eviction/budget API on `mem_storage` and no `--fit` accounting, the MoE arena would be the OOM chain's sacrifice, and `llama-memory-recurrent.cpp` refuses the flag for more than one cell range (so a hybrid model's interleaved slot cannot be saved at all).  Detail in §112 |
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
+
+---
+
+## 70. Harden the expert-cache re-arm / wide-aux growth against a starved arena — ROBUSTNESS
+
+
+Opened 2026-10-19 while fixing r87.  r87 forces the post-prefill drop, so the r86 trigger (the wide layout
+was never released and the arena decayed) is gone.  But the failure shape was: a re-arm that had to shrink
+one layer to a partial slot count (`layer=47 ... 344 requested, only 202 fit`), a starved wide-aux region
+(thousands of `SLAB_WIDE_AUX` attempts), then a GPU page fault in `k_get_rows_float` on the next graph.
+The re-arm is supposed to be layer-uniform and safe; make a partial/refused re-arm leave the cache
+**wholesale stood down** (the fuse-guard invariant) instead of running a mixed-slot layer, and make the
+wide-aux growth refuse once per pass instead of once per allocation.  Repro: the 10-prompt series against
+r86 in `WORKLOG.md` 261019.002; validation arm `MOE_EXPERT_CACHE_VALIDATE=1`.
+
+**r94 note:** the issue #187 fix adds the missing *graph* half of this stale-pointer family — a captured
+graph is now invalidated when the slab work boundary shrinks (block 10, `WORKLOG.md` 261020.004).  That
+covers the observed #187 fault; it does **not** discharge this item, because a re-arm can still change a
+table's arena placement under a graph that is not being dropped.  Keep #70 open.
+
+---
+
+## 102. The band's width purity has no head-256 GQA-8 model arm — PLATFORM VALIDATION
+
+**Status: open, accepted limitation (r134, issue #224).**  Not a suspected defect.  The r134 fix restores the
+band's per-column KV split (`np = nwarps*cols_per_warp/ncols`) as one geometry across query widths 1..8, and
+a `static_assert` on the two band rows makes a config divergence a build error.  `ncols2 = 8` folds a GQA
+group of up to 8 in one pass (and 9..12 in two), so the geometry does not depend on the ratio; the guard is
+width-only.  Measured: `test-logits-width-probe` at `P=4096` on **GQA 6** (dense 27B, q8_0/f16/bf16) and on
+**GQA 12** (Flash-Next, `RS=from_w`, 2 GPU `-sm layer`, `-ncmoe 40`, q8_0) — both maxdiff 0.  No head-256
+GQA-8 model exists in the fleet, so ratio 8 itself is unmeasured.
+
+What to run if one appears: the probe at `P >= 4096` with `KV=q8_0` and `f16` (plus `SPLIT=tensor` for the
+multi-device arm), and `plain == draft-dflash/draft-mtp` at `-n 512`.  A failure would look like a row-0 hash
+split between W=4 and W=5 (the shape the r126 geometry produced).
+
+---
+
+## 103. The ~30x collapse when the last few MiB of VRAM are in use has no root cause — PERFORMANCE (diagnosis)
+
+**Status: open, not understood (r135, found while investigating issue #219).**  On a single gfx1201 with the
+27B GSQ-RCO-IQ3_S + mmproj + MTP at `-c 65536`, reducing the free VRAM at process start from 14.46 GiB to
+14.06 GiB turns a 13 s request into a 384 s one (prefill 1127 -> 35 t/s, decode 53 -> 1.5-3 t/s) with
+**zero** device memory left, and the next larger prompt then aborts with `ROCm error: out of memory`.
+Eliminated so far: the weights are still resident (`rocm-smi --showpids` shows 15.08 GiB for the process);
+it is **not** the FA staging stand-down (`GGML_CUDA_FA_STAGE_MAX_MB=0` on a roomy card is still 13.3 s); it
+is **not** graph churn alone (`graphs reused` is 0 in one arm and 65 in another, both slow); the workspace
+pool's flush + retry and the ECC/pool-floor logic account for a fraction, not 30x.  Next step: `-lv 5` on a
+short (2-3 K token) prompt at that budget with the per-op pool debug (`GGML_CUDA_GCDBG`) and a GPU
+busy/clock sample, to separate "the GPU is doing 30x the work" from "the host is stalling 30x".
+
+Harmless on Linux (it terminates or degrades) and unreachable with `GGML_CUDA_MIN_FREE_MIB` set, but it is
+the state the Windows reporter's card spends its life in, so it is worth understanding.
 
 ---
 
@@ -71,101 +120,7 @@ a snapshot that lives in VRAM does not add to the non-swappable host footprint, 
 `scripts/gate-ckpt-reuse.sh` are the closest existing models for "a restored state moves no token".  Records:
 `archive/work/state-device-path/RESOLUTION.md`, `benchmarks/2026-10-27-state-device-path.md`.
 
-## 106. Issue #214's RDNA2 deep-context prefill residual — PLATFORM VALIDATION (waiting on the reporter)
-
-**Status: open (2026-10-25, r138/r139).**  On the 12 GiB RX 6700 XT (gfx1031 as gfx1030, RDNA2 tile FA,
-`-ncmoe 24`, slab declined so the experts stream) the reporter's r126 depth sweep shows the delivery's
-`pp512` lead over upstream shrinking with depth: +36 % at d0, about even at 80k, -10 % at 120k.  r126 cannot
-be the cause (his card has no WMMA and takes the tile kernel, so the r126 RDNA4 row never applied to him),
-and the r125 campaign's gfx1201 streaming arm leads at every depth.  The remaining candidates are block 05's
-RDNA2 tile config table (PR #165/r76, tuned on a V620 with a different GQA shape), the
-`GGML_CUDA_FATTN_TILE_Q_GLOBAL` wide-tile Q-from-global read (its +30 % was a shallow measurement), and the
-`prefill_stages = !RDNA3_5` FA staging gate (RDNA2 stages; it was never depth-swept).  A near-full card adds
-the staging-arena refusal: his peak is 12204 of 12272 MiB, so the deep-prefill staging allocation can be
-refused and falls back to the native K/V read, which is a slowdown but is also upstream's path.
-
-This fleet cannot measure it: there is no gfx1030/gfx1031 device, and the only RDNA2 silicon is a gfx1036
-iGPU with a 2 GiB BAR and ~1.8 GiB already used by the desktop.  The reporter's r138 sweep, with
-`GGML_CUDA_FA_STAGE_MAX_MB=1` (force the native K/V read) as the staging arm, is what separates the staging
-gate from the tile table.  The r138 gfx1201 control (no crossover, resident +18..+27 %, streaming +18..+45 %
-with default flags) is [`benchmarks/2026-10-25-r138-depth-sweep.md`](benchmarks/2026-10-25-r138-depth-sweep.md).
-
-## 103. The ~30x collapse when the last few MiB of VRAM are in use has no root cause — PERFORMANCE (diagnosis)
-
-**Status: open, not understood (r135, found while investigating issue #219).**  On a single gfx1201 with the
-27B GSQ-RCO-IQ3_S + mmproj + MTP at `-c 65536`, reducing the free VRAM at process start from 14.46 GiB to
-14.06 GiB turns a 13 s request into a 384 s one (prefill 1127 -> 35 t/s, decode 53 -> 1.5-3 t/s) with
-**zero** device memory left, and the next larger prompt then aborts with `ROCm error: out of memory`.
-Eliminated so far: the weights are still resident (`rocm-smi --showpids` shows 15.08 GiB for the process);
-it is **not** the FA staging stand-down (`GGML_CUDA_FA_STAGE_MAX_MB=0` on a roomy card is still 13.3 s); it
-is **not** graph churn alone (`graphs reused` is 0 in one arm and 65 in another, both slow); the workspace
-pool's flush + retry and the ECC/pool-floor logic account for a fraction, not 30x.  Next step: `-lv 5` on a
-short (2-3 K token) prompt at that budget with the per-op pool debug (`GGML_CUDA_GCDBG`) and a GPU
-busy/clock sample, to separate "the GPU is doing 30x the work" from "the host is stalling 30x".
-
-Harmless on Linux (it terminates or degrades) and unreachable with `GGML_CUDA_MIN_FREE_MIB` set, but it is
-the state the Windows reporter's card spends its life in, so it is worth understanding.
-
-## 102. The band's width purity has no head-256 GQA-8 model arm — PLATFORM VALIDATION
-
-**Status: open, accepted limitation (r134, issue #224).**  Not a suspected defect.  The r134 fix restores the
-band's per-column KV split (`np = nwarps*cols_per_warp/ncols`) as one geometry across query widths 1..8, and
-a `static_assert` on the two band rows makes a config divergence a build error.  `ncols2 = 8` folds a GQA
-group of up to 8 in one pass (and 9..12 in two), so the geometry does not depend on the ratio; the guard is
-width-only.  Measured: `test-logits-width-probe` at `P=4096` on **GQA 6** (dense 27B, q8_0/f16/bf16) and on
-**GQA 12** (Flash-Next, `RS=from_w`, 2 GPU `-sm layer`, `-ncmoe 40`, q8_0) — both maxdiff 0.  No head-256
-GQA-8 model exists in the fleet, so ratio 8 itself is unmeasured.
-
-What to run if one appears: the probe at `P >= 4096` with `KV=q8_0` and `f16` (plus `SPLIT=tensor` for the
-multi-device arm), and `plain == draft-dflash/draft-mtp` at `-n 512`.  A failure would look like a row-0 hash
-split between W=4 and W=5 (the shape the r126 geometry produced).
-
-## 79. RDNA3_0 verify-band fusions: the multi-device arm and gfx1101/gfx1102 are unmeasured — PLATFORM VALIDATION
-
-
-**Status: open, accepted limitation.  Shipped default-on in r95 on the maintainer's decision**
-(`WORKLOG.md` 261020.006, record `archive/work/rdna3-verify-fusions/RESOLUTION.md`).  Not a suspected
-defect: the change is arch-identical code behind a host predicate and every single-GPU gate is green
-(gfx1100 `W=1..8` maxdiff 0 on six model/prefix cells, `none == draft-mtp`, same-binary kill-switch
-identity, prefill-logit KLD 0.000000).
-
-Two gaps, both needing hardware the fleet does not have:
-
-1. **RDNA3_0 multi-device.**  The batched f32 `GGML_OP_CPY` fusion is **not** single-device restricted and
-   it is an actively used multi-device path: on 3x gfx1201 with the GDN model + MTP,
-   `GGML_CUDA_FUSE_CPY_BATCH_DEBUG=1` shows **450 runs under `-sm layer` and 1350 under `-sm tensor`**.
-   The RDNA4 multi-device path is therefore heavily exercised, but the same code on a 2+ card gfx1100
-   box was never run.  What to run: a GDN model with MTP (`draft-mtp`, n-max 3) under both `-sm tensor`
-   and `-sm layer`, plus `test-logits-width-probe` with `SPLIT=tensor`, comparing default against
-   `GGML_CUDA_FUSE_CPY_BATCH=0`.  `fingon` is one gfx1100 plus a gfx1036 iGPU and `halo` is gfx1151, so
-   neither is a valid host.  Community members running multiple gfx1100 cards are expected to report.
-   If a multi-device failure does appear, `GGML_CUDA_FUSE_CPY_BATCH=0` is the immediate workaround and
-   restricting that fusion to `get_device_count() <= 1` on RDNA3_0 is the local fix.
-2. **gfx1101 / gfx1102.**  `GGML_CUDA_CC_IS_RDNA3_0` covers `0x1100 <= cc < 0x1150`, so gfx1101 (RX
-   7800 XT / 7700) and gfx1102 (RX 7600) take the same fusions, but neither the PR author nor the r95
-   release ran them.  There is no such card in the fleet.  The same `W=1..8` probe and kill-switch A/B
-   is the check if one becomes available.
-
-**Do not re-report as a bug without one of those runs.**
-
 ---
-
-## 70. Harden the expert-cache re-arm / wide-aux growth against a starved arena — ROBUSTNESS
-
-
-Opened 2026-10-19 while fixing r87.  r87 forces the post-prefill drop, so the r86 trigger (the wide layout
-was never released and the arena decayed) is gone.  But the failure shape was: a re-arm that had to shrink
-one layer to a partial slot count (`layer=47 ... 344 requested, only 202 fit`), a starved wide-aux region
-(thousands of `SLAB_WIDE_AUX` attempts), then a GPU page fault in `k_get_rows_float` on the next graph.
-The re-arm is supposed to be layer-uniform and safe; make a partial/refused re-arm leave the cache
-**wholesale stood down** (the fuse-guard invariant) instead of running a mixed-slot layer, and make the
-wide-aux growth refuse once per pass instead of once per allocation.  Repro: the 10-prompt series against
-r86 in `WORKLOG.md` 261019.002; validation arm `MOE_EXPERT_CACHE_VALIDATE=1`.
-
-**r94 note:** the issue #187 fix adds the missing *graph* half of this stale-pointer family — a captured
-graph is now invalidated when the slab work boundary shrinks (block 10, `WORKLOG.md` 261020.004).  That
-covers the observed #187 fault; it does **not** discharge this item, because a re-arm can still change a
-table's arena placement under a graph that is not being dropped.  Keep #70 open.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
