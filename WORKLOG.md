@@ -71,6 +71,12 @@ same session (`ROCBLAS_USE_HIPBLASLT=0`, `extract-generated.py`); prefill-logit 
 `gate-park-idle-slots.sh` PASS; `gate-hc-fusions.sh` PASS (7/7 arms, BF16-hc class); per-block build
 `--fast --changed-from dc6a78d5c` 2/2.
 
+**Confirmed on the released tree** (`b9418b679`, `fork-refresh.sh --build --gates --push`): the 1 GPU
+`gate-state-pipe.sh` arm reads `copy0` **39.91 ms** -> default **35.09 ms** (-12.1 %) and the restored
+request's `prompt_ms` 67.97 -> 64.65 ms, with all five arms byte-identical; coherence and the prefill-logit
+gate (KLD 0.000000 / 100.000 %) ran on that build as part of the fork refresh.  The fork's `rdna-boosts`
+branch is `b9418b679`, i.e. the tip `release.json` records.
+
 **6. Docs.**  `ENVIRONMENT.md` gains `LLAMA_STATE_COPY_THREADS` and `LLAMA_STATE_TIMING`; `patches/README.md`
 block 12 gains the copy bullet and its knob list; `MANIFESTS.md` gains the r152 block-12
 verification row; `AGENTS.md`'s state invariant carries the group-boundary rule, the fence, the 16 MiB / 64 KiB
