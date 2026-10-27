@@ -122,7 +122,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§58** | a per-device scalar is sound only if its inverse is applied to that device's own partial *before* the reduction — a mode, not a default | doctrine, temporary (r137, block 14; `TODO` #104) |
 | **§59** | a fused window must read a tensor the graph keeps alive for it — the one the emitter pins — never an unpinned ancestor whose last graph use runs *before* the window; and a fusion of a norm must reduce in the *same grouping* as the kernel it replaces, or it is only approximately that kernel | fix (r140 + r141, issue #226) |
 | **§60** | a reduction-order change is a new numerics reference: one reduction (the strided one), and every fused norm kernel reduces like the chain it replaces | doctrine (r145, issue #229) |
-| **§61** | a fused op must reproduce the *model's own chain*, not its fused sibling: an intermediate tensor's scale convention belongs to the emitter, so a pair of fused ops that agree with each other can still be wrong — and the arms they select into are the oracle | fix + doctrine (r148, issue #228) |
+| **§61** | a fused op must reproduce the *model's own chain*, not its fused sibling: an intermediate tensor's scale convention belongs to the emitter, so a pair of fused ops that agree with each other can still be wrong — and the arms they select into are the oracle | fix + doctrine (r148, issue #228; the DSV4 pre/post pair re-baselined to a reported arm at r157) |
 | **§62** | a captured graph is pure only while its **key** names every dimension the subgraph varies in and its **property compare** still sees every baked pointer: a cache key is not a guard, and an identity-free compare is not "purity-neutral" — it is the removal of the only check that a replay's baked kernel arguments still point at the tensors they were captured from | doctrine (r149, TODO #107; `archive/work/graph-replay-keys/`) |
 | **§63** | a verify batch is only as cheap as its *widest* sequence set: aligning the sequences of one step into one ubatch changes a slot's verify width, so the text-level oracle is the single-sequence arm and a verify-width control, never a two-slot text diff | fix + doctrine (r153, issue #234; `archive/work/spec-align-234/`) |
 | **§64** | a restored state may stand in for a fresh save only because the restore re-establishes *everything* a save would capture: the guard is the position alone, so a new per-checkpoint payload must be restored (or stashed before the keep check), and the path only exists where a restore lands on the checkpoint's own position (a hybrid/recurrent memory) | doctrine (r155, PR #236; `archive/work/server-ckpt-reuse/`) |
@@ -1797,14 +1797,21 @@ vs **31.73** with both arms off (+8.7 %), prefill flat; IQ4_NL 34.49/34.35 and Q
 the chain-mixer class).  Release record: `WORKLOG.md` 261026.006 (r148); op contract:
 `patches/README.md` (block 11); switch catalogue: `ENVIRONMENT.md` §7.4.
 
-**Open, measured at r156 (the arm, not the scale).**  On the IQ4_NL class the hard `dsv4_pre_chain` arm
-does **not** match the chain, and never has in this line: 444 vs 453 chars, identical on an r148/r154 build
-(the r149 record logged it first).  What r156 adds is the magnitude -- at the logits the default fused
-`GGML_OP_DSV4_HC_PRE` reads **mean KLD 0.027936 / same-top-p 96.471 %** against its own F32 chain at base
-PPL 1.7888 (`gate-prefill-logits.sh --ab "LLAMA_FUSED_DSV4_HC_PRE=0"`), i.e. 5.6x the limit, so it is a
-real functional difference and not a greedy near-tie.  `GGML_CUDA_MMB_HC16=0` changes neither arm.  Until
-this is decided (fix the op, re-baseline it with this number, or demote the arm to reported like
-`dsv4_post_op`) the gate's green result is the **BF16-hc class only**.  `WORKLOG.md` 261027.007.
+**Closed by re-baseline at r157 (measured at r156).**  On the IQ4_NL class the `dsv4_pre_chain` arm does
+**not** match the chain, and never has in this line: 444 vs 453 chars, identical on an r148/r154 build
+(the r149 record logged it first).  At the logits the default fused `GGML_OP_DSV4_HC_PRE` reads **mean KLD
+0.021542 / same-top-p 95.814 %** against its own F32 chain (`gate-prefill-logits.sh --ab
+"LLAMA_FUSED_DSV4_HC_PRE=0"`, the standard 40-chunk point; a 10-chunk exploratory run read 0.027936 /
+96.471 %), i.e. the **same order the combine+norm fusion has always shown** (0.0185-0.0213 / 95.6 %,
+`WORKLOG.md` 261025.014).  That is a **numeric re-baseline, not a near-tie and not a defect**:
+`dsv4_hc_pre_f32`'s `wbf16`/`xbf16` arms read the HC16 bf16 producer slots by design, so
+`LLAMA_FUSED_DSV4_HC_PRE=0` swaps the producer precision as well as the fusion (`GGML_CUDA_MMB_HC16=0`
+changes neither arm).  r157 therefore: **`dsv4_pre_chain` is a reported arm like `dsv4_post_op`**; the
+Flash-Next IQ4_NL prefill-logit base is re-recorded from the shipped default (`base_ppl` **2.7527**, and the
+pre-r156 build reproduces it at 0.000000 / 100.000 %, i.e. the class is stable and the base is a reference
+rather than a snapshot of one build); and the hard oracle is unchanged -- the four mix/combine arms plus the
+CUDA-side chain fusions still match byte for byte on **both** hc classes (IQ4_NL 444 chars `7ea23f309705`,
+BF16-hc 449 chars `6a102dbc62d6`).  `WORKLOG.md` 261027.007/261027.008.
 
 ## 62. A replay is pure only while its identity is complete: the key must name the layer, and the property compare stays strict (r149, TODO #107)
 

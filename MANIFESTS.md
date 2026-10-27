@@ -114,8 +114,11 @@ in CI.  The model-level gates are manual:
    shipped in r136 and survived r136-r145 on this fact).
 7. **qwen4exp hyper-connection fusions** — `scripts/gate-hc-fusions.sh MODEL.gguf`: runs the **four**
    mix/combine arm combinations (`LLAMA_FUSED_HC_MIX` x `LLAMA_FUSED_HC_COMBINE`, selected independently)
-   plus the CUDA-side chain fusions and the DSV4 HC pre/post pair, and requires every hard arm to be
-   **byte-identical to the unfused chain**.  Required for any change to `build_hc_mix`, `build_hc_combine`,
+   plus the CUDA-side chain fusions, and requires every hard arm to be **byte-identical to the unfused
+   chain**.  The DSV4 HC pre/post pair is **reported, not hard** (r156): those two ops own the HC16 bf16
+   producer slots and are a documented numeric re-baseline, so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps the producer
+   precision as well as the fusion (IQ4_NL class: mean KLD **0.021542 / 95.814 %** against the chain at the
+   standard 40-chunk point, the same order the combine+norm fusion always showed).  Required for any change to `build_hc_mix`, `build_hc_combine`,
    `GGML_OP_HC_MIX` / `GGML_OP_HC_COMBINE` (kernel, CPU reference or op definition) or a matcher that fuses
    either.  **Run it once per hc-down weight class** — Q8_0/BF16 `hc_attn_down` takes the fused mixer, any
    other quant takes the chain (`--types MODEL.gguf` prints the class).  The defect class it exists for only

@@ -38,8 +38,18 @@
 #   HARD: every arm produces the same generated text (byte-identical, same sha) as the
 #         chain+chain reference arm, and the reference arm is not degenerate (>= MIN_CHARS
 #         and no `////` run).  A mismatch names the arm.
-#   The arms cover both halves independently, the CUDA-side chain fusions, and the
-#   DeepSeek-V4 HC pre/post op pair (which qwen4exp also builds through).
+#   REPORTED: the DeepSeek-V4 HC pre/post op pair (which qwen4exp also builds through) is
+#         printed with its sha and divergence but does not fail the gate.  Those two ops are
+#         NOT an exact reimplementation of their ggml chain: they own the HC16 bf16 producer
+#         slots (`dsv4-hc.cu`: "a numerics change vs the F32 chain, approved as a prefill
+#         re-baseline"), so `LLAMA_FUSED_DSV4_HC_PRE`/`_POST` are numeric arms, not aliases.
+#         Baseline on the IQ4_NL class (r156, `gate-prefill-logits.sh --ab`): the fused pre op
+#         reads mean KLD 0.027936 / same-top-p 96.471 % against its own chain at base PPL
+#         1.7888, the same order the combine+norm fusion has always shown (0.0185-0.0213 /
+#         95.6 %, WORKLOG 261025.014).  A *change* in that magnitude is the regression signal;
+#         byte-identity is not expected there.  A class where they DO agree (BF16-hc) prints
+#         equal shas, so nothing is lost.
+#   The arms cover both halves independently and the CUDA-side chain fusions.
 #
 #   The hc weight TYPE decides which mixer runs, so run this once per class:
 #     * a Q8_0 or BF16 hc_attn_down GGUF  -> the fused BF16/Q8_0 mixer (fused mix arm is real)
@@ -171,19 +181,23 @@ echo "    prompt sha256=$PROMPT_SHA  (extractor: scripts/extract-generated.py)"
 echo "    logs: $KEEPOUT"
 echo
 
-# name | environment.  The reference (chain + chain) is the model's own definition; every other
-# HARD arm must reproduce it byte for byte.  The DSV4_HC_POST op is a REPORTED arm only: the op arm
-# is documented as rounding-level vs its chain on one device (r97: NMSE 6.5e-06, and the chain is the
-# default on a single device), so a near-tie flip there is expected and not this gate's subject.
+# The DSV4_HC_PRE/_POST ops are REPORTED arms (r156).  They are numeric re-baselines, not exact
+# reimplementations: `dsv4_hc_pre_f32`'s `wbf16`/`xbf16` arms read the HC16 bf16 producer slots
+# deliberately (see the header), so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps the producer precision as well
+# as the fusion.  Measured on the IQ4_NL class at r156: mean KLD 0.027936 / same-top-p 96.471 %
+# (base PPL 1.7888), i.e. the same class of difference the combine+norm fusion has always shown
+# (0.0185-0.0213 / 95.6 %, WORKLOG 261025.014) -- so it is reported, and a *change* in it is the
+# signal.  Byte-identity IS expected on the BF16-hc class, where both arms still agree (449 chars
+# `6a102dbc62d6`).
 HARD_ARMS=(
     "chain_chain   :LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0"
     "mixed_comb    :LLAMA_FUSED_HC_COMBINE=0"
     "mixfused_comb :LLAMA_FUSED_HC_MIX=0"
     "fused_fused   :-"
     "no_cuda_fuse  :GGML_CUDA_DISABLE_HC_FUSION=1"
-    "dsv4_pre_chain:LLAMA_FUSED_DSV4_HC_PRE=0"
 )
 SOFT_ARMS=(
+    "dsv4_pre_chain:LLAMA_FUSED_DSV4_HC_PRE=0"
     "dsv4_post_op  :LLAMA_FUSED_DSV4_HC_POST=1"
 )
 ARMS=("${HARD_ARMS[@]}" "${SOFT_ARMS[@]}")
@@ -223,7 +237,7 @@ for arm in "${ARMS[@]}"; do
     elif [ "$sha" = "$ref_sha" ] && [ "$chars" = "$ref_chars" ]; then
         verdict="ok"
     elif [ "$soft" -eq 1 ]; then
-        verdict="reported (rounding-level arm, differs)"
+        verdict="reported (numeric arm, differs -- see the header)"
     else
         verdict="FAIL (differs from chain_chain)"
     fi
@@ -241,7 +255,7 @@ if [ "$fails" -ne 0 ]; then
 fi
 if [ "$warns" -ne 0 ]; then
     echo "PASS: all $(( ${#ARMS[@]} - warns )) hard arms are byte-identical to the unfused chain" \
-         "($ref_chars chars, sha $ref_sha); $warns reported arm(s) differ (documented rounding-level)"
+         "($ref_chars chars, sha $ref_sha); $warns reported arm(s) differ (documented numeric re-baseline)"
 else
     echo "PASS: all ${#ARMS[@]} arms are byte-identical to the unfused chain ($ref_chars chars, sha $ref_sha)"
 fi

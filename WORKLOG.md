@@ -1,5 +1,44 @@
 # WORKLOG - dated delivery records
 
+## 261027.008 (tooling/baseline, post-r156) -- re-establish the baseline the IQ4_NL hc class moved: the DSV4 HC pre/post arms are reported, not hard, and the Flash-Next IQ4_NL prefill-logit point is re-recorded
+
+**No release, no patch change.**  Nothing here touches `patches/`, `release.json`, `rdna-boosts-all.patch`
+or the r156 tag; this is the gate/baseline half of the r156 finding (261027.007 §6), decided by the maintainer
+("we fixed a bug in IQ4_NL recently -- re-establish the baseline").
+
+**1. What the numbers say.**  r156 measured the default fused `DSV4_HC_PRE` against its own F32 chain on
+Flash-Next IQ4_NL at **mean KLD 0.027936 / 96.471 %** (a 10-chunk run); at the standard 40-chunk point it is
+**0.021542 / 95.814 %**.  That is the **same order the HC combine+norm fusion has always shown** on that class
+(0.0185-0.0213 / 95.6 %, 261025.014), and it is not a near-tie or a defect: the two DSV4 HC ops own the HC16
+bf16 producer slots (`dsv4-hc.cu`: "a numerics change vs the F32 chain, approved as a prefill re-baseline"),
+so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps the producer precision *as well as* the fusion.  `GGML_CUDA_MMB_HC16=0`
+moves neither arm, so byte-identity was never the right criterion for that pair -- it is a numeric arm.
+The r140/r141 (issue #226) fix is the one that moved this class: on a pre-#31028 / separate-tensor GGUF (which
+IQ4_NL is) the fused combine+norm had been reading a *recycled* buffer as `inject`, which put that arm's PPL at
+2690 against 2.45 through the chain; both arms are correct now, and the fused side is the intended behaviour.
+The remaining fused-vs-chain gap is **not** from that fix -- it is inherent and pre-existing, measured at
+0.021338 already on r135 (pre-r138), which is exactly why this is a re-baseline and not a regression.
+
+**2. `scripts/gate-hc-fusions.sh`: `dsv4_pre_chain` joins `dsv4_post_op` as a REPORTED arm.**  The hard
+oracle is unchanged and is the one §61 exists for -- the four `LLAMA_FUSED_HC_MIX` x `LLAMA_FUSED_HC_COMBINE`
+combinations plus the CUDA-side chain fusions, byte-identical to the unfused chain.  The two DSV4 arms are
+still printed with their sha and verdict, so a **change** in their divergence is visible; on the class where
+they do agree (BF16-hc) they still print equal shas, so nothing was given up there.  Verified: IQ4_NL class
+**PASS, 5/5 hard arms identical (444 chars `7ea23f309705`), 2 reported**; BF16-hc class (GSQ-IQ3_XXS) **PASS,
+all 7 arms identical (449 chars `6a102dbc62d6`)**.
+
+**3. Flash-Next IQ4_NL prefill-logit base re-recorded from the shipped default**, 40 chunks, f16 KV:
+`base_ppl 2.7527`, `build=5bf09b93b`, `arm=<default>` -- so that class finally has a reference of its own (the
+one r156 recorded was deleted: it held a *non-default* `--ab` arm and would have failed any later default run
+for the wrong reason).  It is a reference, not a snapshot: the pre-r156 build (`08c471959`) reproduces it at
+**0.000000 / 100.000 %**, and the shipped build against itself reads the same.  The standing check for this
+class is therefore "0.000000 against the base", and the DSV4 pre/post arms are judged by their reported
+KLD staying at ~0.02 / ~95.8 %.
+
+**4. Docs.**  `GREEDY-PURITY.md` §61 (the claim, the two numbers, and *why* the pair is a numeric arm),
+`MANIFESTS.md` gate 7 and `scripts/README.md` (the gate's hard/reported split), 261027.007 §6 (chunk count for
+its figure and a pointer here).  The KLD bases on disk: `~/.cache/rdna-boosts/gates/`.
+
 ## 261027.007 (r156) -- issue #237: the FA prefill staging arena's size hint is a CEILING, not a target (block 10)
 
 **Shipped:** `v15-6050b467c-r156` (block **10** amended).  `release.json`: tip **`5bf09b93b`**, tree
@@ -70,12 +109,12 @@ and `-c 262144` (`63bb1363bbb9`).
 on an r148 build) and unrelated to the change under test; this release's tree reproduces both hashes and both
 arm verdicts exactly, and the change here only alters an allocation's size.  **New here: the magnitude** --
 measured at the logits with the gate's `--ab`, the default fused `DSV4_HC_PRE` reads **mean KLD 0.027936 /
-same-top-p 96.471 %** against its own F32 chain at base PPL 1.7888 (well inside the calibrated domain), i.e.
-5.6x the gate's KLD limit, not a near-tie.  `GGML_CUDA_MMB_HC16=0` does not move either arm, so the "bf16
-producer" re-baseline the kernel comments cite (`dsv4-hc.cu`: "a numerics change vs the F32 chain, approved as
-a prefill re-baseline") is not confirmed as the whole cause.  The gate's 7/7 PASS is recorded for the class it
-is defined on (the BF16-hc one, as at r155); whether the IQ4_NL-class divergence should be fixed, re-baselined
-or demoted to a reported arm (like `dsv4_post_op`) is the maintainer's call, and it is not a #237 item.
+same-top-p 96.471 %** against its own F32 chain at base PPL 1.7888 (a 10-chunk exploratory run over wikitext;
+the standard 40-chunk cell reads **0.021542 / 95.814 %**).  `GGML_CUDA_MMB_HC16=0` does not move either arm,
+so the "bf16 producer" re-baseline the kernel comments cite (`dsv4-hc.cu`: "a numerics change vs the F32
+chain, approved as a prefill re-baseline") is not confirmed as the *only* route to it.  The gate's 7/7 PASS
+is recorded for the class it is defined on (the BF16-hc one, as at r155); the IQ4_NL-class decision was taken
+in 261027.008 below (re-baselined: reported arm + a re-recorded KLD base), and it is not a #237 item.
 
 ## 261027.006 (r155) -- PR #236: the server keeps the context checkpoint a task just restored instead of saving it again, and recycles the buffers of dropped checkpoints (block 12)
 

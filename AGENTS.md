@@ -1055,10 +1055,12 @@ is re-saved at the same position).  No other gate creates or restores a context 
 is a wrong answer on the *next* resume rather than a crash.
 
 A change to a **qwen4exp hyper-connection** op, its chain or a matcher that fuses it needs
-`scripts/gate-hc-fusions.sh MODEL.gguf`: the four `LLAMA_FUSED_HC_MIX` x `LLAMA_FUSED_HC_COMBINE` arms (plus
-the CUDA-side chain fusions and the DSV4 HC pre/post pair) must all be byte-identical to the unfused chain,
-once per hc-down weight class.  Issue #228 shipped for ten releases because no gate crossed those arms
-(`GREEDY-PURITY.md` §61).
+`scripts/gate-hc-fusions.sh MODEL.gguf`: the four `LLAMA_FUSED_HC_MIX` x `LLAMA_FUSED_HC_COMBINE` arms plus
+the CUDA-side chain fusions must be byte-identical to the unfused chain, once per hc-down weight class.  The
+DSV4 HC pre/post pair is **reported, not hard** (r157): those ops own the HC16 bf16 producer slots and are a
+numeric re-baseline (IQ4_NL class 0.021542 KLD / 95.814 % vs the chain), so a `reported` line is expected
+there and a *change* in its magnitude is the signal.  Issue #228 shipped for ten releases because no gate
+crossed those arms (`GREEDY-PURITY.md` §61).
 
 ### Regenerate the patches (after fork changes)
 
