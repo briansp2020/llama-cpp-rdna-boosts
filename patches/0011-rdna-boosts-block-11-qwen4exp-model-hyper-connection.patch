@@ -1,4 +1,4 @@
-From 1f99d2fdaa8c5cbb28d324cce36744bf66a5b3a3 Mon Sep 17 00:00:00 2001
+From 7ed57a5d07899118e55a4c0391f61c1fcb91ee0c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/14] rdna-boosts: block 11: qwen4exp (model,
@@ -63,19 +63,19 @@ TU in block 10; only the code that needs this block's own symbols is here.
 ---
  common/arg.cpp                           |    3 +-
  ggml/include/ggml-rpc.h                  |    4 +-
- ggml/include/ggml.h                      |  182 ++
+ ggml/include/ggml.h                      |  186 ++
  ggml/src/ggml-backend-meta.cpp           |   57 +
  ggml/src/ggml-backend.cpp                |   11 +
  ggml/src/ggml-cpu/ggml-cpu.c             |   37 +
  ggml/src/ggml-cpu/ggml-cpu.cpp           |    6 +
- ggml/src/ggml-cpu/ops.cpp                |  580 ++++++
+ ggml/src/ggml-cpu/ops.cpp                |  582 ++++++
  ggml/src/ggml-cpu/ops.h                  |    4 +
  ggml/src/ggml-cuda/fattn-qsa.cu          |  756 +++++++
  ggml/src/ggml-cuda/fattn-qsa.cuh         |   28 +
  ggml/src/ggml-cuda/fattn-qsa3.cu         |  774 +++++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |   48 +
  ggml/src/ggml-cuda/ggml-cuda.cu          |  163 ++
- ggml/src/ggml-cuda/hc-mix.cu             | 1400 +++++++++++++
+ ggml/src/ggml-cuda/hc-mix.cu             | 1409 +++++++++++++
  ggml/src/ggml-cuda/hc-mix.cuh            |    8 +
  ggml/src/ggml-cuda/hyperconn.cu          | 1195 +++++++++++
  ggml/src/ggml-cuda/hyperconn.cuh         |   77 +
@@ -104,10 +104,10 @@ TU in block 10; only the code that needs this block's own symbols is here.
  src/models/models.h                      |   62 +-
  src/models/qwen4exp.cpp                  | 2325 ++++++++++++++++++----
  tests/CMakeLists.txt                     |    3 +
- tests/test-backend-ops.cpp               |  455 +++++
+ tests/test-backend-ops.cpp               |  458 +++++
  tests/test-lazy-reader.cpp               |  264 +++
  tests/test-llama-archs.cpp               |   12 +-
- 46 files changed, 11977 insertions(+), 433 deletions(-)
+ 46 files changed, 11995 insertions(+), 433 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -155,7 +155,7 @@ index ecf0a3a6d..28d2187b9 100644
  
  #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index b8ed24630..f3d17e5fd 100644
+index b8ed24630..93b946ad2 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -586,6 +586,12 @@ extern "C" {
@@ -313,7 +313,7 @@ index b8ed24630..f3d17e5fd 100644
      // TODO: needs to be adapted to ggml_flash_attn_ext
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
-@@ -2785,6 +2926,47 @@ extern "C" {
+@@ -2785,6 +2926,51 @@ extern "C" {
              struct ggml_tensor  * score,
              struct ggml_tensor  * blocks,
              struct ggml_tensor  * extra);
@@ -329,11 +329,13 @@ index b8ed24630..f3d17e5fd 100644
 +    //   lo     = silu(w_down^T xn / hc)
 +    //   gate   = sigmoid(w_up^T lo)
 +    //   mixed  = (1/hc) * sum_c xn * gate
-+    //   inject = w_inject^T xn (w_inject may be null: no tail, no inject)
++    //   inject = w_inject^T xn / hc (w_inject may be null: no tail, no inject)
 +    // Bit-exactness: the CUDA kernels mirror the unfused ops (rms_norm_f32,
 +    // the gamma MUL rounding, the mmvq Q8_0 accumulation at M = 1, and the
 +    // mmvf float2-pair FMA accumulation for the F32 inject), so mixed and
-+    // inject are byte-identical to the unfused chain outputs.
++    // inject are byte-identical to the unfused chain outputs.  The 1/hc on
++    // `inject` is build_hc_mix's SCALE: the tail is the *scatter logit* the
++    // combine consumes, not the raw dot product.
 +    GGML_API struct ggml_tensor * ggml_hc_mix(
 +            struct ggml_context * ctx,
 +            struct ggml_tensor  * x,
@@ -346,10 +348,12 @@ index b8ed24630..f3d17e5fd 100644
 +
 +    // hc_combine: fused hyper-connection residual combine (qwen4exp /
 +    // Flash-Next decode). residual [n_embd, hc, n_tokens] -> same shape:
-+    //   w[c] = 2 * sigmoid(inject[c] / hc)          (per stream)
++    //   w[c] = 2 * sigmoid(inject[c])               (per stream)
 +    //   out[r, c] = residual[r, c] + block_out[r] * w[c]
-+    // which is the SCALE+SIGMOID+SCALE+REPEAT+MUL+ADD chain of
-+    // build_hc_combine. The kernel keeps each op's rounding (separate MUL
++    // which is the SIGMOID+SCALE+REPEAT+MUL+ADD chain of build_hc_combine, with
++    // `inject` the scatter logit that chain is handed: the 1/hc is already in it
++    // (build_hc_mix's SCALE, or ggml_hc_mix's inject tail), exactly as it is for
++    // the unfused chain.  The kernel keeps each op's rounding (separate MUL
 +    // and ADD results, no FMA contraction) so decode stays bit-exact vs the
 +    // unfused chain.
 +    GGML_API struct ggml_tensor * ggml_hc_combine(
@@ -559,7 +563,7 @@ index e26fd5095..c9ecef563 100644
              return true;
      }
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index c5f19ae90..ed77f2364 100644
+index c5f19ae90..f73cbeaa1 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -1,8 +1,15 @@
@@ -755,7 +759,7 @@ index c5f19ae90..ed77f2364 100644
  // ggml_compute_forward_flash_attn_back
  
  static void ggml_compute_forward_flash_attn_back_f32(
-@@ -12648,3 +12825,406 @@ void ggml_compute_forward_lightning_indexer(
+@@ -12648,3 +12825,408 @@ void ggml_compute_forward_lightning_indexer(
          }
      }
  }
@@ -913,7 +917,9 @@ index c5f19ae90..ed77f2364 100644
 +            dst_t[j] = sum * inv_hc;
 +        }
 +
-+        // inject = w_inject^T xn into the dst tail [hc] (none at the head)
++        // inject = w_inject^T xn into the dst tail [hc] (none at the head). The tail is the
++        // chain's scatter logit, so it carries build_hc_combine's 1/hc (the SCALE before its
++        // sigmoid) -- the same scale the lora/fused paths apply to lo.
 +        if (w_inject) {
 +            if (w_inject->type == GGML_TYPE_BF16) {
 +                const ggml_bf16_t * wi = (const ggml_bf16_t *) w_inject->data;
@@ -923,7 +929,7 @@ index c5f19ae90..ed77f2364 100644
 +                    for (int64_t k = 0; k < hc_dim; ++k) {
 +                        sum += ggml_bf16_to_fp32(wi_r[k]) * xn[k];
 +                    }
-+                    dst_t[n_embd + r] = sum;
++                    dst_t[n_embd + r] = sum * inv_hc;
 +                }
 +            } else if (w_inject->type == GGML_TYPE_Q8_0) {
 +                // Q8_0 blocks with f32 accumulate, same numerics as the lo dots
@@ -941,7 +947,7 @@ index c5f19ae90..ed77f2364 100644
 +                        }
 +                        sum += d * acc;
 +                    }
-+                    dst_t[n_embd + r] = sum;
++                    dst_t[n_embd + r] = sum * inv_hc;
 +                }
 +            } else {
 +                const float * wi = (const float *) w_inject->data;
@@ -950,7 +956,7 @@ index c5f19ae90..ed77f2364 100644
 +                    for (int64_t k = 0; k < hc_dim; ++k) {
 +                        sum += wi[(int64_t) r*hc_dim + k] * xn[k];
 +                    }
-+                    dst_t[n_embd + r] = sum;
++                    dst_t[n_embd + r] = sum * inv_hc;
 +                }
 +            }
 +        }
@@ -978,9 +984,11 @@ index c5f19ae90..ed77f2364 100644
 +// ggml_compute_forward_hc_combine
 +
 +// Fused hyper-connection residual combine: out[r, c] = residual[r, c] +
-+// block_out[r] * w[c] with w[c] = 2*sigmoid(inject[c]/hc). Reference for the
-+// unfused build_hc_combine chain (SCALE, SIGMOID, SCALE, REPEAT, MUL, ADD);
-+// used only on the CPU backend.
++// block_out[r] * w[c] with w[c] = 2*sigmoid(inject[c]). Reference for the
++// unfused build_hc_combine chain (SIGMOID, SCALE, REPEAT, MUL, ADD); used only
++// on the CPU backend. `inject` is the chain's scatter logit, i.e. the dot
++// product already scaled by 1/hc by build_hc_mix (and by GGML_OP_HC_MIX's own
++// inject tail when the mixer is the fused op).
 +static void ggml_compute_forward_hc_combine_f32(
 +        const ggml_compute_params * params,
 +        ggml_tensor * dst) {
@@ -1011,8 +1019,6 @@ index c5f19ae90..ed77f2364 100644
 +    const int64_t ir0    = dr * ith;
 +    const int64_t ir1    = MIN(ir0 + dr, n_elem);
 +
-+    const float inv_hc = 1.0f / (float) hc;
-+
 +    const float * residual_d = (const float *) residual->data;
 +    const float * block_d    = (const float *) block_out->data;
 +    const float * inject_d   = (const float *) inject->data;
@@ -1022,8 +1028,8 @@ index c5f19ae90..ed77f2364 100644
 +        const int64_t r = i % n_embd;
 +        const int64_t c = (i / n_embd) % hc;
 +        const int64_t t = i / (n_embd * hc);
-+        // 2*sigmoid(inject/hc): the 1/hc and 2.0 scales are exact in f32
-+        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*inj_str] * inv_hc));
++        // 2*sigmoid(inject): the 2.0 scale is exact in f32, and the 1/hc is already in `inject`
++        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*inj_str]));
 +        const float b = block_d[r + t*bo_str] * w;
 +        dst_d[i] = residual_d[i] + b;
 +    }
@@ -3080,10 +3086,10 @@ index aff9d8ac3..b38e9e7af 100644
          case GGML_OP_OPT_STEP_ADAMW:
 diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
 new file mode 100644
-index 000000000..d78157356
+index 000000000..9a0168792
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/hc-mix.cu
-@@ -0,0 +1,1400 @@
+@@ -0,0 +1,1409 @@
 +// Fused hyper-connection mixer tail for qwen4exp (decode/verify band).
 +//
 +// Replaces the unfused decode chain (SCALE, SILU, MUL_MAT up, SIGMOID, MUL,
@@ -3224,7 +3230,7 @@ index 000000000..d78157356
 +}
 +
 +// hc_combine (the residual-stream combine of the previous block) fused into the BF16 hc_mix norm that reads it: block
-+// (c, t) computes stream c of token t of the combine exactly as hc_combine_kernel does (w = 2*sigmoid(inject[c]/hc),
++// (c, t) computes stream c of token t of the combine exactly as hc_combine_kernel does (w = 2*sigmoid(inject[c]),
 +// res + bo*w), writes it (the combine result is still the next combine's residual), and keeps the values in registers
 +// for the grouped RMSNorm + gamma, whose per-thread columns and block reduction are hc_mix_rms_gamma_quant's.  Same
 +// values, same order: bit-identical to the two kernels.  Only the in-register shape (n_embd <= 8*blockDim.x).
@@ -3237,8 +3243,9 @@ index 000000000..d78157356
 +    const int t   = blockIdx.y;
 +    const int tid = threadIdx.x;
 +
-+    const float inv_hc = 1.0f / (float) hc;
-+    const float s = inject[(int64_t) t*inject_stride_t + c] * inv_hc;
++    // `inject` carries the 1/hc-scaled scatter logit (build_hc_mix applies the scale, exactly as the
++    // unfused chain's SCALE node does), so only the 2*sigmoid is left here -- see hc_combine_kernel.
++    const float s = inject[(int64_t) t*inject_stride_t + c];
 +    const float w = (1.0f / (1.0f + expf(-s))) * 2.0f;
 +
 +    const float * res = residual  + (int64_t) t*res_stride_t + (int64_t) c*n_embd;
@@ -3325,7 +3332,9 @@ index 000000000..d78157356
 +        acc += tmp_shared[l];
 +    }
 +    if (threadIdx.x == 0) {
-+        dst[r] = acc;
++        // the inject rows publish the 1/hc-scaled logit its combine consumes (the unfused chain's
++        // SCALE before the sigmoid); the lo rows stay raw, their 1/hc belongs to silu
++        dst[r] = is_inject ? acc * inv_hc : acc;
 +    }
 +    if (y_v == nullptr || is_inject) {
 +        return;
@@ -3650,7 +3659,9 @@ index 000000000..d78157356
 +            sumf = buf[tid];
 +            sumf = warp_reduce_sum<32>(sumf);
 +            if (tid == 0) {
-+                inject_t[r] = sumf;
++                // same 1/hc the unfused chain's SCALE puts in front of the sigmoid: the inject tail is the
++                // scatter logit the combine consumes, not the raw dot product
++                inject_t[r] = sumf * inv_hc;
 +            }
 +        }
 +        return;
@@ -3689,7 +3700,7 @@ index 000000000..d78157356
 +static __global__ void __launch_bounds__(256, 1) hc_mix_bf16_down_inject(
 +        const nv_bfloat16 * w_down, const nv_bfloat16 * w_inject, const float * xn, float * lo, float * inject,
 +        const int ncols2, const int nrows_down, const int64_t xn_stride_t, const int64_t lo_stride_t,
-+        const int64_t inject_stride_t) {
++        const int64_t inject_stride_t, const float inv_hc) {
 +    constexpr int block_size = 256;
 +    constexpr int warp_size  = 32;
 +    const int row = blockIdx.x;
@@ -3749,7 +3760,8 @@ index 000000000..d78157356
 +    }
 +    const float value = sumf[tid];
 +    if (is_inject) {
-+        inject[tid*inject_stride_t + (row - nrows_down)] = value;
++        // the 1/hc the unfused chain's inject SCALE applies, folded into the store (see hc_combine_kernel)
++        inject[tid*inject_stride_t + (row - nrows_down)] = value * inv_hc;
 +    } else {
 +        lo[tid*lo_stride_t + row] = value;
 +    }
@@ -4103,7 +4115,7 @@ index 000000000..d78157356
 +            const ggml_cuda_kernel_launch_params launch_params = {dim3(hc_lr + nrows_inject), dim3(256), 0, stream};
 +#define HC_BF16_DOWN(NT) ggml_cuda_kernel_launch(hc_mix_bf16_down_inject<NT>, launch_params, \
 +            (const nv_bfloat16 *) w_down->data, w_inject ? (const nv_bfloat16 *) w_inject->data : nullptr, xn_c, lo_c, \
-+            inject_c, (int) (hc_dim/2), (int) hc_lr, hc_dim, hc_lr, inject_stride_t)
++            inject_c, (int) (hc_dim/2), (int) hc_lr, hc_dim, hc_lr, inject_stride_t, 1.0f / (float) hc)
 +            switch (nt_c) {
 +                case 1: HC_BF16_DOWN(1); break;
 +                case 2: HC_BF16_DOWN(2); break;
@@ -4350,9 +4362,13 @@ index 000000000..d78157356
 +
 +// Fused hyper-connection residual combine for qwen4exp (decode/verify band).
 +// out[r, c, t] = residual[r, c, t] + block_out[r, t] * w[c, t], with
-+// w[c, t] = 2 * sigmoid(inject[c, t] / hc) (the SCALE+SIGMOID+SCALE chain of
-+// build_hc_combine; the 1/hc and 2.0 scalars are exact in f32 so only the
-+// sigmoid rounds). The product block_out[r]*w[c] and the residual add keep
++// w[c, t] = 2 * sigmoid(inject[c, t]) (the SCALE+SIGMOID+SCALE chain of
++// build_hc_combine; the 2.0 scalar is exact in f32 so only the sigmoid rounds).
++// `inject` is the chain's SCATTER LOGIT, i.e. the dot product ALREADY scaled by
++// 1/hc (build_hc_mix emits that SCALE, and ggml_hc_mix's inject tail folds it in),
++// never the raw product: dividing here as well double-scales it, which stays
++// self-consistent only for a model whose mixer is the fused op.
++// The product block_out[r]*w[c] and the residual add keep
 +// their own roundings because the reference runs separate MUL and ADD ops:
 +// the products go to an array first so the compiler cannot contract them
 +// into FMAs. One thread per row handles the hc columns, mirroring the
@@ -4368,15 +4384,14 @@ index 000000000..d78157356
 +        float * dst, const int n_embd, const int hc,
 +        const int64_t res_stride_t, const int64_t bo_stride_t,
 +        const int64_t inject_stride_t, const int64_t dst_stride_t) {
-+    const float inv_hc = 1.0f / (float) hc;
 +    const int t = blockIdx.y;
 +
-+    // w[c] = 2*sigmoid(inject[c]/hc); per-thread registers rather than shared
++    // w[c] = 2*sigmoid(inject[c]); per-thread registers rather than shared
 +    // memory so the early return below stays barrier-free
 +    const float * inj = inject + (int64_t) t*inject_stride_t;
 +    float w[8];
 +    for (int c = 0; c < hc; ++c) {
-+        const float s = inj[c] * inv_hc;
++        const float s = inj[c];
 +        w[c] = (1.0f / (1.0f + expf(-s))) * 2.0f;
 +    }
 +
@@ -13178,10 +13193,10 @@ index ba3ea3850..5095e1e90 100644
      set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
      file(MAKE_DIRECTORY "${MODEL_DIR}")
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 87cd4b6d5..10cdf81cc 100644
+index 87cd4b6d5..e833d4c35 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -4052,6 +4052,128 @@ struct test_rms_norm_back : public test_case {
+@@ -4052,6 +4052,131 @@ struct test_rms_norm_back : public test_case {
  };
  
  // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
@@ -13225,12 +13240,15 @@ index 87cd4b6d5..10cdf81cc 100644
 +
 +// GGML_OP_HC_COMBINE: fused hyper-connection residual combine (qwen4exp decode/verify band)
 +//
-+//   out[e,c,t] = residual[e,c,t] + block_out[e,t] * 2*sigmoid(inject[c,t]/hc)
++//   out[e,c,t] = residual[e,c,t] + block_out[e,t] * 2*sigmoid(inject[c,t])
 +//
-+// The unfused chain (SCALE, SIGMOID, SCALE, REPEAT, MUL, ADD) is what the CPU reference computes, so
-+// this is the op's only oracle: before it, `-o HC_COMBINE` ran 0/0 and a wrong combine (a wrong 2*sigmoid
-+// centre, a stream/token index swap, an in-place residual read) was invisible to every gate (greedy text
-+// and MTP both survive it because the same wrong value feeds the whole residual stream).
++// `inject` is the chain's scatter logit, i.e. build_hc_mix's output already scaled by 1/hc
++// (ggml_hc_mix folds the same scale into its inject tail), so the op divides by nothing. The
++// unfused chain (SIGMOID, SCALE, REPEAT, MUL, ADD) is what the CPU reference computes.
++// Both arms of this pair are only an oracle for each other: a combine that disagrees with the
++// CHAIN is invisible here (r148, issue #228: the op used to divide by hc as well and the fused
++// mixer's raw tail hid it), which is why scripts/gate-hc-fusions.sh compares the four
++// mix/combine arm combinations on a real GGUF instead.
 +struct test_hc_combine : public test_case {
 +    const int64_t n_embd, hc, n_tokens;
 +    const bool bcast; // block_out/inject broadcast over the token axis (ne[1] == 1: the decode shape)
@@ -13310,7 +13328,7 @@ index 87cd4b6d5..10cdf81cc 100644
  struct test_rms_norm_mul_add : public test_case {
      const ggml_type type;
      const std::array<int64_t, 4> ne;
-@@ -7586,6 +7708,125 @@ struct test_topk_qsa : public test_case {
+@@ -7586,6 +7711,125 @@ struct test_topk_qsa : public test_case {
      }
  };
  
@@ -13436,7 +13454,7 @@ index 87cd4b6d5..10cdf81cc 100644
  enum MoeGatingFunc {
      GATING_FUNC_SOFTMAX,
      GATING_FUNC_SIGMOID,
-@@ -8906,6 +9147,117 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
+@@ -8906,6 +9150,117 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
      }
  };
  
@@ -13554,7 +13572,7 @@ index 87cd4b6d5..10cdf81cc 100644
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -10160,6 +10512,35 @@ static const ggml_type other_types[] = {
+@@ -10160,6 +10515,35 @@ static const ggml_type other_types[] = {
  // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      std::vector<std::unique_ptr<test_case>> test_cases;
@@ -13590,7 +13608,7 @@ index 87cd4b6d5..10cdf81cc 100644
      std::default_random_engine rng(0);
  
      // unary ops
-@@ -10338,6 +10719,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10338,6 +10722,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
          test_cases.emplace_back(new test_mul_mat_reorder_then_big_batch(type));
      }
@@ -13602,7 +13620,7 @@ index 87cd4b6d5..10cdf81cc 100644
      for (ggml_type type : all_types) {
          for (int b : {1, 7}) {
              for (bool v : {false, true}) {
-@@ -12065,6 +12451,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12065,6 +12454,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
      test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
  
@@ -13614,7 +13632,7 @@ index 87cd4b6d5..10cdf81cc 100644
      // exhaustive top_k tests
      //for (int i = 1; i < 9999; ++i) {
      //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
-@@ -12766,6 +13157,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12766,6 +13160,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_falcon(2));
  #endif
  
@@ -13649,7 +13667,7 @@ index 87cd4b6d5..10cdf81cc 100644
      // lightning_indexer
      for (int kv : { 256 }) {
          for (int bs : { 1, 512 }) {
-@@ -12785,6 +13204,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12785,6 +13207,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -13667,7 +13685,7 @@ index 87cd4b6d5..10cdf81cc 100644
      return test_cases;
  }
  #ifdef _MSC_VER
-@@ -12795,6 +13225,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12795,6 +13228,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  

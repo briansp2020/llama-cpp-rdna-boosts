@@ -24,6 +24,22 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-10-26 — the qwen4exp HC fused ops must reproduce the model's chain, and the arms are the oracle (r148, issue #228)
+
+**`WORKLOG.md` 261026.006** + [`2026-10-26-hc-fusion-arms.md`](2026-10-26-hc-fusion-arms.md) —
+`GGML_OP_HC_MIX` published the **raw** inject scatter logit while `GGML_OP_HC_COMBINE` divided it by `hc`
+again.  That pair is self-consistent, so the Q8_0/BF16-hc models (which take both fused halves) stayed
+right — but `LLAMA_FUSED_HC_MIX` / `LLAMA_FUSED_HC_COMBINE` select the halves **independently**, and the
+`6050b467c` re-base had inverted the convention under the ops (upstream's chain now emits `inject/hc` and
+the combine applies only `2*sigmoid`; v14 emitted it raw with the scale in the combine).  Measured on
+gfx1151 (halo): every hc-down quant that is not Q8_0/BF16 (Flash-Next Q5_K_M, IQ4_NL) degenerated into a
+greedy repetition loop at default config, and a BF16-hc model (GSQ-RCO IQ3_XXS) produced an **empty
+generation** with the documented `LLAMA_FUSED_HC_COMBINE=0` kill-switch.  After the fix all four arms (plus
+the CUDA-side chain fusions and the DSV4 HC pre arm) are **byte-identical to the unfused chain** on all
+three GGUFs, the BF16-hc default is **bit-identical before vs after**, and the fusions keep their value
+(decode tg64 34.78 vs 31.73 t/s with both arms off, +9.6 %, prefill flat).  New gate:
+`scripts/gate-hc-fusions.sh`.  Rule: `GREEDY-PURITY.md` §61.
+
 ## 2026-10-26 — the rms_norm float4 reduction is opt-in; the strided reduction is the default again (r145, issue #229)
 
 **`WORKLOG.md` 261026.002** + [`2026-10-26-rms-norm-float4-ab.md`](2026-10-26-rms-norm-float4-ab.md) —

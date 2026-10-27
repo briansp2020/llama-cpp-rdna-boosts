@@ -1,5 +1,257 @@
 # WORKLOG - dated delivery records
 
+## 261026.006 (r148) -- issue #228: the qwen4exp HC inject logit is the chain's 1/hc-scaled scatter logit, so the fused mixer and the fused combine agree with the model again
+
+**Release:** `v15-6050b467c-r148` (base `6050b467c`, canonical tip `df41660ce`, tree
+`80bc2009db455cc206d07126f2a4d4e8c2532697`, 15 blocks).  Delta against the r147 tree: **4 files, +53/-35**
+-- `ggml/src/ggml-cuda/hc-mix.cu` (the inject stores and the two combine kernels), `ggml/src/ggml-cpu/ops.cpp`
+(the CPU references of both ops), `ggml/include/ggml.h` (the op contract) and `tests/test-backend-ops.cpp`
+(the oracle's own note) -- all in **block 11**.  No graph, launch count, allocation or default changes: the
+same kernels run the same work with one multiply moved from the combine into the mixer.
+
+### What issue #228 reports
+
+`martino2k6`, Strix Halo (gfx1151, 128 GB UMA, **single device, default config**), the
+`drluoto/Qwen3.8-Flash-Next-AgenticRequant-Q5K` GGUF (qwen4exp, PLE streamed, ctx 131072, `-fa on`, f16 KV,
+true-specless): since the `v15-6050b467c` base the model **deterministically degenerates** -- greedy
+repetition collapse and a logit-fingerprint drift of kl ~15 against a v14-r120 capture -- while every v14
+re-cut (through r126) is clean at kl 0.0.  Their matrix localised it to a llama-level knob: on r142,
+`LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0` restores a correct generation (kl 1.195, top1 0.986), the
+CUDA-side HC fusions (`GGML_CUDA_DISABLE_HC_COMB=1`) change nothing, `-fa off` and the PLE load mode
+(`-lzm off`) are irrelevant, and r143 was bit-identical to r142.
+
+**Reproduced exactly on our gfx1151 box** with the model class (Flash-Next Q5_K_M trunk, 86 GiB, hc
+weights Q5_K/F32/F32/Q8_0), greedy, `-c 8192 -fa on -ngl 99`:
+
+```
+default               -> "The user is asking for a short paragraph about the Eiffel Tower. The user is
+                         asking for a short paragraph about the Eiffel Tower"  (a repetition loop)
+LLAMA_FUSED_HC_COMBINE=0 -> a correct paragraph ("The Eiffel Tower is a famous iron lattice tower ...")
+```
+
+### Root cause: the fused op pair kept the v14 inject convention after the re-base inverted it
+
+qwen4exp's residual stream is steered by a per-stream **scatter logit**.  `build_hc_mix` computes it and
+`build_hc_combine` turns it into `w = 2*sigmoid(.)`.  Each half exists twice -- a ggml chain (upstream's
+model definition) and a fused op -- and `cparams.fused_hc_mix` / `cparams.fused_hc_combine` select them
+**independently** (`LLAMA_FUSED_HC_MIX` / `LLAMA_FUSED_HC_COMBINE`), so there are four arms.
+
+* v14 (base `097cf33d9`) emitted the logit **raw** and put the `1/hc` in the combine:
+  `*inject = build_lora_mm(w_inject, xn)` / `w = sigmoid(scale(inject, 1/hc))`.  The delivery's fused pair
+  was written against exactly that: `GGML_OP_HC_MIX` published a raw tail and `GGML_OP_HC_COMBINE` divided
+  it by `hc`.
+* the `6050b467c` re-base **inverted** the convention (same final numerics, different intermediate): the
+  mixer now emits `scale(mm, 1/hc)` and the combine applies `sigmoid(inject)` alone.
+
+So the fused pair became *chain-inconsistent while staying self-consistent*.  The Q8_0/BF16-hc models take
+both fused halves and never noticed -- that is the arm every dense/GSQ validation ran, which is why ten
+releases passed.  The other two arms:
+
+| mix | combine | before r148 | after |
+|---|---|---|---|
+| chain | chain | correct (the model's own definition) | unchanged, bit for bit |
+| chain (stride: Q5_K, IQ4_NL, IQ4_XS, Q4_K ...) | **fused** | **`/hc` twice** -- `w` collapses toward 1 instead of sweeping `(0, 2)`; greedy repetition collapse | correct |
+| **fused** (Q8_0/BF16 hc) | chain | **no scale at all** -- the BF16-hc model produced an **empty generation** with the documented kill-switch | correct |
+| fused | fused | correct (self-consistent, right by accident of the pairing) | **bit-identical** |
+
+That is issue #228 end to end: the reporter's Q5_K model is the chain-mixer class with the combine left
+fused, and their rescue arm was the reference chain.  It also means **Flash-Next IQ4_NL -- the model most of
+this repo's qwen4exp measurements used -- was in the broken class**, so its recorded greedy texts and any
+quality judgement made on it are for a model whose HC scatter weights were wrong (throughput numbers are
+unaffected: same kernels, same work).  Verified degenerate on r147 and correct after the fix, e.g.
+"The user asked is a simple request. The prompt is is not encoded." -> a correct Eiffel Tower paragraph.
+
+### Why no gate saw it
+
+`test-backend-ops -o HC_MIX,HC_COMBINE` compares each op against a **CPU reference that encoded the same
+convention**, so the set agreed with itself (the r128 oracle added for the combine does catch a wrong
+`2*sigmoid` centre, an index swap or an in-place read -- not a chain-inconsistent convention).  Greedy
+coherence stays plausible while the two halves match each other, and no gate ever *crossed* the arms: each
+A/B compared one arm with itself.
+
+### Shipped (block 11)
+
+1. **The inject tail is the scaled scatter logit, in every HC_MIX path**: `hc_mix_collapse_inject` (F32
+   inject), `hc_mix_down_dots` (Q8_0 inject) and `hc_mix_bf16_down_inject` (BF16) now store
+   `dot * (1/hc)` -- one multiply, folded into a store that was already there.
+2. **The combine does not divide**: `hc_combine_kernel` (the dispatched `GGML_OP_HC_COMBINE`) and
+   `hc_mix_combine_rms_gamma` (the fused combine+mix kernel the BF16 path uses) read the logit as-is, as
+   does the CPU reference `ggml_compute_forward_hc_combine_f32`; the CPU `ggml_compute_forward_hc_mix_f32`
+   reference scales its inject tail the same way.  `hyperconn.cu`'s unused parameterised
+   `ggml_cuda_op_hc_combine(args)` was already generic and is left alone.
+3. `ggml.h` states the contract (`inject` is the chain's scatter logit; the op divides by nothing) and the
+   test's comment says what the op/CPU pair can and cannot prove.
+4. **New gate `scripts/gate-hc-fusions.sh`**: the four mix/combine arms (plus `GGML_CUDA_DISABLE_HC_FUSION`,
+   `LLAMA_FUSED_DSV4_HC_PRE=0` and the reported `DSV4_HC_POST` arm) must be **byte-identical to the unfused
+   chain** on a real GGUF; `--types MODEL.gguf` prints the model's hc-down class so it is run once per
+   class (Q8_0/BF16 -> fused mixer, anything else -> chain).  Wired into `MANIFESTS.md` (release gate 7 +
+   the block-11 row), `AGENTS.md`, `scripts/README.md` and tier 2 (`scripts/validate-gpu.sh` step 4b, plus
+   `HC_COMBINE`/`HC_COMBINE_MIX` in its op-oracle list).  Rule: `GREEDY-PURITY.md` §61; switch catalogue:
+   `ENVIRONMENT.md` §7.4 (the pair is now documented as two independent arms that must agree).
+
+### Validation (gfx1151 / halo, ROCm 10.1.0; the gfx1201 box is not this session's host)
+
+| arm | result |
+|---|---|
+| `gate-hc-fusions.sh`, Flash-Next **Q5_K_M** (chain mixer) | PASS -- all 6 hard arms byte-identical to the chain (445 chars `c8e579144ff1`); `DSV4_HC_POST=1` reported (+1 char, the documented rounding-level arm) |
+| `gate-hc-fusions.sh`, **GSQ-RCO IQ3_XXS** (BF16, fused mixer) | PASS -- all 7 arms identical (449 chars `6a102dbc62d6`) |
+| `gate-hc-fusions.sh`, **IQ4_NL** (chain mixer) | PASS (arms as above; pre-fix it collapses at default config) |
+| BF16-hc default, before vs after the fix | **bit-identical** (`246463129328` on the short arm probe): the arm the delivery already had right does not move |
+| pre-fix negative control | fails every non-Q8_0/BF16 arm: Q5_K/IQ4_NL greedy repetition collapse, and an **empty generation** on GSQ-RCO IQ3_XXS with `LLAMA_FUSED_HC_COMBINE=0` |
+| `test-backend-ops` | `HC_MIX` 51/51, `HC_COMBINE` 20/20, `HC_COMBINE_MIX` 6/6, `DSV4_HC_*` 11/11, `FLASH_ATTN_EXT` 6450/6450, `GATED_DELTA_NET` 55/55, `FLASH_ATTN_QSA` 26/26, `MUL_MAT` 2445/2445, `MUL_MAT_ID` 931/931, `TOP_K_MASK` 28/28 |
+| `gate-park-idle-slots.sh` (1 GPU, ctx 40960, MTP draft) | PASS -- 6 park + 2 unpark moves on both caches, park == lazy-off 4/4 (this is also the qwen4exp MTP-decode end-to-end arm) |
+| `gate-prefill-logits.sh` (Qwen3.5-9B-Q8_0, gfx1151 base) | **PASS** 0.000056 mean KLD / 99.647 % same-top-p (expected: prefill builds the chain, and the chain is unchanged) |
+| dense coherence, Qwen3.5-4B Q8_0, `--seed 42 --temp 0` | 100 chars `1c5d32ac537d` -- the same text r145/r146/r147 record, i.e. the fix is inert outside qwen4exp (only qwen4exp builds these two ops: `deepseek4`/`glm5-next` use the separate `GGML_OP_DSV4_HC_*` family) |
+| `llama-bench -p 512 -n 64`, default vs both arms off | GSQ-IQ3_XXS pp 766.2/764.5, tg **34.78 / 31.73** (+9.6 % for the fusions; combine alone +4.4 %, mixer +8.7 %); IQ4_NL 973.8/34.49 vs 969.6/34.35; Q5_K_M 879.0/33.80 vs 887.5/33.57 -- prefill flat, no throughput trade |
+| `scripts/gate-per-block-build.sh --fast --rocm /opt/rocm-10.1.0-gfx1151 --gpu-target gfx1151 --changed-from 6ff4499ce` | **2/2** (block 11 533 s, block 14 16 s) |
+| `scripts/validate-set.sh` | strict 15/15 on a fresh tarball, tree equal, Windows-portability scan green (282 added files) |
+| `scripts/check-gpu-faults.sh --since "60 min ago"` | clean |
+
+**Also found, recorded not fixed (a gate-integrity finding, no code change):** the three CUDA-side
+matcher knobs (`GGML_CUDA_DISABLE_HC_FUSION`, `_HC_MIX`, `_HC_COMB`) are **inert on a default qwen4exp
+build** -- they disable matchers over the *unfused chain*, and the fused ops replace exactly the patterns
+those matchers look for.  Measured on GSQ-RCO IQ3_XXS (fused-mixer class): all three produce the default
+arm's text (`246463129328`), and so does `LLAMA_FUSED_HC_COMBINE=0` + `GGML_CUDA_DISABLE_HC_COMB=1`.  So the
+"HC_COMB A/B is byte-identical" entries in the r140..r147 records (including r145's) are true but vacuous
+for that arm, and this is also why the reporter's `GGML_CUDA_DISABLE_HC_COMB=1` probe could not have moved.
+Those knobs only mean something with `LLAMA_FUSED_HC_MIX=0` / `LLAMA_FUSED_HC_COMBINE=0` on the compared
+arm; `ENVIRONMENT.md` §7.4 and `GREEDY-PURITY.md` §61 rule 3 now say so.
+
+**Not run, deliberately:** a gfx1201 arm and any 2/3-GPU split arm (this box has one gfx1151 device; the
+change is arithmetically confined to a single multiply and its consumers, and the arms are compared on one
+device by construction); the four-axis adaptive-MTP gate (no dense/35B decode, fusion or controller change
+-- the qwen4exp speculative path is exercised by the parking gate's MTP arms); the container images (the
+worker builds them from the tag).
+
+**For the reporter:** the collapse they measured is this defect and is fixed; the `kl 1.195` residual they
+saw on the *already-correct* arm was measured on r142, i.e. with upstream #29720's float4 `rms_norm`
+reduction as the default -- r145 reverted that to the pre-#29720 strided reduction (`GGML_CUDA_RMS_NORM_VEC`
+opts in), which is the reduction this delivery's fused norm kernels are bit-identical to.  We ask them to
+re-capture against r148: the expectation is a residual inside their own engine-to-engine floor (kl ~0.002),
+and if anything above that survives we want the fingerprint, because then it is a separate finding and not
+this one.
+
+the qwen4exp HC inject logit is the chain's 1/hc-scaled scatter logit, so the fused mixer and the fused combine agree with the model again
+
+**Release:** `v15-6050b467c-r148` (base `6050b467c`, canonical tip `df41660ce`, tree
+`80bc2009db455cc206d07126f2a4d4e8c2532697`, 15 blocks).  Delta against the r147 tree: **4 files, +53/-35**
+-- `ggml/src/ggml-cuda/hc-mix.cu` (the inject stores and the two combine kernels), `ggml/src/ggml-cpu/ops.cpp`
+(the CPU references of both ops), `ggml/include/ggml.h` (the op contract) and `tests/test-backend-ops.cpp`
+(the oracle's own note) -- all in **block 11**.  No graph, launch count, allocation or default changes: the
+same kernels run the same work with one multiply moved from the combine into the mixer.
+
+### What issue #228 reports
+
+`martino2k6`, Strix Halo (gfx1151, 128 GB UMA, **single device, default config**), the
+`drluoto/Qwen3.8-Flash-Next-AgenticRequant-Q5K` GGUF (qwen4exp, PLE streamed, ctx 131072, `-fa on`, f16 KV,
+true-specless): since the `v15-6050b467c` base the model **deterministically degenerates** -- greedy
+repetition collapse and a logit-fingerprint drift of kl ~15 against a v14-r120 capture -- while every v14
+re-cut (through r126) is clean at kl 0.0.  Their matrix localised it to a llama-level knob: on r142,
+`LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0` restores a correct generation (kl 1.195, top1 0.986), the
+CUDA-side HC fusions (`GGML_CUDA_DISABLE_HC_COMB=1`) change nothing, `-fa off` and the PLE load mode
+(`-lzm off`) are irrelevant, and r143 was bit-identical to r142.
+
+**Reproduced exactly on our gfx1151 box** with the model class (Flash-Next Q5_K_M trunk, 86 GiB, hc
+weights Q5_K/F32/F32/Q8_0), greedy, `-c 8192 -fa on -ngl 99`:
+
+```
+default               -> "The user is asking for a short paragraph about the Eiffel Tower. The user is
+                         asking for a short paragraph about the Eiffel Tower"  (a repetition loop)
+LLAMA_FUSED_HC_COMBINE=0 -> a correct paragraph ("The Eiffel Tower is a famous iron lattice tower ...")
+```
+
+### Root cause: the fused op pair kept the v14 inject convention after the re-base inverted it
+
+qwen4exp's residual stream is steered by a per-stream **scatter logit**.  `build_hc_mix` computes it and
+`build_hc_combine` turns it into `w = 2*sigmoid(.)`.  Each half exists twice -- a ggml chain (upstream's
+model definition) and a fused op -- and `cparams.fused_hc_mix` / `cparams.fused_hc_combine` select them
+**independently** (`LLAMA_FUSED_HC_MIX` / `LLAMA_FUSED_HC_COMBINE`), so there are four arms.
+
+* v14 (base `097cf33d9`) emitted the logit **raw** and put the `1/hc` in the combine:
+  `*inject = build_lora_mm(w_inject, xn)` / `w = sigmoid(scale(inject, 1/hc))`.  The delivery's fused pair
+  was written against exactly that: `GGML_OP_HC_MIX` published a raw tail and `GGML_OP_HC_COMBINE` divided
+  it by `hc`.
+* the `6050b467c` re-base **inverted** the convention (same final numerics, different intermediate): the
+  mixer now emits `scale(mm, 1/hc)` and the combine applies `sigmoid(inject)` alone.
+
+So the fused pair became *chain-inconsistent while staying self-consistent*.  The Q8_0/BF16-hc models take
+both fused halves and never noticed -- that is the arm every dense/GSQ validation ran, which is why ten
+releases passed.  The other two arms:
+
+| mix | combine | before r148 | after |
+|---|---|---|---|
+| chain | chain | correct (the model's own definition) | unchanged, bit for bit |
+| chain (stride: Q5_K, IQ4_NL, IQ4_XS, Q4_K ...) | **fused** | **`/hc` twice** -- `w` collapses toward 1 instead of sweeping `(0, 2)`; greedy repetition collapse | correct |
+| **fused** (Q8_0/BF16 hc) | chain | **no scale at all** -- the BF16-hc model produced an **empty generation** with the documented kill-switch | correct |
+| fused | fused | correct (self-consistent, right by accident of the pairing) | **bit-identical** |
+
+That is issue #228 end to end: the reporter's Q5_K model is the chain-mixer class with the combine left
+fused, and their rescue arm was the reference chain.  It also means **Flash-Next IQ4_NL -- the model most of
+this repo's qwen4exp measurements used -- was in the broken class**, so its recorded greedy texts and any
+quality judgement made on it are for a model whose HC scatter weights were wrong (throughput numbers are
+unaffected: same kernels, same work).  Verified degenerate on r147 and correct after the fix, e.g.
+"The user asked is a simple request. The prompt is is not encoded." -> a correct Eiffel Tower paragraph.
+
+### Why no gate saw it
+
+`test-backend-ops -o HC_MIX,HC_COMBINE` compares each op against a **CPU reference that encoded the same
+convention**, so the set agreed with itself (the r128 oracle added for the combine does catch a wrong
+`2*sigmoid` centre, an index swap or an in-place read -- not a chain-inconsistent convention).  Greedy
+coherence stays plausible while the two halves match each other, and no gate ever *crossed* the arms: each
+A/B compared one arm with itself.
+
+### Shipped (block 11)
+
+1. **The inject tail is the scaled scatter logit, in every HC_MIX path**: `hc_mix_collapse_inject` (F32
+   inject), `hc_mix_down_dots` (Q8_0 inject) and `hc_mix_bf16_down_inject` (BF16) now store
+   `dot * (1/hc)` -- one multiply, folded into a store that was already there.
+2. **The combine does not divide**: `hc_combine_kernel` (the dispatched `GGML_OP_HC_COMBINE`) and
+   `hc_mix_combine_rms_gamma` (the fused combine+mix kernel the BF16 path uses) read the logit as-is, as
+   does the CPU reference `ggml_compute_forward_hc_combine_f32`; the CPU `ggml_compute_forward_hc_mix_f32`
+   reference scales its inject tail the same way.  `hyperconn.cu`'s unused parameterised
+   `ggml_cuda_op_hc_combine(args)` was already generic and is left alone.
+3. `ggml.h` states the contract (`inject` is the chain's scatter logit; the op divides by nothing) and the
+   test's comment says what the op/CPU pair can and cannot prove.
+4. **New gate `scripts/gate-hc-fusions.sh`**: the four mix/combine arms (plus `GGML_CUDA_DISABLE_HC_FUSION`,
+   `LLAMA_FUSED_DSV4_HC_PRE=0` and the reported `DSV4_HC_POST` arm) must be **byte-identical to the unfused
+   chain** on a real GGUF; `--types MODEL.gguf` prints the model's hc-down class so it is run once per
+   class (Q8_0/BF16 -> fused mixer, anything else -> chain).  Wired into `MANIFESTS.md` (release gate 7 +
+   the block-11 row), `AGENTS.md`, `scripts/README.md` and tier 2 (`scripts/validate-gpu.sh` step 4b, plus
+   `HC_COMBINE`/`HC_COMBINE_MIX` in its op-oracle list).  Rule: `GREEDY-PURITY.md` §61; switch catalogue:
+   `ENVIRONMENT.md` §7.4 (the pair is now documented as two independent arms that must agree).
+
+### Validation (gfx1151 / halo, ROCm 10.1.0; the gfx1201 box is not this session's host)
+
+| arm | result |
+|---|---|
+| `gate-hc-fusions.sh`, Flash-Next **Q5_K_M** (chain mixer) | PASS -- all 6 hard arms byte-identical to the chain (445 chars `c8e579144ff1`); `DSV4_HC_POST=1` reported (+1 char, the documented rounding-level arm) |
+| `gate-hc-fusions.sh`, **GSQ-RCO IQ3_XXS** (BF16, fused mixer) | PASS -- all 7 arms identical (449 chars `6a102dbc62d6`) |
+| `gate-hc-fusions.sh`, **IQ4_NL** (chain mixer) | PASS (arms as above; pre-fix it collapses at default config) |
+| BF16-hc default, before vs after the fix | **bit-identical** (`246463129328` on the short arm probe): the arm the delivery already had right does not move |
+| pre-fix negative control | fails every non-Q8_0/BF16 arm: Q5_K/IQ4_NL greedy repetition collapse, and an **empty generation** on GSQ-RCO IQ3_XXS with `LLAMA_FUSED_HC_COMBINE=0` |
+| `test-backend-ops` | `HC_MIX` 51/51, `HC_COMBINE` 20/20, `HC_COMBINE_MIX` 6/6, `DSV4_HC_*` 11/11, `FLASH_ATTN_EXT` 6450/6450, `GATED_DELTA_NET` 55/55, `FLASH_ATTN_QSA` 26/26, `MUL_MAT` 2445/2445, `MUL_MAT_ID` 931/931, `TOP_K_MASK` 28/28 |
+| `gate-park-idle-slots.sh` (1 GPU, ctx 40960, MTP draft) | PASS -- 6 park + 2 unpark moves on both caches, park == lazy-off 4/4 (this is also the qwen4exp MTP-decode end-to-end arm) |
+| `gate-prefill-logits.sh` (Qwen3.5-9B-Q8_0, gfx1151 base) | **PASS** 0.000056 mean KLD / 99.647 % same-top-p (expected: prefill builds the chain, and the chain is unchanged) |
+| dense coherence, Qwen3.5-4B Q8_0, `--seed 42 --temp 0` | 100 chars `1c5d32ac537d` -- the same text r145/r146/r147 record, i.e. the fix is inert outside qwen4exp (only qwen4exp builds these two ops: `deepseek4`/`glm5-next` use the separate `GGML_OP_DSV4_HC_*` family) |
+| `llama-bench -p 512 -n 64`, default vs both arms off | GSQ-IQ3_XXS pp 766.2/764.5, tg **34.78 / 31.73** (+9.6 % for the fusions; combine alone +4.4 %, mixer +8.7 %); IQ4_NL 973.8/34.49 vs 969.6/34.35; Q5_K_M 879.0/33.80 vs 887.5/33.57 -- prefill flat, no throughput trade |
+| `scripts/gate-per-block-build.sh --fast --rocm /opt/rocm-10.1.0-gfx1151 --gpu-target gfx1151 --changed-from 6ff4499ce` | **2/2** (block 11 533 s, block 14 16 s) |
+| `scripts/validate-set.sh` | strict 15/15 on a fresh tarball, tree equal, Windows-portability scan green (282 added files) |
+| `scripts/check-gpu-faults.sh --since "60 min ago"` | clean |
+
+**Not run, deliberately:** a gfx1201 arm and any 2/3-GPU split arm (this box has one gfx1151 device; the
+change is arithmetically confined to a single multiply and its consumers, and the arms are compared on one
+device by construction); the four-axis adaptive-MTP gate (no dense/35B decode, fusion or controller change
+-- the qwen4exp speculative path is exercised by the parking gate's MTP arms); the container images (the
+worker builds them from the tag).
+
+**For the reporter:** the collapse they measured is this defect and is fixed; the `kl 1.195` residual they
+saw on the *already-correct* arm was measured on r142, i.e. with upstream #29720's float4 `rms_norm`
+reduction as the default -- r145 reverted that to the pre-#29720 strided reduction (`GGML_CUDA_RMS_NORM_VEC`
+opts in), which is the reduction this delivery's fused norm kernels are bit-identical to.  We ask them to
+re-capture against r148: the expectation is a residual inside their own engine-to-engine floor (kl ~0.002),
+and if anything above that survives we want the fingerprint, because then it is a separate finding and not
+this one.
+
 ## 261026.005 (r147) -- issue #231: the host pool's fifth portability helper (`pool_close_file`), and a lint that makes the class impossible to miss
 
 **Release:** `v15-6050b467c-r147` (base `6050b467c`, canonical tip `38507e070`, tree

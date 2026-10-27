@@ -3464,7 +3464,7 @@ index ecf0a3a6d..692aaf7ff 100644
  
  #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index d62a63104..be71de7d3 100644
+index d62a63104..704e25b44 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -586,6 +586,12 @@ extern "C" {
@@ -3686,7 +3686,7 @@ index d62a63104..be71de7d3 100644
  
      // DSA lightning indexer
      //
-@@ -2764,6 +2939,47 @@ extern "C" {
+@@ -2764,6 +2939,51 @@ extern "C" {
              struct ggml_tensor  * score,
              struct ggml_tensor  * blocks,
              struct ggml_tensor  * extra);
@@ -3702,11 +3702,13 @@ index d62a63104..be71de7d3 100644
 +    //   lo     = silu(w_down^T xn / hc)
 +    //   gate   = sigmoid(w_up^T lo)
 +    //   mixed  = (1/hc) * sum_c xn * gate
-+    //   inject = w_inject^T xn (w_inject may be null: no tail, no inject)
++    //   inject = w_inject^T xn / hc (w_inject may be null: no tail, no inject)
 +    // Bit-exactness: the CUDA kernels mirror the unfused ops (rms_norm_f32,
 +    // the gamma MUL rounding, the mmvq Q8_0 accumulation at M = 1, and the
 +    // mmvf float2-pair FMA accumulation for the F32 inject), so mixed and
-+    // inject are byte-identical to the unfused chain outputs.
++    // inject are byte-identical to the unfused chain outputs.  The 1/hc on
++    // `inject` is build_hc_mix's SCALE: the tail is the *scatter logit* the
++    // combine consumes, not the raw dot product.
 +    GGML_API struct ggml_tensor * ggml_hc_mix(
 +            struct ggml_context * ctx,
 +            struct ggml_tensor  * x,
@@ -3719,10 +3721,12 @@ index d62a63104..be71de7d3 100644
 +
 +    // hc_combine: fused hyper-connection residual combine (qwen4exp /
 +    // Flash-Next decode). residual [n_embd, hc, n_tokens] -> same shape:
-+    //   w[c] = 2 * sigmoid(inject[c] / hc)          (per stream)
++    //   w[c] = 2 * sigmoid(inject[c])               (per stream)
 +    //   out[r, c] = residual[r, c] + block_out[r] * w[c]
-+    // which is the SCALE+SIGMOID+SCALE+REPEAT+MUL+ADD chain of
-+    // build_hc_combine. The kernel keeps each op's rounding (separate MUL
++    // which is the SIGMOID+SCALE+REPEAT+MUL+ADD chain of build_hc_combine, with
++    // `inject` the scatter logit that chain is handed: the 1/hc is already in it
++    // (build_hc_mix's SCALE, or ggml_hc_mix's inject tail), exactly as it is for
++    // the unfused chain.  The kernel keeps each op's rounding (separate MUL
 +    // and ADD results, no FMA contraction) so decode stays bit-exact vs the
 +    // unfused chain.
 +    GGML_API struct ggml_tensor * ggml_hc_combine(
@@ -9337,7 +9341,7 @@ index d28840a91..39e98f5fe 100644
  #endif
  
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 5735f96f8..ed77f2364 100644
+index 5735f96f8..f73cbeaa1 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -1,8 +1,15 @@
@@ -9620,7 +9624,7 @@ index 5735f96f8..ed77f2364 100644
  // ggml_compute_forward_flash_attn_back
  
  static void ggml_compute_forward_flash_attn_back_f32(
-@@ -12614,3 +12825,406 @@ void ggml_compute_forward_lightning_indexer(
+@@ -12614,3 +12825,408 @@ void ggml_compute_forward_lightning_indexer(
          }
      }
  }
@@ -9778,7 +9782,9 @@ index 5735f96f8..ed77f2364 100644
 +            dst_t[j] = sum * inv_hc;
 +        }
 +
-+        // inject = w_inject^T xn into the dst tail [hc] (none at the head)
++        // inject = w_inject^T xn into the dst tail [hc] (none at the head). The tail is the
++        // chain's scatter logit, so it carries build_hc_combine's 1/hc (the SCALE before its
++        // sigmoid) -- the same scale the lora/fused paths apply to lo.
 +        if (w_inject) {
 +            if (w_inject->type == GGML_TYPE_BF16) {
 +                const ggml_bf16_t * wi = (const ggml_bf16_t *) w_inject->data;
@@ -9788,7 +9794,7 @@ index 5735f96f8..ed77f2364 100644
 +                    for (int64_t k = 0; k < hc_dim; ++k) {
 +                        sum += ggml_bf16_to_fp32(wi_r[k]) * xn[k];
 +                    }
-+                    dst_t[n_embd + r] = sum;
++                    dst_t[n_embd + r] = sum * inv_hc;
 +                }
 +            } else if (w_inject->type == GGML_TYPE_Q8_0) {
 +                // Q8_0 blocks with f32 accumulate, same numerics as the lo dots
@@ -9806,7 +9812,7 @@ index 5735f96f8..ed77f2364 100644
 +                        }
 +                        sum += d * acc;
 +                    }
-+                    dst_t[n_embd + r] = sum;
++                    dst_t[n_embd + r] = sum * inv_hc;
 +                }
 +            } else {
 +                const float * wi = (const float *) w_inject->data;
@@ -9815,7 +9821,7 @@ index 5735f96f8..ed77f2364 100644
 +                    for (int64_t k = 0; k < hc_dim; ++k) {
 +                        sum += wi[(int64_t) r*hc_dim + k] * xn[k];
 +                    }
-+                    dst_t[n_embd + r] = sum;
++                    dst_t[n_embd + r] = sum * inv_hc;
 +                }
 +            }
 +        }
@@ -9843,9 +9849,11 @@ index 5735f96f8..ed77f2364 100644
 +// ggml_compute_forward_hc_combine
 +
 +// Fused hyper-connection residual combine: out[r, c] = residual[r, c] +
-+// block_out[r] * w[c] with w[c] = 2*sigmoid(inject[c]/hc). Reference for the
-+// unfused build_hc_combine chain (SCALE, SIGMOID, SCALE, REPEAT, MUL, ADD);
-+// used only on the CPU backend.
++// block_out[r] * w[c] with w[c] = 2*sigmoid(inject[c]). Reference for the
++// unfused build_hc_combine chain (SIGMOID, SCALE, REPEAT, MUL, ADD); used only
++// on the CPU backend. `inject` is the chain's scatter logit, i.e. the dot
++// product already scaled by 1/hc by build_hc_mix (and by GGML_OP_HC_MIX's own
++// inject tail when the mixer is the fused op).
 +static void ggml_compute_forward_hc_combine_f32(
 +        const ggml_compute_params * params,
 +        ggml_tensor * dst) {
@@ -9876,8 +9884,6 @@ index 5735f96f8..ed77f2364 100644
 +    const int64_t ir0    = dr * ith;
 +    const int64_t ir1    = MIN(ir0 + dr, n_elem);
 +
-+    const float inv_hc = 1.0f / (float) hc;
-+
 +    const float * residual_d = (const float *) residual->data;
 +    const float * block_d    = (const float *) block_out->data;
 +    const float * inject_d   = (const float *) inject->data;
@@ -9887,8 +9893,8 @@ index 5735f96f8..ed77f2364 100644
 +        const int64_t r = i % n_embd;
 +        const int64_t c = (i / n_embd) % hc;
 +        const int64_t t = i / (n_embd * hc);
-+        // 2*sigmoid(inject/hc): the 1/hc and 2.0 scales are exact in f32
-+        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*inj_str] * inv_hc));
++        // 2*sigmoid(inject): the 2.0 scale is exact in f32, and the 1/hc is already in `inject`
++        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*inj_str]));
 +        const float b = block_d[r + t*bo_str] * w;
 +        dst_d[i] = residual_d[i] + b;
 +    }
@@ -36793,10 +36799,10 @@ index aff687a9a..8377c8d24 100644
          /* .iface   = */ ggml_backend_cuda_interface,
 diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
 new file mode 100644
-index 000000000..d78157356
+index 000000000..9a0168792
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/hc-mix.cu
-@@ -0,0 +1,1400 @@
+@@ -0,0 +1,1409 @@
 +// Fused hyper-connection mixer tail for qwen4exp (decode/verify band).
 +//
 +// Replaces the unfused decode chain (SCALE, SILU, MUL_MAT up, SIGMOID, MUL,
@@ -36937,7 +36943,7 @@ index 000000000..d78157356
 +}
 +
 +// hc_combine (the residual-stream combine of the previous block) fused into the BF16 hc_mix norm that reads it: block
-+// (c, t) computes stream c of token t of the combine exactly as hc_combine_kernel does (w = 2*sigmoid(inject[c]/hc),
++// (c, t) computes stream c of token t of the combine exactly as hc_combine_kernel does (w = 2*sigmoid(inject[c]),
 +// res + bo*w), writes it (the combine result is still the next combine's residual), and keeps the values in registers
 +// for the grouped RMSNorm + gamma, whose per-thread columns and block reduction are hc_mix_rms_gamma_quant's.  Same
 +// values, same order: bit-identical to the two kernels.  Only the in-register shape (n_embd <= 8*blockDim.x).
@@ -36950,8 +36956,9 @@ index 000000000..d78157356
 +    const int t   = blockIdx.y;
 +    const int tid = threadIdx.x;
 +
-+    const float inv_hc = 1.0f / (float) hc;
-+    const float s = inject[(int64_t) t*inject_stride_t + c] * inv_hc;
++    // `inject` carries the 1/hc-scaled scatter logit (build_hc_mix applies the scale, exactly as the
++    // unfused chain's SCALE node does), so only the 2*sigmoid is left here -- see hc_combine_kernel.
++    const float s = inject[(int64_t) t*inject_stride_t + c];
 +    const float w = (1.0f / (1.0f + expf(-s))) * 2.0f;
 +
 +    const float * res = residual  + (int64_t) t*res_stride_t + (int64_t) c*n_embd;
@@ -37038,7 +37045,9 @@ index 000000000..d78157356
 +        acc += tmp_shared[l];
 +    }
 +    if (threadIdx.x == 0) {
-+        dst[r] = acc;
++        // the inject rows publish the 1/hc-scaled logit its combine consumes (the unfused chain's
++        // SCALE before the sigmoid); the lo rows stay raw, their 1/hc belongs to silu
++        dst[r] = is_inject ? acc * inv_hc : acc;
 +    }
 +    if (y_v == nullptr || is_inject) {
 +        return;
@@ -37363,7 +37372,9 @@ index 000000000..d78157356
 +            sumf = buf[tid];
 +            sumf = warp_reduce_sum<32>(sumf);
 +            if (tid == 0) {
-+                inject_t[r] = sumf;
++                // same 1/hc the unfused chain's SCALE puts in front of the sigmoid: the inject tail is the
++                // scatter logit the combine consumes, not the raw dot product
++                inject_t[r] = sumf * inv_hc;
 +            }
 +        }
 +        return;
@@ -37402,7 +37413,7 @@ index 000000000..d78157356
 +static __global__ void __launch_bounds__(256, 1) hc_mix_bf16_down_inject(
 +        const nv_bfloat16 * w_down, const nv_bfloat16 * w_inject, const float * xn, float * lo, float * inject,
 +        const int ncols2, const int nrows_down, const int64_t xn_stride_t, const int64_t lo_stride_t,
-+        const int64_t inject_stride_t) {
++        const int64_t inject_stride_t, const float inv_hc) {
 +    constexpr int block_size = 256;
 +    constexpr int warp_size  = 32;
 +    const int row = blockIdx.x;
@@ -37462,7 +37473,8 @@ index 000000000..d78157356
 +    }
 +    const float value = sumf[tid];
 +    if (is_inject) {
-+        inject[tid*inject_stride_t + (row - nrows_down)] = value;
++        // the 1/hc the unfused chain's inject SCALE applies, folded into the store (see hc_combine_kernel)
++        inject[tid*inject_stride_t + (row - nrows_down)] = value * inv_hc;
 +    } else {
 +        lo[tid*lo_stride_t + row] = value;
 +    }
@@ -37816,7 +37828,7 @@ index 000000000..d78157356
 +            const ggml_cuda_kernel_launch_params launch_params = {dim3(hc_lr + nrows_inject), dim3(256), 0, stream};
 +#define HC_BF16_DOWN(NT) ggml_cuda_kernel_launch(hc_mix_bf16_down_inject<NT>, launch_params, \
 +            (const nv_bfloat16 *) w_down->data, w_inject ? (const nv_bfloat16 *) w_inject->data : nullptr, xn_c, lo_c, \
-+            inject_c, (int) (hc_dim/2), (int) hc_lr, hc_dim, hc_lr, inject_stride_t)
++            inject_c, (int) (hc_dim/2), (int) hc_lr, hc_dim, hc_lr, inject_stride_t, 1.0f / (float) hc)
 +            switch (nt_c) {
 +                case 1: HC_BF16_DOWN(1); break;
 +                case 2: HC_BF16_DOWN(2); break;
@@ -38063,9 +38075,13 @@ index 000000000..d78157356
 +
 +// Fused hyper-connection residual combine for qwen4exp (decode/verify band).
 +// out[r, c, t] = residual[r, c, t] + block_out[r, t] * w[c, t], with
-+// w[c, t] = 2 * sigmoid(inject[c, t] / hc) (the SCALE+SIGMOID+SCALE chain of
-+// build_hc_combine; the 1/hc and 2.0 scalars are exact in f32 so only the
-+// sigmoid rounds). The product block_out[r]*w[c] and the residual add keep
++// w[c, t] = 2 * sigmoid(inject[c, t]) (the SCALE+SIGMOID+SCALE chain of
++// build_hc_combine; the 2.0 scalar is exact in f32 so only the sigmoid rounds).
++// `inject` is the chain's SCATTER LOGIT, i.e. the dot product ALREADY scaled by
++// 1/hc (build_hc_mix emits that SCALE, and ggml_hc_mix's inject tail folds it in),
++// never the raw product: dividing here as well double-scales it, which stays
++// self-consistent only for a model whose mixer is the fused op.
++// The product block_out[r]*w[c] and the residual add keep
 +// their own roundings because the reference runs separate MUL and ADD ops:
 +// the products go to an array first so the compiler cannot contract them
 +// into FMAs. One thread per row handles the hc columns, mirroring the
@@ -38081,15 +38097,14 @@ index 000000000..d78157356
 +        float * dst, const int n_embd, const int hc,
 +        const int64_t res_stride_t, const int64_t bo_stride_t,
 +        const int64_t inject_stride_t, const int64_t dst_stride_t) {
-+    const float inv_hc = 1.0f / (float) hc;
 +    const int t = blockIdx.y;
 +
-+    // w[c] = 2*sigmoid(inject[c]/hc); per-thread registers rather than shared
++    // w[c] = 2*sigmoid(inject[c]); per-thread registers rather than shared
 +    // memory so the early return below stays barrier-free
 +    const float * inj = inject + (int64_t) t*inject_stride_t;
 +    float w[8];
 +    for (int c = 0; c < hc; ++c) {
-+        const float s = inj[c] * inv_hc;
++        const float s = inj[c];
 +        w[c] = (1.0f / (1.0f + expf(-s))) * 2.0f;
 +    }
 +
@@ -81658,7 +81673,7 @@ index 543da2aed..2414b7509 100644
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index fe3a67c64..10cdf81cc 100644
+index fe3a67c64..e833d4c35 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -63,7 +63,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
@@ -81753,7 +81768,7 @@ index fe3a67c64..10cdf81cc 100644
                  ud->ok = false;
              }
              return true;
-@@ -3989,6 +4052,128 @@ struct test_rms_norm_back : public test_case {
+@@ -3989,6 +4052,131 @@ struct test_rms_norm_back : public test_case {
  };
  
  // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
@@ -81797,12 +81812,15 @@ index fe3a67c64..10cdf81cc 100644
 +
 +// GGML_OP_HC_COMBINE: fused hyper-connection residual combine (qwen4exp decode/verify band)
 +//
-+//   out[e,c,t] = residual[e,c,t] + block_out[e,t] * 2*sigmoid(inject[c,t]/hc)
++//   out[e,c,t] = residual[e,c,t] + block_out[e,t] * 2*sigmoid(inject[c,t])
 +//
-+// The unfused chain (SCALE, SIGMOID, SCALE, REPEAT, MUL, ADD) is what the CPU reference computes, so
-+// this is the op's only oracle: before it, `-o HC_COMBINE` ran 0/0 and a wrong combine (a wrong 2*sigmoid
-+// centre, a stream/token index swap, an in-place residual read) was invisible to every gate (greedy text
-+// and MTP both survive it because the same wrong value feeds the whole residual stream).
++// `inject` is the chain's scatter logit, i.e. build_hc_mix's output already scaled by 1/hc
++// (ggml_hc_mix folds the same scale into its inject tail), so the op divides by nothing. The
++// unfused chain (SIGMOID, SCALE, REPEAT, MUL, ADD) is what the CPU reference computes.
++// Both arms of this pair are only an oracle for each other: a combine that disagrees with the
++// CHAIN is invisible here (r148, issue #228: the op used to divide by hc as well and the fused
++// mixer's raw tail hid it), which is why scripts/gate-hc-fusions.sh compares the four
++// mix/combine arm combinations on a real GGUF instead.
 +struct test_hc_combine : public test_case {
 +    const int64_t n_embd, hc, n_tokens;
 +    const bool bcast; // block_out/inject broadcast over the token axis (ne[1] == 1: the decode shape)
@@ -81882,7 +81900,7 @@ index fe3a67c64..10cdf81cc 100644
  struct test_rms_norm_mul_add : public test_case {
      const ggml_type type;
      const std::array<int64_t, 4> ne;
-@@ -5113,6 +5298,25 @@ struct test_gated_delta_net : public test_case {
+@@ -5113,6 +5301,25 @@ struct test_gated_delta_net : public test_case {
          return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
      }
  
@@ -81908,7 +81926,7 @@ index fe3a67c64..10cdf81cc 100644
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
              int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
              int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
-@@ -5146,7 +5350,7 @@ struct test_gated_delta_net : public test_case {
+@@ -5146,7 +5353,7 @@ struct test_gated_delta_net : public test_case {
          // q/k are L2-normalised in qwen35/kimi-linear before delta_net
          q = ggml_l2_norm(ctx, q, 1e-6f);
          k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -81917,7 +81935,7 @@ index fe3a67c64..10cdf81cc 100644
          return out;
      }
  
-@@ -5154,7 +5358,7 @@ struct test_gated_delta_net : public test_case {
+@@ -5154,7 +5361,7 @@ struct test_gated_delta_net : public test_case {
          for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
              if (ggml_is_view_op(t->op)) { continue; }
              if (strcmp(t->name, "g") == 0) {
@@ -81926,7 +81944,7 @@ index fe3a67c64..10cdf81cc 100644
              } else if (strcmp(t->name, "beta") == 0) {
                  init_tensor_uniform(t, 0.0f, 1.0f);
              } else if (strcmp(t->name, "v") == 0) {
-@@ -5210,7 +5414,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+@@ -5210,7 +5417,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
          q = ggml_l2_norm(ctx, q, 1e-6f);
          k = ggml_l2_norm(ctx, k, 1e-6f);
  
@@ -81935,7 +81953,7 @@ index fe3a67c64..10cdf81cc 100644
          ggml_set_name(gdn_out, "gdn_out");
  
          // attn scores view (first part of the gdn output)
-@@ -5255,6 +5459,23 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+@@ -5255,6 +5462,23 @@ struct test_gated_delta_net_cache_fusion : public test_case {
      bool run_whole_graph() override { return true; }
      std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
  
@@ -81959,7 +81977,7 @@ index fe3a67c64..10cdf81cc 100644
      uint64_t op_flops(ggml_tensor * t) override {
          GGML_UNUSED(t);
          const uint64_t S_v = head_size;
-@@ -7192,15 +7413,17 @@ struct test_argsort : public test_case {
+@@ -7192,15 +7416,17 @@ struct test_argsort : public test_case {
      const ggml_type type;
      const std::array<int64_t, 4> ne;
      ggml_sort_order order;
@@ -81980,7 +81998,7 @@ index fe3a67c64..10cdf81cc 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-@@ -7225,11 +7448,13 @@ struct test_argsort : public test_case {
+@@ -7225,11 +7451,13 @@ struct test_argsort : public test_case {
                  std::shuffle(data.begin(), data.end(), rng);
                  ggml_backend_tensor_set(t, data.data(), 0, ne[0]*ne[1]*ne[2]*ne[3] * sizeof(int));
              } else if (t->type == GGML_TYPE_F32) {
@@ -81996,7 +82014,7 @@ index fe3a67c64..10cdf81cc 100644
                      }
                      std::shuffle(data.begin(), data.end(), rng);
                      ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
-@@ -7483,6 +7708,125 @@ struct test_topk_qsa : public test_case {
+@@ -7483,6 +7711,125 @@ struct test_topk_qsa : public test_case {
      }
  };
  
@@ -82122,7 +82140,7 @@ index fe3a67c64..10cdf81cc 100644
  enum MoeGatingFunc {
      GATING_FUNC_SOFTMAX,
      GATING_FUNC_SIGMOID,
-@@ -8617,9 +8961,12 @@ struct test_flash_attn_ext : public test_case {
+@@ -8617,9 +8964,12 @@ struct test_flash_attn_ext : public test_case {
      const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
      const bool v_is_view_of_k;
      const int64_t n_kv_max;
@@ -82136,7 +82154,7 @@ index fe3a67c64..10cdf81cc 100644
      }
  
      double max_nmse_err() override {
-@@ -8636,9 +8983,12 @@ struct test_flash_attn_ext : public test_case {
+@@ -8636,9 +8986,12 @@ struct test_flash_attn_ext : public test_case {
      test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                          bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                          ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
@@ -82151,7 +82169,7 @@ index fe3a67c64..10cdf81cc 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
-@@ -8685,7 +9035,7 @@ struct test_flash_attn_ext : public test_case {
+@@ -8685,7 +9038,7 @@ struct test_flash_attn_ext : public test_case {
          ggml_set_name(v, "v");
  
          ggml_tensor * m = nullptr;
@@ -82160,7 +82178,7 @@ index fe3a67c64..10cdf81cc 100644
              m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
              ggml_set_name(m, "m");
          }
-@@ -8698,6 +9048,18 @@ struct test_flash_attn_ext : public test_case {
+@@ -8698,6 +9051,18 @@ struct test_flash_attn_ext : public test_case {
  
          ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
          ggml_flash_attn_ext_add_sinks(out, s);
@@ -82179,7 +82197,7 @@ index fe3a67c64..10cdf81cc 100644
          ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
          ggml_prec_set_acc(out, prec);
          ggml_set_name(out, "out");
-@@ -8715,7 +9077,49 @@ struct test_flash_attn_ext : public test_case {
+@@ -8715,7 +9080,49 @@ struct test_flash_attn_ext : public test_case {
                      init_tensor_kq_mask_sparse(t, n_kv_max);
                  } else {
                      init_tensor_kq_mask(t);
@@ -82229,7 +82247,7 @@ index fe3a67c64..10cdf81cc 100644
              } else {
                  init_tensor_uniform(t);
              }
-@@ -8743,6 +9147,117 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
+@@ -8743,6 +9150,117 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
      }
  };
  
@@ -82347,7 +82365,7 @@ index fe3a67c64..10cdf81cc 100644
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -9480,7 +9995,11 @@ struct test_generic_op : public test_case {
+@@ -9480,7 +9998,11 @@ struct test_generic_op : public test_case {
          ggml_tensor * out = ggml_get_tensor(ctx, "out");
  
          std::random_device rd;
@@ -82360,7 +82378,7 @@ index fe3a67c64..10cdf81cc 100644
  
          for (size_t i = 0; i < sources.size() && i < GGML_MAX_SRC; i++) {
              ggml_tensor * t = out->src[i];
-@@ -9993,6 +10512,35 @@ static const ggml_type other_types[] = {
+@@ -9993,6 +10515,35 @@ static const ggml_type other_types[] = {
  // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      std::vector<std::unique_ptr<test_case>> test_cases;
@@ -82396,7 +82414,7 @@ index fe3a67c64..10cdf81cc 100644
      std::default_random_engine rng(0);
  
      // unary ops
-@@ -10171,6 +10719,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10171,6 +10722,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
          test_cases.emplace_back(new test_mul_mat_reorder_then_big_batch(type));
      }
@@ -82408,7 +82426,7 @@ index fe3a67c64..10cdf81cc 100644
      for (ggml_type type : all_types) {
          for (int b : {1, 7}) {
              for (bool v : {false, true}) {
-@@ -10892,7 +11445,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10892,7 +11448,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
      test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
  
@@ -82417,7 +82435,7 @@ index fe3a67c64..10cdf81cc 100644
          test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
          test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
      }
-@@ -10935,7 +11488,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10935,7 +11491,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      for (auto multi_add : {false, true}) {
          for (auto set_rows : {false, true}) {
              for (auto broadcast : {false, true}) {
@@ -82426,7 +82444,7 @@ index fe3a67c64..10cdf81cc 100644
                      test_cases.emplace_back(new test_rms_norm_mul_rope({768, 1, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                      test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                      test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 5, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
-@@ -11090,6 +11643,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11090,6 +11646,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -82440,7 +82458,7 @@ index fe3a67c64..10cdf81cc 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -11515,7 +12075,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11515,7 +12078,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3, false, true));
  
      for (int bs : {1, 4, 512}) {
@@ -82449,7 +82467,7 @@ index fe3a67c64..10cdf81cc 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  // test with mul after (ffn_moe_weighted)
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
-@@ -11823,6 +12383,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11823,6 +12386,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2049, 2, 1, 3}, order));
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2, 8, 8192, 1}, order)); // bailingmoe2 (group selection)
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
@@ -82460,7 +82478,7 @@ index fe3a67c64..10cdf81cc 100644
      }
  
      for (int n = 1; n < 5; ++n) {
-@@ -11887,6 +12451,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11887,6 +12454,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
      test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
  
@@ -82472,7 +82490,7 @@ index fe3a67c64..10cdf81cc 100644
      // exhaustive top_k tests
      //for (int i = 1; i < 9999; ++i) {
      //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
-@@ -12073,8 +12642,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12073,8 +12645,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -82483,7 +82501,7 @@ index fe3a67c64..10cdf81cc 100644
              if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
              if (hsk ==  96 && (hsv !=  64 && hsv !=  96)) continue; // MiniCPM3
              if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
-@@ -12086,7 +12655,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12086,7 +12658,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -82493,7 +82511,7 @@ index fe3a67c64..10cdf81cc 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -12104,7 +12674,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12104,7 +12677,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                  for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                      if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                      for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
@@ -82504,7 +82522,7 @@ index fe3a67c64..10cdf81cc 100644
                                                          // DeepSeek MLA: the V cache is a sub-view of the K cache
                                                          const bool v_is_view_of_k = hsk == 576;
                                                          test_cases.emplace_back(new test_flash_attn_ext(
-@@ -12128,6 +12700,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12128,6 +12703,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -82525,7 +82543,7 @@ index fe3a67c64..10cdf81cc 100644
      // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
      test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -12150,6 +12736,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12150,6 +12739,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
      test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
  
@@ -82558,7 +82576,7 @@ index fe3a67c64..10cdf81cc 100644
      // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
-@@ -12179,6 +12791,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12179,6 +12794,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      // sparse mask with large batch size
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
@@ -82570,7 +82588,7 @@ index fe3a67c64..10cdf81cc 100644
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  2048));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
-@@ -12253,6 +12870,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12253,6 +12873,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
  
@@ -82614,7 +82632,7 @@ index fe3a67c64..10cdf81cc 100644
      // FLASH_ATTN_EXT MMA, swizzled K/V tiles, power-of-two stride: nbatch_K2 = 32, 64, 128, 256.
      test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096,  8, true,  true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -12386,6 +13040,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12386,6 +13043,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                      test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
                      test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
@@ -82622,7 +82640,7 @@ index fe3a67c64..10cdf81cc 100644
                      // rows at and just past the limit where one block still covers all rows
                      test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
                      test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
-@@ -12417,6 +13072,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12417,6 +13075,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -82644,7 +82662,7 @@ index fe3a67c64..10cdf81cc 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -12469,6 +13139,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12469,6 +13142,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
@@ -82659,7 +82677,7 @@ index fe3a67c64..10cdf81cc 100644
  
  #if 0
      // these tests are disabled to save execution time, sbut they can be handy for debugging
-@@ -12479,6 +13157,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12479,6 +13160,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_falcon(2));
  #endif
  
@@ -82694,7 +82712,7 @@ index fe3a67c64..10cdf81cc 100644
      // lightning_indexer
      for (int kv : { 256 }) {
          for (int bs : { 1, 512 }) {
-@@ -12498,6 +13204,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12498,6 +13207,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -82712,7 +82730,7 @@ index fe3a67c64..10cdf81cc 100644
      return test_cases;
  }
  #ifdef _MSC_VER
-@@ -12508,6 +13225,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12508,6 +13228,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  
@@ -82744,7 +82762,7 @@ index fe3a67c64..10cdf81cc 100644
      // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
      // note: same bytes either way, so a backend that indexes them differently shows it here
      for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
-@@ -12553,6 +13295,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12553,6 +13298,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  
@@ -82783,7 +82801,7 @@ index fe3a67c64..10cdf81cc 100644
      // Conv2d: K=CRS=NPQ=4096 matmul performance
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
-@@ -12734,9 +13508,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12734,9 +13511,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -82819,7 +82837,7 @@ index fe3a67c64..10cdf81cc 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -12744,8 +13542,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12744,8 +13545,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -82830,7 +82848,7 @@ index fe3a67c64..10cdf81cc 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
-@@ -13004,6 +13802,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -13004,6 +13805,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  

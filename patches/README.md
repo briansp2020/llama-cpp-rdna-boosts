@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r147`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r148`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -47,7 +47,7 @@ only as a rough shape.
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters) | +15081 / −525 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
-| 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill) | +11976 / −433 | 46 |
+| 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231) | +4034 / −755 | 46 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
@@ -1166,6 +1166,21 @@ slab/dispatcher/ring code of its own beyond the arms implemented in its own TUs.
   The merged path is untouched (it is one GEMM).  Bit-identical: PPL 2.4392 / 2.4370 (both HC_POST arms)
   and all 24 chunks of the reporter's `--chunks 24` command unchanged, 6/6 same-seed greedy cells
   byte-identical, fused-vs-chain KLD still 0.000000 / 100.000 %.
+  **The inject tensor carries the 1/hc-scaled scatter logit, in BOTH halves (r148, issue #228).**  The
+  chain's contract is upstream's: `build_hc_mix` emits `inject = w_inject^T xn / hc` and
+  `build_hc_combine` applies only `2*sigmoid(inject)`.  Through r147 the **fused** mixer published the RAW
+  dot product and the **fused** combine divided it by `hc` again, i.e. the two fused ops encoded the *v14*
+  convention (`inject` raw, the SCALE in the combine) and the `6050b467c` re-base inverted it under them.
+  That pair is self-consistent, so the Q8_0/BF16-hc models (which take both fused halves) stayed right —
+  but each half can be selected independently (`LLAMA_FUSED_HC_MIX` / `LLAMA_FUSED_HC_COMBINE`), and the
+  other two arms double-scaled (chain mixer + fused combine: every hc-down quant that is not Q8_0/BF16, so
+  Flash-Next Q5_K/IQ4_NL/Q4_K collapse with a greedy repetition loop) or did not scale at all (fused mixer
+  + chain combine: an **empty** generation on a BF16-hc model).  r148 folds the `1/hc` into the fused
+  mixer's inject tail (Q8_0-inject, F32-inject/planar and BF16 kernels) and drops it from the fused combine
+  (CUDA kernel, fused combine+norm kernel, CPU reference), so all four arms reproduce the chain bit for
+  bit — the BF16-hc default is **unchanged** (`246463129328`) and the chain arms are unchanged.  The oracle
+  is `scripts/gate-hc-fusions.sh` (the four arms on a real GGUF); `test-backend-ops` cannot see this class
+  because its CPU reference encoded the same convention.  `GREEDY-PURITY.md` §61.
 * **The managed lazy reader** (`src/llama-lazy-reader.{cpp,h}`) and the loader's `managed_budget`
   (`LLAMA_LAZY_BUF_MB`, `TENSOR_SKIP_MANAGED`, `lazy_read::add_range`): a fixed-size host arena over the
   PLE n-gram table, clock-LRU, read on demand.  **Off by default** (it measured slower than both the mmap
@@ -1187,11 +1202,17 @@ slab/dispatcher/ring code of its own beyond the arms implemented in its own TUs.
 
 **Knobs.**  `LLAMA_QSA_*`, `GGML_QSA_*`, `LLAMA_HC_*` / `GGML_HC_*` (incl. `LLAMA_HC_BLK16` /
 `LLAMA_HC_RES16` / `LLAMA_HC_GATEMIX`), `LLAMA_MTP_SPARSE`, `LLAMA_LAZY_BUF_MB` /
-`LLAMA_LAZY_READER_STATS`, `GGML_CUDA_LIGHTNING_INDEXER4_GFX1100` / `_GFX1201`.
+`LLAMA_LAZY_READER_STATS`, `GGML_CUDA_LIGHTNING_INDEXER4_GFX1100` / `_GFX1201`.  `LLAMA_FUSED_HC_MIX` and
+`LLAMA_FUSED_HC_COMBINE` are **two independent arms**, not one switch: every one of the four combinations
+must reproduce the unfused chain (`scripts/gate-hc-fusions.sh`, once per hc-down weight class —
+`GREEDY-PURITY.md` §61).
 
 **Purity.**  qwen4exp's decode/verify band is `HC_FUSED_MAX_TOKENS = 8` and the QSA decode arm band is
 `max(8, n_rs_batch)`; the arm must be chosen from the band and `n_kv`, never `n_tokens == 1`
-(`GREEDY-PURITY.md` §§13, 16, 26, 32, 38).  The QSA op has a CPU oracle — run
+(`GREEDY-PURITY.md` §§13, 16, 26, 32, 38).  The HC fused ops are the model chain's accelerators, not a
+second definition of it: the inject *scatter logit* they publish is the chain's already-`1/hc`-scaled one,
+so both halves reproduce `build_hc_mix`/`build_hc_combine` bit for bit in all four arm combinations (§61).
+The QSA op has a CPU oracle — run
 `test-backend-ops -o FLASH_ATTN_QSA` (18/18 minimum) and the sparse-vs-dense perplexity ratio, because the
 `W = 1..8` matrix cannot see a width-uniform bug (§21).  Also run `scripts/gate-qwen4exp-quant-coherence.sh`
 before changing the device gather or the head zero.  The HC ops have their own oracles now:

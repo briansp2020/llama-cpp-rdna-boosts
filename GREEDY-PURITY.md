@@ -121,6 +121,8 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§57** | parking the idle slots restores the save-and-clear attention range for a request that runs alone; a memory whose second cache mirrors the attention cells parks both or neither (r146) | doctrine (r136, PR #225; r146, issue #227) |
 | **§58** | a per-device scalar is sound only if its inverse is applied to that device's own partial *before* the reduction — a mode, not a default | doctrine, temporary (r137, block 14; `TODO` #104) |
 | **§59** | a fused window must read a tensor the graph keeps alive for it — the one the emitter pins — never an unpinned ancestor whose last graph use runs *before* the window; and a fusion of a norm must reduce in the *same grouping* as the kernel it replaces, or it is only approximately that kernel | fix (r140 + r141, issue #226) |
+| **§60** | a reduction-order change is a new numerics reference: one reduction (the strided one), and every fused norm kernel reduces like the chain it replaces | doctrine (r145, issue #229) |
+| **§61** | a fused op must reproduce the *model's own chain*, not its fused sibling: an intermediate tensor's scale convention belongs to the emitter, so a pair of fused ops that agree with each other can still be wrong — and the arms they select into are the oracle | fix + doctrine (r148, issue #228) |
 
 ---
 
@@ -1721,3 +1723,73 @@ no gate compares a fusion against its chain at decode widths.
 SSM-fusions-off arm, and the per-fusion KLD probes) are in
 [`benchmarks/2026-10-26-rms-norm-float4-ab.md`](benchmarks/2026-10-26-rms-norm-float4-ab.md); the release
 record is `WORKLOG.md` 261026.002 (r145); the switch is `ENVIRONMENT.md` §7.5.
+
+## 61. A fused op must reproduce the model's own chain — an intermediate's scale convention belongs to the emitter, and a self-consistent op pair can still be wrong
+
+**Claim.**  The oracle of a fused op is the **unfused chain the model emits** — not the op's partner, not
+its own CPU reference, and not another build of itself.  An intermediate tensor's *scale convention* (where
+a `1/hc` or a `2.0` lives) is a property of the **emitter**, and when a model has two interchangeable
+emitters for the same intermediate, each fused consumer must match the *chain*, not the sibling op.  A pair
+of fused ops written hand in hand stays mutually consistent and can still both be wrong.
+
+**What happened (r148, issue #228).**  qwen4exp's hyper-connection stream is steered by a per-stream
+**scatter logit**: `build_hc_mix` emits it and `build_hc_combine` turns it into `w = 2*sigmoid(.)`.  Each
+half exists twice — a ggml chain (upstream's model definition) and a fused op (`GGML_OP_HC_MIX` /
+`GGML_OP_HC_COMBINE`) — and `LLAMA_FUSED_HC_MIX` / `LLAMA_FUSED_HC_COMBINE` select them **independently**,
+so there are four arms.  The v14 model (base `097cf33d9`) emitted `inject = w_inject^T xn` **raw** and put
+the `1/hc` in the combine (`sigmoid(scale(inject, 1/hc))`); the fused pair was written against exactly that,
+publishing a raw tail from the mixer and dividing by `hc` in the combine.  The `6050b467c` re-base
+**inverted the convention** (the mixer now emits `inject/hc`, the combine applies no scale — same final
+numerics, different intermediate) and nothing re-derived the ops: the fused pair kept the v14 convention
+and became chain-inconsistent.  Three consequences, all silent:
+
+* chain mixer + fused combine (every hc-down quant that is not Q8_0/BF16 — Q5_K, IQ4_NL, IQ4_XS, Q4_K, …)
+  divided by `hc` **twice**: `w` collapses towards 1 instead of sweeping `(0, 2)`, and a Q5_K_M requant
+  degenerates into a greedy repetition loop (issue #228: kl ~15 vs the v14 engine).
+* fused mixer + chain combine (any Q8_0/BF16-hc model run with the documented `LLAMA_FUSED_HC_COMBINE=0`
+  kill-switch) applied **no** scale at all: the BF16-hc model produced an **empty** generation.
+* fused + fused (the arm every dense/GSQ validation ran) was right, which is why ten releases passed.
+
+**Why no gate saw it.**  `test-backend-ops -o HC_MIX,HC_COMBINE` compares each op against a CPU reference
+that had encoded the same convention, so the set agreed with itself — the same lesson as §52, one level up.
+Greedy coherence survives a wrong combine while the two halves still match each other (`w` is wrong but
+shared by every stream, so the text stays plausible), and the arms were never *crossed*: every recorded
+qwen4exp number came from one arm, so each A/B compared the broken arm with itself.  The knobs that *look*
+like they cross the arms do not: `GGML_CUDA_DISABLE_HC_FUSION` / `_HC_MIX` / `_HC_COMB` disable matchers
+over the **unfused chain**, and are therefore inert on a default build (measured: identical text on a
+fused-mixer model).  Their "A/B is byte-identical" entries in the r140..r147 records are true but vacuous,
+which is exactly what the reporter's own `GGML_CUDA_DISABLE_HC_COMB=1` arm showed ("changes nothing").
+
+**Rule.**
+1. **A fused op's reference is the model's chain.**  When you change an op or a chain, cross the arms:
+   `scripts/gate-hc-fusions.sh MODEL.gguf` runs all four mix/combine combinations (plus the CUDA-side
+   chain fusions and the DSV4 HC pre/post pair) and fails unless every hard arm is **byte-identical to the
+   unfused chain**.  Run it once per hc-down weight class — Q8_0/BF16 `hc_attn_down` takes the fused mixer,
+   any other quant takes the chain (`--types MODEL.gguf` prints the class).  Two arms of a two-way switch
+   is not coverage.
+2. **An intermediate's scale belongs to the emitter.**  If two emitters (chain and fused) can produce the
+   same intermediate, the convention is stated once and both implement it; a `/hc` (or any scalar) inside a
+   *consumer* is a convention claim that a re-base can invalidate.  `GGML_OP_HC_MIX`'s inject tail now
+   carries the scaled logit exactly as `build_hc_mix` does, and `GGML_OP_HC_COMBINE` divides by nothing.
+3. **A kill-switch must be numerically inert, and an A/B knob must actually change the arm.**  `LLAMA_FUSED_*=0`
+   exists for A/B and bisection; an arm that changes the *result* invalidates every A/B taken with it and
+   can hide a defect — it hid this one (the reporter's rescue arm *was* the reference).  The converse bit
+   too: the three CUDA-side matcher knobs (`GGML_CUDA_DISABLE_HC_FUSION`, `_HC_MIX`, `_HC_COMB`) look for
+   patterns in the **unfused chain**, so on a default build (fused ops on) they are **inert** and a
+   "byte-identical" A/B with them proves nothing (measured: all three produce the default arm's text on a
+   fused-mixer model).  Verify that the knob changes the graph or the kernel under the arm you compare it
+   on before recording it as evidence.  When an arm is approximate by design (the DSV4 `HC_POST` op on one
+   device, §59), the gate reports it, never passes it silently.
+4. **Re-base checklist item:** a re-base that touches a model definition can invert an intermediate's
+   convention.  Diff the model's `build_*` emitters against the fused ops' contract and run the
+   fusion-equivalence gate; "block 11 owns the HC ops" is not enough.
+
+**Evidence.**  `scripts/gate-hc-fusions.sh` on three GGUFs of both classes — Flash-Next Q5_K_M (chain
+mixer), IQ4_NL (chain mixer), GSQ-RCO IQ3_XXS (BF16, fused mixer): all 6 hard arms byte-identical to the
+chain (Q5_K 445 chars `c8e579144ff1`; BF16-hc 449 chars `6a102dbc62d6`), while the pre-fix build fails
+every non-Q8_0/BF16 arm and produces an empty generation on the BF16-hc model's combine-off arm.  The arm
+the delivery had right does not move: the BF16-hc default's greedy text is **bit-identical before vs after**
+(`246463129328`).  The fusions keep paying: `llama-bench -p 512 -n 64` on GSQ-IQ3_XXS **34.78 t/s** default
+vs **31.73** with both arms off (+8.7 %), prefill flat; IQ4_NL 34.49/34.35 and Q5_K 33.80/33.57 (parity,
+the chain-mixer class).  Release record: `WORKLOG.md` 261026.006 (r148); op contract:
+`patches/README.md` (block 11); switch catalogue: `ENVIRONMENT.md` §7.4.

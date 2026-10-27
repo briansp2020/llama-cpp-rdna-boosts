@@ -1,4 +1,4 @@
-From 97349428d63bf94e45c02d6d492e27fb818da059 Mon Sep 17 00:00:00 2001
+From c00535204b7e771aab54b2e1ff4438a97e266788 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/14] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -846,7 +846,7 @@ index 28d2187b9..692aaf7ff 100644
  
  #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index f3d17e5fd..be71de7d3 100644
+index 93b946ad2..704e25b44 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -608,6 +608,8 @@ extern "C" {

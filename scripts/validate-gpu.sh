@@ -18,10 +18,14 @@
 #      applied tree == that rev's `release.json.tree` (strict `git am`);
 #   2. `gate-per-block-build.sh --fast` over every block commit (the ladder);
 #   3. builds the tip's test-binary and runs the op oracles (`FLASH_ATTN_EXT`,
-#      `GATED_DELTA_NET`, `FLASH_ATTN_QSA`, `MUL_MAT`, `MUL_MAT_ID`, `TOP_K_MASK`, `HC_MIX`);
+#      `GATED_DELTA_NET`, `FLASH_ATTN_QSA`, `MUL_MAT`, `MUL_MAT_ID`, `TOP_K_MASK`, `HC_MIX`,
+#      `HC_COMBINE`, `HC_COMBINE_MIX`);
 #   4. `gate-prefill-logits.sh` on the tip -- compares against this box's recorded base, or
 #      RECORDS one on the first run (a fresh worker box has no base; the gate then exits with
 #      the recorded result, and later runs compare);
+#   4b. `gate-hc-fusions.sh` on the qwen4exp GGUF(s) present here -- the four mix/combine arms
+#      must all reproduce the unfused chain (issue #228: the op-vs-CPU oracle cannot see that
+#      class).  Skipped when no qwen4exp GGUF is present or the applied tree touched no HC path;
 #   5. writes a one-screen summary to $STATE_DIR/runs/<rev>/summary.txt and, on success,
 #      records $STATE_DIR/last-ok.
 #
@@ -35,7 +39,9 @@
 #      JOBS                              default nproc
 #      ROCM_DIR / GPU_TARGETS            auto-detected from /opt/rocm-10.1.0-gfxNNNN
 #      KLD_MODEL, KLD_CTX (512), KLD_CHUNKS (40), KLD_BASE_DIR
-#      SKIP_LADDER=1 / SKIP_OPTESTS=1 / SKIP_KLD=1   narrow the run
+#      HC_MODELS                     space-separated qwen4exp GGUFs for the fusion gate (both
+#                                    hc-down classes); HC_ALWAYS=1 forces it
+#      SKIP_LADDER=1 / SKIP_OPTESTS=1 / SKIP_KLD=1 / SKIP_HC=1   narrow the run
 #      MAX_ATTEMPTS (3, per rev)         KEEP_RUNS (5)
 #      KLD_ALWAYS=1                      run the prefill-logit gate even when the applied tree
 #                                        did not touch a prefill path (see below)
@@ -76,6 +82,7 @@ JOBS="${JOBS:-$(nproc)}"
 SKIP_LADDER="${SKIP_LADDER:-0}"
 SKIP_OPTESTS="${SKIP_OPTESTS:-0}"
 SKIP_KLD="${SKIP_KLD:-0}"
+SKIP_HC="${SKIP_HC:-0}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 KEEP_RUNS="${KEEP_RUNS:-5}"
 FORCE=0
@@ -87,10 +94,21 @@ KLD_MODEL="${KLD_MODEL:-/llm/models/Qwen3.5/9B/Q8_0/Qwen3.5-9B-Q8_0.gguf}"
 KLD_CTX="${KLD_CTX:-512}"
 KLD_CHUNKS="${KLD_CHUNKS:-40}"
 KLD_ALWAYS="${KLD_ALWAYS:-0}"
+# qwen4exp GGUFs for the hyper-connection fusion gate (issue #228).  The gate's subject is the
+# four mix/combine arcs, and the hc-down weight TYPE decides which mixer runs, so covering both
+# classes needs one GGUF of each: a Q8_0/BF16 hc_attn_down one (the default below, the class the
+# delivery's own qwen4exp records use) and any other quant (Q5_K/IQ4_NL/...) -- add it here, e.g.
+#   HC_MODELS="/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-...-00001-of-00002.gguf \
+#              /llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf"
+# A path that does not exist is skipped (each class is optional).
+HC_MODELS="${HC_MODELS:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"
+HC_ALWAYS="${HC_ALWAYS:-0}"
 
 # Paths whose change makes the prefill-logit gate relevant (AGENTS: "any change to a prefill
 # kernel ... or a default-on approximate path").
 PREFILL_RE='^(ggml/src/ggml-cuda/|ggml/src/ggml\.c|src/llama-graph\.cpp|src/models/|src/llama-kv-cache)'
+# A change to a qwen4exp hyper-connection op/chain/matcher (issue #228) or to the graph that emits it.
+HC_RE='^(ggml/src/ggml-cuda/hc-mix|ggml/src/ggml-cuda/hyperconn|ggml/src/ggml-cuda/ggml-cuda-try-fuse|ggml/src/ggml-cpu/ops\.cpp|ggml/include/ggml\.h|ggml/src/ggml\.c|src/models/qwen4exp\.cpp)'
 
 log() { echo "$(date -Is) $*"; }
 die() { log "ERROR: $*"; exit 1; }
@@ -242,7 +260,7 @@ else
         fail "tip build for the op tests (log: $RUN/optest-build.log)"
     fi
     opts_failed=""
-    for op in FLASH_ATTN_EXT GATED_DELTA_NET FLASH_ATTN_QSA MUL_MAT MUL_MAT_ID TOP_K_MASK HC_MIX; do
+    for op in FLASH_ATTN_EXT GATED_DELTA_NET FLASH_ATTN_QSA MUL_MAT MUL_MAT_ID TOP_K_MASK HC_MIX HC_COMBINE HC_COMBINE_MIX; do
         line="$(HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" \
                 timeout 3600 "$BUILD/bin/test-backend-ops" -o "$op" 2>&1 | grep -E 'tests passed|FAIL' | tail -1)"
         say "op       : $(printf '%-16s' "$op") ${line:-<no result>}"
@@ -291,10 +309,41 @@ else
     fi
 fi
 
+# --- 4b. qwen4exp hyper-connection fusion equivalence (issue #228) ----------------------------
+# `test-backend-ops -o HC_MIX,HC_COMBINE` compares each op against a CPU reference that can encode
+# the same convention, so it cannot see an op that disagrees with the model's own CHAIN.  This runs
+# the arms instead.  Two weight classes: Q8_0/BF16 hc_attn_down takes the fused mixer, any other
+# quant takes the chain, and the defect class only shows on the cross arms.
+if [ "$SKIP_HC" = 1 ]; then
+    say "hc gate  : skipped (SKIP_HC=1)"
+elif [ -z "$prev_tip" ] || [ "$HC_ALWAYS" = 1 ]; then
+    hc_want=1
+else
+    delta="$(git -C "$LLAMA_REPO" diff --name-only "$prev_tip" HEAD 2>/dev/null || echo ALL)"
+    if printf '%s\n' "$delta" | grep -Eq "$HC_RE"; then hc_want=1; else hc_want=0; fi
+    [ "$hc_want" = 1 ] || say "hc gate  : skipped (applied tree touched no qwen4exp HC path; HC_ALWAYS=1 forces it)"
+fi
+if [ "$hc_want" = 1 ]; then
+    hc_ran=0
+    for hc_model in $HC_MODELS; do
+        [ -f "$hc_model" ] || { say "hc gate  : no qwen4exp GGUF at $hc_model"; continue; }
+        hc_log="$RUN/hc-$(basename "$hc_model").log"
+        if LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" HIP_VISIBLE_DEVICES=0 EXTRA_ARGS="-ngl 99 -fa on" \
+                bash "$REPO/scripts/gate-hc-fusions.sh" "$hc_model" >"$hc_log" 2>&1; then
+            hc_ran=1
+            say "hc gate  : $(basename "$hc_model") $(grep -E '^(PASS|FAIL)' "$hc_log" | tail -1)"
+        else
+            cp "$hc_log" "$STATE_DIR/last-hc-fail.log"
+            fail "qwen4exp HC fusion gate on $hc_model (log: $hc_log)"
+        fi
+    done
+    [ "$hc_ran" = 1 ] || say "hc gate  : skipped (no qwen4exp GGUF on this box; set HC_MODELS)"
+fi
+
 # --- 5. record --------------------------------------------------------------------------------
 # A partial run must NOT mark the rev validated: that would make the next cron pass skip a rev
 # that was never fully gated (hit during the first radiance bring-up).
-if [ "$SKIP_LADDER" = 1 ] || [ "$SKIP_OPTESTS" = 1 ] || [ "$SKIP_KLD" = 1 ]; then
+if [ "$SKIP_LADDER" = 1 ] || [ "$SKIP_OPTESTS" = 1 ] || [ "$SKIP_KLD" = 1 ] || [ "$SKIP_HC" = 1 ]; then
     say "RESULT   : PASS (a step was skipped, so no up-to-date marker was written -- the next run resumes)"
     log "$short partially validated (summary: $SUMMARY)"
     exit 0

@@ -81,7 +81,7 @@ amendment, or a note in the relevant record).
 | `TODO.md` | **forward-looking only**: open items, items waiting on someone else, accepted limitations, parked ideas. A closed item is one `WORKLOG.md` entry — never a TODO entry. `#NN` numbers are permanent handles and are never reused |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims); dated narratives/evidence are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
 | `patches/` | **the delivery set** (0000-0014: block 00 + blocks 01-14) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
-| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-park-idle-slots.sh` (the server idle-slot parking gate: park == lazy-off text + the indexer cache moves with the attention cache, issue #227), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out), `check-windows-portability.sh` (fails on a POSIX-only call outside a Windows-excluding region in a file the delivery adds, issue #231; run by `validate-set.sh`). **Index: `scripts/README.md`** |
+| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-park-idle-slots.sh` (the server idle-slot parking gate: park == lazy-off text + the indexer cache moves with the attention cache, issue #227), `gate-hc-fusions.sh` (the qwen4exp hyper-connection fusion-equivalence gate: all four mix/combine arms must reproduce the unfused chain, once per hc-down weight class, issue #228), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out), `check-windows-portability.sh` (fails on a POSIX-only call outside a Windows-excluding region in a file the delivery adds, issue #231; run by `validate-set.sh`). **Index: `scripts/README.md`** |
 | `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
 |  `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
 | `prompts/` | versioned, hash-stable test prompts; sizes/token counts/**sha256** in `prompts/README.md`. A shipped prompt is **never edited in place** (add a new file); a result is only valid against the prompt hash it names |
@@ -166,7 +166,7 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
 - **Naming (V2.1):** the current set is **15 blocks, 00-14** (block 14 is the temporary `-sm relaxed-tensor`
   block, see `patches/README.md`; release `release.json .release` —
-  `v15-6050b467c-r138` at the 2026-10-25 re-base; the value lives in `release.json`, never here).  Every `block NN`
+  `v15-6050b467c-r148` at the 2026-10-25 re-base; the value lives in `release.json`, never here).  Every `block NN`
   reference elsewhere in this file that is not one of the V2.1 numbers below is the **pre-V2.1 16-block
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,
   **03** chunked GDN, **04** BF16 KV, **05** FA band/native/derived, **06** MMB, **07** k-quant,
@@ -337,6 +337,20 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   inert).  Cost of the default: the host expert set is non-swappable RAM (Q4_K_M 35B-A3B `-ncmoe 40`,
   cache off: `ROCm_Host` 18662 MiB; peak RSS ~41.7 GB).  `--lazy-mode` governs the mmap *reader*, not
   this. `ENVIRONMENT.md` §§1.2.1/4; `patches/README.md` (blocks 09/12).
+- **A qwen4exp fused HC op must reproduce the model CHAIN, and the mix/combine arms are the oracle (r148, issue #228).**
+  `build_hc_mix`/`build_hc_combine` each exist twice (upstream's ggml chain and `GGML_OP_HC_MIX` /
+  `GGML_OP_HC_COMBINE`), selected **independently** by `LLAMA_FUSED_HC_MIX` / `LLAMA_FUSED_HC_COMBINE`, so
+  there are four arms and all four must produce identical text.  The intermediate **inject scatter logit is
+  the emitter's** (upstream's chain emits it *already* `1/hc`-scaled and the combine applies only
+  `2*sigmoid`; v14 emitted it raw with the scale in the combine), a convention the `6050b467c` re-base
+  inverted under the delivery's fused pair: through r147 two of the four arms were wrong (chain mixer +
+  fused combine = `/hc` twice, which collapsed every hc-down quant that is not Q8_0/BF16 — Q5_K/IQ4_NL/Q4_XS —
+  into greedy repetitions; fused mixer + chain combine = no scale at all, an **empty** generation on a
+  BF16-hc model).  `test-backend-ops -o HC_MIX,HC_COMBINE` cannot see it (its CPU reference shared the
+  convention) and greedy coherence cannot either (the wrong `w` is shared by every stream) — run
+  `scripts/gate-hc-fusions.sh MODEL.gguf` for **both** hc-down weight classes (Q8_0/BF16 mixes fused, any
+  other quant mixes on the chain; `--types MODEL.gguf` prints the class), before any change to an HC op, its
+  chain or a matcher, on every release, and as a re-base checklist item.  `GREEDY-PURITY.md` §61.
 - **A host-side call in a file the delivery ADDS must be Windows-portable (r147, issue #231).**  The
   set is built with HIP on Windows too (clang-cl + the MSVC STL), where `<unistd.h>`/`<fcntl.h>` do not
   exist: `close`, `pread`, `open`, `fsync`, `access`, `sysconf`, `getpid`, `posix_memalign`, `mmap` …
@@ -903,6 +917,12 @@ second cache, `LLAMA_SERVER_PARK_IDLE_SLOTS`) needs `scripts/gate-park-idle-slot
 park/unpark request sequence and requires the parking arm to be byte-identical to
 `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`, with the moves traced. Neither of the gates above reaches parking — it
 is inert in `llama-cli`/`llama-bench`/`llama-perplexity` (issue #227 was invisible to both).
+
+A change to a **qwen4exp hyper-connection** op, its chain or a matcher that fuses it needs
+`scripts/gate-hc-fusions.sh MODEL.gguf`: the four `LLAMA_FUSED_HC_MIX` x `LLAMA_FUSED_HC_COMBINE` arms (plus
+the CUDA-side chain fusions and the DSV4 HC pre/post pair) must all be byte-identical to the unfused chain,
+once per hc-down weight class.  Issue #228 shipped for ten releases because no gate crossed those arms
+(`GREEDY-PURITY.md` §61).
 
 ### Regenerate the patches (after fork changes)
 
