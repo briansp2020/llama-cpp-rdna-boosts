@@ -26,9 +26,50 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | **108** | parking a mirroring second cache is validated on qwen4exp (and its k-pool arm is not) | platform validation | open, accepted limitation (r146, issue #227).  `llama_memory_hybrid_idx` is shared with **glm5-next**, whose indexer is the `indexer_kpool > 0` (k-pool, `indexer_kpool_by_order`) variant: the same park code moves it and the same invalidation (`mem_idx_stale_set`, `pool_invalidate_all`) covers the pool layout, but no glm5-next GGUF exists on this fleet, so only the qwen4exp arm is measured (`scripts/gate-park-idle-slots.sh`) |
 | **109** | a replayed graph loses to the direct node loop where the RCCL comm layer is initialised | performance | open (2026-10-26, r149).  Now that decode graphs replay (TODO #107 closed) the captured path loses on **3-device `-sm tensor` qwen35 dense plain decode**: 27B Q8_0 `llama-bench tg128` **41.7 -> 38.6** (Q4_K_XL 52.4 -> 49.1, unchanged at depth 16384).  **The axis is the comm layer, not the model's shape and not the per-call algorithm choice:** with `GGML_CUDA_ALLREDUCE=internal` (RCCL **never initialised**) the same arm is **42.2 (+0.9 %)** on the replaying build, while `hybrid` (41.7 -> 38.6) and `ce` (40.7 -> 38.6, and `ce` runs `comm_init_hybrid` first) both regress, and `nccl` is worse still (38.5 -> 35.6).  `GGML_CUDA_AR_SMALL_BYTES` 0 or 1e9 changes nothing, so it is not which arm runs per call: it is **RCCL's presence**, which the eager-init comment in `ggml_backend_cuda_comm_init_hybrid` already records as an r34 decode-only cost of the internal pipeline — r149 makes it visible on this arm because replay now happens at all.  Not capture churn (one shot per key, the deficit survives `-n 512`), not `GGML_CUDA_GRAPH_CHUNK_SIZE`, not `GGML_CUDA_ASYNC_INPUT`, not `GGML_SCHED_EVENTS`.  **It is not a dense-model property and not a 3-device property:** Gemma4 31B Q8_0 (dense, 32.6 GB) is **+0.8 %** at 2 GPUs (26.64 -> 26.86) and **flat** at 3 (34.68 -> 34.58, and only -0.9 % for `internal` vs `hybrid`), 27B at 2 GPUs is +0.5 % with replay working, and a `draft-mtp` draft hides it at 3 devices (42.8 -> 42.9).  Kill switch: `GGML_CUDA_GRAPH_KEY_WEIGHT=0`.  Next: find what RCCL's init leaves behind that costs a *replayed* graph 5-7 % while the direct node loop is immune (an r34 follow-up, not a r149 regression) |
 | **111** | a multi-slot verify step whose slot drafted NOTHING still splits | performance / accepted limitation | open (2026-10-27, r153/r154, issue #234).  `LLAMA_SPEC_ALIGN` equalizes the draft CAPS of the sequences one `draft-mtp-adaptive` call drafts, but a slot that drafted no tokens this round (the last step of a response, or a drafter that gave up) contributes its sampled row only, so the batch is `n_draft + 1` vs `1` and `split_equal()` still produces a second ubatch there.  Truncating the neighbour's good draft to nothing is the worse trade, so that step keeps splitting (measured: 1 such step per ~200 on the 35B-A3B host-expert arm).  **The cross-drafter case is CLOSED, not deferred**: the generic `min` cut of the finished drafts was shipped in r153 and measured -6 % on the reporter's own n-gram-first chain (65.6 -> 61.7 t/s, prose acceptance 74 % -> 50 %, splits 12 -> 1), so r154 removed it: a length mismatch caused by CONTENT rather than a cap is not worth equalizing.  `scripts/gate-spec-align.sh` now gates that chain (inert within 2 %, identical draft counts).  Record: `archive/work/spec-align-234/` |
+| **112** | VRAM-resident slot snapshots for the server | parked idea | **parked** (2026-10-27, r157) — no work implied.  `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` now copies a sequence state at **14.7 / 17.2 ms** on 2 GPUs (was 2.2 s; `WORKLOG.md` 261027.009), so keeping a slot's snapshot **in VRAM** instead of host RAM is usable for the first time — but nothing calls the arm.  Blockers before a server could: no eviction/budget API on `mem_storage` and no `--fit` accounting, the MoE arena would be the OOM chain's sacrifice, and `llama-memory-recurrent.cpp` refuses the flag for more than one cell range (so a hybrid model's interleaved slot cannot be saved at all).  Detail in §112 |
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
 ---
+
+## 112. VRAM-resident slot snapshots — PARKED IDEA (not scheduled)
+
+**Status: parked (2026-10-27, r157).**  Not a defect and not a plan.  The delivery's "switch away and come
+back" story stays the host-side pair (the in-memory prompt cache and the context checkpoints), and r157 does
+not change that: nothing in `llama-server`, `llama-cli` or `llama-bench` passes
+`LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`, so the arm is reached by `tests/test-llama-context` only.
+
+**What r157 changed for this.**  That arm keeps a snapshot in a *device* buffer instead of handing the caller
+a host blob, and it used to be unusable: 2.23 s to save / 2.28 s to restore a 213.6 MiB state on 2 GPUs
+(`ggml_backend_tensor_copy`'s pageable bounce per piece), i.e. 58x slower than the host path it replaces.  It
+is now 14.7 / 17.2 ms — faster than the host path's 21.9 / 38.9 ms — so the performance objection is gone and
+what remains is a memory-placement decision.
+
+**Where it would pay.**  A discrete GPU whose model leaves the state comfortable VRAM headroom (the 32 GiB
+cards with a 4B-12B model, i.e. most of this box's own runs): the snapshot costs VRAM instead of host RAM and
+the restore never materialises a host blob.  At 213 MiB that is ~7 ms / ~22 ms; at GB scale (a 100k-token
+dense KV) both paths are bandwidth-bound and the argument becomes **residency, not latency**.  On UMA
+(gfx1151) the latency win is a fraction of that — the pinned staging buffer is the same physical memory — but
+a snapshot that lives in VRAM does not add to the non-swappable host footprint, which is the trade
+`--host-experts pool` exists to manage.
+
+**What is missing before a server could use it.**
+
+1. `mem_storage` (`src/llama-context.h:508`) is a `std::map<seq_id, llama_memory_buffers>` with no erase
+   path, no budget and no participation in VRAM accounting: one snapshot per seq_id, retained until the
+   context is destroyed, invisible to `--fit`.
+2. The MoE arena interaction: a snapshot allocation that fails reaches `ggml_cuda_device_malloc`'s OOM
+   chain, whose last resort is freeing the expert arena — the wrong victim for a cache.
+3. `llama-memory-recurrent.cpp:974` refuses `ON_DEVICE` when the recurrent cell ranges are more than one, so a
+   hybrid/recurrent model's **interleaved** slot (the #210 lazy-idle-slot shape that `LLAMA_SERVER_PARK_IDLE_SLOTS`
+   and `--kv-unified` produce) cannot be saved over this path at all.
+4. `--kv-unified` / `seq_cp` sharing: "this slot's state" is not a cell range once two slots share cells (the
+   checkpoint work had to answer the same question), and the one-stage-per-context rule means a save and a
+   restore must not run concurrently.
+
+**If it is ever picked up**, the oracle is `tests/test-llama-context`'s `cp_d` / `cp_d_s` for the copy itself
+(`-sm tensor`, 2 GPU), then the server path it becomes — `scripts/gate-state-pipe.sh` and
+`scripts/gate-ckpt-reuse.sh` are the closest existing models for "a restored state moves no token".  Records:
+`archive/work/state-device-path/RESOLUTION.md`, `benchmarks/2026-10-27-state-device-path.md`.
 
 ## 106. Issue #214's RDNA2 deep-context prefill residual — PLATFORM VALIDATION (waiting on the reporter)
 
