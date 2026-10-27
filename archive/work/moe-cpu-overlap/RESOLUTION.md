@@ -18,7 +18,7 @@ profile produced instead).
 `graph_compute` calls and ~12 000 node dispatches per token, ~13.5 ms of host time, and the CUDA/HIP
 graph never replays on this shape because the Meta rebuild moves node/source identities between
 otherwise-identical tokens.  That work is the new campaign
-[`wip/graph-replay-placement/`](../../../wip/graph-replay-placement/README.md) (`TODO #107`), and it is
+[`archive/work/graph-replay-placement/`](../graph-replay-placement/README.md) (`TODO #107`, closed by r149), and it is
 where the same 2× R9700 / Flash-Next IQ4_NL shape continues.
 
 **Delivered in r144 from this session** (both are diagnostics; no kernel, no numerics, no default):

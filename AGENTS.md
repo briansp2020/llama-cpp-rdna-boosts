@@ -166,7 +166,7 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
 - **Naming (V2.1):** the current set is **15 blocks, 00-14** (block 14 is the temporary `-sm relaxed-tensor`
   block, see `patches/README.md`; release `release.json .release` —
-  `v15-6050b467c-r148` at the 2026-10-25 re-base; the value lives in `release.json`, never here).  Every `block NN`
+  `v15-6050b467c-r149`; the value lives in `release.json`, never here).  Every `block NN`
   reference elsewhere in this file that is not one of the V2.1 numbers below is the **pre-V2.1 16-block
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,
   **03** chunked GDN, **04** BF16 KV, **05** FA band/native/derived, **06** MMB, **07** k-quant,
@@ -627,11 +627,32 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   MiB/device floor) — so `TODO #36` (CPU/GPU overlap for the misses) was **retired**, while the token is
   dispatch-bound: 297 `graph_compute` calls / 12 258 node dispatches per token at 1.1 us/node = 13.5 ms of
   host time, with 93 % of calls refused replay (`direct=56171 replay=3152 properties_changed=55321` over
-  200 tokens) because the Meta rebuild moves node `src[]` object addresses, then inline `name`, then a
-  genuine source `data` pointer.  Do **not** "fix" that by relaxing the property comparison alone: it
-  enables recaptures (`hipGraphExecDestroy`+`Instantiate` per token on HIP) and measures **slower**
-  (28.3 vs 35.2 t/s).  Campaign, gates and traps: `wip/graph-replay-placement/`, `TODO #107`; records
-  `archive/work/moe-cpu-overlap/`, `WORKLOG.md` 261026.001.
+  200 tokens).  Do **not** "fix" that by relaxing the property comparison alone: it enables recaptures
+  (`hipGraphExecDestroy`+`Instantiate` per token on HIP) and measures **slower** (28.3 vs 35.2 t/s).
+  Records `archive/work/moe-cpu-overlap/`, `WORKLOG.md` 261026.001.
+- **A graph-cache key must name every dimension a subgraph varies in, and a replay's property compare is
+  the only safety net (r149, TODO #107).**  The r144 census above was a **cache-key collision**: under a
+  split mode every layer's subgraph begins on the *same* activation buffer, so `(first node data,
+  n_tokens)` sent all of them to one entry and each layer was compared against the **previous layer's**
+  properties (which is why the first differing byte was `src[]`, offset 152, and why the "genuine `data`
+  move" appeared only after canonicalising it — both were the collision).  The key now carries the
+  subgraph's **weight identity** + a structural signature (`GGML_CUDA_GRAPH_KEY_WEIGHT`, on; `=0` restores
+  the old key): 2x R9700 x8 Flash-Next IQ4_NL `-sm tensor -ncmoe 48`, 2000-token decode **37.7 -> 42.8
+  t/s (+13.5 %)**, `properties_changed` 452439 -> 28; +12.0 % at 3 devices, +1.4-2.0 % with a draft, flat on
+  1 GPU / 2-3-device dense / `-sm layer`.  **Never** add a fingerprint that moves across a rebuild (an
+  object address, an allocation pointer, a generation counter) — that is the r115 trap from the other
+  direction — and **never** weaken `ggml_cuda_graph_update_required` (an identity-free compare measured
+  +0.2-0.3 % and is not shipped; an executable whose baked arguments point at re-placed buffers is a
+  silent wrong-answer bug).  A captured graph bakes **raw device pointers that are not tensor sources**
+  (the expert cache's arena slot table, remap staging, routing staging and both heat mirrors), so freeing
+  any of a table's device buffers must bump `ggml_cuda_graph_mem_freed` — put it in the helper that returns
+  the memory, not in the caller.  **Known loss:** a 3-device tensor-split **dense plain** decode is 6-9 %
+  slower now that replay works; `GGML_CUDA_ALLREDUCE=internal` removes it, so it is the hybrid NCCL comm
+  layer or the node-level stream overlap a graph cannot express (`TODO #109`).  Records
+  `archive/work/graph-replay-keys/` (the PR assessment, the corrected diagnosis) plus
+  `benchmarks/2026-10-26-graph-replay-keys.md` (the numbers).
+  Read the census as: `direct ≈ 0`, `replay ≈ calls`, `properties_changed` in the tens, `capture` = the
+  number of distinct keys (hundreds — one graph per layer per width, not recaptures).
 - **On 2+ devices `-sm tensor` is not just "the tuned path", it is worth tens of percent at low residency
   (r144).**  2x R9700 on the x8 root ports, Flash-Next IQ4_NL `-ncmoe 48`, 2000-token decode: **35.5 t/s
   (`tensor`) vs 25.7 (`layer`) = +38 %** at the same expert hit rate (99.74 % vs 99.48 %), so the cost is

@@ -1,6 +1,17 @@
 # Graph replay under the Meta backend: make the decode graph replay (placement identity)
 
-**Status: OPEN, scoping complete (2026-10-26, r144).**  `TODO #107`.  Origin: the O0 measurement of the
+**Status: CLOSED (2026-10-26, r149).**  `TODO #107` is closed and the fix shipped in **block 09**: the graph
+cache key now carries the subgraph's weight identity, so a split graph's per-layer subgraphs no longer
+share one cache entry and decode replays (2x R9700 x8, Flash-Next IQ4_NL `-sm tensor -ncmoe 48`, 2000-token
+decode: 37.7 -> 42.8 t/s, **+13.5 %**; `direct=549499 replay=31696 properties_changed=452439` ->
+`direct=3882 replay=574826 properties_changed=28`).  Rule: `patches/README.md` (block 09),
+`ENVIRONMENT.md` (`GGML_CUDA_GRAPH_KEY_WEIGHT`), `TODO #109` for the 3-device dense residual.  The campaign
+record, including the PR assessment and the measurements that corrected this note's diagnosis, is
+[`../graph-replay-keys/README.md`](../graph-replay-keys/README.md).
+
+The rest of this file is the **original scoping note** (2026-10-26, r144), preserved because its diagnosis
+section is wrong in an instructive way: read §2 together with the correction in
+[`../graph-replay-keys/README.md`](../graph-replay-keys/README.md) §2.  Origin: the O0 measurement of the
 retired MoE-miss campaign (`archive/work/moe-cpu-overlap/FINDINGS-2026-10-26.md` §4-§5), which found the
 token dispatch-bound with the captured graph never replayed.
 

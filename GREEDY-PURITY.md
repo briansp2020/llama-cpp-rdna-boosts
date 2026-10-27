@@ -123,6 +123,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§59** | a fused window must read a tensor the graph keeps alive for it — the one the emitter pins — never an unpinned ancestor whose last graph use runs *before* the window; and a fusion of a norm must reduce in the *same grouping* as the kernel it replaces, or it is only approximately that kernel | fix (r140 + r141, issue #226) |
 | **§60** | a reduction-order change is a new numerics reference: one reduction (the strided one), and every fused norm kernel reduces like the chain it replaces | doctrine (r145, issue #229) |
 | **§61** | a fused op must reproduce the *model's own chain*, not its fused sibling: an intermediate tensor's scale convention belongs to the emitter, so a pair of fused ops that agree with each other can still be wrong — and the arms they select into are the oracle | fix + doctrine (r148, issue #228) |
+| **§62** | a captured graph is pure only while its **key** names every dimension the subgraph varies in and its **property compare** still sees every baked pointer: a cache key is not a guard, and an identity-free compare is not "purity-neutral" — it is the removal of the only check that a replay's baked kernel arguments still point at the tensors they were captured from | doctrine (r149, TODO #107; `archive/work/graph-replay-keys/`) |
 
 ---
 
@@ -1793,3 +1794,26 @@ the delivery had right does not move: the BF16-hc default's greedy text is **bit
 vs **31.73** with both arms off (+8.7 %), prefill flat; IQ4_NL 34.49/34.35 and Q5_K 33.80/33.57 (parity,
 the chain-mixer class).  Release record: `WORKLOG.md` 261026.006 (r148); op contract:
 `patches/README.md` (block 11); switch catalogue: `ENVIRONMENT.md` §7.4.
+
+## 62. A replay is pure only while its identity is complete: the key must name the layer, and the property compare stays strict (r149, TODO #107)
+
+A HIP/CUDA captured graph bakes every kernel launch argument: device pointers, shapes and the kernel
+choice.  Replaying it is therefore *exactly* the direct node loop — same kernels, same arguments, same
+numerics — but **only** while the property comparison can prove that nothing it baked has moved.
+
+r149 closed `TODO #107` with the other half of that sentence.  The graph-cache key was
+`(first node data, n_tokens)`, and under a split mode every layer's subgraph begins on the same activation
+buffer, so all layers shared one entry and each was compared against the previous layer's properties — a
+source `data` pointer that had moved by one layer's worth of weights.  The key must name the layer (the
+weight it reads, plus a structural signature); the compare stays strict.  Both were measured: the key is
+worth **+13.5 %** on a 2x R9700 `-ncmoe` decode, and the identity-free compare the upstream PR offered
+alongside it **+0.2-0.3 %** — not a trade worth making, because that compare is the only thing standing
+between a replay and a silent wrong answer.
+
+Two corollaries that cost real time to learn:
+* **A fingerprint that moves across a rebuild is worse than no fingerprint** (r115's object-address key, and
+  PR #106 patch 0002's data-pointer key): it fragments the cache and turns replays into recaptures.
+* **A raw device pointer passed as a kernel launch parameter is invisible to the compare.**  The expert
+  cache hands the MoE kernels its arena slot table, remap staging, routing staging and both heat mirrors
+  that way, so freeing any of them must bump `ggml_cuda_graph_mem_freed` — in the *helper* that returns the
+  memory, so a new free site cannot forget.

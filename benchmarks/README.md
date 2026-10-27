@@ -24,6 +24,18 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-10-26 — decode graphs replay: the graph-cache key must name the layer, not only the activation (r149, TODO #107 closed)
+
+**`WORKLOG.md` 261026.007** + [`2026-10-26-graph-replay-keys.md`](2026-10-26-graph-replay-keys.md) —
+`ggml_cuda_graph_key` was `(first node data, n_tokens)`, and under a split mode every layer's subgraph can
+begin on the same activation buffer, so one entry served them all and each layer was compared against the
+previous layer's properties.  The key now also carries the subgraph's **weight identity** and a structural
+signature.  2x R9700 x8, Flash-Next IQ4_NL `-sm tensor -ncmoe 48`, 2000-token decode: **37.7 -> 42.8 t/s
+(+13.5 %)** and `properties_changed` 452439 -> 28; +12.0 % on the same shape at 3 devices, +1.4-2.0 % with a
+draft, flat on 1 GPU / 2-3-device dense / `-sm layer` / `llama-bench tg128`; **-6..-9 % on a 3-device
+tensor-split dense *plain* decode**, which `GGML_CUDA_ALLREDUCE=internal` removes (`TODO #109`).  Text is
+byte-identical in 10/10 config pairs and draft acceptance is bit-identical; prefill KLD 0.000000.
+
 ## 2026-10-26 — the qwen4exp HC fused ops must reproduce the model's chain, and the arms are the oracle (r148, issue #228)
 
 **`WORKLOG.md` 261026.006** + [`2026-10-26-hc-fusion-arms.md`](2026-10-26-hc-fusion-arms.md) —
@@ -75,7 +87,7 @@ Two conclusions worth keeping: **the expert misses are not the cost** (14x small
 `graph_compute` calls / 12 258 node dispatches per token = 13.5 ms of host time, with the decode graph
 captured but never replayed (93 % `properties_changed`; hence `DISABLE_GRAPHS` costs nothing).  Also:
 `-sm tensor` is **+38 %** over the `-sm layer` CLI default on this shape.  Follow-up: `TODO #107` /
-`wip/graph-replay-placement/`.
+`archive/work/graph-replay-placement/` (closed by r149's graph-cache key).
 
 ## 2026-10-25 — the expert cache at a model teardown (block 12, r143)
 

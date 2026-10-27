@@ -1,5 +1,100 @@
 # WORKLOG - dated delivery records
 
+## 261026.007 (r149) -- the graph-cache key names the layer, so decode graphs replay (TODO #107 closed; PR #230 assessed and re-cut)
+
+**Release:** `v15-6050b467c-r149` (base `6050b467c`, canonical tip `947fdf295`, tree
+`423a59a605a9c0532d62f1c66345dc28687fcf81`, 15 blocks).  Delta against the r148 tree: **3 files, +114/-6**,
+all in **block 09** -- `ggml/src/ggml-cuda/common.cuh` (the key), `ggml/src/ggml-cuda/ggml-cuda.cu` (the
+three key helpers) and `ggml/src/ggml-cuda/moe-expert-cache.cu` (graph invalidation on a table's device
+frees).  No kernel, no numerics, no default and no allocation changes.
+
+### The defect: the key collided across every layer of a split graph
+
+`ggml_cuda_graph_key` was `(first node data, n_tokens)`.  Under a split mode every layer's subgraph can
+begin on the **same** activation buffer (the subgraphs are structurally identical and their inputs do not
+overlap in lifetime), so one cache entry served all of them and each layer was compared against the
+*previous layer's* properties: a source `data` pointer that had "moved" by one layer's worth of weights.
+The graph was then run directly, or recaptured, on nearly every call -- which is the r144 finding
+(`direct=56171 replay=3152 properties_changed=55321` over 200 tokens).  **The r144 note's stated cause order
+was wrong in an instructive way**: it read the first differing byte of a collision as "the Meta rebuild
+moves `src[]` object addresses" (`src[]` precedes `data` in `ggml_tensor`, so a collision always shows
+there first), and the "genuine source `data` move" that appeared after canonicalising `src`/`name` was the
+neighbouring layer's weights -- the same collision again.  This is `briansp2020`'s **PR #230** finding, and
+it is correct.
+
+### Shipped
+
+1. **The key carries the weight identity** (`GGML_CUDA_GRAPH_KEY_WEIGHT`, on; `0` restores the old key).
+   `first_weight_ptr` is the data of the first device-resident weight the subgraph reads (falling back to
+   `nodes[0]->src[0]` when the experts are host-resident), and `shape_sig` is a cheap FNV mix of the node
+   count, the first node's geometry and first source, the last node's data, and the first/last node names
+   (a layer's `ffn_moe_gate-5`).  The key only *selects* an entry: a replay still requires
+   `ggml_cuda_graph_update_required` to find every node unchanged, so a collision costs a recapture and
+   never a mismatched replay.
+2. **Freeing any of a table's device buffers invalidates the captured graphs on that device.**  The MoE
+   kernels receive the arena slot table, the remap staging, the prefill routing staging and the two heat
+   mirrors as **raw launch parameters**, so nothing in the property compare sees them.
+   `ggml_cuda_graph_mem_freed()` is now bumped in `free_arena_backing` and `free_heat_dev_locked` (the
+   helpers that return the memory) and once in `free_table_buffers_locked`, `stand_down_table_locked` and
+   `moe_cache_update_host`'s device move, plus `moe_cache_release_arena`'s legacy `cudaFree` arm.  Before
+   this the hole was masked: on this shape the decode graph never replayed.
+
+**Not shipped from the PR:** its second half, an identity-free property compare that blanks
+`src[]`/`view_src`/`buffer` before the memcmp.  Measured with the key fix held constant it is worth
+**+0.2-0.3 %** (42.6 vs 42.8 and 112.8 vs 113.1 t/s; `properties_changed` 340/2054 vs 28/1588) and on a
+3-device dense split it only moves the capture count (1161 -> 915) without changing the result, so it is
+not worth weakening the replay's only safety check.  Its `GGML_CUDA_GRAPH_PROPS_STRICT` knob also parsed as
+presence (`=0` enabled it).  Both points are in the PR reply and in
+[`archive/work/graph-replay-keys/README.md`](archive/work/graph-replay-keys/README.md).
+
+### Numbers (2x R9700 x8; `benchmarks/2026-10-26-graph-replay-keys.md`)
+
+| arm | r148 | r149 | delta |
+|---|---:|---:|---:|
+| Flash-Next IQ4_NL 2 GPU `-sm tensor -ncmoe 48`, plain, n2000 (3 pairs) | 37.7 / 37.7 / 37.6 | 42.5 / 42.9 / 42.8 | **+13.5 %** |
+| Flash-Next 3 GPU `-ncmoe 48`, plain, n1000 | 37.6 | 42.1 | **+12.0 %** |
+| Flash-Next 2 GPU `-ncmoe 48` + MTP n3, n2000 | 111.5 | 113.1 | +1.4 % |
+| Flash-Next 3 GPU `-ncmoe 48` + MTP n3, n1000 | 107.1 | 109.2 | +2.0 % |
+| 27B Q8_0 1 GPU Protocol A plain / draft-mtp | 29.6 / 70.2 | 29.7 / 70.0 | flat (acceptance identical) |
+| 27B Q8_0 3 GPU tensor + MTP n3 | 42.8 | 42.9 | flat (acceptance 0.82386 both) |
+| 35B-A3B 1 GPU `tg128` / Protocol A plain / draft-mtp | 101.8 / 82.0 / 174.5 | 101.7 / 81.2 / 174.1 | flat (acceptance 0.75118 both) |
+| 27B Q8_0 3 GPU tensor plain `tg128` (and at d16384) | 42.0 (42.1) | 38.4 (38.3) | **-8.6 %** -- `TODO #109` |
+
+The census on the flagship arm: `direct=549499 replay=31696 capture=149 properties_changed=452439` ->
+`direct=3882 replay=574826 capture=2636 properties_changed=28`; `GGML_CUDA_DISABLE_GRAPHS=1` measures 37.3
+t/s on both builds, so the whole delta is the replay, and both kill switches restore stock exactly
+(census and t/s).  The 1-GPU arm also replays now (`properties_changed` 78215 -> 146 on 35B-A3B) but is
+GPU-bound, so it is flat -- worth recording, because it means the churn was never multi-device-specific.
+
+### The regression that is not this patch's to fix (`TODO #109`)
+
+Now that replay works, a **3-device tensor-split dense** plain decode is slower (`-8.6 %`, above).  It is
+not capture churn (one-shot per key, and the deficit survives `-n 512`), not the chunk size, not the async
+input ring, not the scheduler's events; `GGML_CUDA_ALLREDUCE=internal` removes it (42.2) and `=nccl` is
+worse still (35.6), while neither `GGML_CUDA_AR_SMALL_BYTES` arm moves it -- so it is the hybrid NCCL comm
+layer (merely initialised) or the node-level stream overlap a captured graph cannot express.  A
+`draft-mtp` draft hides it (flat at 3 devices), 3-device **MoE** is the +12 % win, and 1/2-device dense and
+`-sm layer` are flat, so it is the dense plain-decode corner.  Shipped default-on with the number recorded
+rather than gated away: the kill switch is `GGML_CUDA_GRAPH_KEY_WEIGHT=0`.
+
+### Validation
+
+`validate-set.sh` green on a fresh tarball (15 blocks, tree `423a59a6`); `gate-per-block-build.sh --fast
+--changed-from 29b9d1197` **3/3** (09, 12, tip); prefill-logit KLD **0.000000 / 100.000 %**; same-seed
+greedy text **byte-identical in 10/10 config pairs** (27B 1 GPU, 2 GPU `-sm layer -ts 59,41`, 3 GPU
+tensor; 35B-A3B 2 GPU `-ncmoe 40`; Flash-Next IQ4_NL 2 GPU `-ncmoe 48` + MTP; Gemma4 E4B with and without
+its MTP draft) with `ROCBLAS_USE_HIPBLASLT=0`; Protocol A (`-n 3000`, prose) on 27B Q4_K_XL 1 GPU and
+35B-A3B 1 GPU, MTP >= plain with identical acceptance; `test-backend-ops` 9/9 oracles; the parking gate
+PASS; `check-gpu-faults.sh` clean.  `gate-hc-fusions.sh` on Flash-Next IQ4_NL: the five hard HC arms are
+identical and the `dsv4_pre_chain` arm fails **identically on the r148 stock build**, i.e. pre-existing and
+untouched by this change.
+
+**Records:** [`archive/work/graph-replay-keys/README.md`](archive/work/graph-replay-keys/README.md) (the PR
+assessment, the corrected diagnosis and the gates) and
+[`archive/work/graph-replay-placement/README.md`](archive/work/graph-replay-placement/README.md) (the r144
+scoping note, closed).  Rule: `patches/README.md` (block 09), `ENVIRONMENT.md`
+(`GGML_CUDA_GRAPH_KEY_WEIGHT`).
+
 ## 261026.006 (r148) -- issue #228: the qwen4exp HC inject logit is the chain's 1/hc-scaled scatter logit, so the fused mixer and the fused combine agree with the model again
 
 **Release:** `v15-6050b467c-r148` (base `6050b467c`, canonical tip `df41660ce`, tree

@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r148`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r149`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -45,7 +45,7 @@ only as a rough shape.
 | 06 | `0006-…-block-06-MMB-quantized-prefill-GEMM` | MMB quantized prefill GEMM (+ r132: the per-arch dispatch keys on the running device, not the primary) | +2903 / −3 | 7 |
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping) | +5500 / −440 | 35 |
-| 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters) | +15081 / −525 | 65 |
+| 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231) | +4034 / −755 | 46 |
@@ -756,7 +756,10 @@ whatever VRAM is left.
   `cgraph_uid`, which forces the check), so a key collision costs a recapture, never a mismatched
   replay.  `GGML_CUDA_GRAPH_KEY_DATA=0` restores the object-address key.  This is *not* the dropped r25
   PR #106 patch 0002, which **added** data pointers to the object key and fragmented a warm cache.
-  Record: `../archive/work/graph-key-churn/`.
+  Record: `../archive/work/graph-key-churn/`.  The key gained a **weight identity + structural signature**
+  in r149 (above): the first-node `data` pointer alone still collides across the per-layer subgraphs of a
+  split graph, which is the defect that PR #106's key could not fix.  A key that does not name every
+  dimension a subgraph varies in is not a fix — that is the lesson both halves of this story teach.
 * **The copy callback is invoked again, so the upstream MoE cache works** (r99, TODO #56).  This block's
   rewrite of `ggml_backend_sched_copy_input` kept no `sched->callback_copy` call, and that call is the only
   driver of `llama_moe_cache::copy()`: with `--moe-cache-mib` set the slot map stayed `-1` while the graph had
@@ -909,7 +912,8 @@ whatever VRAM is left.
   and `common_init_result::take_draft_model` live in this block together, so the draft model is resident
   before the target context sizes the slab.  A caller and its definition must not be split across blocks.
 
-**Knobs.**  `MOE_EXPERT_CACHE_MIB` (auto default; `0` disables), `_MIN_MIB`, `_MIN_RES_PCT`,
+**Knobs.**  `GGML_CUDA_GRAPH_KEY_WEIGHT` (r149, kill-switch: `0` restores the first-node-only key),
+`MOE_EXPERT_CACHE_MIB` (auto default; `0` disables), `_MIN_MIB`, `_MIN_RES_PCT`,
 `_RESERVE_MIB`, `_AUX_RESERVE_MIB`, `_UNIFIED` (APU opt-in), `_VALIDATE*`, `MOE_EXPERT_HEATMAP[+_DIR]`,
 `MOE_HOST_POOL_MIB` / `MOE_HOST_POOL_FRAC`, `GGML_MOE_CACHE_MAX_TOK`, `GGML_MOE_GATHER_ONCE`,
 `GGML_CUDA_SLAB`/`_RESERVE_MIB`/`_HEADROOM_MIB`/`_MIN_ARENA_MIB`/`_RING_MIB`/`_CHUNK_MIB`,
@@ -939,7 +943,38 @@ tables), so every run printed `over ~0 tokens = 0.00 MiB/token`.  Do not "simpli
 the same config at 200 vs 2000 tokens) — quote the 2000-token number.  `GGML_CUDA_GRAPH_TRACE=1` also
 reports how every `graph_compute` call was served (`direct` / `replay` / `capture` /
 `properties_changed`); a large `direct` with a matching `properties_changed` means the replay identity is
-churning (`TODO #107`, `wip/graph-replay-placement/`) — it is not the same as "graphs are on".
+churning — it is not the same as "graphs are on".  Since r149 that churn is fixed for decode (see the
+next item) and the census to expect is `direct` ~= 0 with `properties_changed` in the tens.
+
+* **The graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs
+  replay (r149, TODO #107 closed).**  `ggml_cuda_graph_key` is (first node `data`, `n_tokens`) **plus
+  `first_weight_ptr` and `shape_sig`**.  Under `-sm tensor` every layer's subgraph can begin on the *same*
+  activation buffer (the subgraphs are structurally identical and their inputs do not overlap in
+  lifetime), so one cache entry served all of them: each layer was compared against the **previous
+  layer's** properties, the first differing member was a source `data` pointer that had "moved" by one
+  layer's worth of weights, and the graph was run directly or recaptured on nearly every call.  Measured
+  2x R9700 x8, Flash-Next IQ4_NL `-sm tensor -ncmoe 48`, 2000-token decode: `direct=549499 replay=31696
+  capture=149 properties_changed=452439` (37.7 t/s, and `GGML_CUDA_DISABLE_GRAPHS=1` the same 37.3, i.e.
+  the captures were worth nothing) -> `direct=3882 replay=574826 capture=2636 properties_changed=28`
+  (**42.8 t/s, +13.5 %**).  `GGML_CUDA_GRAPH_KEY_WEIGHT=0` restores the old key.
+  **The key is still only a key**: a replay requires `ggml_cuda_graph_update_required` to find every node
+  unchanged, so a collision costs a recapture and never a mismatched replay.  Do **not** add a fingerprint
+  that moves across a rebuild (an object address, an allocation pointer, a generation counter) to it —
+  that is the r115 trap from the other direction, and a `.size()`-unbounded key set is bounded now only by
+  the context's 10 s unused-graph sweep.
+  **Deliberately not shipped:** the upstream PR's second half, an identity-free property compare (blank
+  `src[]`/`view_src`/`buffer` before the memcmp).  It is worth **0.2-0.3 %** on top of the key
+  (`42.6/112.8` vs `42.8/113.1` t/s; `properties_changed` 340/2054 vs 28/1588), and on a 3-device dense
+  split it only moves the capture count (1161 -> 915) without changing the outcome, so it is not worth
+  weakening the replay's only safety check.
+* **Freeing any of a table's device buffers invalidates the captured graphs on that device (r149).**  The
+  expert cache hands the MoE kernels **raw device pointers** as launch parameters — the arena slot table,
+  the remap staging, the prefill routing staging, and the two heat mirrors — and none of them is a tensor
+  source, so `ggml_cuda_graph_update_required` cannot see a change in them.  `ggml_cuda_graph_mem_freed()`
+  is therefore bumped in `free_arena_backing`, `free_heat_dev_locked`, `free_table_buffers_locked`,
+  `stand_down_table_locked` and `moe_cache_update_host`'s device move.  Before r149 this was masked (a
+  decode graph on this shape never replayed); now that it does, a new free site must bump too, and the
+  right place is the **helper** that returns the memory, not the caller.
 
 ---
 

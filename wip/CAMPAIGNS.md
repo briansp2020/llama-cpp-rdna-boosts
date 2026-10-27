@@ -21,7 +21,17 @@ is the signature of a stub, not of a campaign.
 | directory | what | status |
 |---|---|---|
 | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED (2026-09-26) — rebased and building, fully RDNA4-gated, but **gate 2 failed** (the fp8 4B is 0.69x Q8_0 where cllm had 1.16x, because the delivery's MMB/GEMM work made Q8_0 +32 % and the fp8 WMMA path did not follow).  Resume actions are in `PLAN.md`.  Not closed — paused behind the delivery work |
-| [`graph-replay-placement/`](graph-replay-placement/README.md) | the decode graph is captured but never replayed under the Meta backend (`-ncmoe` + the cache): make the replay identity stable, or the recapture cheap | OPEN / scoping complete (TODO #107, r144) — measured `direct=56171 replay=3152 properties_changed=55321` over 200 tokens, i.e. 93 % of `graph_compute` calls run the node loop directly (~13.5 ms of host dispatch in a 28.4 ms token, up to +40 % on the table).  The three identity churn causes, four candidate directions, the gates and the instrumentation are in the campaign's `README.md` |
+
+**Shipped (2026-10-26, r149, block 09 — `TODO #107` closed).**  `graph-replay-placement/` left `wip/` for
+[`archive/work/graph-replay-placement/`](../archive/work/graph-replay-placement/README.md) and its fix
+shipped: the graph-cache key now carries the subgraph's weight identity, so a split graph's per-layer
+subgraphs stop sharing one entry and decode replays.  **+13.5 %** on 2x R9700 x8 Flash-Next IQ4_NL
+`-sm tensor -ncmoe 48` (37.7 -> 42.8 t/s), +12.0 % on the same shape at 3 devices, +1.4-2.0 % with a
+`draft-mtp` draft, flat on 1/2/3-device dense, `-sm layer` and `llama-bench tg128`; a 3-device
+tensor-split **dense plain** decode still loses 6-9 % (carried as `TODO #109`, with the
+`GGML_CUDA_ALLREDUCE=internal` lead).  The campaign record — including the assessment of
+`briansp2020`'s PR #230, which found the diagnosis, and the reasoning for dropping its identity-free
+compare half — is [`archive/work/graph-replay-keys/`](../archive/work/graph-replay-keys/README.md).
 
 **Retired (2026-10-26, r144 — `TODO #36`, no delivery feature).**  `moe-cpu-overlap/` left `wip/` for
 [`archive/work/moe-cpu-overlap/`](../archive/work/moe-cpu-overlap/RESOLUTION.md) at the maintainer's call:
