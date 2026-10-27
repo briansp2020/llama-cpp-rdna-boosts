@@ -98,7 +98,7 @@ amendment, or a note in the relevant record).
 | `TODO.md` | **forward-looking only**: open items, items waiting on someone else, accepted limitations, parked ideas. A closed item is one `WORKLOG.md` entry — never a TODO entry. `#NN` numbers are permanent handles and are never reused |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims); dated narratives/evidence are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
 | `patches/` | **the delivery set** (0000-0014: block 00 + blocks 01-14) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
-| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback, **deterministic commit ids**), `fork-refresh.sh` (the release-time fork refresh: re-cut, tree/tip check, optional build/gates/push — the `.tip` rule below), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-park-idle-slots.sh` (the server idle-slot parking gate: park == lazy-off text + the indexer cache moves with the attention cache, issue #227), `gate-hc-fusions.sh` (the qwen4exp hyper-connection fusion-equivalence gate: all four mix/combine arms must reproduce the unfused chain, once per hc-down weight class, issue #228), `gate-state-pipe.sh` (the batched state save/restore gate: the pipelined / plain-memcpy-copy / pipelining-off / save-only / synchronous arms must restore byte-identical text, and it is the only gate that reaches that code), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out), `check-windows-portability.sh` (fails on a POSIX-only call outside a Windows-excluding region in a file the delivery adds, issue #231; run by `validate-set.sh`). **Index: `scripts/README.md`** |
+| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback, **deterministic commit ids**), `fork-refresh.sh` (the release-time fork refresh: re-cut, tree/tip check, optional build/gates/push — the `.tip` rule below), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-park-idle-slots.sh` (the server idle-slot parking gate: park == lazy-off text + the indexer cache moves with the attention cache, issue #227), `gate-hc-fusions.sh` (the qwen4exp hyper-connection fusion-equivalence gate: all four mix/combine arms must reproduce the unfused chain, once per hc-down weight class, issue #228), `gate-ckpt-reuse.sh` (the context-checkpoint reuse gate: a kept restored checkpoint changes no token, and only a hybrid/recurrent target reaches the keep path), `gate-state-pipe.sh` (the batched state save/restore gate: the pipelined / plain-memcpy-copy / pipelining-off / save-only / synchronous arms must restore byte-identical text, and it is the only gate that reaches that code), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out), `check-windows-portability.sh` (fails on a POSIX-only call outside a Windows-excluding region in a file the delivery adds, issue #231; run by `validate-set.sh`). **Index: `scripts/README.md`** |
 | `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
 |  `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
 | `prompts/` | versioned, hash-stable test prompts; sizes/token counts/**sha256** in `prompts/README.md`. A shipped prompt is **never edited in place** (add a new file); a result is only valid against the prompt hash it names |
@@ -626,6 +626,23 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   decode window, which a park changes).  Never park a cache whose cells another cache indexes by cell number without
   moving that cache — r136 matched hybrid-idx through its `llama_memory_hybrid` base and left the indexer behind,
   which aborted the server on the model's own guard.  `GREEDY-PURITY.md` §57; gate: `scripts/gate-park-idle-slots.sh`.
+
+- **A context checkpoint that a task just restored is not saved again (r155, PR #236, block 12,
+  `LLAMA_SERVER_CKPT_REUSE`).**  A prompt that resumes from a cached prefix used to restore a checkpoint and then
+  write the identical state back at the same position before its first batch (and again near the prompt end); each
+  save allocates, zero-fills and faults in a host buffer of the recurrent state's size (150 MiB on 27B, 174 MiB with
+  its DFlash2 draft).  A slot remembers the restored checkpoint's `n_tokens`; when a checkpoint lands at that same
+  position nothing has been decoded since, so it is kept (moved to the back of the list, the ordering a re-save
+  produces) and the buffers of dropped checkpoints are recycled (4 in total, largest kept).  No arithmetic and no KV
+  cell moves: greedy text is byte-identical, and only the TTFT of a resuming request moves (25-100 ms here, 195-223
+  ms on the submitter's DDR4 host, which is page-fault bound).  **Two invariants for anyone editing
+  `create_checkpoint()`:** the keep is valid only because the restore re-established *everything* a save would
+  capture, so a new per-checkpoint payload must be restored (not only saved) or it must be stashed before the keep
+  check; and the guard is `n_tokens_ckpt_restored` alone, so a new task-entry path that skips the
+  `SLOT_STATE_STARTED` reset must set it (it is also cleared in `server_slot::reset()`).  The keep path only fires
+  on a **hybrid/recurrent** target, whose memory reports `pos_min == pos_max` (one recurrent cell carries the last
+  position); on a dense or SWA memory a restore lands at `pos_max` = `n_tokens - 1`, one token short, so nothing is
+  re-saved at the same position and only the buffer reuse applies.  Gate: `scripts/gate-ckpt-reuse.sh`.
 - **The band's two query-width blocks must share one geometry (r134, issue #224, block 05).**  A band block
   splits each Q column's KV rows `np = nwarps*cols_per_warp/ncols` ways (`cols_per_warp` is 16 for the RDNA4
   256-dim WMMA tiles), so the 32-column block (widths 1..4, 8 warps) is `np = 4` and the 64-column block
@@ -1014,6 +1031,14 @@ second cache, `LLAMA_SERVER_PARK_IDLE_SLOTS`) needs `scripts/gate-park-idle-slot
 park/unpark request sequence and requires the parking arm to be byte-identical to
 `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`, with the moves traced. Neither of the gates above reaches parking — it
 is inert in `llama-cli`/`llama-bench`/`llama-perplexity` (issue #227 was invisible to both).
+
+A change to the **server's context-checkpoint path** (`create_checkpoint()`, the restore selection,
+`common_prompt_checkpoint`, `LLAMA_SERVER_CKPT_REUSE`) needs `scripts/gate-ckpt-reuse.sh`: it drives a long
+prompt plus three resumptions on a hybrid model in the two arms and requires byte-identical greedy text, the
+keep arm to have kept and the eager arm to have superseded, and fewer checkpoints created.  It SKIPs on a
+config that makes no usable checkpoint (a dense/SWA target restores at `pos_max` = `n_tokens - 1`, so nothing
+is re-saved at the same position).  No other gate creates or restores a context checkpoint, and a wrong keep
+is a wrong answer on the *next* resume rather than a crash.
 
 A change to a **qwen4exp hyper-connection** op, its chain or a matcher that fuses it needs
 `scripts/gate-hc-fusions.sh MODEL.gguf`: the four `LLAMA_FUSED_HC_MIX` x `LLAMA_FUSED_HC_COMBINE` arms (plus

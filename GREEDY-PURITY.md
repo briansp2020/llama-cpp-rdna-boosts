@@ -125,6 +125,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§61** | a fused op must reproduce the *model's own chain*, not its fused sibling: an intermediate tensor's scale convention belongs to the emitter, so a pair of fused ops that agree with each other can still be wrong — and the arms they select into are the oracle | fix + doctrine (r148, issue #228) |
 | **§62** | a captured graph is pure only while its **key** names every dimension the subgraph varies in and its **property compare** still sees every baked pointer: a cache key is not a guard, and an identity-free compare is not "purity-neutral" — it is the removal of the only check that a replay's baked kernel arguments still point at the tensors they were captured from | doctrine (r149, TODO #107; `archive/work/graph-replay-keys/`) |
 | **§63** | a verify batch is only as cheap as its *widest* sequence set: aligning the sequences of one step into one ubatch changes a slot's verify width, so the text-level oracle is the single-sequence arm and a verify-width control, never a two-slot text diff | fix + doctrine (r153, issue #234; `archive/work/spec-align-234/`) |
+| **§64** | a restored state may stand in for a fresh save only because the restore re-establishes *everything* a save would capture: the guard is the position alone, so a new per-checkpoint payload must be restored (or stashed before the keep check), and the path only exists where a restore lands on the checkpoint's own position (a hybrid/recurrent memory) | doctrine (r155, PR #236; `archive/work/server-ckpt-reuse/`) |
 
 ---
 
@@ -1884,3 +1885,41 @@ is owed on the arms where the width does not change (single-sequence, single-slo
 control; a cross-width text difference is a new per-config reference, not a defect.  It is still worth knowing
 that a multi-slot server upgraded across such a change can produce different -- equally valid -- text, which is
 why the delivery's release note says so rather than a gate failing.
+
+---
+
+## 64. A restored context checkpoint may stand in for a fresh save only because the restore re-establishes everything that save would capture (r155, PR #236)
+
+A hybrid/recurrent memory cannot roll back, so the server keeps **context checkpoints** and a prompt that
+resumes from a cached prefix restores one.  It used to restore a checkpoint and then write the identical state
+back at the same position before its first batch, which is pure waste (a fresh host buffer of the recurrent
+state's size, 150 MiB on 27B).  Since r155 the checkpoint is kept instead (`LLAMA_SERVER_CKPT_REUSE`, on).
+
+Two rules make that sound, and both are constraints on *future* edits rather than on this one:
+
+* **The restore must re-establish everything a save captures.**  The keep is not "the checkpoint was not
+  invalidated"; it is "the live state equals the checkpoint".  `common_prompt_checkpoint` currently carries the
+  target's `PARTIAL_ONLY` state, the draft context's state and the drafter's stashed spec state, and the restore
+  sets all three (the spec state through `common_speculative_set_state`).  A new per-checkpoint payload must be
+  restored too, or stashed *before* the keep check, or the kept checkpoint silently describes a state the live
+  context does not have - a wrong answer on the **next** resume, not a crash, which is why the gate compares the
+  two arms' text rather than looking for a failure.
+* **The guard is a position, so it must be invalidated by anything that moves the state.**  `n_tokens_ckpt_restored`
+  is cleared by the task's own `SLOT_STATE_STARTED` entry, by `server_slot::reset()` and by the first
+  `create_checkpoint()`; a decode in between advances the position and cannot match.  A checkpoint whose
+  `data_tgt` is empty restored nothing (`load_tgt()` is a no-op for it) and is refused as a keep source.
+
+And one scope fact worth recording, because it decides where a measurement can see the change: the keep only
+fires on a **hybrid/recurrent** target.  `llama_memory_hybrid::seq_pos_min()` is the max of the two caches'
+minima and the recurrent cache's single cell carries the last processed position, so the sequence reports
+`pos_min == pos_max`, `pos_next` becomes the checkpoint's own `n_tokens`, and the first checkpoint of the
+resumed task lands exactly there.  On a dense or SWA memory `pos_next = pos_max = n_tokens - 1`: the new
+checkpoint is one token short, no re-save happens at the same position either way, and only the *buffer
+recycling* half applies.  `scripts/gate-ckpt-reuse.sh` SKIPs in that case instead of passing vacuously, and it
+fails unless the two arms differ in the **mechanism** (kept and never superseded / superseded and never kept),
+not only in the timings.
+
+Purity is therefore conditional on the restore being faithful, and the evidence is the arms: 36 requests over
+six configurations (1 GPU and 2 slots + parking on the 4B, 27B + DFlash2 at 2 GPU `-sm layer`, 3 GPU
+`-sm tensor`, with 16- and 128-token generations, plus a slot save/restore round trip) are **byte-identical**,
+and the r154 build reproduces the switch-off text.

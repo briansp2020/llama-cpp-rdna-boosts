@@ -1,5 +1,74 @@
 # WORKLOG - dated delivery records
 
+## 261027.006 (r155) -- PR #236: the server keeps the context checkpoint a task just restored instead of saving it again, and recycles the buffers of dropped checkpoints (block 12)
+
+**Shipped:** `v15-6050b467c-r155` (block **12** amended).  `release.json`: tip **`0ba2387f6`** (the fork branch
+tip, reproduced by `fork-refresh.sh`), tree **`5c941ec661ac1b8c0b4fd0636a495c38a9cbd981`**; `validate-set.sh`
+green (fresh-tarball strict apply 15/15).  Contributed by **@overdoingism** (PR #236, one `git am` file touching
+only `tools/server/server-context.cpp`).  Record: [`archive/work/server-ckpt-reuse/`](archive/work/server-ckpt-reuse/RESOLUTION.md).
+
+**1. What it fixes (a server latency bug, not a kernel).**  On a hybrid/recurrent (or SWA) model the memory
+cannot roll back, so the server saves **context checkpoints** and a prompt that resumes from a cached prefix
+restores one.  It then saved the *identical* state again at the same position before its first batch (the log
+line is `superseding context checkpoint`) and once more near the end of the prompt; each save allocates,
+zero-fills and page-faults a fresh host buffer of the recurrent state's size (**150 MiB** on Qwen3.8-27B,
+**174 MiB** with its DFlash2 draft, 50 MiB on the 4B).  A slot now remembers the `n_tokens` of the checkpoint
+its task restored; when a checkpoint lands at that position nothing has been decoded since the restore, so the
+checkpoint already holds the current state - it is moved to the back of the list (the ordering a re-save
+produces) and **kept**, with the spec state the restore re-applied, instead of being written again.  The
+buffers of erased, superseded and invalidated checkpoints are kept (4 in total, the largest kept) and an
+exact-size one is taken by the next checkpoint, so a save is only the copy.  `LLAMA_SERVER_CKPT_REUSE=0`
+restores the eager behaviour; no arithmetic and no KV cell moves.
+
+**2. Why the keep is valid, and why it is a hybrid fix.**  `common_prompt_checkpoint` carries the target's
+`PARTIAL_ONLY` state (for a hybrid memory: the recurrent state, not the attention cells), the draft context's
+state and the drafter's stashed spec state.  The restore sets exactly that payload and then `seq_rm()`s beyond
+the checkpoint's extent, so a fresh save would write the same bytes back.  The guard can only match on a
+**hybrid/recurrent** target: `llama_memory_hybrid::seq_pos_min()` is the max of the two caches' minima and the
+recurrent cache's single cell carries the last position, so the sequence reports `pos_min == pos_max` and the
+restore lands at the checkpoint's own `n_tokens`; for a dense/SWA memory `pos_next = pos_max = n_tokens - 1`, the
+new checkpoint is one token short, and only the buffer recycling applies.  Upstream's restore arithmetic, not
+this change, but it decides where the headline win exists.
+
+**3. Delivery hardening on top of the PR** (both no-ops on every arm measured): `n_tokens_ckpt_restored` is
+also cleared in `server_slot::reset()`, so the invariant does not rest on every task entering the
+`SLOT_STATE_STARTED` branch (a TTS task already skips it); and the keep path refuses a checkpoint whose
+`data_tgt` is empty, which `load_tgt()` treats as a no-op and which therefore can never stand in for the live
+state.  Reported to the submitter rather than silently changed.  `data_spec` (eagle3-only, one `n_embd` row) is
+not recycled - not worth a spare slot.
+
+**4. Measured (gfx1201, ROCm 10.1.0; every arm's greedy text byte-identical between the two switch settings).**
+Prompt time of the request that resumes from a checkpoint, ms off -> on: 4B 1 GPU **45.1 -> 31.4**, 40.0 ->
+28.7, 46.4 -> 32.4; the same at 2 slots `--kv-unified` with idle-slot parking **43.4/42.2/44.6/42.2/43.9 ->
+29.3/28.7/28.3/27.3/27.7**; 27B + DFlash2 2 GPU `-sm layer` **197.1 -> 163.2**, 186.9 -> 161.9, 144.1 -> 112.0,
+187.6 -> 126.7 (and with 128-token generations 198.7 -> 162.3, 193.1 -> 147.2, 142.2 -> 110.7, 189.4 -> 128.3);
+3 GPU `-sm tensor` **407.9 -> 373.6**, 291.2 -> 236.2, 182.4 -> 142.0, 251.7 -> 150.6.  The same logs read
+`superseding` 3 times off against `keeping` 3 times on, and create **9** checkpoints off against **6** on.
+**36 requests over 6 configurations are byte-identical**, including a `POST /slots/N?action=save|restore` round
+trip (same saved file size, same restored text) which the PR lists as uncovered; `LLAMA_SERVER_CKPT_REUSE=0` on
+the r155 build reproduces the pre-r155 log transitions and text, and the r154 build reproduces the switch-off
+text.  RSS +0.15 GiB (4B) / +0.45 GiB (27B) for the spares.  The win is page-fault bound, as the submitter says:
+25-100 ms here (9950X3D, DDR5, THP) against their 195-223 ms (3900X, DDR4, 4 KiB pages).
+
+**5. New gate: `scripts/gate-ckpt-reuse.sh`.**  A long prompt plus three resumptions on a hybrid model, two
+arms, and it fails unless the greedy text is byte-identical, the keep arm kept a restored checkpoint and never
+superseded one while the eager arm did the opposite, the keep arm created fewer checkpoints, and nothing aborts
+or faults a GPU.  It **SKIPs** (rather than passing vacuously) when the config makes no usable checkpoint, or
+when the keep path is unreachable (a dense/SWA target restores at `pos_max`).  **No other gate creates or
+restores a context checkpoint**, and a wrong keep is a wrong answer on the *next* resume, not a crash - the same
+argument that produced the parking gate and the state gate.
+
+**6. Gates (r155 tree).**  Coherence 4B Q8_0 3 GPU **`1c5d32ac537d`** and 35B-A3B 2 GPU `-ncmoe 10`
+**`627b2ebd7792`**, both == r154; `gate-ckpt-reuse.sh` PASS; `gate-park-idle-slots.sh` PASS (park == lazy-off
+4/4); `gate-state-pipe.sh` PASS 5/5 (every restored cycle byte-identical to `LLAMA_STATE_ASYNC=0`);
+`gate-spec-align.sh` PASS (2 GPU 109.4 -> 142.6 t/s, 3 GPU 87.6 -> 135.5, host experts 117.3 -> 149.1, splits
+58 -> 0, mixed arm inert 100.5 -> 100.9); `gate-hc-fusions.sh` PASS 7/7 (BF16-hc class); `gate-prefill-logits.sh`
+PASS **0.000000 / 100.000 %**; MTP Protocol A prose `-n 3000` `plain == draft-mtp` byte-identical (11066 chars
+sha `33885f8c27bf`) and the four-axis adaptive arms 54.4 / 70.0 / 74.1 / 81.4 t/s plus mixed 56.0; per-block
+build `--fast --changed-from 08c471959` **2/2**; `check-gpu-faults.sh` clean.  The r155 tree differs from r154
+**only** in `tools/server/server-context.cpp` (1 file, 87 insertions), so every decode/prefill kernel and the
+binary content of `libllama`/`libggml` are unchanged by construction.
+
 ## 261027.005 (r154) -- issue #234 follow-up: the verify-batch alignment stays inside the drafter whose caps it changes (r153's generic cut was a -6 % regression on the n-gram-first chain)
 
 **Shipped:** `v15-6050b467c-r154` (block **02** amended).  What r153 shipped was correct for the case it was

@@ -1,4 +1,4 @@
-From dc3489aea31d12fb3e5966fc379a50972f8586eb Mon Sep 17 00:00:00 2001
+From a9396a712f17711e0a58bd14e8cb6ab29fe3a0e9 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/14] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -191,6 +191,36 @@ side isolated by LLAMA_STATE_ASYNC_READ=0), `test-llama-context` keeps an identi
 `rollback`, a slab/VRAM property of this box, on 1 GPU and 2 GPU tensor, as r151), coherence 4B Q8_0
 `1c5d32ac537d` / 35B-A3B 2 GPU `627b2ebd7792` equals the r151 tree, and the prefill-logit KLD is 0.000000 /
 100.000 %.
+
+Fold (r155, PR #236, overdoingism): keep the context checkpoint a task just restored, and reuse the buffers of
+dropped checkpoints.  A prompt that resumes from a context checkpoint (a hybrid/recurrent model reusing a cached
+prefix) restored the checkpoint and then saved the identical state again at the same position before its first
+batch ("superseding"), and saved one more near the end of the prompt; each save allocates, zero-fills and faults
+in a fresh host buffer of the recurrent state's size (150 MiB on Qwen3.8-27B, 174 MiB with the DFlash2 draft).
+A slot now remembers the n_tokens of the checkpoint its task restored; when a checkpoint lands at that same
+position, nothing has been decoded since the restore, so the checkpoint already holds the current state: it is
+moved to the back of the list (the ordering a re-save produces) and kept instead of being written again, and its
+spec state (data_spec) is the one the restore re-applied.  The buffers of erased, superseded and invalidated
+checkpoints are kept (4 in total, the largest kept) and an exact-size one is taken by the next checkpoint, so a
+save is only the copy.  LLAMA_SERVER_CKPT_REUSE=0 restores the eager behaviour.  There are no arithmetic changes
+and no KV cell moves, so output is unchanged.  Delivery hardening on top of the PR: n_tokens_ckpt_restored is also
+cleared in server_slot::reset(), so the invariant does not rest on every task entering the SLOT_STATE_STARTED
+branch, and the keep path refuses a checkpoint whose data_tgt is empty (load_tgt is a no-op for such a checkpoint,
+so it can never stand in for the live state).
+
+Measured (gfx1201, ROCm 10.1.0; every arm's greedy text compared byte for byte against LLAMA_SERVER_CKPT_REUSE=0
+on the same build).  Prompt time of a request that resumes from a checkpoint, -ms off -> on: Qwen3.5-4B (hybrid,
+50.3 MiB state) 1 GPU 45.1 -> 31.4, 40.0 -> 28.7, 46.4 -> 32.4; the same at 2 slots --kv-unified with the
+idle-slot parking 43.4/42.2/44.6/42.2/43.9 -> 29.3/28.7/28.3/27.3/27.7; Qwen3.8-27B UD-Q4_K_XL + DFlash2 n-max 5
+(checkpoint 149.6 + 21.3 MiB) 2 GPU -sm layer 197.1 -> 163.2, 186.9 -> 161.9, 144.1 -> 112.0, 187.6 -> 126.7, and
+with a 128-token decode 198.7 -> 162.3, 193.1 -> 147.2, 142.2 -> 110.7, 189.4 -> 128.3; 3 GPU -sm tensor 407.9 ->
+373.6, 291.2 -> 236.2, 182.4 -> 142.0, 251.7 -> 150.6.  The same log reads "superseding" 3 times off against
+"keeping" 3 times on and creates 9 checkpoints off against 6 on.  Text is byte-identical in every one of the 36
+requests across those 6 pairs plus a slot save/restore endpoint round trip (which the PR lists as uncovered and
+which is unchanged in both saved file size and text).  Resident memory +0.15 GiB (4B) and +0.45 GiB (27B), i.e. the
+4 spares.  The saves are cheaper on this box than on the submitter's (DDR4, 4 KiB pages), which is why the win is
+25-100 ms here against their 195-223 ms TTFT; the mechanism and the direction are the same.  Gates: see the
+r155 record.
 ---
  common/arg.cpp                                |    5 +-
  common/common.cpp                             |    9 +
@@ -234,11 +264,11 @@ side isolated by LLAMA_STATE_ASYNC_READ=0), `test-llama-context` keeps an identi
  src/llama-model.h                             |   13 +-
  src/llama.cpp                                 |    4 +
  src/models/dflash.cpp                         |   89 +-
- tools/server/server-context.cpp               |  130 +-
+ tools/server/server-context.cpp               |  218 +-
  tools/server/server-task.cpp                  |   74 +-
  tools/server/server-task.h                    |   11 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 46 files changed, 4323 insertions(+), 757 deletions(-)
+ 46 files changed, 4410 insertions(+), 758 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 5be48e428..4c2e0fa63 100644
@@ -6932,10 +6962,29 @@ index 8b6d6abdb..696812526 100644
          ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
          inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 6790efe2f..bc79a3031 100644
+index 6790efe2f..d8e83c73f 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1120,6 +1120,27 @@ private:
+@@ -298,6 +298,9 @@ struct server_slot {
+     llama_tokens spec_prompt;
+     std::vector<int32_t> spec_i_batch;
+     common_prompt_checkpoint spec_ckpt;
++
++    // n_tokens of the context checkpoint this task restored, while nothing has been decoded since (-1: none)
++    int64_t n_tokens_ckpt_restored = -1;
+     bool spec_is_replay = false;
+     std::mt19937 spec_synth_rng;
+ 
+@@ -425,6 +428,8 @@ struct server_slot {
+ 
+         spec_is_replay = false;
+ 
++        n_tokens_ckpt_restored = -1;
++
+         last_nl_pos    = 0;
+         generated      = {};
+         has_new_line   = false;
+@@ -1120,6 +1125,71 @@ private:
  
      std::unique_ptr<server_prompt_cache> prompt_cache;
  
@@ -6960,10 +7009,54 @@ index 6790efe2f..bc79a3031 100644
 +    }();
 +    int park_supported = -1; // -1: not asked yet
 +
++    // LLAMA_SERVER_CKPT_REUSE (on unless 0): a context checkpoint is not saved again at the position it was just restored
++    // from, and the buffers of dropped checkpoints are kept for the next one of the same size, so a prompt that resumes
++    // from a checkpoint does not allocate and fault in fresh buffers of the recurrent state's size (150 MiB on
++    // Qwen3.8-27B) before its first token
++    const bool ckpt_reuse = [] {
++        const char * e = getenv("LLAMA_SERVER_CKPT_REUSE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
++    std::vector<std::vector<uint8_t>> ckpt_spare;
++
++    void ckpt_recycle(common_prompt_checkpoint & ckpt) {
++        if (!ckpt_reuse) {
++            return;
++        }
++        for (auto * v : { &ckpt.data_tgt, &ckpt.data_dft }) {
++            if (v->empty()) {
++                continue;
++            }
++            if (ckpt_spare.size() < 4) {
++                ckpt_spare.push_back(std::move(*v));
++            } else {
++                auto it = std::min_element(ckpt_spare.begin(), ckpt_spare.end(),
++                        [](const auto & a, const auto & b) { return a.size() < b.size(); });
++                if (it->size() < v->size()) {
++                    *it = std::move(*v);
++                }
++            }
++            *v = {};
++        }
++    }
++
++    // a spare of exactly n bytes: no new allocation and no zero fill when the checkpoint is written into it
++    std::vector<uint8_t> ckpt_take(size_t n) {
++        for (auto it = ckpt_spare.begin(); it != ckpt_spare.end(); ++it) {
++            if (it->size() == n) {
++                std::vector<uint8_t> v = std::move(*it);
++                ckpt_spare.erase(it);
++                return v;
++            }
++        }
++        return {};
++    }
++
      server_metrics metrics;
  
      // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-@@ -1886,9 +1907,21 @@ private:
+@@ -1886,9 +1956,21 @@ private:
  
                  const int64_t t_start = ggml_time_us();
  
@@ -6986,7 +7079,7 @@ index 6790efe2f..bc79a3031 100644
                      ret->prompt_clear();
                  }
  
-@@ -1901,18 +1934,105 @@ private:
+@@ -1901,18 +1983,105 @@ private:
          return ret;
      }
  
@@ -7093,7 +7186,79 @@ index 6790efe2f..bc79a3031 100644
          for (auto & slot : slots) {
              if (slot.is_processing()) {
                  continue;
-@@ -3031,7 +3151,11 @@ private:
+@@ -2693,6 +2862,28 @@ private:
+     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+         const int id_task = slot.task->id;
+ 
++        // nothing decoded since this task restored the checkpoint at this position: it already holds the current state
++        {
++            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
++            const bool    unchanged    = ckpt_reuse && n_tokens_new == slot.n_tokens_ckpt_restored;
++            slot.n_tokens_ckpt_restored = -1;
++            if (unchanged) {
++                // a checkpoint that carries no target state was never a restore source (load_tgt is a no-op for it),
++                // so it cannot stand in for the current state either
++                auto it = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
++                        [&](const auto & cur) { return cur.n_tokens == n_tokens_new && !cur.data_tgt.empty(); });
++                if (it != slot.prompt.checkpoints.end()) {
++                    common_prompt_checkpoint ckpt = std::move(*it);
++                    slot.prompt.checkpoints.erase(it);
++                    ckpt.id_task = id_task;
++                    ckpt.update_pos(n_tokens_new, pos_min, pos_max);
++                    slot.prompt.checkpoints.push_back(std::move(ckpt));
++                    SLT_TRC(slot, "keeping the context checkpoint just restored at n_tokens = %" PRId64 " (nothing decoded since)\n", n_tokens_new);
++                    return;
++                }
++            }
++        }
++
+         // evict checkpoints within min-step of a previous checkpoint, unless they were
+         // created by the current task
+         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
+@@ -2704,6 +2895,7 @@ private:
+                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+ 
++                ckpt_recycle(*it);
+                 it = slot.prompt.checkpoints.erase(it);
+                 continue;
+             }
+@@ -2714,11 +2906,12 @@ private:
+ 
+         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+             // make room for the new checkpoint, if needed
+-            const auto & cur = slot.prompt.checkpoints.front();
++            auto & cur = slot.prompt.checkpoints.front();
+ 
+             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+ 
++            ckpt_recycle(cur);
+             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+         }
+ 
+@@ -2728,6 +2921,7 @@ private:
+             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                 if (it->n_tokens == n_tokens_new) {
+                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
++                    ckpt_recycle(*it);
+                     it = slot.prompt.checkpoints.erase(it);
+                 } else {
+                     ++it;
+@@ -2744,6 +2938,12 @@ private:
+         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+ 
++        if (ckpt_reuse) {
++            cur.data_tgt = ckpt_take(llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++            if (ctx_dft) {
++                cur.data_dft = ckpt_take(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++            }
++        }
+         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+         // stash the draft's speculative state with the checkpoint
+@@ -3031,7 +3231,11 @@ private:
                          break; // drop the task
                      }
  
@@ -7106,6 +7271,40 @@ index 6790efe2f..bc79a3031 100644
                          for (auto & slot : slots) {
                              if (!slot.is_processing()) {
                                  SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+@@ -3930,6 +4134,8 @@ private:
+ 
+                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+ 
++                        slot.n_tokens_ckpt_restored = -1;
++
+                         if (spec) {
+                             common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->tokens.pos_next());
+                         }
+@@ -4183,6 +4389,8 @@ private:
+ 
+                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+ 
++                                    slot.n_tokens_ckpt_restored = -1;
++
+                                     if (!do_reset) {
+                                         // restore the context checkpoint
+                                         if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+@@ -4202,6 +4410,7 @@ private:
+ 
+                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
++                                        slot.n_tokens_ckpt_restored = it->n_tokens;
+                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                     }
+ 
+@@ -4220,6 +4429,7 @@ private:
+                                     const auto & cur = *it;
+                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
+                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
++                                        ckpt_recycle(*it);
+                                         it = slot.prompt.checkpoints.erase(it);
+                                     } else {
+                                         ++it;
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
 index d7ac2a1dc..0104e6ac0 100644
 --- a/tools/server/server-task.cpp

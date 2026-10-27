@@ -48,7 +48,7 @@ only as a rough shape.
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214) | +12124 / −4887 | 75 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
-| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231) | +4034 / −755 | 46 |
+| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236) | +4034 / −755 | 46 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
 
@@ -1513,6 +1513,38 @@ had no other home.
   `LLAMA_STATE_TIMING=1` logs the enqueue/copy split of each batched read and write.  Gate:
   `scripts/gate-state-pipe.sh`, whose `copy0` arm is the plain-`memcpy` A/B, gated byte-for-byte like every
   other arm.
+* **A restored context checkpoint is not saved again, and dropped checkpoints' buffers are recycled** (r155,
+  PR #236, `archive/work/server-ckpt-reuse/`).  On a hybrid/recurrent (or SWA) model the memory cannot roll
+  back, so the server saves a **context checkpoint** (`common_prompt_checkpoint`: the recurrent state plus the
+  draft context's state and the drafter's stashed spec state) and a prompt that resumes from a cached prefix
+  restores one.  It used to restore the checkpoint and then write the identical state straight back at the
+  same position before its first batch (log: `superseding context checkpoint`), and again near the end of the
+  prompt; each save allocated, zero-filled and faulted in a fresh host buffer of the recurrent state's size
+  (150 MiB on 27B, 174 MiB with its DFlash2 draft).  A slot now remembers the `n_tokens` of the checkpoint its
+  task restored; when a checkpoint lands at that same position nothing has been decoded since the restore, so
+  that checkpoint already holds the current state - it is moved to the back of the list (exactly the ordering a
+  re-save produces) and kept, with the spec state the restore re-applied, instead of being written again.  The
+  buffers of erased, superseded and invalidated checkpoints are kept (4 in total, the largest kept) and an
+  exact-size one is taken by the next checkpoint, so a save is only the copy.  `LLAMA_SERVER_CKPT_REUSE=0`
+  restores the eager behaviour.  No arithmetic and no KV cell moves.  **The keep path only fires on a
+  hybrid/recurrent target**: for a dense (or SWA) memory `seq_pos_min()` is the sequence's oldest cell, so a
+  restore lands at `pos_max` = `n_tokens - 1` and the first checkpoint of the task is one token short of the
+  restored one; a hybrid/recurrent memory reports `pos_min == pos_max` (its single recurrent cell carries the
+  last position), which is what makes the re-save land at the same `n_tokens`.
+  **The delivery's hardening on top of the PR:** `n_tokens_ckpt_restored` is also cleared in
+  `server_slot::reset()` (so the invariant does not depend on every task entering the `SLOT_STATE_STARTED`
+  branch), and the keep path refuses a checkpoint whose `data_tgt` is empty (`load_tgt` is a no-op for such a
+  checkpoint, so it can never stand in for the live state).
+  Measured (gfx1201, every arm's greedy text byte-identical between the switch's two settings): prompt time of a
+  request that resumes from a checkpoint - 4B 1 GPU 45.1 -> 31.4 / 40.0 -> 28.7 / 46.4 -> 32.4 ms, the same at
+  2 slots `--kv-unified` with idle-slot parking 43.4/42.2/44.6/42.2/43.9 -> 29.3/28.7/28.3/27.3/27.7 ms, 27B +
+  DFlash2 2 GPU 197.1 -> 163.2 / 186.9 -> 161.9 / 144.1 -> 112.0 / 187.6 -> 126.7 ms and 3 GPU `-sm tensor`
+  407.9 -> 373.6 / 291.2 -> 236.2 / 182.4 -> 142.0 / 251.7 -> 150.6 ms; the log reads `superseding` 3 times off
+  against `keeping` 3 times on and creates 9 checkpoints off against 6 on; RSS +0.15 GiB (4B) / +0.45 GiB (27B)
+  for the spares.  Text also unchanged across a slot save/restore endpoint round trip, which the PR lists as
+  uncovered.  Gate: `scripts/gate-ckpt-reuse.sh` (it is the only gate that reaches the keep path: no other
+  gate restores a context checkpoint, and the property it protects - a wrong `n_tokens_ckpt_restored` keeping a
+  state the live context does not match - is a wrong answer on the *next* resume, not a crash).
 * **Build time**: one FA template instantiation TU per `(ncols1, ncols2, head size)` instead of per
   `(ncols1, ncols2)` — same instantiations, grouped so the backend build is no longer one-file-bound.
 * **The expected `--fit` probe failure logs as a warning** (r101, campaign 0012): `--fit` builds the extra
@@ -1659,7 +1691,8 @@ had no other home.
 `GGML_CPU_MOE_OFFLOAD_THREADS`, `GGML_CUDA_SLAB_RING_MIB`, and (r111+, POOL mode) `MOE_HOST_POOL_MIB` /
 `MOE_HOST_POOL_FRAC` / `MOE_HOST_POOL_DIO` / `MOE_HOST_POOL_VERIFY` / `LLAMA_HOST_MASTER_PINNED`, plus
 (r113) `MOE_HOST_POOL_RAM_PCT` (default **85** since r114), (r114) `MOE_HOST_POOL_STAGE_BATCH` and
-(r130, server) `LLAMA_SERVER_LAZY_IDLE_SLOTS` / `LLAMA_SERVER_CACHE_REUSE`;
+(r130, server) `LLAMA_SERVER_LAZY_IDLE_SLOTS` / `LLAMA_SERVER_CACHE_REUSE`, (r155, server)
+`LLAMA_SERVER_CKPT_REUSE`;
 the heat prior's MHT2 sidecar is not a knob (an `MHT1` file is read as `dec = all`).
 `MOE_HOST_POOL_BGFETCH` was removed in r113.
 
