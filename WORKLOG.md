@@ -67,6 +67,13 @@ gate that reaches this code -- `llama-cli`/`llama-bench` never save a state, and
 save/restore goes through `llama_io_write_file`/`read_file`, which never touch `state_stage`.  Recorded in
 `MANIFESTS.md` (gate 8, and the renumbered graph-replay census to 9), `scripts/README.md` and `AGENTS.md`.
 
+**Confirmed on the released tree** (the numbers above were measured on the pre-fold arm build, whose
+`llama-context.{cpp,h}` code is identical; the fold added comments and re-cut the commit ids): 1 GPU
+`gate-state-pipe.sh` on the release build (`dc6a78d5c`, `--fast` per-block tip build) reads
+`PIPE_GROUPS=1` **70.2 ms** -> default **66.9 ms** (-4.6 %), save+load trace 45.7 -> 39.4 ms, with every
+identity check green, so the shipped tree is the gated one.  The 1-2 ms run-to-run spread on this arm is
+why the record quotes the direction and the range, not a single delta.
+
 **Post-release tooling fix.**  `scripts/gate-state-pipe.sh --help` printed only the first 58 lines of its
 header (fixed to `sed -n '2,/^set -uo/p'`), so `SUFFIX`, `EXTRA_ARGS` and `KEEPOUT` were missing from it.
 No patch, no tag change.
