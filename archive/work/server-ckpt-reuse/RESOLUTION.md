@@ -105,7 +105,11 @@ transitions exactly, and the unpatched r154 build reproducing the switch-off tex
   0ba2387f6` = 1 file, 87 insertions), which no decode path and no `libllama`/`libggml` TU reaches, so the
   decode/MTP kernels are unchanged by construction.  MTP Protocol A was still run: prose `-n 3000`,
   `plain == draft-mtp` byte-identical (**11066 chars, sha `33885f8c27bf`**), and the four-axis adaptive arms
-  (reasoning 54.4, prose 70.0, code 74.1, recall 81.4 t/s; mixed 56.0) plus the phase-switching prompt.
+  (reasoning 54.4, prose 70.0, code 74.1, recall 81.4 t/s; mixed 56.0) plus the phase-switching prompt.  A
+  `llama-server` four-axis acceptance check (1 GPU, `-c 32768 -fa on -ctk/-ctv bf16`, adaptive cap 3, 3000
+  tokens per axis) reads R 70.2 t/s accept 0.895 mean len 3.32, P 80.4 / 0.990 / 3.58, C 73.0 / 0.934 / 3.54,
+  K 84.1 / 1.000 / 3.65, i.e. healthy and in the expected order; it is a health check, not a like-for-like
+  comparison with the r154 record (different invocation, and `llama-cli` never prints the speculator's stats).
 * `scripts/gate-ckpt-reuse.sh` **PASS** (new gate; 3 keeps, 5 vs 8 checkpoints, text identical, no fault).
 * `scripts/gate-park-idle-slots.sh` **PASS** (park == lazy-off 4/4, 6 park + 2 unpark moves).
 * `scripts/gate-state-pipe.sh` **PASS** 5/5 arms (every restored cycle byte-identical to `LLAMA_STATE_ASYNC=0`).

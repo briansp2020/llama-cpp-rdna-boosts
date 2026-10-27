@@ -64,8 +64,13 @@ argument that produced the parking gate and the state gate.
 `gate-spec-align.sh` PASS (2 GPU 109.4 -> 142.6 t/s, 3 GPU 87.6 -> 135.5, host experts 117.3 -> 149.1, splits
 58 -> 0, mixed arm inert 100.5 -> 100.9); `gate-hc-fusions.sh` PASS 7/7 (BF16-hc class); `gate-prefill-logits.sh`
 PASS **0.000000 / 100.000 %**; MTP Protocol A prose `-n 3000` `plain == draft-mtp` byte-identical (11066 chars
-sha `33885f8c27bf`) and the four-axis adaptive arms 54.4 / 70.0 / 74.1 / 81.4 t/s plus mixed 56.0; per-block
-build `--fast --changed-from 08c471959` **2/2**; `check-gpu-faults.sh` clean.  The r155 tree differs from r154
+sha `33885f8c27bf`) and the four-axis adaptive arms 54.4 / 70.0 / 74.1 / 81.4 t/s plus mixed 56.0; a
+`llama-server` four-axis acceptance check (27B, 1 GPU, `-c 32768 -fa on -ctk/-ctv bf16`, adaptive cap 3, greedy,
+3000 tokens per axis, raw prompt files) **R 70.2 t/s accept 0.895 mean len 3.32 / P 80.4 / 0.990 / 3.58 /
+C 73.0 / 0.934 / 3.54 / K 84.1 / 1.000 / 3.65**, i.e. healthy and in the protocol's expected order (the r154
+record's acceptance numbers use a different invocation, so these are a health check, not a like-for-like
+comparison; `llama-cli` does not print the speculator's statistics at all); per-block build
+`--fast --changed-from 08c471959` **2/2**; `check-gpu-faults.sh` clean.  The r155 tree differs from r154
 **only** in `tools/server/server-context.cpp` (1 file, 87 insertions), so every decode/prefill kernel and the
 binary content of `libllama`/`libggml` are unchanged by construction.
 
