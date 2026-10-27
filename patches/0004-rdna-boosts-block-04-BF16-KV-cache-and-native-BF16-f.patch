@@ -1,4 +1,4 @@
-From 02c79b0664cc68cae0475a40e7ee6e1d0070439d Mon Sep 17 00:00:00 2001
+From c60827ac997960f635fadceba8390a69611e13e0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 04/14] rdna-boosts: block 04: BF16 KV cache and native-BF16

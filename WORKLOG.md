@@ -1,5 +1,81 @@
 # WORKLOG - dated delivery records
 
+## 261026.008 (r150) -- issue #232: the Meta backend's simple-tensor container grows instead of aborting
+
+**Release:** `v15-6050b467c-r150` (base `6050b467c`, tip `5122befa0`, tree `3a0c8f3ae663a5129c86e74def5c507ecfc5dbbe`,
+15 blocks, 09 amended).  Delta against the r149 tree: **2 files, +83/-10**, both in **block 09** --
+`ggml/src/ggml-backend-meta.cpp` (the container) and `ggml/src/ggml.c` (the overflow diagnostic).  No kernel, no
+numerics, no default and no allocation-size change on the normal path.
+
+### What was reported
+
+`MrDrMcCoy`, 8x R9700 / 4 GPUs per server, Flash-Next GSQ-RCO Q2_0 with a DFlash2 draft, `-c 524288 -np 2
+--kv-unified -ctk/-ctv bf16 --rope-scale 2`, `--fit on`, `-sm tensor`, `-sm layer`-free: after a ~258k-token
+prompt the server died in `llama-server` with
+
+```
+ggml.c:1840: GGML_ASSERT(obj_new) failed
+ggml_new_object: not enough space in the context's memory pool (needed 2261360, available 2260992)
+```
+
+`needed` is bigger than `available` (`mem_size`) by **exactly one `ggml_tensor` object** (368 B), so a
+`ggml_context` that holds only tensor metadata was *exactly full* and one more tensor was requested.
+
+### Diagnosis: it is the meta backend's compute container of the attention KV buffer
+
+`2260992 = 128 * 48 * 368`: the `compute_headroom * n_tensors * size(ggml_tensor)` context that
+`ggml_backend_meta_buffer_type_alloc_buffer_n` builds for a buffer with 48 static tensors, at 128 views each.
+A Flash-Next KV cache has exactly 48 (`12 layers * (K, V, k_stream, v_stream)`), confirmed on this box
+(`GGML_META_CTX_DEBUG` in a scratch build: `n_tensors = 48, compute ctx = 2260992 B (6144 views/simple)`).
+
+That container holds the per-device *simple tensors* of everything a "generation" registers between two graph
+rebuilds: a graph's own views **plus** the views an out-of-graph operation creates.  `llama_io_read_device`
+(state restore: one view per KV cache chunk per layer), `llama_kv_cache::park_move` (one per move chunk) and
+every graph shape contribute.  The container was a single fixed-size context per simple device, so it had a
+**cliff**: 6144 views for the attention KV buffer, then `ggml_new_object` returned NULL and the CPU-side
+`GGML_ASSERT` aborted the process (the pool `WARN` is not fatal in a `NDEBUG` build).  Measured on this box
+with the server: a 34,970-token context-checkpoint restore registers **432** views of the KV buffer
+(18 cell ranges x 24), a 2-slot 524288-cell unified-cache flow reaches 648 per generation — i.e. a
+long-context restore is ~0.012 views/token, and 258k tokens of restored state is ~3.1k views: two such
+restores plus the graph's own 216 exceed 6144.  The fix is therefore to remove the cliff, not to tune it.
+
+### Shipped
+
+* `ggml_backend_meta_simple_tensor_container` keeps a **list of contexts per simple backend**
+  (`ctx_for_new_tensor()`) and grows when the last one is full; a rebuild resets and **releases** every context
+  in the list, so one large generation does not pin its peak.  `ctx_first()` is used where the allocator needs
+  the context that holds the buffer's own tensors.  Allocation failure is a clear `GGML_ABORT` instead of a NULL
+  deref.
+* `GGML_META_COMPUTE_HEADROOM` (default 128) overrides the *first*-context size.  Diagnostic/testing only: a
+  smaller value makes the container grow sooner and never changes an output.  A growth is logged at DEBUG,
+  which is how the path was verified.
+* `ggml_new_object`'s overflow warning now also logs `ctx`, `mem_size`, `n_objects` and the bytes used, so a
+  report of this class is diagnosable from the log (the reporter's log could only say "needed/available").
+* Hardened in the same file while reading it: `get_node_aux()` asserts against its `nodes_aux` pool (its
+  ALL_GATHER sibling already did), so an over-budget graph reports instead of writing past the pool
+  (TODO #111, closed; unreachable on every recorded config).
+
+### Validation (3x R9700 gfx1201, ROCm 10.1.0, Flash-Next GSQ-RCO IQ3_XXS)
+
+* **The cliff, before vs after:** `GGML_META_COMPUTE_HEADROOM=1` aborts the r149 build at `sched_reserve`
+  (`needed 27232, available 26864`, the same `GGML_ASSERT(obj_new)`) and runs to completion on this build
+  (105 growth events, `llama-cli`), with **byte-identical greedy text** in both arms and against the r149 build
+  at the default headroom.
+* **No numeric change:** `llama-perplexity` (wikitext-2, `-c 2048 -ub 512`, 4 chunks, `-sm tensor -ncmoe 0`)
+  `PPL = 2.0901 +/- 0.05592` on both builds; same-seed greedy text identical on the 4k-context and
+  server flows (e.g. the two ~240k-token prompts of the 524288-cell 2-slot flow, parking + checkpoint
+  restores included).
+* **Set:** `validate-set.sh` green on a fresh tarball (15 blocks, tree `3a0c8f3ae`);
+  `gate-per-block-build.sh --fast --changed-from 947fdf295` **2/2** (block 09, tip).
+
+### Not done (recorded, not scoped in)
+
+The restore path still creates one view per KV cache *chunk* per layer (`llama_io_read_device` per `rinfo`),
+and `park_move` one per move chunk.  Both are now harmless (the container grows), but coalescing them
+(one view per tensor, chunks staged through scratch) would keep a generation's footprint at tens instead of
+thousands; it is a llama-context change with its own copy-path risk, so it is left alone.  The `nodes_aux` bounds check that was
+missing is added (above).
+
 ## 261026.007 (r149) -- the graph-cache key names the layer, so decode graphs replay (TODO #107 closed; PR #230 assessed and re-cut)
 
 **Release:** `v15-6050b467c-r149` (base `6050b467c`, canonical tip `947fdf295`, tree
