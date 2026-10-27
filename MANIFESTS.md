@@ -81,6 +81,9 @@ in CI.  The model-level gates are manual:
    a recorded known-good base.  **Required for any change to a prefill kernel** (GDN/SSM chunked, FA,
    MMQ/MMVF/MMB, MoE prefill) or to a default-on approximate path.  Protocol:
    [`benchmarks/prefill-logit-methodology.md`](benchmarks/prefill-logit-methodology.md).
+   The default arm is an **f16 KV cache**, which skips the quantized-cache prefill paths (the F16 FA staging
+   arena, `GGML_CUDA_FA_KV_NATIVE`'s tile read); a change to those also needs `--kv q8_0` (its own base file,
+   r156).
    A **kernel-family switch** (a new tile/WMMA head cap, e.g. block 05's RDNA3_0 head-512 rows) uses the
    script's `--family-switch` mode, which judges the same absolute limits **at a point inside the gate's
    calibrated domain** and always prints a same-kernel reordering control measured on the spot:

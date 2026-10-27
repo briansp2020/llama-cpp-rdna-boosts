@@ -25,7 +25,16 @@ point:
 ./scripts/gate-prefill-logits.sh --ab "GGML_CUDA_GDN_CHUNKED_BF16=0"   # exact-fallback A/B
 ./scripts/gate-prefill-logits.sh --ub 8 --record   # the captured-graph band gets its OWN base
 ./scripts/gate-prefill-logits.sh --ub 8            # ... and its own comparison (-ub 8 -b 8)
+./scripts/gate-prefill-logits.sh --kv q8_0 --record        # the quantized-KV prefill paths (r156)
+./scripts/gate-prefill-logits.sh --kv q8_0                 # ... and their own comparison
 ```
+
+**A quantized KV cache is a second point (r156, issue #237).**  The gate's default is an f16 cache, which
+**skips every quantized-cache prefill path**: the F16 FA prefill **staging arena**, `GGML_CUDA_FA_KV_NATIVE`'s
+tile read, and block 05's quantized arms.  `--kv TYPE` passes `-ctk/-ctv TYPE`, stores the base under its own
+name (`...-kvq8_0.kld`, with the type pinned in the meta) and is what a change to any of those must be judged
+against; the f16 base stays the release reference (the two points differ in base PPL: 5.9325 vs 5.9317 on the
+27B Q8_0 wikitext cell).
 
 `--record` writes a `$BASE.meta` sidecar (build ref, model, corpus sha256, ctx/chunks, base sha256, PPL)
 and refuses a compare whose model/corpus/settings do not match the base unless `--allow-base-mismatch`

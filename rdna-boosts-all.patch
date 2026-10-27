@@ -12309,7 +12309,7 @@ index 101afeba2..8ad5e807d 100644
              ggml_cuda_swap(dst_row[col], dst_row[ixj]);
          }
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 6b36ca90b..bbc4b68b2 100644
+index 6b36ca90b..8802351b6 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -40,6 +40,44 @@
@@ -12806,7 +12806,7 @@ index 6b36ca90b..bbc4b68b2 100644
          }
          it->second->last_used_time = time_now;
          return it->second.get();
-@@ -1511,8 +1850,722 @@ struct ggml_backend_cuda_context {
+@@ -1511,8 +1850,742 @@ struct ggml_backend_cuda_context {
          name(GGML_CUDA_NAME + std::to_string(device)) {
      }
  
@@ -13049,13 +13049,16 @@ index 6b36ca90b..bbc4b68b2 100644
 +    //
 +    // `size_hint`, when non-zero, is the eventual full size this arena will be asked for (the F16
 +    // size of the K/V view roots, capped per operand by GGML_CUDA_FA_STAGE_MAX_MB; computed by
-+    // launch_fattn).  When it is set and at least `size`, the arena is allocated once at that size
-+    // instead of climbing the 1.25x growth ladder: on Windows/WDDM a freed allocation stays
-+    // committed against the process, so the ladder strands roughly 5x the final arena over a deep
-+    // prefill.  The hint is only honoured when it stays within the optional-allocation free cap
-+    // (the slab-active guard) and is tried before the ladder, so on refusal or cudaMalloc failure
-+    // the existing growth step runs -- an oversized (or unbounded) hint can never cost more than
-+    // the pre-change path.  GGML_CUDA_FA_STAGE_PREALLOC=0 disables the hint (A/B and bisection).
++    // launch_fattn).  It is a ceiling on the growth, not a target: a growth aims for at most 4x the
++    // request that just arrived, so a shallow prompt does not commit the whole arena while a deep one
++    // still reaches the hint in a few steps -- on Windows/WDDM a freed allocation stays committed
++    // against the process, so the ladder must not climb 1.25x all the way (that strands roughly 5x
++    // the final arena over a deep prefill) and it must not jump to the hint on the first tiny
++    // request either (issue #237: 1 GiB per context on a 262144-token cache).  The hint is only
++    // honoured when it stays within the optional-allocation free cap (the slab-active guard), and
++    // the plain growth step still runs if it is refused or its cudaMalloc fails -- an oversized (or
++    // unbounded) hint can never cost more than the pre-change path.  GGML_CUDA_FA_STAGE_PREALLOC=0
++    // disables the hint (A/B and bisection).
 +    void * fattn_stage_try_get(int stream_no, size_t size, size_t size_hint = 0) {
 +        GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
 +        // wip/slab-transient-absorption: a slab-backed arena is only valid for the wide-phase generation
@@ -13073,24 +13076,39 @@ index 6b36ca90b..bbc4b68b2 100644
 +                const char * e = getenv("GGML_CUDA_FA_STAGE_PREALLOC");
 +                return e == nullptr || atoi(e) != 0;
 +            }();
++            const size_t cached    = fattn_stage_size[stream_no];
 +            const size_t new_size  = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
++            // Issue #237: the hint is the *eventual* full size, and it is a CEILING, not a target.  The
++            // first FA call of a large-context prefill asks for almost nothing (2 MiB at -ub 512 on a
++            // 262144-token cache), so honouring the hint unconditionally commits the whole arena on the
++            // first prefill ubatch: 1 GiB per context at the 512 MiB per-operand cap.  Until r125 only the
++            // target context reached this; since the draft KV follows -ctk the MTP draft context stages
++            // too, so a q8_0-KV config held 1 GiB more than the f16 draft KV it saved (issue #237).  So a
++            // growth aims for at most 4x the request that just arrived, never above the hint: a short
++            // prompt stays at the 16 MiB floor and a deep one climbs to the hint in <= 3 steps, which
++            // bounds the WDDM ladder stranding of issue #138 to ~1/3 of the final arena instead of 5x.
++            const size_t hint_step = (prealloc && size_hint >= size)
++                ? std::max<size_t>(size_t(1) << 24,
++                      std::min(size_hint, size > SIZE_MAX/4 ? SIZE_MAX : 4*size)) : 0;
++            const size_t want      = std::max(new_size, hint_step);
 +            // Outside bytes only: a slab-backed stream already reports through the work region.
 +            const size_t cur_total = fattn_stage_bytes() -
 +                (fattn_stage_slab[stream_no] ? 0 : fattn_stage_size[stream_no]);
-+            size_t alloc_size = new_size;
++            size_t alloc_size = want;
 +            char * new_arena = nullptr;
-+            if (getenv("GGML_CUDA_SLAB_STATS") != nullptr) {
-+                GGML_LOG_WARN("FA_STAGE dev=%d stream=%d size=%.1f MiB cached=%.1f MiB slab=%d\n",
-+                    device, stream_no, (double) size/1048576.0, (double) fattn_stage_size[stream_no]/1048576.0,
-+                    (int) fattn_stage_slab[stream_no]);
-+            }
++            const auto log_stage = [&](size_t alloc, bool slab) {
++                if (getenv("GGML_CUDA_SLAB_STATS") == nullptr) {
++                    return;
++                }
++                GGML_LOG_WARN("FA_STAGE dev=%d stream=%d request=%.1f MiB cached=%.1f MiB alloc=%.1f MiB slab=%d\n",
++                    device, stream_no, (double) size/1048576.0, (double) cached/1048576.0,
++                    (double) alloc/1048576.0, (int) slab);
++            };
 +            // wip/slab-transient-absorption: the FA staging arena is a WIDE-PHASE transient, so give it a
 +            // home in the slab's wide auxiliary region first.  That keeps it out of the headroom budget
 +            // (~762 MiB on the field GSQ config, more on a wide-ubatch config) and returns its bytes to
 +            // the arena on the prefill -> decode transition, exactly like the ring and the wide view.
 +            if (ggml_cuda_slab_active(device)) {
-+                const size_t want = (prealloc && size_hint >= size)
-+                                  ? std::max<size_t>(size_t(1) << 24, size_hint) : new_size;
 +                size_t gen = 0;
 +                void * p = ggml_cuda_slab_wide_aux_alloc(device, want, &gen);
 +                if (p != nullptr) {
@@ -13102,22 +13120,23 @@ index 6b36ca90b..bbc4b68b2 100644
 +                    fattn_stage_size[stream_no]     = want;
 +                    fattn_stage_slab[stream_no]     = true;
 +                    fattn_stage_slab_gen[stream_no] = gen;
++                    log_stage(want, true);
 +                    return p;
 +                }
 +                // Fall through: a wide verify below the ring's arming gate (9..16 rows) or a prefill that
 +                // ran before the narrow floor existed.  The raw allocation stays bounded by the G4 cap.
 +            }
-+            if (prealloc && size_hint >= size) {
-+                const size_t hint_size = std::max<size_t>(size_t(1) << 24, size_hint);
-+                if (optional_alloc_within_free_cap(cur_total + hint_size)) {
-+                    if (cudaMalloc(&new_arena, hint_size) == cudaSuccess) {
-+                        alloc_size = hint_size;
++            if (want > new_size) {
++                if (optional_alloc_within_free_cap(cur_total + want)) {
++                    if (cudaMalloc(&new_arena, want) == cudaSuccess) {
++                        alloc_size = want;
 +                    } else {
 +                        (void) cudaGetLastError(); // clear the sticky error, fall back to the growth step
 +                    }
 +                }
 +            }
 +            if (new_arena == nullptr) {
++                alloc_size = new_size;
 +                // fit-slab-accounting revival (G4): bound this optional transient by the free VRAM it would
 +                // still leave when the movable-boundary slab is active (see
 +                // `optional_alloc_within_free_cap`).  A refusal falls back to the native K/V read.
@@ -13152,6 +13171,7 @@ index 6b36ca90b..bbc4b68b2 100644
 +            }
 +            fattn_stage[stream_no]      = new_arena;
 +            fattn_stage_size[stream_no] = alloc_size;
++            log_stage(alloc_size, false);
 +        }
 +        return fattn_stage[stream_no];
 +    }
@@ -13529,7 +13549,7 @@ index 6b36ca90b..bbc4b68b2 100644
      ~ggml_backend_cuda_context();
  
      cudaStream_t stream(int device, int stream) {
-@@ -1548,6 +2601,40 @@ struct ggml_backend_cuda_context {
+@@ -1548,6 +2621,40 @@ struct ggml_backend_cuda_context {
      // pool
      std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
  
@@ -13570,7 +13590,7 @@ index 6b36ca90b..bbc4b68b2 100644
      static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(ggml_backend_cuda_context & ctx, int device, int stream_no);
  
      ggml_cuda_pool & pool(int device) {
-@@ -1562,12 +2649,60 @@ struct ggml_backend_cuda_context {
+@@ -1562,12 +2669,60 @@ struct ggml_backend_cuda_context {
      }
  };
  
@@ -13631,7 +13651,7 @@ index 6b36ca90b..bbc4b68b2 100644
      ggml_glu_op glu_op;
      float glu_limit = 0.0f;
      const ggml_tensor * shared_up = nullptr;
-@@ -1580,12 +2715,24 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1580,12 +2735,24 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -13656,7 +13676,7 @@ index 6b36ca90b..bbc4b68b2 100644
  };
  
  struct ggml_cuda_kernel_launch_params {
-@@ -1712,3 +2859,49 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+@@ -1712,3 +2879,49 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
      kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
      CUDA_CHECK(cudaGetLastError());
  }
@@ -14173,7 +14193,7 @@ index 2d0b3cfea..ecb0a13f6 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 41d948335..c07450741 100644
+index 41d948335..f8e596e6f 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -8,6 +8,51 @@
@@ -14852,7 +14872,7 @@ index 41d948335..c07450741 100644
      ggml_tensor * KQV = dst;
  
      GGML_ASSERT(Q->type == GGML_TYPE_F32);
-@@ -1011,12 +1583,119 @@ void launch_fattn(
+@@ -1011,12 +1583,121 @@ void launch_fattn(
      const int cc  = ggml_cuda_info().devices[id].cc;
      const int nsm = ggml_cuda_info().devices[id].nsm;
  
@@ -14912,11 +14932,13 @@ index 41d948335..c07450741 100644
 +    const bool stage_wants_V = !native_width && stage_cap_V && kv_native_V != FATTN_KV_NATIVE_NONE && !V_is_K_view;
 +    const size_t stage_req = (stage_wants_K ? stage_bytes_K : 0) + (stage_wants_V ? stage_bytes_V : 0);
 +    // Issue #138: the eventual full size of the staging arena is known from the F16 size of the K/V
-+    // view roots, capped per operand by GGML_CUDA_FA_STAGE_MAX_MB exactly as the request is.  Passing
-+    // it lets the arena allocate once instead of climbing its 1.25x growth ladder, which on
-+    // Windows/WDDM strands every freed step against the process (~5x the final arena over a deep
-+    // prefill).  With an unbounded cap (=0) no hint is passed: the full root can be many GiB and the
-+    // ladder stays the safer growth path there.
++    // view roots, capped per operand by GGML_CUDA_FA_STAGE_MAX_MB exactly as the request is.  It is
++    // passed as a CEILING on the arena's growth: on Windows/WDDM every freed step of the 1.25x
++    // growth ladder stays committed against the process (~5x the final arena over a deep prefill),
++    // so a growth jumps towards this size instead of climbing.  It must not be treated as a target
++    // for the first tiny request, though -- see `fattn_stage_try_get` and issue #237.  With an
++    // unbounded cap (=0) no hint is passed: the full root can be many GiB and the ladder stays the
++    // safer growth path there.
 +    size_t stage_hint = 0;
 +    if (stage_req != 0 && stage_max_bytes != 0) {
 +        auto full_bytes = [stage_max_bytes](const ggml_tensor * t) {
@@ -14976,7 +14998,7 @@ index 41d948335..c07450741 100644
  
      const char * K_data = (const char *) K->data;
      size_t nb11 = K->nb[1];
-@@ -1028,12 +1707,17 @@ void launch_fattn(
+@@ -1028,12 +1709,17 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -14997,7 +15019,7 @@ index 41d948335..c07450741 100644
          if (ggml_is_contiguously_allocated(K)) {
              to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
              to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-@@ -1056,7 +1740,7 @@ void launch_fattn(
+@@ -1056,7 +1742,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -15006,7 +15028,7 @@ index 41d948335..c07450741 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1066,8 +1750,13 @@ void launch_fattn(
+@@ -1066,8 +1752,13 @@ void launch_fattn(
              const size_t bs = ggml_blck_size(V->type);
              const size_t ts = ggml_type_size(V->type);
  
@@ -15022,7 +15044,7 @@ index 41d948335..c07450741 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1132,9 +1821,124 @@ void launch_fattn(
+@@ -1132,9 +1823,124 @@ void launch_fattn(
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -15147,7 +15169,7 @@ index 41d948335..c07450741 100644
      GGML_ASSERT(max_blocks_per_sm > 0);
      int parallel_blocks = max_blocks_per_sm;
  
-@@ -1169,7 +1973,29 @@ void launch_fattn(
+@@ -1169,7 +1975,29 @@ void launch_fattn(
          blocks_num.y = 1;
          blocks_num.z = 1;
  
@@ -15178,7 +15200,7 @@ index 41d948335..c07450741 100644
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1185,20 +2011,29 @@ void launch_fattn(
+@@ -1185,20 +2013,29 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -15211,7 +15233,7 @@ index 41d948335..c07450741 100644
              const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
              const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
  
-@@ -1247,28 +2082,44 @@ void launch_fattn(
+@@ -1247,28 +2084,44 @@ void launch_fattn(
  
      GGML_ASSERT(block_dim.x % warp_size == 0);
  
@@ -15260,7 +15282,7 @@ index 41d948335..c07450741 100644
              const int bpt         = nblocks_sk / ntiles_dst;
  
              const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
-@@ -1283,7 +2134,7 @@ void launch_fattn(
+@@ -1283,7 +2136,7 @@ void launch_fattn(
                  (float *) KQV->data, dst_tmp_meta.ptr,
                   Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                   gqa_ratio, bpt, fd0, fd1, fd2);

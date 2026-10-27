@@ -596,6 +596,20 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   be freed while a kernel that carries its address in its launch parameters is in flight
   (`moe_cache_sync_devices_locked`). `GREEDY-PURITY.md`/`archive/work/moe-cache-autosize/ARENA-UB-TENSION.md`
   §13-§14.
+- **The FA prefill staging arena's size hint is a CEILING, not a target (r156, issue #237).**  `launch_fattn`
+  passes the F16 size of the K/V view **roots** (per-operand capped by `GGML_CUDA_FA_STAGE_MAX_MB`, 512 MiB
+  default) so a growth step can jump towards the eventual size instead of climbing the 1.25x ladder -- on
+  Windows/WDDM a freed allocation stays committed, so the ladder strands ~5x the final arena (issue #138).
+  But the first FA call of a large-context prefill requests a couple of MiB (`-ub 512` on a 262144-token
+  cache), so allocating the hint there commits the whole arena up front: **1 GiB per context**, and since
+  r125 the MTP draft context stages too (its KV follows `-ctk`), which made a `q8_0` draft KV cost +544 MiB
+  against the f16 default it exists to save.  `fattn_stage_try_get()` therefore allocates
+  `min(hint, 4x the request that just arrived)` (never below the 16 MiB floor): a short prompt stays at
+  16-72 MiB, a deep one still reaches the hint in <= 3 steps.  Do not "simplify" it back to
+  `max(16 MiB, hint)`.  `GGML_CUDA_FA_STAGE_PREALLOC=0` is the ladder A/B arm; `GGML_CUDA_SLAB_STATS=1`
+  prints one `FA_STAGE … request=/cached=/alloc=` line per growth.  A change here is judged with
+  `scripts/gate-prefill-logits.sh --kv q8_0` (the f16 default never builds the arena).  `WORKLOG.md`
+  261027.007.
 - **The decode/verify band skips fully masked KV groups (r133, PR #223, block 05).**  `GGML_CUDA_FA_BAND_SKIP`
   (default on) lets the band consume the packed fully-masked-group bitmap the prefill path already builds, so
   the band keeps its tuned round-robin KV split (`block i` owns iterations `i, i+P, ...`) and only leaves out

@@ -1,5 +1,81 @@
 # WORKLOG - dated delivery records
 
+## 261027.007 (r156) -- issue #237: the FA prefill staging arena's size hint is a CEILING, not a target (block 10)
+
+**Shipped:** `v15-6050b467c-r156` (block **10** amended).  `release.json`: tip **`5bf09b93b`**, tree
+**`dc96d43cc294b95071a025776fbf5ccc917283ea`**; `validate-set.sh` green (fresh-tarball strict apply 15/15).
+Reported by **@DanoPTT** (issue #237).
+
+**1. What it fixes (a memory regression, not a kernel).**  Since r125 the MTP draft context's KV cache
+follows the main `-ctk` (issue #216), so a `-ctk/-ctv q8_0` config *stages* its draft attention where an f16
+draft cache never did.  #138's preallocation then committed the whole arena on the first prefill ubatch: the
+hint is the F16 size of the K/V view **roots** (capped at 512 MiB per operand), while the first request of a
+large-context prefill is a few MiB, so a `-c 262144` config allocated **1024 MiB per context** even though
+the whole 5k-token prompt needs ~20 MiB.  On the reporter's 1x R9700 that is `-480 MiB` of draft KV for
+`+1024 MiB` of arena, i.e. a q8_0-KV user ended up **+544 MiB** worse than the f16 default the change was
+supposed to beat.  Reproduced here on 1 GPU (Qwen3.5-4B-Q8_0, MTP n3, `-c 262144 -ctk/-ctv q8_0 -fa on -ub
+512 -b 1024`, the 5246-token prose prompt, peak VRAM from `rocm-smi`): **12744 MiB** (default q8_0 draft) vs
+**12200 MiB** (`-ctkd f16 -ctvd f16`) = **+544 MiB**, the reporter's number exactly, with
+`FA_STAGE size=2.0 MiB cached=0.0` printed for both contexts (target + draft).
+
+**2. The fix.**  `fattn_stage_try_get()` treats `size_hint` as a **ceiling on a growth step** rather than
+the allocation target: a growth now aims for `min(hint, 4x the request that just arrived)` (never below the
+16 MiB floor / 1.25x ladder), so a shallow prompt stays at 16-72 MiB and a deep one still reaches the hint in
+<= 3 steps.  That keeps both #138 properties (a bounded number of freed-then-reallocated steps on
+Windows/WDDM, where a freed allocation stays committed: the ladder's ~5x stranding becomes ~1/3 of the final
+arena) and removes the 512x overshoot.  The slab path takes the same `want`, the G4 free-cap refusal and the
+plain growth fallback are unchanged (an oversized hint still can never cost more than the pre-change path),
+and `GGML_CUDA_FA_STAGE_PREALLOC=0` still disables the hint entirely.  The `GGML_CUDA_SLAB_STATS`
+diagnostic now prints `request=… cached=… alloc=…` **after** the allocation (the reported arena size was the
+one thing the old line did not show).
+
+**3. Measured (gfx1201, ROCm 10.1.0, 1 GPU unless stated).**  Reproduction above, after the fix: **10840
+MiB** (q8_0 draft) vs **11248 MiB** (f16 draft) = **-408 MiB**, i.e. the q8_0 draft KV now keeps most of its
+480 MiB (the draft arena costs 72 MiB at this depth).  Arena allocations
+(`GGML_CUDA_SLAB_STATS=1`, 2 contexts, 5246-token prompt, `-c 262144`): `request=2.0 MiB -> alloc=16.0 MiB`
+then `request=18.0 -> alloc=72.0`, against 1024 MiB on the first ubatch before.  Deep prefix (`-c 131072`,
+105k-token prompt): 16 -> 72 -> 296 -> **512 MiB** (the hint) in lockstep for both contexts -- the same peak
+it reaches on its own today, just not from the first ubatch.  No prefill cost: the same 105k arm measures
+**2960.6 t/s** against the pre-fix build's **2938.7** (+0.7 %, and the ladder measured 1108.94 vs 1108.03 on
+r48), and 27B UD-Q4_K_XL `llama-bench` q8_0 KV **pp2048 1360.63 +/- 1.24 / pp16384 1248.93 +/- 0.78** vs
+**1356.65 +/- 1.18 / 1247.87 +/- 0.57**.  `--fit`'s projection is deliberately unchanged (it reserves the
+per-context *worst case*, `min(2*cap, F16 KV)`, which a full-context prefill really can reach).
+
+**4. New: `scripts/gate-prefill-logits.sh --kv TYPE` (default `f16`).**  The gate pinned an f16 KV cache,
+which **skips every quantized-cache prefill path** -- the F16 staging arena, `GGML_CUDA_FA_KV_NATIVE`'s tile
+read -- so a change to either was invisible to it (this release's own change included).  `--kv q8_0` now runs
+the same comparison with `-ctk/-ctv q8_0`, in its own base file (`…-kvq8_0.kld`) with the type pinned in the
+meta, and its candidate log carries `FA_STAGE request=4.0 MiB alloc=16.0 MiB` (the arena is exercised).  Do
+not fold it into the default: the f16 base is the recorded release reference, and a quantized cache is a
+different point (its base PPL is 5.9317 vs 5.9325 at f16).
+
+**5. Gates (r156 tree).**  Coherence 4B Q8_0 3 GPU `-sm tensor` **`1c5d32ac537d`** and 35B-A3B UD-Q4_K_M 2 GPU
+`-sm tensor -ncmoe 10` **`627b2ebd7792`** -- both == the r153/r155 build.  `gate-prefill-logits.sh`: f16
+**0.000000 / 100.000 %** and the new `--kv q8_0` arm **0.000000 / 100.000 %**, both against bases recorded
+from the pre-fix build (PPL 5.9325 / 5.9317).  MTP: Protocol A prose `-n 3000` `plain == draft-mtp`
+byte-identical (**6168 chars, sha `c97d97802e63`**, 29.6 -> 69.9 t/s) and the four-axis adaptive arms **54.4 /
+69.9 / 74.2 / 81.5 t/s** (the r155 record reads 54.4 / 70.0 / 74.1 / 81.4).  `gate-park-idle-slots.sh` PASS
+(4/4, park == lazy-off), `gate-ckpt-reuse.sh` PASS, `gate-state-pipe.sh` PASS 5/5, `gate-spec-align.sh` PASS
+(host-expert pair 115.9 -> 147.2 t/s, mixed chain inert, `n_seq == 1` text identical), `gate-hc-fusions.sh`
+**PASS 7/7** on the BF16-hc class (Flash-Next GSQ-IQ3_XXS, 449 chars sha `6a102dbc62d6`); per-block build
+`--fast --changed-from 0ba2387f6` **2/2** (block 10 and the tip); `check-gpu-faults.sh` clean; q8_0-KV
+staging-arm text identical across `PREALLOC` on/off and `FA_STAGE_MAX_MB=1` (the native read) at `-c 32768`
+and `-c 262144` (`63bb1363bbb9`).
+
+**6. Already-known finding, re-measured (NOT changed here; now with the magnitude on record).**
+`gate-hc-fusions.sh` on the **IQ4_NL hc class** (Flash-Next IQ4_NL, the `CHAIN` mixer class) fails its hard
+`dsv4_pre_chain` arm: 444 chars `7ea23f309705` with `LLAMA_FUSED_DSV4_HC_PRE=1` (the default) vs 453 chars
+`f242246a382b` with the chain.  The r149 record already logged this as **pre-existing** (it fails identically
+on an r148 build) and unrelated to the change under test; this release's tree reproduces both hashes and both
+arm verdicts exactly, and the change here only alters an allocation's size.  **New here: the magnitude** --
+measured at the logits with the gate's `--ab`, the default fused `DSV4_HC_PRE` reads **mean KLD 0.027936 /
+same-top-p 96.471 %** against its own F32 chain at base PPL 1.7888 (well inside the calibrated domain), i.e.
+5.6x the gate's KLD limit, not a near-tie.  `GGML_CUDA_MMB_HC16=0` does not move either arm, so the "bf16
+producer" re-baseline the kernel comments cite (`dsv4-hc.cu`: "a numerics change vs the F32 chain, approved as
+a prefill re-baseline") is not confirmed as the whole cause.  The gate's 7/7 PASS is recorded for the class it
+is defined on (the BF16-hc one, as at r155); whether the IQ4_NL-class divergence should be fixed, re-baselined
+or demoted to a reported arm (like `dsv4_post_op`) is the maintainer's call, and it is not a #237 item.
+
 ## 261027.006 (r155) -- PR #236: the server keeps the context checkpoint a task just restored instead of saving it again, and recycles the buffers of dropped checkpoints (block 12)
 
 **Shipped:** `v15-6050b467c-r155` (block **12** amended).  `release.json`: tip **`0ba2387f6`** (the fork branch

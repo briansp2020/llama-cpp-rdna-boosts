@@ -1062,6 +1062,19 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
   creates the slab and every allocation on a declined device keep the percentage margin (561 MiB), and
   a live slab uses the chunk from the first allocation after it exists.  Text byte-identical on the
   streamed and arena arms, decode/prefill at parity.  `WORKLOG.md` 261025.012.
+* **The FA prefill staging arena's size hint is a CEILING, not a target** (r156, issue #237).
+  `launch_fattn` passes the F16 size of the K/V view **roots** (per-operand capped by
+  `GGML_CUDA_FA_STAGE_MAX_MB`) so a growth step can jump towards the eventual size instead of climbing the
+  1.25x ladder -- on Windows/WDDM a freed allocation stays committed, so the ladder strands ~5x the final
+  arena (issue #138).  But the first FA call of a large-context prefill requests almost nothing (2 MiB at
+  `-ub 512` on a 262144-token cache), and allocating the hint there commits the whole arena up front: 1 GiB
+  **per context**, which since r125 includes the MTP draft context (its KV follows `-ctk`), so a `q8_0` draft
+  KV cost more than the f16 default it exists to save.  `fattn_stage_try_get()` therefore takes
+  `min(hint, 4x the request that just arrived)` (never below the 16 MiB floor), which right-sizes a short
+  prompt and still reaches the hint in <= 3 steps for a deep one.  Do not "simplify" it back to
+  `max(16 MiB, hint)`: the WDDM stranding it would fix is bounded either way, and the overshoot is not.
+  `GGML_CUDA_FA_STAGE_PREALLOC=0` is the ladder A/B arm; `GGML_CUDA_SLAB_STATS=1` prints the per-growth
+  `request=/cached=/alloc=` line.  `WORKLOG.md` 261027.007.
 * **The block-10 arms of the Q8_1 cache fix** (r132, with block 08): the fused GLU -> Q8_1 site's key walk
   stops at the first pointer change (the fused write is keyed by the matmul's `src1`), and both of this
   block's gated-q8_1 launch arms — the fused norm+gate kernel and the GLU write — validate their sources

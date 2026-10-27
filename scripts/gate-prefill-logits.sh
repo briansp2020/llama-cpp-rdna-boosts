@@ -70,6 +70,12 @@
 #                                    scheduler/upload defect shows up and its logits differ.
 #   --ngl N           NGL            default 99
 #   --fa on|off|auto  FA             default on
+#   --kv TYPE         KV             default f16.  The KV cache type, passed as `-ctk TYPE -ctv TYPE`.
+#                                    `f16` is the plain reference arm, but it *skips* the
+#                                    quantized-cache prefill paths entirely (no F16 staging arena,
+#                                    no native q8_0/bf16 tile read in the FA kernels), so any change
+#                                    to those is invisible at f16 -- judge it with `--kv q8_0`,
+#                                    which gets its own base file and a meta pin.
 #   --threads N       THREADS        default 8
 #   --max-kld F       MAX_KLD        default 0.005   (fail if mean KLD > F)
 #   --min-top-p F     MIN_TOPP       default 98.0    (fail if same-top-p < F)
@@ -115,6 +121,7 @@ CHUNKS="${CHUNKS:-40}"
 UB="${UB:-}"
 NGL="${NGL:-99}"
 FA="${FA:-on}"
+KV="${KV:-f16}"
 THREADS="${THREADS:-8}"
 MAX_KLD="${MAX_KLD:-0.005}"
 MIN_TOPP="${MIN_TOPP:-98.0}"
@@ -148,6 +155,7 @@ while [ $# -gt 0 ]; do
         --ub)                   UB="$2"; shift 2 ;;
         --ngl)                  NGL="$2"; shift 2 ;;
         --fa)                   FA="$2"; shift 2 ;;
+        --kv)                   KV="$2"; shift 2 ;;
         --threads)              THREADS="$2"; shift 2 ;;
         --max-kld)              MAX_KLD="$2"; shift 2 ;;
         --min-top-p)            MIN_TOPP="$2"; shift 2 ;;
@@ -228,7 +236,11 @@ if [ -z "$BASE" ]; then
     # base name; the default (wikitext, 512-token chunk) base is a different point.
     fs_tag=""
     [ "$FAMILY_SWITCH" -eq 1 ] && fs_tag="-familyswitch"
-    BASE="$BASE_DIR/prefill-logit-${ARCH}-${MODEL_STEM}${fs_tag}${UB:+-ub${UB}}.kld"
+    # A quantized KV cache reaches the prefill paths an f16 cache never builds (the F16 staging
+    # arena, the native tile read), so it is a different point and gets its own base file.
+    kv_tag=""
+    [ "$KV" != "f16" ] && kv_tag="-kv${KV}"
+    BASE="$BASE_DIR/prefill-logit-${ARCH}-${MODEL_STEM}${fs_tag}${kv_tag}${UB:+-ub${UB}}.kld"
 fi
 META="$BASE.meta"
 CONTROL_BASE="${BASE%.kld}-control-ub${CONTROL_UB}.kld"
@@ -251,7 +263,7 @@ echo "==> prefill-logit KLD gate (issue #113)"
 echo "    ppl=$LLAMA_PPL"
 echo "    model=$MODEL"
 echo "    corpus=$CORPUS  (sha256=${CORPUS_SHA:0:16}...)"
-echo "    arch=$ARCH  device=$DEVICE  ctx=$CTX chunks=$CHUNKS fa=$FA ngl=$NGL threads=$THREADS"
+echo "    arch=$ARCH  device=$DEVICE  ctx=$CTX chunks=$CHUNKS fa=$FA kv=$KV ngl=$NGL threads=$THREADS"
 echo "    base=$BASE"
 echo "    thresholds: mean KLD <= $MAX_KLD, same-top-p >= ${MIN_TOPP}%"
 [ "$FAMILY_SWITCH" -eq 1 ] && echo "    mode=family-switch (control ubatch=$CONTROL_UB, max point PPL=$FAMILY_MAX_PPL)"
@@ -269,7 +281,7 @@ run_ppl() {
     # shellcheck disable=SC2086  # $extra is an intended word-split K=V list
     timeout "$TIMEOUT" env HIP_VISIBLE_DEVICES="$DEVICE" ${extra:-} \
         "$LLAMA_PPL" -m "$MODEL" -f "$CORPUS" \
-        -c "$CTX" --chunks "$CHUNKS" -ngl "$NGL" -fa "$FA" -t "$THREADS" "${ub_args[@]}" \
+        -c "$CTX" --chunks "$CHUNKS" -ngl "$NGL" -fa "$FA" -ctk "$KV" -ctv "$KV" -t "$THREADS" "${ub_args[@]}" \
         "$@" >"$out" 2>&1
 }
 
@@ -310,13 +322,14 @@ base_meta_field() { [ -f "$META" ] && sed -n "s/^$1=//p" "$META" | head -1 || tr
 check_base_compat() {
     [ -f "$META" ] || { echo "    WARN: no base metadata ($META); cannot verify the base matches this model/corpus"; return 0; }
     local problems=0 k v want
-    for k in model corpus_sha256 ctx chunks; do
+    for k in model corpus_sha256 ctx chunks kv; do
         v="$(base_meta_field "$k")"
         case "$k" in
             model)         want="$MODEL" ;;
             corpus_sha256) want="$CORPUS_SHA" ;;
             ctx)           want="$CTX" ;;
             chunks)        want="$CHUNKS" ;;
+            kv)            want="$KV" ;;
         esac
         if [ -n "$v" ] && [ "$v" != "$want" ]; then
             echo "    base meta mismatch: $k='$v' != current '$want'" >&2
@@ -365,6 +378,7 @@ if [ "$RECORD" -eq 1 ]; then
         echo "chunks=$CHUNKS"
         echo "ngl=$NGL"
         echo "fa=$FA"
+        echo "kv=$KV"
         echo "arm=${RECORD_ENV:-<default>}"
         echo "base_ppl=$b_ppl"
         echo "base_sha256=$b_sha"
@@ -401,6 +415,7 @@ if [ "$RECORD" -eq 1 ]; then
             echo "chunks=$CHUNKS"
             echo "ngl=$NGL"
             echo "fa=$FA"
+            echo "kv=$KV"
             echo "ub=$CONTROL_UB"
             echo "arm=${RECORD_ENV:-<default>}"
             echo "base_ppl=$c_ppl"

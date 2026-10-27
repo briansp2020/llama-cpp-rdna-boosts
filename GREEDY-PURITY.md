@@ -1797,6 +1797,15 @@ vs **31.73** with both arms off (+8.7 %), prefill flat; IQ4_NL 34.49/34.35 and Q
 the chain-mixer class).  Release record: `WORKLOG.md` 261026.006 (r148); op contract:
 `patches/README.md` (block 11); switch catalogue: `ENVIRONMENT.md` §7.4.
 
+**Open, measured at r156 (the arm, not the scale).**  On the IQ4_NL class the hard `dsv4_pre_chain` arm
+does **not** match the chain, and never has in this line: 444 vs 453 chars, identical on an r148/r154 build
+(the r149 record logged it first).  What r156 adds is the magnitude -- at the logits the default fused
+`GGML_OP_DSV4_HC_PRE` reads **mean KLD 0.027936 / same-top-p 96.471 %** against its own F32 chain at base
+PPL 1.7888 (`gate-prefill-logits.sh --ab "LLAMA_FUSED_DSV4_HC_PRE=0"`), i.e. 5.6x the limit, so it is a
+real functional difference and not a greedy near-tie.  `GGML_CUDA_MMB_HC16=0` changes neither arm.  Until
+this is decided (fix the op, re-baseline it with this number, or demote the arm to reported like
+`dsv4_post_op`) the gate's green result is the **BF16-hc class only**.  `WORKLOG.md` 261027.007.
+
 ## 62. A replay is pure only while its identity is complete: the key must name the layer, and the property compare stays strict (r149, TODO #107)
 
 A HIP/CUDA captured graph bakes every kernel launch argument: device pointers, shapes and the kernel
