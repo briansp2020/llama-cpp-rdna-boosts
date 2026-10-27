@@ -67935,7 +67935,7 @@ index 321aa9d23..c6e2c9e34 100644
                      } else {
                          ss << ".";
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index d5a66a499..d5e9e0715 100644
+index d5a66a499..05c4dea52 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,10 @@
@@ -69334,23 +69334,48 @@ index d5a66a499..d5e9e0715 100644
          if (output_dev_host_buft) {
              buft = output_dev_host_buft;
          }
-@@ -2403,8 +3329,146 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+@@ -2403,34 +3329,172 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
      return n_outputs_max;
  }
  
+-bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+-    bool extracted = false;
+-    for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+-        if (!cparams.embeddings_layer_inp[il]) {
+-            continue;
+-        }
+-        if (!embd_layer_inp[il].has_data()) {
+-            GGML_ABORT("output layer input buffer not allocated");
+-        }
+-        ggml_tensor * t = res->get_layer_inp((int) il);
+-        if (!t) {
+-            GGML_ABORT("layer input tensor not found");
+-        }
 +void llama_context::set_lf_layer_inp_dev(bool enable) {
 +    cparams.lf_layer_inp_dev = enable;
 +}
-+
+ 
+-        const size_t nbytes = ggml_nbytes(t);
+-        const size_t nfloats = nbytes / sizeof(float);
+-        GGML_ASSERT(n_tokens > 0);
+-        GGML_ASSERT(nfloats % n_tokens == 0);
 +ggml_tensor * llama_context::get_lf_layer_inp_dev(uint32_t lid) const {
 +    return lid < lf_layer_dev.size() ? lf_layer_dev[lid] : nullptr;
 +}
-+
+ 
+-        const size_t row_floats = nfloats / n_tokens;
+-        GGML_ASSERT(row_floats == model.hparams.n_embd);
+-        const size_t dst_offset = token_offset * row_floats;
+-        GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 +const int32_t * llama_context::get_lf_dev_rows(int32_t * n_rows) const {
 +    *n_rows = (int32_t) lf_dev_rows.size();
 +    return lf_dev_rows.empty() ? nullptr : lf_dev_rows.data();
 +}
-+
+ 
+-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+-        GGML_ASSERT(backend != nullptr);
+-        // Tensor-split backends require a zero source offset.
+-        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
 +void llama_context::set_lf_dev_inject(bool enable) {
 +    cparams.lf_dev_inject = enable;
 +}
@@ -69395,7 +69420,7 @@ index d5a66a499..d5e9e0715 100644
 +    tgt->lf_set_consumed_event(reader);
 +}
 +
- bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
++bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
 +    if (cparams.lf_layer_inp_dev) {
 +        // Llama-Frankenstein F1: device-to-device copy into persistent per-layer buffers [n_embd, n_batch] on the
 +        // layer's own backend, so a draft context reads them in place instead of a device -> host -> device trip
@@ -69476,11 +69501,37 @@ index d5a66a499..d5e9e0715 100644
 +        return true;
 +    }
 +
-     bool extracted = false;
++    bool extracted = false;
 +
-     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
-         if (!cparams.embeddings_layer_inp[il]) {
-             continue;
++    for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
++        if (!cparams.embeddings_layer_inp[il]) {
++            continue;
++        }
++        if (!embd_layer_inp[il].has_data()) {
++            GGML_ABORT("output layer input buffer not allocated");
++        }
++        ggml_tensor * t = res->get_layer_inp((int) il);
++        if (!t) {
++            GGML_ABORT("layer input tensor not found");
++        }
++
++        const size_t nbytes = ggml_nbytes(t);
++        const size_t nfloats = nbytes / sizeof(float);
++        GGML_ASSERT(n_tokens > 0);
++        GGML_ASSERT(nfloats % n_tokens == 0);
++
++        const size_t row_floats = nfloats / n_tokens;
++        GGML_ASSERT(row_floats == model.hparams.n_embd);
++        const size_t dst_offset = token_offset * row_floats;
++        GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
++
++        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++        GGML_ASSERT(backend != nullptr);
++        // Tensor-split backends require a zero source offset.
++        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+         extracted = true;
+     }
+     return extracted;
 @@ -2505,7 +3569,8 @@ void llama_context::output_reorder() {
                  }
              }
@@ -69713,7 +69764,7 @@ index d5a66a499..d5e9e0715 100644
  }
  
  llm_graph_cb llama_context::graph_get_cb() const {
-@@ -2918,15 +3951,330 @@ private:
+@@ -2918,15 +3951,433 @@ private:
      size_t size_written = 0;
  };
  
@@ -69896,6 +69947,109 @@ index d5a66a499..d5e9e0715 100644
 +    }
 +}
 +
++// one piece of a device-state copy, as byte ranges into two tensors
++struct llama_state_copy_job {
++    ggml_tensor * src;
++    ggml_tensor * dst;
++    size_t        src_off;
++    size_t        dst_off;
++    size_t        n;
++};
++
++// Fold (r157, TODO #110): a copy between two meta buffers has to go through the host (a meta buffer has no
++// `.cpy_tensor`), and `ggml_backend_tensor_copy`'s fallback does it one piece at a time through a *pageable*
++// `malloc` with a synchronize per piece.  The device-state path copies one piece per (layer, K/V) per cell
++// range, so a 1024-token 2-slot state is ~130 pieces: measured 2.23 s to save and 2.28 s to restore 213.6 MiB
++// (~100 MB/s) against 21.9/38.9 ms for the same bytes over the host path.  Queue one band of pieces through the
++// context's pinned state stage and synchronize once per band instead: 14.7/17.2 ms, i.e. 150x, and the
++// single-device arm (which copies on the device and never reaches this) is unchanged at 3.0/3.2 ms.
++// Returns false when the caller must take its own path (no context, no pinned host buffer type, LLAMA_STATE_
++// STAGE_MIB=0 which is the A/B arm).
++static bool llama_state_copy_staged(llama_context * lctx, const std::vector<llama_state_copy_job> & jobs) {
++    static const size_t band_max = [] {
++        const char * e = getenv("LLAMA_STATE_STAGE_MIB");
++        return e != nullptr ? (size_t) strtoull(e, nullptr, 10) << 20 : (size_t) 64 << 20;
++    }();
++    if (lctx == nullptr || jobs.empty() || band_max == 0) {
++        return false;
++    }
++    std::vector<ggml_backend_t> bks(2*jobs.size(), nullptr);
++    for (size_t i = 0; i < jobs.size(); ++i) {
++        if ((bks[2*i + 0] = lctx->state_backend(jobs[i].src)) == nullptr ||
++            (bks[2*i + 1] = lctx->state_backend(jobs[i].dst)) == nullptr) {
++            return false;
++        }
++    }
++    struct band_piece {
++        size_t   job;
++        size_t   n;
++        size_t   pos;
++        uint8_t * data;
++    };
++    std::vector<band_piece>     band;
++    std::vector<ggml_backend_t> band_bks;
++    size_t pos = 0;
++    // a band is a run of whole pieces: a piece is only ever a window the backends accept (a tensor or a view of
++    // it), so it is never cut.  A single piece larger than the band gets a band of its own.
++    auto flush = [&]() {
++        size_t need = 0;
++        for (const auto & b : band) {
++            need += b.n;
++        }
++        uint8_t * stage = lctx->state_stage(need);
++        if (stage == nullptr) {
++            return false;
++        }
++        for (auto & b : band) {
++            b.data = stage + b.pos;
++        }
++        band_bks.clear();
++        for (const auto & b : band) {
++            const auto & j = jobs[b.job];
++            ggml_backend_tensor_get_async(bks[2*b.job + 0], j.src, b.data, j.src_off, b.n);
++            if (std::find(band_bks.begin(), band_bks.end(), bks[2*b.job + 0]) == band_bks.end()) {
++                band_bks.push_back(bks[2*b.job + 0]);
++            }
++        }
++        llama_state_sync_all(band_bks);
++        for (const auto & b : band) {
++            const auto & j = jobs[b.job];
++            ggml_backend_tensor_set_async(bks[2*b.job + 1], j.dst, b.data, j.dst_off, b.n);
++            if (std::find(band_bks.begin(), band_bks.end(), bks[2*b.job + 1]) == band_bks.end()) {
++                band_bks.push_back(bks[2*b.job + 1]);
++            }
++        }
++        llama_state_sync_all(band_bks);   // also what makes the stage reusable by the next band
++        band.clear();
++        pos = 0;
++        return true;
++    };
++    for (size_t i = 0; i < jobs.size(); ++i) {
++        if (pos > 0 && pos + jobs[i].n > band_max && !flush()) {
++            return false;
++        }
++        band.push_back({ i, jobs[i].n, pos, nullptr });
++        pos += jobs[i].n;
++    }
++    return band.empty() || flush();
++}
++
++// whether a (tensor, offset, size) window is one the backend serves directly.  A meta buffer's setter/reader
++// splices a window aligned to the tensor's own layout with one strided copy per device; a view of the piece is
++// correct for anything else but walks its split state row by row (measured: 4.5 ms vs 0.15 ms for 2 MiB), so
++// the copy stays on the tensor itself whenever it can.  `nb[1]` is the coarsest of those units, hence the test.
++static bool llama_state_copy_window_ok(const ggml_tensor * t, size_t off, size_t n) {
++    const size_t unit = t->nb[1] != 0 ? t->nb[1] : 1;
++    return off % unit == 0 && n % unit == 0;
++}
++
++// whether a copy into `buf` has to be staged: the destination cannot copy on device (the meta backend), so
++// `ggml_backend_tensor_copy` would take its own pageable bounce
++static bool llama_state_copy_bounces(ggml_backend_buffer_t buf) {
++    ggml_backend_dev_t dev = buf != nullptr ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)) : nullptr;
++    return dev != nullptr && ggml_backend_dev_is_meta(dev);
++}
++
  class llama_io_write_host : public llama_io_write_i {
  public:
      llama_io_write_host(
@@ -70048,7 +70202,7 @@ index d5a66a499..d5e9e0715 100644
          }
      }
  
-@@ -2969,13 +4317,75 @@ private:
+@@ -2969,13 +4420,75 @@ private:
          size_t offset;
      };
      std::vector<write_info> winfos;
@@ -70125,7 +70279,7 @@ index d5a66a499..d5e9e0715 100644
          // flush the reads
          for (const auto & rinfo : rinfos) {
              ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
-@@ -3015,6 +4425,7 @@ public:
+@@ -3015,6 +4528,7 @@ public:
  
  private:
      const uint8_t * ptr;
@@ -70133,8 +70287,163 @@ index d5a66a499..d5e9e0715 100644
      size_t buf_size = 0;
      size_t size_read = 0;
  
-@@ -3384,6 +4795,69 @@ private:
+@@ -3079,7 +4593,8 @@ private:
+ 
+ class llama_io_write_device : public llama_io_write_i {
+ public:
+-    llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
++    llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs, llama_context * lctx = nullptr)
++        : ptr(p), buf_size(len), mbufs(mbufs), lctx(lctx) {
+     }
+ 
+     ~llama_io_write_device() {
+@@ -3168,8 +4683,27 @@ public:
+                 }
+             }
+ 
+-            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+-                ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
++            // the pieces have to bounce through the host when the copy buffer is on a meta device: stage a band at
++            // a time instead of one pageable allocation + synchronize per piece (r157, TODO #110)
++            std::vector<llama_state_copy_job> jobs;
++            if (llama_state_copy_bounces(mbuf_cur.buf.get())) {
++                jobs.reserve(mbuf_cur.org.size());
++                for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
++                    ggml_tensor * org = mbuf_cur.org[i];
++                    ggml_tensor * src = org->view_src != nullptr ? org->view_src : org;
++                    const size_t  off = org->view_src != nullptr ? org->view_offs : 0;
++                    const size_t  n   = ggml_nbytes(org);
++                    if (llama_state_copy_window_ok(src, off, n) && llama_state_copy_window_ok(mbuf_cur.cpy[i], 0, n)) {
++                        jobs.push_back({ src, mbuf_cur.cpy[i], off, 0, n });
++                    } else {
++                        jobs.push_back({ org, mbuf_cur.cpy[i], 0, 0, n });
++                    }
++                }
++            }
++            if (!llama_state_copy_staged(lctx, jobs)) {
++                for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
++                    ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
++                }
+             }
+         }
+     }
+@@ -3207,11 +4741,13 @@ private:
+     std::vector<write_info> winfos;
+ 
+     llama_memory_buffers & mbufs;
++    llama_context * lctx = nullptr;
+ };
+ 
+ class llama_io_read_device : public llama_io_read_i {
+ public:
+-    llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
++    llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs, llama_context * lctx = nullptr)
++        : ptr(p), buf_size(len), mbufs(mbufs), lctx(lctx) {
+     }
+ 
+     ~llama_io_read_device() {
+@@ -3255,29 +4791,12 @@ public:
+                 GGML_ABORT("%s: memory buffer mismatch\n", __func__);
+             }
+ 
+-            if (mbuf_cur.n_tensors == mbuf.n_tensors) {
+-                // an equal tensor count does not imply the same chunking, e.g. save ranges [2,1] vs restore runs [1,2]
+-                bool same_chunking = true;
+-                for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+-                    if (ggml_nbytes(mbuf_cur.cpy[i]) != ggml_nbytes(mbuf.org[i])) {
+-                        same_chunking = false;
+-                        break;
+-                    }
+-                }
+-
+-                if (same_chunking) {
+-                    // same chunking: copy 1:1 by index
+-                    for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+-                        ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+-                    }
+-                    continue;
+-                }
+-            }
+-
+-            // different chunking: copy the write-side data (mbuf_cur.cpy) into the read-side targets (mbuf.org)
+-            // with a byte cursor. Write and read enumerate the same logical data in the same order but may chunk
+-            // it differently (even with an equal number of tensors), so copy across tensor boundaries rather than
+-            // 1:1 by index.
++            // copy the write-side data (mbuf_cur.cpy) into the read-side targets (mbuf.org) with a byte cursor.
++            // Write and read enumerate the same logical data in the same order but may chunk it differently (even
++            // with an equal number of tensors), e.g. save ranges [2,1] vs restore runs [1,2], so copy across
++            // tensor boundaries rather than 1:1 by index.  The pieces are collected first: when the destination is
++            // on a meta device the copy has to bounce through the host anyway, and staging a band of them through
++            // the pinned state stage is what makes the restore fast (r157, TODO #110).
+             const size_t total = mbuf_cur.total_size;
+ 
+             ggml_init_params params_scratch = {
+@@ -3287,6 +4806,9 @@ public:
+             };
+             ggml_context * ctx_scratch = ggml_init(params_scratch);
+ 
++            std::vector<llama_state_copy_job> jobs;
++            jobs.reserve(mbuf_cur.cpy.size());
++
+             size_t src_pos  = 0;
+             size_t dst_pos  = 0;
+             size_t src_j    = 0;
+@@ -3306,15 +4828,13 @@ public:
+ 
+                 const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
+ 
+-                const size_t   el   = ggml_element_size(src_t);
+-                const int64_t n_el = (int64_t) (n_copy / el);
++                // the piece is handed to the backend as the tensor itself plus an offset: a meta buffer splices
++                // an aligned window with one strided copy per device, while a view of the piece walks its split
++                // state per row (measured 4.5 ms vs 0.15 ms for 2 MiB)
++                ggml_tensor * dst_root     = dst_t->view_src != nullptr ? dst_t->view_src : dst_t;
++                const size_t  dst_root_off = dst_t->view_src != nullptr ? dst_t->view_offs : 0;
+ 
+-                auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
+-                ggml_backend_view_init(src_v);
+-                auto * dst_v = ggml_view_1d(ctx_scratch, dst_t, n_el, dst_off);
+-                ggml_backend_view_init(dst_v);
+-
+-                ggml_backend_tensor_copy(src_v, dst_v);
++                jobs.push_back({ src_t, dst_root, src_off, dst_root_off + dst_off, n_copy });
+ 
+                 src_pos += n_copy;
+                 dst_pos += n_copy;
+@@ -3338,6 +4858,28 @@ public:
+                 GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
+             }
+ 
++            if (!llama_state_copy_bounces(mbuf_cur.buf.get()) || !llama_state_copy_staged(lctx, jobs)) {
++                // a device that copies on its own needs two same-layout tensors, so a sub-range is expressed as
++                // a view of the piece (the staged arm above hands the backend the window and its offset instead)
++                for (const auto & job : jobs) {
++                    if (job.src_off == 0 && job.dst_off == 0 &&
++                        job.n == ggml_nbytes(job.src) && job.n == ggml_nbytes(job.dst)) {
++                        ggml_backend_tensor_copy(job.src, job.dst);
++                        continue;
++                    }
++
++                    const size_t   el   = ggml_element_size(job.src);
++                    const int64_t n_el = (int64_t) (job.n / el);
++
++                    auto * src_v = ggml_view_1d(ctx_scratch, job.src, n_el, job.src_off);
++                    ggml_backend_view_init(src_v);
++                    auto * dst_v = ggml_view_1d(ctx_scratch, job.dst, n_el, job.dst_off);
++                    ggml_backend_view_init(dst_v);
++
++                    ggml_backend_tensor_copy(src_v, dst_v);
++                }
++            }
++
+             ggml_free(ctx_scratch);
+         }
+ 
+@@ -3382,8 +4924,72 @@ private:
+     std::vector<read_info> rinfos;
+ 
      const llama_memory_buffers & mbufs;
++    llama_context * lctx = nullptr;
  };
  
 +uint8_t * llama_context::state_stage(size_t size) {
@@ -70203,7 +70512,7 @@ index d5a66a499..d5e9e0715 100644
  size_t llama_context::state_get_size() {
      llama_io_write_dummy io(false);
      try {
-@@ -3395,7 +4869,7 @@ size_t llama_context::state_get_size() {
+@@ -3395,7 +5001,7 @@ size_t llama_context::state_get_size() {
  }
  
  size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
@@ -70212,7 +70521,7 @@ index d5a66a499..d5e9e0715 100644
      try {
          return state_write_data(io);
      } catch (const std::exception & err) {
-@@ -3405,7 +4879,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+@@ -3405,7 +5011,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
  }
  
  size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
@@ -70221,16 +70530,19 @@ index d5a66a499..d5e9e0715 100644
      try {
          return state_read_data(io);
      } catch (const std::exception & err) {
-@@ -3435,7 +4909,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
+@@ -3433,9 +5039,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
+ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+     std::unique_ptr<llama_io_write_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
+-        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
++        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id], this);
      } else {
 -        io = std::make_unique<llama_io_write_host>(dst, size);
 +        io = std::make_unique<llama_io_write_host>(dst, size, this);
      }
  
      try {
-@@ -3453,7 +4927,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -3453,7 +5059,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
      std::unique_ptr<llama_io_read_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
          // create a temporary io to read the magic and the src seq_id
@@ -70239,16 +70551,19 @@ index d5a66a499..d5e9e0715 100644
  
          uint32_t magic_read;
          io->read(&magic_read, sizeof(magic_read));
-@@ -3468,7 +4942,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -3466,9 +5072,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
  
-         io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+         GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
+ 
+-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
++        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read], this);
      } else {
 -        io = std::make_unique<llama_io_read_host>(src, size);
 +        io = std::make_unique<llama_io_read_host>(src, size, this);
      }
  
      try {
-@@ -3715,6 +5189,52 @@ void llama_context::perf_reset() {
+@@ -3715,6 +5321,52 @@ void llama_context::perf_reset() {
      // note: the reallocation counters are not reset - they track the lifetime totals for this context
  }
  
@@ -70301,7 +70616,7 @@ index d5a66a499..d5e9e0715 100644
  llama_memory_breakdown llama_context::memory_breakdown() const {
      std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
      for (const auto & [buft, size] : model.memory_breakdown()) {
-@@ -3725,22 +5245,38 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+@@ -3725,22 +5377,38 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
              ret[buft].context += size;
          }
      }
@@ -70342,7 +70657,7 @@ index d5a66a499..d5e9e0715 100644
          }
      }
      return ret;
-@@ -3766,12 +5302,12 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter
+@@ -3766,12 +5434,12 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter
      ggml_set_param(tensor);
  }
  
@@ -70359,7 +70674,7 @@ index d5a66a499..d5e9e0715 100644
      GGML_ASSERT(n_batch                    % n_ubatch == 0);
  
      if (cparams.flash_attn) {
-@@ -3801,22 +5337,22 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
+@@ -3801,22 +5469,22 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
      void * param_filter_ud              = lopt_params.param_filter_ud;
  
    //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
@@ -70398,7 +70713,7 @@ index d5a66a499..d5e9e0715 100644
          for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
              llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
          }
-@@ -3891,12 +5427,15 @@ void llama_context::opt_epoch_iter(
+@@ -3891,12 +5559,15 @@ void llama_context::opt_epoch_iter(
                  break;
              }
  
@@ -70415,7 +70730,7 @@ index d5a66a499..d5e9e0715 100644
              res->reset();
  
              auto * gf = model.build_graph(gparams);
-@@ -3927,7 +5466,6 @@ void llama_context::opt_epoch_iter(
+@@ -3927,7 +5598,6 @@ void llama_context::opt_epoch_iter(
                      ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                  }
              }
@@ -70423,7 +70738,7 @@ index d5a66a499..d5e9e0715 100644
              ggml_opt_eval(opt_ctx, result);
              if (callback) {
                  callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
-@@ -3998,10 +5536,12 @@ llama_context_params llama_context_default_params() {
+@@ -3998,10 +5668,12 @@ llama_context_params llama_context_default_params() {
          /*.n_ubatch                    =*/ 512,
          /*.n_seq_max                   =*/ 1,
          /*.n_rs_seq                    =*/ 0,
@@ -70436,7 +70751,7 @@ index d5a66a499..d5e9e0715 100644
          /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
          /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
          /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
-@@ -4028,6 +5568,7 @@ llama_context_params llama_context_default_params() {
+@@ -4028,6 +5700,7 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,
@@ -70444,7 +70759,7 @@ index d5a66a499..d5e9e0715 100644
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
-@@ -4036,6 +5577,26 @@ llama_context_params llama_context_default_params() {
+@@ -4036,6 +5709,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -70471,7 +70786,7 @@ index d5a66a499..d5e9e0715 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -4059,7 +5620,7 @@ llama_context * llama_init_from_model(
+@@ -4059,7 +5752,7 @@ llama_context * llama_init_from_model(
          params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
      }
  
@@ -70480,7 +70795,7 @@ index d5a66a499..d5e9e0715 100644
          if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
              LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
              params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-@@ -4071,10 +5632,49 @@ llama_context * llama_init_from_model(
+@@ -4071,10 +5764,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -70532,7 +70847,7 @@ index d5a66a499..d5e9e0715 100644
          return nullptr;
      }
  
-@@ -4137,7 +5737,16 @@ llama_context * llama_init_from_model(
+@@ -4137,7 +5869,16 @@ llama_context * llama_init_from_model(
  
          return ctx;
      } catch (const std::exception & err) {
@@ -70550,7 +70865,7 @@ index d5a66a499..d5e9e0715 100644
      }
  
      return nullptr;
-@@ -4271,6 +5880,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+@@ -4271,6 +6012,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
      return ctx->get_embeddings_seq(seq_id);
  }
  
@@ -70561,7 +70876,7 @@ index d5a66a499..d5e9e0715 100644
  void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
      ctx->set_embeddings_nextn(value, masked);
  }
-@@ -4303,6 +5916,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+@@ -4303,6 +6048,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
      return ctx->get_embeddings_nextn_ith(i);
  }
  

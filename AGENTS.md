@@ -798,6 +798,15 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   44.2 -> 40.5 ms (2 GPU tensor) and 79.3 -> 74.9 ms (Flash-Next + MTP) of the server's save+load trace.
   `scripts/gate-state-pipe.sh` gains a **`copy0`** arm (`LLAMA_STATE_COPY_THREADS=0`) that is gated
   byte-for-byte like every other arm; `LLAMA_STATE_TIMING=1` is the per-op diagnostic.
+  **The device-state class (`llama_io_write_device`/`read_device`, `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`) is a
+  separate path and copies in bands through that same stage (r157, TODO #110).**  A piece must be handed to a
+  meta backend as **the tensor plus an offset**, never as a fresh `ggml_view_1d` of it, and a band must be a
+  run of **whole** pieces: a view's inherited split state makes the backend splice the piece row by row (4.5 ms
+  vs 0.15 ms for 2 MiB), and the backend only accepts a window aligned to the tensor's own layout (a cut piece
+  trips `size % row_stride == 0`).  Per-piece `ggml_backend_tensor_copy` between two meta buffers is ggml's
+  pageable bounce and measured 58x slower than the host path; `LLAMA_STATE_STAGE_MIB` (default 64, `0` = old
+  path) sets the band.  That class is reached by nothing but `tests/test-llama-context` (`cp_d`/`cp_d_s`), which
+  is its oracle; `gate-state-pipe.sh` does not reach it.  `benchmarks/2026-10-27-state-device-path.md`.
 - **The op-offload H2D staging ring (V2.0 block 09; old block 06, r12) has three invariants:** (1) prefill is never
   CUDA-graph captured, so a redirected split input that reaches a copy path aborts (tripwire asserts
   this); (2) the width gate is floored at **64 tokens**; (3) the arena lives **outside** the

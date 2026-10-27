@@ -1,4 +1,4 @@
-From 3fab8091e98562d5a9ec8c196c88fb343e50a733 Mon Sep 17 00:00:00 2001
+From 4d8bff933a01d0b93ef1d8ec68dd0d53711bb1ca Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -201,7 +201,7 @@ index 801dadec6..679fa7e59 100644
          enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
          enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 7da853b69..569414003 100644
+index cfc3e317c..243c56518 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -814,6 +814,22 @@ llama_context::llama_context(
@@ -235,7 +235,7 @@ index 7da853b69..569414003 100644
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
-@@ -5524,6 +5541,7 @@ llama_context_params llama_context_default_params() {
+@@ -5656,6 +5673,7 @@ llama_context_params llama_context_default_params() {
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,

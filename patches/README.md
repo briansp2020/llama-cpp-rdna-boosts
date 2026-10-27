@@ -1526,6 +1526,28 @@ had no other home.
   `LLAMA_STATE_TIMING=1` logs the enqueue/copy split of each batched read and write.  Gate:
   `scripts/gate-state-pipe.sh`, whose `copy0` arm is the plain-`memcpy` A/B, gated byte-for-byte like every
   other arm.
+* **The device-state path (`LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`) is staged, not bounced per piece** (r157, TODO #110).
+  `llama_io_write_device`/`read_device` keep a sequence's memory in a *device* buffer (that is the whole point
+  of the flag), and under a tensor split both ends are meta buffers, so every piece went through
+  `ggml_backend_tensor_copy`'s fallback: a pageable `malloc` + a synchronous device read + a synchronous
+  device write **per piece**.  The state path copies one piece per (layer, K/V) per cell range, so a
+  1024-token 2-slot state is ~128 pieces (49 152 when two slots interleave their cells), and it measured
+  **2.23 s to save / 2.28 s to restore** 213.6 MiB — **58x slower than the host path** it is supposed to
+  beat (21.9/38.9 ms) and 700x slower than the same state on one GPU, where the copy is a real
+  device-to-device `cpy_tensor` (3.0/3.2 ms).  `llama_state_copy_staged()` now copies a list of pieces in
+  **bands** through the context's pinned `state_stage`: every piece of a band is queued with
+  `ggml_backend_tensor_get_async` on the backend that owns it, each backend is synchronized once, then every
+  piece is queued with `set_async` and synchronized once.  Two details decide the result: a piece is never
+  cut (the meta backend serves a window only when it is aligned to the tensor's own layout, so a band is a
+  run of whole pieces and a piece larger than the band gets a band of its own), and a piece is handed to the
+  backend as **the tensor plus an offset**, never as a fresh `ggml_view_1d` of it (the view's inherited split
+  state makes the reader splice it row by row: 4.5 ms for 2 MiB against 0.15 ms).  The arm is chosen per
+  buffer type (the destination is a meta device), so a single device keeps its device-to-device copy
+  untouched (3.02/3.22 ms before and after).  Measured: **14.7 ms / 17.2 ms** (150x), i.e. faster than the
+  host path; the fragmented 49 152-piece shape 2.24 s -> 14.7 ms.  `LLAMA_STATE_STAGE_MIB` (default 64,
+  `0` = the old path) sets the band; 8 MiB already reaches the plateau.  Oracle: `tests/test-llama-context`'s
+  `cp_d`/`cp_d_s` (the restored KV blob is compared byte for byte) — nothing in the server or `llama-cli`
+  uses this io class, which is why it went unnoticed.  `benchmarks/2026-10-27-state-device-path.md`.
 * **A restored context checkpoint is not saved again, and dropped checkpoints' buffers are recycled** (r155,
   PR #236, `archive/work/server-ckpt-reuse/`).  On a hybrid/recurrent (or SWA) model the memory cannot roll
   back, so the server saves a **context checkpoint** (`common_prompt_checkpoint`: the recurrent state plus the
@@ -1700,7 +1722,7 @@ had no other home.
 **Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `GGML_LF_DFLASH_DEV`, `GGML_LF_FAST_TOPK`,
 `LLAMA_DFLASH_INGEST_TAIL` (r130), `LLAMA_STATE_GET_MERGE_GAP`, `LLAMA_STATE_ASYNC`, `LLAMA_STATE_ASYNC_MAX_MIB`,
 `LLAMA_STATE_ASYNC_READ`, `LLAMA_STATE_PIPE_GROUPS` (r151), `LLAMA_STATE_COPY_THREADS` and
-`LLAMA_STATE_TIMING` (r152),
+`LLAMA_STATE_TIMING` (r152), `LLAMA_STATE_STAGE_MIB` (r157),
 `GGML_CPU_MOE_OFFLOAD_THREADS`, `GGML_CUDA_SLAB_RING_MIB`, and (r111+, POOL mode) `MOE_HOST_POOL_MIB` /
 `MOE_HOST_POOL_FRAC` / `MOE_HOST_POOL_DIO` / `MOE_HOST_POOL_VERIFY` / `LLAMA_HOST_MASTER_PINNED`, plus
 (r113) `MOE_HOST_POOL_RAM_PCT` (default **85** since r114), (r114) `MOE_HOST_POOL_STAGE_BATCH` and

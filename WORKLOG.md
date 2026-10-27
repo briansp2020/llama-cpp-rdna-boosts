@@ -1,5 +1,75 @@
 # WORKLOG - dated delivery records
 
+## 261027.009 (r157) -- TODO #110: the device-state path's cost was the pageable bounce per piece, not its views (block 12)
+
+**Release:** `v15-6050b467c-r157` (base `6050b467c`, tip **`c50bfdea0`**, tree
+**`954548b201df410acf65e6a404cef8a23d7390ba`**, 15 blocks; `validate-set.sh` green).  Delta against the r156
+tree: **one file, +169/-37**, `src/llama-context.cpp` (block 12).  No kernel, no numerics, no default and no
+allocation size on any path a `llama-cli`/`llama-bench`/server run takes.
+
+**1. What the item claimed, and what the measurement said.**  TODO #110 described
+`llama_io_read_device` as creating "one simple-tensor view per KV cache chunk per layer ... where one view
+per tensor plus a chunked copy would be ~24".  Instrumented, the views were **0.17 ms** for 128 of them
+(plus 0.01 ms for the write side's) — the item's metadata cost was real but worthless.  The copy loop was
+**2210/2269 ms** of a 2227/2269 ms pair: `ggml_backend_tensor_copy` between two meta buffers takes ggml's
+fallback (a meta buffer has no `.cpy_tensor`), i.e. a **pageable `malloc` + a synchronous device read + a
+synchronous device write per piece**.  Per piece, the meta read of a 2 MiB *view* cost 3.4-5.1 ms at
+enqueue (V-cache tensors only; K's stayed under 2 ms) because the view's inherited split state makes the
+reader splice it row by row — the same bytes handed to the backend as `(tensor, offset, size)` cost
+0.15 ms.  So the device path was **58x slower than the host path it exists to beat**: 2.23 s to save and
+2.28 s to restore 213.6 MiB on 2 GPUs, against 21.9/38.9 ms for the same bytes over `llama_io_write_host`/
+`read_host`, and 3.0/3.2 ms on one GPU (where the copy is a true device-to-device `cpy_tensor`).
+
+**2. The fix.**  `llama_state_copy_staged()` (`src/llama-context.cpp`) copies a list of pieces through the
+context's pinned `state_stage` in **bands**: every piece of a band is queued with
+`ggml_backend_tensor_get_async` on the backend that owns it, each backend is synchronized once, then every
+piece is queued with `set_async` and synchronized once — so the fixed cost is paid per band, not per piece.
+A band is a run of **whole** pieces (a piece is never cut: the meta backend only serves a window aligned to
+the tensor's own layout — cutting one trips `size % row_stride == 0`); a single piece larger than the band
+gets a band of its own and grows the stage to it.  `LLAMA_STATE_STAGE_MIB` (default 64, `0` = the old path
+and the A/B arm; 8 MiB already reaches the plateau) sets the band.  Pieces are handed to the backend as
+**the tensor plus an offset**, not as a fresh `ggml_view_1d` of the piece: that is the second half of the
+win and the reason the fix is not just "use a pinned buffer".  Both device io classes take the context, so
+the staged arm is chosen per buffer type (`llama_state_copy_bounces()`: the destination is a meta device) —
+the single-device arm keeps its device-to-device copy untouched.  The read path's `same_chunking`/1:1 fast
+path is gone (the byte-cursor walk it sat next to covers it: an aligned piece becomes a whole-tensor copy),
+and its per-piece views are now created only in the non-meta fallback.
+
+**3. Measured** (gfx1201, ROCm 10.1.0, Qwen3.8-27B-UD-Q4_K_XL, `-c 2112`, state 213.6 MiB, 2 GPU
+`-sm tensor`, best of 3):
+
+| arm | save | restore |
+|---|---|---|
+| contiguous, **before** | 2227 ms | 2269 ms |
+| contiguous, **after** | **14.7 ms** | **17.2 ms** |
+| fragmented (49 152 pieces of ~3 KiB, the #210 lazy-idle-slot shape), before | 2237 ms | 2282 ms |
+| fragmented, after | 16.1 / **14.7 ms** (rep 0 pays the stage's first fault: 497 ms) | 21.1 / **17.3 ms** (rep 0: 355 ms) |
+| one GPU, before / after | 3.01 / 3.02 ms | 3.18 / 3.22 ms |
+
+i.e. **151x / 132x** on the shape the item named, and now **faster than the host path** (21.9/38.9 ms)
+instead of 58x slower.  `LLAMA_STATE_STAGE_MIB` sweep, save/restore: `0` 2231/2278, `8` 15.3/18.4, `32`
+14.8/17.7, `64` 14.7/17.2, `512` 14.6/17.5.  The single-device arm is unchanged, as it must be: it never
+reaches the new code.
+
+**4. Validation.**  `tests/test-llama-context` (2 GPU `-sm tensor`, Qwen3.5-4B-Q8_0): `cp_d`, `cp_d_s` (the
+restored KV blob is compared byte for byte), `rt`, `ps`, `frag`, `rot`, `seq_rm`, `state_load`, `rollback`,
+`replay`, `shared` **OK**.  `rf` FAILs on this build **and on the r153 build** — that case creates its own
+context without flash attention, which `-sm tensor` requires; it passes on 1 GPU.  Coherence unchanged
+(Qwen3.5-4B-Q8_0 seed 42, 3 GPU, `1c5d32ac537d`).  `scripts/gate-state-pipe.sh` **PASS** (every host-path arm
+byte-identical to `LLAMA_STATE_ASYNC=0`, pipelined -15.9 %, threaded copy -15.5 %);
+`scripts/gate-prefill-logits.sh` **0.000000 / 100.000 %**; `scripts/gate-ckpt-reuse.sh` **PASS**.
+`scripts/validate-set.sh` green on a fresh tarball (tree `954548b20`).
+
+**5. Why it stayed invisible.**  Nothing in the delivery's default paths uses this io class: the server's
+prompt cache and the context checkpoints pass `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`/`NONE` (the host path),
+and only `tests/llama-context` asks for `ON_DEVICE`.  So the item was recorded as "harmless but the same
+pattern", and the only thing that ever measured it was a harness written for this release.  The harness
+(`archive/work/state-device-path/llama-stateio.cpp`) and the full table are in
+`benchmarks/2026-10-27-state-device-path.md`; `TODO #110` is retired.
+
+**6. Docs.**  `ENVIRONMENT.md` §4 `LLAMA_STATE_STAGE_MIB`, `patches/README.md` (block 12),
+`archive/work/state-device-path/`.
+
 ## 261027.008 (tooling/baseline, post-r156) -- re-establish the baseline the IQ4_NL hc class moved: the DSV4 HC pre/post arms are reported, not hard, and the Flash-Next IQ4_NL prefill-logit point is re-recorded
 
 **No release, no patch change.**  Nothing here touches `patches/`, `release.json`, `rdna-boosts-all.patch`
