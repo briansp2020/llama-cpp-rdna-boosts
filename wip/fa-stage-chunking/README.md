@@ -133,6 +133,46 @@ Feasibility questions the M1 read must answer **before** any code (each is a pot
   overlapped conversion on the copy stream needs events — the delivery already has this pattern in the
   H2D ring and the async-input ring.
 
+### 4a. M1 result (2026-10-27, code read — no prototype yet): the split-and-combine machinery exists
+
+`launch_fattn` already has **two** N-way KV-split paths, both with a host-visible partial buffer:
+
+* `parallel_blocks` (the non-stream-K path, `fattn-common.cuh` ~2030-2080): `blocks_num = (ntiles_x,
+  parallel_blocks, …)`, the kernel takes its KV share from `blockIdx.y`, partials land in
+  `dst_tmp`/`dst_tmp_meta`, and the launcher finishes with
+  `flash_attn_combine_results<DV>(dst_tmp, dst_tmp_meta, KQV, parallel_blocks)` — **the same combine the
+  decode band runs every step**.
+* `stream_k` (Ada/`DKQ==64`/low-efficiency shapes): a 1-D grid whose blocks walk KV ranges, combined by
+  `flash_attn_stream_k_fixup_uniform` / `_general`.
+
+So the *reduction* side is not the work.  What is missing for a chunked prefill is only:
+
+1. **A KV base offset the kernel honours.**  Today the KV index is derived from `blockIdx.y` (and the
+   stream-K arithmetic) and is also the **mask column** and the `cell_pos`/`tok_lo`/`tok_hi` index.
+   Threading one `kv_start` scalar (and offsetting `K_data`/`V_data` by `k0` rows, `n_kv = chunk`) keeps
+   the causal alignment intact; that is a signature change in the MMA kernel (`fattn-mma-f16.cuh`) and
+   its instantiations, not a rewrite.
+2. **`dst_tmp`/`dst_tmp_meta` sized by chunk count**, with one `flash_attn_combine_results` call at the
+   end (`n_chunks` instead of `parallel_blocks`).  `C` should be a multiple of `nbatch_fa` so no chunk
+   ends mid-tile.
+3. **The mask scans stay once-per-op.**  `flash_attn_mask_to_KV_max` and `flash_attn_mask_to_KV_blocks`
+   are per *tile* already (`KV_max[sequence*ne31 + jt]`, `kq_blocks`), so a chunked loop reads its slice of
+   them, and chunks beyond a tile's `KV_max` are skipped outright.  Do **not** rescan the mask per chunk.
+4. **The sparse path stays single-launch.**  `use_sparse` (QSA) index lists address arbitrary KV columns;
+   chunking it is a separate change with its own oracle (`test-backend-ops -o FLASH_ATTN_QSA`).  Gate the
+   loop on `!use_sparse`, which is also block 11's territory rather than block 05's.
+
+Scope this suggests: **MMA-f16 only** (the RDNA4/RDNA3_0 prefill kernel, which is where the arena is
+reached); the tile kernel keeps today's single-launch staging (its `prefill_stages` is already false on
+RDNA3_5), so the risk stays off the RDNA2/`bf16` arm.  `V_is_K_view` needs no special case (it is a
+pointer alias, so one conversion covers both operands).
+
+The two costs to watch in the prototype: (a) the **numerics re-baseline** (chunk boundaries change the
+combine order — the prefill-logit gate, §7), and (b) **enqueue count**: `n_chunks ≈ payload/8192` extra
+launches per layer per ubatch — irrelevant at `-ub 512` (one chunk), and ~13 at 100k across ~60 layers ≈
+800 extra launches per ubatch, which must be measured against the dispatch-bound shape of r144 before it
+is called free.
+
 ## 5. The second prize: arena bytes on host-expert configs (maintainer's hypothesis) — **measured, and it is not a decode prize**
 
 On a config where the movable-boundary slab is armed, the staging arena is *inside* the slab
@@ -163,7 +203,7 @@ iGPU and must never be enumerated), and every arm records the arena bytes from
 |---|---|---|---|
 | **M0a** ✅ | what the staging is worth at depth (dense) | Qwen3.8-27B UD-Q4_K_XL, 1 GPU (`0`), `-fa on -ctk/-ctv q8_0`, `llama-bench -p 8192,16384,32768 -n 0 -ub 512 -r 2` | staged **+1.5 / +2.7 / +5.1 %** over native → see `FINDINGS-2026-10-27-m0.md` §F2 |
 | **M0b** ✅ | the arena→slab→decode prize | Flash-Next IQ4_NL `-sm tensor -ncmoe 48` on 2 GPUs (`0,2`), fixed `MOE_EXPERT_CACHE_MIB`, MTP draft as in the r144 records | run on 35B-A3B instead (load time): **no decode prize** — the arena is released at the drop, `wide_aux=0 / arena=28480` in both arms.  §F4 |
-| **M1** | the feasibility read (§4) — launcher + kernel entry points; no code | — | — |
+| **M1** ✅ | the feasibility read (§4) — launcher + kernel entry points; no code | — | **feasible without new machinery** — the split/combine exists (`parallel_blocks` + `flash_attn_combine_results`, and the stream-K fixups); the work is one `kv_start` scalar threaded into the MMA kernel + chunk-sized `dst_tmp` + one combine.  §4a |
 | **M2** | prototype: `C`-chunked conversion + per-chunk launch, single stream first | same as M0a | chunked / staged / native |
 | **M3** | prototype with the overlapped conversion on the copy stream | same as M0a + M0b | as M2 |
 
@@ -220,3 +260,9 @@ updated or removed by the same change.
   prefill→decode drop; identical arena bytes in both arms).  Arena sizing matches the formula exactly
   (16 → 68 → 160 MiB at 32k on the 27B).  Next: **M1** (feasibility read of `launch_fattn`'s KV split and
   the three kernels' entry points), then the M2 prototype.
+* **2026-10-27 (M1)** — feasibility read done (§4a): the KV split + combine already exists for both the
+  `parallel_blocks` and the stream-K paths (`flash_attn_combine_results`), so a chunked prefill needs one
+  `kv_start` scalar in the MMA kernel, chunk-sized `dst_tmp` and a single combine — no new reduction
+  machinery.  Scope: **MMA-f16 only**, sparse/QSA and the tile kernel stay single-launch.  Remaining
+  unknowns are the numerics re-baseline and the extra enqueue count at depth.  **Next: the M2
+  prototype** (chunked conversion + per-chunk launch, single stream first).
