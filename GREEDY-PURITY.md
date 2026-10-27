@@ -124,6 +124,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§60** | a reduction-order change is a new numerics reference: one reduction (the strided one), and every fused norm kernel reduces like the chain it replaces | doctrine (r145, issue #229) |
 | **§61** | a fused op must reproduce the *model's own chain*, not its fused sibling: an intermediate tensor's scale convention belongs to the emitter, so a pair of fused ops that agree with each other can still be wrong — and the arms they select into are the oracle | fix + doctrine (r148, issue #228) |
 | **§62** | a captured graph is pure only while its **key** names every dimension the subgraph varies in and its **property compare** still sees every baked pointer: a cache key is not a guard, and an identity-free compare is not "purity-neutral" — it is the removal of the only check that a replay's baked kernel arguments still point at the tensors they were captured from | doctrine (r149, TODO #107; `archive/work/graph-replay-keys/`) |
+| **§63** | a verify batch is only as cheap as its *widest* sequence set: aligning the sequences of one step into one ubatch changes a slot's verify width, so the text-level oracle is the single-sequence arm and a verify-width control, never a two-slot text diff | fix + doctrine (r153, issue #234; `archive/work/spec-align-234/`) |
 
 ---
 
@@ -1817,3 +1818,61 @@ Two corollaries that cost real time to learn:
   cache hands the MoE kernels its arena slot table, remap staging, routing staging and both heat mirrors
   that way, so freeing any of them must bump `ggml_cuda_graph_mem_freed` — in the *helper* that returns the
   memory, so a new free site cannot forget.
+
+## 63. A verify batch is only as cheap as its widest sequence set: aligning one step's sequences into one ubatch, and the oracle that can judge it (r153, issue #234)
+
+`llama_memory_hybrid::init_batch()` splits a decode batch with
+`llama_batch_allocr::split_equal(n_ubatch, !unified, n_rs_seq + 1)`, and `split_equal()` takes **one token per
+sequence set per round and stops when the shortest set runs out**.  A decode step in which two slots verify
+different draft lengths therefore becomes **two ubatches**, i.e. two complete passes of the target model over
+the same step.  Padding the shorter sequence to the same length is not an option on this model class: a padded
+row advances the recurrent state in `mem_recr->prepare()`.
+
+Nothing in the delivery caused it, and a fixed `--spec-draft-n-max` never exposed it (every slot drafts
+`n_max`, so the lengths are equal for free).  The adaptive MTP controller's **per-sequence** depth does: two
+concurrently verifying slots routinely sit a step apart.  Measured on the r152 tree (27B UD-Q4_K_XL, greedy,
+`n_predict 400`, `--parallel 2 --kv-unified`, concurrent high- and low-acceptance prompts): the pair aggregates
+**108.1 t/s at 2 GPUs and 86.9 at 3 GPUs**, against **145.6 / 132.2** for the same two prompts whose drafts
+happen to be the same length -- +35 % / +52 %, and the penalty grows with the number of devices the duplicated
+pass spans.  That is why the gate runs both device counts.
+
+The rule: **the sequences that verify in one step must present the same row count.**  The fix (`LLAMA_SPEC_ALIGN`,
+on) raises every drafting sequence's cap to the deepest cap in the same `draft()` call -- only ever up, and
+never past a sequence's own hard bound -- and cuts the drafts to the shortest one when the lengths still differ
+(a different speculator per slot, or a slot whose own `n_max` is smaller because the response is running out of
+tokens).  The implementation that produced a cut draft is told (`common_speculative_impl::draft_truncated()`),
+so its acceptance statistics count only the positions the target verified.  A slot that drafted **nothing** is
+left alone: cutting its neighbour's good draft to nothing is the worse trade, and that step still splits.
+
+**The oracle: the promise is PER CONFIG, and that is what makes a two-slot text diff the wrong instrument.**
+Any fix for this must change some slot's verify width (align up, or cut the other slot down), and a verify
+width is a numeric axis like any other (§36, §45, §60): the target's kernels see a different number of rows.
+`LLAMA_SPEC_ALIGN=0` and `=1` are therefore two **configs**, exactly as `--spec-draft-n-max 4` and `5` are, and
+the rulebook promises greedy text *per config*, not equality between configs.
+
+Both halves of that promise were measured, and neither is a "near-tie that might flip from run to run":
+
+* **Each config is deterministic.**  Every arm of the gate -- knob on and off, 2 GPU, 3 GPU and the host-expert
+  arm -- reproduced its text **character for character across every run** (4/4 runs at 2 GPU, 2/2 at 3 GPU and
+  on the host-expert arm), with `ROCBLAS_USE_HIPBLASLT=0` (§44).  The on/off delta itself is stable: the same
+  divergence character, char 220 of 1202/1352 at 2 GPUs and char 627 of 1234/1315 at 3 GPUs, in every run.
+* **The delta is the width, not the change.**  A **fixed `draft-mtp` pair at depth 5 against depth 4** -- both
+  slots equal length in both arms, no alignment in play -- moves the same slot at the same kind of point
+  (char 259: "Ada not on Monday" vs "but Ada not on Monday").
+
+And the token *rule* is untouched: every emitted token is still the target's own greedy sample at that
+position; what moves is how many positions are verified per pass.  The purity statements this change makes are
+therefore the ones with no width axis in them:
+
+* **`n_seq == 1` is byte-identical.**  One drafting sequence has nothing to align, so the code is inert by
+  construction and the text is unchanged (verified: `llama-cli`, knob on vs off; and every single-slot server
+  request in the gate, at 2 and 3 GPUs and on the host-expert arm).
+* **The equal-length arm does not regress** (two identical prompts: -0.4..-2.1 %).
+* **The cross-process text comparison is stable** with `ROCBLAS_USE_HIPBLASLT=0` -- two runs of the same arm
+  agreed character for character in every slot, which is what makes the pair's delta attributable at all (§44).
+
+Corollary for any future change to a *verify width* (a draft depth, a band bound, an alignment): text identity
+is owed on the arms where the width does not change (single-sequence, single-slot) and against a same-width
+control; a cross-width text difference is a new per-config reference, not a defect.  It is still worth knowing
+that a multi-slot server upgraded across such a change can produce different -- equally valid -- text, which is
+why the delivery's release note says so rather than a gate failing.

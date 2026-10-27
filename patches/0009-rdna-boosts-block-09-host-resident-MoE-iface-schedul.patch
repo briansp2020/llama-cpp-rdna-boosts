@@ -1,4 +1,4 @@
-From ca3efa2414a7bb1dd54490cf8a19ce0406197283 Mon Sep 17 00:00:00 2001
+From 37636237b4e2fce351692166a70e2a929b11a698 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/14] rdna-boosts: block 09: host-resident MoE (iface,
@@ -266,6 +266,20 @@ Also hardened while reading the same file: `get_node_aux()` now asserts against 
 (`nodes_aux`, `3 * n_reduce_steps * max_subgraphs` tensors per device).  Its ALL_GATHER sibling already
 asserted; an over-budget graph would have written past the pool instead of reporting (not reachable on any
 recorded config, no behaviour change).
+
+Amended r153 (issue #234): the aligned verify-batch depth is bounded by this device's MoE expert-cache verify
+band.  Block 02 aligns the drafts of the sequences that verify in the same step so the target batch stays one
+ubatch, but on a host-expert config a batch wider than the band leaves the arena and streams the routed experts
+from the pinned host master on every step (see common_speculative_clamp_ngram_n_max), and alignment turns a wide
+batch from an occasional step into the steady state.  The aligned depth is therefore bounded by
+`band / n_drafting - 1` rows per sequence, because the whole ubatch has to fit: a two-slot verify on RDNA4
+(band 16) aligns to at most 7 each, not 15 each.  A sequence already deeper than that keeps its own cap -- the
+band bound may only WIDEN a shallow draft, never shorten a deep one, which is what keeps every single-sequence
+run bit-identical -- so it needs no new knob; LLAMA_SPEC_ALIGN=0 (block 02) disables the alignment with it.
+The value is read once, after the target context exists, from llama_model_moe_cache_band(), so a config where
+the slab declined (no arena) is unbounded.  Measured with the bound in place on 35B-A3B UD-Q4_K_M -ncmoe 40,
+2 GPU, --parallel 2 --kv-unified: the diverging pair goes 116.2 -> 149.0 t/s (+28 %) and the split decode steps
+58 -> 0, with the single-slot requests byte-identical on/off.  Issue #234.
 ---
  common/CMakeLists.txt                         |    2 +
  common/arg.cpp                                |   21 +-
@@ -275,7 +289,7 @@ recorded config, no behaviour change).
  common/draft-reserve.h                        |   44 +
  common/fit.cpp                                |  499 +-
  common/fit.h                                  |    7 +
- common/speculative.cpp                        |   96 +-
+ common/speculative.cpp                        |  102 +-
  common/speculative.h                          |   31 +-
  docs/multi-gpu.md                             |    4 +-
  .../speculative-simple/speculative-simple.cpp |    4 +-
@@ -333,7 +347,7 @@ recorded config, no behaviour change).
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 66 files changed, 15318 insertions(+), 537 deletions(-)
+ 66 files changed, 15322 insertions(+), 539 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -1731,10 +1745,24 @@ index 824d386b0..9b171b54b 100644
  
  // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index da51f9ddb..42f989869 100644
+index 70335c262..009bbcc76 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -2910,15 +2910,32 @@ struct common_speculative_init_result::impl {
+@@ -1598,9 +1598,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         n_cap.assign(n_seq, 0);
+         n_last.assign(n_seq, 0);
+ 
+-        // issue #234: the verify-band bound of the aligned depth is read once by the MoE expert-cache
+-        // integration, which is where `llama_model_moe_cache_band()` lives (0 = no arena = no bound)
++        // issue #234: the verify-band bound of the aligned depth is read once here, after the target context
++        // exists, because `llama_model_moe_cache_band()` answers from the arena's real state (0 = the slab
++        // declined or there is no host-expert cache, in which case the aligned depth is unbounded)
+         this->align = align;
++        this->band  = llama_model_moe_cache_band(llama_get_model(ctx_tgt));
+ 
+         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
+         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+@@ -3005,15 +3007,32 @@ struct common_speculative_init_result::impl {
      llama_context_ptr context;
  };
  
@@ -1768,7 +1796,7 @@ index da51f9ddb..42f989869 100644
      auto cparams = common_context_params_to_llama(params);
  
      if (spec_mtp) {
-@@ -2948,9 +2965,22 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -3043,9 +3062,22 @@ common_speculative_init_result::common_speculative_init_result(
      std::string model_path;
      if (has_draft) {
          model_path = params.speculative.draft.mparams.path;
@@ -1793,7 +1821,7 @@ index da51f9ddb..42f989869 100644
          if (model_dft == NULL) {
              LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
              return;
-@@ -2978,6 +3008,15 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -3073,6 +3105,15 @@ common_speculative_init_result::common_speculative_init_result(
  
          pimpl->context.reset(ctx_dft);
      }
@@ -1809,7 +1837,7 @@ index da51f9ddb..42f989869 100644
  }
  
  common_speculative_init_result::~common_speculative_init_result() = default;
-@@ -2990,8 +3029,9 @@ llama_context * common_speculative_init_result::context() {
+@@ -3085,8 +3126,9 @@ llama_context * common_speculative_init_result::context() {
      return pimpl->context.get();
  }
  
@@ -1821,7 +1849,7 @@ index da51f9ddb..42f989869 100644
  }
  
  common_speculative_output_limits common_speculative_get_output_limits(
-@@ -3419,3 +3459,49 @@ void common_speculative_print_stats(const common_speculative * spec) {
+@@ -3579,3 +3621,49 @@ void common_speculative_print_stats(const common_speculative * spec) {
                  str_perf.c_str());
      }
  }

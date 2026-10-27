@@ -1,5 +1,96 @@
 # WORKLOG - dated delivery records
 
+## 261027.004 (r153) -- issue #234: the sequences that verify in one step are aligned into one ubatch (blocks 02 + 09); +30..34 % at 2 GPUs, +54 % at 3, and the fix is device-count independent by construction
+
+**Shipped:** `v15-6050b467c-r153` (blocks **02** and **09** amended).  `release.json`: tip **`1e992529d`**
+(the fork branch tip, reproduced by `fork-refresh.sh`), tree **`672f788c9b`**, `scripts/validate-set.sh` green
+(fresh-tarball strict apply 15/15).  Reported by **@overdoingism** (issue #234, with a measurement, an analysis
+and a patch cut on two drafters of their own); archived in
+[`archive/work/spec-align-234/`](archive/work/spec-align-234/) with a `RESOLUTION.md` and an evidence log.
+
+**1. What it fixes.**  `llama_memory_hybrid::init_batch()` splits a decode batch with
+`llama_batch_allocr::split_equal()`, which takes **one token per sequence set per round and stops when the
+shortest set runs out**.  A step in which two slots verify different draft lengths therefore becomes **two
+ubatches** -- the shorter slot's rows in the first, the longer slot's tail in a second -- and the target model
+runs a full extra pass.  A fixed `--spec-draft-n-max` never exposed it (every slot drafts `n_max`, so the
+lengths match for free); the delivery exposes it because `draft-mtp-adaptive` (block 02) holds a
+**per-sequence** depth, so two concurrently verifying slots routinely sit a step apart.  Reproduced on the
+r152 tree, 27B UD-Q4_K_XL, 2 GPU `-sm tensor --parallel 2 --kv-unified -c 32768 -fa on`, greedy, `n_predict
+400`: the concurrent recall+reasoning pair aggregated **108.1 t/s** against **145.6** for the same two prompts
+at one fixed depth (**+35 %**), 86.9 vs 132.2 at 3 GPUs (**+52 %**).  The split is visible in the recurrent
+memory's own trace: one decode step prints `RSPREP prep=1/2 n_tokens=4` (slot 0, depth 3) and
+`prep=2/2 n_tokens=5` (slot 1, depth 4).
+
+**2. The change** (`LLAMA_SPEC_ALIGN`, default **on**, `0` disables; `common/speculative.cpp` only, 2 files of
+delivery content across two blocks).  Block 02: `draft-mtp-adaptive` raises every drafting sequence's cap to
+the deepest cap in the same `draft()` call (only ever up; each sequence keeps `--spec-draft-n-max`, the MTP
+layer cap and the caller's per-slot `n_draft_max`), and `common_speculative_draft()` cuts the drafts to the
+shortest one when the lengths still differ -- which covers a different speculator on each slot (an n-gram hit
+has no cap at all) and a slot whose own `n_max` is smaller -- telling the implementation that its draft was cut
+(`draft_truncated()`) so acceptance statistics count only verified positions.  Block 09: the aligned depth is
+bounded by `band / n_drafting - 1` rows per sequence, because the expert cache's band applies to the **whole**
+batch (two slots at depth 7 already fill the RDNA4 band, so a two-slot verify aligns to 7 each, not 15 each);
+the bound may only widen a shallow draft, never shorten a deep one, which is what keeps a single-sequence run
+bit-identical.  Both blocks are needed because `llama_model_moe_cache_band()` is block 09's API and a block may
+not use a later block's symbol (`gate-per-block-build.sh`).
+
+**3. Declined, with the reason (so they are not re-proposed).**  **Padding the shorter sequence** to equal
+length advances the recurrent state in `mem_recr->prepare()`, so it corrupts the sequence it was meant to help
+-- dead for this model class.  **Cutting the adaptive depth down** to the shallowest slot is the wrong
+direction: adaptive depth is worth **+13 %** over a fixed depth at equal lengths (184.2 vs 163.0 on the same
+pair).  `cparams.n_rs_batch` is untouched (an align-up cannot exceed the per-slot cap, which is bounded by that
+same `n_max`).  The reporter's `0015-6055-spec-align-v1` does not apply -- it sits on drafters this tree does
+not have -- so this is a port of the idea, plus two pieces their patch lacks (the per-implementation cut
+feedback and the band bound).
+
+**4. Measured** (`scripts/gate-spec-align.sh`, the new gate; pair aggregate of a concurrent recall + reasoning
+pair, and the split decode steps from the `RSPREP` trace):
+
+| arm | knob off | knob on | | split steps |
+|---|---:|---:|---|---|
+| 27B, 2 GPU (x8 pair) | 104.8-108.3 | **140.1-140.6** | **+30..34 %** | 58 -> 0 |
+| 27B, 3 GPU | 86.5-87.0 | **133.1-133.7** | **+54 %** | 58 -> 0 |
+| 35B-A3B UD-Q4_K_M `-ncmoe 40`, 2 GPU | 116.2 | **149.0** | **+28 %** | 59 -> 1 |
+
+Per slot: 2 GPU 72-74/57-60 -> 112/76 t/s, 3 GPU 55/45 -> 110/72.  **The penalty scales with the devices the
+duplicated pass spans, which is why the gate runs 2 and 3 GPUs**; the fix itself is device-count independent
+(it edits batch composition in `common/`, before any split mode or kernel is involved, so `-sm layer` benefits
+identically).  The one remaining host-expert split is a slot that drafted **nothing** that round (its sampled
+row alone): cutting its neighbour's good draft to nothing would be the worse trade, so that step still splits.
+The equal-length arm (two identical prompts) is unchanged (-0.4 / -1.4 / -2.1 % / +0.2 %); that arm's spread
+between two identical runs is ~12 %, so the gate bounds it at 10 %.  The final gate run also measures a
+`--spec-type draft-mtp -n 3` arm (equal lengths by construction, a different drafter config) as the checkpoint
+the fix has to reach: pair **141.3 (aligned adaptive) vs 143.9 (fixed n3)**, i.e. within 2 %, while the aligned
+adaptive arm keeps its advantage where acceptance is high (two identical prompts: 171-185 vs 161.2).
+
+**5. Purity: the oracle is the single-sequence arm, not a two-slot text diff.**  Any fix here changes some
+slot's verify width, and a verify-width change moves greedy text on its own.  Measured, in this order: (a)
+**`n_seq == 1` is byte-identical** on/off (`llama-cli`, `b8775233a93a`), and so is every single-slot server
+request at both device counts and on the host-expert arm; (b) cross-process text is **stable** with
+`ROCBLAS_USE_HIPBLASLT=0` (two runs of one arm agreed character for character in every slot and phase); (c) the
+pair's low-acceptance slot diverges at a near-tie (char 220 of 1202 at 2 GPUs, 627 of 1234 at 3), and the
+**control** that attributes it to the width rather than to this change is a fixed `draft-mtp` pair at depth 5
+against depth 4 -- both slots equal length in both arms, no alignment in play -- which flips the same slot at
+the same kind of point (char 259, "Ada not on Monday" vs "but Ada not on Monday").  Recorded as
+`GREEDY-PURITY.md` §63; the gate reports the divergence point and does not gate on it.
+
+**6. Gates.**  Four-axis MTP (adaptive n3 = pinned at the floor, 1 GPU, `-n 3000`, reasoning pinned per axis,
+plus the phase-switching prompt): acceptance **R 0.5425 / P 0.8091 / C 0.8722 / K 0.9920 / mixed 0.6348**;
+the prose `draft-mtp n3` Protocol A arm is **bit-identical to the r152 build** (1449/1791 draft tokens, mean
+accepted length 3.43, 68.7 vs 68.9 t/s), which is the inertness check for a single sequence.  Coherence 4B
+Q8_0 3 GPU **`1c5d32ac537d`** and 35B-A3B 2 GPU `-ncmoe 10` **`627b2ebd7792`**, both == r152.  Prefill-logit
+KLD **0.000000 / 100.000 %**.  `gate-state-pipe.sh` **5/5** (restored text byte-identical to
+`LLAMA_STATE_ASYNC=0` in every cycle; 3.38 ms of the pipelined copy preserved).  `gate-park-idle-slots.sh`
+**PASS** (park == lazy-off on all four requests, parkoff still differs).  `gate-hc-fusions.sh` **7/7**
+(449 chars `6a102dbc62d6`).  `gate-per-block-build.sh --fast --changed-from b9418b679` **3/3** (blocks 02, 09,
+tip).  `validate-set.sh` strict **15/15**, Windows portability clean.
+
+**7. Docs.**  `ENVIRONMENT.md` §3 (`LLAMA_SPEC_ALIGN`, with the multi-slot band note added to the verify-width
+rule), `patches/README.md` (block 02 contents/knobs + the alignment paragraph, block 09's band-bound fact),
+`MANIFESTS.md` (release gate 9 + the two per-block rows), `AGENTS.md` (critical fact), `GREEDY-PURITY.md` §63,
+`scripts/README.md`, `TODO.md` #111 (the two corners outside the fix: a slot that drafted nothing, and the
+`ngram-mod,draft-mtp` chain's cut, which has no A/B yet).
+
 ## 261027.003 (r152) -- PR #235: the state copy is streamed on two threads (block 12); -5.5 to -13 % of the server's save+load, and the streaming-store premise is a per-box property
 
 **Shipped:** `v15-6050b467c-r152` (**block 12** amended; the only delivery content change is

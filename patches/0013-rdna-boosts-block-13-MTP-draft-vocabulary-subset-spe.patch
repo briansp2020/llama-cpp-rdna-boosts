@@ -1,4 +1,4 @@
-From 6bc57ec94fed41ac79eac3a2f5ef061a11576d36 Mon Sep 17 00:00:00 2001
+From a3841b850a9cd67b29b5d778009da69903a11f84 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -111,10 +111,10 @@ index df8caafba..ec1dd017b 100644
      common_cpu_params cpuparams_batch;
  
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 1e9ab3263..c042af715 100644
+index ab447acee..45b9dcc16 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -3075,7 +3075,8 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -3172,7 +3172,8 @@ common_speculative_init_result::common_speculative_init_result(
      auto cparams = common_context_params_to_llama(params);
  
      if (spec_mtp) {

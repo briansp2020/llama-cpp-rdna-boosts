@@ -172,7 +172,26 @@ reserves its compute buffers (r94 moved it here, the block that calls it).
 **Knobs.**  `--spec-draft-n-max`, `--spec-draft-n-start`, `--spec-draft-p-min`,
 `LLAMA_SPEC_DRAFT_N_MAX_CLAMP`, `LLAMA_MTP_INGEST_TAIL`, `LLAMA_MTP_TAIL_READBACK` (r118: kill-switch
 for the readback skip, on by default; `0` restores the pre-r118 behaviour with the tail still set),
-`LLAMA_MTP_DRAFT_OP_OFFLOAD`.
+`LLAMA_MTP_DRAFT_OP_OFFLOAD`, `LLAMA_SPEC_ALIGN` (r153: verify-batch alignment, on).
+
+**The verify batch is aligned across the sequences of one step (r153, issue #234).**
+`llama_memory_hybrid::init_batch()` splits a decode with `llama_batch_allocr::split_equal()`, which takes one
+token per sequence set per round and **stops when the shortest set runs out**, so two slots verifying different
+draft lengths put the longer one's tail into a SECOND ubatch and the target runs a full extra pass for that
+step.  A fixed `--spec-draft-n-max` never produced a difference (every slot drafts `n_max`), which is why this
+survived; the adaptive controller's **per-sequence** depth makes it the normal case on a multi-slot server.
+`draft-mtp-adaptive` now raises every drafting sequence's cap to the deepest cap in the same `draft()` call
+(only ever up: each sequence keeps `--spec-draft-n-max`, the MTP layer cap and the caller's per-slot
+`n_draft_max`), and `common_speculative_draft()` cuts the drafts to the shortest one when the lengths still
+differ (a different speculator per slot, or a slot whose own `n_max` is smaller), telling the implementation
+that its draft was cut (`common_speculative_impl::draft_truncated()`) so acceptance statistics count only
+verified positions.  Measured (27B UD-Q4_K_XL, greedy `-n 400`, concurrent `recall` + `reasoning`): pair
+aggregate **104.8-108.3 -> 140.1-140.6 t/s at 2 GPU (+30..34 %)**, **86.5-87.0 -> 133.1-133.7 at 3 GPU
+(+54 %)**, 35B-A3B `-ncmoe 40` **116.2 -> 149.0 (+28 %)**; split decode steps 58 -> 0 at each; equal-length arm
+-0.4..-2.1 %; single-sequence text byte-identical.  The low-acceptance slot of a mixed pair verifies at its
+neighbour's width, which is a new numerics reference for that config rather than a defect: each config is
+deterministic run to run, and `LLAMA_SPEC_ALIGN=0` vs `=1` differ just as `--spec-draft-n-max 4` vs `5` do
+(`GREEDY-PURITY.md` §63).  A slot that drafted nothing is left alone.  Record: `archive/work/spec-align-234/`.
 
 **The draft's KV cache type follows the main `-ctk` / `-ctv` (r125, issue #216).**  Upstream gives the
 speculative draft context its own KV type pair (`--spec-draft-type-k` / `-ctvd`, defaulting to **f16**)
@@ -594,6 +613,17 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 fitting the whole model on the device: a pinned host master, a per-op H2D staging ring, a scheduler that
 can hand an op to a host-resident table, and the MoE expert cache that keeps the hottest experts in
 whatever VRAM is left.
+
+**The verify batch of a multi-slot step is bounded by the band as a WHOLE (r153, issue #234).**
+`LLAMA_SPEC_ALIGN` (block 02) makes every sequence that verifies in one step present the same row count, so a
+batch is `n_drafting * (n_draft + 1)` rows.  The aligned depth is therefore bounded by
+`band / n_drafting - 1` rows per sequence, read once from `llama_model_moe_cache_band()` after the target
+context exists: two slots at depth 7 already fill the RDNA4 band (16), so a two-slot verify aligns to 7 each
+rather than 15 each.  A sequence already deeper than that keeps its own cap -- the bound may only WIDEN a
+shallow draft, never shorten a deep one, which is what keeps a single-sequence run bit-identical.  Measured
+with the bound on 35B-A3B `-ncmoe 40`, 2 GPU: 116.2 -> 149.0 t/s (+28 %), split decode steps 58 -> 0.  The
+value lives in block 09 because that is where the band API is (a block may not use a later block's symbol,
+which the per-block build gate enforces).
 
 **Contents.**
 
