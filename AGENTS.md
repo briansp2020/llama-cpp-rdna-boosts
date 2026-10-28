@@ -436,6 +436,17 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
 - **MTP gates must be long and reasoning-pinned.** Use `-n 3000` (`-n 2000` floor), `--reasoning on`
   for R and `--reasoning off` for P/C/K. Short runs are a correctness smoke test only. Rule 0 in
   `benchmarks/mtp-adaptive-methodology.md`.
+- **The MTP drafter is embedded in the model GGUF — check before claiming there is no drafter.**
+  `--spec-type draft-mtp` runs the model's *own* MTP head, so every Qwen3.5/3.6/3.8 GGUF under `/llm/models`
+  (and every other model whose GGUF carries an `mtp`/`nextn` tensor) can run an MTP gate with **no second
+  model file**: `-md` is only for a *separate* draft model.  `scripts/fork-refresh.sh --gates` prints the
+  canonical Protocol A command instead of running it because the arm needs a model and a device-count choice
+  — that is a prompt to pick them, not a statement that a drafter is missing.  Run the arm on **both split
+  modes** (`-sm layer` and `-sm tensor`; r159 dense 27B UD-Q4_K_XL, `-c 102400`, bf16 KV, `-n 3000`: layer
+  **51.66 vs 24.97 t/s**, acceptance 0.62; tensor **90.69 vs 48.46**, acceptance 0.60), and note that
+  `llama-cli` needs `-v` to print its perf/acceptance summary at all.  Never report "MTP gate not run: no
+  drafter available" without checking the model's tensors first (`llama_model_loader` logs the MTP head, or
+  `gguf-dump --tensors | grep -i 'mtp\|nextn'`).
 - **Prefill-logit purity is a release gate (issue #113).** Same-seed coherence and MTP are blind to a
   uniform prefill shift. Run `scripts/gate-prefill-logits.sh` before shipping any change to a prefill
   kernel (GDN/SSM chunked, FA, MMQ/MMVF/MMB, MoE prefill) or a default-on approximate path: it compares
