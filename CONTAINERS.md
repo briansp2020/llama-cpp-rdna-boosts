@@ -439,3 +439,12 @@ FORCE_TAG=v15-6050b467c-r138 ~/bin/rdna-container-watch.sh
 
 The primary box can keep using `scripts/build-containers.sh` directly for a manual or
 smoke build; the watcher is only the unattended path.
+
+**A re-pointed release tag must not wedge the watcher (r166, 2026-10-28).**  The release flow tags,
+then lands a trailing record commit and moves the tag onto it, so a tag can legitimately be re-pointed
+after the watcher has already fetched it.  The fetch is therefore `git fetch --tags --force`, and its
+failure is logged.  Before that, a plain `--tags` fetch refused the moved tag (`! [rejected] … (would
+clobber existing tag)`), exited 1, and under the script's `set -e` killed the watcher on that line with
+**no log output at all** — r166 sat unbuilt through 40 minutes of silent one-second cron runs while the
+log's last line was the previous release.  If a worker ever goes quiet, run
+`git -C <repo> fetch --tags --force origin` by hand and read its exit status before suspecting podman.

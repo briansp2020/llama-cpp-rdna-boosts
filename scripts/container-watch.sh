@@ -77,7 +77,17 @@ cd "$RDNA_REPO"
 if [ -n "$FORCE_TAG" ]; then
     tag="$FORCE_TAG"
 else
-    git fetch --quiet --tags origin
+    # `--force`: a RELEASE tag can legitimately be re-pointed -- the release flow tags, then lands a
+    # trailing record commit and moves the tag onto it (r165 and r166 both did).  A plain `--tags`
+    # fetch then REFUSES the update ("! [rejected] v... -> v... (would clobber existing tag)"), exits
+    # 1, and under `set -e` kills this watcher on that line with no log output at all -- so every
+    # later run died the same way and the new tag was never built (observed 2026-10-28, r166: 40 min
+    # of silent 1-second runs, no line in watch.log).  The remote tag is the source of truth for a
+    # release, so force it, and make a real fetch failure loud instead of silent.
+    if ! git fetch --quiet --tags --force origin; then
+        log "ERROR: git fetch --tags --force origin failed"
+        exit 1
+    fi
     # -creatordate, not -v:refname: the base SHA is in the tag name, so a re-base to a
     # "lower" base would otherwise be missed.  Release tags are annotated, so this is
     # the release order.

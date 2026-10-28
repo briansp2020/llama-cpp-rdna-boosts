@@ -33,6 +33,14 @@ natural prompt for a model-specific arm — its own KLD corpus, 25 814 tokens �
 (need 25814)`; it now asks the tokenizer for the required length (`llama_tokenize(..., nullptr, 0, ...)
 returns -n`) and sizes the buffer from that.  Verdict logic untouched, test-only, no runtime path.
 
+**Also found (and fixed) while publishing it: the container watcher could wedge silently.**  The release
+flow tags and then moves the tag onto a trailing record commit, and the worker had already fetched the
+previous position, so `git fetch --quiet --tags origin` refused the update (`would clobber existing tag`),
+exited 1, and `set -e` killed `scripts/container-watch.sh` on that line **before any log write** — r166 sat
+unbuilt through 40 minutes of one-second cron runs with nothing in `watch.log`.  It is now
+`git fetch --tags --force` (a release tag is the source of truth) and a failed fetch is logged.  The
+worker was repaired by hand and picks r166 up; `CONTAINERS.md` records the signature.
+
 **Gates.**  `validate-set.sh` strict 15/15, tree `cbcb8808`; `gate-per-block-build.sh --changed-from 809a27419`
 **2/2** on the `all` target set (block 06 + the tip, 58 s); `gate-prefill-logits.sh` **mean KLD 0.000000 /
 same-top-p 100.000 %**; same-seed coherence unchanged; Protocol A on the dense 27B UD-Q4_K_XL
