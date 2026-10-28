@@ -10,17 +10,17 @@ arena step lands in shared memory.  The r156/r149 delta there is *exactly* the a
 (`+899` → `+1923` MiB shared for a f16 draft KV, `+2949` with a q8_0 draft): one and two 1024 MiB arenas
 that arrived late.  See §1 for the arithmetic.
 
-> **STATE (2026-10-27): phase 1 done (scoped, measured, decided); phase 2 = `TODO` #114, not started.**
-> Outcome **C** shipped as `beta/fa-stage-peak/` (one early allocation, eager by default on Windows, plus a
-> draft cap) and is awaiting the Windows tester.  The size fix — tiling the staging so the arena is
-> O(chunk) — is `TODO` #114 and its cold-session handover is
-> [`HANDOVER-2026-10-27-114.md`](HANDOVER-2026-10-27-114.md) (kickoff prompt in §0).  The prototype is kept
-> here (`PROTOTYPE-chunked-staging.patch`).  The
-> staging is worth keeping (+1.5/+2.7/+5.1 % pp, §3), and a chunked prototype works and is numerically sound
-> (`FINDINGS-2026-10-27-m2.md`), **but** the MMA prefill kernel's only multi-block KV split is stream-K, so
-> a chunked launch currently costs 2.8x prefill.  Tiling therefore requires re-expressing the stream-K
-> partial protocol (the same path the decode band's purity depends on) — a deliberate follow-up, not a
-> launcher tweak.  Read §0 with `FINDINGS-2026-10-27-m2.md` §"Verdict".
+> **STATE (2026-10-27, r159): PROMOTED AND SHIPPED as an opt-in.**  `GGML_CUDA_FA_STAGE_CHUNK=<rows>`
+> (block 10) tiles the staging conversion per KV chunk so the arena is **O(chunk), 64 MiB flat at any
+> depth**; `GGML_CUDA_FA_STAGE_PREALLOC=2` (also block 10) ships the eager allocation the reporter's
+> re-test validated.  Both are opt-in, nothing changes for a default run, and the four documented choices
+> (plus "don't stage") are in `ENVIRONMENT.md`.  Cost of the tiled arm: +0.0 % prefill at 32k, -4.1 % at
+> 64k, and the same shape in prefill-logit drift (2 chunks pass the gate, 4 sit at its limit), so the
+> recommended chunk is 16384; on a slab (host-expert) config it buys nothing and should stay off.  The
+> remaining ~2.2 % that lives in the FA kernel's short-KV execution is **not** budgeted.  `DRAFT_MB` was
+> dropped (the tester showed it is not a cap).  This directory is the historical record: numbers in
+> `FINDINGS-2026-10-27-m3.md`, the mechanism in `PROTOTYPE-2-streamk-partial.patch`, the rule + traps in
+> `patches/README.md` (block 10).
 
 ## 0. The decision this campaign must produce
 
@@ -277,6 +277,17 @@ updated or removed by the same change.
   `kv_start` scalar in the MMA kernel, chunk-sized `dst_tmp` and a single combine — no new reduction
   machinery.  Scope: **MMA-f16 only**, sparse/QSA and the tile kernel stay single-launch.  Remaining
   unknowns are the numerics re-baseline and the extra enqueue count at depth.
+* **2026-10-27 (M3)** — the stream-K per-row partial contract is implemented and measured
+  (`FINDINGS-2026-10-27-m3.md`, `PROTOTYPE-2-streamk-partial.patch`).  Step 0 (one chunk, protocol only)
+  reproduces the baseline PPL exactly; with the protocol in place the M2 matrix is **no longer 2.8x** — the
+  cost is ~1.5 % of prefill per chunk beyond two (0 % at 2 chunks: pp32768 1139.56 vs 1139.41 with a
+  64 MiB ring; −4.1 % at 64k with 4 chunks; −6.1 % at 16 chunks).  Arena: 64 MiB flat vs 160 MiB at 33k
+  and 1024 MiB at `-c 262144`.  Gates: `FLASH_ATTN_EXT` 6450/6450 with chunking on, `FLASH_ATTN_QSA`
+  26/26, width probe PASS (maxdiff 0), prefill-logit KLD 0.001 at 2 chunks (PASS) / 0.0053 at 4 chunks
+  (just over the limit), greedy text unchanged at ≤ 5 chunks on both models.  Three real bugs were found
+  by the op matrix and fixed (sinks counted per chunk, the no-seam publish's activation condition, the
+  packed group bitmap); the remaining ~2.2 % is inside the FA kernel's short-KV execution.  **Decision
+  (default-on bound vs opt-in) is open with the maintainer.**
 * **2026-10-27 (M2)** — the prototype is built and measured (`FINDINGS-2026-10-27-m2.md`): the ring + merge
   + finalize path is correct (single-chunk PPL identical to the baseline, 4 chunks -0.06 %) and takes the
   arena to O(chunk), but forcing the per-output-tile grid costs **2.8x pp** because the MMA kernel's work

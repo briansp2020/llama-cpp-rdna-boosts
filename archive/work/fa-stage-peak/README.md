@@ -1,6 +1,15 @@
 # `fa-stage-peak` — BETA (issue #237 follow-up): one early, correctly-sized FA staging allocation
 
-> **STATUS (2026-10-27): BETA — NOT part of the delivery set.**  Cut against `v15-6050b467c-r158` for
+> **STATUS (2026-10-27, r159): CLOSED — FOLDED INTO BLOCK 10 as an opt-in, except `DRAFT_MB`, which was
+> dropped.**  `GGML_CUDA_FA_STAGE_PREALLOC=2` (eager) is shipped, opt-in, with no platform-dependent
+> default (the maintainer's call: one default policy everywhere).  The reporter's re-test validated it —
+> pp 592 -> 781 against r149's 791, identical greedy text hash and PPL in all six arms — and his best arm
+> was `GGML_CUDA_FA_STAGE_MAX_MB=256`.  `GGML_CUDA_FA_STAGE_DRAFT_MB` did **not** work as a cap (it only
+> lowered the draft arena's starting size; the draft context kept laddering 64 -> 417.5 MiB with late
+> steps), so it never shipped.  This patch is **historical**: it no longer applies to the current release
+> tree, and `WORKLOG.md` 261027.011 carries the record.
+>
+> **Original status (2026-10-27): BETA — NOT part of the delivery set.**  Cut against `v15-6050b467c-r158` for
 > @DanoPTT's Windows/WDDM re-test (the #237 follow-up: the r156 growth ladder makes a 100k prefill ~22 %
 > slower than r149 because the last 1 GiB step lands in shared memory).  Nothing here is folded into a
 > block; see "When promoted" for where it would go.

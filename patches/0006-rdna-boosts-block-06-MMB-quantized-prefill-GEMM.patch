@@ -1,4 +1,4 @@
-From c830d0aaf20ad01a9ab20ac3bc056f151aa6510d Mon Sep 17 00:00:00 2001
+From eb52d7b657c6c2b3af68a16e744916caba7944b7 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 06/14] rdna-boosts: block 06: MMB quantized prefill GEMM

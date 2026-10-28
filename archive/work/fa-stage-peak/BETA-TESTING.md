@@ -68,7 +68,7 @@ log with `GGML_CUDA_SLAB_STATS=1` is ideal — it contains all of it.
 * **The peak comes back.**  On WDDM there is no safe time to take VRAM except the first, so arm A reserves
   the arena's full size up front (1 GiB per context at `-c 262144`).  That is r149's memory shape; arm B and
   arm C are how it is bounded.  This patch does *not* reduce the peak — making the arena genuinely small
-  (a per-KV-chunk staging ring) needs a kernel change we have prototyped but not shipped (`wip/fa-stage-chunking/`
+  (a per-KV-chunk staging ring) needs a kernel change we have prototyped but not shipped (`archive/work/fa-stage-chunking/`
   in the delivery repo).
 * The draft cap (arm B) is **unmeasured on our side**: we have no Windows MTP arm.  If the draft's prefill
   gets slower in arm B than arm A, say so — the cap is a knob, not a decision.

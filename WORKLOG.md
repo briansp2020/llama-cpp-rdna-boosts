@@ -1,5 +1,80 @@
 # WORKLOG - dated delivery records
 
+## 261027.011 (r159) -- the FA prefill staging arena gains two OPT-IN bounds: a KV-chunked ring and an eager allocation (block 10)
+
+**Release:** `v15-6050b467c-r159` (base `6050b467c`, tip **`6627ed715`**, tree
+**`4a02cc27b354fa4316dc5f9f4832f82f32f9b789`**, 15 blocks; `validate-set.sh` green, checksums and both
+Windows lints clean).  Blocks 05/10/11-14 are unchanged in content except block 10, which gains both
+changes.  **Nothing changes for a default run**: an arena allocation size and an env-gated launch path
+cannot move a logit, and the default arm's prefill logits were re-measured at **0.000000 / 100.000 %**.
+
+**Why an opt-in and not a default.**  Both bound a *transient* the default arm is happy to pay for: the
+staging is worth +1.5 / +2.7 / +5.1 % pp at 8k/16k/32k (M0a) and every bound costs either the peak (eager)
+or depth (chunking).  The maintainer's rule for this release is one default policy on every platform, so
+both ship as choices and `ENVIRONMENT.md` documents the four-arm table (`ENVIRONMENT.md` "four documented
+choices").
+
+**1. `GGML_CUDA_FA_STAGE_CHUNK=<rows>` -- the staging transient becomes O(chunk) (`TODO` #114, closed).**
+The MMA prefill kernel's only multi-block KV split is stream-K (`kbc = blockIdx.x*total/gridDim.x`), whose
+partials were published in two contracts: a tile-start block wrote a **final normalized** value and a seam
+block an unnormalized partial plus meta that only the fixup folds.  A tile whose KV sat inside one block
+therefore published no `(max, rowsum)` at all -- which is why the first chunked attempt (M2) produced NaNs.
+r159 gives the path a **per-row partial contract**: every block publishes `(unnormalized numerator, max,
+rowsum)` for its own rows (the no-seam case included, with `np > 1`'s combined max carried in the free
+padding float of `tile_Q`), the two fixup kernels hand the merged value back unnormalized, and one
+`kv_start` int keeps the fully-masked-group bitmap and the `KV_max` bound exact per chunk (chunks are
+`lcm(nbatch_fa, FATTN_KQ_STRIDE)`-aligned).  The launcher converts + launches + folds per chunk over a
+**one-slot** ring (in-order stream, so one slot suffices), merges with an online softmax and normalizes
+once.  Measured (27B UD-Q4_K_XL, 1 GPU, q8_0 KV, `-ub 512`, `llama-bench -r 3`):
+
+| arm | ring | pp8192 | pp16384 | pp32768 |
+|---|---|---:|---:|---:|
+| default | 134 MiB @32k | 1315.01 | 1245.08 | **1139.41** |
+| `CHUNK=16384` | **64 MiB** | 1307.79 | 1246.99 | **1139.56 (+0.0 %)** |
+| `CHUNK=8192` | 32 MiB | 1307.67 | 1245.31 | 1106.85 (-2.9 %) |
+| `CHUNK=4096` | 16 MiB | 1305.53 | 1223.84 | 1089.72 (-4.4 %) |
+
+Depth: pp65536 default 971.68 vs `CHUNK=16384` 931.90 (**-4.1 %**, 4 chunks).  The cost is per chunk
+boundary (~1.5 % beyond the second), and it is **not** the merge or the fold (~0.2 % each, priced by
+skipping them) nor the per-chunk conversion (~0.4 %): ~2.2 % is inside the FA kernel's short-KV execution
+and is left as a documented, unbudgeted follow-up (only worth a campaign if <= 4 chunks ever becomes a
+default).  Arena proof: 33k prompt -- default `FA_STAGE` climbs 16 -> 68 -> **160 MiB**, `CHUNK=16384`
+prints `FA_CHUNK n_kv=33024 rows=16384 chunks=3 ring=64.0 MiB` and stays there at any depth (1024 MiB ->
+64 MiB at `-c 262144`).  Gates: `gate-prefill-logits.sh --kv q8_0` re-recorded at the standard point
+(`base PPL 5.9317`) -- 2 chunks **0.000995 / 99.707 %** PASS, 4 chunks 0.005264 / 98.828 % (5 % over the
+limit, the expected re-baseline and the reason the recommended chunk is 16384); `FLASH_ATTN_EXT`
+**6450/6450 with chunking on** (`=256` and `=128`), `FLASH_ATTN_QSA` 26/26, `W=1..8` probe PASS (maxdiff 0,
+f16 and q8_0, chunk off and on), greedy text byte-identical up to ~5 chunks on 4B and 27B, and one slab
+arm (35B-A3B, 2 GPU `-sm tensor -ncmoe 40`): `slab=1`, ring 16 MiB/device, pp 1241.07 -> 1237.79 --
+parity, and **no benefit**, because that arena is already released at the wide-drop: documented "leave it
+off on slab configs".  Three real bugs the op matrix caught and this release fixes in the mechanism: sinks
+counted once per chunk (149 cases), the no-seam publish gated on an empty `stride_k` pass for small
+`nbatch_combine` (7 cases, +-inf), and the unsliceable **packed** group bitmap (disabled while chunked; the
+derived layout slices exactly).
+
+**2. `GGML_CUDA_FA_STAGE_PREALLOC=2` -- the eager allocation, validated on WDDM (block 10).**  The r156
+ceiling grows the arena in <= 3 steps; on WDDM a freed allocation stays committed and a late step lands in
+shared memory (issue #138 / the #237 follow-up).  Mode `2` takes the root-based hint in one allocation at
+the first request.  The reporter's re-test (Windows, 1x R9700, `-c 262144`, q8_0 KV, 100607-token
+`/completion`, fresh server per arm): **pp 592 -> 781** (r149: 791), one `alloc=1024.0 MiB` at 0:22 instead
+of `16 -> 72 -> 296 -> 1024` at 1:48, dedicated VRAM back to r149's peak; **greedy text hash identical in
+all six arms and equal to r149**, draft acceptance 44/54 everywhere, PPL identical in every arm including
+per-chunk values.  The trade is the peak (1 GiB/context at `-c 262144`), which `FA_STAGE_CHUNK` or
+`FA_STAGE_MAX_MB` then bound -- and the tester's own best arm was `MAX_MB=256` (pp == r149, shared == r149,
+480 MiB *less* dedicated than r149).
+
+**Dropped:** `GGML_CUDA_FA_STAGE_DRAFT_MB` (prototyped in `beta/fa-stage-peak`, never shipped).  The
+tester's arm B showed it only sets the draft arena's *starting* size -- the context kept its 1.25x ladder
+(64 -> 417.5 MiB, late steps at 2:08) -- so it did not do what its name promised.  `FA_STAGE_MAX_MB` is the
+knob that actually bounds a draft; a true draft ceiling is a possible future item, not a promise.
+
+**Also clarified in `ENVIRONMENT.md`:** `GGML_CUDA_FA_STAGE_MAX_MB` is a **per-operand** cap, so `=256`
+gives a 512 MiB arena for a K+V op (the tester's "why 512?" question -- intended, not rounding).
+
+**Records:** `archive/work/fa-stage-chunking/` (campaign: `README.md`, `FINDINGS-2026-10-27-{m0,m2,m3}.md`,
+`HANDOVER-2026-10-27-114.md`, both prototypes) and `archive/work/fa-stage-peak/` (the superseded beta).
+`TODO` #113 and #114 closed by this entry.
+
 ## 261027.010 (r158) -- the replay guard compares in place over a source-packed store; the graph key is built once (block 10)
 
 **Release:** `v15-6050b467c-r158` (base `6050b467c`, tip **`217b1c999`**, tree

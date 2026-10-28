@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r158`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r159`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, and the graph key is built once per call) | +12124 / −4887 | 75 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in — see the block section) | +12543 / −4954 | 75 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236) | +4034 / −755 | 46 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -1225,6 +1225,49 @@ acceptance must come with the same-shape refusal for the straddling case (`GREED
 `hole=0` and `outside_failed=0` are the acceptance signals).
 
 ---
+
+
+### The FA prefill staging arena: two opt-in bounds (r159)
+
+**What it is.**  `launch_fattn` dequantizes the K/V rows an op reads into a per-stream F16 arena
+(`fattn_stage[]`) before launching, because reading the quantized cache once per *output* tile is slower
+(worth +1.5 / +2.7 / +5.1 % pp at 8k/16k/32k on gfx1201, M0a).  The arena is transient (created and dropped
+inside one op, per layer) but its **request** is O(`n_past + n_q`), which is what issues #138 (the growth
+ladder strands ~5x its size on WDDM) and #237 (an eager ceiling commits up to 1 GiB at `-c 262144`) are
+about.  r159 adds two **opt-in** bounds; the default arm is unchanged and bit-identical.
+
+* **`GGML_CUDA_FA_STAGE_CHUNK=<rows>`** — the structural bound.  The op is launched **once per KV chunk**:
+  convert that chunk into a one-slot ring, launch the same stream-K grid over it, fold, merge into the
+  running accumulator with an online softmax, then normalize once at the end.  That needs a **per-row
+  partial contract** in the prefill kernel: every block publishes `(unnormalized numerator, max, rowsum)`
+  for its own rows — the no-seam (whole-tile-in-one-block) case included, which used to publish a
+  normalized value and no meta at all — and the two stream-K fixup kernels hand the merged, still
+  unnormalized value back instead of dividing (`float2 * kv_partial_meta`, nullptr = the shipping
+  behaviour).  One `kv_start` int lets the chunk keep the two absolute-KV optimizations: the fully-masked
+  group bitmap indexes `(kv_start + kb0*nbatch_fa)/FATTN_KQ_STRIDE` and the `KV_max` bound becomes
+  `max(0, KV_max - kv_start)/nbatch_fa`; both are exact because chunks are `lcm(nbatch_fa,
+  FATTN_KQ_STRIDE)`-aligned.  Arena: **64 MiB flat** at `=16384` (27B), vs 160 MiB at 33k / 1024 MiB at
+  `-c 262144`.  Cost: +0.0 % at 32k, -4.1 % at 64k, ~1.5 % per chunk beyond the second (and the same shape
+  in prefill-logit drift: KLD 0.001 at 2 chunks vs 0.0053 at 4).  **Facts a future edit must keep:**
+  attention **sinks** belong to chunk 0 only (they add `exp(sink - max)` to the rowsum, so passing them to
+  every chunk counts them `n_chunks` times); the no-seam publish must be gated on `k == 0`, not on a
+  particular `stride_k` pass (a small `nbatch_combine`, e.g. 16, leaves the `warp_size` pass empty); the
+  **packed** fully-masked-group bitmap cannot be sliced by a chunk start (its per-tile word count is derived
+  from the launched KV length) so a chunked launch disables it — the **derived** (batch-wide) layout, which
+  is what a single-sequence prefill uses, slices exactly; and a chunked launch runs `>= 2` chunks only (one
+  chunk is the whole-prefix arena).  On a slab config the arena is served by the slab's wide-aux region and
+  released at the prefill->decode drop, so this buys nothing there: leave it off.  Gate set: `gate-prefill-logits.sh
+  --kv q8_0` (the chunked arm is a re-baseline, 2 chunks pass), `FLASH_ATTN_EXT` 6450/6450 **with chunking
+  on**, `FLASH_ATTN_QSA` 26/26, the `W=1..8` probe (band untouched) and the pp matrix.  Records:
+  `archive/work/fa-stage-chunking/` (`FINDINGS-2026-10-27-m3.md` = the numbers).
+* **`GGML_CUDA_FA_STAGE_PREALLOC=2`** — the policy bound: one allocation of the root-based hint at the first
+  request (r149 behaviour) instead of the r156 ceiling's ladder.  Allocation only, so numerics are
+  bit-identical (the reporter's re-test: identical greedy text hash and PPL across every arm).  On WDDM it
+  restores r149 (pp 592 -> 781 against r149's 791); the trade is the r149 **peak**, 1 GiB per context at
+  `-c 262144`.  `0` = the pre-r53 1.25x ladder, `1` = the default ceiling.  A draft-context cap
+  (`GGML_CUDA_FA_STAGE_DRAFT_MB`) was prototyped and **dropped**: it only lowered the draft arena's
+  starting size and the context kept laddering (64 -> 417.5 MiB, late steps at 2:08), so it did not do what
+  its name promised; `GGML_CUDA_FA_STAGE_MAX_MB` is the knob that actually bounds a draft.
 
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 
