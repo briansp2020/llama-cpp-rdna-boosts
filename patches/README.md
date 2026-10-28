@@ -126,16 +126,40 @@ upstream's version and drop the local hunk.
 ## Block 01 — hybrid HIP all-reduce
 
 **What it is.**  A device-side all-reduce for the small tensors `-sm tensor` reduces on every decode step,
-plus a per-size hybrid dispatch: small tensors take the internal pipeline, large ones go to RCCL/NCCL.
-Four files, ~2.4k lines, all in `allreduce-hip.cu` + `ggml-cuda.cu`.
+plus a per-size dispatch: small tensors take the internal pipeline, and the large ones go to an arm chosen
+per model -- RCCL's ring when the model offloads experts to host memory, the copy-engine (SDMA) path
+otherwise, with **peer access never enabled** (r165; the choice itself is wired in block 10, which owns the
+slab state it reads).  Four files, ~2.4k lines, all in `allreduce-hip.cu` + `ggml-cuda.cu`.
 
 **Contents.**  Internal host-staged pipeline and butterfly kernels; a wall-clock soft/hard spin budget so a
 lagging rank fails soft instead of hanging (issue #139); eager `ncclCommInitAll` (a lazy mid-run init
 perturbed the split compute and broke `-sm tensor -ncmoe` MTP purity); a first-runtime-failure fallback
-that warns once, disables NCCL and re-routes to the internal path; an opt-in P2P/large path and an opt-in
-copy-engine (SDMA) scratch path; and the `AR_PROFILE` device-list initialisation fix.
+that warns once, disables NCCL and re-routes to the internal path; an opt-in P2P/large path and the
+copy-engine (SDMA) large-tensor path; and the `AR_PROFILE` device-list initialisation fix.
 
-**Knobs.**  `GGML_CUDA_ALLREDUCE` (`hybrid` default, `nccl`, `internal`, `meta`), `GGML_CUDA_AR_P2P*`,
+**r165 -- the large-tensor arm, and `TODO #109` closed.**  The Linux/HIP default is now `auto`: the internal
+pipeline for decode/verify-sized tensors and a **large-tensor arm chosen once, at the first large
+all-reduce** -- RCCL's ring when the model offloads experts to host memory (`g_comm_host_experts`, set by
+`ggml_cuda_slab_arm()` in block 10), the copy-engine arm otherwise -- and **peer access is never enabled**.
+Why: `hipDeviceEnablePeerAccess` alone (the AR path held constant) costs a replayed dense decode
+42.25 -> 38.77 t/s on 3x R9700; the GPU critical path is unchanged (a per-token sync makes the arms equal:
+41.1 vs 41.4), and the cost is not reversible after RCCL has made its mappings (every
+`cudaDeviceDisablePeerAccess` returns `no error` and the arm stays at 37.9), so it has to be prevented at
+init.  The two arms are good at different shapes, which is what sets the routing rule: the copy engine wins
+every dense shape (27B `pp2048` 2178 vs 2018, Gemma4 31B 1998 vs 1944, Flash-Next all-VRAM decode 67.2 vs
+59.9) while RCCL wins a PCIe-saturated host-expert prefill at **every** offload depth (Flash-Next IQ4_NL
+2 GPU `-ncmoe 20` 809 vs 604, `-ncmoe 32` 555 vs 414, `-b/-ub 4096` `pp4096` 2901 vs 2344) -- disabling
+RCCL's P2P globally instead costs 8 % on that shape (731-747 t/s), so the routing is what keeps both.
+The copy-engine arm no longer enables peer access either (`GGML_CUDA_AR_CE_PEER=1` opts in; staged and
+direct peer copies measure the same, so the default is off).  `GGML_CUDA_ALLREDUCE=hybrid` keeps the
+pre-r165 P2P chain, `ce` pins the copy-engine half.  Purity: the decode/verify band's small/large
+crossover is unchanged, so those paths are bit-identical to r164; the large arm is a prefill-numeric change,
+gated at **mean KLD 0.001448 / same-top-p 98.676 %** against the RCCL arm on 3 devices `-sm tensor`
+(`scripts/gate-prefill-logits.sh --sm tensor --device 0,1,2`, `GREEDY-PURITY.md` §67).  Numbers and the
+isolation: `benchmarks/2026-10-28-allreduce-peer-access.md`; `WORKLOG.md` 261028.007.
+
+**Knobs.**  `GGML_CUDA_ALLREDUCE` (`auto` default on Linux/HIP since r165, `hybrid`, `nccl`, `internal`,
+`ce`, `meta`), `GGML_CUDA_AR_CE_PEER`, `GGML_CUDA_AR_P2P*`,
 `GGML_CUDA_AR_CE_SCRATCH_MIB`, `GGML_CUDA_AR_SPIN_TIMEOUT_MS` / `_HARD_MS`,
 `GGML_CUDA_AR_SMALL_BLOCKS` / `_SMALL_BYTES`, `GGML_CUDA_AR_KER_EVENTS`, `GGML_CUDA_AR_PROFILE`.
 

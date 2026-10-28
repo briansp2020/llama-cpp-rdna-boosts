@@ -1,5 +1,72 @@
 # WORKLOG - dated delivery records
 
+## 261028.007 (r165) -- TODO #109: `hipDeviceEnablePeerAccess` is what costs a replayed decode, so the all-reduce arms were re-cut (dense -> copy engine, host experts -> RCCL's ring, peer access never enabled)
+
+**Release `v15-6050b467c-r165`**, base `6050b467c`, 15 blocks, tip `1b13aa91300a12691a13e3bb8ebdcc1a2ac0aad0`,
+tree `c321baad4d8de2382f0a073b638c2d60e4b1cf97`.  Blocks 01 and 10 amended; docs, one gate extension and the
+retirement of `TODO #109`.
+
+**What #109 actually was.**  The item asked what RCCL's init leaves behind that costs a *replayed* graph 5-7 %
+while the direct node loop is immune, and its own note already suspected "RCCL's presence".  It is not RCCL:
+with the all-reduce path held constant, `GGML_CUDA_ALLREDUCE=internal` on 27B Q8_0 3x R9700 `-sm tensor
+tg128` measures **42.25** with no peer access and **38.77** with `hipDeviceEnablePeerAccess` forced on at comm
+init — the whole of the regression, from one HIP call.  It is a **host** cost: a per-token synced loop is
+equal in both arms (41.39 vs 41.09), the decode window's kernel census under `rocprofv3` is identical
+(24 665 per device, same kernels, the AR kernel is not slower), the AR profile accounts for only
++0.05 ms/token, and a 3-device probe (4 GiB streaming read + an FMA loop, peer access enabled before *and*
+after the allocation) measures 0.0 % on bandwidth, ALU time and GPU per-dispatch cost (3.46 vs 3.51 us).
+It scales with the number of enabled pairs and enable/disable costs microseconds.  And it is **not
+reversible**: after `ncclCommInitAll` has built its P2P mappings, every `cudaDeviceDisablePeerAccess`
+returns `no error` and the arm stays at 37.9 t/s — so a chain that does not want the cost must not enable it.
+
+**Ruled out on the way** (same arm): the per-call arm choice and the hybrid routing thresholds
+(`AR_SMALL_BYTES` 0/1e9, and forcing every AR to the internal pipeline with RCCL up still loses: 38.85),
+RCCL's presence without peer access (`hybrid` + `NCCL_P2P_DISABLE` 42.2), proxy CPU (`NCCL_PROXY_CPUSET`),
+channels (`MAX/MIN_NCHANNELS`, `MAX_P2P_NCHANNELS`), cuMem (`NCCL_CUMEM_ENABLE=0`), dma-buf
+(`NCCL_DMABUF_ENABLE=0`), the graph helper/register/mixing knobs, `NCCL_PROGRESS_APPENDOP_FREQ`,
+`NCCL_RUNTIME_CONNECT`, `NCCL_P2P_DIRECT_DISABLE`, `NCCL_P2P_USE_CUDA_MEMCPY`, capture churn (the
+`GGML_CUDA_GRAPH_TRACE` census is identical in both arms), `GGML_CUDA_GRAPH_CHUNK_SIZE`,
+`GGML_CUDA_ASYNC_INPUT`, `GGML_SCHED_EVENTS`.
+
+**The change.**  The Linux/HIP default (block 01's `auto` chain) is now: internal pipeline for the
+decode/verify band; RCCL brought up **eagerly** (the r34 purity rule) but with `NCCL_P2P_DISABLE` set when
+the user has not; the copy engine brought up too; and the **large arm chosen once, at the first large
+all-reduce** by `g_comm_host_experts` — set by `ggml_cuda_slab_arm()` (block 10, which owns the slab state)
+— RCCL's ring for a host-offloaded model, the copy-engine arm otherwise.  The copy-engine arm also stopped
+enabling peer access (`GGML_CUDA_AR_CE_PEER=1` opts in; staged and direct peer copies measure the same).
+The routing is what keeps both regimes, and it is measured at every offload depth: dense prefers the copy
+engine (27B `pp2048` 2178 vs 2018, Gemma4 31B 1998 vs 1944, Flash-Next GSQ all-VRAM decode **67.2 vs
+59.9** t/s) while a PCIe-saturated host-expert prefill prefers RCCL by 24-34 % (Flash-Next IQ4_NL 2 GPU
+`-ncmoe 20` 809 vs 604, `-ncmoe 32` 555 vs 414, `-b/-ub 4096` `pp4096` 2901 vs 2344) and the two only
+converge at `-ncmoe 8` on 3 GPUs / full residency.  Disabling RCCL's P2P globally instead (731-747) loses
+8 % there, which is why it is a routing decision and not a blanket switch.  `GGML_CUDA_ALLREDUCE=hybrid`
+keeps the pre-r165 P2P chain, `ce` pins the copy-engine half.
+
+**Numbers.**  27B Q8_0 dense 3 GPU `tg128` **38.6 -> 42.3** (+9.5 %) with prefill flat (2161 vs 2177), 2 GPU
+2237/33.09 vs 2210/32.68; Gemma4 31B 3 GPU 1998/34.91 vs 1944/34.40; Flash-Next GSQ IQ3_XXS all-VRAM
+decode 67.15 vs 59.92; 35B-A3B `-ncmoe 40` 2 GPU 1252/99.14 vs 1232/99.18; Flash-Next IQ4_NL `-ncmoe 20`
+2 GPU 731-747/43.8 vs 809/44.15 (the one documented residual).  Protocol A (27B Q8_0, 3 GPU `-sm tensor`,
+100K ctx, `prompts/prose-rdna-boosts.txt`): plain **38.3 -> 40.7 t/s**, `draft-mtp` **80.9 -> 88.5 t/s**,
+acceptance **0.641** (1972/3075).
+
+**Gates.**  The prefill-logit gate could not reach an all-reduce at all (one device, and the default split is
+`layer`), so it gained `--sm` and a `--device` list; the arm switch then gates at **mean KLD 0.001448 /
+same-top-p 98.676 %** against the RCCL arm on 3 devices `-sm tensor` (4B Q8_0).  `plain == draft-mtp` greedy
+text holds on 27B 3 GPU `-sm tensor` and 35B-A3B 2 GPU `-ncmoe 40`, and same-arm repeats are identical
+(the small/large crossover is unchanged, so the decode/verify band is bit-identical to r164 by
+construction).  `gate-per-block-build.sh --changed-from 6a8b807b3` **4/4** (the first attempt failed: block
+01 cannot call `ggml_cuda_slab_enabled()`, which block 10 introduces — the routing therefore reads a plain
+flag that block 10 sets, which is also why the arm choice is described as block 01 + block 10).
+`validate-set.sh` strict 15/15, tree `c321baad4`.
+
+**Files.**  `ggml-cuda.cu` (block 01: the `auto` chain, the `ce` chain, the copy-engine peer opt-in),
+`ggml-cuda-slab.cu` (block 10: set `g_comm_host_experts`), `ENVIRONMENT.md` (`GGML_CUDA_ALLREDUCE` default,
+new `GGML_CUDA_AR_CE_PEER`, the r149 "known cost" note retired), `patches/README.md` (block 01),
+`GREEDY-PURITY.md` §67, `MANIFESTS.md` (gate options + block-01 row), `AGENTS.md` (critical facts),
+`TODO.md` (#109 removed), `benchmarks/2026-10-28-allreduce-peer-access.md`.
+
+---
+
 ## 261028.006 (r164) -- PR #242: the derived kq mask input is reusable on hybrid models, so a >8-token verify step stops rebuilding its graph
 
 **Release `v15-6050b467c-r164`**, base `6050b467c`, 15 blocks, tip `6a8b807b39712c37292df9ca994c67cb6cc44e08`,

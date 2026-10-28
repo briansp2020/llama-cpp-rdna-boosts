@@ -128,6 +128,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§64** | a restored state may stand in for a fresh save only because the restore re-establishes *everything* a save would capture: the guard is the position alone, so a new per-checkpoint payload must be restored (or stashed before the keep check), and the path only exists where a restore lands on the checkpoint's own position (a hybrid/recurrent memory) | doctrine (r155, PR #236; `archive/work/server-ckpt-reuse/`) |
 | **§65** | a fusion's precondition belongs to the arm it dispatches to: an assert in a shared entry point must state the *union* of its arms', and each arm asserts its own where it dispatches — a dense-only `!ids` assert must not gate the routed fused-gate arm | fix (r161, issue #241) |
 | **§66** | a copy that exists only to keep a tensor alive is a graph node, not a graph output: the copy's position in the node order is the whole memory win, the store's row index must be a graph input (never a baked view offset), and a graph built without the store must not be reused once the stores exist | doctrine (r163, issue #240) |
+| **§67** | an all-reduce *arm* is a prefill-numerics reference, so swapping it is gated at the prefill-logit level (multi-device, `-sm tensor`) and never by text; and a device with **peer access enabled** charges the host submission path, which is invisible to a synced loop and to kernel microbenchmarks and only shows where the host limits a replaying decode | doctrine (r165, `TODO #109` closed; `benchmarks/2026-10-28-allreduce-peer-access.md`) |
 
 ---
 
@@ -2045,3 +2046,36 @@ is how the F1 multi-sequence mapping was validated in the first place.
 **Cost.**  Five extra `SET_ROWS` launches per target graph (decode: 5 rows of `n_embd`): decode is flat
 within noise (106.2 / 106.7 / 106.2 / 106.7 t/s over four alternating `-n 1000` arms), and the win is
 **132 MiB of compute buffer** plus **200 MiB of pinned host rows** that F1 never read.
+
+## 67. An all-reduce arm is a prefill-numerics reference — gate it at the prefill-logit level; and peer access is a host-submission tax (r165, `TODO #109` closed)
+
+The large-tensor all-reduce implementation is a **reduction order**: RCCL's ring, the copy-engine
+reduce-scatter/all-gather and the internal pipeline's own CE path sum the same bytes in different orders
+(BF16 staging is common to all of them, but the tree does not match).  Swapping the arm therefore moves
+prefill logits while leaving the decode band untouched, which puts it in §46's class, not §44's:
+
+1. **The oracle is `scripts/gate-prefill-logits.sh`, and it only reaches the all-reduce on >= 2 devices
+   with `-sm tensor`.**  A single-device arm has no comm layer at all, and the CLI's default split (`layer`)
+   needs none either — so the gate grew `--sm MODE` and a `--device` *list* for exactly this.  r165's
+   record: base arm `GGML_CUDA_ALLREDUCE=hybrid`, candidate the new default, 3 devices `-sm tensor`,
+   4B Q8_0 → **mean KLD 0.001448 / same-top-p 98.676 %** (limits 0.005 / 98 %).
+2. **Greedy text is not the oracle** (text moves *because* the prefill moved), but the *within-build*
+   invariants still are: `plain == draft-mtp` at `n_max <= 7` (the verify widths stay on the internal arm,
+   since the small/large crossover is unchanged) and same-arm repeats identical.  Both held at r165 on
+   27B Q8_0 3 GPU `-sm tensor` and 35B-A3B 2 GPU `-ncmoe 40`.
+3. **`hipDeviceEnablePeerAccess` is a host cost, not a GPU one.**  With the all-reduce path held constant,
+   enabling peer access on 3 devices takes a replayed dense decode from 42.25 to 38.77 t/s; a per-token
+   synced loop is *equal* (41.1 vs 41.4), the decode window's kernel census is identical, and a 3-device
+   probe measures 0.0 % on streaming bandwidth, ALU throughput and GPU per-dispatch cost.  So: never judge
+   this class of change by an unprofiled `tg` number alone, never "fix" it by relaxing the graph replay
+   (r149/r158), and never assume a kernel microbenchmark can see it — the instrument is a synced-vs-async
+   pair plus the AR profile.
+4. **It is not reversible.**  After `ncclCommInitAll` has set up P2P, every `cudaDeviceDisablePeerAccess()`
+   returns `no error` and the cost stays (37.9 t/s); the diagnostic conclusion is that the cost lives in
+   the peer mappings, so a chain that does not want it must not enable it.  The delivery's default chain
+   therefore leaves peer access off and routes the large arm by *whether the model offloads experts to
+   host memory* (`g_comm_host_experts`, armed by the slab block): host experts → RCCL's ring (a PCIe-bound
+   prefill wants it at every `-ncmoe` depth and at `-ub 4096`: 809 vs 604, 555 vs 414, 2901 vs 2344 t/s),
+   dense → the copy-engine arm (which wins every dense shape, and an 8k-token prefill shows the staged peer
+   copy costs nothing: 2100 vs 2096 t/s).  `GGML_CUDA_AR_CE_PEER=1` and `GGML_CUDA_ALLREDUCE=hybrid` are
+   the opt-outs for a topology where the trade differs.

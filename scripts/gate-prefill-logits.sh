@@ -97,7 +97,11 @@
 #                                    calibration, for a switch that provably cannot meet
 #                                    them).  Off by default so a bad change cannot pass
 #                                    just because the point is insensitive.
-#   --device N        DEVICE         HIP_VISIBLE_DEVICES (default 0; single card)
+#   --device LIST     DEVICE         HIP_VISIBLE_DEVICES (default 0; a list selects a multi-device arm)
+#   --sm MODE         SM             pass `-sm MODE` to llama-perplexity (default: unset = the CLI
+#                                    default, `layer`).  Needed for anything that changes the
+#                                    ALL-REDUCE: a layer split needs none, so an AR change is invisible
+#                                    to this gate unless the arm is `--sm tensor` on >= 2 devices.
 #   --timeout N       TIMEOUT        per-run seconds (default 1800)
 #   --keep            KEEP=1         keep the per-run logs
 #   --allow-base-mismatch            skip the base-meta compatibility check
@@ -131,6 +135,7 @@ CONTROL_UB="${CONTROL_UB:-256}"
 CAND_ENV="${CAND_ENV:-}"
 ALLOW_CONTROL_PASS="${ALLOW_CONTROL_PASS:-0}"
 DEVICE="${DEVICE:-0}"
+SM="${SM:-}"
 TIMEOUT="${TIMEOUT:-1800}"
 KEEP="${KEEP:-0}"
 ALLOW_BASE_MISMATCH=0
@@ -165,6 +170,7 @@ while [ $# -gt 0 ]; do
         --candidate-env)        CAND_ENV="$2"; shift 2 ;;
         --allow-control-pass)   ALLOW_CONTROL_PASS=1; shift ;;
         --device)               DEVICE="$2"; shift 2 ;;
+        --sm)                   SM="$2"; shift 2 ;;
         --timeout)              TIMEOUT="$2"; shift 2 ;;
         --keep)                 KEEP=1; shift ;;
         --allow-base-mismatch)  ALLOW_BASE_MISMATCH=1; shift ;;
@@ -278,10 +284,12 @@ run_ppl() {
     local extra="$1" out="$2"; shift 2
     local ub_args=()
     [ -n "$UB" ] && ub_args=(-ub "$UB" -b "$UB")
+    local sm_args=()
+    [ -n "$SM" ] && sm_args=(-sm "$SM")
     # shellcheck disable=SC2086  # $extra is an intended word-split K=V list
     timeout "$TIMEOUT" env HIP_VISIBLE_DEVICES="$DEVICE" ${extra:-} \
         "$LLAMA_PPL" -m "$MODEL" -f "$CORPUS" \
-        -c "$CTX" --chunks "$CHUNKS" -ngl "$NGL" -fa "$FA" -ctk "$KV" -ctv "$KV" -t "$THREADS" "${ub_args[@]}" \
+        -c "$CTX" --chunks "$CHUNKS" -ngl "$NGL" -fa "$FA" -ctk "$KV" -ctv "$KV" -t "$THREADS" "${ub_args[@]}" "${sm_args[@]}" \
         "$@" >"$out" 2>&1
 }
 

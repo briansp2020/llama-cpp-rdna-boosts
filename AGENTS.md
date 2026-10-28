@@ -952,6 +952,23 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
 - **Block 01 (all-reduce; old block 12):** the `GGML_CUDA_AR_PROFILE` device-list init fix; on the first NCCL runtime failure the
   comm layer warns once, disables NCCL and re-routes to the internal pipeline/butterfly.
   `GGML_CUDA_ALLREDUCE=nccl` is **NOT bit-identical** under `-sm tensor` (the internal AR BF16-round-trips).
+  Since r165 the Linux/HIP default is `auto`: internal pipeline for the decode/verify band, and the
+  **large-tensor arm chosen once at the first large all-reduce** — RCCL's ring when the model offloads
+  experts to host memory (`g_comm_host_experts`, armed by the slab block), the copy-engine arm otherwise
+  (`GGML_CUDA_ALLREDUCE=hybrid` = the pre-r165 P2P chain, `ce` = the copy-engine half).
+- **Never enable peer access on the delivery's own initiative (r165, TODO #109 closed).**
+  `hipDeviceEnablePeerAccess` charges the **host submission path**, not the GPU: with the AR path held
+  constant, 3x R9700 27B Q8_0 `-sm tensor tg128` is 42.25 with no peer access and 38.77 with it; a per-token
+  synced loop is *equal* (41.1 vs 41.4), the decode kernel census is identical, and a 3-device probe sees
+  0.0 % on bandwidth/ALU/per-dispatch cost.  It is **not reversible** — after `ncclCommInitAll` has built
+  its P2P mappings, every `cudaDeviceDisablePeerAccess` returns `no error` and the cost stays (37.9), so a
+  chain that does not want it must not enable it (`NCCL_P2P_DISABLE` before `ncclCommInitAll`).
+  Consequences: an arm carrying peer access is an 8-9 % dense-decode cost whenever the host is the limiter
+  and graphs replay (invisible to the direct node loop); a *kernel* microbenchmark cannot see it, so judge
+  a change with a synced-vs-async pair; and the large-arm choice is a **prefill-numeric** change gated by
+  `scripts/gate-prefill-logits.sh --sm tensor --device 0,1,2` (the gate cannot reach an all-reduce
+  otherwise), never by greedy text.  `GREEDY-PURITY.md` §67,
+  `benchmarks/2026-10-28-allreduce-peer-access.md`.
 - **Block 08 MTP regression fixes (old block 13):** the dense K-split kernel for verify batches, and the
   rms_norm->mmvq Q8_1 fold gated to single-token MMID + plain `MUL_MAT`. **Purity ranks above raw
   non-MTP throughput.** `GREEDY-PURITY.md` §19.
@@ -1146,6 +1163,10 @@ a bit-identical reference under `-sm tensor` (see Block 01 above); treat it as a
 The coherence gate is a decode/greedy check and is **blind to a uniform prefill-logit shift**. For any
 change to a prefill kernel (GDN/SSM, FA, MMQ/MMVF/MMB, MoE prefill) or a default-on approximate path,
 run the **prefill-logit gate** as well:
+
+An **all-reduce arm** change (block 01) is only reachable with a multi-device `tensor` split, so pass
+`--sm tensor --device 0,1,2` (r165); a single device has no comm layer and the default `layer` split needs
+no all-reduce, so the bare gate would pass a broken arm.
 
 ```bash
 ./scripts/gate-prefill-logits.sh          # compare the current build against the known-good base

@@ -1,4 +1,4 @@
-From e9ee69e98fee5c0311e0debfb5996df2935a2b64 Mon Sep 17 00:00:00 2001
+From f825bfb44e4124b1566da37461bf55314961c6dd Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 01/14] rdna-boosts: block 01: hybrid HIP all-reduce
@@ -9,8 +9,8 @@ Sources: old 12 (whole block).
  ggml/src/ggml-cuda/allreduce-hip.cu | 1795 +++++++++++++++++++++++++++
  ggml/src/ggml-cuda/allreduce.cu     |   27 +-
  ggml/src/ggml-cuda/allreduce.cuh    |   21 +
- ggml/src/ggml-cuda/ggml-cuda.cu     |  566 ++++++++-
- 4 files changed, 2365 insertions(+), 44 deletions(-)
+ ggml/src/ggml-cuda/ggml-cuda.cu     |  721 ++++++++++-
+ 4 files changed, 2519 insertions(+), 45 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/allreduce-hip.cu
 
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
@@ -1894,10 +1894,10 @@ index 76205d323..a2e1f41dd 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index df052501f..f7f46083a 100644
+index df052501f..0a2d7ba74 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1042,21 +1042,129 @@ struct ggml_backend_cuda_comm_context {
+@@ -1042,21 +1042,135 @@ struct ggml_backend_cuda_comm_context {
  
      ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
  
@@ -1929,6 +1929,12 @@ index df052501f..f7f46083a 100644
 +    // defined (stays false) so the dispatcher needs no #ifdef in
 +    // non-NCCL builds.
 +    bool                        nccl_failed = false;
++
++    // r165 default chain state (see ggml_backend_cuda_comm_init_auto / _select_arm).
++    bool                        ce_ready   = false;   // the copy-engine large arm came up
++    bool                        nccl_ready = false;   // the NCCL/RCCL large arm came up
++    bool                        auto_select = false;  // the large arm has not been chosen yet
++    try_allreduce_fn            nccl_arm    = nullptr; // the NCCL/RCCL large arm, kept for the selection
 +
  #ifdef GGML_USE_NCCL
      std::vector<ncclComm_t>     comms;
@@ -2028,7 +2034,7 @@ index df052501f..f7f46083a 100644
  // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
  // tensors (bandwidth-bound), then converts back to FP32.
  static bool ggml_backend_cuda_comm_allreduce_nccl(
-@@ -1076,9 +1184,19 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+@@ -1076,9 +1190,19 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
          GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
      }
  
@@ -2049,7 +2055,7 @@ index df052501f..f7f46083a 100644
          for (size_t i = 0; i < n_backends; ++i) {
              if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                  ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-@@ -1086,12 +1204,18 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+@@ -1086,12 +1210,18 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
                  CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
              }
          }
@@ -2071,7 +2077,7 @@ index df052501f..f7f46083a 100644
          return true;
      }
  
-@@ -1114,12 +1238,18 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+@@ -1114,12 +1244,18 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -2093,7 +2099,7 @@ index df052501f..f7f46083a 100644
  
      for (size_t i = 0; i < n_backends; ++i) {
          ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-@@ -1140,7 +1270,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
+@@ -1140,7 +1276,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
      GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
  
      const size_t n_backends = comm_ctx->backends.size();
@@ -2102,7 +2108,7 @@ index df052501f..f7f46083a 100644
      GGML_ASSERT(tensors[0] != nullptr);
  
      const int64_t   ne   = ggml_nelements(tensors[0]);
-@@ -1220,29 +1350,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
+@@ -1220,29 +1356,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
      ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
  }
  
@@ -2144,7 +2150,7 @@ index df052501f..f7f46083a 100644
      }
  
      const size_t n = ret->dev_ids.size();
-@@ -1250,26 +1382,320 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
+@@ -1250,26 +1388,465 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
      ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
      if (rc == ncclSuccess) {
          ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
@@ -2322,7 +2328,8 @@ index df052501f..f7f46083a 100644
 +        }
 +        CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_send[i], s));
 +    }
-+
+ 
+-    ggml_backend_cuda_comm_init_internal(ret);
 +    // phase 1b: reduce the received slices into the own chunk in place
 +    for (int i = 0; i < n; ++i) {
 +        ggml_cuda_set_device(cctx(i)->device);
@@ -2390,8 +2397,7 @@ index df052501f..f7f46083a 100644
 +        CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_out[i], s));
 +        CUDA_CHECK(cudaGetLastError());
 +    }
- 
--    ggml_backend_cuda_comm_init_internal(ret);
++
 +    return true;
  }
  
@@ -2413,19 +2419,40 @@ index df052501f..f7f46083a 100644
 +    ret->ce_ev_out.assign(nb, nullptr);
 +    for (size_t i = 0; i < nb; ++i) {
 +        ggml_cuda_set_device(ret->dev_ids[i]);
-+        for (size_t j = 0; j < nb; ++j) {
-+            if (j == i) {
-+                continue;
-+            }
-+            cudaError_t e = cudaDeviceEnablePeerAccess(ret->dev_ids[j], 0);
-+            if (e == cudaErrorPeerAccessAlreadyEnabled) {
-+                // Benign: peer access is already on (e.g. a previous comm context on this device).
-+                // It is still recorded as a sticky "last error", so clear it or the next kernel
-+                // launch's error check will pick it up and abort.
-+                (void) cudaGetLastError();
-+            } else if (e != cudaSuccess) {
-+                (void) cudaGetLastError();
-+                return false;
++        // Peer access is OPT-IN (`GGML_CUDA_AR_CE_PEER=1`) since r165, and OFF is the measured default.
++        //
++        // A device that has peer access enabled charges the HOST submission path, not the GPU: with the
++        // AR path otherwise untouched, enabling it on three R9700s costs 27B Q8_0 `-sm tensor tg128`
++        // 42.25 -> 38.77 t/s, and `cudaDeviceDisablePeerAccess` gives the whole of it back (42.24).  It
++        // is a per-device state (one device's pairs already cost most of it), it is invisible to a
++        // per-token-synced loop (41.1 vs 41.4 -- the GPU critical path is unchanged) and to kernel
++        // microbenchmarks, and it only appears once decode graphs replay, i.e. once the host has to run
++        // ahead.  That is `TODO #109`.
++        //
++        // Nothing is lost by leaving it off: a staged `cudaMemcpyPeerAsync` is driver-managed and still
++        // runs on the copy engines, and it measured the same as the direct P2P arm even at 8k-token
++        // prefill (pp2048 2212 vs 2206, pp8192 2100 vs 2096 t/s on the same 3-device config), because
++        // the CE slices are only `ne/n` elements and each hop is already one transfer.  Enable the knob
++        // on a topology where a direct peer copy is genuinely cheaper (xGMI/NVLink-like links).
++        static const bool ce_peer = []() {
++            const char * e = getenv("GGML_CUDA_AR_CE_PEER");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        if (ce_peer) {
++            for (size_t j = 0; j < nb; ++j) {
++                if (j == i) {
++                    continue;
++                }
++                cudaError_t e = cudaDeviceEnablePeerAccess(ret->dev_ids[j], 0);
++                if (e == cudaErrorPeerAccessAlreadyEnabled) {
++                    // Benign: peer access is already on (e.g. a previous comm context on this device).
++                    // It is still recorded as a sticky "last error", so clear it or the next kernel
++                    // launch's error check will pick it up and abort.
++                    (void) cudaGetLastError();
++                } else if (e != cudaSuccess) {
++                    (void) cudaGetLastError();
++                    return false;
++                }
 +            }
 +        }
 +        if (cudaEventCreateWithFlags(&ret->ce_ev_send[i], cudaEventDisableTiming) != cudaSuccess ||
@@ -2439,12 +2466,136 @@ index df052501f..f7f46083a 100644
 +    return true;
 +}
 +
++// Copy-engine first chain (the Linux/HIP default since r165): the internal host-staged pipeline for
++// latency-bound small tensors plus the copy-engine (SDMA) arm for bandwidth-bound large ones, and
++// **RCCL is not brought up at all**.  The per-size routing is the same one the hybrid chain uses
++// (ggml_backend_cuda_comm_allreduce_tensor sends smalls to the internal pipeline and everything else
++// to try_allreduce), so the decode/verify band is served by exactly the same internal kernel as
++// `hybrid` -- only the prefill-sized arm changes, from RCCL's P2P kernels to our copy-engine one.
++//
++// Why not RCCL (TODO #109, r165): RCCL's P2P bring-up (`ncclCommInitAll` on a PCIe topology, which
++// exports/imports every channel buffer as a direct peer pointer) measurably slows the HOST submission
++// path -- 27B Q8_0 3x R9700 `-sm tensor tg128` 41.5 -> 38.6 t/s -- while the GPU critical path is
++// unchanged (a per-token sync removes the difference: 41.1 vs 41.4).  It is the presence of the P2P
++// setup, not the per-call choice of arm: routing every tensor to the internal pipeline with RCCL up
++// loses identically, and `NCCL_P2P_DISABLE=1` restores the full speed.  On the measured shapes the CE
++// arm is also *faster* than RCCL's large-tensor path (pp2048 2227 vs 2187 t/s on the same 3-device
++// config), so the large-tensor win is kept without paying the host-side cost.
++//
++// `GGML_CUDA_ALLREDUCE=ce` selects this chain explicitly: internal pipeline for smalls, copy engine for
++// large tensors, RCCL never brought up.  A topology where CE cannot be set up falls back to RCCL.
++static bool ggml_backend_cuda_comm_init_ce_chain(ggml_backend_cuda_comm_context * ret) {
++    // Latency-bound smalls: the internal pipeline, exactly as in the hybrid chain.
++    const bool has_internal = ggml_backend_cuda_comm_init_internal(ret);
++    if (has_internal) {
++        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
++    }
++    if ((ret->ce_ready = ggml_backend_cuda_comm_init_ce(ret))) {
++        // Large tensors now go to the copy-engine arm; smalls keep the internal pipeline.
++        return true;
++    }
++    // The copy engine is unavailable (fewer than 2 devices, or event/scratch setup failed): fall back to
++    // the RCCL large-tensor arm rather than losing it (only NCCL -- the internal pipeline is already up,
++    // and re-running it would leak a pipeline).
++    GGML_LOG_WARN("copy-engine all-reduce unavailable; using the RCCL/NCCL large-tensor arm instead\n");
++    if ((ret->nccl_ready = ggml_backend_cuda_comm_init_nccl(ret))) {
++        return true;
++    }
++    if (!has_internal) {
++        ret->try_allreduce = nullptr;
++    }
++    return ret->try_allreduce != nullptr;
++}
++
++// Set once the host-expert machinery knows this model offloads experts to host memory (the slab block's
++// `ggml_cuda_slab_arm()` sets it; a dense model never does).  A plain flag rather than a call so this
++// block does not depend on a symbol a later block introduces -- every block of the set must build on its
++// own (scripts/gate-per-block-build.sh).  When it is false the large all-reduce uses the copy-engine arm
++// and peer access is never enabled, which is what the dense shapes want (see below); when it is true the
++// large arm is RCCL's ring, which is what a PCIe-saturated host-expert prefill wants.
++bool g_comm_host_experts = false;
++
++// The Linux/HIP default chain (r165).  Both large-tensor arms are brought up eagerly and the arm is
++// chosen once, at the FIRST large all-reduce, from the only signal that separates the two regimes:
++// whether the model offloads experts to host memory (g_comm_host_experts, set by the slab block).
++//
++//   * host experts in play -> RCCL's ring.  A host-offloaded prefill is PCIe-saturated by the expert
++//     streaming and RCCL is far ahead there, at every offload depth we measured and at both ubatch
++//     widths: Flash-Next IQ4_NL 2 GPU `-ncmoe 20` pp2048 809 vs 604 t/s (CE), `-ncmoe 32` 555 vs 414,
++//     `-b/-ub 4096 -ncmoe 20` pp4096 2901 vs 2344; 35B-A3B 2 GPU `-ncmoe 40` 1257 vs 1257.
++//   * no host experts -> the copy-engine arm, which is the faster one on every dense shape measured
++//     (27B Q8_0 3 GPU pp2048 2178 vs 2018, 2 GPU 2245 vs 2091; Gemma4 31B 3 GPU 1998 vs 1944) and,
++//     because peer access is then never enabled, it is also the only configuration that escapes the
++//     TODO #109 host-submission cost (dense decode 42.2 vs 38.6 t/s).
++//
++// RCCL is brought up with peer access disabled (`NCCL_P2P_DISABLE`, only when the user has not set it).
++// Its P2P bring-up is the host-submission cost, and it is not reversible: disabling peer access after
++// `ncclCommInitAll` leaves the cost in place (measured: every `cudaDeviceDisablePeerAccess` returned
++// `no error` and the dense decode stayed at 37.9 t/s).  The cost of that on the host-expert prefill is
++// shape-dependent and small: RCCL over SHM measures the same as over P2P on Flash-Next GSQ `-ncmoe 48`
++// (551.8 vs 552.7 t/s) and on 35B-A3B `-ncmoe 40` (1257 vs 1232), and 8 % behind on Flash-Next IQ4_NL
++// `-ncmoe 20` (747 vs 809).  `GGML_CUDA_ALLREDUCE=hybrid` keeps the old P2P chain for a topology with
++// genuinely cheap peer links (xGMI/scale-up).
++static bool ggml_backend_cuda_comm_init_auto(ggml_backend_cuda_comm_context * ret) {
++    const bool has_internal = ggml_backend_cuda_comm_init_internal(ret);
++    if (has_internal) {
++        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
++    }
++    // RCCL must not enable peer access: its P2P bring-up is what costs the host submission path
++    // (TODO #109) and the cost SURVIVES a later `cudaDeviceDisablePeerAccess` (the mappings RCCL
++    // created stay), so it has to be prevented at init.  Only if the user has not set the knob.
++    static const bool p2p_env = []() {
++        setenv("NCCL_P2P_DISABLE", "1", 0);
++        return true;
++    }();
++    (void) p2p_env;
++    ret->nccl_ready = ggml_backend_cuda_comm_init_nccl(ret);
++    if (ret->nccl_ready) {
++        ret->nccl_arm = ret->try_allreduce;
++    }
++    ret->ce_ready   = ggml_backend_cuda_comm_init_ce(ret);
++    // A valid arm has to exist before the first large call arrives (the CE arm if it came up, otherwise
++    // whatever the two inits left as `try_allreduce`); the selection below overrides it once.
++    if (ret->ce_ready) {
++        ret->try_allreduce = ggml_backend_cuda_comm_allreduce_ce;
++    }
++    if (!ret->ce_ready && !ret->nccl_ready && !has_internal) {
++        ret->try_allreduce = nullptr;
++        return false;
++    }
++    ret->auto_select = true;
++    return true;
++}
++
++// Choose the large-tensor arm once (see ggml_backend_cuda_comm_init_auto).
++static void ggml_backend_cuda_comm_select_arm(ggml_backend_cuda_comm_context * comm_ctx) {
++    comm_ctx->auto_select = false;
++    const bool host_experts = g_comm_host_experts;
++
++    if (host_experts && comm_ctx->nccl_ready) {
++        GGML_LOG_INFO("all-reduce: host-resident experts -- large tensors use the RCCL ring "
++                      "(GGML_CUDA_ALLREDUCE=ce forces the copy-engine arm)\n");
++        comm_ctx->try_allreduce = comm_ctx->nccl_arm;
++        return;
++    }
++
++    // Dense (or the slab declined): the copy-engine arm.  Peer access is not enabled at all in this
++    // chain (see the init), and CE measures the same speed with a staged peer copy as with a direct one
++    // (pp8192 2100 vs 2096 t/s), so nothing is given up.
++    if (comm_ctx->ce_ready) {
++        comm_ctx->try_allreduce = ggml_backend_cuda_comm_allreduce_ce;
++        GGML_LOG_INFO("all-reduce: no host-resident experts -- large tensors use the copy-engine arm "
++                      "(GGML_CUDA_ALLREDUCE=hybrid restores the RCCL P2P arm)\n");
++    }
++}
++
 +// Hybrid: NCCL/RCCL (P2P, BF16 round-trip) for bandwidth-bound large tensors,
 +// plus the internal host-staged pipeline (low per-call latency) for
 +// latency-bound small tensors.  The per-size routing happens in
 +// ggml_backend_cuda_comm_allreduce_tensor: small tensors go to the internal
 +// pipeline directly; everything else falls through to try_allreduce, which we
-+// set to NCCL when available.
++// set to NCCL when available.  `GGML_CUDA_ALLREDUCE=hybrid` still selects this
++// chain; the Linux/HIP default is the copy-engine chain above (r165).
 +static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
 +    // Bring the internal pipeline up first -- it serves every decode-sized tensor directly.
 +    const bool has_internal = ggml_backend_cuda_comm_init_internal(ret);
@@ -2474,17 +2625,21 @@ index df052501f..f7f46083a 100644
  static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
      for (size_t i = 0; i < n_backends; i++) {
          if (!ggml_backend_is_cuda(backends[i])) {
-@@ -1285,38 +1711,89 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
+@@ -1285,38 +1862,91 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
      }
  
      const char * env = getenv("GGML_CUDA_ALLREDUCE");
 +    bool ok = false;
      if (!env) {
 -        // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
-+        // Platform default: Linux uses the hybrid (NCCL for large, internal
-+        // for small); otherwise (generally Windows) internal only.
- #if defined(__linux__)
+-#if defined(__linux__)
 -        ggml_backend_cuda_comm_init_nccl(ret);
++        // Platform default: on Linux/HIP the dual-arm chain (r165, TODO #109): host experts -> RCCL ring,
++        // dense -> copy-engine, peer access never enabled by us.  On CUDA Linux the hybrid chain (NCCL
++        // for large, internal for small); otherwise (generally Windows) internal only.
++#if defined(__linux__) && defined(GGML_USE_HIP)
++        ok = ggml_backend_cuda_comm_init_auto(ret);
++#elif defined(__linux__)
 +        ggml_backend_cuda_comm_init_hybrid(ret);
 +        ok = ret->try_allreduce != nullptr;
  #else
@@ -2504,18 +2659,12 @@ index df052501f..f7f46083a 100644
 -            ggml_backend_cuda_comm_init_internal(ret);
 +            ok = ggml_backend_cuda_comm_init_internal(ret);
 +        } else if (env_str == "ce") {
-+            // Start from the hybrid setup (NCCL for large tensors, internal pipeline for
-+            // latency-bound small tensors) so that a CE failure is a no-op downgrade, then swap
-+            // the large-tensor arm to CE.  If CE cannot be set up (e.g. no peer access) we keep
-+            // the hybrid path -- falling all the way back to the butterfly would cost ~2.5x.
-+            ggml_backend_cuda_comm_init_hybrid(ret);
-+            if (ggml_backend_cuda_comm_init_ce(ret)) {
-+                ok = true;
-+            } else {
-+                GGML_LOG_WARN("GGML_CUDA_ALLREDUCE=ce unavailable (needs >= 2 peer-accessible devices); "
-+                              "using the hybrid (NCCL + internal) path\n");
-+                ok = ret->try_allreduce != nullptr;
-+            }
++            // The copy-engine chain: internal pipeline for latency-bound small tensors, CE for
++            // bandwidth-bound large ones, no RCCL (see ggml_backend_cuda_comm_init_ce_chain).  The
++            // Linux/HIP default (r165) is the dual-arm chain that picks between this and RCCL per model;
++            // `ce` pins this half.  If CE cannot be set up the chain keeps the RCCL large-tensor arm, so
++            // a CE failure is still a no-op downgrade.
++            ok = ggml_backend_cuda_comm_init_ce_chain(ret);
          } else if (env_str == "none") {
 -            ggml_backend_cuda_comm_init_none(ret);
 +            ok = false;
@@ -2557,6 +2706,11 @@ index df052501f..f7f46083a 100644
 +    if (comm_ctx->ar_pipeline != nullptr && ggml_backend_cuda_comm_is_small(ne, n_backends)) {
 +        return ggml_backend_cuda_comm_try_allreduce_internal(comm_ctx, tensors);
 +    }
++    if (comm_ctx->auto_select) {
++        // r165 default chain: the first large tensor chooses the large arm (host experts -> RCCL,
++        // otherwise the copy-engine arm).  See ggml_backend_cuda_comm_select_arm.
++        ggml_backend_cuda_comm_select_arm(comm_ctx);
++    }
 +    // First-call NCCL failure failover (issue #86): the selected function may
 +    // fail (NCCL/RCCL refusing to dispatch, e.g. hipErrorIllegalState on a PCIe
 +    // root port without AtomicOp completer support) and re-route itself to the
@@ -2574,7 +2728,7 @@ index df052501f..f7f46083a 100644
  }
  
  // host buffer type
-@@ -4872,6 +5349,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4872,6 +5502,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
  #ifdef USE_CUDA_GRAPH
          if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
