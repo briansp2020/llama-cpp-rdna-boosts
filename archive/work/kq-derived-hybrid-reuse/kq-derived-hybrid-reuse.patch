@@ -1,0 +1,53 @@
+From 515d2f7c8be752d6da72913baf61dcdf4c15410f Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 20:48:29 +0800
+Subject: [PATCH] llama-graph: the derived kq mask input can be reused on
+ hybrid models (LLAMA_KQ_MASK_DERIVED_REUSE)
+
+llm_graph_input_kq_derived::can_reuse() rejected the reuse whenever the graph's memory context is not a kv cache
+context.  A hybrid model's context (llama_memory_hybrid_context, e.g. Qwen3.x) wraps the attention cache this input was
+built from (build_inp_mem_hybrid), so on those models every single-sequence batch of more than 8 tokens rebuilt its
+graph - including the verification of long n-gram drafts (9-16 rows), step after step.  The check now looks through a
+hybrid context to its attention cache; other wrappers (iSWA) still reject.  LLAMA_KQ_MASK_DERIVED_REUSE=0 restores the
+rejection.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index bf695cc9d..5f9b95d0f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -91,11 +91,24 @@ void llm_graph_input_kq_derived::set_input(const llama_ubatch * ubatch) {
+ bool llm_graph_input_kq_derived::can_reuse(const llm_graph_params & params) {
+     // params.mctx is the *memory* context of the graph, which for many models wraps the attention
+     // cache (llama_memory_hybrid_context) instead of being the kv cache context this input was built
+-    // from, so it must not be reinterpreted blindly.  When it is not a kv cache context, simply
+-    // reject the reuse - the derived form only exists for prefill-shaped batches, where graphs are
+-    // rebuilt on every ubatch anyway.
++    // from, so it must not be reinterpreted blindly.  A hybrid context's attention cache is the one
++    // build_inp_mem_hybrid() built this input from: without looking through it, every single-sequence
++    // batch of more than 8 tokens on a hybrid model (a long n-gram draft's verification, 9-16 rows)
++    // rebuilt its graph.  Any other wrapper (iSWA: base or SWA cache) still rejects the reuse.
++    // LLAMA_KQ_MASK_DERIVED_REUSE=0 rejects it for hybrid models too.
++    static const bool reuse_hybrid = [] {
++        const char * e = getenv("LLAMA_KQ_MASK_DERIVED_REUSE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
+     const auto * mctx_cur = dynamic_cast<const llama_kv_cache_context *>(params.mctx);
+ 
++    if (mctx_cur == nullptr && reuse_hybrid) {
++        if (const auto * mctx_hyb = dynamic_cast<const llama_memory_hybrid_context *>(params.mctx)) {
++            mctx_cur = mctx_hyb->get_attn();
++        }
++    }
++
+     if (mctx_cur == nullptr) {
+         return false;
+     }
+-- 
+2.43.0
+

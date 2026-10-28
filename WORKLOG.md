@@ -59,6 +59,9 @@ prefill-shaped batches (`n_tokens > 8`), so decode/verify are untouched".  That 
 hid this class of regression: the predicate is `n_tokens > 8`, which a verify step reaches as soon as a draft
 is 8 tokens deep.  The bullet now says so, and carries the r164 fold.
 
+The contributor's record (their README and the patch as submitted) is archived in
+`archive/work/kq-derived-hybrid-reuse/` with this assessment in its `RESOLUTION.md`.
+
 ## 261028.005 (r163) -- issue #240: the DFlash layer inputs are written into F1's store from inside the target graph
 
 **Release `v15-6050b467c-r163`**, base `6050b467c`, 15 blocks, tip `d99fc588fa075a08f299665d29281ca2bc5057f4`,
