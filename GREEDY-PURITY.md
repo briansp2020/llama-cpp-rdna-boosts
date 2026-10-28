@@ -126,6 +126,8 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§62** | a captured graph is pure only while its **key** names every dimension the subgraph varies in and its **property compare** still sees every baked pointer: a cache key is not a guard, and an identity-free compare is not "purity-neutral" — it is the removal of the only check that a replay's baked kernel arguments still point at the tensors they were captured from. The compare runs on *every* `graph_compute` (its `uid` early-out cannot fire), so its cost is reduced by comparing the live tensors in place over a source-packed store, never by comparing less | doctrine (r149, TODO #107; r158 compare rework; `archive/work/graph-replay-keys/`) |
 | **§63** | a verify batch is only as cheap as its *widest* sequence set: aligning the sequences of one step into one ubatch changes a slot's verify width, so the text-level oracle is the single-sequence arm and a verify-width control, never a two-slot text diff | fix + doctrine (r153, issue #234; `archive/work/spec-align-234/`) |
 | **§64** | a restored state may stand in for a fresh save only because the restore re-establishes *everything* a save would capture: the guard is the position alone, so a new per-checkpoint payload must be restored (or stashed before the keep check), and the path only exists where a restore lands on the checkpoint's own position (a hybrid/recurrent memory) | doctrine (r155, PR #236; `archive/work/server-ckpt-reuse/`) |
+| **§65** | a fusion's precondition belongs to the arm it dispatches to: an assert in a shared entry point must state the *union* of its arms', and each arm asserts its own where it dispatches — a dense-only `!ids` assert must not gate the routed fused-gate arm | fix (r161, issue #241) |
+| **§66** | a copy that exists only to keep a tensor alive is a graph node, not a graph output: the copy's position in the node order is the whole memory win, the store's row index must be a graph input (never a baked view offset), and a graph built without the store must not be reused once the stores exist | doctrine (r163, issue #240) |
 
 ---
 
@@ -2001,3 +2003,45 @@ whose MMB routed path is on with a model MMB's GLU does not cover.  Repro on gfx
 A routed fused gate arm is therefore a *width* and *shape* claim like any other fused kernel: it owes the
 unfused triple its exact logits, and it owes the graph an `ids != nullptr` precondition that the dense arm's
 assert must not shadow.
+
+## 66. A copy that only exists to keep a tensor alive is a graph node, not an output (r163, issue #240)
+
+**Claim.**  F1 (the DFlash device-resident layer inputs) is pure only because the store holds **exactly** the
+bytes the post-graph extraction copied there, at the **same rows**.  Moving that copy inside the graph is a
+relocation, not a numerics change: `GGML_OP_SET_ROWS` writes a value byte for byte, so the draft's
+`ggml_get_rows` source is identical to the one the post-graph device copy produced.
+
+**Rule.**  Three things must hold together, and any one of them missing is a silent wrong answer on the
+*next* step rather than a crash:
+
+1. **The row index is a graph input, never a baked offset.**  The store is indexed by the token's row in the
+   decode batch, which changes per ubatch; a `ggml_cpy` into a view at a build-time offset would bake it into
+   a captured HIP graph and a replay would write the wrong rows (the r149 key lesson, §62).  The indices ride
+   in an `I32 [n_tokens]` input tensor filled per ubatch — the same shape the draft's own gather reads with.
+2. **The copy's position in the node order is the whole point.**  `ggml-alloc` frees a tensor after its last
+   consumer (§"the copy into a view of preallocated memory" idiom), so the copy must be expanded *after* the
+   layer that reads the input and *before* the next layer.  An arch that records its layer inputs through
+   `llm_graph_result::set_layer_inp()` gets that placement automatically (the next layer's recording expands
+   the layer's nodes, then emits the copy); an arch that does not is still correct (the copy lands at the end
+   of the graph) but keeps the memory cost it was supposed to remove.
+3. **A graph built without an armed store must not be reused once the stores exist.**  The store changes the
+   graph's topology (an output becomes a `SET_ROWS`), so `llm_graph_params::allow_reuse()` compares
+   `cparams.lf_layer_inp_dev_store` (armed vs not) exactly as it already compares `lf_dev_inject`.
+4. **An embedding ubatch still reads the host rows.**  A token row addresses its store row; an image/audio row
+   does not (it has no token id), so the draft takes its host path there and the target must fill the host
+   rows for that ubatch as well.  The rows are reserved on demand, so only a multimodal run pays for them.
+
+**Evidence.**  27B UD-Q4_K_XL + DFlash2-Q4_K_M, `-ub 2048 -b 2048`, q8_0 KV, `prompts/prose-rdna-boosts.txt`
+(5246 tokens, so the target's decode is 3 ubatches and the store row offsets 0/2048/4096 are all exercised).
+Greedy text is **byte-identical** between the in-graph store, `GGML_LF_DFLASH_DEV_GRAPH=0` (post-graph copy)
+and `GGML_LF_DFLASH_DEV=0` (host path) — `950 chars sha=8016577f2ed8` on 1 GPU and on a 2-GPU `-sm layer`
+arm (text alone is *not* the oracle here: the draft only proposes, so garbage rows would still verify to the
+same text).  The oracle is the **draft**: acceptance and the per-position acceptance rates are identical to
+the fifth decimal (`0.44337 (137/309)`, `acc rate/pos = (0.806, 0.516, 0.387, 0.306, 0.194)`) in every arm,
+and on a 2-slot `--kv-unified` server the concurrent pair is identical too (`0.74163 (155/209)`, both
+responses 688/709 chars, all three arms).  A mixed row mapping would show up as a collapsed acceptance, which
+is how the F1 multi-sequence mapping was validated in the first place.
+
+**Cost.**  Five extra `SET_ROWS` launches per target graph (decode: 5 rows of `n_embd`): decode is flat
+within noise (106.2 / 106.7 / 106.2 / 106.7 t/s over four alternating `-n 1000` arms), and the win is
+**132 MiB of compute buffer** plus **200 MiB of pinned host rows** that F1 never read.

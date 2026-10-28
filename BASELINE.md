@@ -51,7 +51,7 @@ wrapper, allocator/graph-layout fixes).
 | 09 | host-resident MoE | iface, scheduler, Meta, movable-boundary slab, expert cache, prefill cache staging |
 | 10 | infrastructure: slab, fusion dispatcher, async input ring | the TUs split out of `ggml-cuda.cu` (slab/arena/vmm, `try-fuse`, MoE cache hooks), the async graph-input ring, the GDN/rope/MMB fusions |
 | 11 | qwen4exp | model, hyper-connections, lazy reader, QSA/indexer, the keys-only indexer cache (r109 split of the old block 10) |
-| 12 | campaign remainder | CPU wins, backend iface fills, DFlash (incl. the draft-reserve split, r162/issue #239), FA build grouping, mmap reclaim |
+| 12 | campaign remainder | CPU wins, backend iface fills, DFlash (incl. the draft-reserve split, r162/issue #239, and the in-graph layer-input store, r163/issue #240), FA build grouping, mmap reclaim |
 | 13 | MTP draft vocabulary subset | `--spec-draft-mtp-vocab N` (opt-in, default off) |
 
 Per-block *content* and edit history is [`patches/README.md`](patches/README.md); per-block verification is

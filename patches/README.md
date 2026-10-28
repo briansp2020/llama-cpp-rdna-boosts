@@ -48,7 +48,7 @@ only as a rough shape.
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section) | +12697 / −4954 | 78 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
-| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch` — issue #239) | +4629 / −807 | 48 |
+| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240) | +5073 / −937 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
 
@@ -1472,6 +1472,36 @@ had no other home.
   2 GPU `-sm tensor`, F1 on/off, `LLAMA_DRAFT_SCHED2=0`, and a deterministic 1-slot server with
   `ngram-mod,draft-dflash`); draft counts and acceptance identical.  No knob: nothing is disabled, the
   reserve is simply smaller (`WORKLOG.md` 261028.004).
+* **The DFlash target writes its layer inputs into F1's store from inside the graph (r163, issue #240).**
+  F1 kept the extracted layer inputs on the device, but `extract_layer_inputs()` copied them *after* the
+  graph ran, so `llm_graph_result::set_outputs()` had to mark them as graph **outputs** — and an output
+  cannot be reused by the allocator, so by the last layer every extracted input was still live: 5 ×
+  `n_embd × n_ubatch` f32 = **188.8 MiB** of compute buffer at `-ub 2048` on a 27B (757.26 MiB with the
+  extraction vs 568.42 with none, measured on the reporter's config).  `set_outputs()` now emits a
+  `GGML_OP_SET_ROWS` into the persistent store instead, and `llm_graph_result::set_layer_inp()` (which every
+  arch graph now calls instead of assigning `t_layer_inp[il]` directly) closes each layer's extraction
+  window: at the next layer's recording it expands that layer's nodes and *then* emits the copy, so the copy
+  lands right after the input's last consumer.  The row offsets are a graph **input** (`I32 [n_tokens]`,
+  filled per ubatch by `llama_context::process_ubatch`), not a baked view offset: a graph with the same
+  shape stays reusable across ubatches at different offsets, and a captured HIP graph replays with the right
+  rows.  The store is created in `lf_layer_inp_dev_arm()` at the top of `decode()`, before the first graph
+  that writes it, and the context drops and re-reserves its compute buffers once so the smaller layout is
+  what the run settles on; the wait for the draft's read of the previous batch moves before that graph.
+  The store lives on the device that owns the first extracted layer; a layer input on another device (a
+  `-sm layer` split boundary — layers 48/62 on the second card in the 2-GPU arm) is copied across by the
+  scheduler, exactly as the post-graph device copy used to be.  **Two side effects are part of the fix:**
+  the pinned host rows the *host* path reads are now reserved lazily (`layer_inp_host_reserve()`) — F1 never
+  read them, and they cost **200 MiB** of pinned host memory per context at `-b 2048` (the one exception is an
+  embedding ubatch: it has no token ids, so the draft reads the host rows and `extract_layer_inputs()` fills
+  them on demand) — and the per-ubatch
+  `sync_readback()` of the layer inputs is skipped when there is no host readback to order (it was a device
+  synchronize per ubatch of a multi-ubatch prefill).  `GGML_LF_DFLASH_DEV_GRAPH=0` restores the pre-r163
+  shape (outputs + post-graph copy) for A/B and bisect.  Measured (27B UD-Q4_K_XL + DFlash2-Q4_K_M,
+  `-ub 2048 -b 2048`, q8_0 KV): target compute buffer **757.26 → 625.27 MiB**, target output buffer
+  **200.95 → 0.95 MiB**, host layer-input rows released after the arm; greedy text and draft acceptance
+  **byte-identical** in every arm (1 GPU, 2 GPU `-sm layer`, 2 GPU `-sm tensor` host fallback, 35B-A3B
+  `-ncmoe 20`, and a 2-slot `--kv-unified` server: identical text, acceptance 0.74163 in all three arms);
+  decode flat within noise (106.2-106.7 t/s at `-n 1000`, four alternating arms) (`WORKLOG.md` 261028.005).
 * **DFlash2 under `-sm tensor`** (r106, TODO #78): the selector builds `ggml_top_k` over the draft logits and
   `ggml_get_rows` to read the candidate values back, and those logits are the *target's* `output.weight`
   projection — placed vocabulary-split by the target's policy — so both ops reduce along the split axis and

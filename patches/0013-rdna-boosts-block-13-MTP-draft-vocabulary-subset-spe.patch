@@ -1,4 +1,4 @@
-From 614353bf0234a36b3902bef722ec2a1d3db7c4c9 Mon Sep 17 00:00:00 2001
+From bfce46c2f1bcfb63c0c0e87191142539e3fa1013 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -201,7 +201,7 @@ index 38a45acac..8222184a1 100644
          enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
          enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index d40d9d8d5..0f576ec10 100644
+index 188de3473..2db252646 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -856,6 +856,22 @@ llama_context::llama_context(
@@ -227,7 +227,7 @@ index d40d9d8d5..0f576ec10 100644
          sched_reserve();
  
          // wip/first-prefill-latency: reserve the wide prefill work region in the slab BEFORE the MoE
-@@ -3915,6 +3931,7 @@ llm_graph_params llama_context::graph_params(
+@@ -4110,6 +4126,7 @@ llm_graph_params llama_context::graph_params(
          /*.prec_policy =*/ &model.prec_policy,
          /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
          /*.samplers    =*/ sampling.samplers,
@@ -235,7 +235,7 @@ index d40d9d8d5..0f576ec10 100644
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
-@@ -5760,6 +5777,7 @@ llama_context_params llama_context_default_params() {
+@@ -5955,6 +5972,7 @@ llama_context_params llama_context_default_params() {
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
@@ -244,10 +244,10 @@ index d40d9d8d5..0f576ec10 100644
          /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
          /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
 diff --git a/src/llama-context.h b/src/llama-context.h
-index ff3e151bb..12cfd71ba 100644
+index 6098988ed..b634acd74 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -367,6 +367,9 @@ private:
+@@ -386,6 +386,9 @@ private:
  
      llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
  
@@ -258,7 +258,7 @@ index ff3e151bb..12cfd71ba 100644
      llama_moe_cache_ptr moe_cache;
  
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 436bad944..f5e2e50ad 100644
+index 4c6f67705..1f472330f 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
 @@ -22,6 +22,8 @@ struct llama_cparams {
@@ -271,10 +271,10 @@ index 436bad944..f5e2e50ad 100644
      float rope_freq_scale;
  
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index f5f49b637..bf695cc9d 100644
+index 90cfacd33..bba07a553 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1670,6 +1670,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+@@ -1745,6 +1745,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
      prec_policy      (params.prec_policy),
      hdmd             (params.hdmd),
      samplers         (params.samplers),
@@ -283,7 +283,7 @@ index f5f49b637..bf695cc9d 100644
      res              (params.res),
      ctx0             (res->get_ctx()),
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index c2317fe60..735380a2a 100644
+index ff5518983..8eef59917 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -101,6 +101,7 @@ struct llama_cross {
@@ -303,7 +303,7 @@ index c2317fe60..735380a2a 100644
      static bool samplers_equal(
            const std::map<llama_seq_id, llama_sampler *> & lhs,
            const std::map<llama_seq_id, llama_sampler *> & rhs) {
-@@ -945,6 +948,8 @@ struct llm_graph_params {
+@@ -951,6 +954,8 @@ struct llm_graph_params {
              cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
              cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
              cparams.causal_attn             == other.cparams.causal_attn             &&
@@ -312,7 +312,7 @@ index c2317fe60..735380a2a 100644
              arch  == other.arch  &&
              gtype == other.gtype &&
              cvec  == other.cvec  &&
-@@ -1121,6 +1126,8 @@ struct llm_graph_context {
+@@ -1148,6 +1153,8 @@ struct llm_graph_context {
  
      std::map<llama_seq_id, llama_sampler *> samplers;
  
@@ -569,7 +569,7 @@ index cfca82e80..b8deda29e 100644
      res->t_logits = logits;
  
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index 8a4e43411..8dc00a6ff 100644
+index 63cea9709..927c5e73c 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
 @@ -656,7 +656,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
@@ -593,7 +593,7 @@ index 8a4e43411..8dc00a6ff 100644
  
      res->t_logits = cur;
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index 939f10f7f..3d0d3688e 100644
+index 4e0a587d9..9ac1f47cb 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
 @@ -728,7 +728,18 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
@@ -617,7 +617,7 @@ index 939f10f7f..3d0d3688e 100644
  
      res->t_logits = cur;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index aeff555f6..2d5f53b0f 100644
+index c5d412967..47ff49f75 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -1377,7 +1377,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_

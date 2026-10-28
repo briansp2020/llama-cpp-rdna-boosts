@@ -1,5 +1,78 @@
 # WORKLOG - dated delivery records
 
+## 261028.005 (r163) -- issue #240: the DFlash layer inputs are written into F1's store from inside the target graph
+
+**Release `v15-6050b467c-r163`**, base `6050b467c`, 15 blocks, tip `d99fc588fa075a08f299665d29281ca2bc5057f4`,
+tree `ba1e1e072f218179d9a7296483e1681311a31f38`.  One change (block 12) plus the release docs.
+
+**The report.**  Issue #240 (Windows 11, R9700 gfx1201, TheRock ROCm 10): with a DFlash2 draft the target
+marks each extracted layer's input as a graph **output** (`ggml_set_output(t_layer_inp[il])`), because
+`extract_layer_inputs()` copies them after the graph has run.  An output cannot be reused by the allocator, so
+by the last layer all five were live at once and the target's compute buffer grew by ~190 MiB at `-ub 2048`.
+Separately, `output_reserve()` always reserved the host rows for them (`n_embd x n_batch` floats per layer,
+200 MiB at `-b 2048`, pinned) which F1's device path never reads.
+
+**Reproduced.**  27B UD-Q4_K_XL + DFlash2-Q4_K_M, 1x gfx1201, `--parallel 1 -fa on -ctk q8_0 -ctv q8_0
+-ub 2048 -b 2048 --spec-type ngram-mod,draft-dflash --spec-draft-n-max 5`, F1 on: target `sched_reserve`
+**757.26 MiB** device compute with the draft vs **568.42 MiB** without any layer extraction (the `--fit`
+probe), `ROCm_Host output buffer size = 200.95 MiB`, and `F1 device layer-input buffers: 200.0 MiB`.
+
+**Fix (block 12).**
+
+* **The copy is a graph node.**  `llm_graph_result::set_outputs()` emits a `GGML_OP_SET_ROWS` into the
+  persistent store per extracted layer instead of marking the tensor an output.  The destination is the
+  store, the source is the layer input, and the row indices are an `I32 [n_tokens]` graph **input** filled
+  per ubatch (`llama_context::process_ubatch`, offset `cparams.lf_row_offset`) — a baked view offset would be
+  captured into a HIP graph and replayed for the wrong ubatch (the r149 lesson), while an index tensor is
+  read at runtime.
+* **Placement.**  Every arch graph now records its layer inputs through `llm_graph_result::set_layer_inp()`
+  (33 files, one line each) instead of assigning `t_layer_inp[il]`.  At the *next* layer's recording it
+  expands that layer's nodes and then emits the pending copy, so the copy lands right after the input's last
+  consumer — which is what lets the allocator free it.  An arch that does not use the hook is still correct
+  (the copy lands at the end of the graph) but keeps the memory cost.
+* **The store exists before the first graph that writes it.**  `llama_context::lf_layer_inp_dev_arm()` runs at
+  the top of `decode()` and creates the store on the device that owns the first extracted layer (a layer input
+  on another device — a `-sm layer` split boundary — is copied across by the scheduler, as the post-graph
+  device copy was), then drops and re-reserves the compute buffers **once** so the run settles on the smaller
+  layout.  The wait on the draft's consumed event moves before that graph (`lf_wait_features_consumed()`).
+* **The host rows are lazy.**  `embd_layer_inp` is no longer part of the output buffer;
+  `layer_inp_host_reserve()` allocates the pinned rows when the *host* path first runs, and the arm releases
+  the rows the target's warm-up had allocated (the warm-up runs before the draft exists).  The per-ubatch
+  `sync_readback()` of the layer inputs is skipped when there is no host readback to order.  **One case still
+  needs the host rows:** an embedding (image/audio) ubatch has no token ids, so the draft's device injection
+  cannot address its rows and reads the host rows instead.  `extract_layer_inputs()` therefore fills them as
+  well when `ubatch.embd != nullptr` (reserving them on demand, so this is the only case that pays the pinned
+  rows).  Before this release that path read rows the device-only extraction had left stale - the aborted
+  case is now a correct host copy, and the multimodal arm below is its gate.
+
+`GGML_LF_DFLASH_DEV_GRAPH=0` restores the pre-r163 shape for A/B and bisect.  `-sm tensor` (Meta layer
+inputs), a CPU-offloaded first extracted layer and an allocation failure all keep the host path and log the
+reason, exactly as before.
+
+**Validation.**
+
+| check | result |
+|---|---|
+| target compute buffer (1 GPU, `-ub 2048`) | **757.26 -> 625.27 MiB** (-132 MiB); the 568.42 no-extraction probe is the floor, and the remaining 57 MiB is one layer input in flight |
+| target host buffer | `ROCm_Host output buffer size` **200.95 -> 0.95 MiB**; the 200 MiB pinned layer-input rows are allocated by the warm-up and released at the arm |
+| greedy text + **draft acceptance**, 27B + DFlash2, 5246-token prompt (3 target ubatches, store offsets 0/2048/4096), `-n 200` | in-graph / `GGML_LF_DFLASH_DEV_GRAPH=0` / `GGML_LF_DFLASH_DEV=0`: `950 chars sha=8016577f2ed8` and `0.44337 (137/309)`, `acc rate/pos = (0.806, 0.516, 0.387, 0.306, 0.194)` in **all three** arms |
+| 2 GPU `-sm layer` (store on ROCm0, extracted layers 48/62 on ROCm1) | identical text (`8016577f2ed8`) in all three arms, acceptance identical to the 1-GPU arm |
+| 2 GPU `-sm tensor` | arm declines (`F1: layer inputs are in a Meta buffer (tensor split), using the host path`); text identical to `GGML_LF_DFLASH_DEV=0` (`832 chars sha=be945a3af397`) |
+| 35B-A3B UD-Q4_K_M + DFlash2, `-ncmoe 20` (movable-boundary slab armed) | identical text (`733 chars sha=dc6aecbf55b8`) in all three arms |
+| 2-slot `--kv-unified` server, concurrent recall + reasoning requests | identical text (688 / 709 chars) and acceptance `0.74163 (155/209)` in all three arms |
+| image (embedding) batch: 35B-A3B UD-Q4_K_M + mmproj-F32 + its DFlash2, `llama-server -np 4 --kv-unified`, one `/v1/chat/completions` request with a PNG | the 256-row embd ubatch takes the host fill (the reason logged: rows reserved on demand *after* the arm's release), the image is described correctly, text + acceptance `0.76271 (45/59)` identical in all three arms (`248 chars sha=80dc45f13d4a`) |
+| decode throughput, `-n 1000`, four alternating arms (graph, copy, host, graph) | 106.2 / 106.7 / 106.2 / 106.7 t/s — flat; the five `SET_ROWS` per token cost nothing measurable |
+| prefill, 5246-token prompt, `-n 200` | 1220.9 (graph) / 1214.4 (copy) / 1190.0 (host) t/s |
+| `scripts/gate-prefill-logits.sh` (base re-recorded from the **r162** build) | **PASS**: mean KLD **0.000000**, same-top-p **100.000 %**, base PPL 5.9325 |
+| MTP Protocol A, 27B UD-Q4_K_XL, 3 devices, `-n 3000`, 4 axes x 2 split modes | text **byte-identical to r162 in all 8 arms** (e.g. prose layer `6349 chars sha=f3c9463c8d17`, tensor `6765 chars sha=a297b2564310`); decode 61.5-61.7 (prose layer) / 106.8-107.4 (prose tensor) t/s, acceptance 0.81015 (prose layer) - flat |
+| `scripts/validate-set.sh` | strict 15/15, applied tree equals release.json |
+
+**Release mechanics.**  The change is folded into block 12 (the DFlash home) with a fixup + autosquash, so
+the block count stays 15; `patches/` and `rdna-boosts-all.patch` were regenerated from `6050b467c`, the set
+was re-cut with `scripts/apply-all.sh`/`scripts/fork-refresh.sh` to the canonical tip recorded in
+`release.json`, and the fork's `rdna-boosts` branch plus the ROCm container images are refreshed with the tag
+per the pushing policy.
+
 ## 261028.004 (r162) -- issue #239: the DFlash draft reserves its noise block, not the lm_head over the whole ubatch
 
 **Release `v15-6050b467c-r162`**, base `6050b467c`, 15 blocks, tip `652e66694ee61d5490bac1f60c0f06b9b0a56ba3`,

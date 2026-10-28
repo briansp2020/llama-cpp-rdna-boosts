@@ -232,6 +232,23 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `plain == draft-dflash` text-identical arm pairs.  Index `n_layer` (the last layer's output) is **not**
   exported — it needs the pre-gather residual; no head taps the final layer.  Record:
   `archive/work/qwen4exp-dflash2/`.
+- **An extracted layer input is written into F1's store from inside the graph, never kept as a graph output
+  (r163, issue #240).**  `llm_graph_result::set_outputs()` emits a `GGML_OP_SET_ROWS` per extracted layer into
+  the persistent device store (`cparams.lf_layer_inp_dev_store`), whose row indices are an `I32 [n_tokens]`
+  graph **input** filled per ubatch — a baked view offset would be captured into a HIP graph and replay for
+  the wrong ubatch.  The copy's **position in the node order is the memory win**: every arch graph records its
+  layer inputs through `llm_graph_result::set_layer_inp()`, which at the next layer's recording expands that
+  layer's nodes and then emits the pending copy, so the allocator can reuse the input after its last consumer.
+  An arch that assigns `t_layer_inp[il]` directly is still correct but keeps the whole cost (5 x
+  `n_embd x n_ubatch` f32 live to the end of the graph, 188.8 MiB at `-ub 2048` on a 27B).  The stores are
+  created in `lf_layer_inp_dev_arm()` at the top of `decode()` (the context drops and re-reserves its compute
+  buffers once, so the smaller layout is what the run settles on), and the wait on the draft's consumed event
+  moves **before** that graph.  The host layer-input rows are reserved lazily by
+  `layer_inp_host_reserve()` — F1 never read them and they were 200 MiB of pinned memory per context.  Do not
+  re-add `ggml_set_output(t_layer_inp[il])` for the F1 case, do not replace the index input with a view
+  offset, and do not drop the `cparams.lf_layer_inp_dev_store` term from `llm_graph_params::allow_reuse()`:
+  `GGML_LF_DFLASH_DEV_GRAPH=0` is the A/B arm that restores the pre-r163 shape.  `GREEDY-PURITY.md` §66,
+  `WORKLOG.md` 261028.005.
 - **A cross-device copy must ask `ggml_cuda_slab_peer_copy_ok()` first (r121).**  The slab's
   peer-access grant is per-device and **best effort**: with three ~29 GiB slabs the driver refuses it for the
   second and third device (the peers have no free VRAM to build a 29 GiB peer mapping), and a
