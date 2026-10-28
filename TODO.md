@@ -12,7 +12,7 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 still means the same subject after that item is closed and removed from this file.  New items append.
 
 **Current state:** the **15-block V2.1 set** (block 00 + blocks 01-14) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v15-6050b467c-r160`**.  `release.json` is the source of truth for the
+(the 2026-10-25 re-base), release **`v15-6050b467c-r161`**.  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 
 | # | subject | kind | status |
@@ -23,6 +23,7 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | **109** | a replayed graph loses to the direct node loop where the RCCL comm layer is initialised | performance | open (2026-10-26, r149).  Now that decode graphs replay (TODO #107 closed) the captured path loses on **3-device `-sm tensor` qwen35 dense plain decode**: 27B Q8_0 `llama-bench tg128` **41.7 -> 38.6** (Q4_K_XL 52.4 -> 49.1, unchanged at depth 16384).  **The axis is the comm layer, not the model's shape and not the per-call algorithm choice:** with `GGML_CUDA_ALLREDUCE=internal` (RCCL **never initialised**) the same arm is **42.2 (+0.9 %)** on the replaying build, while `hybrid` (41.7 -> 38.6) and `ce` (40.7 -> 38.6, and `ce` runs `comm_init_hybrid` first) both regress, and `nccl` is worse still (38.5 -> 35.6).  `GGML_CUDA_AR_SMALL_BYTES` 0 or 1e9 changes nothing, so it is not which arm runs per call: it is **RCCL's presence**, which the eager-init comment in `ggml_backend_cuda_comm_init_hybrid` already records as an r34 decode-only cost of the internal pipeline — r149 makes it visible on this arm because replay now happens at all.  Not capture churn (one shot per key, the deficit survives `-n 512`), not `GGML_CUDA_GRAPH_CHUNK_SIZE`, not `GGML_CUDA_ASYNC_INPUT`, not `GGML_SCHED_EVENTS`.  **It is not a dense-model property and not a 3-device property:** Gemma4 31B Q8_0 (dense, 32.6 GB) is **+0.8 %** at 2 GPUs (26.64 -> 26.86) and **flat** at 3 (34.68 -> 34.58, and only -0.9 % for `internal` vs `hybrid`), 27B at 2 GPUs is +0.5 % with replay working, and a `draft-mtp` draft hides it at 3 devices (42.8 -> 42.9).  Kill switch: `GGML_CUDA_GRAPH_KEY_WEIGHT=0`.  Next: find what RCCL's init leaves behind that costs a *replayed* graph 5-7 % while the direct node loop is immune (an r34 follow-up, not a r149 regression) |
 | **111** | a multi-slot verify step whose slot drafted NOTHING still splits | performance / accepted limitation | open (2026-10-27, r153/r154, issue #234).  `LLAMA_SPEC_ALIGN` equalizes the draft CAPS of the sequences one `draft-mtp-adaptive` call drafts, but a slot that drafted no tokens this round (the last step of a response, or a drafter that gave up) contributes its sampled row only, so the batch is `n_draft + 1` vs `1` and `split_equal()` still produces a second ubatch there.  Truncating the neighbour's good draft to nothing is the worse trade, so that step keeps splitting (measured: 1 such step per ~200 on the 35B-A3B host-expert arm).  **The cross-drafter case is CLOSED, not deferred**: the generic `min` cut of the finished drafts was shipped in r153 and measured -6 % on the reporter's own n-gram-first chain (65.6 -> 61.7 t/s, prose acceptance 74 % -> 50 %, splits 12 -> 1), so r154 removed it: a length mismatch caused by CONTENT rather than a cap is not worth equalizing.  `scripts/gate-spec-align.sh` now gates that chain (inert within 2 %, identical draft counts).  Record: `archive/work/spec-align-234/` |
 | **112** | VRAM-resident slot snapshots for the server | parked idea | **parked** (2026-10-27, r157) — no work implied.  `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` now copies a sequence state at **14.7 / 17.2 ms** on 2 GPUs (was 2.2 s; `WORKLOG.md` 261027.009), so keeping a slot's snapshot **in VRAM** instead of host RAM is usable for the first time — but nothing calls the arm.  Blockers before a server could: no eviction/budget API on `mem_storage` and no `--fit` accounting, the MoE arena would be the OOM chain's sacrifice, and `llama-memory-recurrent.cpp` refuses the flag for more than one cell range (so a hybrid model's interleaved slot cannot be saved at all).  Detail in §112 |
+| **115** | the pair fusion's MMB stand-down and the GLU matcher's MMB predicate disagree | performance / kernel selection | open (2026-10-28, r161, found fixing issue #241).  `mul_mat_q_pair` stands down when `ggml_cuda_mmb_routed_will_take()` says MMB will take both muls (a weak check: `mmb_routed_flag() && mmb_wtype_ok(type)`), while the later `{MUL_MAT_ID, MUL_MAT_ID, GLU}` matcher tests the real `ggml_cuda_mmb_supported_glu()` (which also needs `mmb_glu()`, `K % 64`, `T >= mmb_min_t()`, `n_used <= 64`, a plain unswapped SWIGLU and matching `dst` layout).  When they disagree the pair has already stood down and the MMQ triple takes the gate/up instead of MMB.  Measured neutral-to-positive on gfx1151 (prefill 5421/5425 vs 5397/5398 t/s on LFM2.5-8B-A1B Q6_K), so no change was made: this is a decision to measure, not a known defect.  Detail in §115 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -120,6 +121,43 @@ a snapshot that lives in VRAM does not add to the non-swappable host footprint, 
 (`-sm tensor`, 2 GPU), then the server path it becomes — `scripts/gate-state-pipe.sh` and
 `scripts/gate-ckpt-reuse.sh` are the closest existing models for "a restored state moves no token".  Records:
 `archive/work/state-device-path/RESOLUTION.md`, `benchmarks/2026-10-27-state-device-path.md`.
+
+---
+
+## 115. The pair fusion's MMB stand-down and the GLU matcher's MMB predicate disagree — PERF/KERNEL SELECTION
+
+**Status: open (2026-10-28, r161).  Found while fixing issue #241; measured neutral, so nothing was changed.**
+
+Two matchers decide who serves a routed (MoE) gate/up/GLU prefill, and their MMB predicates are not the same:
+
+* `ggml_cuda_mul_mat_q_pair_try_fuse` (mmq.cu) **stands down** when
+  `ggml_cuda_mmb_active() && ggml_cuda_mmb_routed_will_take(w_gate) && ggml_cuda_mmb_routed_will_take(w_up)`.  That
+  predicate is only `mmb_enabled() && mmb_routed_flag() && mmb_wtype_ok(w->type)`.
+* The later `{MUL_MAT_ID, MUL_MAT_ID, GLU}` matcher (ggml-cuda-try-fuse.cu) asks
+  `ggml_cuda_mmb_supported_glu()`, which additionally requires `mmb_glu()`, `gw->type == uw->type`,
+  `K % 64 == 0` (and `K % 256 == 0` for the k-quant/IQ super-block types), `T >= mmb_min_t()`, `n_used <= 64`,
+  a plain unswapped `SWIGLU`, and a `dst` layout of `[M, n_used, T, 1]`.
+
+So whenever `mmb_routed_will_take` is true but `mmb_supported_glu` is false (a GLU variant MMB does not fuse, a
+shape below `mmb_min_t()`, an expert count above 64, ...), the pair fusion has already stood down for MMB and the
+MMQ triple then takes the gate/up: the two decisions are not consistent with each other.
+
+**Why it matters (and did, once).**  This is the hole issue #241 fell through: on gfx1151 (`routed = 1`) the pair
+stands down for MMB and MMB's fused GLU normally takes the triple, so the delivery's own arms never reached the
+MMQ routed arm, and its dead `!ids` assert went unnoticed for five releases.  With that fixed, the mismatch is
+only a kernel-selection question.
+
+**Measured (gfx1151, LFM2.5-8B-A1B-i1-Q6_K, server, `cache_prompt:false`, 3 requests per arm):** fused MMQ triple
+**5421 / 5425 t/s** prefill vs the MMB-individuals arm (`GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1`) **5397 / 5398**, decode
+identical (128.5-128.7 t/s), output byte-identical (`965 chars sha=d55bc8a8def9`).  No stand-down was added,
+because on the one model that reaches the arm the MMQ path is not a loss.
+
+**What to do when this is picked up.**  Make the stand-down ask the question the GLU matcher asks (the pair site
+can see `i+2`, so it can evaluate the GLU predicate properly, or share one helper), then measure both arms on the
+gfx1151 models that can reach it (an MMB-declined MoE: this LFM2, plus any shape at `T < mmb_min_t()` or
+`n_used > 64`) and on the RDNA4 arm (`mmb_cfg().routed = 0` there, so the pair always wins and the change must be
+inert).  A kernel-selection change of this kind owes the fused-vs-unfused text and prefill-logit check
+(`GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` as the A/B), per `GREEDY-PURITY.md` §65.
 
 ---
 

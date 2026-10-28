@@ -1991,7 +1991,9 @@ whose MMB routed path is on with a model MMB's GLU does not cover.  Repro on gfx
   request on the r161 build answers, and its 256-token output is **byte-identical** to
   `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` (`965 chars sha=d55bc8a8def9`).  Prefill there is **flat** against the MMB
   individuals the arm replaces (5421/5425 vs 5397/5398 t/s, three `cache_prompt:false` requests each), so
-  restoring it is not a perf loss and MMB's stand-down predicate does not need to change.
+  restoring it is not a perf loss and MMB's stand-down predicate did not have to change in this release.  The
+  two predicates still disagree (`mmb_routed_will_take` vs `ggml_cuda_mmb_supported_glu`) and that mismatch is
+  what made this abort reachable at all; it is `TODO.md` #115.
 * fused vs `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` (both with `GGML_PAIR_OFF=1` to reach the arm on gfx1201):
   **byte-identical** 200-token greedy text (`1264 chars sha=727257c78293`) and per-token **prefill-logit KLD
   -0.000000 / same-top-p 100.000 %** (`llama-perplexity --kl-divergence`, 40 chunks, `-c 512`, gfx1201).

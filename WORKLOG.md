@@ -38,7 +38,8 @@ fusion (`mul_mat_q_pair`) stands down, and that is arch-dependent:
   triple -> the abort.
 
 So reproducing it needs both the arch and the model: an RDNA4 box with `GGML_PAIR_OFF=1`, or an RDNA3.5 box
-with an MMB-declined MoE.
+with an MMB-declined MoE.  The predicate mismatch itself is filed as `TODO.md` #115 (measured neutral, so it is a
+kernel-selection decision to measure, not a defect to fix here).
 
 **Reproduced, both ways.**
 
