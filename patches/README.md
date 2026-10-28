@@ -728,24 +728,6 @@ which the per-block build gate enforces).
   it logged `released the MoE expert cache arena (0.0 MiB) ... (experts come from the host)` and returned
   true, which sent a reporter looking for an arena that does not exist (same class as r125's gated flat
   draft reserve, issue #216).
-* **The VRAM limit now reports itself, and the "silent over-commit" reading is retired (r167, TODO #103;
-  block 10).**  The run's free-VRAM **low-water mark** is sampled at every `>= 16 MiB` device allocation on
-  *every* config — until r167 it existed only while the movable-boundary slab was active and printed only
-  under `GGML_CUDA_SLAB_STATS`, so a dense/plain run (the shape #103 was found on) recorded nothing — and
-  `GGML_CUDA_LOW_FREE_MIB` (default **512**, `0` = off, skipped while the slab is armed) warns **once per
-  device** when an allocation leaves less than that free, naming the knobs (`-c` / `-ub` / `-ngl`,
-  `GGML_CUDA_MIN_FREE_MIB`).  A refused allocation now reports free/total plus the low-water mark instead of
-  only `cudaMalloc failed: out of memory`.  Nothing is refused and no default path changes; measured neutral
-  in an interleaved A/B (a 15.8k-token 27B prefill).
-  *Why the diagnosis moved:* #103's r135 cell ("1 GiB less free VRAM turns 13 s into 384 s") is **not** a
-  llama.cpp path.  On this box HIP **refuses** an allocation that does not fit and never demotes a resident
-  working set (a 30 GiB resident set reads at 505-513 GB/s with 1.7 GiB free), the at-the-limit cliff is
-  ~50 MiB wide (15 754 MiB free: full speed; 15 704 MiB free: clean `ROCm error: out of memory`), and the
-  only degradation a squeeze produces is **page migration of the *other* client's buffers** — 0-48 % of
-  prefill, tracking GTT volume: one 16.4 GB holder BO is migrated whole (GTT 16.7 GB, 577 t/s at the same
-  free VRAM where the same hold split into 64 MiB BOs migrates nothing and measures 1074-1077 t/s).  The
-  FA staging stand-down, graph churn and clocks were each ruled out by measurement.  Record:
-  `archive/work/vram-limit-103/`.
 * `moe-expert-cache.cu` (~5.1k lines) + `.h`: the cache engine — arena sizing, per-layer uniform slots,
   the slot remap, the routed-MMVQ decode/verify band (`moe_cache_band`), admission/heat policy, the
   persistent cross-run heat map (`MOE_EXPERT_HEATMAP`) and prefill cache staging.
@@ -1171,6 +1153,24 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
   `max(16 MiB, hint)`: the WDDM stranding it would fix is bounded either way, and the overshoot is not.
   `GGML_CUDA_FA_STAGE_PREALLOC=0` is the ladder A/B arm; `GGML_CUDA_SLAB_STATS=1` prints the per-growth
   `request=/cached=/alloc=` line.  `WORKLOG.md` 261027.007.
+* **The VRAM limit now reports itself, and the "silent over-commit" reading is retired (r167, TODO #103).**  The run's free-VRAM **low-water mark** is sampled at every `>= 16 MiB` device allocation on
+  *every* config — until r167 it existed only while the movable-boundary slab was active and printed only
+  under `GGML_CUDA_SLAB_STATS`, so a dense/plain run (the shape #103 was found on) recorded nothing — and
+  `GGML_CUDA_LOW_FREE_MIB` (default **512**, `0` = off, skipped while the slab is armed) warns **once per
+  device** when an allocation leaves less than that free, naming the knobs (`-c` / `-ub` / `-ngl`,
+  `GGML_CUDA_MIN_FREE_MIB`).  A refused allocation now reports free/total plus the low-water mark instead of
+  only `cudaMalloc failed: out of memory`.  Nothing is refused and no default path changes; measured neutral
+  in an interleaved A/B (a 15.8k-token 27B prefill).
+  *Why the diagnosis moved:* #103's r135 cell ("1 GiB less free VRAM turns 13 s into 384 s") is **not** a
+  llama.cpp path.  On this box HIP **refuses** an allocation that does not fit and never demotes a resident
+  working set (a 30 GiB resident set reads at 505-513 GB/s with 1.7 GiB free), the at-the-limit cliff is
+  ~50 MiB wide (15 754 MiB free: full speed; 15 704 MiB free: clean `ROCm error: out of memory`), and the
+  only degradation a squeeze produces is **page migration of the *other* client's buffers** — 0-48 % of
+  prefill, tracking GTT volume: one 16.4 GB holder BO is migrated whole (GTT 16.7 GB, 577 t/s at the same
+  free VRAM where the same hold split into 64 MiB BOs migrates nothing and measures 1074-1077 t/s).  The
+  FA staging stand-down, graph churn and clocks were each ruled out by measurement.  Record:
+  `archive/work/vram-limit-103/`.  (It also replaces the "30x because the driver evicts resident weight pages"
+  sentence in block 09's `GGML_CUDA_MIN_FREE_MIB` comment, since this block owns the tail of the same function.)
 * **The block-10 arms of the Q8_1 cache fix** (r132, with block 08): the fused GLU -> Q8_1 site's key walk
   stops at the first pointer change (the fused write is keyed by the matmul's `src1`), and both of this
   block's gated-q8_1 launch arms — the fused norm+gate kernel and the GLU write — validate their sources
