@@ -37,7 +37,10 @@ returns -n`) and sizes the buffer from that.  Verdict logic untouched, test-only
 **2/2** on the `all` target set (block 06 + the tip, 58 s); `gate-prefill-logits.sh` **mean KLD 0.000000 /
 same-top-p 100.000 %**; same-seed coherence unchanged; Protocol A on the dense 27B UD-Q4_K_XL
 (`-c 102400`, bf16 KV, `-n 3000`) `plain == draft-mtp` byte-identical on **both** split modes —
-`-sm tensor` 50.9 -> 100.7 t/s (acceptance 0.608) and `-sm layer` 25.0 -> 51.6 t/s.  `TODO.md` #102 removed.
+`-sm tensor` 50.9 -> 100.7 t/s (acceptance 0.608) and `-sm layer` 25.0 -> 51.6 t/s.  The width arms above were
+re-run on the release binary and reproduce the same hashes.  `git diff 809a27419 29219f9cb` is
+`tests/test-logits-width-probe.cpp` only, i.e. **no shipped binary links the changed TU**, so the op-test
+matrices (`test-backend-ops -o FLASH_ATTN_EXT` etc.) are r165's and were not re-run.  `TODO.md` #102 removed.
 
 ## 261028.007 (r165) -- TODO #109: `hipDeviceEnablePeerAccess` is what costs a replayed decode, so the all-reduce arms were re-cut (dense -> copy engine, host experts -> RCCL's ring, peer access never enabled)
 
