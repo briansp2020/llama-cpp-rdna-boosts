@@ -182,8 +182,8 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
 - **Apply method:** all 15 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
   `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
 - **Naming (V2.1):** the current set is **15 blocks, 00-14** (block 14 is the temporary `-sm relaxed-tensor`
-  block, see `patches/README.md`; release `release.json .release` —
-  `v15-6050b467c-r160`; the value lives in `release.json`, never here).  Every `block NN`
+  block, see `patches/README.md`; the release tag lives in `release.json` — read `.release` there, it is
+  never restated here).  Every `block NN`
   reference elsewhere in this file that is not one of the V2.1 numbers below is the **pre-V2.1 16-block
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,
   **03** chunked GDN, **04** BF16 KV, **05** FA band/native/derived, **06** MMB, **07** k-quant,

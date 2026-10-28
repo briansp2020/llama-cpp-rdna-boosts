@@ -1,5 +1,44 @@
 # WORKLOG - dated delivery records
 
+## 261028.008 (r166) -- TODO #102 closed: the band has its head-256 **GQA-8** arm after all (Qwen3.6-35B-A3B), and the width probe can finally tokenize a corpus
+
+**Release `v15-6050b467c-r166`**, base `6050b467c`, 15 blocks, tip `29219f9cbfd4f3aa89bca0c75270addebbe0843f`,
+tree `cbcb88080bffa9c58b43feca7236d01249841c10`.  Block 06 amended (the width probe's token buffer); docs,
+one TODO retired.  Numbers: `benchmarks/2026-10-28-fa-band-gqa8-arm.md`.
+
+**The item's premise was wrong, not the claim.**  #102 was an accepted limitation because "no head-256
+GQA-8 model exists in the fleet".  `Qwen3.6-35B-A3B` has been in the fleet all along and loads as
+`n_head 16 / n_head_kv 2 / n_embd_head_k 256` — head 256 at **ratio 8**, i.e. the band predicate's one
+unmeasured ratio (`Q->ne[0] == 256 && V->ne[0] == 256 && 4 < gqa_ratio <= 12`).  The model the other
+assistant suggested (`gemma-4-26B-A4B`) is **not** that arm: its SWA layers are head 256 at ratio **2** and
+its full-attention layers ratio 8 at head **512**, so no layer of it enters the band (same for 31B/12B/E4B).
+Ratio 8 is the one ratio where the `ncols2 = 8` fold is *exact* (a whole group, no masked tail), which is
+why it was worth its own arm.
+
+**Validation.**  `test-logits-width-probe` at `P=4096` (the wide block's gate), 3x R9700, PASS with worst
+maxdiff **0** on `KV=f16` and `q8_0`, `-sm layer` and `-sm tensor`, `RS=0` and `RS=from_w`, on
+`prompts/prose-rdna-boosts.txt` **and** on the model's own 25 814-token in-domain corpus; `row0_row1_hashes`
+are one value across W=1..8 (no W=4/W=5 split).  Controls: `GGML_HIP_FA_BAND_WMMA=0` moves every hash (so the
+default arm is on the band) and `GGML_HIP_FA_BAND_WIDE=0` is bit-identical (the r134 `static_assert` seen as
+a number).  A `rocprofv3` kernel census proves both band blocks are reached at GQA 8: the 64-column band
+instantiation `<256,256,8,8,…fetch_ahead,band_wide=true>` dispatched 55 times next to the 32-column band's
+70 and prefill's 121.  Text: `plain == draft-mtp == draft-dflash` (block-16 head) `== draft-dflash` (DFlash2
+block-8 + selector) at `-n 512` on both split modes (layer 1888 chars `1c5f9e08e5e4`, tensor 2011 chars
+`c5b2c23d064a`), with live drafters (acceptance 0.736 / 0.545 / 0.543; 82.9 -> 137.8 / 130.2 / 131.9 t/s).
+Both DFlash heads are new files under `/llm/models/Qwen3.6/35B-A3B/{DFlash,DFlash2}/Q8_0/` (hashes in the
+record).
+
+**Block 06 amendment (found while running it).**  The probe tokenized into a fixed 8192-token vector, so the
+natural prompt for a model-specific arm — its own KLD corpus, 25 814 tokens — died with `tokenize failed
+(need 25814)`; it now asks the tokenizer for the required length (`llama_tokenize(..., nullptr, 0, ...)
+returns -n`) and sizes the buffer from that.  Verdict logic untouched, test-only, no runtime path.
+
+**Gates.**  `validate-set.sh` strict 15/15, tree `cbcb8808`; `gate-per-block-build.sh --changed-from 809a27419`
+**2/2** on the `all` target set (block 06 + the tip, 58 s); `gate-prefill-logits.sh` **mean KLD 0.000000 /
+same-top-p 100.000 %**; same-seed coherence unchanged; Protocol A on the dense 27B UD-Q4_K_XL
+(`-c 102400`, bf16 KV, `-n 3000`) `plain == draft-mtp` byte-identical on **both** split modes —
+`-sm tensor` 50.9 -> 100.7 t/s (acceptance 0.608) and `-sm layer` 25.0 -> 51.6 t/s.  `TODO.md` #102 removed.
+
 ## 261028.007 (r165) -- TODO #109: `hipDeviceEnablePeerAccess` is what costs a replayed decode, so the all-reduce arms were re-cut (dense -> copy engine, host experts -> RCCL's ring, peer access never enabled)
 
 **Release `v15-6050b467c-r165`**, base `6050b467c`, 15 blocks, tip `809a27419f0ed7201d693352f4deef3ce4ceb6b3`,

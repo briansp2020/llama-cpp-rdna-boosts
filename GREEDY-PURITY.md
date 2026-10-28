@@ -1335,7 +1335,20 @@ for years and never touched widths 5..8: the wide launch's gate is `K->ne[1] >= 
 context's **used** length, so `n_ctx` (a fixed 4096) was irrelevant and the probe's prefix was 256 cells.  That
 is why `width_purity=PASS` was reported on every r126..r133 arm.  The probe's `n_ctx` is now `P + W + 8` and
 a purity run must pass **`P >= 4096`**: at that point the r126 geometry fails (worst maxdiff 0.199764 on q8_0
-K/V, the row-0 hash splitting between W=4 and W=5) and the shipped geometry passes with maxdiff 0.
+K/V, the row-0 hash splitting between W=4 and W=5) and the shipped geometry passes with maxdiff 0.  A probe
+prompt also has to be *tokenizable*: the buffer is sized from `llama_tokenize(..., nullptr, 0, ...)` since
+r166, so a model's own 25k-token in-domain corpus can be the prompt instead of failing on a fixed 8192.
+
+**The ratio axis is measured at 6, 8 and 12 (r166, `TODO` #102 closed).**  `ncols2 = 8` folds a whole GQA
+group in one pass, a partial one with a masked tail, and ratios 9..12 in two passes -- so those are three
+distinct code shapes and each needs its own arm.  Ratio **6** = dense 27B (24 q / 4 kv), ratio **12** =
+qwen4exp Flash-Next (24 / 2), and ratio **8** = Qwen3.6-35B-A3B (16 q / 2 kv at `n_embd_head_k` 256) -- the
+exact-fold case, which was carried as an accepted limitation because "no head-256 GQA-8 model exists in the
+fleet" while one had been in it all along.  All three are width-pure at `P=4096` (maxdiff 0, `KV=q8_0` and
+`f16`, `-sm layer` and `-sm tensor`, `RS=0` and `RS=from_w`), and at ratio 8 a `rocprofv3` census shows the
+64-column **band** instantiation (not the prefill row) dispatching at widths 5..8.  A gemma4 model is not an
+arm for this axis: its SWA layers are head 256 at ratio 2 and its full-attention layers ratio 8 at head
+512, so neither enters the band predicate.
 
 **Rule.**  A config row that exists for the decode/verify band must be reachable **only** from the band: key
 it on a compile-time band flag (or on a distinct instantiation), never on `ncols`, `n_kv` or `n_q` at
@@ -1347,8 +1360,9 @@ instantiation.  **A row that reaches prefill owes `scripts/gate-prefill-logits.s
 changes the KV-row split and combine order -- the family-switch class of §34/§46), plus the band arm's own
 decode/verify A/B so the band's measured gain is not silently traded away.
 
-Record: `TODO.md` #97/#98/#99 (all closed), issue #224, `patches/README.md` block 05, `WORKLOG.md`
-261024.006 / 261024.007 / 261024.010 / 261025.004, `benchmarks/2026-10-25-fa-band-width-purity.md`.
+Record: `TODO.md` #97/#98/#99 (all closed) and #102 (closed r166), issue #224, `patches/README.md` block 05,
+`WORKLOG.md` 261024.006 / 261024.007 / 261024.010 / 261025.004 / 261028.008,
+`benchmarks/2026-10-25-fa-band-width-purity.md`, `benchmarks/2026-10-28-fa-band-gqa8-arm.md`.
 
 ## 52. An op with no test case has no oracle — and a default-on fusion needs the pair covered, not just the op
 

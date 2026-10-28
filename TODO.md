@@ -12,13 +12,12 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 still means the same subject after that item is closed and removed from this file.  New items append.
 
 **Current state:** the **15-block V2.1 set** (block 00 + blocks 01-14) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v15-6050b467c-r165`**.  `release.json` is the source of truth for the
+(the 2026-10-25 re-base), release **`v15-6050b467c-r166`**.  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 
 | # | subject | kind | status |
 |---|---|---|---|
 | **70** | harden the expert-cache re-arm / wide-aux growth against a starved arena | robustness | open |
-| **102** | the band's width purity has no head-256 **GQA-8** arm | platform validation | open, accepted limitation (r134, issue #224).  The r134 guard is width-only (`np`, `nbatch_fa/K2/V2`, `nstages_target`, `Q_in_reg` on the two band rows), and it is measured at **GQA 6** (dense 27B: `test-logits-width-probe P=4096`, maxdiff 0) and **GQA 12** (Flash-Next `RS=from_w`, 2 GPU `-sm layer -ncmoe 40`, q8_0, maxdiff 0); no head-256 GQA-8 model exists in the fleet.  What to run if one appears: the same probe at `P >= 4096` (`KV=q8_0/f16`) plus `plain == draft-*` at `-n 512` |
 | **103** | the ~30x collapse at the last few MiB of free VRAM | diagnosis | open (r135, found in issue #219).  At 14.06 GiB free the same 27B + MTP config runs prefill 35 t/s / decode 1.5-3 t/s instead of 1127 / 53 with the weights still resident; not the FA staging fallback and not graph churn alone.  `GGML_CUDA_MIN_FREE_MIB` makes it unreachable; the cause is unrecorded.  Detail in `TODO.md` §103 |
 | **111** | a multi-slot verify step whose slot drafted NOTHING still splits | performance / accepted limitation | open (2026-10-27, r153/r154, issue #234).  `LLAMA_SPEC_ALIGN` equalizes the draft CAPS of the sequences one `draft-mtp-adaptive` call drafts, but a slot that drafted no tokens this round (the last step of a response, or a drafter that gave up) contributes its sampled row only, so the batch is `n_draft + 1` vs `1` and `split_equal()` still produces a second ubatch there.  Truncating the neighbour's good draft to nothing is the worse trade, so that step keeps splitting (measured: 1 such step per ~200 on the 35B-A3B host-expert arm).  **The cross-drafter case is CLOSED, not deferred**: the generic `min` cut of the finished drafts was shipped in r153 and measured -6 % on the reporter's own n-gram-first chain (65.6 -> 61.7 t/s, prose acceptance 74 % -> 50 %, splits 12 -> 1), so r154 removed it: a length mismatch caused by CONTENT rather than a cap is not worth equalizing.  `scripts/gate-spec-align.sh` now gates that chain (inert within 2 %, identical draft counts).  Record: `archive/work/spec-align-234/` |
 | **112** | VRAM-resident slot snapshots for the server | parked idea | **parked** (2026-10-27, r157) — no work implied.  `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` now copies a sequence state at **14.7 / 17.2 ms** on 2 GPUs (was 2.2 s; `WORKLOG.md` 261027.009), so keeping a slot's snapshot **in VRAM** instead of host RAM is usable for the first time — but nothing calls the arm.  Blockers before a server could: no eviction/budget API on `mem_storage` and no `--fit` accounting, the MoE arena would be the OOM chain's sacrifice, and `llama-memory-recurrent.cpp` refuses the flag for more than one cell range (so a hybrid model's interleaved slot cannot be saved at all).  Detail in §112 |
@@ -44,22 +43,6 @@ r86 in `WORKLOG.md` 261019.002; validation arm `MOE_EXPERT_CACHE_VALIDATE=1`.
 graph is now invalidated when the slab work boundary shrinks (block 10, `WORKLOG.md` 261020.004).  That
 covers the observed #187 fault; it does **not** discharge this item, because a re-arm can still change a
 table's arena placement under a graph that is not being dropped.  Keep #70 open.
-
----
-
-## 102. The band's width purity has no head-256 GQA-8 model arm — PLATFORM VALIDATION
-
-**Status: open, accepted limitation (r134, issue #224).**  Not a suspected defect.  The r134 fix restores the
-band's per-column KV split (`np = nwarps*cols_per_warp/ncols`) as one geometry across query widths 1..8, and
-a `static_assert` on the two band rows makes a config divergence a build error.  `ncols2 = 8` folds a GQA
-group of up to 8 in one pass (and 9..12 in two), so the geometry does not depend on the ratio; the guard is
-width-only.  Measured: `test-logits-width-probe` at `P=4096` on **GQA 6** (dense 27B, q8_0/f16/bf16) and on
-**GQA 12** (Flash-Next, `RS=from_w`, 2 GPU `-sm layer`, `-ncmoe 40`, q8_0) — both maxdiff 0.  No head-256
-GQA-8 model exists in the fleet, so ratio 8 itself is unmeasured.
-
-What to run if one appears: the probe at `P >= 4096` with `KV=q8_0` and `f16` (plus `SPLIT=tensor` for the
-multi-device arm), and `plain == draft-dflash/draft-mtp` at `-n 512`.  A failure would look like a row-0 hash
-split between W=4 and W=5 (the shape the r126 geometry produced).
 
 ---
 

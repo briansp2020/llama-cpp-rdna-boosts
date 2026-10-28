@@ -1,4 +1,4 @@
-From 43a8069a0d054168ea13a6c452bfdd20e9eb2e2f Mon Sep 17 00:00:00 2001
+From 2016c8a809f241ff9b44715077c92d64032a06ef Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/14] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -21537,7 +21537,7 @@ index 000000000..03ac81bd2
 +    return 0;
 +}
 diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
-index cc307b321..0df108827 100644
+index 4b117dbe3..120e9f8ff 100644
 --- a/tests/test-logits-width-probe.cpp
 +++ b/tests/test-logits-width-probe.cpp
 @@ -32,6 +32,7 @@
@@ -21591,7 +21591,7 @@ index cc307b321..0df108827 100644
      const llama_vocab * vocab = llama_model_get_vocab(model);
  
      std::string text;
-@@ -95,7 +130,10 @@ int main(int argc, char ** argv) {
+@@ -100,7 +135,10 @@ int main(int argc, char ** argv) {
  
      const int n_vocab = llama_vocab_n_tokens(vocab);
      const ggml_type kv_type = kv_from_env();
@@ -21603,7 +21603,7 @@ index cc307b321..0df108827 100644
  
      // rows[w-1] = the logits of every row of the W-token batch, in row order
      std::vector<std::vector<float>> rows[NW];
-@@ -110,6 +148,7 @@ int main(int argc, char ** argv) {
+@@ -115,6 +153,7 @@ int main(int argc, char ** argv) {
          // P >= 4096 (issue #224: the P=256 run never reached that block, so the gate could not see the
          // 8-warp row that broke width purity; a P=4096 run fails on it).
          cp.n_ctx = P + NW + 8; cp.n_batch = P > ubatch ? P : ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
@@ -21611,7 +21611,7 @@ index cc307b321..0df108827 100644
          // Replicate the MTP verify-batch recurrent-state snapshot count: common sets
          // n_rs_seq = draft.n_max, so a W-token batch with n_max = W-1 uses n_rs_seq = W-1.
          {
-@@ -160,13 +199,12 @@ int main(int argc, char ** argv) {
+@@ -165,13 +204,12 @@ int main(int argc, char ** argv) {
      float worst = 0.0f;
      for (int W = 1; W <= NW; ++W) {
          float wmax = 0.0f;

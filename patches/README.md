@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r161`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r166`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -370,8 +370,15 @@ almost all of them `template-instances/*.cu`.
   measured at parity with `GGML_HIP_FA_BAND_WIDE=0` end to end (75.2/74.6 vs 75.0/74.9 t/s at 8K;
   61.0/60.6 vs 60.9/60.8 at a 131072-cell FA range; 164.5/166.6 vs 166.3/164.9 on the W=8 MoE arm) and
   within +-2.5 % at the kernel level (`kv 16384`, q8_0, `n_q` 5: 163.3 vs 167.3 us; `n_q` 8: 174.0 vs
-  170.0 us).  `GREEDY-PURITY.md` §51, `WORKLOG.md` 261025.004,
-  `benchmarks/2026-10-25-fa-band-width-purity.md`.
+  170.0 us).  **The ratio axis is measured at 6, 8 and 12 since r166:** head-256 **GQA-8** is
+  `Qwen3.6-35B-A3B` (16 q / 2 kv, `n_embd_head_k` 256) — the *exact* whole-group fold, the one ratio the
+  `ncols2 = 8` tile does not have to mask — and it passes every arm of the r134 gate (maxdiff 0 on
+  `KV=q8_0/f16`, `-sm layer`/`-sm tensor`, `RS=0`/`RS=from_w`, on `prompts/prose-rdna-boosts.txt` and on the
+  model's own 25.8k-token corpus) plus a `rocprofv3` census that shows the 64-column **band** instantiation
+  (not the prefill row) dispatching at widths 5..8.  A gemma4 model is not an arm for this axis: its SWA
+  layers are head 256 at ratio 2 and its full-attention layers ratio 8 at head 512, so neither enters the
+  predicate.  `GREEDY-PURITY.md` §51, `WORKLOG.md` 261025.004 / 261028.008,
+  `benchmarks/2026-10-25-fa-band-width-purity.md`, `benchmarks/2026-10-28-fa-band-gqa8-arm.md`.
 * **Native quantized K/V (V4/V5)**: the sub-F16 quant types (`q8_0`/`q4_0`/`q4_1`/`q5_0`/`q5_1`/`iq4_nl`)
   read the cache natively instead of a whole-cache F16 conversion per decode step — a decode-*depth* win,
   and the margin that lets a high-context MTP config load (`GREEDY-PURITY.md` §34).
@@ -545,7 +552,9 @@ measured −1.3…−2.2 % at `pp2048` on gfx1100, so the lever there would be a
 **Contents.**  The `mmb` kernel family and its dispatch (`ggml-cuda.cu`); a per-quant type list
 (`GGML_CUDA_MMB_TYPES`); per-arch RDNA3/RDNA4 tuning knobs; `mmf32.cu`/`mmf32.cuh` and its dispatch; and
 `tests/test-logits-width-probe.cpp` — the **width probe** that every purity claim in the delivery is
-measured with.
+measured with.  Since r166 the probe sizes its token buffer from the tokenizer
+(`llama_tokenize(..., nullptr, 0, ...)` returns `-n`) instead of a fixed 8192, so a model's own multi-10k-token
+in-domain corpus can be the probe prompt rather than failing with `tokenize failed (need N)`.
 
 **Knobs.**  `GGML_CUDA_MMB` (master switch), `_TYPES`, `_DENSE`, `_ROUTED`/`_ROUTED_THRESH`, `_GLU`/`_GLU_THRESH`,
 `_F32SPLIT`(+`_MIN_K`/`_MIN_M`), `_TALL`(+`_MIN_M`), `_TINY_M`/`_TINY_TT`, `_DOWN16`, `_HC16`, `_IQ3XXS`,

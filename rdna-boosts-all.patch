@@ -86361,10 +86361,10 @@ index 00267716d..86b1437ad 100644
                          status_roundtrip = "\033[1;32mOK\033[0m";
 diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
 new file mode 100644
-index 000000000..0df108827
+index 000000000..120e9f8ff
 --- /dev/null
 +++ b/tests/test-logits-width-probe.cpp
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,234 @@
 +// W = 1..8 logits purity probe -- the delivery's §11 promotion gate item 1
 +// ("`W = 1..8` logits matrix with GGML_CUDA_MMB=1 == off").
 +//
@@ -86490,7 +86490,12 @@ index 000000000..0df108827
 +    { FILE * f = fopen(text_path, "rb"); if (!f) { perror("text"); return 1; }
 +      char buf[65536]; size_t r; while ((r = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, r); fclose(f); }
 +
-+    std::vector<llama_token> toks(8192);
++    // Size the token buffer from the tokenizer (llama_tokenize returns the required count, negated, when
++    // the buffer is too small) rather than from a fixed 8192: a probe whose prompt is a long corpus has to
++    // be runnable, and the shipped in-domain KLD corpora are 25k+ tokens -- the natural prompt for an arm
++    // is often the model's own corpus.  A too-small buffer used to fail with `tokenize failed (need N)`.
++    const int n_needed = -llama_tokenize(vocab, text.data(), (int) text.size(), nullptr, 0, false, false);
++    std::vector<llama_token> toks((size_t) (n_needed > 0 ? n_needed : 1) + 8);
 +    int n = llama_tokenize(vocab, text.data(), (int) text.size(), toks.data(), (int) toks.size(), false, false);
 +    if (n < 0) { fprintf(stderr, "tokenize failed (need %d)\n", -n); return 1; }
 +    if (n < P + NW) { fprintf(stderr, "text too short: %d tokens, need %d\n", n, P + NW); return 1; }
