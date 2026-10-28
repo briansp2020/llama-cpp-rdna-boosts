@@ -1,4 +1,4 @@
-From d74e0e86133f939fb626d8dd2345cb07e1903d6b Mon Sep 17 00:00:00 2001
+From 8deb8a86b5fcc6e67a3d3740c2f59416f4216c85 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/14] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -16309,7 +16309,7 @@ index cdb5b5972..7d6513e9b 100644
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 2b19c9a94..5c35ab4c5 100644
+index 89989372e..2d0208d92 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -1,5 +1,7 @@
@@ -16335,7 +16335,7 @@ index 2b19c9a94..5c35ab4c5 100644
          const mmq_args args = {
              (const char *) src0_i->data, src0_i->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), (float *) dst_i->data,
              nullptr,
-@@ -888,3 +898,134 @@ bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows
+@@ -893,3 +903,134 @@ bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows
      const int64_t tiles_efficiency_percent = 100 * ntiles / (nsm*tiles_nwaves);
      return tiles_efficiency_percent >= 90;
  }

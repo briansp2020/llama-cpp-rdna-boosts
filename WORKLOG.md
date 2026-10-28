@@ -1,5 +1,80 @@
 # WORKLOG - dated delivery records
 
+## 261028.003 (r161) -- issue #241: the routed fused gate arm is back (block 08)
+
+**Release `v15-6050b467c-r161`**, base `6050b467c`, 15 blocks, tip `4a156887b4918f178551993c34ded4bc4c69df48`,
+tree `e379e5c3df9e4a6f5503840e2547b2fb0b578cfd`.  One code change (block 08) plus a stale gate base refresh.
+
+**The report.**  Issue #241 (r159, gfx1151): `llama-server` aborts on the first prefill of an `lfm2moe` model
+with `ggml/src/ggml-cuda/mmq.cu:468: GGML_ASSERT(gate && !ids && !fusion->x_bias && ...)` in
+`ggml_cuda_mul_mat_q`, called from `ggml_cuda_try_fuse`.  The reporter's analysis was right in substance and
+one detail was wrong, which matters for the fix:
+
+* The firing matcher is block 08's **MoE gate/up+GLU MMQ prefill fusion** (`MUL_MAT_ID`, `ids != nullptr`,
+  `GGML_CUDA_DISABLE_MOE_MMQ_FUSION` as its kill switch), *not* upstream #29948's dense arm.
+* Guarding the dense arm with `ids == nullptr` (the reporter's first patch hunk) is **inert**:
+  `ggml_cuda_should_fuse_mul_mat_q` -> `ggml_cuda_mul_mat_q_fusion_matches` requires
+  `up->op == GGML_OP_MUL_MAT`, so it cannot match a `MUL_MAT_ID`.  What actually made their model work was the
+  env kill switch, which stopped the routed arm.
+
+**Root cause.**  `ggml_cuda_mul_mat_q` serves **two** fused gate/up/GLU arms with disjoint preconditions:
+upstream #29948's dense interleaved `has_fusion` arm (`ids == nullptr`, bias/scale allowed, NVIDIA-only) and
+block 08's routed `has_gate` arm (`ids != nullptr`, no bias/scale, `ggml_cuda_mul_mat_q_switch_type_gate`,
+RDNA).  The r138 re-base merged upstream's whole `if (fusion) { GGML_ASSERT(gate && !ids && ...) }` preamble
+into the function that also serves the routed arm, so the MoE fusion aborted on **every** config that reached
+it, from r138 through r160.  Nothing else was wrong with the path: it is reachable and correct, and the fix is
+to drop `ids` from the shared preamble (bias/scale stay dense-only).  Block 08 carries it, with the reason in
+the commit's `Amended (r161)` paragraph; `GREEDY-PURITY.md` §65 is the rule, `patches/README.md` (block 08) and
+an `AGENTS.md` bullet are the pointers.
+
+**Why five releases missed it (the finding worth keeping).**  The triple matcher only runs when the *pair*
+fusion (`mul_mat_q_pair`) stands down, and that is arch-dependent:
+
+* on **RDNA4** `mmb_cfg().routed = 0` (S12: MMB's routed path is a measured loss there), so `mul_mat_q_pair`
+  takes the gate/up pair before the triple is considered -> the abort is unreachable on the maintainer's daily
+  arms (that is why `GGML_PAIR_OFF=1` is the gfx1201 repro);
+* on **gfx1151** `routed = 1`, so the pair stands down *for MMB*, and MMB's fused GLU takes the triple on the
+  Qwen-family shapes.  Only a model whose GLU shape MMB declines (this `lfm2moe`) falls through to the MMQ
+  triple -> the abort.
+
+So reproducing it needs both the arch and the model: an RDNA4 box with `GGML_PAIR_OFF=1`, or an RDNA3.5 box
+with an MMB-declined MoE.
+
+**Reproduced, both ways.**
+
+* gfx1151 (`halo`, single gfx1151, the r148 tree, same assert): the reporter's own server command
+  (`-c 32768 -fa on -np 1 -ub 2048 --cache-type-k q8_0 --cache-type-v q8_0`, first `/v1/chat/completions`)
+  aborts at `mmq.cu:468`; the r161 tree answers the same request.
+* gfx1201: `llama-cli` + `GGML_PAIR_OFF=1` on Qwen3.6-35B-A3B UD-Q4_K_M aborts at the same assert, and passes
+  after the fix (the routed kernel then runs: verified with a temporary log).
+
+**Validation.**
+
+| check | result |
+|---|---|
+| gfx1201, LFM2.5-8B-A1B-i1-Q6_K, fused vs `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` (`GGML_PAIR_OFF=1` both) | greedy text **byte-identical** (`1264 chars sha=727257c78293`); prefill **KLD -0.000000 / same-top-p 100.000 %** (llama-perplexity `--kl-divergence`, 40 chunks, `-c 512`) |
+| gfx1151, the reporter's server request, 256 tokens, fused vs unfused | **byte-identical** (`965 chars sha=d55bc8a8def9`) |
+| gfx1151 prefill, fused vs MMB-individuals (`GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1`), server `cache_prompt:false`, 3 runs | fused **5421 / 5425 t/s**, unfused **5397 / 5398** (+0.5 %); decode identical (128.5-128.7 t/s).  The restored arm is not a perf loss where it now runs, so no MMB stand-down change is warranted |
+| r159 vs r161, interleaved x2 | dense 27B Q8_0 2 GPU tensor pp2048 2205.45 / 2204.36 vs **2215.57 / 2213.94**, tg128 flat (32.75/32.77 vs 32.79/32.78); 35B-A3B Q4_K_M `-ncmoe 40` 2 GPU tensor pp2048 1249.21 / 1245.96 vs 1245.03 / 1248.77, tg64 96.76 / 96.71 vs **97.01 / 97.33** |
+| coherence vs the r159 binary | 35B-A3B Q4_K_M `1256 chars sha=083dc514ab0a` and 27B Q8_0 `sha=d89fa8935929`, **byte-identical** in both |
+| MTP Protocol A (27B UD-Q4_K_XL, 3 devices, tensor, `-n 3000`, prose) | plain **49.8** t/s, `draft-mtp` **98.2** t/s, acceptance **0.604** |
+| MoE MTP depth 3, fusion on vs `GGML_CUDA_DISABLE_FUSION=1` (35B-A3B `-ncmoe 40`, 2 GPU tensor, `-n 2000`) | acceptance 0.64702 (1021/1578) / 179.7 t/s vs 0.69603 / 139.0 t/s -- and **identical to the r159 binary** (0.64702, 179.9), i.e. the difference is pre-existing instrumentation of the all-fusions-off arm, not this change |
+| prefill-logit gate, 27B Q8_0 (r159-era recorded base) | **0.000000 KLD / 100.000 %** |
+| prefill-logit gate, 35B-A3B UD-Q4_K_M | **0.000000 / 100.000 %** against a **re-recorded** base (see below) |
+| `scripts/validate-set.sh` | strict 15/15, tree `e379e5c3d`, Windows scan OK |
+
+**Also fixed on the way: the gfx1201 MoE prefill-logit base was stale.**  The recorded
+`prefill-logit-gfx1201-Qwen3.6-35B-A3B-UD-Q4_K_M.kld` (2026-10-24, build `55d421582b7b`) fails **identically**
+on the previous release's binary (r159: `0.005657 / 96.794 %`) and on r161, so it predates a numerics change
+that was never refreshed -- a gate pointing at a reference nobody ships.  It was re-recorded from
+`build-r159` (the previous release's tree; `base_ppl 5.8257`, build `6627ed715`) and r161 now compares at
+`-0.000000 / 100.000 %`.  No code change; gate hygiene.
+
+**Release mechanics.**  Block 08 amended (assert fix + `Amended (r161)` paragraph), the set re-cut from
+`6050b467c` (`apply-all.sh` deterministic tip `4a156887b`, tree `e379e5c3d`), `patches/` + `rdna-boosts-all.patch`
+regenerated from that canonical chain, `release.json` rewritten.  The fork's `rdna-boosts` branch and the ROCm
+container images are refreshed with the tag, per the pushing policy.
+
 ## 261028.002 (r160) -- the MTP reference figures are THREE-device numbers: r159 -> r160 has no throughput regression
 
 **Not a release.**  No code, patch or `release.json` change; `v15-6050b467c-r160` (tip `c7adb4f2b`, tree

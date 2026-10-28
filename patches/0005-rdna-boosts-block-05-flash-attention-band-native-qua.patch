@@ -1,4 +1,4 @@
-From 374294c514a9fb67264b345269cf672d1d99629d Mon Sep 17 00:00:00 2001
+From 3cc74be266f928b26d394dab029b30c5a900f8a3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 05/14] rdna-boosts: block 05: flash-attention band, native

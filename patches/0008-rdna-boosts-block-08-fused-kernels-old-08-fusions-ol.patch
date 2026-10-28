@@ -1,4 +1,4 @@
-From 536b90d64966efa574827c72b657ac3179ec6908 Mon Sep 17 00:00:00 2001
+From da1fb882b4b0412a23e8dfa90c60e3bd29be0c06 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 08/14] rdna-boosts: block 08: fused kernels (old-08 fusions +
@@ -42,6 +42,18 @@ correctness fix for configurations we do not run: 12/12 same-seed configs byte-i
 identical (1859/3416, 1420/1710, 2171/2483, 372/375 on the four axes), prefill-logit KLD 0.000000.
 
 Co-authored-by: Slava P. <slavap@users.noreply.github.com>
+
+Amended (r161): the routed fused gate arm is back.  Upstream #29948's
+`GGML_ASSERT(gate && !ids && ...)` in ggml_cuda_mul_mat_q is the *dense* arm's
+precondition, but the ids path below dispatches this block's `has_gate` kernel
+(ggml_cuda_mul_mat_q_switch_type_gate) over the routed weight tables, which is
+exactly what the MoE gate/up+GLU prefill fusion calls with `ids != nullptr`, so
+the assert aborted every config that reached it (issue #241: an lfm2moe server
+prefill; reproduced on gfx1151 and on gfx1201 with GGML_PAIR_OFF=1).  `ids` is
+no longer part of the assert -- bias/scale stay dense-only because the routed
+arm sets none, and a routed call can never reach upstream's dense interleaved
+kernel.  Gate: fused == unfused on the reporting MoE (byte-identical greedy
+text; prefill-logit KLD -0.000000 / same-top-p 100.000 %).
 ---
  ggml/src/ggml-cpu/ops.cpp                     |    8 +
  ggml/src/ggml-cuda/argsort.cu                 |   12 +-
@@ -51,7 +63,7 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  ggml/src/ggml-cuda/getrows.cu                 |   12 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |  628 +++++-
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |   16 +-
- ggml/src/ggml-cuda/mmq.cu                     |  380 +++-
+ ggml/src/ggml-cuda/mmq.cu                     |  389 +++-
  ggml/src/ggml-cuda/mmq.cuh                    |  454 +++-
  ggml/src/ggml-cuda/mmvq-rdna-params.cuh       |  179 ++
  ggml/src/ggml-cuda/mmvq-rdna.cuh              |   78 +
@@ -78,7 +90,7 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  ggml/src/ggml-cuda/unary.cu                   |  231 ++
  ggml/src/ggml-cuda/unary.cuh                  |   12 +
  tests/test-backend-ops.cpp                    |    2 +-
- 35 files changed, 5530 insertions(+), 434 deletions(-)
+ 35 files changed, 5537 insertions(+), 436 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cuh
  create mode 100644 ggml/src/ggml-cuda/mmvq-rdna-params.cuh
@@ -1491,7 +1503,7 @@ index 29ebe24fa..c8b706f63 100644
              load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
  
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 45be9f6ea..2b19c9a94 100644
+index 45be9f6ea..89989372e 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -131,21 +131,130 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
@@ -1832,7 +1844,23 @@ index 45be9f6ea..2b19c9a94 100644
      GGML_ASSERT(        src1->type == GGML_TYPE_F32);
      GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
      GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
-@@ -193,6 +466,8 @@ void ggml_cuda_mul_mat_q(
+@@ -181,8 +454,13 @@ void ggml_cuda_mul_mat_q(
+     // Fused gate/up/GLU: src0 is the up weight, dst the GLU output.
+     const ggml_tensor * gate = fusion ? fusion->gate : nullptr;
+     if (fusion) {
+-        // TODO MoE support
+-        GGML_ASSERT(gate && !ids && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
++        // Bias/scale are the dense arm's (upstream #29948) only.  `ids` is NOT dense-only: the routed
++        // arm below (ggml_cuda_mul_mat_q_switch_type_gate, has_gate) reads both expert weight tables
++        // with the ids mapping, which is how block 08's MoE gate/up+GLU prefill fusion calls this.
++        // Upstream's assert dropped that arm at the r138 re-base and aborted on every model it fired
++        // on (issue #241); a routed call can never reach the dense interleaved kernel because the ids
++        // branch below only ever dispatches the has_gate kernel.
++        GGML_ASSERT(gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
+         GGML_ASSERT(gate->type == src0->type && ggml_are_same_shape(gate, src0) && ggml_are_same_stride(gate, src0));
+     }
+ 
+@@ -193,6 +471,8 @@ void ggml_cuda_mul_mat_q(
      const int    id    = ggml_cuda_get_device();
      const int    cc    = ggml_cuda_info().devices[id].cc;
      const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
@@ -1841,7 +1869,7 @@ index 45be9f6ea..2b19c9a94 100644
  
      const size_t ts_src0 = ggml_type_size(src0->type);
      const size_t ts_src1 = ggml_type_size(src1->type);
-@@ -203,12 +478,25 @@ void ggml_cuda_mul_mat_q(
+@@ -203,12 +483,25 @@ void ggml_cuda_mul_mat_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  
@@ -1868,7 +1896,7 @@ index 45be9f6ea..2b19c9a94 100644
          if (t && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
              const size_t size_data  = ggml_nbytes(t);
              const size_t size_alloc = ggml_backend_buffer_get_alloc_size(t->buffer, t);
-@@ -243,9 +531,11 @@ void ggml_cuda_mul_mat_q(
+@@ -243,9 +536,11 @@ void ggml_cuda_mul_mat_q(
      int nthreads_best = 0;
      {
          int64_t ncols_opt = ne11;
@@ -1880,7 +1908,7 @@ index 45be9f6ea..2b19c9a94 100644
  
              // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
              // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-@@ -253,8 +543,9 @@ void ggml_cuda_mul_mat_q(
+@@ -253,8 +548,9 @@ void ggml_cuda_mul_mat_q(
                  ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
              }
          }
@@ -1892,7 +1920,7 @@ index 45be9f6ea..2b19c9a94 100644
      }
      GGML_ASSERT(J_best > 0);
  
-@@ -283,9 +574,24 @@ void ggml_cuda_mul_mat_q(
+@@ -283,9 +579,24 @@ void ggml_cuda_mul_mat_q(
                  quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                          ne11, ne12, ne13, stream);
  
@@ -1918,7 +1946,7 @@ index 45be9f6ea..2b19c9a94 100644
              }
              CUDA_CHECK(cudaGetLastError());
          }
-@@ -366,12 +672,18 @@ void ggml_cuda_mul_mat_q(
+@@ -366,12 +677,18 @@ void ggml_cuda_mul_mat_q(
                  quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                          ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
              }
@@ -1939,7 +1967,7 @@ index 45be9f6ea..2b19c9a94 100644
          }
          CUDA_CHECK(cudaGetLastError());
      }
-@@ -395,9 +707,35 @@ void ggml_cuda_mul_mat_q(
+@@ -395,9 +712,35 @@ void ggml_cuda_mul_mat_q(
          ne03, ne13, s03, s13, s3,
          stream_k ? ne_get_rows : ne12, J_best};
  

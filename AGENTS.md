@@ -1009,6 +1009,20 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   (pp2048 +5.3 % gfx1151 / +9.4 % gfx1100).  `ggml_cuda_should_fuse_mul_mat_q` is non-static and declared in
   `ggml-cuda-try-fuse.cuh` because block 10's moved dispatcher calls it.  Record:
   `archive/work/rebase-2026-10b/DECISIONS.md`.
+- **`ggml_cuda_mul_mat_q`'s `if (fusion)` assert is the ARM's precondition, not the function's: `ids` is legal
+  on the routed arm (r161, issue #241).**  Upstream #29948's
+  `GGML_ASSERT(gate && !ids && !x_bias && !gate_bias && !x_scale && !gate_scale)` is the *dense* interleaved
+  arm's precondition, but the same entry point serves block 08's routed `has_gate` arm (`ids != nullptr`, no
+  bias/scale, dispatches `ggml_cuda_mul_mat_q_switch_type_gate`), which is exactly what the MoE gate/up+GLU
+  prefill fusion calls.  The assert arrived with the r138 re-base and made that path abort on every config
+  that reached it (r138-r160; `lfm2moe` server prefill was the live case, `GGML_ASSERT(gate && !ids ...)` at
+  `mmq.cu:468`).  Never re-add `!ids` there; never "fix" such an abort by guarding the dense matcher
+  (`ggml_cuda_should_fuse_mul_mat_q` cannot match a `MUL_MAT_ID`) or by switching the fusion off (the env kill
+  switch only hides it).  Reachability is arch- **and** model-dependent: on RDNA4 `mmb_cfg().routed = 0` lets
+  `mul_mat_q_pair` consume the gate/up pair first (`GGML_PAIR_OFF=1` is the gfx1201 repro), while gfx1151
+  reaches it from the server when MMB's fused GLU declines the shape - so a green daily arm does not prove it.
+  The A/B arm is `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` (fused == unfused: identical greedy text,
+  prefill-logit KLD -0.000000 / 100.000 % top-p).  `GREEDY-PURITY.md` §65.
 - **A combine+norm style fusion must read the tensor the model PINS, never an unpinned ancestor (r140, issue #226).**
   The repeat-anchored `hc_combine_norm` matcher starts its window at the `REPEAT`, so `scale1 -> sigmoid ->
   scale2` run standalone *before* it; a tensor read from before the window is only safe while the graph keeps

@@ -1951,3 +1951,51 @@ Purity is therefore conditional on the restore being faithful, and the evidence 
 six configurations (1 GPU and 2 slots + parking on the 4B, 27B + DFlash2 at 2 GPU `-sm layer`, 3 GPU
 `-sm tensor`, with 16- and 128-token generations, plus a slot save/restore round trip) are **byte-identical**,
 and the r154 build reproduces the switch-off text.
+
+---
+
+## 65. A fusion's precondition belongs to the arm it dispatches to: the dense-only `!ids` assert must not gate the routed fused-gate arm (r161, issue #241)
+
+`ggml_cuda_mul_mat_q` serves **two** fused gate/up/GLU arms whose preconditions are disjoint:
+
+* upstream #29948's dense interleaved arm (`has_fusion`): `ids == nullptr`, bias/scale allowed, NVIDIA-only by
+  construction (its write-back relies on the MMA accumulator layout); and
+* block 08's routed arm (`has_gate`, `ggml_cuda_mul_mat_q_switch_type_gate`): `ids != nullptr`, **no**
+  bias/scale, both expert weight tables read with the same ids mapping, RDNA.
+
+The r138 re-base took upstream's whole `if (fusion) { ... GGML_ASSERT(gate && !ids && !bias && !scale); }`
+preamble into the function that also serves the routed arm, so the MoE gate/up+GLU prefill fusion -- which
+passes `ids` and only `gate` -- aborted on **every** configuration that reached it (issue #241, r159:
+`lfm2moe` server prefill).  The rule: an assert in a shared entry point must state the **union** of the arms'
+preconditions, and each arm asserts its own where it dispatches (`ids == nullptr` -> dense,
+`ids != nullptr` -> the routed kernel).  Bias/scale stay dense-only because the routed arm sets none.
+
+**Guarding a matcher with `ids == nullptr` is not the fix**, and the reporter's branch-1 guard is provably
+inert: `ggml_cuda_should_fuse_mul_mat_q` -> `ggml_cuda_mul_mat_q_fusion_matches` requires
+`up->op == GGML_OP_MUL_MAT`, so the dense predicate can never match a `MUL_MAT_ID`.  Guarding branch 1 only
+*looks* like a fix because the env kill switch (`GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1`) is what actually
+stopped the abort; the branch that fires is the routed one.
+
+**Why it survived five releases** (r138-r160): the triple matcher only runs when the *pair* fusion stands
+down, and the stand-down is arch-dependent.  On RDNA4 `mmb_cfg().routed = 0` (MMB's routed path is a
+measured loss there), so `mul_mat_q_pair` takes the gate/up pair before the triple is ever considered; on
+gfx1151 `routed = 1`, the pair stands down *for MMB*, and MMB's fused GLU usually takes the triple -- only a
+model whose GLU shape MMB declines (the reporter's `lfm2moe`) falls through to the MMQ triple.  So every
+maintainer arm (gfx1201 dense/MoE, gfx1151 Qwen3.x) missed it, and the issue is only reachable on an arch
+whose MMB routed path is on with a model MMB's GLU does not cover.  Repro on gfx1201 is
+`GGML_PAIR_OFF=1` (which stops the pair from hiding it); on gfx1151 it is the plain server path.
+
+**Evidence** (`LFM2.5-8B-A1B-i1-Q6_K`, the reporting model, and `Qwen3.6-35B-A3B-UD-Q4_K_M`, single GPU):
+
+* gfx1151: `llama-server` + a `/v1/chat/completions` request aborts at `mmq.cu:468` on the r148 tree; the same
+  request on the r161 build answers, and its 256-token output is **byte-identical** to
+  `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` (`965 chars sha=d55bc8a8def9`).  Prefill there is **flat** against the MMB
+  individuals the arm replaces (5421/5425 vs 5397/5398 t/s, three `cache_prompt:false` requests each), so
+  restoring it is not a perf loss and MMB's stand-down predicate does not need to change.
+* fused vs `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` (both with `GGML_PAIR_OFF=1` to reach the arm on gfx1201):
+  **byte-identical** 200-token greedy text (`1264 chars sha=727257c78293`) and per-token **prefill-logit KLD
+  -0.000000 / same-top-p 100.000 %** (`llama-perplexity --kl-divergence`, 40 chunks, `-c 512`, gfx1201).
+
+A routed fused gate arm is therefore a *width* and *shape* claim like any other fused kernel: it owes the
+unfused triple its exact logits, and it owes the graph an `ids != nullptr` precondition that the dense arm's
+assert must not shadow.

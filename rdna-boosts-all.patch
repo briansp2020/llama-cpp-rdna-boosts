@@ -46198,7 +46198,7 @@ index a75dd046e..c8b706f63 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 27558ec77..5c35ab4c5 100644
+index 27558ec77..2d0208d92 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -1,5 +1,7 @@
@@ -46550,7 +46550,23 @@ index 27558ec77..5c35ab4c5 100644
      GGML_ASSERT(        src1->type == GGML_TYPE_F32);
      GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
      GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
-@@ -183,6 +476,8 @@ void ggml_cuda_mul_mat_q(
+@@ -171,8 +464,13 @@ void ggml_cuda_mul_mat_q(
+     // Fused gate/up/GLU: src0 is the up weight, dst the GLU output.
+     const ggml_tensor * gate = fusion ? fusion->gate : nullptr;
+     if (fusion) {
+-        // TODO MoE support
+-        GGML_ASSERT(gate && !ids && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
++        // Bias/scale are the dense arm's (upstream #29948) only.  `ids` is NOT dense-only: the routed
++        // arm below (ggml_cuda_mul_mat_q_switch_type_gate, has_gate) reads both expert weight tables
++        // with the ids mapping, which is how block 08's MoE gate/up+GLU prefill fusion calls this.
++        // Upstream's assert dropped that arm at the r138 re-base and aborted on every model it fired
++        // on (issue #241); a routed call can never reach the dense interleaved kernel because the ids
++        // branch below only ever dispatches the has_gate kernel.
++        GGML_ASSERT(gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
+         GGML_ASSERT(gate->type == src0->type && ggml_are_same_shape(gate, src0) && ggml_are_same_stride(gate, src0));
+     }
+ 
+@@ -183,6 +481,8 @@ void ggml_cuda_mul_mat_q(
      const int    id    = ggml_cuda_get_device();
      const int    cc    = ggml_cuda_info().devices[id].cc;
      const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
@@ -46559,7 +46575,7 @@ index 27558ec77..5c35ab4c5 100644
  
      const size_t ts_src0 = ggml_type_size(src0->type);
      const size_t ts_src1 = ggml_type_size(src1->type);
-@@ -193,12 +488,25 @@ void ggml_cuda_mul_mat_q(
+@@ -193,12 +493,25 @@ void ggml_cuda_mul_mat_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  
@@ -46586,7 +46602,7 @@ index 27558ec77..5c35ab4c5 100644
          if (t && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
              const size_t size_data  = ggml_nbytes(t);
              const size_t size_alloc = ggml_backend_buffer_get_alloc_size(t->buffer, t);
-@@ -233,9 +541,11 @@ void ggml_cuda_mul_mat_q(
+@@ -233,9 +546,11 @@ void ggml_cuda_mul_mat_q(
      int nthreads_best = 0;
      {
          int64_t ncols_opt = ne11;
@@ -46598,7 +46614,7 @@ index 27558ec77..5c35ab4c5 100644
  
              // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
              // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-@@ -243,8 +553,9 @@ void ggml_cuda_mul_mat_q(
+@@ -243,8 +558,9 @@ void ggml_cuda_mul_mat_q(
                  ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
              }
          }
@@ -46610,7 +46626,7 @@ index 27558ec77..5c35ab4c5 100644
      }
      GGML_ASSERT(J_best > 0);
  
-@@ -273,9 +584,24 @@ void ggml_cuda_mul_mat_q(
+@@ -273,9 +589,24 @@ void ggml_cuda_mul_mat_q(
                  quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                          ne11, ne12, ne13, stream);
  
@@ -46636,7 +46652,7 @@ index 27558ec77..5c35ab4c5 100644
              }
              CUDA_CHECK(cudaGetLastError());
          }
-@@ -356,12 +682,18 @@ void ggml_cuda_mul_mat_q(
+@@ -356,12 +687,18 @@ void ggml_cuda_mul_mat_q(
                  quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                          ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
              }
@@ -46657,7 +46673,7 @@ index 27558ec77..5c35ab4c5 100644
          }
          CUDA_CHECK(cudaGetLastError());
      }
-@@ -372,17 +704,48 @@ void ggml_cuda_mul_mat_q(
+@@ -372,17 +709,48 @@ void ggml_cuda_mul_mat_q(
      const int64_t s13 = ne12*s12;
  
      // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
@@ -46707,7 +46723,7 @@ index 27558ec77..5c35ab4c5 100644
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
  #ifdef GGML_CUDA_FORCE_CUBLAS
      return false;
-@@ -535,3 +898,134 @@ bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows
+@@ -535,3 +903,134 @@ bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows
      const int64_t tiles_efficiency_percent = 100 * ntiles / (nsm*tiles_nwaves);
      return tiles_efficiency_percent >= 90;
  }
