@@ -41,7 +41,7 @@ only as a rough shape.
 | 02 | `0002-…-block-02-adaptive-MTP-draft-depth` | adaptive MTP draft depth | +1186 / −54 | 24 |
 | 03 | `0003-…-block-03-chunked-gated-delta-net-prefill` | chunked GDN prefill + rollback tracker | +3182 / −15 | 22 |
 | 04 | `0004-…-block-04-BF16-KV-cache-and-native-BF16-f` | BF16 KV cache + native-BF16 FA | +630 / −214 | 8 |
-| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133; + r160: the packed kq mask is only **reserved** where a batch needing it is reachable, issue #238) | +5285 / −624 | 294 |
+| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133; + r160: the packed kq mask is only **reserved** where a batch needing it is reachable, issue #238; + r164: the derived input is reusable on hybrid models, PR #242) | +5285 / −624 | 294 |
 | 06 | `0006-…-block-06-MMB-quantized-prefill-GEMM` | MMB quantized prefill GEMM (+ r132: the per-arch dispatch keys on the running device, not the primary) | +2903 / −3 | 7 |
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
@@ -356,10 +356,24 @@ almost all of them `template-instances/*.cu`.
   (`GREEDY-PURITY.md` §20-22).
 * **The derived kq mask (V3)**: per-token bounds + one per-cell position replace the packed mask; the FA
   kernel computes visibility on the fly.  Implemented in **both** the MMA and the tile kernels, and only
-  for prefill-shaped batches (`n_tokens > 8`), so decode/verify are untouched.  The mask tensor is still
+  for batches of more than 8 tokens (`n_tokens > 8`) — **not** "prefill-shaped batches": a single-sequence
+  verify step reaches that predicate as soon as a draft is 8 tokens deep (a long n-gram draft, or MTP at
+  `--spec-draft-n-max >= 8`), which is what made the r164 reuse bug below expensive.  The mask tensor is still
   created; a graph that never consumes it leaves it **unallocated**, so every fill site is guarded on
   `tensor && tensor->buffer` (r131 closed the last three — the hybrid-K one aborted `-np 1` on
   `bailingmoe3`; see Purity below).
+* **The derived input is reusable through a hybrid memory context (r164, PR #242).** `can_reuse()` compares
+  `params.mctx` — but a hybrid model's context is a `llama_memory_hybrid_context`, never the
+  `llama_kv_cache_context` this input was built from, so the pre-r164 code rejected the reuse for *every*
+  single-sequence batch of more than 8 tokens and each such step rebuilt its whole graph.  It now looks
+  through `get_attn()` (exactly the cache `build_inp_mem_hybrid()` used) and then runs the existing checks
+  unchanged.  Measured: reuse returns to parity with the packed path on every arm (n-gram `n_max 15` 1 GPU
+  58 → 77; MTP depth 15: 0 → 97 at 3 GPU and 0 → 76 at 2 GPU), which is **+7.6 % / +5.7 %** decode for the
+  MTP cases, with greedy text and draft acceptance byte-identical.  `LLAMA_KQ_MASK_DERIVED_REUSE=0` restores
+  the rejection.  iSWA still rejects **necessarily**: `build_inp_mem_hybrid_iswa()` registers two derived
+  inputs (one bound to the base cache, one to the SWA cache), so there is no single cache to look through —
+  do not "fix" that without giving the input a record of which of the two it belongs to.  `WORKLOG.md`
+  261028.006.
 * **The packed mask is only reserved where it is reachable (r160, issue #238).**  The derived form is a
   *per-batch* decision, so `sched_reserve()` has to cover the packed mask for a batch it cannot serve
   (issue #42).  For an M-RoPE model that used to mean **every** M-RoPE context, because `n_pos_per_embd()

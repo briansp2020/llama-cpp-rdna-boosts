@@ -1,4 +1,4 @@
-From a1885b7096f6c7d2f570ab2dfcee72cb7be0943e Mon Sep 17 00:00:00 2001
+From c812d28cf2c094755fc398212cecfae267e8e3a2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/14] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -6870,10 +6870,10 @@ index 77471bc25..0079595f5 100644
  LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
  // returns the number of extracted layers from target model
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index f5f49b637..90cfacd33 100644
+index 383e795f0..d10d3492e 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1497,6 +1497,10 @@ void llm_graph_result::reset() {
+@@ -1510,6 +1510,10 @@ void llm_graph_result::reset() {
      t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
      std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
  
@@ -6884,7 +6884,7 @@ index f5f49b637..90cfacd33 100644
      t_sampled.clear();
      t_sampled_probs.clear();
      t_sampled_logits.clear();
-@@ -1527,6 +1531,57 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+@@ -1540,6 +1544,57 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
      }
  }
  
@@ -6942,7 +6942,7 @@ index f5f49b637..90cfacd33 100644
  void llm_graph_result::set_outputs(const llm_graph_params & params_l) {
      if (t_logits != nullptr) {
          ggml_set_output(t_logits);
-@@ -1545,8 +1600,22 @@ void llm_graph_result::set_outputs(const llm_graph_params & params_l) {
+@@ -1558,8 +1613,22 @@ void llm_graph_result::set_outputs(const llm_graph_params & params_l) {
          for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
              if (embeddings_layer_inp[il]) {
                  GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
@@ -6966,7 +6966,7 @@ index f5f49b637..90cfacd33 100644
          }
      }
      for (auto * tensor : t_sampled) {
-@@ -1623,6 +1692,12 @@ void llm_graph_result::set_hdmd_input(const ggml_tensor * cur, const ggml_tensor
+@@ -1636,6 +1705,12 @@ void llm_graph_result::set_hdmd_input(const ggml_tensor * cur, const ggml_tensor
  
  void llm_graph_result::set_params(const llm_graph_params & params_l) {
      this->params = params_l;

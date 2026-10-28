@@ -603,6 +603,20 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   reintroduce an `n_pos_per_embd()`-only reserve test, and do not remove the latch - it is the only thing
   that keeps an undeclared multimodal caller correct.  A/B arm: `LLAMA_KQ_MASK_PACKED_RESERVE=1` (the
   pre-r160 worst case).  `WORKLOG.md` 261028.001.
+- **A graph-reuse predicate must look through the memory-context wrappers, and a hybrid context has exactly one
+  attention cache to look through (r164, PR #242).**  `llm_graph_input_kq_derived::can_reuse()` sees
+  `params.mctx` (the wrapper), never the cache the input was built from, and the pre-r164 code rejected on that
+  alone - which silently rebuilt the graph on **every** single-sequence batch of more than 8 tokens: a long
+  n-gram draft's verification, or an MTP verify step at `--spec-draft-n-max >= 8` (measured: **0** graphs
+  reused over 300 decode tokens at a fixed depth 15, i.e. r163 was 7.6 % slower at 3 GPU `-sm tensor` and 5.4 %
+  at 2 GPU than its own `LLAMA_KQ_MASK_DERIVED=0`).  It now looks through
+  `llama_memory_hybrid_context::get_attn()` - the cache `build_inp_mem_hybrid()` built the input from - and then
+  re-runs the shape / `kq_mask_derivable()` checks unchanged; `LLAMA_KQ_MASK_DERIVED_REUSE=0` restores the
+  rejection.  iSWA **must** keep rejecting: `build_inp_mem_hybrid_iswa()` registers two derived inputs (base
+  and SWA), so a look-through would validate one against the other's cache - that needs the input to record
+  which cache it belongs to first.  A new wrapper or a new `allow_derived = true` builder owes the same
+  reasoning, and a change here is judged by the graph-reuse count (`llama-cli -v` prints `graphs reused`)
+  against the packed arm, not by text alone.
 - **A Q8_1 quantize-cache key walk stops at the first pointer change, and every fill validates its read
   range (r132, PR #218).**  The cache is keyed on the **root** tensor but the arena is filled from the
   caller's (possibly offset) **view** pointer, so an offset view that walked to the root stored its rows

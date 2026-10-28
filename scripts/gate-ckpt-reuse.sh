@@ -301,9 +301,12 @@ PY
 rc=$?
 [ "$rc" -ne 0 ] && fails=$((fails + 1))
 
-# the only valid GPU-fault check: the kernel journal plus the arm logs, with the echoed prompts stripped
+# the only valid GPU-fault check: the kernel journal plus the arm logs, with the echoed prompts stripped.
+# --since is required, as in gate-state-pipe.sh / gate-spec-align.sh: without it check-gpu-faults.sh reads the
+# whole boot's journal, so any fault from an EARLIER session fails a clean run (a stale page fault from the
+# previous evening failed the r164 release run while the gate's own arm logs were clean)
 if [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
-    fault_out="$("$REPO_DIR/scripts/check-gpu-faults.sh" --log "$KEEPOUT/keep/log.txt" 2>&1)"
+    fault_out="$("$REPO_DIR/scripts/check-gpu-faults.sh" --since "30 min ago" --log "$KEEPOUT/keep/log.txt" 2>&1)"
     fault_rc=$?
     if [ "$fault_rc" -eq 0 ]; then
         echo "PASS  no GPU fault in the kernel journal or the keep arm's log"

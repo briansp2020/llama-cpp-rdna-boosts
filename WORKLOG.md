@@ -1,5 +1,64 @@
 # WORKLOG - dated delivery records
 
+## 261028.006 (r164) -- PR #242: the derived kq mask input is reusable on hybrid models, so a >8-token verify step stops rebuilding its graph
+
+**Release `v15-6050b467c-r164`**, base `6050b467c`, 15 blocks, tip `6a8b807b39712c37292df9ca994c67cb6cc44e08`,
+tree `59f6b98ebd5f7585eb33ca38a09c81e3abb8c0a7`.  One change (block 05) plus the release docs and one gate fix.
+
+**The report.**  PR #242 (@overdoingism): `llm_graph_input_kq_derived::can_reuse()` rejects the reuse whenever
+`params.mctx` is not a `llama_kv_cache_context`.  A hybrid model's memory context is a
+`llama_memory_hybrid_context`, so the derived input - which was built from `get_attn()`, itself a plain kv
+cache context - declined **every** single-sequence batch of more than 8 tokens, and each such step rebuilt its
+graph: the verification of a long n-gram draft (9-16 rows), or an MTP verify step at
+`--spec-draft-n-max >= 8`.
+
+**Our assessment reproduced the mechanism and found the case the PR does not measure, which is the bigger
+one.**  With `LLAMA_KV_N_PAD_MIN` holding `n_kv` on the 256-cell stride the derived form's own gate requires
+(`n_kv % 256 == 0`), those batches really did take the derived form, so an MTP verify at a fixed depth 15
+reused **0** graphs over 300 decode tokens: r163 was slower than its own `LLAMA_KQ_MASK_DERIVED=0` by
+**-7.1 %** at 3 GPU `-sm tensor` (6820.18 -> 6337.97 ms / 300) and **-5.4 %** at 2 GPU (0,2) (5328.70 ->
+5041.15 ms / 300).  The 2.7-4 % the PR reports for n-gram drafting on a 3900X is a real but
+CPU-dependent slice: our 9950X3D pays ~1.0 ms per rebuild against its ~2.7 ms, so the same n-gram arm (n_max
+15, `prompts/recall.txt`, 1 GPU) moves 127.04 -> 127.82 t/s (+0.6 %, and the r163 default was 0.7 % *below* its
+own packed arm), and `draft-mtp-adaptive,ngram-mod` at its defaults moves 1331.68 -> 1308.44 ms / 400
+(+1.7 %).  3 GPU prefill keeps a 26 286-token prompt at 14.28 s either way (reuse 15 -> 22, no time win).
+
+**Fix (block 05).**  `can_reuse()` looks through a `llama_memory_hybrid_context` to `get_attn()` - exactly the
+cache `build_inp_mem_hybrid()` built the input from - and then runs the existing checks unchanged (`n_kv`,
+stream count, token count, `params.cparams.kq_mask_derived && kq_mask_derivable(ubatch)`).  iSWA still
+rejects, and **must**: `build_inp_mem_hybrid_iswa()` creates *two* derived inputs, one bound to the base cache
+and one to the SWA cache, so there is no single cache to look through and a naive look-through would validate
+one against the other's state.  No maintained model here is hybrid+SWA (`qwen35` reports `n_swa = 0`), which
+is why the gap is a doc note and not code.  `LLAMA_KQ_MASK_DERIVED_REUSE=0` restores the rejection (the A/B
+arm); `LLAMA_KQ_MASK_DERIVED=0` remains the packed reference.
+
+**Validation.**
+
+| check | result |
+|---|---|
+| graphs reused, derived vs packed | parity on every arm: n-gram n_max 15 1 GPU **58 -> 77** (= the packed arm's 77), 3 GPU MTP depth 15 **0 -> 97** (= 97), 2 GPU MTP depth 15 **0 -> 76** (= 76), `mtp-adaptive,ngram-mod` defaults 16 -> 19 (= 19) |
+| greedy text, 4 arms (r163 / r164 x derived / packed), `ROCBLAS_USE_HIPBLASLT=0` | byte-identical, `1866 chars sha=b1f1903bc51c`; the release coherence arm (4B, "The capital of France is") identical too (`111 chars sha=7e6229b260f6`) |
+| draft acceptance, 300-3000-token arms | identical to 5 decimals in every arm (MTP depth 15: 0.12846 / 0.18970; adaptive,ngram: 0.97917; Flash-Next adaptive n_max 8: 0.46286) |
+| Flash-Next (qwen4exp, `llama_memory_hybrid_idx_context` derives from the hybrid context) 2 GPU `-sm tensor -ncmoe 48` | text identical (`1033 chars sha=603ac1984270`) and reuse unchanged (35) - that model's reuse is limited by another input in both builds, so the patch is inert there rather than harmful |
+| MTP Protocol A, 3 GPU, `prompts/prose-rdna-boosts.txt`, `-n 3000`, bf16 KV | tensor **90.2 t/s** (reference 90.7) vs plain **48.3** (48.4), acceptance **0.604** (0.60); layer **51.8** (51.7) vs plain **25.0**, acceptance **0.621** (0.62) - every figure within noise of the recorded reference |
+| prefill-logit gate | **PASS**, mean KLD 0.000000 / same-top-p 100.000 % (no kernel touched) |
+| per-block build | `--changed-from` r163 tip: block 05 + tip only, 2/2 build in 31 s (`--fast`) |
+| `gate-park-idle-slots.sh` | PASS |
+| `gate-ckpt-reuse.sh` | PASS (after the fix below) |
+| `validate-set.sh` | green (15 patches, fresh-tarball strict apply, tree `59f6b98e`) |
+
+**Gate fix.**  `scripts/gate-ckpt-reuse.sh` was the only gate calling `check-gpu-faults.sh` **without
+`--since`**, so it read the whole boot's kernel journal and a stale `[gfxhub] page fault` from the previous
+evening (Oct 27 18:14, an unrelated session) failed an otherwise clean run - every functional check had
+passed, the keep arm's own log was clean, and the session window was clean.  It now passes
+`--since "30 min ago"`, matching `gate-state-pipe.sh` and `gate-spec-align.sh`.  Nothing in the delivery
+itself was at fault.
+
+**Doc correction that matters.**  `patches/README.md` block 05 said the derived form is "only for
+prefill-shaped batches (`n_tokens > 8`), so decode/verify are untouched".  That word "prefill-shaped" is what
+hid this class of regression: the predicate is `n_tokens > 8`, which a verify step reaches as soon as a draft
+is 8 tokens deep.  The bullet now says so, and carries the r164 fold.
+
 ## 261028.005 (r163) -- issue #240: the DFlash layer inputs are written into F1's store from inside the target graph
 
 **Release `v15-6050b467c-r163`**, base `6050b467c`, 15 blocks, tip `d99fc588fa075a08f299665d29281ca2bc5057f4`,

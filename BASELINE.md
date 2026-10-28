@@ -44,7 +44,7 @@ wrapper, allocator/graph-layout fixes).
 | 02 | adaptive MTP draft depth | `--spec-type draft-mtp-adaptive` and its controller |
 | 03 | chunked gated-delta-net prefill | bf16/WMMA chunked GDN (two arch-segregated kernels) + the recurrent rollback tracker; **the only chunked GDN kernel the delivery dispatches** — upstream's RDNA3.5 MMA kernel stays reachable only where this path stands down (`kda`, `S_v` outside {16,32,64,128}, or `GGML_CUDA_GDN_CHUNKED=0` for A/B) |
 | 04 | BF16 KV cache + native-BF16 flash attention | the bf16 cache type and its native FA arm |
-| 05 | flash-attention band / native quantized K-V / derived kq mask | the RDNA FA band kernels, native KV staging, the derived mask |
+| 05 | flash-attention band / native quantized K-V / derived kq mask | the RDNA FA band kernels, native KV staging, the derived mask (and its reuse through a hybrid memory context, r164) |
 | 06 | MMB quantized prefill GEMM | bf16-WMMA dequant-weight GEMM and its tuning |
 | 07 | k-quant boosts | `mmvq` VDR, Q6_K MMQ, Q1_0, grid pad — **the decode-numerics block** |
 | 08 | fused kernels | conv1d/RMS/top-k MoE/verify fusions, fused MoE gate+up+GLU, per-shape `mmvq` `nwarps` |

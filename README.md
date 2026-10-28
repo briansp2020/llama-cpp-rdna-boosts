@@ -15,7 +15,7 @@ It ships as **15 patches** (block 00 + blocks 01-14) for a clean llama.cpp check
 assumes its predecessors), so the set is applied whole.  **Block 14 is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
 [block 14](patches/README.md#block-14--sm-relaxed-tensor-for-the-moe-amax-arches-temporary-expect-removal)
-and treat it as a stop-gap, not a feature.  The current release is **`v15-6050b467c-r161`**: the release
+and treat it as a stop-gap, not a feature.  The current release is **`v15-6050b467c-r164`**: the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
 [`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,
@@ -42,7 +42,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 15 blocks + b
 ## Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v15-6050b467c-r161`**; the
+(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v15-6050b467c-r164`**; the
 `v16-*` tags are the historical 16-block set.  `r1` is the
 re-base of the set onto that fork point and every later `rN` is a dated change recorded in
 [`WORKLOG.md`](WORKLOG.md), newest first).
@@ -161,7 +161,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 | `0002` | **adaptive MTP draft depth** (`--spec-type draft-mtp-adaptive`) | old-01; + opt-in MTP prompt-tail ingest and the last-row prompt copy (r52); + the embeddings-layer-input preset API the draft setup calls (r94 block-boundary repair); + the draft context's KV cache type follows the main `-ctk` / `-ctv` unless `-ctkd` / `-ctvd` pins it (r125, issue #216) |
 | `0003` | **chunked gated-delta-net prefill** (bf16/WMMA GDN) | old-02; + the per-sequence rollback tracker folds in every ubatch and `LLAMA_RS_ROLLBACK_DEBUG` (r91) |
 | `0004` | **BF16 KV cache + native-BF16 flash attention** | old-03 |
-| `0005` | **flash-attention band / native quantized K-V / derived kq mask** | old-04 FA + the old-15 FA work; + the 2-byte arm joins the 32-column band block and the head-512 MMA row is retuned (r92); + the q8_0 fetch-ahead band variant, default on (`GGML_HIP_FA_BAND_FETCH_AHEAD=0`), r98 PR #195; + one tile K/V type selection for the instantiation and the F16 scratch, and an RDNA2-gated checked tail, r99 PR #198 |
+| `0005` | **flash-attention band / native quantized K-V / derived kq mask** | old-04 FA + the old-15 FA work; + the 2-byte arm joins the 32-column band block and the head-512 MMA row is retuned (r92); + the q8_0 fetch-ahead band variant, default on (`GGML_HIP_FA_BAND_FETCH_AHEAD=0`), r98 PR #195; + one tile K/V type selection for the instantiation and the F16 scratch, and an RDNA2-gated checked tail, r99 PR #198; + the derived mask's input is reusable through a hybrid memory context, so a >8-token verify step stops rebuilding its graph (r164, PR #242) |
 | `0006` | **MMB quantized prefill GEMM** | old-08 MMB |
 | `0007` | **k-quant boosts** (mmvq VDR, Q6_K MMQ, Q1_0, grid pad) | old-10 + old-04 MMQ + old-15 Q1_0/grid/PR57; + the RDNA3_0 per-shape mmvq `nwarps` (r93) |
 | `0008` | **fused kernels** (conv1d/RMS/top-k MoE/verify fusions + fused MoE gate+up+GLU) | old-08 fusions + old-13 fused MoE + old-15 PR63/114; + `topk_moe` sorted-key argmax (r52); + the RDNA3_0 per-shape mmvq `nwarps` (r93) |
