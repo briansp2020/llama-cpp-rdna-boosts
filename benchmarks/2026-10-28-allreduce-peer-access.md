@@ -117,7 +117,7 @@ Linux/HIP default = `ggml_backend_cuda_comm_init_auto`:
   (1972/3075).  Quote these as a same-build A/B; the `patches/README.md` Protocol A reference figures were
   recorded on a different arm and are not comparable (the old build's plain arm is the one `#109` is about).
 * `gate-per-block-build.sh --changed-from <r164 tip>`: **4/4** changed blocks build `all`.
-* `validate-set.sh`: green (tree `c321baad4d8de2382f0a073b638c2d60e4b1cf97`).
+* `validate-set.sh`: green (tree `6d7926b87ab6eff83da91a7c4d5e4b27c681aeef`).
 
 ## Reproduce
 

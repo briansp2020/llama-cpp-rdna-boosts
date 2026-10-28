@@ -2,8 +2,8 @@
 
 ## 261028.007 (r165) -- TODO #109: `hipDeviceEnablePeerAccess` is what costs a replayed decode, so the all-reduce arms were re-cut (dense -> copy engine, host experts -> RCCL's ring, peer access never enabled)
 
-**Release `v15-6050b467c-r165`**, base `6050b467c`, 15 blocks, tip `473485380b19cb6eb52eb1b30345a2dbe5161aaf`,
-tree `c321baad4d8de2382f0a073b638c2d60e4b1cf97`.  Blocks 01 and 10 amended; docs, one gate extension and the
+**Release `v15-6050b467c-r165`**, base `6050b467c`, 15 blocks, tip `809a27419f0ed7201d693352f4deef3ce4ceb6b3`,
+tree `6d7926b87ab6eff83da91a7c4d5e4b27c681aeef`.  Blocks 01 and 10 amended; docs, one gate extension and the
 retirement of `TODO #109`.
 
 **What #109 actually was.**  The item asked what RCCL's init leaves behind that costs a *replayed* graph 5-7 %
@@ -57,7 +57,7 @@ text holds on 27B 3 GPU `-sm tensor` and 35B-A3B 2 GPU `-ncmoe 40`, and same-arm
 construction).  `gate-per-block-build.sh --changed-from 6a8b807b3` **4/4** (the first attempt failed: block
 01 cannot call `ggml_cuda_slab_enabled()`, which block 10 introduces — the routing therefore reads a plain
 flag that block 10 sets, which is also why the arm choice is described as block 01 + block 10).
-`validate-set.sh` strict 15/15, tree `c321baad4`.
+`validate-set.sh` strict 15/15, tree `6d7926b8`.
 
 **Files.**  `ggml-cuda.cu` (block 01: the `auto` chain, the `ce` chain, the copy-engine peer opt-in),
 `ggml-cuda-slab.cu` (block 10: set `g_comm_host_experts`), `ENVIRONMENT.md` (`GGML_CUDA_ALLREDUCE` default,
