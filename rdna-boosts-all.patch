@@ -25993,10 +25993,10 @@ index 000000000..f67f584ee
 +size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t max_table);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 new file mode 100644
-index 000000000..f75f0a171
+index 000000000..62c61f5d3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-@@ -0,0 +1,1863 @@
+@@ -0,0 +1,1948 @@
 +// Movable-boundary slab (OPEN 2 / r42): the per-device VMM reserve + work/arena boundary move.
 +// Split out of ggml-cuda.cu (an upstream hub); the API is declared in ggml-cuda-vmm.h.
 +
@@ -26185,6 +26185,28 @@ index 000000000..f75f0a171
 +    // `wide_aux_size` is the extent of the HIGHEST live block: holes below it are bounded and cost nothing,
 +    // and a group of frees in any order still returns the region to the live high-water.
 +    std::map<size_t, size_t> wide_live;
++    // TODO #70: the wide-aux GROWTH decision is made once per wide pass.  A refused grow used to be retried
++    // on every allocation that needed the region -- a prefill asks ~61 times per ubatch (one per FA op), so a
++    // starved region produced thousands of `SLAB_WIDE_AUX` attempts, each of which could evict a band of
++    // arena tables (or evict one and then refuse on a racing boundary move) while a graph that still held
++    // the previous placement was queued.
++    //
++    // The two refusal classes are NOT the same decision:
++    //   * a VA-LIMIT refusal (`target > aux_limit`: the pinned narrow-2 region, or the top of the mapping)
++    //     is structural -- `aux_limit` cannot grow within the pass and any later grow only raises the
++    //     extent -- so it is latched for the rest of the pass;
++    //   * a SNAPSHOT-RACE refusal (the boundary moved while `g_slab_mutex` was dropped for the eviction)
++    //     is recoverable -- the racing thread is the MTP draft context's reserve and it has usually
++    //     finished by the next request -- so it is retried, but only `GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX`
++    //     times per pass, because each attempt costs an arena-band eviction and the old code's unbounded
++    //     retry is what faulted the graph that still held the previous placement.
++    // `wide_aux_denied_want` is the smallest request refused in this pass (0 = nothing latched yet); a
++    // request at least that large is refused without touching the layout, a smaller one may still fit (a
++    // grow only ever raises the extent).  It -- and the race counter -- are cleared by `ring_set` on a pass
++    // transition, whenever the boundary shrinks (which hands VA back to the region), and on slab (re-)init.
++    size_t                   wide_aux_denied_want = 0;
++    size_t                   wide_aux_denied_n    = 0;   // refusals recorded in this pass (diagnostic)
++    size_t                   wide_aux_race_n      = 0;   // snapshot-race refusals in this pass (bounded)
 +    // wip/slab-transient-absorption (step 2b-2) DIAGNOSTIC: why the wide-aux region grows.
 +    size_t                   wide_n_pop    = 0;   // frees that shrank the region
 +    size_t                   wide_n_hole   = 0;   // frees of a block that was not live (stale/hole)
@@ -26250,6 +26272,13 @@ index 000000000..f75f0a171
 +    }
 +    return on != 0;
 +}
++
++// TODO #70: how many times ONE wide pass may retry a wide-aux grow whose layout snapshot was invalidated by
++// another thread (the MTP draft context's reserve) before the pass gives up and lets the callers fall back to
++// their capped raw allocations.  A retry costs an arena-band eviction, so the bound is small; 4 covers the one
++// racing reserve a session actually performs with room to spare, and a bounded retry is deliberately kept (a
++// blanket latch would write the pass off after one benign race).  No knob: not a tuning axis.
++#define GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX 4
 +
 +// wip/slab-ring-region: the H2D staging-ring hole the slab must carve (0 = the ring stays a cudaMalloc
 +// outside the slab).  Set once by the model preflight, before the slab is created, from the largest
@@ -26901,6 +26930,9 @@ index 000000000..f75f0a171
 +    s.wide_aux_off  = 0;
 +    s.wide_aux_size = 0;
 +    s.wide_aux_gen  = 0;
++    s.wide_aux_denied_want = 0;   // TODO #70: this pass's wide-aux growth has not been refused
++    s.wide_aux_denied_n    = 0;
++    s.wide_aux_race_n      = 0;
 +    s.ring_slots   = ggml_backend_cuda_context::h2d_stage_slots();
 +    s.arena_free.clear();
 +    s.arena_free[w] = s.mapped - w;
@@ -27321,6 +27353,9 @@ index 000000000..f75f0a171
 +            if (target < s.boundary) {
 +                const size_t old = s.boundary;
 +                s.boundary = target;
++                s.wide_aux_denied_want = 0;   // TODO #70: the VA above the boundary grew; allow one new grow
++                s.wide_aux_denied_n    = 0;
++                s.wide_aux_race_n      = 0;
 +                // ISSUE #187: a captured CUDA/HIP graph bakes the addresses of the work region's tensors
 +                // into the executable graph.  The bytes above `target` have just gone back to the arena,
 +                // so any graph captured against the old boundary must be recaptured before its next
@@ -27529,7 +27564,7 @@ index 000000000..f75f0a171
 +                  "work=%.1f MiB (narrow=%.1f ring=%.1f wide_aux=%.1f narrow2=%.1f) arena=%.1f MiB "
 +                  "pool=%.1f MiB pool_wide=%.1f MiB/%zu refused=%.1f MiB outside_max=%.1f MiB "
 +                  "outside_failed=%.1f MiB headroom_cfg=%.1f MiB aux_cfg=%.1f MiB "
-+                  "wide[n_pop=%zu hole=%zu inval=%zu rebase=%zu]\n",
++                  "wide[n_pop=%zu hole=%zu inval=%zu rebase=%zu aux_refused=%zu]\n",
 +                  tag, device, (int) inited,
 +                  (double) free_b / 1048576.0, (double) ggml_cuda_free_min_bytes(device) / 1048576.0,
 +                  (double) total_b / 1048576.0, (double) mapped / 1048576.0,
@@ -27544,7 +27579,7 @@ index 000000000..f75f0a171
 +                  (double) ggml_cuda_outside_fail_max_bytes(device) / 1048576.0,
 +                  (double) ggml_cuda_slab_headroom_bytes() / 1048576.0,
 +                  (double) g_slab_aux_reserve_bytes / 1048576.0,
-+                  s.wide_n_pop, s.wide_n_hole, s.wide_n_inval, s.wide_n_rebase);
++                  s.wide_n_pop, s.wide_n_hole, s.wide_n_inval, s.wide_n_rebase, s.wide_aux_denied_n);
 +}
 +
 +void ggml_cuda_slab_log_stats(int device, const char * tag) {
@@ -27582,6 +27617,10 @@ index 000000000..f75f0a171
 +// Growing the region is an ordinary work-boundary move: the arena tables in the taken band are evicted
 +// (the same cold band a wide prefill already reclaims).  A refusal (no slab, ring disarmed, or the region
 +// would reach the pinned narrow-2 view) is fail-soft: the caller falls back to its capped raw allocation.
++//
++// TODO #70: the growth decision is made ONCE per wide pass (see `wide_aux_denied_want`).  A refusal is
++// logged once per pass and the rest of the pass is served by the caller's fallback, so a starved region
++// cannot turn into thousands of boundary moves under a graph that still holds the previous placement.
 +void * ggml_cuda_slab_wide_aux_alloc(int device, size_t size, size_t * gen_out) {
 +    if (gen_out != nullptr) {
 +        *gen_out = 0;
@@ -27595,14 +27634,32 @@ index 000000000..f75f0a171
 +    {
 +        std::lock_guard<std::mutex> lock(g_slab_mutex);
 +        ggml_cuda_slab & s = g_slabs[device];
++        const size_t want = ggml_cuda_slab_up(size, s.unit);
++        // One refusal log per wide pass, whatever the reason.  The no-slab / ring-disarmed case is NOT
++        // latched: the ring can be armed later in the same pass (the first prefill ubatch of a session can
++        // arrive before the narrow floor is pinned).
++        const auto refuse_once = [&s, device, size](const char * why, size_t extra) {
++            if (s.wide_aux_denied_n++ == 0) {
++                GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused for this wide pass (%s%s%.0f MiB): "
++                              "the callers fall back to their raw allocations until the pass ends\n",
++                              device, (double) size/1048576.0, why, extra > 0 ? ", " : "",
++                              extra > 0 ? (double) extra/1048576.0 : 0.0);
++            }
++        };
 +        if (!s.inited || !s.ring_armed) {
 +            if (getenv("GGML_CUDA_SLAB_STATS") != nullptr) {
-+                GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused: slab=%d ring_armed=%d\n",
-+                              device, (double) size/1048576.0, (int) s.inited, (int) s.ring_armed);
++                if (s.wide_aux_denied_n == 0) {
++                    GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused: slab=%d ring_armed=%d\n",
++                                  device, (double) size/1048576.0, (int) s.inited, (int) s.ring_armed);
++                }
++                s.wide_aux_denied_n++;
 +            }
 +            return nullptr;   // narrow-only stretch: the region belongs to the arena
 +        }
-+        const size_t want = ggml_cuda_slab_up(size, s.unit);
++        if (s.wide_aux_denied_want != 0 && want >= s.wide_aux_denied_want) {
++            s.wide_aux_denied_n++;
++            return nullptr;   // this pass's growth was already refused: do not touch the layout again
++        }
 +        if (s.wide_aux_size == 0 && s.wide_aux_off == 0) {
 +            s.wide_aux_off = s.boundary;   // just above the wide compute view
 +            s.wide_n_rebase++;
@@ -27626,6 +27683,8 @@ index 000000000..f75f0a171
 +                s.wide_aux_off = 0;
 +                s.wide_live.clear();
 +            }
++            s.wide_aux_denied_want = want;
++            refuse_once("VA limit", target > aux_limit ? target - aux_limit : 0);
 +            return nullptr;
 +        }
 +        off  = aux_end;
@@ -27657,6 +27716,25 @@ index 000000000..f75f0a171
 +        // move then rounds the boundary up to `chunk`, so the retained base normally sits a whole chunk
 +        // below the boundary -- every later growth would be refused and fall back outside the slab.)
 +        if (!s.inited || !s.ring_armed || s.boundary != lo || s.wide_aux_off + s.wide_aux_size != off) {
++            // TODO #70: the growth was ALREADY paid for (a band of arena tables was evicted) and the layout
++            // it was sized against moved while the lock was dropped, so this snapshot is unusable.  This is
++            // the RECOVERABLE class: the racing thread is the MTP draft context's reserve and retrying from
++            // the new state normally succeeds.  Retry, but at most `GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX` times
++            // per pass -- each attempt evicts another band, which is what made the pre-r168 code fault a
++            // queued graph that still held the previous placement -- and then latch the pass.
++            const size_t want_denied = ggml_cuda_slab_up(size, s.unit);
++            s.wide_aux_race_n++;
++            if (s.wide_aux_race_n < GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX) {
++                return nullptr;   // next allocation re-reads the layout and tries again
++            }
++            s.wide_aux_denied_want = s.wide_aux_denied_want != 0
++                ? std::min(s.wide_aux_denied_want, want_denied)
++                : want_denied;
++            if (s.wide_aux_denied_n++ == 0) {
++                GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused for this wide pass (%zu layout moves "
++                              "during the grow); the callers fall back to their raw allocations until the "
++                              "pass ends\n", device, (double) size/1048576.0, s.wide_aux_race_n);
++            }
 +            return nullptr;
 +        }
 +        if (hi > s.boundary) {
@@ -27778,6 +27856,13 @@ index 000000000..f75f0a171
 +        // is logged BEFORE the auxiliary region is cleared so the wide_aux figure is the prefill's.
 +        // `ggml_cuda_slab_log_stats_locked` gates itself on GGML_CUDA_SLAB_STATS.
 +        ggml_cuda_slab_log_stats_locked(device, arm ? "wide-arm" : "wide-drop");
++    }
++    if (transition) {
++        // TODO #70: one wide pass has ended -- the next one gets its own wide-aux growth decision, so a
++        // region that was starved under this pass's layout is retried rather than written off for the run.
++        s.wide_aux_denied_want = 0;
++        s.wide_aux_denied_n    = 0;
++        s.wide_aux_race_n      = 0;
 +    }
 +    if (!arm) {
 +        // The live set must not outlive the region it describes.
@@ -52462,10 +52547,10 @@ index 5605bf7a4..10b689844 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..8005280e5
+index 000000000..38881d54a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,6661 @@
+@@ -0,0 +1,6800 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -56576,14 +56661,23 @@ index 000000000..8005280e5
 +}
 +
 +static void stand_down_table_locked(table_t & t, int idx) {
-+    const int    old_device = t.device;
-+    const int    old_slots  = t.slots;
-+    void * const old_arena  = t.arena;
-+    void * const old_remap  = t.remap_dev;
++    const int    old_device   = t.device;
++    const int    old_slots    = t.slots;
++    const size_t old_reserved = t.arena_reserved;
++    void * const old_arena    = t.arena;
++    void * const old_remap    = t.remap_dev;
 +
-+    // OPEN 2: a VMM arena keeps its reserved VA across a stand-down (only physical is unmapped), so a
-+    // re-arm maps at the same address; a cudaMalloc arena is freed and its pointer cleared.
-+    t.arena        = t.arena_reserved != 0 ? t.arena : nullptr;
++    // TODO #70: the arena's backing is RETURNED, so the table must not keep the pointer.  A slab-backed
++    // table used to keep `t.arena` here (on the theory that a VMM arena keeps its reserved VA across a
++    // stand-down), but `ggml_cuda_slab_arena_free` puts the range back on the slab's free list -- the work
++    // pool or another table can take it -- while `alloc_table_locked` reads a non-null `t.arena` as
++    // "already allocated" and reuses it at the requested slot count.  A re-arm of a table that an
++    // allocation-OOM stand-down had dropped therefore claimed slots in a range it no longer owned
++    // (measured as `[validate device-malloc-yield] ... layer=46 slots=0..512` right before an eviction +
++    // re-arm).  Clear it exactly as `free_table_buffers_locked` and `moe_cache_evict_slab_range` do, so a
++    // re-arm re-allocates from the free list.
++    t.arena          = nullptr;
++    t.arena_reserved = 0;
 +    t.remap_dev    = nullptr;
 +    t.remap_cap    = 0;
 +    free_heat_dev_locked(t);   // keep the tally across a stand-down (folds the mirror into `heat`)
@@ -56607,7 +56701,7 @@ index 000000000..8005280e5
 +            // The slab OWNS the arena's VA, so this only returns the range to the slab's free list (the
 +            // work pool can then take it, or the arena can hand it to another table); the plain path's
 +            // arena is a cudaMalloc the table owns outright.
-+            free_arena_backing(old_device, old_arena, t.arena_reserved, old_slots, t);
++            free_arena_backing(old_device, old_arena, old_reserved, old_slots, t);
 +        }
 +        if (old_remap != nullptr) {
 +            (void) cudaFree(old_remap);
@@ -56939,6 +57033,81 @@ index 000000000..8005280e5
 +// Returns true when at least one table was re-armed.  The caller must run it at a point where no graph
 +// is in flight and the compute buffer has already been dropped (the drop site re-reserves the narrow
 +// layout first), so the CPU-side take-over decisions of the next graph all see the same residency.
++//
++// TODO #70: a re-arm is LAYER-UNIFORM OR THE LAYER IS STOOD DOWN, never partial.  The arena a re-arm sizes
++// against can be smaller than the one the sizing pass saw (that is the whole reason a table was evicted),
++// so a layer's tables can each land on a different slot count; the gate+up fused kernel indexes the gate
++// lane with the *up* table's remap, so a mixed-slot layer reads the wrong expert for one role.  The sizing
++// path answers that with a safety net that disables the cache outright -- which a re-arm must NOT do (the
++// graphs are already built against the tables, and a late `g_enabled = false` desynchronises the MTP draft
++// from the target).  So: converge every table of the layer on one count (retrying at the largest count any
++// of them reached), and if that cannot be made uniform stand the WHOLE layer down (every table at 0
++// slots).  A stood-down table makes `moe_cache_has_arena_locked()` false, so the cache-aware fusions stand
++// down for every table and each per-table consumer declines -- the fuse-guard invariant.
++
++// TODO #70: bring ONE layer's tables to a uniform slot count, or stand the whole layer down.  Returns the
++// count the layer ended at (0 = stood down), or -1 when nothing was attempted.
++static int moe_cache_rearm_layer_locked(int layer, std::vector<int> & ids, int want) {
++    // largest expert slice first: a big table needs one contiguous block, and it gets the best chance
++    // while the layer's own memory is still free
++    std::stable_sort(ids.begin(), ids.end(), [](int a, int b) {
++        return g_tables[a].expert_bytes > g_tables[b].expert_bytes;
++    });
++    // Undo every table's current allocation so the next attempt starts from a clean arena.  A table that is
++    // already at 0 slots owns no backing (a stand-down hands the range back and clears the pointer), so it is
++    // left alone and `alloc_table_locked` re-allocates it from the slab's free list on this attempt.
++    const auto reset_layer = [&ids]() {
++        for (int i : ids) {
++            if (g_tables[i].slots > 0) {
++                free_table_buffers_locked(g_tables[i]);
++            }
++        }
++    };
++    int target = want;
++    int got    = -1;
++    for (int attempt = 0; attempt < 8; ++attempt) {
++        reset_layer();
++        for (int i : ids) {
++            alloc_table_locked(g_tables[i], target);
++        }
++        int mn = target;
++        int mx = 0;
++        for (int i : ids) {
++            mn = std::min(mn, g_tables[i].slots);
++            mx = std::max(mx, g_tables[i].slots);
++        }
++        if (mn == mx) {
++            got = mn;   // uniform (possibly 0): the layer converged
++            break;
++        }
++        if (mx < target) {
++            target = mx;            // every table came up short: retry at the best count any of them reached
++        } else if (mn > 0) {
++            target = mn;            // mixed with a non-zero floor: retry at the count all of them reached
++        } else if (target > 1) {
++            target = target / 2;    // a table could not hold even one slot: back off and retry
++        } else {
++            break;                  // nothing can hold a slot: stand the layer down
++        }
++    }
++    if (got < 0) {
++        // Attempts exhausted with the layer still mixed.  Never run it: stand every table of the layer down.
++        reset_layer();
++        for (int i : ids) {
++            alloc_table_locked(g_tables[i], 0);
++        }
++        GGML_LOG_ERROR("%s: layer %d could not be re-armed slot-uniformly (wanted %d slots); standing the "
++                       "whole layer down (%zu tables at 0 slots) rather than running a mixed-slot layer\n",
++                       __func__, layer, want, ids.size());
++        return 0;
++    }
++    if (got > 0 && got < want) {
++        GGML_LOG_WARN("%s: layer %d re-armed uniformly at %d slots (the sizing pass had %d): the arena is "
++                      "smaller than it was then\n", __func__, layer, got, want);
++    }
++    return got;
++}
++
 +bool moe_cache_rearm() {
 +    g_write_seq++;
 +    if (!g_enabled) {
@@ -56950,9 +57119,16 @@ index 000000000..8005280e5
 +    }
 +
 +    // Which layers have stood-down tables?  A layer is re-armed as a unit: gate/up/down must stay
-+    // slot-uniform, or the shared remap points a role at the wrong expert.  A stood-down table is one
-+    // that was ALLOCATED but currently has no slots -- under VMM it still holds its reserved VA (only the
-+    // physical was unmapped), under cudaMalloc its pointer is null.
++    // slot-uniform, or the shared remap points a role at the wrong expert.  A stood-down table is one that
++    // was ALLOCATED but currently has no slots (0 is a legal state: the table holds no backing and every
++    // consumer declines it).
++    //
++    // TODO #70: a layer that landed at a SMALLER uniform count is deliberately NOT revisited here.  Nothing
++    // lowers `g_rearm_slots[layer]`, so the target is re-read from the sizing count at every drop (there is
++    // no arithmetic ratchet), and this re-arm runs at the prefill -> decode drop, i.e. with the arena at its
++    // per-request maximum: a shortfall means the arena really is smaller from now on (a later context's KV or
++    // compute layout took it, and those do not give it back), so a retry would only re-fill the layer for a
++    // count it cannot hold.  Retrying a deficit layer every drop would also zero its residents each time.
 +    std::map<int, std::vector<int>> by_layer;
 +    for (int i = 0; i < (int) g_tables.size(); ++i) {
 +        const table_t & t = g_tables[i];
@@ -56973,53 +57149,50 @@ index 000000000..8005280e5
 +        }
 +    }
 +
-+    int n_rearmed = 0;
++    int n_rearmed   = 0;
++    int n_stooddown = 0;
 +    for (auto & kv : by_layer) {
 +        const int         layer = kv.first;
 +        std::vector<int> &ids   = kv.second;
-+        int target = (layer >= 0 && layer < 512) ? g_rearm_slots[layer] : -1;
-+        if (target <= 0) {
++        const int want = (layer >= 0 && layer < 512) ? g_rearm_slots[layer] : -1;
++        if (want <= 0) {
 +            continue;   // the layer was not cacheable at sizing time
 +        }
-+        std::stable_sort(ids.begin(), ids.end(), [](int a, int b) {
-+            return g_tables[a].expert_bytes > g_tables[b].expert_bytes;
-+        });
-+        for (int attempt = 0; attempt < 8; ++attempt) {
-+            for (int i : ids) {
-+                if (g_tables[i].slots > 0) {
-+                    free_table_buffers_locked(g_tables[i]);   // undo a partial attempt (only mapped tables)
-+                }
-+            }
-+            for (int i : ids) {
-+                alloc_table_locked(g_tables[i], target);
-+            }
-+            int mn = target;
-+            for (int i : ids) {
-+                if (g_tables[i].slots < mn) {
-+                    mn = g_tables[i].slots;
-+                }
-+            }
-+            if (mn == target) {
-+                break;   // uniform
-+            }
-+            if (mn <= 0) {
-+                if (target <= 1) {
-+                    target = 0;
-+                    break;
-+                }
-+                target = target / 2;
-+                continue;
-+            }
-+            target = mn;
-+        }
-+        if (target > 0) {
++        const int got = moe_cache_rearm_layer_locked(layer, ids, want);
++        if (got > 0) {
 +            n_rearmed += (int) ids.size();
++        } else if (got == 0) {
++            n_stooddown += (int) ids.size();
++        }
++    }
++    // TODO #70 safety net (mirrors the sizing pass's, but LOCAL to the layer): the convergence above is
++    // constructed to leave every touched layer uniform, so a non-uniform one is a bug.  Stand that layer
++    // down instead of disabling the cache (the graphs already reference the tables) -- a mixed-slot layer
++    // is the one state that silently reads the wrong expert.
++    for (auto & kv : by_layer) {
++        int mn = -1, mx = -1;
++        for (int i : kv.second) {
++            const int s = g_tables[i].slots;
++            mn = mn < 0 ? s : std::min(mn, s);
++            mx = mx < 0 ? s : std::max(mx, s);
++        }
++        if (mn < 0 || mn == mx) {
++            continue;
++        }
++        GGML_LOG_ERROR("%s: layer %d is not slot-uniform after the re-arm (%d..%d); standing it down rather "
++                       "than risking a role mismatch\n", __func__, kv.first, mn, mx);
++        for (int i : kv.second) {
++            if (g_tables[i].slots > 0) {
++                free_table_buffers_locked(g_tables[i]);
++            }
++            alloc_table_locked(g_tables[i], 0);
 +        }
 +    }
 +
-+    if (n_rearmed > 0) {
++    if (n_rearmed > 0 || n_stooddown > 0) {
 +        GGML_LOG_WARN("%s: re-armed %d stood-down expert-cache tables after a compute-buffer drop "
-+                      "(arena now %.1f MiB)\n", __func__, n_rearmed, (double) g_arena_bytes / (1024 * 1024));
++                      "(%d stood down: the arena could not hold the layer uniformly) (arena now %.1f MiB)\n",
++                      __func__, n_rearmed, n_stooddown, (double) g_arena_bytes / (1024 * 1024));
 +    }
 +    return n_rearmed > 0;
 +}
@@ -57082,6 +57255,15 @@ index 000000000..8005280e5
 +        t.allocated      = true;   // it was decided; a re-arm can rebuild it
 +    }
 +    if (freed > 0) {
++        // TODO #70: a captured graph bakes a table's arena address into the MoE kernels' launch parameters
++        // (the arena is a raw device pointer, not a tensor source, so `ggml_cuda_graph_update_required`
++        // cannot see it).  The bytes just went back to the slab's free list -- where the work pool or
++        // another table can take them -- so no capture that baked them in may be replayed.  This is the
++        // same invalidation `free_arena_backing` performs for the paths that go through it; this hook hands
++        // the range back to the slab directly and so must bump for itself (belt and braces: a wide -> narrow
++        // drop also shrinks the boundary and bumps through `work_alloc`, but a NARROW boundary move -- a
++        // wider verify view, a wide-aux grow -- evicts without any other bump).
++        ggml_cuda_graph_mem_freed(device);
 +        GGML_LOG_WARN("%s: evicted %.1f MiB of arena tables from the taken slab chunks (arena now %.1f MiB)\n",
 +                      __func__, (double) freed / (1024 * 1024), (double) g_arena_bytes / (1024 * 1024));
 +    }
@@ -57178,6 +57360,48 @@ index 000000000..8005280e5
 +    if (bytes != g_arena_bytes) {
 +        GGML_LOG_ERROR("[validate %s] ARENA-BYTES g_arena_bytes=%lld sum(slots*expert_bytes)=%lld\n",
 +                       where, (long long) g_arena_bytes, (long long) bytes);
++    }
++    // TODO #70: a layer's tables must agree on their slot count (and, under `-sm tensor`, across devices).
++    // The gate+up fused kernel indexes the gate lane with the up table's remap, so two NON-ZERO counts in one
++    // layer would read the wrong expert there; a table at 0 slots is legal (it declines every consumer, and
++    // the identity-only fusion guard then stands the pair's fusion down).  Reported at WARN, not counted as
++    // inconsistent, because `moe_cache_shrink_step` (the device-allocation OOM chain) stands ONE table down
++    // on purpose, so a mixed layer is a legitimate emergency state -- what must not happen is a PARTIAL
++    // count differing from its partners', which is what the re-arm's convergence now prevents.
++    {
++        int mn_of[512];
++        int mx_of[512];
++        int nz_of[512];   // the smallest NON-ZERO count, i.e. the count the served tables actually use
++        for (int i = 0; i < 512; i++) {
++            mn_of[i] = -1;
++            mx_of[i] = -1;
++            nz_of[i] = -1;
++        }
++        for (const table_t & t : g_tables) {
++            if (t.device < 0 || t.layer < 0 || t.layer >= 512 || !t.allocated) {
++                continue;
++            }
++            mn_of[t.layer] = mn_of[t.layer] < 0 ? t.slots : std::min(mn_of[t.layer], t.slots);
++            mx_of[t.layer] = mx_of[t.layer] < 0 ? t.slots : std::max(mx_of[t.layer], t.slots);
++            if (t.slots > 0) {
++                nz_of[t.layer] = nz_of[t.layer] < 0 ? t.slots : std::min(nz_of[t.layer], t.slots);
++            }
++        }
++        for (int l = 0; l < 512; l++) {
++            if (mn_of[l] < 0 || mn_of[l] == mx_of[l]) {
++                continue;
++            }
++            if (nz_of[l] >= 0 && nz_of[l] == mx_of[l]) {
++                GGML_LOG_WARN("[validate %s] MIXED-LAYER layer=%d slots=%d..%d (a stood-down role; the served "
++                              "tables still agree, the cache-aware fusions are per-table)\n",
++                              where, l, mn_of[l], mx_of[l]);
++                continue;
++            }
++            n_bad++;
++            GGML_LOG_ERROR("[validate %s] NONUNIFORM-LAYER layer=%d slots=%d..%d (two DIFFERENT non-zero "
++                           "counts: a fused gate/up lane would read the wrong expert)\n",
++                           where, l, mn_of[l], mx_of[l]);
++        }
 +    }
 +    GGML_LOG_WARN("[validate %s] tables=%zu resident=%zu down=%zu inconsistent=%zu bytes=%lld g_arena_bytes=%lld enabled=%d has_arena=%d sized=%d\n",
 +                  where, g_tables.size(), n_res, n_down, n_bad, (long long) bytes, (long long) g_arena_bytes,

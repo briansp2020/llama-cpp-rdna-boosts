@@ -1,4 +1,4 @@
-From 2cec53b82f0bad38189360aa8df81ed1a0407aef Mon Sep 17 00:00:00 2001
+From abc46c8ef21fdd29a46043fa2e6c61a3f377cc76 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/14] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -1747,10 +1747,10 @@ index 12db6fa10..e849ccbf8 100644
          void * pin = cuda_ctx->h2d_pin_buffer(slot, total);
          if (pin == nullptr) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-index f8ea07d3e..f75f0a171 100644
+index acc4262f2..62c61f5d3 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-@@ -947,7 +947,23 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+@@ -979,7 +979,23 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
  // The size is FIXED at the first establishment: narrow-2 is anchored at the top (`off = size - floor`), so
  // a later, larger request would move a live view's base.  In practice the first request is the draft's
  // `sched_reserve` pp layout, which is its widest graph, so the region never needs to grow.
@@ -1775,7 +1775,7 @@ index f8ea07d3e..f75f0a171 100644
      if (!s.inited || bytes == 0) {
          return 0;
      }
-@@ -959,9 +975,8 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
+@@ -991,9 +1007,8 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
          const size_t off = s.size - nf2;
          const size_t min_arena = ggml_cuda_slab_min_arena_bytes();
          // The work region (`boundary`, which includes the wide prefill view and the ring) and a usable
@@ -1787,7 +1787,7 @@ index f8ea07d3e..f75f0a171 100644
              GGML_LOG_WARN("%s: device %d: no room for a %.2f GiB narrow-2 region above the work region "
                            "(%.2f GiB) and a %.2f GiB arena floor in a %.2f GiB slab (mapped %.2f GiB); "
                            "the draft compute buffer stays on the cudaMalloc path\n",
-@@ -970,38 +985,156 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
+@@ -1002,38 +1017,156 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
                            (double) s.mapped / (1ull << 30));
              return 0;
          }
@@ -1961,7 +1961,7 @@ index f8ea07d3e..f75f0a171 100644
  }
  
  // This is a MULTISET, not a flag: more than one compute buffer is live at a time (the main context and the
-@@ -1050,6 +1183,11 @@ void ggml_cuda_slab_work_release(int device, size_t off, size_t need) {
+@@ -1082,6 +1215,11 @@ void ggml_cuda_slab_work_release(int device, size_t off, size_t need) {
  // when the wide view is dropped.  The ring is never part of the arena, so arming it is an ordinary
  // boundary move (evicting the COLDEST tables), not an independent arena eviction.
  void * ggml_cuda_slab_work_alloc(int device, size_t need) {
@@ -1973,7 +1973,7 @@ index f8ea07d3e..f75f0a171 100644
      size_t lo = 0, hi = 0;
      bool   move = false;
      size_t ret_off = 0;
-@@ -1064,36 +1202,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1096,36 +1234,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
              if (!ggml_cuda_slab_init_locked(device, s, need)) {
                  return nullptr;
              }
@@ -2188,7 +2188,7 @@ index 2e3fbabf1..e571dd535 100644
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index bd6b32640..8005280e5 100644
+index 717b39f17..38881d54a 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -17,15 +17,11 @@
@@ -4173,7 +4173,7 @@ index bd6b32640..8005280e5 100644
      }
      if (!g_auto) {
          return true;   // an explicit MOE_EXPERT_CACHE_MIB is used verbatim; no early floor
-@@ -3801,6 +4312,132 @@ bool moe_cache_release_arena() {
+@@ -3810,6 +4321,132 @@ bool moe_cache_release_arena() {
      return true;
  }
  
@@ -4306,7 +4306,7 @@ index bd6b32640..8005280e5 100644
  // Disable the cache outright and STREAM the experts from the host (the stock `-ncmoe` path).
  //
  // MUST be called BEFORE the first graph that can consult the cache -- i.e. from the movable-boundary
-@@ -4320,7 +4957,8 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
+@@ -4459,7 +5096,8 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
      if (it != t.expert_slot.end()) {
          return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
      }
@@ -4316,7 +4316,7 @@ index bd6b32640..8005280e5 100644
          return { (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off), false };
      }
      return { nullptr, false };
-@@ -4426,7 +5064,8 @@ static void moe_trace_emit(char band, int layer, const char * role, int n_tok, i
+@@ -4565,7 +5203,8 @@ static void moe_trace_emit(char band, int layer, const char * role, int n_tok, i
  // counts stay on the same scale as the exact tallies).
  static __global__ void moe_cache_heat_kernel(const int32_t * __restrict__ ids, int64_t nb0, int64_t nb1,
                                               int n_used, int n_tok, int n_experts, uint32_t w,
@@ -4326,7 +4326,7 @@ index bd6b32640..8005280e5 100644
      const int64_t n = (int64_t) n_used * (int64_t) n_tok;
      for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += (int64_t) gridDim.x * blockDim.x) {
-@@ -4436,6 +5075,10 @@ static __global__ void moe_cache_heat_kernel(const int32_t * __restrict__ ids, i
+@@ -4575,6 +5214,10 @@ static __global__ void moe_cache_heat_kernel(const int32_t * __restrict__ ids, i
                                                (size_t) j * (size_t) nb0);
          if (e >= 0 && e < n_experts) {
              atomicAdd(&heat[e], w);
@@ -4337,7 +4337,7 @@ index bd6b32640..8005280e5 100644
          }
      }
  }
-@@ -4503,6 +5146,8 @@ void moe_cache_heat_observe(const ggml_tensor * op, const ggml_tensor * src0, co
+@@ -4642,6 +5285,8 @@ void moe_cache_heat_observe(const ggml_tensor * op, const ggml_tensor * src0, co
      if (!prefill_band && !t.identity) {
          return;   // the eager host path tallies this table exactly; never double count it
      }
@@ -4346,7 +4346,7 @@ index bd6b32640..8005280e5 100644
      g_heat_dirty = true;
      // The mirror is pre-allocated at sizing (alloc_table_locked).  Never allocate here on the decode
      // band: that path is a captured graph, where a `cudaMalloc` aborts the capture.
-@@ -4520,7 +5165,8 @@ void moe_cache_heat_observe(const ggml_tensor * op, const ggml_tensor * src0, co
+@@ -4659,7 +5304,8 @@ void moe_cache_heat_observe(const ggml_tensor * op, const ggml_tensor * src0, co
      }
      moe_cache_heat_kernel<<<(unsigned) nb, threads, 0, (cudaStream_t) stream>>>(
          (const int32_t *) ids->data, (int64_t) ids->nb[0], (int64_t) ids->nb[1],
@@ -4356,7 +4356,7 @@ index bd6b32640..8005280e5 100644
  }
  
  // Fold every table's device heat mirror into the host `heat` vector and zero the mirror.  Run at a
-@@ -4546,6 +5192,23 @@ static void heat_pull_locked() {
+@@ -4685,6 +5331,23 @@ static void heat_pull_locked() {
              const uint64_t s = (uint64_t) t.heat[(size_t) e] + (uint64_t) tmp[(size_t) e];
              t.heat[(size_t) e] = s > 0xffffffffull ? 0xffffffffu : (uint32_t) s;
          }
@@ -4380,7 +4380,7 @@ index bd6b32640..8005280e5 100644
      }
  }
  
-@@ -4615,6 +5278,120 @@ static bool moe_cache_slices_addr_ok(size_t host_bytes, size_t expert_bytes,
+@@ -4754,6 +5417,120 @@ static bool moe_cache_slices_addr_ok(size_t host_bytes, size_t expert_bytes,
      return total == expert_bytes;
  }
  
@@ -4501,7 +4501,7 @@ index bd6b32640..8005280e5 100644
  bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const ggml_tensor * ids, void * stream, int device,
                             size_t slice_off, int split_axis) {
-@@ -4751,19 +5528,25 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -4890,19 +5667,25 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
      }
      static uint64_t ordered_seq[GGML_CUDA_MAX_DEVICES] = {};
      std::lock_guard<std::mutex> lock(g_mutex);
@@ -4533,7 +4533,7 @@ index bd6b32640..8005280e5 100644
          const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
          int64_t rows = 0;
          int64_t row_bytes = 0;
-@@ -4787,6 +5570,140 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -4926,6 +5709,140 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
  
          device_guard dg(device);
  
@@ -4674,7 +4674,7 @@ index bd6b32640..8005280e5 100644
          // Refresh the immutable snapshot when the cache wrote since we built it, or the arena moved.
          const uint64_t seq = g_write_seq.load();
          if (t.prs_dev == nullptr || t.prs_n != t.n_experts) {
-@@ -4852,7 +5769,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -4991,7 +5908,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
          moe_cache_stage_kernel<<<t.n_experts, 256, 0, (cudaStream_t) copy_stream>>>(
              (char *) dst, (const char *) t.arena, (const char *) t.host_dev, t.prs_dev, t.slots,
              (int64_t) t.expert_bytes, (int64_t) t.host_bytes, (int64_t) t.src_off,
@@ -4683,7 +4683,7 @@ index bd6b32640..8005280e5 100644
          return cudaGetLastError() == cudaSuccess;
      }
      g_stage_decline_nomatch++;
-@@ -4988,11 +5905,13 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5127,11 +6044,13 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      }
  
      // A pageable axis-0 slice (a `-sm tensor` `down_exps` split) has no device mapping and its only
@@ -4702,7 +4702,7 @@ index bd6b32640..8005280e5 100644
          g_decline_all++;
          return false;
      }
-@@ -5160,10 +6079,21 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5299,10 +6218,21 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          if ((int) t.heat.size() != t.n_experts) {
              t.heat.assign((size_t) t.n_experts, 0);
          }

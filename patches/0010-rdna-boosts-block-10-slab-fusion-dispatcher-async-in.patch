@@ -1,4 +1,4 @@
-From 7e5dc577250d9f8aa923e11937ce739690316de3 Mon Sep 17 00:00:00 2001
+From aa5723e607c6ef07ff1db1f5ba4090415877fe02 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/14] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -112,7 +112,7 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  ggml/src/ggml-cuda/ggml-cuda-arena.cuh        |   15 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  276 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   26 +
- ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1752 +++++
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1837 +++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 2743 ++++++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh     |   38 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   60 +
@@ -160,7 +160,7 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  tests/test-fusion-gate-beta-multiseq.cpp      |  278 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 78 files changed, 12768 insertions(+), 4986 deletions(-)
+ 78 files changed, 12853 insertions(+), 4986 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
@@ -4144,10 +4144,10 @@ index 000000000..f67f584ee
 +size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t max_table);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 new file mode 100644
-index 000000000..f8ea07d3e
+index 000000000..acc4262f2
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-@@ -0,0 +1,1752 @@
+@@ -0,0 +1,1837 @@
 +// Movable-boundary slab (OPEN 2 / r42): the per-device VMM reserve + work/arena boundary move.
 +// Split out of ggml-cuda.cu (an upstream hub); the API is declared in ggml-cuda-vmm.h.
 +
@@ -4336,6 +4336,28 @@ index 000000000..f8ea07d3e
 +    // `wide_aux_size` is the extent of the HIGHEST live block: holes below it are bounded and cost nothing,
 +    // and a group of frees in any order still returns the region to the live high-water.
 +    std::map<size_t, size_t> wide_live;
++    // TODO #70: the wide-aux GROWTH decision is made once per wide pass.  A refused grow used to be retried
++    // on every allocation that needed the region -- a prefill asks ~61 times per ubatch (one per FA op), so a
++    // starved region produced thousands of `SLAB_WIDE_AUX` attempts, each of which could evict a band of
++    // arena tables (or evict one and then refuse on a racing boundary move) while a graph that still held
++    // the previous placement was queued.
++    //
++    // The two refusal classes are NOT the same decision:
++    //   * a VA-LIMIT refusal (`target > aux_limit`: the pinned narrow-2 region, or the top of the mapping)
++    //     is structural -- `aux_limit` cannot grow within the pass and any later grow only raises the
++    //     extent -- so it is latched for the rest of the pass;
++    //   * a SNAPSHOT-RACE refusal (the boundary moved while `g_slab_mutex` was dropped for the eviction)
++    //     is recoverable -- the racing thread is the MTP draft context's reserve and it has usually
++    //     finished by the next request -- so it is retried, but only `GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX`
++    //     times per pass, because each attempt costs an arena-band eviction and the old code's unbounded
++    //     retry is what faulted the graph that still held the previous placement.
++    // `wide_aux_denied_want` is the smallest request refused in this pass (0 = nothing latched yet); a
++    // request at least that large is refused without touching the layout, a smaller one may still fit (a
++    // grow only ever raises the extent).  It -- and the race counter -- are cleared by `ring_set` on a pass
++    // transition, whenever the boundary shrinks (which hands VA back to the region), and on slab (re-)init.
++    size_t                   wide_aux_denied_want = 0;
++    size_t                   wide_aux_denied_n    = 0;   // refusals recorded in this pass (diagnostic)
++    size_t                   wide_aux_race_n      = 0;   // snapshot-race refusals in this pass (bounded)
 +    // wip/slab-transient-absorption (step 2b-2) DIAGNOSTIC: why the wide-aux region grows.
 +    size_t                   wide_n_pop    = 0;   // frees that shrank the region
 +    size_t                   wide_n_hole   = 0;   // frees of a block that was not live (stale/hole)
@@ -4401,6 +4423,13 @@ index 000000000..f8ea07d3e
 +    }
 +    return on != 0;
 +}
++
++// TODO #70: how many times ONE wide pass may retry a wide-aux grow whose layout snapshot was invalidated by
++// another thread (the MTP draft context's reserve) before the pass gives up and lets the callers fall back to
++// their capped raw allocations.  A retry costs an arena-band eviction, so the bound is small; 4 covers the one
++// racing reserve a session actually performs with room to spare, and a bounded retry is deliberately kept (a
++// blanket latch would write the pass off after one benign race).  No knob: not a tuning axis.
++#define GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX 4
 +
 +// wip/slab-ring-region: the H2D staging-ring hole the slab must carve (0 = the ring stays a cudaMalloc
 +// outside the slab).  Set once by the model preflight, before the slab is created, from the largest
@@ -5052,6 +5081,9 @@ index 000000000..f8ea07d3e
 +    s.wide_aux_off  = 0;
 +    s.wide_aux_size = 0;
 +    s.wide_aux_gen  = 0;
++    s.wide_aux_denied_want = 0;   // TODO #70: this pass's wide-aux growth has not been refused
++    s.wide_aux_denied_n    = 0;
++    s.wide_aux_race_n      = 0;
 +    s.ring_slots   = ggml_backend_cuda_context::h2d_stage_slots();
 +    s.arena_free.clear();
 +    s.arena_free[w] = s.mapped - w;
@@ -5361,6 +5393,9 @@ index 000000000..f8ea07d3e
 +            if (target < s.boundary) {
 +                const size_t old = s.boundary;
 +                s.boundary = target;
++                s.wide_aux_denied_want = 0;   // TODO #70: the VA above the boundary grew; allow one new grow
++                s.wide_aux_denied_n    = 0;
++                s.wide_aux_race_n      = 0;
 +                // ISSUE #187: a captured CUDA/HIP graph bakes the addresses of the work region's tensors
 +                // into the executable graph.  The bytes above `target` have just gone back to the arena,
 +                // so any graph captured against the old boundary must be recaptured before its next
@@ -5569,7 +5604,7 @@ index 000000000..f8ea07d3e
 +                  "work=%.1f MiB (narrow=%.1f ring=%.1f wide_aux=%.1f narrow2=%.1f) arena=%.1f MiB "
 +                  "pool=%.1f MiB pool_wide=%.1f MiB/%zu refused=%.1f MiB outside_max=%.1f MiB "
 +                  "outside_failed=%.1f MiB headroom_cfg=%.1f MiB aux_cfg=%.1f MiB "
-+                  "wide[n_pop=%zu hole=%zu inval=%zu rebase=%zu]\n",
++                  "wide[n_pop=%zu hole=%zu inval=%zu rebase=%zu aux_refused=%zu]\n",
 +                  tag, device, (int) inited,
 +                  (double) free_b / 1048576.0, (double) ggml_cuda_free_min_bytes(device) / 1048576.0,
 +                  (double) total_b / 1048576.0, (double) mapped / 1048576.0,
@@ -5584,7 +5619,7 @@ index 000000000..f8ea07d3e
 +                  (double) ggml_cuda_outside_fail_max_bytes(device) / 1048576.0,
 +                  (double) ggml_cuda_slab_headroom_bytes() / 1048576.0,
 +                  (double) g_slab_aux_reserve_bytes / 1048576.0,
-+                  s.wide_n_pop, s.wide_n_hole, s.wide_n_inval, s.wide_n_rebase);
++                  s.wide_n_pop, s.wide_n_hole, s.wide_n_inval, s.wide_n_rebase, s.wide_aux_denied_n);
 +}
 +
 +void ggml_cuda_slab_log_stats(int device, const char * tag) {
@@ -5622,6 +5657,10 @@ index 000000000..f8ea07d3e
 +// Growing the region is an ordinary work-boundary move: the arena tables in the taken band are evicted
 +// (the same cold band a wide prefill already reclaims).  A refusal (no slab, ring disarmed, or the region
 +// would reach the pinned narrow-2 view) is fail-soft: the caller falls back to its capped raw allocation.
++//
++// TODO #70: the growth decision is made ONCE per wide pass (see `wide_aux_denied_want`).  A refusal is
++// logged once per pass and the rest of the pass is served by the caller's fallback, so a starved region
++// cannot turn into thousands of boundary moves under a graph that still holds the previous placement.
 +void * ggml_cuda_slab_wide_aux_alloc(int device, size_t size, size_t * gen_out) {
 +    if (gen_out != nullptr) {
 +        *gen_out = 0;
@@ -5635,14 +5674,32 @@ index 000000000..f8ea07d3e
 +    {
 +        std::lock_guard<std::mutex> lock(g_slab_mutex);
 +        ggml_cuda_slab & s = g_slabs[device];
++        const size_t want = ggml_cuda_slab_up(size, s.unit);
++        // One refusal log per wide pass, whatever the reason.  The no-slab / ring-disarmed case is NOT
++        // latched: the ring can be armed later in the same pass (the first prefill ubatch of a session can
++        // arrive before the narrow floor is pinned).
++        const auto refuse_once = [&s, device, size](const char * why, size_t extra) {
++            if (s.wide_aux_denied_n++ == 0) {
++                GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused for this wide pass (%s%s%.0f MiB): "
++                              "the callers fall back to their raw allocations until the pass ends\n",
++                              device, (double) size/1048576.0, why, extra > 0 ? ", " : "",
++                              extra > 0 ? (double) extra/1048576.0 : 0.0);
++            }
++        };
 +        if (!s.inited || !s.ring_armed) {
 +            if (getenv("GGML_CUDA_SLAB_STATS") != nullptr) {
-+                GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused: slab=%d ring_armed=%d\n",
-+                              device, (double) size/1048576.0, (int) s.inited, (int) s.ring_armed);
++                if (s.wide_aux_denied_n == 0) {
++                    GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused: slab=%d ring_armed=%d\n",
++                                  device, (double) size/1048576.0, (int) s.inited, (int) s.ring_armed);
++                }
++                s.wide_aux_denied_n++;
 +            }
 +            return nullptr;   // narrow-only stretch: the region belongs to the arena
 +        }
-+        const size_t want = ggml_cuda_slab_up(size, s.unit);
++        if (s.wide_aux_denied_want != 0 && want >= s.wide_aux_denied_want) {
++            s.wide_aux_denied_n++;
++            return nullptr;   // this pass's growth was already refused: do not touch the layout again
++        }
 +        if (s.wide_aux_size == 0 && s.wide_aux_off == 0) {
 +            s.wide_aux_off = s.boundary;   // just above the wide compute view
 +            s.wide_n_rebase++;
@@ -5666,6 +5723,8 @@ index 000000000..f8ea07d3e
 +                s.wide_aux_off = 0;
 +                s.wide_live.clear();
 +            }
++            s.wide_aux_denied_want = want;
++            refuse_once("VA limit", target > aux_limit ? target - aux_limit : 0);
 +            return nullptr;
 +        }
 +        off  = aux_end;
@@ -5697,6 +5756,25 @@ index 000000000..f8ea07d3e
 +        // move then rounds the boundary up to `chunk`, so the retained base normally sits a whole chunk
 +        // below the boundary -- every later growth would be refused and fall back outside the slab.)
 +        if (!s.inited || !s.ring_armed || s.boundary != lo || s.wide_aux_off + s.wide_aux_size != off) {
++            // TODO #70: the growth was ALREADY paid for (a band of arena tables was evicted) and the layout
++            // it was sized against moved while the lock was dropped, so this snapshot is unusable.  This is
++            // the RECOVERABLE class: the racing thread is the MTP draft context's reserve and retrying from
++            // the new state normally succeeds.  Retry, but at most `GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX` times
++            // per pass -- each attempt evicts another band, which is what made the pre-r168 code fault a
++            // queued graph that still held the previous placement -- and then latch the pass.
++            const size_t want_denied = ggml_cuda_slab_up(size, s.unit);
++            s.wide_aux_race_n++;
++            if (s.wide_aux_race_n < GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX) {
++                return nullptr;   // next allocation re-reads the layout and tries again
++            }
++            s.wide_aux_denied_want = s.wide_aux_denied_want != 0
++                ? std::min(s.wide_aux_denied_want, want_denied)
++                : want_denied;
++            if (s.wide_aux_denied_n++ == 0) {
++                GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused for this wide pass (%zu layout moves "
++                              "during the grow); the callers fall back to their raw allocations until the "
++                              "pass ends\n", device, (double) size/1048576.0, s.wide_aux_race_n);
++            }
 +            return nullptr;
 +        }
 +        if (hi > s.boundary) {
@@ -5818,6 +5896,13 @@ index 000000000..f8ea07d3e
 +        // is logged BEFORE the auxiliary region is cleared so the wide_aux figure is the prefill's.
 +        // `ggml_cuda_slab_log_stats_locked` gates itself on GGML_CUDA_SLAB_STATS.
 +        ggml_cuda_slab_log_stats_locked(device, arm ? "wide-arm" : "wide-drop");
++    }
++    if (transition) {
++        // TODO #70: one wide pass has ended -- the next one gets its own wide-aux growth decision, so a
++        // region that was starved under this pass's layout is retried rather than written off for the run.
++        s.wide_aux_denied_want = 0;
++        s.wide_aux_denied_n    = 0;
++        s.wide_aux_race_n      = 0;
 +    }
 +    if (!arm) {
 +        // The live set must not outlive the region it describes.
@@ -18480,7 +18565,7 @@ index 35f625eaa..10b689844 100644
  void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 69df953b2..bd6b32640 100644
+index 959be4187..717b39f17 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -67,6 +67,11 @@ struct table_t {
@@ -18657,7 +18742,7 @@ index 69df953b2..bd6b32640 100644
  }
  
  // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
-@@ -4144,7 +4224,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
+@@ -4283,7 +4363,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
  
  int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                      size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
@@ -18667,7 +18752,7 @@ index 69df953b2..bd6b32640 100644
      if (!g_enabled) {
          return -1;
      }
-@@ -4162,6 +4243,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -4301,6 +4382,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
          cold_safe = host_bytes > 0 && host_bytes % host_pitch == 0 &&
                      expert_bytes > 0 && expert_bytes % (host_bytes / host_pitch) == 0;
      }
@@ -18681,7 +18766,7 @@ index 69df953b2..bd6b32640 100644
  
      const std::pair<const void*, int> key = { src0, device };
      const auto it = g_key_to_id.find(key);
-@@ -4191,6 +4279,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -4330,6 +4418,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
      t.host_pitch   = host_pitch;
      t.split_axis   = split_axis;
      t.cold_safe    = cold_safe;
@@ -18693,7 +18778,7 @@ index 69df953b2..bd6b32640 100644
      // TEMP diagnostic (wip/moe-verify-fusions): print the per-table split geometry, to compare the
      // residency-sensitive qwen4exp tables against the residency-insensitive qwen35moe ones.
      if (ggml_cuda_cache_geom_debug()) {
-@@ -4227,7 +4320,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
+@@ -4366,7 +4459,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
      if (it != t.expert_slot.end()) {
          return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
      }
@@ -18702,7 +18787,7 @@ index 69df953b2..bd6b32640 100644
          return { (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off), false };
      }
      return { nullptr, false };
-@@ -4501,6 +4594,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
+@@ -4640,6 +4733,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
      return span <= host_bytes - src_off;
  }
  
@@ -18730,7 +18815,7 @@ index 69df953b2..bd6b32640 100644
  bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const ggml_tensor * ids, void * stream, int device,
                             size_t slice_off, int split_axis) {
-@@ -4748,7 +4862,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -4887,7 +5001,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
  bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const int32_t * ids, int64_t n_used, int64_t n_tok,
                             size_t ids_nb0, size_t ids_nb1, void * stream,
@@ -18740,7 +18825,7 @@ index 69df953b2..bd6b32640 100644
      g_write_seq++;
      if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
          return false;
-@@ -4791,7 +4906,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -4930,7 +5045,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
              host_pitch = weight->nb[1];   // a strided axis-0 slice needs a 2-D fill
          }
      }
@@ -18766,7 +18851,7 @@ index 69df953b2..bd6b32640 100644
          static bool warned = false;
          if (!warned) {
              warned = true;
-@@ -4808,7 +4940,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -4947,7 +5079,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          return false;
      }
      const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
@@ -18776,7 +18861,7 @@ index 69df953b2..bd6b32640 100644
      if (table < 0) {
          return false;
      }
-@@ -4859,7 +4992,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -4998,7 +5131,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (issue #116's copy-side twin).  Decline the partial-residency case so the scheduler's
      // pageable-safe host path serves the op.  An identity (whole-resident) table needs no fill and is
      // left alone.
@@ -18785,7 +18870,7 @@ index 69df953b2..bd6b32640 100644
          g_decline_all++;
          return false;
      }
-@@ -5104,7 +5237,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+@@ -5243,7 +5376,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
      }
      std::lock_guard<std::mutex> lock(g_mutex);
      for (const table_t & t : g_tables) {

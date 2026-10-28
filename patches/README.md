@@ -731,6 +731,25 @@ which the per-block build gate enforces).
 * `moe-expert-cache.cu` (~5.1k lines) + `.h`: the cache engine — arena sizing, per-layer uniform slots,
   the slot remap, the routed-MMVQ decode/verify band (`moe_cache_band`), admission/heat policy, the
   persistent cross-run heat map (`MOE_EXPERT_HEATMAP`) and prefill cache staging.
+* **A re-arm is layer-uniform or the layer is stood down, and a returned arena range is never kept (r168,
+  TODO #70).**  `moe_cache_rearm()` re-allocates what a slab boundary move evicted, to the slot count the
+  sizing pass settled on.  Its retry loop could exit with a **mixed-slot layer** (it set
+  `target = min(achieved)` on the last attempt and the loop ended, leaving freshly allocated tables at their
+  own counts); the sizing pass forbids that -- the gate+up fused kernel seeds the gate lane from the **up**
+  table's remap -- and answers it by disabling the cache, which a re-arm must not do (the graphs already
+  reference the tables, and a late `g_enabled = false` desynchronises the MTP draft from the target).
+  `moe_cache_rearm_layer_locked()` now converges a layer on ONE count (retrying at the largest count any table
+  reached, halving when one cannot hold a slot) and, if the retries run out, stands the **whole layer** down
+  -- never a mixed layer; a smaller-but-uniform count is accepted with a warning, and a final sweep re-checks
+  the touched layers (the sizing safety net, made local).  Two invariants it relies on: a stand-down must
+  clear `t.arena`/`t.arena_reserved` once the range goes back (a slab range lands on the slab's free list,
+  where the work pool or another table can take it, while `alloc_table_locked()` reads a non-null `t.arena`
+  as *already allocated* -- `stand_down_table_locked()` used to keep it, so a re-arm of an
+  allocation-OOM-dropped table claimed slots in a range it no longer owned), and any path that frees a
+  table's device buffer bumps `ggml_cuda_graph_mem_freed` (`moe_cache_evict_slab_range()` hands ranges to the
+  slab directly, so it bumps for itself).  `MOE_EXPERT_CACHE_VALIDATE=1` reports both states
+  (`MIXED-LAYER` = a role stood down and the served tables still agree; `NONUNIFORM-LAYER` = two different
+  non-zero counts).  Record: `archive/work/todo70-rearm-wideaux/`.
 * **The cache has an offline policy instrument, and two host-tally gaps are closed** (r110, TODO #61 P1/P3
   + TODO #64.1/.2/.3).  `MOE_EXPERT_TRACE=<path>` dumps the raw routing of every `mul_mat_id` for
   `scripts/moe-trace-replay.py`, which scores the shipped F-LRU, an oracle static top-f, a per-layer
@@ -1132,6 +1151,21 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
 * **The slab** (`ggml-cuda-slab.cu`, `ggml-cuda-arena.cu`): one VMM reserve per device split by a movable
   boundary — compute below, MoE arena above, no HIP call at runtime.  Plus the narrow-band learning, the
   wide-phase auxiliary region, pool-wide routing, and the slab transient absorption.
+* **The wide-aux growth is decided ONCE per wide pass (r168, TODO #70).**  `ggml_cuda_slab_wide_aux_alloc()`
+  (the FA prefill staging arena's home) is called on **every** FA op of a prefill, and a refusal used to be
+  returned per allocation: a starved region became hundreds of decisions, each able to evict a band of arena
+  tables -- or evict one and then refuse on a boundary move that raced the MTP draft context -- while a
+  queued graph still held the previous placement (the r86 fault shape).  A **VA-limit** refusal (the pinned
+  narrow-2 region, the top of the mapping) is structural and latched in `wide_aux_denied_want` -- cleared by a
+  `ring_set()` pass transition, by a boundary **shrink** in `work_alloc`, and on slab (re-)init -- so a request
+  at least as large as the refused one returns immediately while a smaller one may still fit (a grow only
+  ever raises the extent); a **snapshot-race** refusal (the boundary moved while the lock was dropped for the
+  eviction) is recoverable and is retried, bounded to `GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX` (4) attempts per
+  pass because each attempt costs another arena-band eviction.  One `SLAB_WIDE_AUX ... refused for this wide pass` WARN per
+  pass (not gated on `GGML_CUDA_SLAB_STATS`), and the per-pass count is the `aux_refused=` field of the
+  `SLAB_STATS` line; the per-growth `SLAB_WIDE_AUX` diagnostic is unchanged (it is the sizing tool).  The
+  shape is unreachable since r87 forces the prefill -> decode drop, so it is validated by code review plus a
+  healthy-run no-op.  Record: `archive/work/todo70-rearm-wideaux/`.
 * **The compute-buffer chunk follows a LIVE slab** (r139, issue #214): `GGML_COMPUTE_BUFFER_CHUNK_MIB`
   used to key on `ggml_cuda_slab_enabled()` (armed), which stays true after the slab declines at the
   first compute allocation.  A 12 GiB card that streams its host experts therefore had a 510 MiB
