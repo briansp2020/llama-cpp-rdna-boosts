@@ -1,5 +1,90 @@
 # WORKLOG - dated delivery records
 
+## 261028.010 (r168) -- TODO #70 closed: a re-arm is layer-uniform or the layer is stood down, and a starved wide-aux growth is decided once per wide pass
+
+**Release `v15-6050b467c-r168`**, base `6050b467c`, 15 blocks, tip `fcf00b46cff86b07100536a8174498ddd49b2d1c`,
+tree `93e10130cc847e7cd9ce0f5a59c551f36f86e9d7`.  **Blocks 09 and 10 amended** (block 09
+`ggml/src/ggml-cuda/moe-expert-cache.cu` +219/-9, block 10 `ggml/src/ggml-cuda/ggml-cuda-slab.cu` +64/-3).
+No new environment variable, no default changed, and no kernel, dispatch row or numerics path touched, so
+`gate-prefill-logits.sh` reads **0.000000 / 100.000 %** and every greedy-text arm is byte-identical to r167.
+Record: `archive/work/todo70-rearm-wideaux/`.
+
+### What #70 was, and what shipped
+
+r86's field fault (`WORKLOG.md` 261019.002) ended in `HSA_STATUS_ERROR_MEMORY_FAULT` in `k_get_rows_float`
+after (a) a re-arm that had to shrink one layer to a partial slot count (`layer=47 ... 344 requested, only
+202 fit`) and (b) a starved wide-aux region.  r87 removed the *trigger* (a wide -> narrow compute-layout
+transition always drops), so #70 was the hardening half, and its two asks are now in:
+
+1. **A re-arm is transactional per layer (block 09).**  `moe_cache_rearm()`'s retry loop could exit with a
+   **mixed-slot layer** (it set `target = min(achieved)` on its last attempt and the loop ended, leaving the
+   tables it had just allocated at their own counts).  The sizing pass forbids that state -- the gate+up
+   fused kernel seeds the gate lane from the **up** table's remap -- and answers it by disabling the cache,
+   which a re-arm must not do (the graphs already reference the tables, and a late `g_enabled = false`
+   desynchronises the MTP draft from the target).  Now `moe_cache_rearm_layer_locked()` converges a layer on
+   ONE count (retrying at the largest count any table reached, halving when one cannot hold a slot) and, if
+   the retries run out, stands the **whole layer** down -- never a mixed layer; a smaller-but-uniform count
+   is accepted (with a warning) because that is a legal state the sizing pass also decides.  A final sweep
+   re-checks the touched layers (the sizing safety net, made local).  A stood-down table makes the fusion
+   guard fail and every per-table consumer decline -- the fuse-guard invariant.
+2. **A starved wide-aux growth is refused once per wide pass (block 10).**  `ggml_cuda_slab_wide_aux_alloc()`
+   is called on every FA op of a prefill, and a refusal used to be returned per allocation: a starved region
+   became hundreds of decisions, each able to evict a band of arena tables -- or evict one and then refuse on
+   a boundary move that raced the MTP draft context -- while a queued graph still held the previous placement.
+   The two refusal classes are treated separately: a **VA-limit** refusal (the pinned narrow-2 region, or
+   the top of the mapping) is structural -- the limit cannot grow within the pass and any later grow only
+   raises the extent -- so it is latched (`wide_aux_denied_want`, cleared by a `ring_set` pass transition, a
+   boundary shrink, or a slab (re-)init), and a request at least as large as the refused one returns
+   immediately while a smaller one may still fit; a **snapshot-race** refusal (the boundary moved while the
+   lock was dropped for the eviction) is recoverable, so it is retried -- but bounded to
+   `GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX` (4) attempts per pass, because every attempt costs another arena-band
+   eviction.  One WARN per pass when a pass is finally refused, and the per-pass count is the new
+   `aux_refused=` field of `GGML_CUDA_SLAB_STATS`.
+
+### Two further defects found while validating (both fixed, same blocks)
+
+* **`stand_down_table_locked()` kept a slab-backed arena pointer after handing the range back.**  A slab
+  stand-down returns the range to the slab's free list (where the work pool or another table can take it) but
+  kept `t.arena`/`t.arena_reserved` on the theory that "a VMM arena keeps its reserved VA" -- and
+  `alloc_table_locked()` reads a non-null `t.arena` as *already allocated*.  So a **re-arm of a table that an
+  allocation-OOM stand-down had dropped claimed slots in a range it no longer owned**; seen live as
+  `[validate device-malloc-yield] ... layer=46 slots=0..512` right before an eviction and a re-arm of 162
+  tables.  (`moe_cache_shrink_step` stands one table down on purpose, so the mixed layer itself is legal; the
+  pointer reuse was not.)  Fixed by clearing both fields there, as `free_table_buffers_locked()` and
+  `moe_cache_evict_slab_range()` already do.
+* **The eviction hook did not invalidate captured graphs.**  `moe_cache_evict_slab_range()` frees table
+  arenas through `ggml_cuda_slab_arena_free` directly, bypassing `free_arena_backing()`, which is where the
+  `ggml_cuda_graph_mem_freed()` bump lives -- and a captured graph bakes a table's arena address into the MoE
+  kernels' launch parameters (a raw device pointer, not a tensor source).  A wide prefill always ends in a
+  boundary shrink that bumps anyway, so practice was covered; a **narrow** boundary move (a wider verify
+  view, a wide-aux grow) evicts with no other bump.  The hook now bumps when it releases anything.
+  `MOE_EXPERT_CACHE_VALIDATE=1` also reports layer slot uniformity now (`MIXED-LAYER` = a role stood down and
+  the served tables still agree, WARN; `NONUNIFORM-LAYER` = two different non-zero counts, an inconsistency).
+
+### Gates (final build `fcf00b46c`, r167 reference `38aac1e49`, 3x gfx1201)
+
+| arm | result |
+|---|---|
+| dense Qwen3.5-4B Q8_0, 1 GPU, greedy `-n 48` | output identical to r167 (only the load spinner differs) |
+| Flash-Next GSQ-IQ3_XXS, `-sm tensor -ncmoe 48 -c 32768 -ub 8192`, q8_0 KV, auto cache | 288/288 resident, arena 40 925.0 MiB, 5 evictions, `re-armed 12`; identical text |
+| the same + `GGML_CUDA_SLAB_RESERVE_MIB=18000` | arena 14 227.8 MiB = **34.8 % residency**, 6-7 evictions (~8.6 GiB), `re-armed 162 (0 stood down)`, `validate: 288 resident, 0 down, inconsistent=0`; identical text |
+| the same + MTP draft (`--spec-type draft-mtp`), `-c 16384 -ub 4096` | narrow-2 pinned (draft compute 0.50 GiB), 7 evictions, `re-armed 150`, draft acceptance **0.493**, no abort |
+| MTP **Protocol A**, dense 27B UD-Q4_K_XL, 3 GPU `-sm tensor`, `-n 3000` | **100.8 t/s**, acceptance **0.60816** (1937/3185), mean len 2.82 (r167 reference 90.7 / 0.60) |
+| `scripts/gate-prefill-logits.sh` on the final build `fcf00b46c` | mean KLD **0.000000**, same-top-p **100.000 %** PASS |
+| `scripts/check-gpu-faults.sh --since 15:00` | clean -- no GPU fault in any arm |
+
+Text comparisons were made with `ROCBLAS_USE_HIPBLASLT=0`.  **Without it the same two builds produced
+different text on the 34.8 %-residency arm** (576 vs 580 chars) at an identical arena, identical
+eviction/re-arm counts and identical acceptance -- the r44/GREEDY-PURITY §44 per-process hipBLASLt solution
+choice, measured on a third config.  Also note `scripts/extract-generated.py` hashes the prompt echo on a
+`-v` run, so a `-v` "match" proves nothing about the generation: compare clean (non-`-v`) logs.
+
+**Not reproducible, by design.**  The r86 shape needed the wide compute layout *never released* (the boundary
+sat at the 6.9 GiB wide view); r87 forces the drop, so no config here starves the region -- `aux_refused=0` in
+most prefill passes and `1-2` in a pass whose first FA op ran before the ring armed (the cheap, deliberately
+unlatched `ring_armed=0` path).  The latched refusals are validated by code review plus the healthy-run no-op
+above, not by a repro.
+
 ## 261028.009 (r167) -- TODO #103 closed: the "~30x VRAM collapse" is driver page migration, not a llama.cpp path, and the VRAM limit now reports itself
 
 **Release `v15-6050b467c-r167`**, base `6050b467c`, 15 blocks, tip `38aac1e499de319621bc6be45fba5515be266e8f`,

@@ -758,6 +758,35 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   model is *not* a GQA-8 arm: its SWA layers are head 256 at ratio 2 and its full-attention layers ratio 8 at
   head 512, so neither enters the predicate (`Q->ne[0] == 256 && 4 < gqa_ratio <= 12`).  `GREEDY-PURITY.md` §51,
   `benchmarks/2026-10-25-fa-band-width-purity.md`, `benchmarks/2026-10-28-fa-band-gqa8-arm.md`.
+- **A re-arm is LAYER-UNIFORM or the layer is stood down, and an arena range that is returned must not be
+  kept (r168, TODO #70).**  `moe_cache_rearm()` re-allocates what a slab boundary move evicted, to the slot
+  count the sizing pass settled on.  `moe_cache_rearm_layer_locked()` converges a layer on ONE count and, if
+  the retries run out, stands the **whole layer** down (every table at 0 slots) -- never a mixed-slot layer:
+  the gate+up fused kernel seeds the gate lane from the **up** table's remap, and the sizing pass answers
+  that state by disabling the cache, which a re-arm must not do (the graphs already reference the tables).  A
+  uniformly smaller count is accepted (with a warning); a final sweep re-checks the touched layers.  Two
+  invariants this depends on: **a stand-down must clear `t.arena`/`t.arena_reserved`** once it hands the
+  range back -- `ggml_cuda_slab_arena_free` puts it on the slab's free list where the work pool or another
+  table can take it, and `alloc_table_locked()` reads a non-null `t.arena` as *already allocated* (r168
+  found `stand_down_table_locked` keeping it, so a re-arm of an allocation-OOM-dropped table claimed slots in
+  a range it no longer owned); and **any path that frees a table's device buffer must bump
+  `ggml_cuda_graph_mem_freed`** -- `moe_cache_evict_slab_range` hands ranges to the slab directly and
+  bypasses `free_arena_backing`, so it bumps for itself.  `MOE_EXPERT_CACHE_VALIDATE=1` reports the state:
+  `MIXED-LAYER` (a role stood down, the served tables agree -- legal, `moe_cache_shrink_step` does it on
+  purpose) and `NONUNIFORM-LAYER` (two different non-zero counts, an inconsistency).  Do not "simplify" the
+  re-arm back to accepting `min(achieved)`.
+- **A starved wide-aux growth is decided ONCE per wide pass (r168, TODO #70).**  `ggml_cuda_slab_wide_aux_alloc()`
+  runs on every FA op of a prefill; a refusal used to be returned per allocation, so a starved region became
+  hundreds of decisions, each able to evict a band of arena tables -- or evict one and then refuse on a
+  boundary move that raced the MTP draft context -- under a queued graph that still held the previous
+  placement.  `wide_aux_denied_want` latches the pass (cleared by a `ring_set` pass transition, a boundary
+  shrink, or a slab (re-)init); a request at least as large as the refused one returns immediately, a smaller
+  one may still fit.  The two refusal classes are separate: a **VA-limit** refusal is structural and latched,
+  a **snapshot-race** refusal (the boundary moved while the lock was dropped for the eviction) is retried but
+  bounded to `GGML_CUDA_SLAB_WIDE_AUX_RACE_MAX` (4) attempts per pass -- each costs another arena-band
+  eviction.  One WARN per pass when a pass is finally refused; `GGML_CUDA_SLAB_STATS` prints the per-pass
+  count as `aux_refused=`, and the per-growth `SLAB_WIDE_AUX` line is unchanged (it is the sizing tool).  The shape is **not reproducible**
+  since r87 forces the prefill -> decode drop, so it is validated by code review plus a healthy-run no-op.
 - **The expert cache's tables must not outlive the model that registered them (r143).**  `g_tables` is
   process-global and keyed by host-master pointers the MODEL owns, so `llama_model_free` must drop them
   before the masters go: `llama_model_moe_cache_forget()` -> the `moe_cache_forget` device iface entry ->
