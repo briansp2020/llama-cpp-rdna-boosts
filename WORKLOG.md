@@ -9,9 +9,9 @@ one TODO retired.  Numbers: `benchmarks/2026-10-28-fa-band-gqa8-arm.md`.
 **The item's premise was wrong, not the claim.**  #102 was an accepted limitation because "no head-256
 GQA-8 model exists in the fleet".  `Qwen3.6-35B-A3B` has been in the fleet all along and loads as
 `n_head 16 / n_head_kv 2 / n_embd_head_k 256` — head 256 at **ratio 8**, i.e. the band predicate's one
-unmeasured ratio (`Q->ne[0] == 256 && V->ne[0] == 256 && 4 < gqa_ratio <= 12`).  The model the other
-assistant suggested (`gemma-4-26B-A4B`) is **not** that arm: its SWA layers are head 256 at ratio **2** and
-its full-attention layers ratio 8 at head **512**, so no layer of it enters the band (same for 31B/12B/E4B).
+unmeasured ratio (`Q->ne[0] == 256 && V->ne[0] == 256 && 4 < gqa_ratio <= 12`).  The model suggested for the
+item (`gemma-4-26B-A4B`) is **not** that arm: its SWA layers are head 256 at ratio **2** and its
+full-attention layers ratio 8 at head **512**, so no layer of it enters the band (same for 31B/12B/E4B).
 Ratio 8 is the one ratio where the `ncols2 = 8` fold is *exact* (a whole group, no masked tail), which is
 why it was worth its own arm.
 
