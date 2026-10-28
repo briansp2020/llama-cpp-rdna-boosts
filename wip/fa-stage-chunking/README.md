@@ -10,9 +10,12 @@ arena step lands in shared memory.  The r156/r149 delta there is *exactly* the a
 (`+899` → `+1923` MiB shared for a f16 draft KV, `+2949` with a q8_0 draft): one and two 1024 MiB arenas
 that arrived late.  See §1 for the arithmetic.
 
-> **STATE (2026-10-27): CLOSED as a campaign — outcome C was taken.**  `beta/fa-stage-peak/` ships the
-> bounded-commitment answer (one early allocation, eager by default on Windows, plus a draft cap) and the
-> tiling follow-up is `TODO` #114 with the prototype kept here (`PROTOTYPE-chunked-staging.patch`).  The
+> **STATE (2026-10-27): phase 1 done (scoped, measured, decided); phase 2 = `TODO` #114, not started.**
+> Outcome **C** shipped as `beta/fa-stage-peak/` (one early allocation, eager by default on Windows, plus a
+> draft cap) and is awaiting the Windows tester.  The size fix — tiling the staging so the arena is
+> O(chunk) — is `TODO` #114 and its cold-session handover is
+> [`HANDOVER-2026-10-27-114.md`](HANDOVER-2026-10-27-114.md) (kickoff prompt in §0).  The prototype is kept
+> here (`PROTOTYPE-chunked-staging.patch`).  The
 > staging is worth keeping (+1.5/+2.7/+5.1 % pp, §3), and a chunked prototype works and is numerically sound
 > (`FINDINGS-2026-10-27-m2.md`), **but** the MMA prefill kernel's only multi-block KV split is stream-K, so
 > a chunked launch currently costs 2.8x prefill.  Tiling therefore requires re-expressing the stream-K
