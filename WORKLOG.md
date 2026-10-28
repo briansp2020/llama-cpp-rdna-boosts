@@ -1,5 +1,65 @@
 # WORKLOG - dated delivery records
 
+## 261028.002 (r160) -- the MTP reference figures are THREE-device numbers: r159 -> r160 has no throughput regression
+
+**Not a release.**  No code, patch or `release.json` change; `v15-6050b467c-r160` (tip `c7adb4f2b`, tree
+`1574b375e`) is unchanged.  This entry corrects a wrong attribution in 261028.001 and records the A/B that
+settles it.
+
+**What was wrong.**  261028.001 ends the gate list with "the tensor figure is below the r159 record's 90.69
+with the same command; the same-binary A/B ... measures 81.3 vs 81.1 t/s, so that gap is the box (GPU pair /
+host state)".  That attribution is **wrong**.  The r159 reference numbers (`benchmarks/mtp-adaptive-
+methodology.md` rule 0 arm quoted in `AGENTS.md`) are **three-device** measurements, and the arm measured
+here was **two devices** (`HIP_VISIBLE_DEVICES=0,2`).  Dense 27B MTP decode scales with the device count
+(90.7 at 3 vs 81.4 at 2), so the comparison was never like for like.
+
+**The A/B (interleaved, same session, same source path `~/llama.cpp`, same `GGML_CUDA_FA_QUANTS` set in both
+build directories, 27B UD-Q4_K_XL, `-c 102400`, bf16 KV, `-n 3000`, prose prompt, `-fit off`):**
+`build-r159` is the previous release's tree; `build-rocm` is r160.
+
+| arm | r159 | r160 |
+|---|---|---|
+| MTP `draft-mtp`, **3 devices**, tensor | **90.8** t/s | **90.7** t/s |
+| MTP plain, 3 devices, tensor | 48.2 | 48.4 |
+| MTP `draft-mtp`, **2 devices (0,2 = x8+x8)**, tensor | **81.4** | **81.4** |
+| MTP `draft-mtp`, 3 devices, layer | 51.7 | 51.6 |
+| MTP `draft-mtp`, 2 devices, layer | 54.5 | 54.6 (acceptance 0.621) |
+
+Acceptance, r160: 0.541 (2 devices, tensor), 0.621 (2 devices, layer).  Protocol A (draft-mtp >= plain on
+both split modes, acceptance > ~0.45) is met on every arm.
+
+**Every other axis, r159 vs r160, interleaved:**
+
+| arm | r159 | r160 |
+|---|---|---|
+| dense pp2048, 2 devices tensor, `-r 5`, round 1 / 2 | 1971.10 / 1987.37 | 1962.55 / 1985.84 |
+| dense tg128, 2 devices tensor, same runs | 46.32 / 46.36 | 46.36 / 46.39 |
+| dense pp2048 / tg128, **1 device** | 1349.98 / 30.69 | 1353.43 / 30.75 |
+| dense tg64 **@ d16384**, 2 devices tensor, 2 rounds | 44.58 / 44.58 | 44.64 / 44.63 |
+| 35B-A3B `-ncmoe 40`, pp / tg64, `-c 32768`, 2 devices tensor, 2 rounds | 1067.3 / 1058.5, 89.6 / 90.4 | 1064.2 / 1065.6, 90.1 / 91.0 |
+
+All within each arm's own run-to-run spread; the one first-reading deviation (pp2048 1981.99 vs 1943.16,
+-2.0 %) does not survive interleaving, and the same-binary reserve A/B on that arm is flat
+(default 1998.86 / 1968.26 vs `LLAMA_KQ_MASK_PACKED_RESERVE=1` 1972.10 / 1966.39).  The `-ncmoe` arm's greedy
+text is byte-identical (`254 chars sha=f60c8ac82d67`) and its load is unchanged apart from the intended one:
+the **host (CPU) compute buffer** 48.29 -> 16.42 MiB at `-c 32768 -ub 512` (exactly the 32 MiB mask), with
+the meta compute buffer (510.00 MiB), the slab (29.19 GiB), the arena (28.62 GiB) and every boundary
+identical.
+
+**The PCIe question, verified on the box.**  Root ports `00:01.1` = **x8**, `00:01.2` = **x4**,
+`00:01.3` = **x8** (all max 32 GT/s; each GPU's own link is x16 @ 32 GT/s behind its switch), and
+`rocm-smi --showbus` maps HIP 0 -> `03:00.0` (root x8), HIP 1 -> `06:00.0` (**x4**), HIP 2 -> `09:00.0`
+(root x8), HIP 3 -> `1a:00.0` (the iGPU).  Every 2-device arm in this release used **`0,2`, the x8+x8
+pair**.  The pair is not a confounder for decode (MTP tensor `draft-mtp`: 81.1-81.4 on `0,2` vs 81.2 on the
+mixed `0,1`) but it is decisive for prefill, as recorded: dense pp2048 2 devices tensor **2003.36** on `0,2`
+vs **1765.71** on `0,1` (**-11.9 %**, link-bound), tg128 flat (46.23 vs 46.15).
+
+**Kept for future A/Bs:** `~/llama.cpp/build-r159` (the r159 tree at the canonical source path, so ccache
+and the compiler command lines match `build-rocm`).
+
+**Rule that follows:** quote the **device count** with every multi-GPU throughput number, and never compare
+a 2-device arm against the 3-device reference.  `AGENTS.md`'s MTP bullet now carries the counts.
+
 ## 261028.001 (r160) -- a text-only M-RoPE context no longer reserves the packed kq mask it never uses (issue #238, blocks 05 + 10)
 
 **Release:** `v15-6050b467c-r160` (base `6050b467c`, tip **`c7adb4f2b`**, tree

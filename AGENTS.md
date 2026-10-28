@@ -442,8 +442,12 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   model file**: `-md` is only for a *separate* draft model.  `scripts/fork-refresh.sh --gates` prints the
   canonical Protocol A command instead of running it because the arm needs a model and a device-count choice
   — that is a prompt to pick them, not a statement that a drafter is missing.  Run the arm on **both split
-  modes** (`-sm layer` and `-sm tensor`; r159 dense 27B UD-Q4_K_XL, `-c 102400`, bf16 KV, `-n 3000`: layer
-  **51.66 vs 24.97 t/s**, acceptance 0.62; tensor **90.69 vs 48.46**, acceptance 0.60), and note that
+  modes** (`-sm layer` and `-sm tensor`; dense 27B UD-Q4_K_XL, `-c 102400`, bf16 KV, `-n 3000`).  **Quote the
+  device count with the numbers** - the reference arm is **3 devices**: layer **51.7** and tensor **90.7**
+  t/s with `--spec-type draft-mtp` (tensor plain 48.4), acceptance 0.62 / 0.60; the **2-device** arms (the
+  `0,2` x8+x8 pair) are layer **54.6 vs 26.6** (acceptance 0.621) and tensor **81.4 vs 44.8**
+  (acceptance 0.541).  A 2-device arm read against the 3-device reference looks like a ~10 % "regression"
+  that is not there (`WORKLOG.md` 261028.002).  Also note that
   `llama-cli` needs `-v` to print its perf/acceptance summary at all.  Never report "MTP gate not run: no
   drafter available" without checking the model's tensors first (`llama_model_loader` logs the MTP head, or
   `gguf-dump --tensors | grep -i 'mtp\|nextn'`).
