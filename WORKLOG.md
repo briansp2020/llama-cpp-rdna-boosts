@@ -2,7 +2,7 @@
 
 ## 261028.007 (r165) -- TODO #109: `hipDeviceEnablePeerAccess` is what costs a replayed decode, so the all-reduce arms were re-cut (dense -> copy engine, host experts -> RCCL's ring, peer access never enabled)
 
-**Release `v15-6050b467c-r165`**, base `6050b467c`, 15 blocks, tip `1b13aa91300a12691a13e3bb8ebdcc1a2ac0aad0`,
+**Release `v15-6050b467c-r165`**, base `6050b467c`, 15 blocks, tip `473485380b19cb6eb52eb1b30345a2dbe5161aaf`,
 tree `c321baad4d8de2382f0a073b638c2d60e4b1cf97`.  Blocks 01 and 10 amended; docs, one gate extension and the
 retirement of `TODO #109`.
 
