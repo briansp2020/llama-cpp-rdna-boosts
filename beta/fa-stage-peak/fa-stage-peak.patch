@@ -1,0 +1,183 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index c602b140e..faf1cb426 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2070,6 +2070,10 @@ struct ggml_backend_cuda_context {
+     bool   fattn_stage_slab[GGML_CUDA_MAX_STREAMS]     = {};
+     size_t fattn_stage_slab_gen[GGML_CUDA_MAX_STREAMS] = {};
+     bool   fattn_stage_oom_warned                  = false;
++    // beta C1: an optional per-context CAP on the staging arena (0 = none).  `llama_context` sets it for
++    // a speculative draft context (`GGML_CUDA_FA_STAGE_DRAFT_MB`), whose staging win is one layer's
++    // amortised conversion rather than sixty -- that is the issue #237 half of the arena's cost.
++    size_t fattn_stage_cap                         = 0;
+ 
+     // Total bytes currently held by the per-stream FA prefill staging arenas that live OUTSIDE the slab.
+     // Those are a raw device allocation outside the compute-graph reserve, so llama_get_memory_breakdown
+@@ -2123,9 +2127,21 @@ struct ggml_backend_cuda_context {
+             fattn_stage_slab_gen[stream_no] = 0;
+         }
+         if (size > fattn_stage_size[stream_no]) {
+-            static const bool prealloc = []() {
++            // 0 = the plain 1.25x ladder (pre-r53), 1 = the r156 ceiling (a growth aims for at most
++            // 4x the request), 2 = EAGER: allocate the hint in one go at the first request (the r149
++            // behaviour).  A ladder is wrong on Windows/WDDM (a freed allocation stays committed, and a
++            // late step lands in shared memory -- issue #138 and the issue #237 follow-up), where the
++            // only safe moment to take VRAM is the first one, so 2 is the default there and 1 elsewhere.
++            static const int prealloc_mode = []() {
+                 const char * e = getenv("GGML_CUDA_FA_STAGE_PREALLOC");
+-                return e == nullptr || atoi(e) != 0;
++                if (e != nullptr) {
++                    return atoi(e);
++                }
++#if defined(_WIN32)
++                return 2;
++#else
++                return 1;
++#endif
+             }();
+             const size_t cached    = fattn_stage_size[stream_no];
+             const size_t new_size  = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
+@@ -2138,8 +2154,9 @@ struct ggml_backend_cuda_context {
+             // growth aims for at most 4x the request that just arrived, never above the hint: a short
+             // prompt stays at the 16 MiB floor and a deep one climbs to the hint in <= 3 steps, which
+             // bounds the WDDM ladder stranding of issue #138 to ~1/3 of the final arena instead of 5x.
+-            const size_t hint_step = (prealloc && size_hint >= size)
+-                ? std::max<size_t>(size_t(1) << 24,
++            const size_t hint_step = size_hint < size ? 0 :
++                prealloc_mode >= 2 ? size_hint :
++                prealloc_mode == 1 ? std::max<size_t>(size_t(1) << 24,
+                       std::min(size_hint, size > SIZE_MAX/4 ? SIZE_MAX : 4*size)) : 0;
+             const size_t want      = std::max(new_size, hint_step);
+             // Outside bytes only: a slab-backed stream already reports through the work region.
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index f8e596e6f..265513624 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1654,6 +1654,11 @@ void launch_fattn(
+         };
+         stage_hint = (stage_wants_K ? full_bytes(K) : 0) + (stage_wants_V ? full_bytes(V) : 0);
+     }
++    // beta C1: a speculative draft context may cap its arena below the root-based hint (its staging win
++    // is one layer's amortised conversion, not sixty).  The cap only ever LOWERS the hint.
++    if (ctx.fattn_stage_cap != 0 && stage_hint > ctx.fattn_stage_cap) {
++        stage_hint = ctx.fattn_stage_cap;
++    }
+     char * stage_buf = stage_req != 0 ? (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, stage_req, stage_hint) : nullptr;
+     const bool stage_ok = stage_buf != nullptr;
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+index e849ccbf8..240ef1f5b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+@@ -274,6 +274,16 @@ size_t ggml_backend_cuda_fattn_stage_bound(ggml_backend_t backend) {
+     return 2*cap;
+ }
+ 
++// beta C1: an optional per-context cap on the FA prefill staging arena (0 = none).  `llama_context`
++// sets it for a speculative draft context only (`GGML_CUDA_FA_STAGE_DRAFT_MB`).
++void ggml_backend_cuda_fattn_stage_cap_set(ggml_backend_t backend, size_t cap_bytes) {
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    if (ctx == nullptr) {
++        return;
++    }
++    ctx->fattn_stage_cap = cap_bytes;
++}
++
+ size_t ggml_backend_cuda_fattn_stage_used(ggml_backend_t backend) {
+     const ggml_backend_cuda_context * ctx = (const ggml_backend_cuda_context *) backend->context;
+     return ctx != nullptr ? ctx->fattn_stage_bytes() : 0;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+index f67f584ee..b8da90251 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+@@ -22,5 +22,6 @@ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend);
+ bool   ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, size_t slice_off, int split_axis);
+ size_t ggml_backend_cuda_fattn_stage_bound(ggml_backend_t backend);
+ size_t ggml_backend_cuda_fattn_stage_used(ggml_backend_t backend);
++void   ggml_backend_cuda_fattn_stage_cap_set(ggml_backend_t backend, size_t peak_bytes);
+ size_t ggml_backend_cuda_h2d_stage_used(ggml_backend_t backend);
+ size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t max_table);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7998a1c30..329b9d34c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -8035,6 +8035,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_cuda_fattn_stage_used") == 0) {
+         return (void *) ggml_backend_cuda_fattn_stage_used;
+     }
++    if (strcmp(name, "ggml_backend_cuda_fattn_stage_cap_set") == 0) {
++        return (void *) ggml_backend_cuda_fattn_stage_cap_set;
++    }
+     if (strcmp(name, "ggml_backend_cuda_h2d_stage_bound") == 0) {
+         return (void *) ggml_backend_cuda_h2d_stage_bound;
+     }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 05c4dea52..3b257eb5e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2743,6 +2743,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     }
+     n_queued_tokens += n_tokens_all;
+ 
++    // beta C1: apply the speculative-draft staging-arena cap (a no-op unless GGML_CUDA_FA_STAGE_DRAFT_MB
++    // is set on a draft context; the cap is process-lifetime, so this is idempotent).
++    update_fattn_stage_cap();
++
+     output_swaps.clear();
+     embd_batch_idxs.clear();
+     lf_dev_rows.clear();
+@@ -5350,6 +5354,40 @@ static size_t llama_fattn_stage_accounting(ggml_backend_t backend, bool reserve,
+     return std::min(bound, f16_kv_bytes);
+ }
+ 
++// beta C1: a speculative draft context may cap its FA prefill staging arena.  The draft stages the same
++// prefix as the target, so with a quantized cache an MTP draft doubled the arena while its staging win is
++// one layer's amortised conversion rather than sixty (issue #237).  `GGML_CUDA_FA_STAGE_DRAFT_MB` sets the
++// cap in MiB (unset/0 = no cap, i.e. the pre-change behaviour); only a non-default context type is capped,
++// and only the CUDA backend implements the hook.
++void llama_context::update_fattn_stage_cap() {
++    size_t cap = 0;
++    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT && cparams.flash_attn &&
++            cparams.type_k != GGML_TYPE_F16 && cparams.type_k != GGML_TYPE_F32) {
++        static const size_t draft_cap = [] {
++            const char * e = getenv("GGML_CUDA_FA_STAGE_DRAFT_MB");
++            return e != nullptr ? (size_t) std::max<int64_t>(0, atoll(e)) << 20 : (size_t) 0;
++        }();
++        cap = draft_cap;
++    }
++    if (cap == 0) {
++        return;   // no cap requested: leave the backend alone
++    }
++
++    for (ggml_backend_t backend : backend_ptrs) {
++        if (backend == nullptr) {
++            continue;
++        }
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
++        if (reg == nullptr) {
++            continue;
++        }
++        auto cap_fn = (void (*)(ggml_backend_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fattn_stage_cap_set");
++        if (cap_fn != nullptr) {
++            cap_fn(backend, cap);
++        }
++    }
++}
++
+ // The op-offload H2D staging ring (block 06) is also a raw device allocation outside the compute
+ // reserve.  `reserve` (the --fit / no_alloc path) uses the worst-case bound for a model whose largest
+ // host-resident weight tensor is `max_table` bytes (the ring holds one table per slot); the live path
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 2cc324ba4..afc99b327 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -240,6 +240,9 @@ struct llama_context {
+             int64_t                          t_loop_start);
+ 
+ private:
++    // beta C1: apply GGML_CUDA_FA_STAGE_DRAFT_MB to a speculative draft context's staging arena.
++    void update_fattn_stage_cap();
++
+     //
+     // output
+     //
