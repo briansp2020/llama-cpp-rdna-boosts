@@ -1,3 +1,29 @@
+From 24a0fbe9ded5bd7763cd4449fce0dc22cae0dfd7 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Tue, 27 Oct 2026 19:35:52 -0500
+Subject: [PATCH] beta: fa-stage-peak -- the FA staging arena as ONE early
+ allocation (issue #237 follow-up)
+
+Eager (`GGML_CUDA_FA_STAGE_PREALLOC=2`, now the Windows/WDDM default) reserves the arena in a single
+allocation at the first prefill request instead of growing a ladder: on WDDM a freed allocation stays
+committed and a late step lands in shared memory, which is issue #138 and the issue #237 follow-up
+(the reporter measured the shift as an exact 1024/2048 MiB move from dedicated to shared against r149).
+
+Also adds `GGML_CUDA_FA_STAGE_DRAFT_MB` (default off) to cap a speculative draft context's arena --
+the draft stages the same prefix as the target while its staging win is one layer's amortised
+conversion, which is the issue #237 half of the cost.
+
+Allocation-only: PPL 6.6302 unchanged, prefill-logit KLD 0.000000 / same-top-p 100.000 %.
+---
+ ggml/src/ggml-cuda/common.cuh                 | 25 ++++++++++--
+ ggml/src/ggml-cuda/fattn-common.cuh           |  5 +++
+ .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    | 10 +++++
+ .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |  1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  3 ++
+ src/llama-context.cpp                         | 38 +++++++++++++++++++
+ src/llama-context.h                           |  3 ++
+ 7 files changed, 81 insertions(+), 4 deletions(-)
+
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index c602b140e..faf1cb426 100644
 --- a/ggml/src/ggml-cuda/common.cuh
@@ -181,3 +207,6 @@ index 2cc324ba4..afc99b327 100644
      //
      // output
      //
+-- 
+2.56.0
+

@@ -10,9 +10,9 @@
 | field | value |
 |---|---|
 | patch | `fa-stage-peak.patch` (in this directory) |
-| sha256 | `257fe48ba4bfc802f578203be5505ba7f4a6843df493360d530cfc6041c82de4` |
+| sha256 | `99d5b6647256c239d97b42fba225071b75cba3e17a22ef0a0cf07c74c7cee1fa` |
 | base | delivery `v15-6050b467c-r158`, tip `217b1c999`, tree `8851bb0024e547142ec533bd76ec18912539edad` |
-| applies | `git apply --check` clean on a fresh `scripts/apply-all.sh` checkout of that tree (verified here) |
+| applies | verified here on the release tree: `git apply --check` clean **and** `git am` clean (one commit) — the latter is what `scripts/apply-all.sh --include-beta` uses |
 | files | 7, +81/-4 (`common.cuh`, `fattn-common.cuh`, `ggml-cuda.cu` + hooks, `llama-context.{h,cpp}`) |
 | knobs | `GGML_CUDA_FA_STAGE_PREALLOC` (`0`/`1`/`2`), `GGML_CUDA_FA_STAGE_DRAFT_MB` (new), `GGML_CUDA_FA_STAGE_MAX_MB` (unchanged) |
 
