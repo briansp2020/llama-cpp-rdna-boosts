@@ -1,5 +1,100 @@
 # WORKLOG - dated delivery records
 
+## 261028.009 (r167) -- TODO #103 closed: the "~30x VRAM collapse" is driver page migration, not a llama.cpp path, and the VRAM limit now reports itself
+
+**Release `v15-6050b467c-r167`**, base `6050b467c`, 15 blocks, tip `38aac1e499de319621bc6be45fba5515be266e8f`,
+tree `4d971189492f6c81d29d58b0fc033e7dc50c6e21`.  **Block 10 amended** (3 hunks in
+`ggml/src/ggml-cuda/ggml-cuda.cu`: +78 / -4 — the low-water sampling, two one-shot reports, and the corrected
+mechanism note in block 09's `GGML_CUDA_MIN_FREE_MIB` comment).  One new env var (`GGML_CUDA_LOW_FREE_MIB`,
+default-on diagnostic) and no default changed.  No kernel, dispatch row or numerics path changed, so the
+prefill-logit gate reads **0.000000 / 100.000 %** as expected.  Record + tools:
+`archive/work/vram-limit-103/`.
+
+### What #103 was, and what it turned out to be
+
+r135 (issue #219) recorded that on one gfx1201, dropping the free VRAM at process start from 14.46 GiB to
+14.06 GiB turned a 13 s request into a 384 s one (prefill 1127 -> 35 t/s, decode 53 -> 1.5-3 t/s), and left
+"is the GPU doing 30x the work or is the host stalling 30x" as the next step.  **Neither: it is the driver
+moving the *other* client's memory.**  Measured on r166/r167 with the same model, flags and a 15790-token
+prompt, using a holder process to set the free VRAM (64 runs; the distinct cells are below):
+
+| free VRAM at start | holder | prefill | GTT peak |
+|---|---|---:|---:|
+| 32 554 MiB (none) | — | **1117.9 / 1120.1 t/s** | 20 MiB |
+| 15 954 MiB | one 16.4 GB BO | 626.1 t/s | **27.6 GB** |
+| 15 754 MiB | one 16.4 GB BO | **577.7 t/s** | **16.7 GB** |
+| 15 754 MiB | the same hold in 64 MiB BOs | **1077.3 / 1074.4 t/s** | 26 MiB |
+| 15 754 MiB | 64 MiB BOs, live (touching) | 972.1 t/s, 49.2 decode | 26 MiB |
+| 15 704 MiB / 15 654 / 15 604 | any | **clean abort** (`ROCm error: out of memory`) | — |
+
+The last two rows are the finding: **at the same free VRAM** a single huge competing BO costs 48 % of
+prefill and the identical hold in 64 MiB BOs costs nothing, because TTM evicts a whole BO — the holder's
+16.4 GB buffer is migrated to system memory in full to free a few hundred MiB, and the migration lands
+inside the measured window.  The at-the-limit cliff on this box is **~50 MiB wide** (15 754 MiB free: full
+speed; 15 704 MiB free: a clean `out of memory`), i.e. the "narrow band" exists but it is *run-or-refuse*,
+not *run-30x-slower*.
+
+Three things the r135 record had assumed are now **measured** the other way:
+
+* **HIP does not over-commit and never demotes a resident working set.**  With 1 048 MiB free,
+  `hipMalloc(2048 MiB)` fails `out of memory`; a 30 GiB resident working set reads at **505-513 GB/s** with
+  1 684 MiB free (versus 513 GB/s roomy).  So "the driver evicts resident weight pages to GTT" is not what
+  happens to the *requester* — nothing of the run's own is moved, and `rocm-smi`'s process figure (cited in
+  r135 as proof the weights stayed resident) cannot distinguish VRAM from GTT anyway.
+* **It is not the FA staging stand-down.**  `GGML_CUDA_FA_STAGE_MAX_MB=0` on a roomy card measures
+  1106 t/s — the same as staging on — so the arena cannot be worth 2x, let alone 30x.  r135's *eager* hint
+  (`GGML_CUDA_FA_STAGE_PREALLOC=2`, that tree's behaviour) turns the tight cell into an *earlier OOM*, not
+  a slow run.
+* **It is not graph churn.**  The graph census is identical in a 588 t/s arm and a 1117 t/s arm
+  (`direct=57 replay=51 capture=3 properties_changed=1`, `graphs reused = 10`), and not clocks either (GFX
+  2764-3427 MHz, `GPU use 100 %`, mem 1258 vs 1124 MHz — at most 11 %).  The workspace pool's recovery is
+  `alloc … failed, flushing … and retrying` then a clean error; it has no slow path.
+
+**Conclusion:** #103 is retired as *not reproducible as a llama.cpp path* — a 30x cell is a driver/OS
+page-migration effect (on Windows it is the WDDM paging the r135 budget knob exists to avoid), and what the
+delivery can do, it now does.
+
+### The change (block 10)
+
+1. **The free-VRAM low-water mark is tracked on every config.**  `ggml_cuda_device_malloc` sampled it only
+   while the movable-boundary slab was active, and only `GGML_CUDA_SLAB_STATS` printed it — so a
+   dense/plain run, the shape #103 was found on, recorded nothing about how close it came.  It is now
+   sampled at every `>= 16 MiB` allocation (one `cudaMemGetInfo`; the 16 MiB gate keeps the workspace pool's
+   small transient misses out of the hot path) and kept per device.
+2. **`GGML_CUDA_LOW_FREE_MIB`** (default **512**, `0` = off, `=0` is the A/B arm): one WARN per device when
+   an allocation leaves less than that free, naming the numbers and the knobs (`-c` / `-ub` / `-ngl`, a
+   smaller quant, `GGML_CUDA_MIN_FREE_MIB`).  It refuses nothing and changes no behaviour.  **Diagnostic,
+   default-on** per the default-on policy; skipped while the slab is armed (the slab parks nearly all free
+   VRAM by design).
+3. **A refused allocation reports free/total and the low-water mark** instead of only
+   `cudaMalloc failed: out of memory`, so `ROCm error: out of memory` arrives with the arithmetic.
+4. The `GGML_CUDA_MIN_FREE_MIB` comment's "30x slower because the driver evicts resident weight pages"
+   sentence is replaced with the measured statement (that paragraph lives in block 09 and is edited by
+   block 10, which already owns this function's tail).
+
+### Gates
+
+| gate | result |
+|---|---|
+| `scripts/validate-set.sh` | green: 15 patch files + `rdna-boosts-all.patch` verify, strict 15/15 `git am` on a fresh tarball, applied tree `4d97118949` |
+| per-block build gate (`--changed-from 29219f9cb --fast`) | **2/2** (block 10, tip), 14 s; `all` (incl. `tests/`) built at the tip |
+| prefill-logit gate (`scripts/gate-prefill-logits.sh`) | **mean KLD 0.000000, same-top-p 100.000 %** — bit-identical, as expected (no kernel touched) |
+| coherence, 4B Q8_0 same-seed text | `111 chars sha=7e6229b260f6` — identical to the r166 binary |
+| MTP smoke, 27B GSQ + `draft-mtp-adaptive`, 1 GPU, `-n 3000`, `-p prompts/prose-rdna-boosts.txt` | prompt 5298 tok **1079 t/s**, decode **82.4 t/s**, draft 2772 / accepted 2075 (0.749) |
+| neutrality A/B, interleaved, 27B GSQ + MTP, 15790-token prompt | r166 prefill **1102.9 / 1095.1** t/s, decode 61.8 / 61.5; r167 **1093.1 / 1103.3**, 61.6 / 61.8 — neutral |
+| the new warning, at a tight budget | fires once: `device 0 is at its VRAM limit: 386.50 MiB free of 32624.00 MiB after a 178.50 MiB allocation` — in an arm that then completes at **1113 t/s** |
+| the new refusal report | `a 178.50 MiB device allocation failed on device 0: 0.00 MiB free of 32624.00 MiB, run low-water mark 0.00 MiB` in an arm that aborts (the pool's `flushing … and retrying` line follows it) |
+| `scripts/check-gpu-faults.sh --since "8 hours ago"` | clean |
+
+### Docs
+
+`ENVIRONMENT.md` (the new `GGML_CUDA_LOW_FREE_MIB` row, and the `GGML_CUDA_MIN_FREE_MIB` mechanism corrected
+in place), `patches/README.md` (block 09 section: the new diagnostic + the retired reading),
+`AGENTS.md` (the over-budget fact now says "do not re-derive a silent over-commit"), `TODO.md` (#103 row and
+section removed — the item is closed, not parked), `README.md`/`TODO.md` release pointer, `release.json`,
+`archive/work/vram-limit-103/` (the campaign record: the arms, the three probes, the log excerpts, the
+tools that reproduce them).
+
 ## 261028.008 (r166) -- TODO #102 closed: the band has its head-256 **GQA-8** arm after all (Qwen3.6-35B-A3B), and the width probe can finally tokenize a corpus
 
 **Release `v15-6050b467c-r166`**, base `6050b467c`, 15 blocks, tip `29219f9cbfd4f3aa89bca0c75270addebbe0843f`,

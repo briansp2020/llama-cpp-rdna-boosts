@@ -1,0 +1,5 @@
+# vram_probe 2048 MiB with 1.05 GiB free — hipMalloc refuses, it does not over-commit (2026-10-28T15:16:25-05:00)
+# holder: vram_fill: 1 devices, 31500 MiB each, chunk 31500 MiB, touch 0 vram_fill: dev 0 held 31500 MiB in 1 BOs, free now 1048 MiB of 32624 MiB 
+before: free 1048 MiB total 32624 MiB
+hipMalloc(2048 MiB) FAILED: out of memory
+# exit=3

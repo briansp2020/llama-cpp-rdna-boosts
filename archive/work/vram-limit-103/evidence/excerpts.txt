@@ -1,0 +1,20 @@
+# log excerpts (r167 session, gfx1201, ROCm 10.1.0)
+
+## the new default-on low-free warning (a run that completes at full speed, 386.50 MiB free at its peak)
+0.03.550.458 W ggml_cuda_low_free_warn: device 0 is at its VRAM limit: 386.50 MiB free of 32624.00 MiB after a 178.50 MiB allocation.  The next growth can fail with out-of-memory (on Windows/WDDM the allocation is paged instead and a later access can fault -- issue #219), and a driver that has to migrate another client's buffers to make room costs this run PCIe time.  Lower -c / -ub / -ngl or use a smaller quant; GGML_CUDA_MIN_FREE_MIB=<MiB> turns this into a deterministic refusal first.  (Diagnostic only -- silence it with GGML_CUDA_LOW_FREE_MIB=0.)
+
+## the new refusal report (this arm then aborted: ROCm error: out of memory)
+0.03.578.789 W ggml_cuda_oom_warn: a 178.50 MiB device allocation failed on device 0: 0.00 MiB free of 32624.00 MiB, run low-water mark 0.00 MiB.  Lower -c / -ub / -ngl or use a smaller quant; GGML_CUDA_MIN_FREE_MIB=<MiB> refuses earlier with a message like this one, and GGML_CUDA_LOW_FREE_MIB (default 512) warns before the run reaches this state.
+0.03.578.791 D ROCm pool[0]: alloc of 178.50 MiB failed, flushing 354.07 MiB of cached buffers and retrying
+
+## the FA prefill staging stand-down (a ~2x prefill cost, NOT the 30x: staging off on a roomy card measures 1106 t/s, the same as staging on)
+0.09.616.958 W fattn_stage_try_get: not enough free device memory for a 31 MiB FA prefill staging buffer, reading the K/V cache natively instead (prefill may be slower)
+0.12.237.937 W fattn_stage_try_get: not enough free device memory for a 28 MiB FA prefill staging buffer, reading the K/V cache natively instead (prefill may be slower)
+
+## identical graph census in a 983 t/s tight arm and a 1114 t/s roomy arm (GGML_CUDA_GRAPH_TRACE=1): not graph churn
+-- trace0: prompt eval time =   14167.79 ms / 15790 tokens (    0.90 ms per token,  1114.50 tokens per second
+graph_compute calls: direct=57 replay=51 capture=3 properties_changed=1
+graphs reused =         10
+-- trace15900: prompt eval time =   16052.45 ms / 15790 tokens (    1.02 ms per token,   983.65 tokens per second
+graph_compute calls: direct=57 replay=51 capture=3 properties_changed=1
+graphs reused =         10

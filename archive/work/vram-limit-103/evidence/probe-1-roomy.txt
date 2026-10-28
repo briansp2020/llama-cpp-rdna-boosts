@@ -1,0 +1,10 @@
+# vram_probe 2048 MiB, roomy card (2026-10-28T15:16:18-05:00)
+before: free 32554 MiB total 32624 MiB
+hipMalloc(2048 MiB) ok, free now 30506 MiB
+after memset: free 30358 MiB
+write 2048 MiB:     3.82 ms    561.4 GB/s
+read  2048 MiB:     4.99 ms    430.5 GB/s
+write 2048 MiB:     3.47 ms    618.8 GB/s
+read  2048 MiB:     4.26 ms    504.4 GB/s
+write 2048 MiB:     3.49 ms    614.7 GB/s
+read  2048 MiB:     4.23 ms    507.8 GB/s

@@ -1,0 +1,6 @@
+# vram_probe2 12288 18432 — no demotion of a resident buffer (2026-10-28T15:16:19-05:00)
+start: free 32554 MiB of 32624 MiB
+A=12288 MiB allocated, free 20118 MiB; A read 512.7 GB/s
+B=18432 MiB allocated, free 1684 MiB; A read 511.3 GB/s, B read 511.7 GB/s
+A read 507.6 GB/s, B read 510.9 GB/s
+A read 506.2 GB/s, B read 513.1 GB/s
