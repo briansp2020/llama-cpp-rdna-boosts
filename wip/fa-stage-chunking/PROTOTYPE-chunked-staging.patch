@@ -1,0 +1,475 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index f8e596e6f..1b8b2c1be 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1278,6 +1278,10 @@ __launch_bounds__(D, 1)
+ static __global__ void flash_attn_stream_k_fixup_uniform(
+         float * dst_ptr,
+         const float2 * dst_fixup_ptr,
++        // wip/fa-stage-chunking: when non-null, write the UNNORMALIZED combined partial for this row
++        // instead of the final result, plus its (max, rowsum), so the launcher can merge KV chunks
++        // itself.  `kv_partial_meta` is indexed element-major (one entry per output row).
++        float2 * kv_partial_meta,
+         const int ne01, const int ne02,
+         const int ne12, const int nblocks_stream_k,
+         const int gqa_ratio,
+@@ -1351,8 +1355,15 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
+         max_val = max_val_new;
+     }
+ 
++    if (kv_partial_meta != nullptr) {
++        // wip/fa-stage-chunking: hand the merged, still-unnormalized partial to the caller.
++        const int64_t row = ((int64_t) sequence*ne01 + jt*ncols1 + j)*ne02 + zt_Q + c;
++        kv_partial_meta[row] = make_float2(max_val, rowsum);
++        *dst = dst_val;
++    } else {
+     // Write back final result:
+     *dst = dst_val / rowsum;
++    }
+ }
+ 
+ // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
+@@ -1362,6 +1373,7 @@ __launch_bounds__(D, 1)
+ static __global__ void flash_attn_stream_k_fixup_general(
+         float * dst_ptr,
+         const float2 * dst_fixup_ptr,
++        float2 * kv_partial_meta,   // wip/fa-stage-chunking: see the uniform variant
+         const int ne01, const int ne02,
+         const int gqa_ratio,
+         const int total_work,
+@@ -1462,8 +1474,15 @@ static __global__ void flash_attn_stream_k_fixup_general(
+         kbc_stop = kbc;
+     }
+ 
++    if (kv_partial_meta != nullptr) {
++        // wip/fa-stage-chunking: hand the merged, still-unnormalized partial to the caller.
++        const int64_t row = ((int64_t) sequence*ne01 + jt*ncols1 + j)*ne02 + zt_Q + c;
++        kv_partial_meta[row] = make_float2(max_val, rowsum);
++        *dst = dst_val;
++    } else {
+     // Write back final result:
+     *dst = dst_val / rowsum;
++    }
+ }
+ 
+ template<int D> // D == head size
+@@ -1524,6 +1543,55 @@ static __global__ void flash_attn_combine_results(
+     dst[tid] = VKQ_numerator / VKQ_denominator;
+ }
+ 
++// wip/fa-stage-chunking: merge one KV chunk's unnormalized partial into the running accumulator.
++// One block per output row, one thread per DV element.  `acc`/`acc_meta` stay unnormalized until
++// `final`, so the next chunk can merge into them; only the final call divides by the rowsum.
++// `part == nullptr` (final only) just normalizes.  Same arithmetic as flash_attn_combine_results.
++static __global__ void flash_attn_chunk_merge(
++        float  * __restrict__ acc,             // [nrows][D], unnormalized, in/out
++        float2 * __restrict__ acc_meta,        // [nrows]   (max, rowsum), in/out
++        const float  * __restrict__ part,      // [nrows][D] or nullptr
++        const float2 * __restrict__ part_meta, // [nrows]    or nullptr
++        const int D) {
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++
++    __shared__ float2 s_meta;
++    if (tid == 0) {
++        s_meta = acc_meta[row];
++    }
++    __syncthreads();
++
++    float2 m = s_meta;
++    float * a = acc + (int64_t) row*D;
++    if (part != nullptr) {
++        const float2 pm = part_meta[row];
++        const float kqmax  = fmaxf(m.x, pm.x);
++        const float s_acc  = expf(m.x  - kqmax);
++        const float s_part = expf(pm.x - kqmax);
++        m.x = kqmax;
++        m.y = s_acc*m.y + s_part*pm.y;
++
++        const float * b = part + (int64_t) row*D;
++        a[tid] = s_acc*a[tid] + s_part*b[tid];
++    }
++    __syncthreads();
++    if (tid == 0) {
++        acc_meta[row] = m;
++    }
++}
++
++// Normalize the finished accumulator into the op's output.
++static __global__ void flash_attn_chunk_finalize(
++        const float  * __restrict__ acc,
++        const float2 * __restrict__ acc_meta,
++        float  * __restrict__ out,
++        const int D) {
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    out[(int64_t) row*D + tid] = acc[(int64_t) row*D + tid] / acc_meta[row].y;
++}
++
+ // Q pre-scaled and converted to half2 pairs, contiguous as [ne03][ne02][ne01][ne00/2]. The tile
+ // kernel reads Q from here with warp-uniform loads through the cache instead of staging it in
+ // shared memory; the conversion is the one the kernel did itself (scale in fp32, then to half).
+@@ -1654,7 +1722,67 @@ void launch_fattn(
+         };
+         stage_hint = (stage_wants_K ? full_bytes(K) : 0) + (stage_wants_V ? full_bytes(V) : 0);
+     }
+-    char * stage_buf = stage_req != 0 ? (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, stage_req, stage_hint) : nullptr;
++    // wip/fa-stage-chunking: chunked prefill staging.  Instead of one prefix-sized arena, ring S slots
++    // of `chunk_rows` KV rows each: convert a chunk, launch the FA kernel for that KV range, merge its
++    // unnormalized partial into a running accumulator (online softmax), repeat.  The staged memory is
++    // then O(chunk_rows) instead of O(n_kv), which is what makes #138/#237/the WDDM follow-up
++    // structurally impossible instead of something the growth policy has to survive.
++    //   GGML_CUDA_FA_STAGE_CHUNK = rows per chunk (0/unset = off, the whole-prefix arena as today).
++    // Only the staged, non-sparse, non-stream-K prefill path is chunked (see the notes in the campaign
++    // record: the mask group skip and KV_max are disabled for a chunk -- they are exact optimizations).
++    static const int chunk_rows_env = [] {
++        const char * e = getenv("GGML_CUDA_FA_STAGE_CHUNK");
++        return e != nullptr ? atoi(e) : 0;
++    }();
++    const int64_t n_kv_total = K->ne[1];
++    int chunk_rows_use = 0;
++    if (chunk_rows_env > 0) {
++        // whole KV tiles only, so a chunk never splits an nbatch_fa tile
++        chunk_rows_use = std::max(nbatch_fa, (chunk_rows_env / nbatch_fa) * nbatch_fa);
++        if (chunk_rows_use > n_kv_total) {
++            chunk_rows_use = (int) n_kv_total;
++        }
++    }
++    // Chunking converts every staged operand per chunk, so it needs BOTH native-capable operands to be
++    // staged (a mixed staged/native op would need the native operand's cache pointer rebased too).
++    const bool chunk_both_staged =
++        (kv_native_K == FATTN_KV_NATIVE_NONE || stage_wants_K) &&
++        (kv_native_V == FATTN_KV_NATIVE_NONE || stage_wants_V || V_is_K_view);
++    // A chunked launch forces the per-output-tile (non-stream-K) grid itself (the same kernel handles
++    // both grids; stream_k only chooses the grid and the fixup), so the kernel's own choice does not
++    // block chunking.
++    // A chunk needs a stream-K split of its own (>= 2 KV tiles) and at least two chunks; shallower
++    // prefixes keep the whole-prefix arena, which is small there anyway.
++    bool chunk = chunk_rows_use >= 2*nbatch_fa && n_kv_total >= 2*(int64_t) chunk_rows_use &&
++        stage_req != 0 && !use_sparse && !native_width && chunk_both_staged;
++    const int chunk_slots = 2;
++    size_t ring_bytes = 0;
++    if (chunk) {
++        const size_t chunk_elems = (size_t) ggml_nelements(K) * (size_t) chunk_rows_use / (size_t) std::max<int64_t>(n_kv_total, 1);
++        const size_t kb = chunk_elems * sizeof(half);
++        ring_bytes = (size_t) chunk_slots * (kb + (V_is_K_view ? 0 : kb));
++    }
++    if (getenv("GGML_CUDA_FA_STAGE_CHUNK_DEBUG") != nullptr) {
++        static int dbg = 0;
++        if (dbg < 24 && Q->ne[1] > 8) {
++            dbg++;
++            GGML_LOG_WARN("FA_CHUNK_DBG rows=%d nbatch_fa=%d n_kv=%lld stage_req=%.1f MiB wantsK=%d wantsV=%d stream_k=%d native_width=%d chunk=%d\n",
++                chunk_rows_env, nbatch_fa, (long long) K->ne[1], (double) stage_req/1048576.0,
++                (int) stage_wants_K, (int) stage_wants_V, (int) stream_k, (int) native_width, (int) chunk);
++        }
++    }
++    char * stage_buf = nullptr;
++    if (chunk) {
++        // The ring is served by the same arena: the arena simply never needs to be larger than
++        // chunk_slots x chunk_rows of F16 K/V, whatever the depth.
++        stage_buf = (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, ring_bytes, 0);
++        if (stage_buf == nullptr) {
++            chunk = false;   // no room for the ring: fall back to the whole-prefix arena path below
++        }
++    }
++    if (!chunk) {
++        stage_buf = stage_req != 0 ? (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, stage_req, stage_hint) : nullptr;
++    }
+     const bool stage_ok = stage_buf != nullptr;
+ 
+     const bool use_native_K = (native_width || !stage_ok || !stage_cap_K) && kv_native_K != FATTN_KV_NATIVE_NONE;
+@@ -1709,6 +1837,17 @@ void launch_fattn(
+     size_t nb22 = V->nb[2];
+     size_t nb23 = V->nb[3];
+ 
++    // wip/fa-stage-chunking: in chunked mode the F16 copy is one CHUNK of rows (dim1), converted per
++    // chunk inside the launch loop, so the strides below describe the chunk-dense layout and no
++    // whole-tensor conversion runs here.
++    if (chunk) {
++        nb11 = K->ne[0]*sizeof(half);
++        nb12 = (size_t) chunk_rows_use*nb11;
++        nb13 = (size_t) K->ne[2]*nb12;
++        nb21 = nb11;
++        nb22 = nb12;
++        nb23 = nb13;
++    } else
+     if (need_f16_K && K->type != GGML_TYPE_F16 && !use_native_K) {
+         const size_t bs = ggml_blck_size(K->type);
+         const size_t ts = ggml_type_size(K->type);
+@@ -1742,6 +1881,9 @@ void launch_fattn(
+         K_data = (char *) K_f16;
+     }
+ 
++    if (chunk) {
++        // nothing: the chunk-dense V strides are set above (V_is_K_view shares K's chunk)
++    } else
+     if (need_f16_V && V->type != GGML_TYPE_F16 && !use_native_V) {
+         if (V_is_K_view) {
+             V_data = K_data;
+@@ -1805,7 +1947,11 @@ void launch_fattn(
+     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
+     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
+     //     multiple sequences of possibly different lengths.
+-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
++    // wip/fa-stage-chunking: a chunked launch disables the two exact optional paths that are indexed
++    // by the ABSOLUTE KV position (the fully-masked group bitmap and the per-tile KV_max bound): both
++    // are whole-op scans and neither can be sliced without threading a kv_start into the kernel (a
++    // follow-up; they are optimizations, so disabling them is correctness-neutral).
++    const bool scan_mask = !chunk && !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+     if (scan_mask) {
+         const int64_t s31 = mask->nb[1] / sizeof(half2);
+         const int64_t s33 = mask->nb[3] / sizeof(half2);
+@@ -1853,12 +1999,12 @@ void launch_fattn(
+     // prefill, and the band when band_skip: the packed mask is the only form that can serve a batch
+     // holding several slots (each tile is classified against its own rows).
+     const bool kq_block_skip_packed =
+-        kq_skip_ok && cell_pos == nullptr && mask != nullptr && (Q->ne[1] > 8 || band_skip) &&
++        !chunk && kq_skip_ok && cell_pos == nullptr && mask != nullptr && (Q->ne[1] > 8 || band_skip) &&
+         K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
+     const uint32_t * kq_blocks_arg = nullptr;
+ 
+-    if (kq_block_skip_derived) {
++    if (kq_block_skip_derived && !chunk) {
+         const int64_t n_kv = K->ne[1];
+         GGML_ASSERT(cell_pos->ne[0] == n_kv);
+         GGML_ASSERT(tok_lo->ne[0] == Q->ne[1]);
+@@ -1911,7 +2057,10 @@ void launch_fattn(
+         kq_blocks_arg = kq_blocks.ptr;
+     }
+ 
+-    const int * kv_max_arg = KV_max.ptr;
++    // wip/fa-stage-chunking: a chunk computes with the chunk-local KV indices, so the absolute-KV
++    // scan results do not apply.
++    kq_blocks_arg = chunk ? nullptr : kq_blocks_arg;
++    const int * kv_max_arg = chunk ? nullptr : KV_max.ptr;
+ 
+     const dim3 block_dim(warp_size, nwarps, 1);
+     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
+@@ -1948,7 +2097,7 @@ void launch_fattn(
+     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+ 
+     dim3 blocks_num;
+-    if (stream_k) {
++    if (stream_k && !chunk) {
+         // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
+         const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
+ 
+@@ -2019,7 +2168,7 @@ void launch_fattn(
+         }
+     } else {
+         // parallel_blocks must not be larger than what the tensor size allows:
+-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
++        parallel_blocks = chunk ? 1 : std::min(parallel_blocks, ntiles_KV);
+ 
+         // Decode and speculative verify batches (n_q <= 8) must use a query-width-
+         // independent KV split: ntiles_dst is a function of Q->ne[1]
+@@ -2034,7 +2183,9 @@ void launch_fattn(
+         const int blocks_per_wave = nsm * max_blocks_per_sm;
+         int nwaves_best = 0;
+         int efficiency_percent_best = 0;
+-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
++        // wip/fa-stage-chunking: a chunked launch is one block per output tile over the chunk's KV, and
++        // the chunk merge is the launcher's; the occupancy/efficiency search does not apply.
++        for (int parallel_blocks_test = parallel_blocks; !chunk && parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+             const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
+             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+@@ -2059,6 +2210,11 @@ void launch_fattn(
+             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
+             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+         }
++        if (chunk) {
++            // two slots: [0] the running accumulator, [1] the current chunk's unnormalized partial
++            dst_tmp.alloc(2*ggml_nelements(KQV));
++            dst_tmp_meta.alloc(2*ggml_nrows(KQV));
++        }
+     }
+ 
+     float scale         = 1.0f;
+@@ -2093,6 +2249,167 @@ void launch_fattn(
+         CUDA_CHECK(cudaGetLastError());
+     }
+ 
++    // ---------------------------------------------------------------------------------------------
++    // wip/fa-stage-chunking: chunked prefill.  One conversion + one STREAM-K launch per KV chunk over
++    // the ring (the same grid/split/fixup the unchunked prefill uses), each handing back an
++    // unnormalized partial + (max, rowsum); the chunks are merged here with an online-softmax update.
++    // The staged memory is the ring, not the prefix.
++    // ---------------------------------------------------------------------------------------------
++    if (chunk) {
++        const int64_t nelem_q = ggml_nelements(KQV);
++        const int64_t nrows_q = ggml_nrows(KQV);
++        const int     DV_q    = (int) KQV->ne[0];
++
++        float  * acc       = dst_tmp.ptr;
++        float2 * acc_meta  = dst_tmp_meta.ptr;
++        float  * part      = dst_tmp.ptr + nelem_q;
++        float2 * part_meta = dst_tmp_meta.ptr + nrows_q;
++
++        // chunk-dense F16 byte sizes per ring slot (nb11/nb12 were set to the chunk layout above)
++        const size_t k_slot_bytes = (size_t) K->ne[2] * K->ne[3] * nb12;
++        const size_t v_slot_bytes = V_is_K_view ? 0 : (size_t) V->ne[2] * V->ne[3] * nb22;
++        const size_t slot_bytes   = k_slot_bytes + v_slot_bytes;
++
++        const size_t ts_K = ggml_type_size(K->type);
++        const int64_t sK1 = K->nb[1] / ts_K, sK2 = K->nb[2] / ts_K, sK3 = K->nb[3] / ts_K;
++        const size_t ts_V = ggml_type_size(V->type);
++        const int64_t sV1 = V->nb[1] / ts_V, sV2 = V->nb[2] / ts_V, sV3 = V->nb[3] / ts_V;
++
++        GGML_ASSERT(mask == nullptr || mask->nb[0] == sizeof(half));
++        GGML_ASSERT(cell_pos == nullptr || cell_pos->nb[0] == sizeof(int));
++
++        // per-chunk stream-K scratch (the kernel's fixup buffer: ncols*(2 + DV/2) floats per block)
++        const int nblocks_cap = ((max_blocks_per_sm*nsm + ntiles_dst - 1) / ntiles_dst + 1) * ntiles_dst;
++        // the kernel's stream-K fixup buffer: ncols*(2 + DV/2) FLOAT2 per block (see dst_tmp_meta above)
++        ggml_cuda_pool_alloc<float2> chunk_fix(pool);
++        chunk_fix.alloc((size_t) nblocks_cap * ncols * (2 + DV/2));
++
++        // Every chunk but the last is exactly chunk_rows_use; the last absorbs the remainder so no
++        // chunk is shorter than a couple of KV tiles (a 1-tile chunk has no stream-K split at all).
++        const int64_t n_chunks = std::max<int64_t>(1, n_kv_total / chunk_rows_use);
++
++        int c = 0;
++        for (int64_t ci = 0; ci < n_chunks; ++ci, ++c) {
++            const int64_t k0 = ci*chunk_rows_use;
++            const int64_t k1 = (ci + 1 == n_chunks) ? n_kv_total : (ci + 1)*chunk_rows_use;
++            const int     nc = (int) (k1 - k0);
++
++            const size_t slot = (size_t) (c % chunk_slots) * slot_bytes;
++            char * K_slot = stage_buf + slot;
++            char * V_slot = stage_buf + slot + k_slot_bytes;
++
++            // rows [k0, k1) of dim1 -> dense F16 with dim1 = nc
++            to_fp16_nc_cuda_t to_fp16_K = ggml_get_to_fp16_nc_cuda(K->type);
++            GGML_ASSERT(to_fp16_K != nullptr && K->nb[0] == ggml_type_size(K->type));
++            to_fp16_K((const char *) K->data + k0*K->nb[1], (half *) K_slot, K->ne[0], nc, K->ne[2], K->ne[3],
++                      sK1, sK2, sK3, main_stream);
++            if (!V_is_K_view) {
++                to_fp16_nc_cuda_t to_fp16_V = ggml_get_to_fp16_nc_cuda(V->type);
++                GGML_ASSERT(to_fp16_V != nullptr && V->nb[0] == ggml_type_size(V->type));
++                to_fp16_V((const char *) V->data + k0*V->nb[1], (half *) V_slot, V->ne[0], nc, V->ne[2], V->ne[3],
++                          sV1, sV2, sV3, main_stream);
++            }
++
++            // the chunk's own KV tile count drives the stream-K grid and the fixup (the launcher's rule)
++            const int ntiles_KV_c = (int) ((nc + nbatch_fa - 1) / nbatch_fa);
++            const int nblocks_raw = std::min(max_blocks_per_sm*nsm, ntiles_KV_c*ntiles_dst);
++            const int nblocks_rnd = (nblocks_raw / ntiles_dst) * ntiles_dst;
++            const int eff_loss = nblocks_rnd > 0 ? 100*(nblocks_raw - nblocks_rnd)/nblocks_raw : 100;
++            const int nblocks_c  = eff_loss <= 5 ? nblocks_rnd : nblocks_raw;
++            GGML_ASSERT(nblocks_c > 0 && nblocks_c <= nblocks_cap);
++            GGML_ASSERT(nblocks_c % ntiles_dst != 0 || nblocks_c > ntiles_dst);   // a fixup must run
++
++            const size_t nb12_c = (size_t) nc * nb11;
++            const size_t nb13_c = (size_t) K->ne[2] * nb12_c;
++            const size_t nb22_c = (size_t) nc * nb21;
++            const size_t nb23_c = (size_t) V->ne[2] * nb22_c;
++
++            const dim3 bn_c((unsigned) nblocks_c, 1, 1);
++            const ggml_cuda_kernel_launch_params lp_chunk =
++                ggml_cuda_kernel_launch_params(bn_c, block_dim, nbytes_shared, main_stream);
++            ggml_cuda_kernel_launch(fattn_kernel, lp_chunk,
++                (const char *) Q->data,
++                q_h2 ? (const char *) Q_h2.ptr : nullptr,
++                K_slot,
++                V_is_K_view ? K_slot : V_slot,
++                mask ? ((const char *) mask->data + k0*(int64_t) sizeof(half)) : nullptr,
++                sinks ? ((const char *) sinks->data) : nullptr,
++                nullptr,   // KV_max: an absolute-KV scan, disabled in a chunk
++                nullptr,   // kq_blocks: an absolute-KV group bitmap, disabled in a chunk
++                part, chunk_fix.ptr,
++                scale, max_bias, m0, m1, n_head_log2, logit_softcap,
++                Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
++                K->ne[0], nc, K->ne[2], K->ne[3], (int32_t) nb11, (int32_t) nb12_c, (int64_t) nb13_c,
++                (int32_t) nb21, (int32_t) nb22_c, (int64_t) nb23_c,
++                mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
++                mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
++                cell_pos ? (const int *) cell_pos->data + k0 : nullptr,
++                tok_lo   ? (const int *) tok_lo  ->data : nullptr,
++                tok_hi   ? (const int *) tok_hi  ->data : nullptr,
++                FATTN_KV_NATIVE_NONE, FATTN_KV_NATIVE_NONE
++            );
++            CUDA_CHECK(cudaGetLastError());
++
++            // the stream-K fixup, handing back the unnormalized partial + its (max, rowsum)
++            if (nblocks_c % ntiles_dst == 0) {
++                const int    bpt = nblocks_c / ntiles_dst;
++                const uint3  fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
++                const uint3  fd1 = init_fastdiv_values(ntiles_x * ntiles_z_gqa);
++                const uint3  fd2 = init_fastdiv_values(ntiles_x);
++                const dim3   bd_c(DV, 1, 1);
++                const dim3   bnc_c((unsigned) ntiles_dst, ncols1, ncols2);
++                const ggml_cuda_kernel_launch_params lp_fx =
++                    ggml_cuda_kernel_launch_params(bnc_c, bd_c, 0, main_stream);
++                ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, lp_fx,
++                    part, (const float2 *) chunk_fix.ptr, part_meta,
++                    Q->ne[1], Q->ne[2], K->ne[2], nblocks_c,
++                    gqa_ratio, bpt, fd0, fd1, fd2);
++            } else {
++                const int    total_work_c = ntiles_KV_c * ntiles_dst;
++                const uint3  fd_k_j_z_ne12 = init_fastdiv_values(ntiles_KV_c * ntiles_x * ntiles_z_gqa * K->ne[2]);
++                const uint3  fd_k_j_z      = init_fastdiv_values(ntiles_KV_c * ntiles_x * ntiles_z_gqa);
++                const uint3  fd_k_j        = init_fastdiv_values(ntiles_KV_c * ntiles_x);
++                const uint3  fd_k          = init_fastdiv_values(ntiles_KV_c);
++                const dim3   bd_c(DV, 1, 1);
++                const dim3   bnc_c((unsigned) nblocks_c, ncols1, ncols2);
++                const ggml_cuda_kernel_launch_params lp_fx =
++                    ggml_cuda_kernel_launch_params(bnc_c, bd_c, 0, main_stream);
++                ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, lp_fx,
++                    part, (const float2 *) chunk_fix.ptr, part_meta,
++                    Q->ne[1], Q->ne[2], gqa_ratio, total_work_c,
++                    fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
++            }
++            CUDA_CHECK(cudaGetLastError());
++
++            if (getenv("GGML_CUDA_FA_STAGE_CHUNK_DEBUG") != nullptr) {
++                static int ndbg = 0;
++                if (ndbg < 3) {
++                    ndbg++;
++                    float2 m0 = make_float2(-1, -1); float p0 = -12345;
++                    CUDA_CHECK(cudaMemcpyAsync(&m0, part_meta, sizeof(float2), cudaMemcpyDeviceToHost, main_stream));
++                    CUDA_CHECK(cudaMemcpyAsync(&p0, part, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
++                    CUDA_CHECK(cudaStreamSynchronize(main_stream));
++                    GGML_LOG_WARN("FA_CHUNK_META c=%d nc=%d nblocks=%d ntiles_dst=%d meta=(%g,%g) part0=%g\n",
++                        c, nc, nblocks_c, ntiles_dst, (double) m0.x, (double) m0.y, (double) p0);
++                }
++            }
++            if (c == 0) {
++                CUDA_CHECK(cudaMemcpyAsync(acc, part, nelem_q*sizeof(float), cudaMemcpyDeviceToDevice, main_stream));
++                CUDA_CHECK(cudaMemcpyAsync(acc_meta, part_meta, nrows_q*sizeof(float2), cudaMemcpyDeviceToDevice, main_stream));
++            } else {
++                const ggml_cuda_kernel_launch_params lp_m = ggml_cuda_kernel_launch_params(
++                    dim3((unsigned) nrows_q, 1, 1), dim3((unsigned) DV_q, 1, 1), 0, main_stream);
++                ggml_cuda_kernel_launch(flash_attn_chunk_merge, lp_m, acc, acc_meta, part, part_meta, DV_q);
++                CUDA_CHECK(cudaGetLastError());
++            }
++        }
++        const ggml_cuda_kernel_launch_params lp_fin = ggml_cuda_kernel_launch_params(
++            dim3((unsigned) nrows_q, 1, 1), dim3((unsigned) DV_q, 1, 1), 0, main_stream);
++        ggml_cuda_kernel_launch(flash_attn_chunk_finalize, lp_fin, acc, acc_meta, (float *) KQV->data, DV_q);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
++
+     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
+         (const char *) Q->data,
+@@ -2133,7 +2450,7 @@ void launch_fattn(
+ 
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
+-                (float *) KQV->data, dst_tmp_meta.ptr,
++                (float *) KQV->data, dst_tmp_meta.ptr, nullptr,
+                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
+                  gqa_ratio, bpt, fd0, fd1, fd2);
+         } else if (ntiles_dst % nblocks_launched != 0) {
+@@ -2150,7 +2467,7 @@ void launch_fattn(
+ 
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, launch_params,
+-                (float *) KQV->data, dst_tmp_meta.ptr,
++                (float *) KQV->data, dst_tmp_meta.ptr, nullptr,
+                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
+                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
+         }

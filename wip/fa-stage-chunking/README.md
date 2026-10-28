@@ -10,6 +10,13 @@ arena step lands in shared memory.  The r156/r149 delta there is *exactly* the a
 (`+899` → `+1923` MiB shared for a f16 draft KV, `+2949` with a q8_0 draft): one and two 1024 MiB arenas
 that arrived late.  See §1 for the arithmetic.
 
+> **STATE (2026-10-27): M0 + M1 + M2 done; recommendation is C, pending the maintainer's call.**  The
+> staging is worth keeping (+1.5/+2.7/+5.1 % pp, §3), and a chunked prototype works and is numerically sound
+> (`FINDINGS-2026-10-27-m2.md`), **but** the MMA prefill kernel's only multi-block KV split is stream-K, so
+> a chunked launch currently costs 2.8x prefill.  Tiling therefore requires re-expressing the stream-K
+> partial protocol (the same path the decode band's purity depends on) — a deliberate follow-up, not a
+> launcher tweak.  Read §0 with `FINDINGS-2026-10-27-m2.md` §"Verdict".
+
 ## 0. The decision this campaign must produce
 
 > Is the F16 prefill staging worth its memory at depth — and if it is, can it be **tiled** so its
@@ -204,7 +211,7 @@ iGPU and must never be enumerated), and every arm records the arena bytes from
 | **M0a** ✅ | what the staging is worth at depth (dense) | Qwen3.8-27B UD-Q4_K_XL, 1 GPU (`0`), `-fa on -ctk/-ctv q8_0`, `llama-bench -p 8192,16384,32768 -n 0 -ub 512 -r 2` | staged **+1.5 / +2.7 / +5.1 %** over native → see `FINDINGS-2026-10-27-m0.md` §F2 |
 | **M0b** ✅ | the arena→slab→decode prize | Flash-Next IQ4_NL `-sm tensor -ncmoe 48` on 2 GPUs (`0,2`), fixed `MOE_EXPERT_CACHE_MIB`, MTP draft as in the r144 records | run on 35B-A3B instead (load time): **no decode prize** — the arena is released at the drop, `wide_aux=0 / arena=28480` in both arms.  §F4 |
 | **M1** ✅ | the feasibility read (§4) — launcher + kernel entry points; no code | — | **feasible without new machinery** — the split/combine exists (`parallel_blocks` + `flash_attn_combine_results`, and the stream-K fixups); the work is one `kv_start` scalar threaded into the MMA kernel + chunk-sized `dst_tmp` + one combine.  §4a |
-| **M2** | prototype: `C`-chunked conversion + per-chunk launch, single stream first | same as M0a | chunked / staged / native |
+| **M2** ✅ | prototype: `C`-chunked conversion + per-chunk launch, single stream first | same as M0a | built (`PROTOTYPE-chunked-staging.patch`): correct (PPL 6.6302 -> 6.6261 at 4 chunks) and the arena is the ring, but **2.8x slower** because the MMA kernel is stream-K-only.  `FINDINGS-2026-10-27-m2.md` |
 | **M3** | prototype with the overlapped conversion on the copy stream | same as M0a + M0b | as M2 |
 
 Decision criteria (written before the numbers, so they cannot be rationalised afterwards):
@@ -264,5 +271,14 @@ updated or removed by the same change.
   `parallel_blocks` and the stream-K paths (`flash_attn_combine_results`), so a chunked prefill needs one
   `kv_start` scalar in the MMA kernel, chunk-sized `dst_tmp` and a single combine — no new reduction
   machinery.  Scope: **MMA-f16 only**, sparse/QSA and the tile kernel stay single-launch.  Remaining
-  unknowns are the numerics re-baseline and the extra enqueue count at depth.  **Next: the M2
-  prototype** (chunked conversion + per-chunk launch, single stream first).
+  unknowns are the numerics re-baseline and the extra enqueue count at depth.
+* **2026-10-27 (M2)** — the prototype is built and measured (`FINDINGS-2026-10-27-m2.md`): the ring + merge
+  + finalize path is correct (single-chunk PPL identical to the baseline, 4 chunks -0.06 %) and takes the
+  arena to O(chunk), but forcing the per-output-tile grid costs **2.8x pp** because the MMA kernel's work
+  decomposition (`kbc = blockIdx.x*total/gridDim.x`) never reads `blockIdx.y/z` — i.e. MMA prefill is
+  **stream-K-only**.  The mask-skip control (`GGML_CUDA_FA_MASK_SKIP=0`: ~0 %) rules out the other suspect.
+  The remaining work is therefore a **kernel-protocol change**: give the stream-K path a per-row
+  `(numerator, max, rowsum)` contract for *every* row (no-seam tiles currently write a final normalized
+  value and no meta), plus `kv_start` so the group skip and `KV_max` keep working per chunk.  Estimate
+  1-2 days with a prefill-logit re-baseline.  **Recommendation: outcome C (bound it) for this cycle**, keep
+  the prototype for that follow-up.
