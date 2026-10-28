@@ -744,8 +744,12 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `nbatch_fa/K2/V2`, `nstages_target`, `Q_in_reg`) makes a repeat a build error -- do not "simplify" it away.
   And `test-logits-width-probe` must run at **`P >= 4096`**: the wide block's gate is `K->ne[1] >= 4096` and
   `K->ne[1]` is the context's used length, so the historical `P=256` run reported PASS without reaching the
-  block (that is how r126..r133 passed).  `GREEDY-PURITY.md` §51,
-  `benchmarks/2026-10-25-fa-band-width-purity.md`.
+  block (that is how r126..r133 passed).  The ratio axis is measured at **6**, **8** and **12** since r166:
+  ratio 8 is `Qwen3.6-35B-A3B` (16 q / 2 kv at `n_embd_head_k` 256), the one *exact* whole-group fold, and a
+  `rocprofv3` census shows the band's 64-column instantiation dispatching at widths 5..8 there.  A **gemma4**
+  model is *not* a GQA-8 arm: its SWA layers are head 256 at ratio 2 and its full-attention layers ratio 8 at
+  head 512, so neither enters the predicate (`Q->ne[0] == 256 && 4 < gqa_ratio <= 12`).  `GREEDY-PURITY.md` §51,
+  `benchmarks/2026-10-25-fa-band-width-purity.md`, `benchmarks/2026-10-28-fa-band-gqa8-arm.md`.
 - **The expert cache's tables must not outlive the model that registered them (r143).**  `g_tables` is
   process-global and keyed by host-master pointers the MODEL owns, so `llama_model_free` must drop them
   before the masters go: `llama_model_moe_cache_forget()` -> the `moe_cache_forget` device iface entry ->
