@@ -1,5 +1,98 @@
 # WORKLOG - dated delivery records
 
+## 261028.001 (r160) -- a text-only M-RoPE context no longer reserves the packed kq mask it never uses (issue #238, blocks 05 + 10)
+
+**Release:** `v15-6050b467c-r160` (base `6050b467c`, tip **`c7adb4f2b`**, tree
+**`1574b375eafa361ff2155ba075dcb5b382aff05e`** -- recorded in `release.json`, which is the source of truth;
+15 blocks; `validate-set.sh` green, checksums and both Windows lints clean).  Delta against the r159 tree:
+**six files, +99/-2**, `include/llama.h`, `src/llama-cparams.h`, `src/llama-context.{h,cpp}`,
+`common/{common,speculative}.cpp`.  Folded into **block 05**, which owns the derived kq mask and the reserve
+predicate (the reserve-reason note's 2-D bullet is block 10's text and is updated there, hence a two-block
+fold).  No kernel, no numerics, no default change: every gate below is byte-identical.
+
+**The report (issue #238, `overdoingism`, Windows 11 / R9700).**  A text-only `llama-server` on Qwen3.8-27B
+(Q5_K, q8_0 KV, `-c 220160 -ub 2048`) reserved the **packed** kq mask in `sched_reserve()` although every
+batch of the run took the **derived** mask (`resolve_fused_ops: derived kq mask flash attention enabled`,
+and `GGML_SCHED_DEBUG=2` shows the prefill reserve graph built without `attn_inp_kq_cell_pos`, i.e. with
+`kq_mask_derived = false`).  The cause is the #42 fix: `kq_mask_packed_reachable()` answered "yes" for any
+`n_pos_per_embd() > 1` model, and Qwen3.x is **IMROPE even for text** -- where every position is degenerate
+(`x == y == pos`), so `kq_mask_derivable()` accepts every batch and the packed mask is never allocated.
+Their numbers: 0.832 MiB of device compute buffer and 0.498 MiB of pinned host per ubatch token at 220160
+cells, i.e. ~860 MiB + ~860 MiB at `-c 220160 -ub 2048`, which is what decides whether a bigger context or
+ubatch still fits on a 32 GiB card (29.6 GiB peak on their config).
+
+**Reproduced here** (r159 `build-rocm`, Qwen3.8-27B UD-Q5_K_M, 1x R9700 `gfx1201`, ROCm 10.1.0, q8_0 K/V,
+`-fa on`, `-c 220160`, text only, `-fit` on so both contexts are visible):
+
+| `-ub` | ROCm0 | ROCm_Host |
+|---|---|---|
+| 512 | 357.29 MiB | 255.29 MiB |
+| 1024 | 714.30 MiB | 510.31 MiB |
+| 2048 | 1428.34 MiB | 1020.36 MiB |
+
+0.697 / 0.498 MiB per ubatch token -- the host figure is the reporter's exactly (2.0 bytes per cell per
+token); their device figure is 0.135 MiB/token higher because their target runs a DFlash2 draft with
+backend sampling, which this arm does not.
+
+**What shipped.**  The M-RoPE term of `kq_mask_packed_reachable()` is no longer the model's capability but
+two reachability signals:
+* **`llama_context_params.pos_2d`** (new, default false) -- the caller declares that 2-D (M-RoPE) positions
+  can be submitted.  `common_context_params_to_llama()` sets it from `--mmproj`, and
+  `common_base_params_to_speculative()` clears `mmproj.path` for the draft context (a drafter only ever sees
+  the target's text positions).  A multimodal run therefore reserves the worst case **at load time**, as
+  before, and never has to grow later.
+* **A latch** -- `decode()` inspects the incoming batch (an embedding row, no token id, whose `pos[0..2]`
+  differ) **before** `sched_reserve()` and, if the context did not declare 2-D, sets
+  `kq_mask_pos_2d_seen` and forces exactly **one** re-reserve with the packed mask, logged as
+  `decode: 2-D (M-RoPE) positions in this batch - re-reserving with the packed kq mask`.  This is the
+  correctness half: a library that submits image chunks itself is repaired once instead of depending on a
+  per-graph compute-buffer growth (which on Windows/WDDM is the failure mode that costs the most).
+Multi-sequence, alibi and the `allow_derived == false` builders keep the packed reserve unchanged.
+`LLAMA_KQ_MASK_PACKED_RESERVE=1` forces the pre-r160 worst case for every M-RoPE context (the exact A/B
+arm); `=0` forces the derived one and disables the latch.
+
+**Measured after** (same arm as above, `-c 220160 -ub 2048`, text only): the `--fit` probe context reserves
+**569.20 / 161.21 MiB** and the run's own context **626.12 / 161.21 MiB** instead of **1428.34 / 1020.36**
+and **1571.18 / 1020.36** -- i.e. **859 MiB of VRAM and 859 MiB of pinned host memory** per context, at
+exactly the mask's size.  `LLAMA_KQ_MASK_PACKED_RESERVE=1` reproduces the old numbers to the byte (so the A/B
+is exact), and `-np 2` is byte-identical in both arms (multi-slot keeps the packed reserve by design).
+The win scales with the context, as the mask does: at `-c 32768 -ub 2048` the same single-sequence config
+goes 696.34 / 288.36 -> **568.48 / 160.50 MiB** (128 MiB, which is the mask at 32768 cells).  A **deep
+context** is what the issue reports and where the numbers matter.
+
+**The two 2-D paths were both verified.**  `--mmproj` (Qwen3.8-27B GSQ IQ3_S + its BF16 projector,
+`-c 65536 -ub 2048`) logs `packed kq mask reserve = 1 (2-D positions declared, e.g. a multimodal
+projector)` and reserves **2060.02 / 416.37 MiB** -- identical to `LLAMA_KQ_MASK_PACKED_RESERVE=1`, while
+`=0` drops the host side to 160.63 MiB.  A real image request (`-c 8192 -ub 512`, a 800x480 PNG -> a
+375-token image chunk) runs with the declared reserve, no re-reserve, and the usual 4 same-size + 1
+changed-size graph reallocs.  Then, with the declaration temporarily suppressed (a local edit, not shipped),
+the same request started at 515.00 / 40.33, printed the latch line once, re-reserved to **566.50 / 48.29**
+(= the declared arm exactly) and produced **byte-identical** text.
+
+**Gates (all green).**
+* Greedy coherence, 27B UD-Q5_K_M 2 GPU `-sm tensor` `-c 16384 -ub 512` q8_0, 200 tokens: the derived-reserve
+  and packed-reserve arms are **823 chars, sha `e0bad2553078`** (identical), and the `-ncmoe` arm
+  (35B-A3B UD-Q4_K_M, 2 GPU `-sm tensor -ncmoe 40`, `-c 32768 -ub 512`, 128 tokens) is **533 chars,
+  sha `1a9fe8baaa7f`** in both.
+* `scripts/gate-prefill-logits.sh` (release, against the r159-recorded base, f16 KV): **0.000000 / 100.000 %**.
+  `--kv q8_0 --ab "LLAMA_KQ_MASK_PACKED_RESERVE=1"` (base recorded from this build with the env, candidate
+  default): **0.000000 / 100.000 %**, base PPL 5.9317.
+* MTP Protocol A (27B UD-Q4_K_XL, `-c 102400`, bf16 KV, `-n 3000`, 2 GPU, both split modes):
+  layer **54.6** vs **26.6** t/s plain, acceptance **0.621**; tensor **81.1** vs **44.8** t/s, acceptance
+  **0.541**.  The tensor figure is below the r159 record's 90.69 with the same command; the same-binary A/B
+  (`LLAMA_KQ_MASK_PACKED_RESERVE=1` vs default) measures **81.3 vs 81.1 t/s**, so that gap is the box (GPU
+  pair / host state), not this change -- the layer arm, which is the one the r159 note records as 51.66, is
+  54.6 here.
+* `scripts/validate-set.sh`: strict 15/15 on a fresh tarball, tree `1574b375e`, checksums, conflict-marker
+  scan and the Windows portability lint all clean.
+
+**Records:** this entry; `patches/README.md` (block 05 "the packed mask is only reserved where it is
+reachable", block 10's note, the knob list), `ENVIRONMENT.md` (`LLAMA_KQ_MASK_PACKED_RESERVE`), `AGENTS.md`
+(the invariant: never reserve on `n_pos_per_embd()` alone, and do not remove the latch),
+`MANIFESTS.md` (block 05's verification line).  No `TODO` item was opened: the change is the issue's fix,
+and the only open question it leaves -- whether a *future* `kq_mask_derivable()` rejection reason needs its
+own reachability test -- is the standing rule already written into the predicate's comment.
+
 ## 261027.011 (r159) -- the FA prefill staging arena gains two OPT-IN bounds: a KV-chunked ring and an eager allocation (block 10)
 
 **Release:** `v15-6050b467c-r159` (base `6050b467c`, tip **`6627ed715`**, tree

@@ -1,4 +1,4 @@
-From 09640346e1dd5e8bd75dd01fcaa19c9e185f0bfe Mon Sep 17 00:00:00 2001
+From 374294c514a9fb67264b345269cf672d1d99629d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 05/14] rdna-boosts: block 05: flash-attention band, native
@@ -206,6 +206,8 @@ through the config getters, the case function and the kernel, so prefill keeps t
 A static_assert on the two band rows (np and the KV batch shape must match) makes this
 class of regression a build error.
 ---
+ common/common.cpp                             |    6 +
+ common/speculative.cpp                        |    4 +
  docs/build.md                                 |    2 +-
  ggml/CMakeLists.txt                           |    2 +-
  ggml/cmake/common.cmake                       |    2 +-
@@ -489,15 +491,16 @@ class of regression a build error.
  .../template-instances/generate_cu_files.py   |   46 +-
  ggml/src/ggml-hip/CMakeLists.txt              |   11 +
  ggml/src/ggml.c                               |   39 +
- src/llama-context.cpp                         |  217 +++-
- src/llama-context.h                           |   11 +-
- src/llama-cparams.h                           |    2 +
+ include/llama.h                               |    6 +
+ src/llama-context.cpp                         |  286 +++-
+ src/llama-context.h                           |   16 +-
+ src/llama-cparams.h                           |    4 +
  src/llama-graph.cpp                           |  200 ++-
  src/llama-graph.h                             |   60 +
  src/llama-kv-cache.cpp                        |  182 +++
  src/llama-kv-cache.h                          |   14 +
  tests/test-backend-ops.cpp                    |  170 ++-
- 291 files changed, 5193 insertions(+), 624 deletions(-)
+ 294 files changed, 5285 insertions(+), 624 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-rdna.cuh
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_4-ncols2_8-dkq256-dv256.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_8-ncols2_8-dkq256-dv256.cu
@@ -765,6 +768,38 @@ class of regression a build error.
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-iq4_nl.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-iq4_nl.cu
 
+diff --git a/common/common.cpp b/common/common.cpp
+index 7c2c9b11a..42d708e5b 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1846,6 +1846,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.swa_full          = params.swa_full;
+     cparams.kv_unified        = params.kv_unified;
+ 
++    // issue #238: a multimodal projector feeds 2-D (M-RoPE) positions into this context, and the packed KQ
++    // mask must be part of the compute reserve for those.  Without a projector the context only ever sees
++    // text positions, which are degenerate even on an M-RoPE model, so the much smaller derived layout is
++    // reserved instead (the draft context clears this in common_base_params_to_speculative).
++    cparams.pos_2d            = !params.mmproj.path.empty();
++
+     cparams.type_k = params.cache_type_k;
+     cparams.type_v = params.cache_type_v;
+ 
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index ec4be29a3..555224c47 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2943,6 +2943,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
+     result.embedding    = false;
+     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+ 
++    // issue #238: the draft context only ever sees the target's text positions, never an image/audio chunk,
++    // so it must not inherit --mmproj and reserve the packed KQ mask for 2-D positions it cannot receive
++    result.mmproj.path.clear();
++
+     if (has_draft) {
+         // default to global devices value
+         if (!params_spec.devices.empty()) {
 diff --git a/docs/build.md b/docs/build.md
 index 42c726127..16744cd78 100644
 --- a/docs/build.md
@@ -8806,11 +8841,52 @@ index ffa557de4..78f4ffa1c 100644
  void ggml_flash_attn_ext_add_sinks(
          struct ggml_tensor * a,
          struct ggml_tensor * sinks) {
+diff --git a/include/llama.h b/include/llama.h
+index c897c09e4..321bc7f66 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -416,6 +416,12 @@ extern "C" {
+         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
+                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
+                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
++        bool pos_2d;      // 2-D (M-RoPE) positions can be submitted to this context, e.g. when a multimodal
++                          // projector feeds it.  The compute reserve then also covers the packed KQ mask,
++                          // which is what a non-degenerate (x, y) position needs.  Leave it false for text
++                          // input: an M-RoPE model's text positions are degenerate, so the much smaller
++                          // derived mask serves every batch.  A 2-D batch that arrives anyway forces one
++                          // mid-run re-reserve instead (see llama_context::decode).
+ 
+         // [EXPERIMENTAL]
+         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index d3d5f9b34..6c3e283fe 100644
+index d3d5f9b34..8a7cd1b0c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -121,6 +121,18 @@ struct llm_fused_op_probe {
+@@ -26,6 +26,23 @@
+ // llama_context
+ //
+ 
++// issue #238: does this batch carry a non-degenerate 2-D (M-RoPE) position?  Only an embedding entry (an
++// image/audio chunk, i.e. no token id) can: the batch allocator expands a text entry to [p, p, p, 0], so a
++// text token is degenerate by construction.  This mirrors what llama_ubatch::is_pos_2d() + the check in
++// llama_kv_cache::kq_mask_derivable() will decide for the resulting ubatch - an embedding whose sections
++// differ, or whose later sections were left at 0, needs the packed mask.
++static bool batch_has_pos_2d(const llama_batch_ext & batch) {
++    for (const auto & tok : batch.tokens) {
++        if (tok.id != LLAMA_TOKEN_NULL) {
++            continue;
++        }
++        if (tok.pos[0] != tok.pos[1] || tok.pos[0] != tok.pos[2]) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
+ // without this check, an arch that skips the transform helpers loads and computes wrong results
+ static void llama_verify_hadamard_graph(
+@@ -121,6 +138,18 @@ struct llm_fused_op_probe {
      llm_fused_op op;
      const char * name;
      uint32_t n_tokens_per_seq;
@@ -8829,7 +8905,7 @@ index d3d5f9b34..6c3e283fe 100644
  };
  
  static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
-@@ -171,6 +183,81 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+@@ -171,6 +200,81 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
@@ -8911,7 +8987,7 @@ index d3d5f9b34..6c3e283fe 100644
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -189,6 +276,8 @@ llama_context::llama_context(
+@@ -189,6 +293,8 @@ llama_context::llama_context(
  
      const auto & hparams = model.hparams;
  
@@ -8920,7 +8996,7 @@ index d3d5f9b34..6c3e283fe 100644
      cparams.n_seq_max = std::max(1u, params.n_seq_max);
      if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
          throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
-@@ -326,6 +415,19 @@ llama_context::llama_context(
+@@ -326,6 +432,44 @@ llama_context::llama_context(
      cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
      cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
  
@@ -8937,10 +9013,35 @@ index d3d5f9b34..6c3e283fe 100644
 +        }
 +    }
 +
++    // issue #238: the packed kq mask costs 2 bytes per KV cell per ubatch token (860 MiB of VRAM plus as
++    // much pinned host memory at -c 220160 -ub 2048) and only a batch the derived form cannot serve needs
++    // it.  For an M-RoPE model (Qwen3.x is IMROPE even for text) that is a batch carrying non-degenerate
++    // 2-D positions, i.e. an image/audio chunk from a multimodal projector.  Two signals decide it:
++    //   * `params.pos_2d` - the caller declares that 2-D positions can reach this context (`common` sets
++    //     it when --mmproj is given), so a multimodal run keeps the worst-case reserve at load time and
++    //     never has to grow later;
++    //   * `kq_mask_pos_2d_seen` - latched in decode() when a 2-D batch actually arrives from a caller that
++    //     did not declare it, which forces one re-reserve with the packed mask.
++    // Without either, the much smaller derived layout is reserved: a text-only M-RoPE context never pays.
++    // LLAMA_KQ_MASK_PACKED_RESERVE=1 forces the packed reserve for every M-RoPE context (the pre-r160
++    // behaviour); =0 forces the derived one and disables the latch (the growth path is the fallback).
++    cparams.kq_mask_pos_2d        = params.pos_2d;
++    cparams.kq_mask_packed_reserve = -1;
++    {
++        const char * e = getenv("LLAMA_KQ_MASK_PACKED_RESERVE");
++        if (e != nullptr) {
++            cparams.kq_mask_packed_reserve = atoi(e) != 0 ? 1 : 0;
++            LLAMA_LOG_INFO("%s: packed kq mask reserve = %d (env)\n", __func__, cparams.kq_mask_packed_reserve);
++        } else if (cparams.kq_mask_pos_2d && hparams.n_pos_per_embd() > 1) {
++            LLAMA_LOG_INFO("%s: packed kq mask reserve = 1 (2-D positions declared, e.g. a multimodal projector)\n",
++                    __func__);
++        }
++    }
++
      cparams.fused_gdn_ar = true;
      cparams.fused_gdn_ch = true;
      cparams.auto_fgdn    = false;
-@@ -618,19 +720,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -618,19 +762,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
              return;
          }
  
@@ -8966,7 +9067,7 @@ index d3d5f9b34..6c3e283fe 100644
              GGML_ASSERT(node.il >= 0);
  
              ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
-@@ -650,11 +756,46 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -650,11 +798,46 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                  device_mismatch = true;
                  break;
              }
@@ -9013,7 +9114,7 @@ index d3d5f9b34..6c3e283fe 100644
          } else {
              enabled = true;
              LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
-@@ -666,6 +807,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -666,6 +849,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fa = false;
      }
  
@@ -9043,13 +9144,27 @@ index d3d5f9b34..6c3e283fe 100644
      if (cparams.auto_fgdn) {
          LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
          resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
-@@ -733,6 +897,18 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+@@ -733,6 +939,32 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
      ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
  }
  
 +bool llama_context::kq_mask_packed_reachable() const {
-+    if (model.hparams.n_pos_per_embd() > 1) {
++    // issue #238: an explicit LLAMA_KQ_MASK_PACKED_RESERVE=1 restores the pre-r160 worst-case reserve for
++    // every model (an A/B arm and a safety valve, not a policy)
++    if (cparams.kq_mask_packed_reserve > 0) {
 +        return true;
++    }
++
++    if (model.hparams.n_pos_per_embd() > 1) {
++        // 2-D (M-RoPE) positions.  Only a caller that can submit them (a multimodal projector) needs the
++        // packed mask reserved up front; a 2-D batch that arrives on a context which did not declare it
++        // latches `kq_mask_pos_2d_seen` and re-reserves once (see decode()).  A text-only context keeps
++        // the derived layout, which every M-RoPE text batch satisfies (kq_mask_derivable() accepts
++        // degenerate positions, and qwen35/qwen3.8 are IMROPE even for text).
++        if (cparams.kq_mask_packed_reserve == 0) {
++            return false;
++        }
++        return cparams.kq_mask_pos_2d || kq_mask_pos_2d_seen;
 +    }
 +
 +    if (cparams.n_seq_max > 1) {
@@ -9062,7 +9177,7 @@ index d3d5f9b34..6c3e283fe 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -749,6 +925,10 @@ void llama_context::sched_reserve() {
+@@ -749,6 +981,10 @@ void llama_context::sched_reserve() {
      const uint32_t n_seqs = cparams.n_seq_max;
      const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
  
@@ -9073,7 +9188,7 @@ index d3d5f9b34..6c3e283fe 100644
      const size_t max_nodes = this->graph_max_nodes(n_tokens);
  
      LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
-@@ -793,13 +973,14 @@ void llama_context::sched_reserve() {
+@@ -793,13 +1029,14 @@ void llama_context::sched_reserve() {
      // reserve pp (prompt processing) graph first so that buffers are only allocated once
      {
          auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -9090,7 +9205,7 @@ index d3d5f9b34..6c3e283fe 100644
              }
              if (!gf) {
                  throw std::runtime_error("failed to allocate compute pp buffers");
-@@ -820,7 +1001,7 @@ void llama_context::sched_reserve() {
+@@ -820,7 +1057,7 @@ void llama_context::sched_reserve() {
          n_splits_tg = n_splits_pp;
          n_nodes_tg  = n_nodes_pp;
      } else {
@@ -9099,7 +9214,7 @@ index d3d5f9b34..6c3e283fe 100644
          if (!gf) {
              throw std::runtime_error("failed to allocate compute tg buffers");
          }
-@@ -842,10 +1023,10 @@ void llama_context::sched_reserve() {
+@@ -842,10 +1079,10 @@ void llama_context::sched_reserve() {
                  // [TAG_RESERVE_DIAG_DECAY]
                  // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                  // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
@@ -9112,7 +9227,7 @@ index d3d5f9b34..6c3e283fe 100644
          };
  
          if (!gf) {
-@@ -1018,7 +1199,7 @@ bool llama_context::memory_update(bool optimize) {
+@@ -1018,7 +1255,7 @@ bool llama_context::memory_update(bool optimize) {
  
          const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
  
@@ -9121,7 +9236,26 @@ index d3d5f9b34..6c3e283fe 100644
          if (!gf) {
              LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
          }
-@@ -2731,7 +2912,8 @@ static void ubatch_prepare_reserve(
+@@ -1940,6 +2177,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     output_swaps.clear();
+     embd_batch_idxs.clear();
+ 
++    // issue #238: a 2-D (M-RoPE) position can only come from a multimodal chunk, and the compute reserve
++    // covers the packed kq mask for such a batch only when the caller declared it at context creation.
++    // When one arrives from a caller that did not, re-reserve ONCE here (before this batch is split into
++    // ubatches) instead of leaving the graph to grow a buffer mid-flight - the packed mask is 2 bytes per
++    // KV cell per ubatch token.  A text-only context never reaches this.  See kq_mask_packed_reachable().
++    if (!kq_mask_pos_2d_seen && !cparams.kq_mask_pos_2d && cparams.kq_mask_packed_reserve != 0 &&
++            model.hparams.n_pos_per_embd() > 1 && batch_has_pos_2d(batch_inp)) {
++        kq_mask_pos_2d_seen = true;
++        sched_need_reserve = true;
++        LLAMA_LOG_INFO("%s: 2-D (M-RoPE) positions in this batch - re-reserving with the packed kq mask\n", __func__);
++    }
++
+     sched_reserve();
+ 
+     bool did_optimize = false;
+@@ -2731,7 +2980,8 @@ static void ubatch_prepare_reserve(
  }
  
  ggml_cgraph * llama_context::graph_reserve(
@@ -9131,7 +9265,7 @@ index d3d5f9b34..6c3e283fe 100644
      LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
      GGML_ASSERT(n_outputs_l >= 1);
  
-@@ -2763,7 +2945,22 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -2763,7 +3013,22 @@ ggml_cgraph * llama_context::graph_reserve(
  
      auto * res = gf_res_reserve.get();
  
@@ -9155,8 +9289,16 @@ index d3d5f9b34..6c3e283fe 100644
  
      res->reset();
  
+@@ -4123,6 +4388,7 @@ llama_context_params llama_context_default_params() {
+         /*.op_offload                  =*/ true,
+         /*.swa_full                    =*/ true,
+         /*.kv_unified                  =*/ false,
++        /*.pos_2d                      =*/ false,
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
 diff --git a/src/llama-context.h b/src/llama-context.h
-index c7a121857..d120285ce 100644
+index c7a121857..5929be8e8 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -258,8 +258,17 @@ public:
@@ -9178,16 +9320,30 @@ index c7a121857..d120285ce 100644
  
      bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
  
+@@ -370,6 +379,11 @@ private:
+ 
+     bool sched_need_reserve = true;
+ 
++    // issue #238: latched by decode() when a 2-D (M-RoPE) batch actually arrives on a context that did not
++    // declare one (cparams.kq_mask_pos_2d), so the packed kq mask is reserved from then on - see
++    // kq_mask_packed_reachable()
++    bool kq_mask_pos_2d_seen = false;
++
+     // whether the reserve graph has a logits tensor, set in sched_reserve()
+     // true until then, because the first output_reserve() runs before any graph is reserved
+     bool graph_has_logits = true;
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index e36b78ac8..ff45dee81 100644
+index e36b78ac8..92bfbedef 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
-@@ -40,6 +40,8 @@ struct llama_cparams {
+@@ -40,6 +40,10 @@ struct llama_cparams {
      bool offload_kqv;
      bool flash_attn;
      bool auto_fa;
 +    bool kq_mask_derived;      // V3: derive the kq mask in the FA kernel instead of materializing it
 +    bool auto_kq_mask_derived; // the derived kq mask still has to be confirmed by the backend probe
++    bool kq_mask_pos_2d;       // the caller can submit 2-D (M-RoPE) positions (a multimodal projector)
++    int  kq_mask_packed_reserve; // LLAMA_KQ_MASK_PACKED_RESERVE: -1 auto, 0 never, 1 always (issue #238)
      bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
      bool fused_gdn_ch;       // use fused gated delta net (chunked)
      bool auto_fgdn;

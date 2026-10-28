@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r159`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r160`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -41,12 +41,12 @@ only as a rough shape.
 | 02 | `0002-…-block-02-adaptive-MTP-draft-depth` | adaptive MTP draft depth | +1186 / −54 | 24 |
 | 03 | `0003-…-block-03-chunked-gated-delta-net-prefill` | chunked GDN prefill + rollback tracker | +3182 / −15 | 22 |
 | 04 | `0004-…-block-04-BF16-KV-cache-and-native-BF16-f` | BF16 KV cache + native-BF16 FA | +630 / −214 | 8 |
-| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133) | +5092 / −612 | 289 |
+| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133; + r160: the packed kq mask is only **reserved** where a batch needing it is reachable, issue #238) | +5285 / −624 | 294 |
 | 06 | `0006-…-block-06-MMB-quantized-prefill-GEMM` | MMB quantized prefill GEMM (+ r132: the per-arch dispatch keys on the running device, not the primary) | +2903 / −3 | 7 |
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in — see the block section) | +12543 / −4954 | 75 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section) | +12697 / −4954 | 78 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236) | +4034 / −755 | 46 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -360,6 +360,25 @@ almost all of them `template-instances/*.cu`.
   created; a graph that never consumes it leaves it **unallocated**, so every fill site is guarded on
   `tensor && tensor->buffer` (r131 closed the last three — the hybrid-K one aborted `-np 1` on
   `bailingmoe3`; see Purity below).
+* **The packed mask is only reserved where it is reachable (r160, issue #238).**  The derived form is a
+  *per-batch* decision, so `sched_reserve()` has to cover the packed mask for a batch it cannot serve
+  (issue #42).  For an M-RoPE model that used to mean **every** M-RoPE context, because `n_pos_per_embd()
+  > 1` was read as "2-D positions can arrive" — but Qwen3.x is IMROPE **even for text**, where every
+  position is degenerate (`x == y == pos`) and `kq_mask_derivable()` accepts every batch.  The reserve
+  therefore carried `n_kv × n_ubatch × 2` bytes (plus the device copy of it) that no text-only run ever
+  allocated: **860 MiB of VRAM and 860 MiB of pinned host memory at `-c 220160 -ub 2048`** on a 27B, which
+  is what issue #238 is about.  The M-RoPE term is now **`cparams.kq_mask_pos_2d`** (a new
+  `llama_context_params.pos_2d`, which `common` sets from `--mmproj`) **or** a latch that `decode()` sets
+  on the first batch that actually carries a non-degenerate 2-D position; the latch forces one
+  **re-reserve** with the packed mask before that batch is split, so an undeclared 2-D caller (a library
+  that submits M-RoPE image chunks itself) is repaired once instead of relying on a per-graph growth.
+  Multi-sequence, alibi and the `allow_derived == false` builders are unchanged (they keep the packed
+  reserve).  No kernel, no logit and no runtime path changes: the derived form still serves every
+  derivable batch.  `LLAMA_KQ_MASK_PACKED_RESERVE=1` restores the pre-r160 worst-case reserve for every
+  M-RoPE context (the A/B arm); `=0` forces the derived one and disables the latch.  Measured (see
+  `WORKLOG.md` 261028.001): a text-only 27B at `-c 220160 -ub 2048` reserves **569.20 / 161.21 MiB**
+  (device / host) instead of **1428.34 / 1020.36**; a `--mmproj` context reserves exactly what it did
+  before; and an undeclared 2-D batch re-reserves to exactly that layout with byte-identical text.
 * **q8_0 fetch-ahead variant (r98, PR #195)**: with q8_0 K and V read in place (decode/verify, `n_q <= 8`,
   head 256) the band launches a second kernel, `flash_attn_ext_f16<..., band_fetch_ahead = true>`, that
   fetches the raw q8_0 bytes of the next K/V batches into registers ahead of use and converts each batch
@@ -408,7 +427,9 @@ almost all of them `template-instances/*.cu`.
   prefill), the RDNA2 (gfx1030) gate fixes of PR #181, the masked-V HIP fixes, and the FA staging arena
   (prealloc + graceful degradation instead of abort).
 
-**Knobs.**  `LLAMA_KQ_MASK_DERIVED`, `GGML_CUDA_FA_KV_NATIVE` (auto / force on / force staging),
+**Knobs.**  `LLAMA_KQ_MASK_DERIVED`, `LLAMA_KQ_MASK_PACKED_RESERVE` (r160: `1` = reserve the packed kq
+mask for every M-RoPE context, `0` = never/derived-only; unset = reserve it only where a 2-D batch is
+reachable), `GGML_CUDA_FA_KV_NATIVE` (auto / force on / force staging),
 `GGML_CUDA_FA_MASK_SKIP`, `GGML_CUDA_FA_BAND_SKIP` (r133; the master switch must be on too),
 `GGML_HIP_FA_BAND_WMMA*` (`_SPLIT`, `_GQA_MAX`, `_WIDE`),
 `GGML_HIP_FA_BAND_FETCH_AHEAD` (r98; `=0` runs the q8_0 band kernel without the fetch-ahead variant),

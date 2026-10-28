@@ -1,4 +1,4 @@
-From 2fc9a0df332789e7aef2f339b60d35242b623b03 Mon Sep 17 00:00:00 2001
+From d74e0e86133f939fb626d8dd2345cb07e1903d6b Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/14] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -149,7 +149,7 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  ggml/src/ggml-cuda/unary.cu                   |  315 +-
  ggml/src/ggml-cuda/unary.cuh                  |    6 +-
  ggml/src/ggml.c                               |   13 +
- src/llama-context.cpp                         |  410 +-
+ src/llama-context.cpp                         |  415 +-
  src/llama-context.h                           |   22 +
  src/llama-ext.h                               |   12 +
  src/llama-graph.cpp                           |   12 +-
@@ -160,7 +160,7 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  tests/test-fusion-gate-beta-multiseq.cpp      |  278 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 78 files changed, 12687 insertions(+), 4991 deletions(-)
+ 78 files changed, 12692 insertions(+), 4991 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
@@ -20288,7 +20288,7 @@ index 87e7c725d..64c471862 100644
              }
              view_src = view_src->view_src;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6f36891b8..68409ae35 100644
+index 0804d9f5f..dcf66990c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -20299,7 +20299,7 @@ index 6f36891b8..68409ae35 100644
  #include "llama-arch.h"
  #include "llama-graph.h"
  #include "llama-impl.h"
-@@ -284,6 +285,11 @@ llama_context::llama_context(
+@@ -301,6 +302,11 @@ llama_context::llama_context(
      }
  
      cparams.n_rs_seq = params.n_rs_seq;
@@ -20311,7 +20311,7 @@ index 6f36891b8..68409ae35 100644
      if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
          LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
                          __func__, cparams.n_rs_seq);
-@@ -338,7 +344,7 @@ llama_context::llama_context(
+@@ -355,7 +361,7 @@ llama_context::llama_context(
          cparams.ctx_other = params.ctx_other;
      }
  
@@ -20320,7 +20320,7 @@ index 6f36891b8..68409ae35 100644
          if (model.tok_embd == nullptr || model.output == nullptr) {
              if (params.ctx_other == nullptr) {
                  throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
-@@ -437,8 +443,52 @@ llama_context::llama_context(
+@@ -479,8 +485,52 @@ llama_context::llama_context(
  
      cparams.fused_dsv4_hc_pre  = true;
      cparams.fused_dsv4_hc_comb = true;
@@ -20374,7 +20374,7 @@ index 6f36891b8..68409ae35 100644
  
      // only the indexer models build this mask, skip the probe for the others
      cparams.fused_top_k_mask = true;
-@@ -691,6 +741,10 @@ llama_context::llama_context(
+@@ -733,6 +783,10 @@ llama_context::llama_context(
  }
  
  llama_context::~llama_context() {
@@ -20385,7 +20385,7 @@ index 6f36891b8..68409ae35 100644
      // wait for any pending asynchronous copies into the output buffers before they are freed
      synchronize();
  
-@@ -705,6 +759,12 @@ llama_context::~llama_context() {
+@@ -747,6 +801,12 @@ llama_context::~llama_context() {
              if (size_exp == size_act) {
                  LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
                      __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
@@ -20398,7 +20398,7 @@ index 6f36891b8..68409ae35 100644
              } else {
                  LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
                      __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
-@@ -890,6 +950,35 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+@@ -932,6 +992,40 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
      return (int) users.size();
  }
  
@@ -20411,7 +20411,12 @@ index 6f36891b8..68409ae35 100644
 +// reasoned about from the model/context, not from the ubatch:
 +//   * 2-D (M-RoPE) batches - an image/audio chunk decode carries 2-D positions (mtmd), which is only
 +//     possible for an M-RoPE model: llama_batch::is_pos_2d() is `n_pos >= 3`, and n_pos_per_embd() is
-+//     4 only for MROPE/IMROPE.  The packed mask's ext-based causal clause cannot be derived.
++//     4 only for MROPE/IMROPE.  The packed mask's ext-based causal clause cannot be derived.  This is
++//     the reason the M-RoPE term is NOT "any M-RoPE model" (issue #238): Qwen3.x is IMROPE even for
++//     text, so that form reserved ~2 bytes per cell per ubatch token for a batch a text-only context
++//     can never produce.  It is now `cparams.kq_mask_pos_2d` (the caller declared 2-D positions, e.g.
++//     a multimodal projector) or the `kq_mask_pos_2d_seen` latch that decode() sets on the first 2-D
++//     batch - which re-reserves once with the packed mask instead of relying on a per-graph growth.
 +//   * multi-sequence batches (ubatch.n_seqs_unq != 1), e.g. `--kv-unified` with several slots, which
 +//     kq_mask_derivable() rejects because the derived cell encoding is single-sequence.
 +//   * alibi, which encodes a *value* (the distance) rather than a predicate.
@@ -20434,7 +20439,7 @@ index 6f36891b8..68409ae35 100644
  void llama_context::sched_new(size_t max_nodes, bool parallel) {
      sched.reset(ggml_backend_sched_new(
              backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
-@@ -1097,6 +1186,24 @@ void llama_context::sched_reserve() {
+@@ -1153,6 +1247,24 @@ void llama_context::sched_reserve() {
          }
      }
  
@@ -20459,7 +20464,7 @@ index 6f36891b8..68409ae35 100644
      {
          const bool diff = n_nodes_pp != n_nodes_tg || n_splits_pp != n_splits_tg ||
                            n_inputs_pp != n_inputs_tg || n_input_tensors_pp != n_input_tensors_tg;
-@@ -1780,12 +1887,12 @@ bool llama_context::set_adapter_cvec(
+@@ -1836,12 +1948,12 @@ bool llama_context::set_adapter_cvec(
      return res;
  }
  
@@ -20478,7 +20483,7 @@ index 6f36891b8..68409ae35 100644
  
  llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
      if (mctx && !mctx->apply()) {
-@@ -1816,6 +1923,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1872,6 +1984,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // settled on" -- self-calibrating, no history guess, and it fires on the FIRST narrow pass of a
      // short-prompt workload.  Without a slab the classic wide-pass condition is kept, because there
      // reclaiming the wide layout is exactly what used to abort.
@@ -20492,7 +20497,7 @@ index 6f36891b8..68409ae35 100644
      bool drop_now = false;
      // The work region actually observed before the drop.  The reference must be at least this: the narrow
      // layout varies with the graph (the MTP decode/verify graph is wider than the `n_rs_batch` reserve the
-@@ -1875,7 +1989,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1931,7 +2050,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          // (`mctx`) spans this ubatch's streams, and `build_attn_mha`/`ggml_flash_attn_ext` require the
          // query and the cache to agree on the stream dim (`q->ne[3] == k->ne[3]`).  A hard-coded 1
          // against a multi-sequence batch took `q->ne[2]/n_stream` to zero and aborted (issue #48).
@@ -20501,7 +20506,7 @@ index 6f36891b8..68409ae35 100644
          // wip/slab-ring-region: measure the narrow (decode/verify) layout BEFORE allocating it, so the slab
          // can pin its narrow floor AHEAD of the cache's deferred sizing (which runs later in this same pass).
          // `split_only` + a `sizes` array is a size-only reserve (no allocation); the real reserve follows.
-@@ -2017,7 +2131,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2073,7 +2192,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -20528,7 +20533,7 @@ index 6f36891b8..68409ae35 100644
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
              return nullptr;
-@@ -2043,6 +2175,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2099,6 +2236,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -20536,15 +20541,15 @@ index 6f36891b8..68409ae35 100644
      ret = GGML_STATUS_SUCCESS;
  
      return res;
-@@ -2392,6 +2525,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2448,6 +2586,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
      output_swaps.clear();
      embd_batch_idxs.clear();
 +    lf_dev_rows.clear();
  
-     sched_reserve();
- 
-@@ -2728,6 +2862,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     // issue #238: a 2-D (M-RoPE) position can only come from a multimodal chunk, and the compute reserve
+     // covers the packed kq mask for such a batch only when the caller declared it at context creation.
+@@ -2796,6 +2935,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          }
      } while (true);
  
@@ -20567,7 +20572,7 @@ index 6f36891b8..68409ae35 100644
      // set to total number of outputs in the batch, for use in llama_get_logits_ith
      n_outputs = n_outputs_all;
  
-@@ -2959,8 +3109,130 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3027,8 +3182,130 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
      return n_outputs_max;
  }
  
@@ -20698,7 +20703,7 @@ index 6f36891b8..68409ae35 100644
      for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
          if (!cparams.embeddings_layer_inp[il]) {
              continue;
-@@ -3061,7 +3333,8 @@ void llama_context::output_reorder() {
+@@ -3129,7 +3406,8 @@ void llama_context::output_reorder() {
                  }
              }
              for (auto & layer : embd_layer_inp) {
@@ -20708,7 +20713,7 @@ index 6f36891b8..68409ae35 100644
                      for (size_t k = 0; k < n_embd; ++k) {
                          std::swap(layer.data[i*n_embd + k], layer.data[j*n_embd + k]);
                      }
-@@ -3264,10 +3537,34 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -3332,10 +3610,34 @@ ggml_cgraph * llama_context::graph_reserve(
          } else {
              ggml_backend_sched_split_graph(sched.get(), gf);
          }
@@ -20747,7 +20752,7 @@ index 6f36891b8..68409ae35 100644
      }
  
      return gf;
-@@ -4601,6 +4898,26 @@ llama_context_params llama_context_default_params() {
+@@ -4670,6 +4972,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -20774,7 +20779,7 @@ index 6f36891b8..68409ae35 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -4636,10 +4953,49 @@ llama_context * llama_init_from_model(
+@@ -4705,10 +5027,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -20826,7 +20831,7 @@ index 6f36891b8..68409ae35 100644
          return nullptr;
      }
  
-@@ -4872,6 +5228,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+@@ -4941,6 +5302,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
      return ctx->get_embeddings_nextn_ith(i);
  }
  
@@ -20854,7 +20859,7 @@ index 6f36891b8..68409ae35 100644
      ctx->synchronize();
  
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 03f3cb3b7..7559664db 100644
+index 2a6cb66d6..f26e888d7 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -249,6 +249,28 @@ private:

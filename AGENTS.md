@@ -183,7 +183,7 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
 - **Naming (V2.1):** the current set is **15 blocks, 00-14** (block 14 is the temporary `-sm relaxed-tensor`
   block, see `patches/README.md`; release `release.json .release` —
-  `v15-6050b467c-r149`; the value lives in `release.json`, never here).  Every `block NN`
+  `v15-6050b467c-r160`; the value lives in `release.json`, never here).  Every `block NN`
   reference elsewhere in this file that is not one of the V2.1 numbers below is the **pre-V2.1 16-block
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,
   **03** chunked GDN, **04** BF16 KV, **05** FA band/native/derived, **06** MMB, **07** k-quant,
@@ -552,6 +552,21 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   false for its `mla`/`lid` masks).  A new fill site, a new `allow_derived = true` builder or a new hybrid
   input class must carry it; `can_reuse` needs nothing (`can_reuse_kq_mask()` reads `ne[]`, never
   `buffer`).  `LLAMA_KQ_MASK_DERIVED=0` is the work-around and the packed reference arm.
+- **The packed kq mask is reserved only where a batch needing it is reachable, and "M-RoPE" alone is not
+  that (r160, issue #238).**  `kq_mask_packed_reachable()` (block 05) used to answer "yes" for any
+  `n_pos_per_embd() > 1` model, but Qwen3.x is IMROPE even for text, where every position is degenerate and
+  `kq_mask_derivable()` accepts every batch: a text-only 27B at `-c 220160 -ub 2048` reserved **860 MiB of
+  VRAM plus 860 MiB of pinned host memory** per context that was never allocated.  The M-RoPE term is now
+  `cparams.kq_mask_pos_2d` (`llama_context_params.pos_2d`, set by `common` when `--mmproj` is given) or the
+  `kq_mask_pos_2d_seen` latch that `decode()` sets on the first batch carrying a non-degenerate 2-D (embd)
+  position, which forces one **re-reserve** with the packed mask before that batch is split.  Multi-sequence,
+  alibi and the `allow_derived == false` builders keep the packed reserve; the runtime mask path is
+  unchanged (every derivable batch still takes the derived form).  So: a context that can receive
+  image/audio chunks must be created with `pos_2d` (a caller that submits 2-D positions and skips it pays
+  one re-reserve, which on a `-ncmoe` config can cost the expert-cache arena - declare it); do not
+  reintroduce an `n_pos_per_embd()`-only reserve test, and do not remove the latch - it is the only thing
+  that keeps an undeclared multimodal caller correct.  A/B arm: `LLAMA_KQ_MASK_PACKED_RESERVE=1` (the
+  pre-r160 worst case).  `WORKLOG.md` 261028.001.
 - **A Q8_1 quantize-cache key walk stops at the first pointer change, and every fill validates its read
   range (r132, PR #218).**  The cache is keyed on the **root** tensor but the arena is filled from the
   caller's (possibly offset) **view** pointer, so an offset view that walked to the root stored its rows
