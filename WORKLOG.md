@@ -1,5 +1,58 @@
 # WORKLOG - dated delivery records
 
+## 261028.004 (r162) -- issue #239: the DFlash draft reserves its noise block, not the lm_head over the whole ubatch
+
+**Release `v15-6050b467c-r162`**, base `6050b467c`, 15 blocks, tip `652e66694ee61d5490bac1f60c0f06b9b0a56ba3`,
+tree `3a4906f1a30fd2c97279a49d88562859d0c08104`.  One change (block 12) plus the release docs.
+
+**The report.**  Issue #239 (gfx1201, TheRock ROCm 10): a DFlash2 draft context's compute buffer was
+2417.98 MiB at `-ub 2048`, of which 1940 MiB was the decoder's `result_output [n_vocab, n_ubatch]` f32.  At
+runtime the draft's token batch is at most `n_seq x (n_max + 1)` rows, so no graph ever used that width.
+
+**Reproduced.**  27B UD-Q5_K_M + DFlash2-Q4_K_M, 1x gfx1201, `-ub 2048`, q8_0 KV: the draft context's
+`sched_reserve` reported **2444.41 MiB** device compute (the issue's model/vocab gives 2417.98), and
+`graph_reserve` logged the pp graph at `n_tokens = 2048, n_outputs = 2048`.
+
+**Root cause.**  A DFlash/DFlash2 draft context alternates two graph shapes by batch kind: the target-feature
+KV injection (`ubatch.embd` / `lf_dev_inject`; up to `n_ubatch`, on the **main** scheduler) and the noise-block
+decoder (token batch; at most `n_seq x block`, on the **alt** scheduler - `LLAMA_DRAFT_SCHED2`, r120).
+`sched_reserve()`'s generic pp measure graph is a *token* ubatch at `n_ubatch`, so it measured the decoder
+branch, and that branch applies the lm_head to every row (DFlash2's selector reads every block position; it
+has no `build_inp_out_ids`).  The main scheduler only ever runs the injection graph, so the buffer it was given
+was sized for a decoder width it never runs.  The `#18039` encoder rule (`n_outputs_max = n_batch` for
+`llama_model_has_encoder()`) is a leftover next to this, not the cause: forcing `n_outputs_max` down does not
+help because the DFlash decoder ignores the output limit (the reporter measured this).
+
+**Fix (block 12).**  `llama_batch_allocr::ubatch_reserve(..., with_embd)` can mark a measure ubatch as an
+embd batch, and `llama_context::graph_reserve(..., reserve_injection)` uses it to build the injection measure
+graph.  For a DFlash draft (`model.arch == LLM_ARCH_DFLASH && cparams.ctx_other != nullptr`)
+`sched_reserve()` now reserves:
+
+* the **injection** at `n_ubatch` (the main scheduler's real shape), and
+* the **decoder** at `n_seq_max x max(dflash.block_size, n_outputs_max_per_seq)` (the width the noise block
+  actually receives; the block covers lilicorr and the DSpark anchor layout),
+
+then leaves the layout at the injection graph.  The buffer keeps the larger of the two, so neither shape can
+grow it mid-run (issue #42), and the decoder's own (small) buffer on the alt scheduler is unchanged.  No env
+knob: nothing is disabled, the reserve is simply the graph the scheduler runs.
+
+**Validation.**
+
+| check | result |
+|---|---|
+| draft `sched_reserve`, 1 GPU, `-ub 2048` | device compute **2444.41 -> 264.15 MiB (-2.18 GiB)**; host compute 40.18 -> 200.14 MiB (the injection's F32 feature input; the F1 gather's output is the same shape); free VRAM 8622 -> 10802 MiB.  `-v` logs: injection pp `n_tokens=2048`, decoder tg `n_tokens=8` (block_size 8, `n_max` 5) |
+| greedy text, 27B Q5_K + DFlash2, `-n 200`, seed 42 | 1 GPU `941 chars sha=c62b6901495a`, 2 GPU `-sm tensor` `899 / 97fb92617a9b`, `LLAMA_DFLASH_DEV=0` `592 / 6e3fd559c6a8` (the host injection path), `LLAMA_DRAFT_SCHED2=0` `941 / c62b6901495a` - **byte-identical before/after in every arm** |
+| deterministic 1-slot server (`--parallel 1 --kv-unified`, `--spec-type ngram-mod,draft-dflash --spec-draft-n-max 5 --backend-sampling`, `ROCBLAS_USE_HIPBLASLT=0`) | 636 chars, **identical content** and draft counts (189 generated / 88 accepted) before vs after |
+| 2-slot `--kv-unified` server (allocation/abort coverage) | both concurrent slots answer; no compute-buffer growth, no abort.  Concurrent 2-slot text is not a text oracle (per-process/concurrent nondeterminism, same shape as the documented hipBLASLt class), so it is coverage, not the gate |
+| MTP Protocol A (27B UD-Q4_K_XL, 3 devices, `-n 3000`, prose, bf16 KV) | tensor plain **48.16** / `draft-mtp` **90.78** t/s, acceptance **0.60413**; layer plain **24.96** / `draft-mtp` **51.62**, acceptance **0.62134** - the recorded 3-device reference (48.4 / 90.7 / 0.60 and 51.7 / 0.62) |
+| `scripts/validate-set.sh` | strict 15/15, applied tree `3a4906f1a` equals release.json |
+
+**Release mechanics.**  The change is folded into block 12 (the DFlash home) with a fixup + autosquash, so the
+block count stays 15; the set was re-cut from `6050b467c` (canonical `apply-all.sh` tip `652e66694`, tree
+`3a4906f1a`), `patches/` + `rdna-boosts-all.patch` regenerated, `release.json` rewritten.  Block 12's patch
+is `+4629 / -807` over 48 files.  The fork's `rdna-boosts` branch and the ROCm container images are refreshed
+with the tag, per the pushing policy.
+
 ## 261028.003 (r161) -- issue #241: the routed fused gate arm is back (block 08)
 
 **Release `v15-6050b467c-r161`**, base `6050b467c`, 15 blocks, tip `4a156887b4918f178551993c34ded4bc4c69df48`,

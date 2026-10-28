@@ -1,4 +1,4 @@
-From 5b866f29fd9e228039320c7a0b01e9991fca42bc Mon Sep 17 00:00:00 2001
+From 614353bf0234a36b3902bef722ec2a1d3db7c4c9 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -201,7 +201,7 @@ index 38a45acac..8222184a1 100644
          enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
          enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index c42b5cb90..fa93c58b0 100644
+index d40d9d8d5..0f576ec10 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -856,6 +856,22 @@ llama_context::llama_context(
@@ -227,7 +227,7 @@ index c42b5cb90..fa93c58b0 100644
          sched_reserve();
  
          // wip/first-prefill-latency: reserve the wide prefill work region in the slab BEFORE the MoE
-@@ -3884,6 +3900,7 @@ llm_graph_params llama_context::graph_params(
+@@ -3915,6 +3931,7 @@ llm_graph_params llama_context::graph_params(
          /*.prec_policy =*/ &model.prec_policy,
          /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
          /*.samplers    =*/ sampling.samplers,
@@ -235,7 +235,7 @@ index c42b5cb90..fa93c58b0 100644
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
-@@ -5729,6 +5746,7 @@ llama_context_params llama_context_default_params() {
+@@ -5760,6 +5777,7 @@ llama_context_params llama_context_default_params() {
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
@@ -244,7 +244,7 @@ index c42b5cb90..fa93c58b0 100644
          /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
          /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
 diff --git a/src/llama-context.h b/src/llama-context.h
-index f7b0b0a0e..1bbad649d 100644
+index ff3e151bb..12cfd71ba 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -367,6 +367,9 @@ private:

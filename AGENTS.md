@@ -257,6 +257,21 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   the draft's compute buffer exceeds the unmapped VA spare (a tensor-split drafter's is 1280 MiB against the
   estimator's 512 MiB tier; without it `-sm tensor` + draft + `-ncmoe` aborts in `graph_reserve`).  Rule:
   `patches/README.md` (block 12, "Facts that span blocks").
+- **A DFlash draft reserve must measure its two graphs at their own widths (r162, issue #239).**  A
+  DFlash/DFlash2 draft context alternates a KV-injection graph (target-feature rows, up to `n_ubatch`, on the
+  main scheduler) and a noise-block decoder graph (at most `n_seq x block` tokens, on the alt scheduler).
+  `sched_reserve()`'s generic token ubatch at `n_ubatch` measures the *decoder* shape, whose lm_head emits
+  `[n_vocab, n_ubatch]` f32: 1.9 GiB at 2048 tokens and a 248k vocabulary, while no runtime token batch is
+  wider than `n_seq x block`.  `graph_reserve(..., reserve_injection)` builds the measure ubatch with a
+  non-null embd marker (a DFlash draft is `model.arch == LLM_ARCH_DFLASH && cparams.ctx_other != nullptr`),
+  and `sched_reserve()` reserves the injection at `n_ubatch` and the decoder at
+  `n_seq_max x max(dflash.block_size, n_outputs_max_per_seq)`.  The buffer keeps the larger of the two
+  (issue #42: a shape left out grows the buffer mid-run), and the final layout stays at the injection graph
+  because that is what the main scheduler runs.  Do not "simplify" this back to one reserve width: the
+  decoder's lm_head is proportional to `n_ubatch` and the injection's feature input is not, so the two
+  shapes must both be measured.  Measured: draft device compute 2444.41 -> 264.15 MiB (-2.18 GiB) at
+  `-ub 2048`, host compute 40.18 -> 200.14 MiB, greedy text byte-identical (1/2 GPU, F1 on/off,
+  `LLAMA_DRAFT_SCHED2=0`, a deterministic 1-slot server); `WORKLOG.md` 261028.004.
 - **The draft context's second scheduler is selected per arch (`sched_alt_for`): `n_outputs` for MTP, the
   batch kind for DFlash/DFlash2 (r120, issue #208).**  MTP's two graphs differ by outputs; a DFlash2
   draft's do not (the lattice is read from `h_nextn`, so `output = !is_dflash2`), so selecting on

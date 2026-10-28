@@ -3,7 +3,8 @@
 ## Base (2026-10-24 re-base)
 
 **The delivery base moved again at r138 (`v15-6050b467c-r138`, base `6050b467c`, 2026-10-25) and nothing here
-has been re-cut for it.**  The paragraphs below are the r127-era status and still name `3f03b1772`: treat
+has been re-cut for it, except `dflash-draft-reserve/` (cut against `6050b467c` on 2026-10-28).**  The
+paragraphs below are the r127-era status and still name `3f03b1772`: treat
 "applies cleanly" as *that* base's result and re-check with `git apply --check` against the current
 `release.json.base` before handing a candidate to anyone.  Nothing in `upstream/` is part of the delivery.
 
@@ -50,6 +51,7 @@ delivery then carries only the fork-local remainder.
 | [`kv-cache-keys-only/`](kv-cache-keys-only/README.md) | llama: keys-only KV caches — `llama_kv_cache` gains `v_enabled` (no V tensor, no V-side op) | **block 11** (+ the plumbing in **block 08**) | verified on master: indexer KV 72.00 → 24.00 MiB at ctx 8192 |
 | [`lazy-mode-off-resident/`](lazy-mode-off-resident/README.md) | llama: make `--lazy-mode off` keep `TENSOR_READ_LAZY` tensors resident under `--load-mode mmap` (the help text promised it; the mapping won) | **block 00** (r122) | applies clean to `097cf33d9`; validated in the delivery tree |
 | [`pr210-server-prompt-cache-lazy/`](pr210-server-prompt-cache-lazy/README.md) | server: keep idle slots resident with a unified KV cache, save-before-clear on the KV-full path, make room before a failed restore, reuse prompt-cache buffers | **block 12** (r130, PR #210) | applies clean to `3f03b1772` (cut there, not on `097cf33d9`); validated on gfx1201 in the delivery tree; needs the server test update that ships with it |
+| [`dflash-draft-reserve/`](dflash-draft-reserve/README.md) | llama: reserve a DFlash draft's KV injection at `-ub` and its noise block at `n_seq × block`, instead of the lm_head over the whole ubatch | **block 12** (r162, issue #239) | cut against `6050b467c`; validated in the delivery tree (draft compute −2.18 GiB, greedy text identical) |
 
 ## Backlog (not written up yet)
 

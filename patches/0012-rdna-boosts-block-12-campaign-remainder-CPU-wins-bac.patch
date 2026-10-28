@@ -1,4 +1,4 @@
-From 37b46ee564413531684e859207f696df5399c868 Mon Sep 17 00:00:00 2001
+From b47280b516cd927169d2589a882c6bd7261ae5d4 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/14] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -249,8 +249,10 @@ r155 record.
  ggml/src/ggml-rpc/ggml-rpc.cpp                |    3 +
  ggml/src/ggml.c                               |   23 +-
  include/llama.h                               |   12 +-
- src/llama-context.cpp                         |  898 +++++++-
- src/llama-context.h                           |   26 +
+ src/llama-batch.cpp                           |   11 +-
+ src/llama-batch.h                             |    6 +-
+ src/llama-context.cpp                         |  941 +++++++-
+ src/llama-context.h                           |   28 +-
  src/llama-ext.h                               |   17 +
  src/llama-kv-cache.cpp                        |  319 ++-
  src/llama-kv-cache.h                          |   30 +
@@ -268,7 +270,7 @@ r155 record.
  tools/server/server-task.cpp                  |   74 +-
  tools/server/server-task.h                    |   11 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 46 files changed, 4579 insertions(+), 795 deletions(-)
+ 48 files changed, 4629 insertions(+), 807 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 5be48e428..4c2e0fa63 100644
@@ -4865,8 +4867,61 @@ index 5c720d243..38a45acac 100644
      // WIP r42: aggregate the MoE expert cache arena's cumulative hit/miss counters for per-turn logging
      // (a before/after delta gives the turn's decode hit rate).  Returns false when no cache is active.
      LLAMA_API bool llama_moe_cache_stats(const struct llama_model * model, int64_t * hits, int64_t * misses, int64_t * arena_bytes);
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index c6e2c9e34..019e3c1d3 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -499,7 +499,7 @@ bool llama_batch_allocr::init(
+     return true;
+ }
+ 
+-llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs) {
++llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs, bool with_embd) {
+     const uint32_t n_tokens = n_seq_tokens*n_seqs;
+ 
+     clear();
+@@ -510,7 +510,12 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t
+     auto udata = std::make_shared<llama_ubatch::data_t>();
+ 
+     udata->token     .resize(n_tokens);
+-    udata->embd      .clear();
++    if (with_embd) {
++        // only a non-null marker for the measure graph: nothing reads the rows during a reserve
++        udata->embd.resize(n_tokens, 0.0f);
++    } else {
++        udata->embd.clear();
++    }
+     udata->embd_state.clear();
+     udata->pos       .resize(n_pos_all);
+     udata->n_seq_id  .resize(n_tokens);
+@@ -533,7 +538,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t
+         /*.n_pos        =*/ n_pos_per_embd,
+ 
+         /*.token        =*/ udata->token.data(),
+-        /*.embd         =*/ nullptr,
++        /*.embd         =*/ with_embd ? udata->embd.data() : nullptr,
+         /*.embd_state   =*/ nullptr,
+         /*.pos          =*/ udata->pos.data(),
+         /*.n_seq_id     =*/ udata->n_seq_id.data(),
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index e1e43979b..5c1b6adce 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -190,8 +190,10 @@ public:
+     llama_ubatch split_seq(uint32_t n_ubatch);
+ 
+     // a helper method for creating a well-defined ubatch of tokens
+-    // TODO: support embeddings if needed in the future
+-    llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
++    // with_embd: mark the ubatch as an embedding batch (a non-null embd pointer), so a model whose graph
++    //   branches on the batch kind can measure its embedding branch with a reserve graph (DFlash, issue #239).
++    //   The contents are never read: only the graph layout is measured.
++    llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs, bool with_embd = false);
+ 
+ private:
+     void clear();
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 79cd1c973..c42b5cb90 100644
+index 79cd1c973..d40d9d8d5 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,3 +1,6 @@
@@ -5045,7 +5100,91 @@ index 79cd1c973..c42b5cb90 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -1796,6 +1929,12 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+@@ -1125,6 +1258,23 @@ void llama_context::sched_reserve() {
+     const uint32_t n_seqs = cparams.n_seq_max;
+     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+ 
++    // DFlash draft (issue #239): the draft context alternates two graph shapes - the target-feature KV
++    // injection (embd rows, up to `n_ubatch`, on the main scheduler) and the noise-block decoder (at most
++    // `n_seqs x block` tokens, on the alt scheduler).  The decoder applies the lm_head to every row, so
++    // measuring it at `n_ubatch` reserves `result_output` as `[n_vocab, n_ubatch]` f32 - about 1.9 GiB at
++    // 2048 tokens and a 248k vocabulary - for a width no graph ever uses.  Reserve the injection at
++    // `n_ubatch` and the decoder at the only width it receives; the compute buffer keeps the larger of the
++    // two, so neither shape can grow it mid-run (issue #42).
++    // `block` covers the lilicorr block and the DSpark/Dflash `n_max + 1` rows per sequence.  A model that
++    // does not declare `dflash.block_size` gets common's default 16, which is also the bound its `n_max`
++    // clamp uses.
++    const bool dflash_draft = model.arch == LLM_ARCH_DFLASH && cparams.ctx_other != nullptr;
++    const uint32_t dflash_block = model.hparams.dflash_block_size > 0 ? model.hparams.dflash_block_size : 16;
++    const uint32_t n_tokens_draft = dflash_draft
++            ? std::min<uint32_t>(n_tokens, n_seqs*std::max<uint32_t>(dflash_block,
++                    std::max<uint32_t>(cparams.n_outputs_max_per_seq, 1)))
++            : n_tokens;
++
+     // size the compute buffers for the packed kq mask when a batch the derived form cannot serve is
+     // reachable in this context - see kq_mask_packed_reachable()
+     const bool packed_kq_mask = kq_mask_packed_reachable();
+@@ -1173,18 +1323,20 @@ void llama_context::sched_reserve() {
+     int n_input_tensors_tg = -1;
+ 
+     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
++    const uint32_t n_outputs_draft = std::min(n_tokens_draft, cparams.n_outputs_max);
+ 
+     // reserve pp (prompt processing) graph first so that buffers are only allocated once
+     {
+         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr,
+-                packed_kq_mask);
++                packed_kq_mask, /*reserve_injection =*/ dflash_draft);
+         if (!gf) {
+             if (cparams.pipeline_parallel) {
+                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                 cparams.pipeline_parallel = false;
+                 sched_new(max_nodes, false);
+-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ false, nullptr, packed_kq_mask);
++                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ false, nullptr, packed_kq_mask,
++                        /*reserve_injection =*/ dflash_draft);
+             }
+             if (!gf) {
+                 throw std::runtime_error("failed to allocate compute pp buffers");
+@@ -1205,7 +1357,10 @@ void llama_context::sched_reserve() {
+         n_splits_tg = n_splits_pp;
+         n_nodes_tg  = n_nodes_pp;
+     } else {
+-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask);
++        // a DFlash draft's token graph is the noise-block decoder, whose width is the block (not `n_ubatch`)
++        auto * gf = dflash_draft
++                ? graph_reserve(n_tokens_draft, n_seqs, n_outputs_draft, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask)
++                : graph_reserve(n_seqs,         n_seqs, n_seqs,           mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask);
+         if (!gf) {
+             throw std::runtime_error("failed to allocate compute tg buffers");
+         }
+@@ -1214,6 +1369,12 @@ void llama_context::sched_reserve() {
+         n_nodes_tg         = ggml_graph_n_nodes(gf);
+         n_inputs_tg        = get_gf_res_reserve()->inputs.size();
+         n_input_tensors_tg = this->n_input_tensors;
++
++        // the pp (injection) reserve has no lm_head, so for a DFlash draft the token graph is the one that
++        // decides whether logits exist
++        if (dflash_draft) {
++            graph_has_logits = get_gf_res_reserve()->get_logits() != nullptr;
++        }
+     }
+ 
+     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+@@ -1230,7 +1391,10 @@ void llama_context::sched_reserve() {
+                 gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask);
+                 break;
+             default:
+-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask);
++                // a DFlash draft leaves the layout at the injection graph: that is the graph this scheduler
++                // runs on every verify step, and the decoder width was already reserved above
++                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask,
++                        /*reserve_injection =*/ dflash_draft);
+         };
+ 
+         if (!gf) {
+@@ -1796,6 +1960,12 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
  
      GGML_ASSERT(lid <= model.hparams.n_layer());
  
@@ -5058,7 +5197,7 @@ index 79cd1c973..c42b5cb90 100644
      cparams.embeddings_layer_inp[lid] = enable;
  
      // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
-@@ -2030,6 +2169,43 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2030,6 +2200,43 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          }
      }
  
@@ -5102,7 +5241,7 @@ index 79cd1c973..c42b5cb90 100644
      // wip/slab-ring-region: the H2D staging ring is one meta-unit with the WIDE (prefill) compute layout.
      // It is armed for a wide pass (>= the staging gate floor, 64 tokens) and disarmed for a narrow one, so
      // a decode-only stretch returns its hole to the arena.  This runs BEFORE the drop's cache re-arm, so a
-@@ -2038,14 +2214,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2038,14 +2245,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // while the ring is used on every wide pass.  `ring_set` is a no-op when the state already matches.
      if (!model.moe_host_expert_bytes.empty() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
          const bool ring_arm = ubatch.n_tokens >= 64;
@@ -5138,7 +5277,7 @@ index 79cd1c973..c42b5cb90 100644
      }
      if (drop_now) {
          ggml_backend_sched_drop_buffers(sched.get());
-@@ -2058,9 +2255,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2058,9 +2286,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          // wip/slab-ring-region: measure the narrow (decode/verify) layout BEFORE allocating it, so the slab
          // can pin its narrow floor AHEAD of the cache's deferred sizing (which runs later in this same pass).
          // `split_only` + a `sizes` array is a size-only reserve (no allocation); the real reserve follows.
@@ -5152,7 +5291,7 @@ index 79cd1c973..c42b5cb90 100644
                                narrow_sizes, kq_mask_packed_reachable()) != nullptr) {
                  size_t narrow_bytes = 0;
                  for (int i = 0; i < 16; i++) {
-@@ -2080,7 +2280,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2080,7 +2311,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                  }
              }
          }
@@ -5161,7 +5300,7 @@ index 79cd1c973..c42b5cb90 100644
          if (!narrow_ok) {
              LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
                      " growth may not fit next to the MoE expert cache arena\n", __func__);
-@@ -3259,6 +3459,22 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
+@@ -3259,6 +3490,22 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
              ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
              GGML_ASSERT(backend != nullptr);
  
@@ -5184,7 +5323,25 @@ index 79cd1c973..c42b5cb90 100644
              if (lf_layer_dev.empty()) {
                  const size_t n_layers = cparams.embeddings_layer_inp.size();
                  lf_layer_dev.assign(n_layers, nullptr);
-@@ -3791,15 +4007,433 @@ private:
+@@ -3544,7 +3791,7 @@ static void ubatch_prepare_reserve(
+ 
+ ggml_cgraph * llama_context::graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs_l, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+-        bool packed_kq_mask) {
++        bool packed_kq_mask, bool reserve_injection) {
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
+     GGML_ASSERT(n_outputs_l >= 1);
+ 
+@@ -3571,7 +3818,7 @@ ggml_cgraph * llama_context::graph_reserve(
+     this->n_outputs = n_outputs_l;
+ 
+     llama_batch_allocr balloc_l(model.hparams.n_pos_per_embd());
+-    llama_ubatch ubatch = balloc_l.ubatch_reserve(n_tokens/n_seqs, n_seqs);
++    llama_ubatch ubatch = balloc_l.ubatch_reserve(n_tokens/n_seqs, n_seqs, reserve_injection);
+ 
+     ubatch_prepare_reserve(ubatch, n_outputs_l, sampling.samplers, cparams.n_outputs_max_per_seq);
+ 
+@@ -3791,15 +4038,433 @@ private:
      size_t size_written = 0;
  };
  
@@ -5622,7 +5779,7 @@ index 79cd1c973..c42b5cb90 100644
          }
      }
  
-@@ -3842,13 +4476,75 @@ private:
+@@ -3842,13 +4507,75 @@ private:
          size_t offset;
      };
      std::vector<write_info> winfos;
@@ -5699,7 +5856,7 @@ index 79cd1c973..c42b5cb90 100644
          // flush the reads
          for (const auto & rinfo : rinfos) {
              ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
-@@ -3888,6 +4584,7 @@ public:
+@@ -3888,6 +4615,7 @@ public:
  
  private:
      const uint8_t * ptr;
@@ -5707,7 +5864,7 @@ index 79cd1c973..c42b5cb90 100644
      size_t buf_size = 0;
      size_t size_read = 0;
  
-@@ -3952,7 +4649,8 @@ private:
+@@ -3952,7 +4680,8 @@ private:
  
  class llama_io_write_device : public llama_io_write_i {
  public:
@@ -5717,7 +5874,7 @@ index 79cd1c973..c42b5cb90 100644
      }
  
      ~llama_io_write_device() {
-@@ -4041,8 +4739,27 @@ public:
+@@ -4041,8 +4770,27 @@ public:
                  }
              }
  
@@ -5747,7 +5904,7 @@ index 79cd1c973..c42b5cb90 100644
              }
          }
      }
-@@ -4080,11 +4797,13 @@ private:
+@@ -4080,11 +4828,13 @@ private:
      std::vector<write_info> winfos;
  
      llama_memory_buffers & mbufs;
@@ -5762,7 +5919,7 @@ index 79cd1c973..c42b5cb90 100644
      }
  
      ~llama_io_read_device() {
-@@ -4128,29 +4847,12 @@ public:
+@@ -4128,29 +4878,12 @@ public:
                  GGML_ABORT("%s: memory buffer mismatch\n", __func__);
              }
  
@@ -5798,7 +5955,7 @@ index 79cd1c973..c42b5cb90 100644
              const size_t total = mbuf_cur.total_size;
  
              ggml_init_params params_scratch = {
-@@ -4160,6 +4862,9 @@ public:
+@@ -4160,6 +4893,9 @@ public:
              };
              ggml_context * ctx_scratch = ggml_init(params_scratch);
  
@@ -5808,7 +5965,7 @@ index 79cd1c973..c42b5cb90 100644
              size_t src_pos  = 0;
              size_t dst_pos  = 0;
              size_t src_j    = 0;
-@@ -4179,15 +4884,13 @@ public:
+@@ -4179,15 +4915,13 @@ public:
  
                  const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
  
@@ -5830,7 +5987,7 @@ index 79cd1c973..c42b5cb90 100644
  
                  src_pos += n_copy;
                  dst_pos += n_copy;
-@@ -4211,6 +4914,28 @@ public:
+@@ -4211,6 +4945,28 @@ public:
                  GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
              }
  
@@ -5859,7 +6016,7 @@ index 79cd1c973..c42b5cb90 100644
              ggml_free(ctx_scratch);
          }
  
-@@ -4255,8 +4980,72 @@ private:
+@@ -4255,8 +5011,72 @@ private:
      std::vector<read_info> rinfos;
  
      const llama_memory_buffers & mbufs;
@@ -5932,7 +6089,7 @@ index 79cd1c973..c42b5cb90 100644
  size_t llama_context::state_get_size() {
      llama_io_write_dummy io(false);
      try {
-@@ -4268,7 +5057,7 @@ size_t llama_context::state_get_size() {
+@@ -4268,7 +5088,7 @@ size_t llama_context::state_get_size() {
  }
  
  size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
@@ -5941,7 +6098,7 @@ index 79cd1c973..c42b5cb90 100644
      try {
          return state_write_data(io);
      } catch (const std::exception & err) {
-@@ -4278,7 +5067,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+@@ -4278,7 +5098,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
  }
  
  size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
@@ -5950,7 +6107,7 @@ index 79cd1c973..c42b5cb90 100644
      try {
          return state_read_data(io);
      } catch (const std::exception & err) {
-@@ -4306,9 +5095,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
+@@ -4306,9 +5126,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
  size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
      std::unique_ptr<llama_io_write_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
@@ -5962,7 +6119,7 @@ index 79cd1c973..c42b5cb90 100644
      }
  
      try {
-@@ -4326,7 +5115,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -4326,7 +5146,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
      std::unique_ptr<llama_io_read_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
          // create a temporary io to read the magic and the src seq_id
@@ -5971,7 +6128,7 @@ index 79cd1c973..c42b5cb90 100644
  
          uint32_t magic_read;
          io->read(&magic_read, sizeof(magic_read));
-@@ -4339,9 +5128,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -4339,9 +5159,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
  
          GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
  
@@ -5983,7 +6140,7 @@ index 79cd1c973..c42b5cb90 100644
      }
  
      try {
-@@ -5136,7 +5925,16 @@ llama_context * llama_init_from_model(
+@@ -5136,7 +5956,16 @@ llama_context * llama_init_from_model(
  
          return ctx;
      } catch (const std::exception & err) {
@@ -6002,7 +6159,7 @@ index 79cd1c973..c42b5cb90 100644
  
      return nullptr;
 diff --git a/src/llama-context.h b/src/llama-context.h
-index f26e888d7..f7b0b0a0e 100644
+index f26e888d7..ff3e151bb 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -169,6 +169,14 @@ struct llama_context {
@@ -6020,7 +6177,14 @@ index f26e888d7..f7b0b0a0e 100644
      size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
  
      bool state_load_file(
-@@ -297,6 +305,15 @@ public:
+@@ -291,12 +299,21 @@ public:
+     //   support probes must NOT set it - they verify the derived form is present in the graph.
+     ggml_cgraph * graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+-        bool packed_kq_mask = false);
++        bool packed_kq_mask = false, bool reserve_injection = false);
+ 
+     // true when a batch the derived kq mask cannot serve is reachable at runtime, i.e. when the
      // compute reserve must be sized for the packed mask - see the definition for the full reasoning
      bool kq_mask_packed_reachable() const;
  

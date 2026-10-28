@@ -48,7 +48,7 @@ only as a rough shape.
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section) | +12697 / −4954 | 78 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
-| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236) | +4034 / −755 | 46 |
+| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch` — issue #239) | +4629 / −807 | 48 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
 
@@ -1454,6 +1454,24 @@ had no other home.
 * **DFlash**: the F1 device-resident layer-input path made default-on with a warn-once fallback
   (`GGML_LF_DFLASH_DEV=0` disables), `GGML_LF_FAST_TOPK`, and — since **r106** — DFlash2 under
   `-sm tensor` (see the fold below; the r54 clean rejection is gone).
+* **The DFlash draft's compute reserve measures both of its graphs at their real widths (r162, issue #239).**
+  A DFlash/DFlash2 draft context alternates a KV-injection graph (target-feature rows, up to `n_ubatch`, on
+  the main scheduler) and a noise-block decoder graph (at most `n_seq × block` tokens, on the alt scheduler).
+  `sched_reserve()` measured both shapes from the generic token ubatch at `n_ubatch`, and the decoder applies
+  the lm_head to every row, so `result_output` reserved `[n_vocab, n_ubatch]` f32 — **1940 MiB** of the draft
+  context's **2444.41 MiB** device compute buffer at `-ub 2048` on a 248k vocabulary, for a width no graph
+  ever uses (runtime decoder rows are `n_seq × (n_max + 1)`).  `graph_reserve()` takes `reserve_injection`,
+  which builds the measure ubatch with a non-null embd marker (`llama_batch_allocr::ubatch_reserve(...,
+  with_embd)`), and a DFlash draft now reserves the injection at `n_ubatch` plus the decoder at
+  `n_seq_max × max(block, n_outputs_max_per_seq)` (the block covers lilicorr and DSpark).  The buffer keeps
+  the larger of the two, so neither shape can grow it mid-run (issue #42), and the final layout stays at the
+  injection graph, which is the one the main scheduler runs.  Measured (27B UD-Q5_K_M + DFlash2-Q4_K_M, 1×
+  gfx1201, `-ub 2048`, q8_0 KV): draft device compute **2444.41 → 264.15 MiB (−2.18 GiB)**, free VRAM
+  8622 → 10802 MiB; host compute 40.18 → 200.14 MiB (the injection's F32 feature input, which the host
+  injection path needs and the F1 gather's output matches).  Greedy text byte-identical in every arm (1 GPU,
+  2 GPU `-sm tensor`, F1 on/off, `LLAMA_DRAFT_SCHED2=0`, and a deterministic 1-slot server with
+  `ngram-mod,draft-dflash`); draft counts and acceptance identical.  No knob: nothing is disabled, the
+  reserve is simply smaller (`WORKLOG.md` 261028.004).
 * **DFlash2 under `-sm tensor`** (r106, TODO #78): the selector builds `ggml_top_k` over the draft logits and
   `ggml_get_rows` to read the candidate values back, and those logits are the *target's* `output.weight`
   projection — placed vocabulary-split by the target's policy — so both ops reduce along the split axis and

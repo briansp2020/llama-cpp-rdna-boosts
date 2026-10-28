@@ -1,13 +1,13 @@
 {
-  "release": "v15-6050b467c-r161",
+  "release": "v15-6050b467c-r162",
   "base": "6050b467c",
   "base_tree": "cb3251e17731887f7d17dade0676ddef50bc27e7",
   "n_blocks": 15,
-  "tip": "4a156887b4918f178551993c34ded4bc4c69df48",
-  "tree": "e379e5c3df9e4a6f5503840e2547b2fb0b578cfd",
+  "tip": "652e66694ee61d5490bac1f60c0f06b9b0a56ba3",
+  "tree": "3a4906f1a30fd2c97279a49d88562859d0c08104",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "a7e90acb767e4283d7dec29b05dc6e997a701158a6fe48be4f290cc2da7dccd9"
+    "sha256": "5d00ef453495fecc8ec1f25cfeadbef0b4f994799b9062514408eb10578033b6"
   },
   "patches": {
     "0000-rdna-boosts-block-00-foundation-band-uniformity-Meta.patch": "95aa6cee0f71c15c3f5dc40067168814cf6c4df29311729a061da8a26746c4d7",
@@ -22,8 +22,8 @@
     "0009-rdna-boosts-block-09-host-resident-MoE-iface-schedul.patch": "57e8e0c2d2246cfc8f5479f2748fb7bf048bdb5d9f4974680bdd5908a3f80311",
     "0010-rdna-boosts-block-10-slab-fusion-dispatcher-async-in.patch": "4ceef9cf3f94ccee11ac3c27f2341be494a895578b0a856f5342155014c8b3b7",
     "0011-rdna-boosts-block-11-qwen4exp-model-hyper-connection.patch": "51940d083e98f502a681002a34e42c50f9129d0edeca9683b231a0ce946791f0",
-    "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "c233b34a974a7376a33346e8bb129272171caa9bdef95b422b5448b4eae04bec",
-    "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "cbb19aaf92830bf704390942aab37135cfd2cffe866cc0e3649036dd1511b004",
-    "0014-rdna-boosts-block-14-relaxed-tensor-split-mode-TEMPO.patch": "f6d6cfce2511ca33b7d3162d3c520402a31addaffb24848211f9d24608675b54"
+    "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "2a2049a81a8c0f4205e07a5ad2f1c37a5f3393c6cd09f18a258b5061f13a33e3",
+    "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "5cdd89f5e8a501ab084b71bde3308f282d187e3dcb73ae7bcccef80e0b4ea24a",
+    "0014-rdna-boosts-block-14-relaxed-tensor-split-mode-TEMPO.patch": "c62882c51ea5657421bb869c859dfa4e7315d6c9517a0f7395a1cd86f92d53be"
   }
 }
