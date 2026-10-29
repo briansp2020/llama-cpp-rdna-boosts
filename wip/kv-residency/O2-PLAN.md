@@ -7,19 +7,43 @@ That is correct. This file exists so it cannot happen a third time.
 
 ---
 
-## 1. What was asked for
+## 1. What was asked for, and why (the maintainer's words, 2026-10-29)
 
-> a **Strata-style windowed KV cache / streaming** — the KV's VRAM footprint is a **fixed window**, not
-> `O(-c)`, so a large context stops costing VRAM the expert arena (or anything else) could use.
+> a **Windowed KV** … for **fully resident dense/MoE models**, because doing so would allow users to run large
+> contexts with a Q8_0 quantization of Qwen3.8-27B, or a Q6_K quantization of 35B-A3B, on a 32 GB card, and
+> **not run out of VRAM** … and for **host-resident MoE's (slab mode)**, because it would free up more VRAM
+> for the decode arena, allowing for higher expert hit rates, leading to higher decode speeds.  Once that is
+> in place, we could then look at improving the drafter via a ring too.
+
+Three goals, in this order:
+
+| # | goal | who it is for | status |
+|---|---|---|---|
+| **A** | **fittability**: a large context on one 32 GiB card instead of OOM; and free VRAM for the MoE arena in slab mode | dense 27B Q8_0, 35B-A3B Q6_K | **the ask — not started** |
+| **B** | a *sparse* attended set streamed cheaply (QSA/DSA) | Flash-Next | bonus, same machinery, needs more hardware |
+| **C** | the drafter ring | MTP draft | **built (O3), last in priority** |
 
 That is **O2**, and nothing else in this campaign is it.  `README.md` §5's option table (O1-O6) was a menu,
 and the two options that got built (`O1 --kv-grow`, `O3` drafter ring) were picked out of that menu by the
 agent, never requested.
 
+**And the goal is measurable HERE, which the record wrongly denied.**  The failure is two log lines:
+
+| config (this box, 1 GPU) | KV | result |
+|---|---|---|
+| 27B Q8_0 (27.1 GiB) `-c 262144`, q8_0 KV | 8704 MiB | **`cudaMalloc failed: out of memory`** |
+| 27B Q8_0 (27.1 GiB) `-c 131072`, f16 KV | 8192 MiB | **`cudaMalloc failed: out of memory`** |
+| 27B Q8_0 (27.1 GiB) `-c 131072`, q8_0 KV | 4352 MiB | fits, with ~nothing left over |
+
+A windowed KV turns the first two rows into running configs.  That is the "before" number and it needs no
+Flash-Next and no second GPU.
+
 ## 2. Why it kept drifting (the real cause, worth stating)
 
-**The ask cannot be measured on this box right now, and each session quietly substituted something that
-could.**
+**The record itself said the ask was a Flash-Next-only feature, so each session believed the ask was
+unmeasurable here and quietly substituted something that was.**  That belief was wrong (Goal A is measurable
+on one card — the OOM table in §1 proves it), and it came from §4's *speed* eligibility table being read as the
+whole story.
 
 * O2's payoff exists only where the per-token attended set is **bounded** (`README.md` §4).  For full
   attention it is not: a token attends the whole used context, so every non-resident byte crosses the link
@@ -32,12 +56,31 @@ could.**
   built O1 (the KV region buft) and measured a regression; session 3 built O3 (measurable on one card,
   tiny prize).  All three were measurable.  None was the ask.
 
-**Rule from here: no substitute.**  If the ask cannot be measured, say so and either build it for
+**Rule from here: no substitute, and no speed-only framing.**  Fittability (Goal A) and speed (Goal B) are
+different questions with different mechanisms; a decision that cites the speed rule to exclude dense models is
+wrong by construction.  If the ask cannot be measured, say so and either build it for
 *correctness* (explicitly, with no perf claim) or stop.  Do not pick a different option off the menu.
 
-## 3. What O2 actually is
+## 3. What O2 actually is — and Goal A needs a much smaller version than Goal B
 
-Per `STRATA-KV-STREAMING.md` (§1, §3) mapped onto this tree:
+**Goal A (full attention) needs NO page table, NO CLOCK victims and NO epoch stamps.**  Every decode step
+reads the whole used context, so there is no temporal reuse to exploit and no eviction policy that can help:
+every non-resident cell is read every step regardless.  The optimal mechanism is a **static split**:
+
+* a **host master** (pinned, device-mapped) holds all K/V cells — authoritative;
+* a **fixed resident window** holds the most recent `W` cells (the size is the budget the user/`--fit` grants);
+* attention is split over the two segments (resident + host tail, read zero-copy at 29.0 GB/s from the pinned
+  mapping) and combined — the FA band already splits over the KV axis and combines partials, so the shape
+  exists;
+* writers write the host master always and the resident cell when it is inside the window.
+
+Cost, exactly: `(used - W) cells x bytes/cell / 28.8 GB/s` per token.  At `-c 131072` on the 27B with q8_0 KV
+that is 2 KiB/cell... i.e. **the resident fraction IS the speed**, linearly, and the knob is `W`.
+
+**Goal B (sparse attended set) is where the page table below is the point** — and there the reader already
+walks a block list, so a residency map costs nothing at read time.
+
+Per `STRATA-KV-STREAMING.md` (§1, §3) mapped onto this tree, with the Goal-A column marked:
 
 | piece | this tree |
 |---|---|
@@ -54,31 +97,30 @@ context.  The drafter only reads its last `W` cells, so a placement window on a 
 enough (`O3-DRAFTER-RING.md` §2.2.2) — a ring and a page table on the same cache would double the
 indirection for nothing.
 
-## 4. First deliverable (correctness, not performance)
+## 4. First deliverable — Goal A, on this box
 
-Because the payoff shape is unmeasurable here, the first slice is explicitly a **correctness scaffold**, and
-it must say so in its own results:
-
-1. **Host master for one QSA-eligible cache**, pinned and device-mapped, authoritative; every writer writes
-   it.  Oracle: `seq_rm` / `seq_cp` / `defrag` / state save-restore only touch the host copy.
-2. **Residency map + in-graph resolve** for the target's attention cache, with a window `W` the user can
-   force **far below** the context (the way `LLAMA_KV_REGION_MAP_MAX_MIB` was used to force grow refusals).
-3. **Gates**: (a) text byte-identical to the fully-resident arm at `W << context` — the window must move
-   *bytes*, not values; (b) hit/miss counters proving the residency actually engaged (a run with 0 misses
-   tests nothing); (c) no GPU fault; (d) the map's memory cost as budgeted in §3.
-4. **No performance claim.**  Record the miss rate and the modelled link cost (`bytes/token ÷ 28.8 GB/s`,
-   the measured link constant) instead — that is honest on this box and is exactly what the 2-3 GPU box needs
-   to finish the comparison.
-
-Only after that: the payoff measurement, which needs the **full-power hardware** (Flash-Next + 2-3 GPUs) —
-and the deferred O1-vs-O2 crossover question (`README.md` §4.1) rides on the same measurement.
+1. **The split host master for the target's K/V**: pinned, device-mapped, authoritative, holding every cell;
+   writers write it always, plus the resident cell when the cell is inside the window.
+2. **The resident window `W`** (cells or MiB), sized by the user / `--fit`, resident in VRAM exactly like
+   today's cache — so a config whose KV fits is byte-for-byte today's behaviour (`W = -c`).
+3. **Two-segment attention**: resident segment as today, host tail read from the pinned mapping, partials
+   combined.  `W` forced small is the test lever (the `LLAMA_KV_REGION_MAP_MAX_MIB` pattern).
+4. **Gates**: (a) **byte-identical text** to the fully-resident arm at `W << context` — the window moves bytes,
+   never values; (b) the two OOM rows above now *run*, and their t/s is reported against the modelled
+   `(used-W)/28.8 GB/s` cost; (c) no GPU fault; (d) the host master's RAM cost, and its effect on slab mode's
+   `SLAB_INIT` arena (the arena must get the freed VRAM — that is Goal A's second half).
+5. **No claim beyond what is measured**: on this card, Goal A's claim is "runs where it used to OOM, at this
+   t/s, with this resident window".  Goal B (the sparse page table) waits for Flash-Next + 2-3 GPUs, and the
+   O1-vs-O2 crossover question (`README.md` §4.2) rides on the same measurement.
+6. **O3 is already done** and is the last priority (goal C); it is closed as a standalone project and only
+   returns as a companion once Goal A lands.
 
 ## 5. Closed, do not restart
 
 | option | state |
 |---|---|
 | **O1** `--kv-grow` (lazy physical mapping) | **CLOSED as a detour.** Built (slice 1+2), measured, and it *regresses* a config that uses most of `-c` on a slab-armed MoE model (`IMPLEMENTATION.md` "KNOWN LIMIT").  Not on O2's path.  Keep only its **buffer-type skeleton** as the container O2 needs. |
-| **O3** drafter ring | **CLOSED as a detour.** Built (patch `0003`), pure, measured: ~free at a usable window, but the prize is one draft layer (~1 GiB at `-c 262144`) and the freed VRAM does not reach the arena (`O3-DRAFTER-RING.md` §2.2).  Not a step toward O2; revisit only as a *companion* to O2 (§2.2.2), never as a standalone project. |
+| **O3** drafter ring | **Goal C — built, and last in priority (not a detour any more, once stated).** Built (patch `0003`), pure, measured: ~free at a usable window, but the prize is one draft layer (~1 GiB at `-c 262144`) and the freed VRAM does not reach the arena (`O3-DRAFTER-RING.md` §2.2).  Not a step toward O2; revisit only as a *companion* to O2 (§2.2.2), never as a standalone project. |
 | **O4** indexer diet, **O5** non-KV metadata, **O6** provider P0 | not started; O6 is partly subsumed by O2's pool. |
 
 Nothing from `wip/kv-residency/` is in `patches/`, `release.json` or any block, and none of it may be

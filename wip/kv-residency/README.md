@@ -88,7 +88,47 @@ Two things make it work there and would have to be built here: their **reader al
 (QSA), so streaming needed *no reader change*; and their VMM lets them reserve a region without mapping it
 (`--kv-grow`).
 
-## 4. The eligibility rule (the finding that decides the port)
+## 4. The eligibility rule
+
+**There are TWO goals, and they have different rules.  Goal A was the ask and is missing from the rest of
+this document — read §4.0 first.**
+
+### 4.0 The ask (2026-10-29, from the maintainer, in their words)
+
+> a **Windowed KV** … for **fully resident dense/MoE models**, because doing so would allow users to run large
+> contexts with a Q8_0 quantization of Qwen3.8-27B, or a Q6_K quantization of 35B-A3B, on a 32 GB card, and
+> **not run out of VRAM** … and for **host-resident MoE's (slab mode)**, because it would free up more VRAM
+> for the decode arena, allowing for higher expert hit rates, leading to higher decode speeds.  Once that is in
+> place, we could then look at improving the drafter via a ring too.
+
+So: **Goal A = fittability on dense/full-attention models** (run a large context at all, on one card), plus
+**freeing VRAM for the arena**; **Goal B = a bounded attended set** (QSA/DSA), and **Goal C = the drafter ring
+(O3), which comes last.**
+
+**Measured on this box (1 GPU), the Goal A failure is real and reproducible:**
+
+| config | KV | result |
+|---|---|---|
+| 27B Q8_0 (27.1 GiB) `-c 262144`, q8_0 KV | 8704 MiB | **`cudaMalloc failed: out of memory`** |
+| 27B Q8_0 (27.1 GiB) `-c 131072`, f16 KV | 8192 MiB | **`cudaMalloc failed: out of memory`** |
+| 27B Q8_0 (27.1 GiB) `-c 131072`, q8_0 KV | 4352 MiB | fits, with ~nothing left over |
+
+**Goal A's rule is not a speed rule.**  For full attention every step reads the whole used context, so the
+streaming cost is *deterministic*: `(non-resident bytes) / 28.8 GB/s` per token.  The comparison is not
+"windowed vs resident", it is **"windowed vs OOM"** — a resident fraction greater than zero turns an
+impossible config into a running one, and its speed is a straight line in that fraction.  That is why the
+(dense-row) "no streaming" verdict further down was the wrong conclusion for this campaign: it answered a
+speed question nobody asked.
+
+**And it makes the design much cheaper than the XL this document assumed: for full attention there is no
+temporal reuse to exploit, so an LRU / CLOCK page table is pointless** — every cell is read every step, so
+*which* cells are resident changes nothing about the traffic.  The right mechanism is a **static split**: the
+most recent `W` cells resident in VRAM, the older tail read directly from a pinned, device-mapped host master
+(zero-copy kernel reads at 29.0 GB/s), split attention over the two segments and combined.  No page table, no
+victims, no epochs.  The page table of §3 is for **Goal B**, where the attended set is sparse and a residency
+map *is* the point.
+
+### 4.1 The speed rule (Goal B, and the reason the drafter is bounded)
 
 A streamed KV's resident pool must contain **everything attention reads this step**.  A miss therefore costs
 link bytes on the critical path, and the link is the constraint:
@@ -108,11 +148,13 @@ so **1 GiB of misses per token = 37 ms/token**, and the question is only ever "h
 | gemma4 iSWA | the SWA half is *already* bounded (its own smaller cache); the full half is not | the SWA cache could become a ring with no behavioural change; the full half does not stream |
 | the **drafter** (MTP / DFlash) | bounded by construction — it only proposes | a ring (Strata's `--mtp-window`) is an *acceptance* trade, zero correctness risk (the target verifies) |
 
-**So the honest headline is: "windowed KV" is a qwen4exp/DSA feature, not a dense-model feature.**  For dense
-models the win in axis C (a fixed, lazily-mapped KV region) is a *sizing and placement* win only, and it
-changes nothing about a full context — which is why O1 is parked (SCOPE DECISION).
+**The corrected headline (2026-10-29): the windowed KV is *first* a dense/MoE fittability feature (§4.0) and
+*second* a sparse-attention speed feature (this table, Goal B).**  The dense row's "no streaming" verdict
+stands as a *speed* statement — streaming a full-attention context is expensive, and its price is
+`bytes/28.8 GB/s` per token — but it was never a reason to exclude dense models, because for them the
+alternative is not "fast", it is "out of memory".
 
-## 4.1 SCOPE DECISION (2026-10-29) — the goal is the window, not the region
+## 4.2 SCOPE DECISION (2026-10-29) — the goal is the window, not the region
 
 **The ask was, and is, a Strata-style windowed KV cache (O2): the KV's VRAM footprint is a *fixed window*
 (host master + residency page table + in-graph resolve), so a large `-c` stops costing VRAM the expert arena
