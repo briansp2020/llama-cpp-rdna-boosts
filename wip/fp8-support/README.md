@@ -1,6 +1,7 @@
 # wip/fp8-support — native FP8 E4M3 for llama.cpp (RDNA4)
 
-**Status: PARKED (2026-09-26).**  Branch `wip/fp8-support`.  Re-based and building — the cllm FP8 work
+**Status: PARKED (2026-09-26), tracked as `TODO.md` #116** (the permanent handle; resume actions below and in
+`PLAN.md`).  Branch `wip/fp8-support`.  Re-based and building — the cllm FP8 work
 sits on the current `rdna-boosts` (r9) as **13 commits** (`patches-rebased/`, branch `fp8-rebase` in
 `~/llama-fp8`, tip `bc01a921e`, tree `f1e49b6f8`), clean on gfx1201 and fully **RDNA4-gated** — but
 **gate 2 FAILED**: the fp8 4B is **0.69x Q8_0** where cllm had **1.16x**, because the delivery's

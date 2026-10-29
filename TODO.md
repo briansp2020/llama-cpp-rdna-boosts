@@ -18,6 +18,7 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | # | subject | kind | status |
 |---|---|---|---|
 | **115** | the pair fusion's MMB stand-down and the GLU matcher's MMB predicate disagree | performance / kernel selection | open (2026-10-28, r161, found fixing issue #241).  `mul_mat_q_pair` stands down when `ggml_cuda_mmb_routed_will_take()` says MMB will take both muls (a weak check: `mmb_routed_flag() && mmb_wtype_ok(type)`), while the later `{MUL_MAT_ID, MUL_MAT_ID, GLU}` matcher tests the real `ggml_cuda_mmb_supported_glu()` (which also needs `mmb_glu()`, `K % 64`, `T >= mmb_min_t()`, `n_used <= 64`, a plain unswapped SWIGLU and matching `dst` layout).  When they disagree the pair has already stood down and the MMQ triple takes the gate/up instead of MMB.  Measured neutral-to-positive on gfx1151 (prefill 5421/5425 vs 5397/5398 t/s on LFM2.5-8B-A1B Q6_K), so no change was made: this is a decision to measure, not a known defect.  Detail in §115 |
+| **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -59,6 +60,59 @@ inert).  A kernel-selection change of this kind owes the fused-vs-unfused text a
 (`GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` as the A/B), per `GREEDY-PURITY.md` §65.
 
 ---
+
+## 116. Native FP8 E4M3 for RDNA4 — PARKED behind a GEMM regression (campaign `wip/fp8-support/`)
+
+**Status: parked (2026-09-26).  Not scheduled, not in `patches/`, and nothing may be applied from it without an
+explicit go-ahead (`AGENTS.md`, WIP rules).  The campaign is `wip/fp8-support/` (`README.md`, `PLAN.md`,
+`HANDOVER.md`, `RESULTS-2026-09-26-rebase-gate.md`).**
+
+**Why it exists.**  Single-request prefill is **70-81 % `mul_mat_q`** (sibling campaign
+`archive/work/prefill-gap-attribution/`), so the vLLM gap is a GEMM problem, and the int8 MMQ is
+**epilogue-bound**: every per-16 quantization pays a scaled dequant epilogue in the MMA path (~57 TFLOPS
+against Q8_0's 83 and F16's 107 — `archive/work/per16-f16-mma/`).  FP8 tensor cores need no int8 dequant epilogue, gfx1201's fp8 WMMA peak is
+~171-370 TFLOP/s-class against the int8 MMQ's ~41.5 T-MAC/s, llama.cpp has **no FP8 weight type at all** (so
+today's "75 % of vLLM" comparison is engine *and* precision), and the port already measured **+13-17 % prefill
+over Q8_0** on a 4B / gfx1201 on the maintainer's `cllm` branch (last touched 2026-08-06, base `6ea215d17`).
+
+**What exists.**  `patches/` = the original 23-commit `cllm` series (provenance; `~/cllm` tip `7c17faffc` is
+one unpushed commit ahead of `origin/cllm` and is the source of truth), `patches-rebased/` = the delivered
+re-base: **13 commits, 37 files, +5374/-12**, on the r9 base, with the 10 superseded commits (chunked GDN,
+ssm-conv, perf docs) dropped because block 02 ships a newer and different GDN.  The port is
+`GGML_TYPE_F8_E4M3` (43, self-contained `[f32 scale][128 fp8]` blocks), `ggml-cuda/fp8.cu` (`mul_mat_fp8_wmma`:
+CTA 128x64, 8 warps, `GROUP_M=4` pid swizzle, 16x16x128 tiles, register-staged, repacked weights; plus
+`quantize_fp8` activation staging and a `dot4` GEMV for decode), direct HF safetensors loading, a
+`convert_hf_to_gguf.py --outtype fp8_e4m3` path, a CPU quant + `GET_ROWS` (bit-exact vs CPU), and RDNA4 gating
+(compile-time `RDNA4` + runtime `CC_IS_RDNA4`, scalar fallback otherwise).
+
+**Where it stopped (gate 2 fails).**  4B, `pp512`, gfx1201, same box: Q8_0 **8146 ± 221** (the `cllm`-era
+figure was 6177, i.e. the delivery's MMB/GEMM work is +32 %) vs `F8_E4M3` **5607 ± 15** (the `cllm` figure was
+7184-7260) — **0.69x** where it used to be **1.16x**.  The machine is not the problem, the fp8 path is: the
+kernel runs ~65 TFLOP/s here against the ~77 the old notes recorded **on the same source**, and
+`fp8_repack_weights` takes **7.3 %** because it appears to run **per call** instead of once (it is meant to be
+a lazy one-time layout change cached on the context — check `fp8_backend_cuda_context::fp8_repack_buf`
+invalidation on the newer base).  GDN/ssm is 3 % and attention 1.3 %, so this is GEMM + repack + staging, not
+the dropped commits.
+
+**Next actions** (`PLAN.md`, in order): (1) interleaved A/B of `mul_mat_fp8_wmma` on the re-based tree against
+`~/cllm` at the same `pp512` to isolate codegen vs launch configuration; (2) fix/confirm the repack caching
+(target its 7.3 % to ~0); (3) re-run the 4B gate (fp8 must beat Q8_0 again); (4) only then convert
+`/llm/models/Qwen3.8/27B/FP8/` and measure `pp8192` against the int8 baselines (Q8_0 1371 / Q6_K 975 /
+Q4_K_XL 1254 t/s), which is the number that decides the campaign; (5) lift AITER's gfx1201
+`A8W8_BLOCKSCALE` tiles / `GROUP_SIZE_M` / `kpack` (target `mul_mat_fp8_wmma` ≥ 110 TFLOP/s effective; AITER's
+Triton reaches 121-137 against our 77-98).
+
+**Risks / constraints.**  The **conversion is the correctness cliff**: HF fp8 (per-tensor/per-channel weight
+scales, dynamic per-token activation) → the 128-block `block_f8_e4m3` grid, and a wrong scale mapping produces
+plausible-but-wrong text — so the oracle is PPL against the vLLM fp8 record (fp8 6.2250 vs Q8_0 6.2464) plus the
+same-seed greedy gate, never "it runs" (there is **no CPU oracle** for an fp8 `MUL_MAT`).  FP8 is a different
+numerics path, so it can never be bit-identical to int8 and the purity contract is a PPL/oracle comparison.  A
+**non-RDNA4 policy** (reject vs dequantize rather than a silent scalar fallback) has to be settled before any
+promotion.  "Dequantize to bf16 + hipBLAS" is a **trap** — upstream already measured that on RDNA4 MMQ beats
+dequant+hipBLAS (`ggml-cuda/mmq.cu:608`, PR #18537) — so the win must come from the native WMMA GEMM.  And the
+4B result may not scale (the 27B has different shapes, a bigger lm_head and more attention).  Promotion shape,
+if it ever gets there: a new weight type + kernels + loader + converter is a **large block** and a maintainer
+call.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
