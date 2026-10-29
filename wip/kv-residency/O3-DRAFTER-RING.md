@@ -44,6 +44,40 @@ context's cache with a sliding window of `W` cells.**  If that holds, O3 becomes
 plus an env knob, and the interesting work moves to proving the acceptance cost and that rollback is
 sound.
 
+## 2.1 Step A result (2026-10-29) — the ring is STRUCTURAL; do not route it through SWA
+
+Step A asked "can the draft cache take a window at all?"  Reading the code answered it, and changed the
+plan for the better:
+
+* **The mask is a per-*context* term, not a per-*model* one.**  `fill_mask(...)` is fed `hparams.n_swa` /
+  `hparams.swa_type` (`llama-graph.cpp:610-620`, `:593` uses `cparams.causal_attn`), and `hparams` is shared
+  between the target and the draft context (MTP builds the draft from the same model).  So a draft-only
+  window *can* be expressed — but only by adding a `cparams`-level window term and threading it into the
+  mask fill, the `self_kq_mask_swa` builder (`hparams.swa_type != NONE` gates its very existence), the cache
+  sizing, and the cache's own `n_swa`.  That is 4 sites and a new cparams field.
+* **We do not need that.**  Strata's drafter is "a ring, not a page table: a static table
+  `block -> block % n_slots` and **no resolve**" (`STRATA-KV-STREAMING.md` §1).  A ring enforces the window
+  *structurally*: a cell that has been recycled simply holds a different token, so the drafter attends
+  whatever is in the cache and the approximation comes from the ring, not from a mask.  **No mask change and
+  no `n_swa` are required.**  The mask stays what it is (absolute positions, so causality is still exact);
+  the only loss is that tokens older than the ring are gone.
+* **What the ring does need is a placement policy**: `cell = pos % n_slots` instead of `find_slot`'s free-cell
+  search, plus `kv_size = PAD(W * streams + n_ubatch)` (the formula `llama_kv_cache_iswa` already uses for its
+  SWA cache — reuse the sizing, not the masking).  That is the same shape as the idle-slot parking feature
+  (a cell-placement policy inside `llama_kv_cache`), not a new cache class.
+
+**The one real hazard this uncovered.**  `kq_mask_derivable()` (`llama-kv-cache.cpp:2307`) builds the derived
+mask from a **`tok_lo`/`tok_hi` position *range*** over cell indices, i.e. it assumes cell order ≈ position
+order.  A ring breaks that, so a ringed cache must **not** take the derived path (force the packed mask) —
+otherwise the range silently mis-masks.  Note also that `kq_mask_derivable()` does **not** reject
+`n_swa != 0`: the derived predicate has no window clause at all, so *if* anyone ever does route a window
+through SWA, that path would attend outside the window with no error.  Worth a guard when this is
+implemented, independent of which route is taken.
+
+Consequence for the plan: **Step A is done and Step B is smaller than expected** (no cparams field, no mask
+plumbing); the derived-mask exclusion is a new, explicit item.  Revised order: B (placement + sizing) ->
+C (rollback) -> D (acceptance).
+
 ## 3. Invariants the slice must keep
 
 1. **The target is untouched.**  Only the draft context's cache gets a window.  A wrong draft is a slower
@@ -71,13 +105,13 @@ sound.
 
 ## 5. Plan
 
-**Step A — can the draft cache take a window at all?**  Find where the draft context's memory is constructed
-(`llama_context::create_memory`, driven by `cparams.ctx_other` / the draft model) and whether `n_swa` can be
-forced there for the draft only.  Cheap experiment: force `n_swa` on the draft cache and run a greedy
-`--spec-type draft-mtp` arm; the text must be identical and the draft cache log line must show ~`W` cells.
+**Step A — DONE (see §2.1).**  The ring is structural; do not use the SWA mask.  New sub-item: a ringed cache
+must be excluded from `kq_mask_derivable()` (its `tok_lo`/`tok_hi` range assumes cell order ≈ position
+order).
 
-**Step B — the knob and the floor.**  `LLAMA_SPEC_DRAFT_WINDOW=N` (cells, 0 = off), floored at
-`n_max + n_ubatch`.  Log the draft cache's size so the VRAM win is visible in the KV log line.
+**Step B — the placement policy, the knob and the floor.**  `cell = pos % n_slots` for the draft cache only,
+`LLAMA_SPEC_DRAFT_WINDOW=N` (cells, 0 = off), floored at `n_max + n_ubatch`; exclude the cache from the
+derived mask; log the draft cache's size so the VRAM win is visible in the KV log line.
 
 **Step C — correctness of rollback under a window.**  The oracle is not text: run at a window small enough
 to overlap constantly (e.g. 512 cells against a 3000-token run) and require (i) no abort, (ii) the target's
