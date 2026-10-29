@@ -1,5 +1,95 @@
 # WORKLOG - dated delivery records
 
+## 261028.012 (r170) -- block 07: dense Q6_K VDR=2 is upstream's default on every arch now, so the delivery keeps it (measured) and ships a build-time VDR=1 escape (issue #228 follow-up)
+
+**Release `v15-6050b467c-r170`**, base `6050b467c`, 15 blocks, tip `30855de701d623319da984f9c80f7878e49c7bef`,
+tree `c6c0d8e236f7e628c36cc82df5dfb32180b92cc4`.  **Block 07 amended** — `ggml/src/ggml-cuda/vecdotq.cuh`
+(+18/-0: the define becomes an `#ifdef`/`#else`, plus the comment that records the measurement) and
+`ggml/src/ggml-cuda/mmvq-vecdot.cuh` (+3/-1: the same condition in `get_vec_dot_q_cuda()`): **comments and
+one preprocessor condition only, no arithmetic**.  With the new flag off the applied tree is preprocessor-identical
+for every arch, and the built gfx1151 binary reproduces the pre-change arms byte-for-byte (below).  New
+build-time flag **`-DGGML_HIP_Q6K_DENSE_VDR1`** (default off).  Blocks 08-14 carry new commit ids (their
+parent changed); their bodies are unchanged.
+
+### What was reported (issue #228, comment 6483065646)
+
+The gfx1151 consumer re-probed after the r148 HC fix: collapse gone, MTP healthy (32.7 -> 64.8 t/s), **but**
+greedy text at temp 0 still moves against their r120 reference (first-token top-5 KL 0.497, top-1 0.989,
+7/7 prompts diverge) and their output-identity gate (<= 0.007 across eight previous cutovers) blocks the
+v15 line.  They bisected it to upstream `2744e48d1` (#30517, "faster MMVQ for low-bit types"), which sets
+`VDR_Q6_K_Q8_1_MMVQ` 1 -> 2 and rewrites the q6_K `mmvq` kernel, and asked the right question: is this
+intended for the v15 line, and is there a way to keep the v14 association order?  They also noted that our
+own r120 stack had gated that define per arch.
+
+### The finding is ours, not theirs
+
+That per-arch gate **was** block 07's:
+
+```
+// Dense Q6_K keeps the upstream VDR=1 elsewhere; on RDNA4/RDNA3_0 the 16-element
+// vdr2 chunk wins at the verify widths (issue #58, gfx1201) and is band-uniform.
+#if defined(RDNA4) || defined(RDNA3_0)
+#define VDR_Q6_K_Q8_1_MMVQ 2
+#else
+#define VDR_Q6_K_Q8_1_MMVQ 1
+#endif
+```
+
+The `6050b467c` re-base absorbed upstream's unconditional `2`, so the macro arrives as *context*, the gate is
+gone, and RDNA3_5 (gfx1151) moved 1 -> 2 as a side effect — an unverified geometry on a validated arch,
+purely inherited.  The dispatch `#if defined(RDNA4) || defined(RDNA3_0)` survived but no longer distinguishes
+a VDR (both arms are VDR=2: ours vs upstream's kernel).  This is the same class as the r138 `!ids` assert and
+the r145 norm-order adoption: a re-base that silently re-scopes a delivery tuning decision.
+
+### Measured before deciding (gfx1151, ROCm 10.1.0, `GGML_HIP_NO_VMM=ON`, one long-lived tree, ccache)
+
+Payload: `/llm/models/Qwen3.8/Flash-Next/Q5K` — 339 Q5_K / 199 Q8_0 / 94 IQ3_S / 44 IQ4_NL / 2 IQ4_XS /
+**13 Q6_K** (the lm_head + 12 attention outputs), i.e. the same census class the report filed.  Two binaries
+from the same tree differing only in the macro (interleaved, 2 reps):
+
+| arm | tg128 | batched B=1 | B=4 | B=8 | tg128 @ d16384 |
+|---|---|---|---|---|---|
+| VDR=2 (current default) | 33.86 / 33.86 | 33.50 / 33.49 | 81.76 / 81.72 | **104.14 / 103.98** | 31.86 |
+| VDR=1 (restored gate) | 33.83 / 33.81 | 33.48 / 33.47 | 81.75 / 81.55 | 102.94 / 102.60 | 31.86 |
+
+Neutral at B=1/B=4/depth, **+1.2 % at batched B=8** -> default-on policy says keep VDR=2 (and it is
+upstream's default, so keeping it is also the no-divergence choice).  Greedy text moves between the builds,
+as the association-order rule says it must (`GREEDY-PURITY.md` §1-§8).
+
+**Width purity holds at VDR=2** (the invariant that matters, and the one a cross-release text gate cannot
+see): Q5_K target + the shared Q8_0 MTP head, 200 greedy tokens — `plain`, `draft-mtp n_max 3` and
+`draft-mtp n_max 7` all 1302 chars, sha `115141867744`.
+
+### What shipped
+
+* `vecdotq.cuh`: the define becomes `#ifdef GGML_HIP_Q6K_DENSE_VDR1 -> 1 #else -> 2`, with the measurement
+  and the reason in the comment.  `VDR_Q6_K_Q8_1_MMVQ_MOE` unchanged (2), and the MoE path is untouched: off
+  RDNA4/RDNA3_0 `GGML_CUDA_MMVQ_MOE_DENSE` already collapses it to the dense VDR.
+* `mmvq-vecdot.cuh`: the dense dispatch takes the same condition, so with the flag the **generic** kernel runs
+  on every arch (its VDR comes from the macro) instead of our HIP-optimised `_vdr2` one.  `get_vdr_mmvq()`
+  reads the same macro, so the host K-split arithmetic and the device kernel cannot disagree.
+* **No runtime knob, deliberately.**  VDR is a `constexpr` that the host's `blocks_per_iter`/`kqs`/`calc_nwarps`
+  also read, so an env var means instantiating the Q6_K `mmvq` kernel family twice and adding a third
+  numerics arm to gate forever — for a delta that is +1.2 % at one width.  The consumer builds their own
+  binaries, so a compile-time escape serves them (`ENVIRONMENT.md` §14).
+
+### Verification
+
+* `scripts/validate-set.sh`: checksums, strict `git am` from a fresh tarball, tree
+  `c6c0d8e2` — green; Windows portability scan 282 files, clean.
+* `scripts/apply-all.sh` on a real checkout at `6050b467c`: applied tip `30855de70` == `release.json.tip`.
+* Rebuilt default gfx1151 tree: 128-token greedy `d47f08557f75` (identical to the pre-change VDR=2 arm, i.e.
+  flag-off is a behavioural no-op), and `draft-mtp n_max 7` still `115141867744` == plain.
+* Flag-on arm compiled (`-DGGML_HIP_Q6K_DENSE_VDR1` on the `mmvq.cu` command line, object 15 189 864 B vs the
+  default 15 218 536 B) and reproduces the VDR=1 binary's text `bf8ddd5271d1`.
+* Docs: `GREEDY-PURITY.md` §68, `patches/README.md` (block 07), `ENVIRONMENT.md` §14, `AGENTS.md`.
+
+### Not done (and why)
+
+No arch gate restored and no VDR=1 default: the measurement does not support paying 1.2 % at B=8, and a
+re-base inheriting an upstream default is a re-baseline, not a defect.  The reply to the reporter says exactly
+that, gives them the numbers and the flag, and records their finding as ours.
+
 ## 261028.011 (r169) -- block 12: the backend-sampling compute buffers are reserved once per sequence, and again only for a WIDER chain (contributor PR #245)
 
 **Release `v15-6050b467c-r169`**, base `6050b467c`, 15 blocks, tip `fb7b244316d1ecdfc0e0b982e352ee3f9674452d`,

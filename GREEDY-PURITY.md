@@ -129,6 +129,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§65** | a fusion's precondition belongs to the arm it dispatches to: an assert in a shared entry point must state the *union* of its arms', and each arm asserts its own where it dispatches — a dense-only `!ids` assert must not gate the routed fused-gate arm | fix (r161, issue #241) |
 | **§66** | a copy that exists only to keep a tensor alive is a graph node, not a graph output: the copy's position in the node order is the whole memory win, the store's row index must be a graph input (never a baked view offset), and a graph built without the store must not be reused once the stores exist | doctrine (r163, issue #240) |
 | **§67** | an all-reduce *arm* is a prefill-numerics reference, so swapping it is gated at the prefill-logit level (multi-device, `-sm tensor`) and never by text; and a device with **peer access enabled** charges the host submission path, which is invisible to a synced loop and to kernel microbenchmarks and only shows where the host limits a replaying decode | doctrine (r165, `TODO #109` closed; `benchmarks/2026-10-28-allreduce-peer-access.md`) |
+| **§68** | a re-base that inherits an upstream **association-order** change is a *re-baseline*, not a purity break: classify a cross-release text move by *what* moved (a VDR/nwarps/norm-grouping carrier is a re-baseline; a scale or tensor-identity carrier is a defect), judge it by width purity and a distribution check, and answer a consumer's output-identity gate with a build-time escape — never a runtime arm | doctrine (r170, issue #228 follow-up; `prompts/` payload, gfx1151) |
 
 ---
 
@@ -2093,3 +2094,61 @@ prefill logits while leaving the decode band untouched, which puts it in §46's 
    dense → the copy-engine arm (which wins every dense shape, and an 8k-token prefill shows the staged peer
    copy costs nothing: 2100 vs 2096 t/s).  `GGML_CUDA_AR_CE_PEER=1` and `GGML_CUDA_ALLREDUCE=hybrid` are
    the opt-outs for a topology where the trade differs.
+
+---
+
+## 68. A re-base that inherits an upstream association-order change is a re-baseline, not a purity break (r170, issue #228 follow-up)
+
+**What was reported.**  A downstream consumer on gfx1151 (Strix Halo) runs an *output-identity* gate across
+base bumps: the logit fingerprint of each release against its predecessor had stayed within 0.007 for eight
+cutovers, and r150's first-token top-5 KL against their r120 reference was **0.497** with greedy text moving
+within a few dozen tokens on 7/7 prompts.  They bisected it kernel-directory → file → commit and landed on
+upstream `2744e48d1` (llama.cpp #30517, "faster MMVQ for low-bit types"), which sets
+`VDR_Q6_K_Q8_1_MMVQ` 1 → 2 and rewrites the q6_K `mmvq` kernel.  Their payload's 13 Q6_K tensors (the
+lm_head and 12 attention outputs) are exactly what that changes.  Nothing in the delivery's own kernel work
+was implicated: with the r150 `vecdotq.cuh` reverted and every other r150 file kept, their arm reads r150
+bit-for-bit, and the mmq tile-loader rework alone is numerically pure.
+
+**Why it is not a purity break.**  Every purity claim in this file is a **within-build** invariance: a
+verify batch reproduces single-token decode (§6), a fused op reproduces the chain it replaces (§9, §59,
+§61), one arm spans the whole band (§19, §24, §25, §26), a replayed graph computes what its capture
+computed (§62).  None of them is "text matches the previous release", and §5 says why: bit-identity is a
+**reproducibility** requirement, not a correctness one.  A re-base that adopts an upstream reduction-order
+change re-baselines every quantized dot that change touches.  The consumer's gate is a legitimate
+reproducibility requirement *of theirs*; it is not a contract this delivery ever made.
+
+**The measurement (gfx1151, 2026-10-28, ROCm 10.1.0, `GGML_HIP_NO_VMM=ON`).**  Payload: Qwen3.8 Flash-Next
+Q5_K (339 Q5_K / 199 Q8_0 / 94 IQ3_S / 44 IQ4_NL / 2 IQ4_XS / **13 Q6_K** — the same census class the
+report filed).  Two builds from the same tree, differing only in the macro:
+
+| arm | tg128 | batched B=1 | B=4 | B=8 | tg128 @ d16384 |
+|---|---|---|---|---|---|
+| VDR=2 (shipped default) | 33.86 / 33.86 | 33.50 / 33.49 | 81.76 / 81.72 | **104.14 / 103.98** | 31.86 |
+| VDR=1 (pre-#30517 order) | 33.83 / 33.81 | 33.48 / 33.47 | 81.75 / 81.55 | 102.94 / 102.60 | 31.86 |
+
+So the wide chunk is neutral at B=1/B=4 and at depth, **+1.2 % at batched B=8**: it stays on (default-on
+policy, and it is upstream's default anyway).  Greedy text moves between the two builds, exactly as the
+association-order rule predicts (128 tokens, one prompt: `d47f08557f75` vs `bf8ddd5271d1`).  Width purity is
+untouched at VDR=2: `plain`, `draft-mtp --spec-draft-n-max 3` and `--spec-draft-n-max 7` all produce the
+identical 1302-char stream (`115141867744`) on the Q5_K target with the shared Q8_0 MTP head — the property
+that actually matters, and the one the reporter's gate cannot see.
+
+**Doctrine.**
+
+1. **Classify a cross-release move by its carrier.**  A reduction-order carrier (a VDR value, a `nwarps`
+   choice, a tile/atom selection, a norm grouping) is a *re-baseline*: the delivered invariants still hold
+   within the build.  A scale/convention/identity carrier (§59, §61) is a *defect*, and from the outside the
+   two look the same — a different, still-coherent greedy stream.  Bisect to the file, then read the file:
+   here `vecdotq.cuh`'s define, not a delivery kernel.
+2. **The oracle for a re-baseline is width purity + a distribution check, never a cross-release text hash.**
+   `plain == draft-mtp` at `n_max <= 7` on the affected payload class, plus PPL unchanged, decides it.
+3. **A consumer's output-identity gate is answered with a build-time escape, not a runtime arm.**  VDR is a
+   `constexpr` that the host's K-split arithmetic also reads (`get_vdr_mmvq` → `blocks_per_iter`, `kqs`,
+   `calc_nwarps`), so a runtime knob means instantiating the Q6_K `mmvq` kernel family twice and adding a
+   third numerics arm to every future gate — for a delta that is +1.2 % at one width.  The flag
+   (`-DGGML_HIP_Q6K_DENSE_VDR1`) gates the macro and the device selection together, so the host partition
+   and the kernel cannot disagree; a knob that changed only one of them is a wrong answer, not a different
+   one.
+4. **Re-base checklist item:** diff `vecdotq.cuh`'s `VDR_*` defines and the `get_vec_dot_q_cuda()` dispatch
+   against the previous base.  An upstream default flip re-scopes the delivery's own per-arch gate silently,
+   turning a block-07 tuning decision into an inherited one — which is how this report became possible.

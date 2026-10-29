@@ -582,6 +582,13 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
 - **The mmvq band-uniform knobs are a purity requirement *and* a perf trap.** `nwarps` and the vec_dot
   VDR participate in the mmvq K-split order, so one value must hold across the whole band (`W=1..8`)
   and must be tuned at the **verify widths**. RDNA4 dense `nwarps=1`; dense VDR=2, MoE-expert VDR=4.
+  **Dense Q6_K VDR=2 is upstream's default on every arch since #30517 (`2744e48d1`), and the delivery keeps
+  it (r170):** block 07's own per-arch gate (`RDNA4`/`RDNA3_0` → 2, VDR=1 elsewhere) was silently
+  re-scoped by that base bump, and the re-measurement on gfx1151 says keep it (B=1/B=4/d16384 within noise,
+  batched B=8 +1.2 %, width purity `plain == draft-mtp` intact). Text moves against a pre-#30517 build —
+  association order, not a defect (`GREEDY-PURITY.md` §68). **`-DGGML_HIP_Q6K_DENSE_VDR1`** is the
+  build-time escape for a consumer with an output-identity gate (never a runtime knob: VDR is a `constexpr`
+  the host K-split arithmetic also reads, so a runtime arm would duplicate the mmvq kernel family).
   The **pinned fusion ops (GDN/SSM, shared-expert, gate fusions) MUST keep plain `calc_nwarps`** — they
   are single-token reduction-order anchors. Run the stock-relative
   `llama-batched-bench -npl 1,4,8` gate (`mtp-adaptive-methodology.md` rule 5) before any decode/mmvq
