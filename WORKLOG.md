@@ -50,15 +50,19 @@ MMB-GLU arms.  The decision is still the right one to fix; the number was not ev
 | gfx1201 (inert: `mmb_cfg().routed = 0`), r170 vs r171 same-seed 128-token text | 27B Q8_0 `da2e2d192e21`, 35B-A3B Q4_K_M `5d485275db6d` (1 GPU **and** 3 GPU `-sm tensor -ncmoe 40`), LFM2 Q6_K `0b02fbdc4bd3` — all **byte-identical** |
 | gfx1201 prefill `-p 2048 -r 2`, 1 GPU | 35B-A3B Q4_K_M 4856 -> 4894 t/s, LFM2 Q6_K 9177 -> 9166 (noise) |
 | `scripts/gate-prefill-logits.sh` (recorded gfx1201 bases) | 27B Q8_0 **0.000000 / 100.000 %**, 35B-A3B Q4_K_M **-0.000000 / 100.000 %** |
+| MTP Protocol A (27B UD-Q4_K_XL, 3 devices `-sm tensor`, bf16 KV, `-c 102400`, `-n 3000`, prose) | plain **50.95** t/s, `draft-mtp` **101.31** t/s, acceptance **0.608** (1937/3185) — at/above the recorded 3-device tensor reference (90.7 t/s, 0.60) |
 | `scripts/validate-set.sh` | strict 15/15, tree `2f5870713`, Windows portability scan OK (282 files) |
+| `scripts/gate-per-block-build.sh --fast --changed-from 30855de70` | 3/3 built (block 06 38 s, block 10 308 s, block 14 6 s) |
+| `scripts/fork-refresh.sh --build --gates` | re-cut reproduces tip `060dc264f` and tree `2f5870713`; build OK, coherence gate OK, prefill-logit PASS; pushed to the personal fork |
 
 Record: `benchmarks/2026-10-29-mmb-pair-ownership.md`.  Rule: `GREEDY-PURITY.md` §69.  Pointers:
 `ENVIRONMENT.md` §7.4 (`GGML_PAIR_ROUTED_OFF`), `patches/README.md` (blocks 06 and 10), `AGENTS.md` (critical
 facts).
 
-**Not run, deliberately.**  MTP Protocol A and the arch sweeps: the change touches no arithmetic on any arm
-(the pair and the triple are bit-identical, measured), and both boxes' coherence + the prefill-logit gate cover it.
-The gfx1151 numbers above are the A/B the item asked for; the gfx1201 arm is inert by construction and verified.
+**Not run, deliberately.**  The gfx1100 (RDNA3_0) sweep: `routed` is on there, but nothing in the fleet can run a
+MoE at that VRAM size, and the change is a predicate swap whose arms are bit-identical where they are reachable.  The
+container images are the `radiance` watcher's job (it picks the tag up within 10 minutes); nothing was built on the
+primary box.
 
 ## 261028.014 (docs) -- TODO #111 (a verify step whose slot cannot draft at all) is investigated, DECLINED and retired; the gate gains the instrument, and `GREEDY-PURITY.md` §63's determinism claim is scoped
 
