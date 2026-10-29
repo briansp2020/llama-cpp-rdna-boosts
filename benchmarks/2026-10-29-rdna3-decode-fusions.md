@@ -19,9 +19,13 @@ default-on with a `=0` switch each.  Released as `v15-6050b467c-r175`.
   `GGML_CUDA_FA_QUANTS` set — a differing instantiation set changes greedy text on its own, r138).
 * Candidate arm = the r174 tree + the 7 patches + our two adjustments (`git am -3`, or the release
   block-10 tree once folded).
-* `llama-bench -fa 1 -r 5 -t 8`, 2-3 **alternating** rounds (never parallel).  Greedy text compared with
+* `llama-bench -fa 1 -r 5 -t 8`, 2-3 **alternating** rounds (never parallel).  Greedy text is compared with
   `scripts/extract-generated.py` (never a raw `diff` of the log: the terminal's backspace corrections and
   the perf footer move).
+* **Read a delta only from within one interleaved batch.**  This box's clocks drift between batches: the
+  same gfx1201 30B binary pair measured 143.9-147.4 t/s against a 131.4 stock in one batch and 142.0-142.5
+  against a 133.0 stock in the next, i.e. +10.9 % and +6.9 % for the same content.  The strictly
+  interleaved 3-round batch is the one quoted (stock 133.3/132.7/133.0, shipped 142.0/142.2/142.5).
 * Per-patch contribution = the tg128 **loss when only that patch is switched off** from the full series.
 
 ## Throughput (1 GPU)
@@ -42,8 +46,8 @@ default-on with a `=0` switch each.  Released as `v15-6050b467c-r175`.
 
 | model | stock | shipped | delta |
 |---|---|---|---|
-| Qwen3-30B-A3B Q4_K_M | 131.07 / 131.69 | 147.43 / 143.88 | **+10.9 %** |
-| Qwen3.6-35B-A3B Q4_K_M | 102.05 / 102.08 | 104.79 / 104.47 | **+2.5 %** |
+| Qwen3-30B-A3B Q4_K_M | 133.32 / 132.70 / 132.99 | 141.97 / 142.23 / 142.45 | **+6.9 %** |
+| Qwen3.6-35B-A3B Q4_K_M | 102.02 / 101.95 | 104.88 / 105.13 | **+2.9 %** |
 | Qwen3.8-27B UD-Q4_K_XL dense | 30.77 / 30.81 | 30.88 / 30.91 | +0.4 % |
 | 27B, `pp8192` | 1315.8 | 1317.5 | flat (peak VRAM 20.17 GiB **both**) |
 
@@ -61,7 +65,7 @@ that arch):
 | `GGML_CUDA_MWR_FOLD=0` | 1.0 % | — |
 | `GGML_CUDA_ROPE_QK_PAIR=0` | 3.7 % | 3.0 % |
 | `GGML_CUDA_MMVQ_ROW_CONCAT=0` (RDNA3_0) | 2.8 % | inert |
-| `LLAMA_QK_ADJACENT=0` (dropped; shown for the record) | 6.0 % | 3.3 % |
+| `LLAMA_QK_ADJACENT=0` (dropped; shown for the record) | 5.9 % | 3.3 % |
 
 Every switch is live and every patch is individually positive.  The submitter's own table (relative to
 r171 + #249) reads 3.1 / 2.7 / 2.9 / 5.3 / 1.2 / 7.2 / 4.2 — same shape, slightly larger magnitudes
@@ -87,8 +91,9 @@ because their baseline is r171 without r174's M-RoPE hoist.
 
 1. **The `src/models/qwen3moe.cpp` reorder is dropped** (`LLAMA_QK_ADJACENT` does not exist in the
    delivery).  It makes the Q and K norm+rope chains adjacent so `GGML_CUDA_ROPE_QK_PAIR` fires on
-   qwen3moe; it is worth ~3.3 % of the 30B's 12-20 %, but it edits **upstream model code for every
-   backend** to enable a CUDA fusion, for a retired arch family.  Without it Qwen3.6 still pairs and
+   qwen3moe; it is worth **~6.7 %** of the 30B on gfx1100 (206.1-206.3 -> 192.8-193.6 t/s, the whole
+   difference between +19.7 % and +12.2 %) and **~3.3 %** on gfx1201, but it edits **upstream model code
+   for every backend** to enable a CUDA fusion, for a retired arch family.  Without it Qwen3.6 still pairs and
    qwen3moe pairs rarely; the row concat is unaffected.
 2. **The MoE GLU Q8_1 publish zeroes the padding tail** of each published row (the submitter flagged
    the gap): the arena is reused across graphs, so a reader that ever walks a padded row would find stale

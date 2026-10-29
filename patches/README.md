@@ -1551,7 +1551,8 @@ t/s, gfx1100) and, once the submitter's `qwen3moe` model reorder is dropped, **i
   (an in-kernel segment check cost Qwen3.6 2 % with the feature off).
 * **The submitter's `qwen3moe.cpp` graph reorder is NOT taken** (`LLAMA_QK_ADJACENT` does not exist here).
   It expands V and the raw K projection before the Q norm so the two norm+rope chains are adjacent, which is
-  worth ~3.3 % of the 30B on top (that is the difference between +12 % and +19.6 %) — but it edits **upstream
+  worth ~6.7 % of the 30B on top on gfx1100 (~3.3 % on gfx1201), i.e. the whole difference between +12.2 %
+  and +19.7 % -- but it edits **upstream
   model code for all backends** to enable a CUDA fusion, on an arch family that is retired.  Without it the
   Q/K pair fires where the graph is already adjacent (Qwen3.6) and qwen3moe pairs rarely; the row concat
   still takes V/K/Q when the heights differ.
@@ -1559,7 +1560,7 @@ t/s, gfx1100) and, once the submitter's `qwen3moe` model reorder is dropped, **i
   the mmvq table id) because their launch geometry is row-count-only through `small_m` and the rows per
   block.  RDNA4's config depends on the row count twice more, so neither is armed there — do not widen the
   gate without that model.  Everything else is arch-free and fires on RDNA4 too (measured: 30B-A3B
-  +10.9 %, 35B-A3B +2.5 %, dense 27B +0.4 % on gfx1201).
+  +6.9 %, 35B-A3B +2.9 %, dense 27B +0.4 % on gfx1201).
 
 **Gates.**  Greedy text byte-identical to the previous release on 30B-A3B (both arches), 35B-A3B and dense
 27B; `plain == draft-mtp` (width purity) on 27B dense and 35B-A3B at 1500 tokens, on 1 GPU and 2-GPU

@@ -23,8 +23,8 @@ argument).
 tg128 **172.3 -> 206.2 (+19.6 %)** and d4096 **153.6 -> 179.6 (+17.0 %)** with the series as submitted
 (they claimed +20.6 / +17.7); Qwen3.6-35B-A3B **138.2 -> 141.0 (+2.0 %)** (claimed +2.5); dense 27B
 +0.5 %; prefill flat.  **The submitter could not test RDNA4 and it wins there too, with only five of the
-seven patches armed** (0006/0009 are RDNA3_0-gated): gfx1201, 1 GPU, 30B-A3B **131.4 -> 145.7
-(+10.9 %)**, 35B-A3B **102.1 -> 104.6 (+2.5 %)**, dense 27B +0.4 %.  Every switch was verified live by
+seven patches armed** (0006/0009 are RDNA3_0-gated): gfx1201, 1 GPU, 30B-A3B **133.0 -> 142.2
+(+6.9 %)**, 35B-A3B **102.0 -> 105.0 (+2.9 %)**, dense 27B +0.4 %.  Every switch was verified live by
 its own switch-off delta (2.5 / 2.1 / 2.2 / 3.6 / 1.0 / 3.7 / 2.8 % on the 30B at gfx1100).
 
 **Declined: the `src/models/qwen3moe.cpp` graph reorder** (`LLAMA_QK_ADJACENT` does not exist here).  It
@@ -32,7 +32,7 @@ expands V and the raw K projection before the Q norm so the Q and K norm+rope ch
 is worth 3.3 of the 30B's points (that is the whole difference between +12.2 % and +19.6 %) — but it edits
 upstream model code for **every** backend to enable a CUDA fusion, for a retired arch family.  Without it
 Qwen3.6 pairs anyway, qwen3moe pairs rarely, and the row concat is unaffected; the shipped 30B arm is
-192.8-193.6 t/s at gfx1100 and 143.9-147.4 at gfx1201.  This is a maintainer decision, recorded here per
+192.8-193.6 t/s at gfx1100 (6.7 % of the 30B's points) and 142.0-142.5 at gfx1201 (3.3 %).  This is a maintainer decision, recorded here per
 the report-findings rule.
 
 **Fixed here (the submitter flagged it):** the MoE GLU Q8_1 publish wrote the row's real blocks but not
