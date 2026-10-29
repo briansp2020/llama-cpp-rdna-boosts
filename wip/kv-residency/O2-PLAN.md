@@ -157,27 +157,45 @@ promoted.  The fork branch `wip-kv-residency` is the record.
   **non-swappable RAM**: 4.25 GiB at `-c 131072` q8_0 on the 27B, 8.5 GiB at 262144.  It must be gated on
   `MemAvailable` (the `MOE_HOST_POOL_RAM_PCT` pattern) and refuse loudly before `cudaHostAlloc` fails.
 
-### 6.3 Mechanism (chosen: two FA passes + a combine, **not** a FA kernel rewrite)
+### 6.3 Mechanism — CORRECTED 2026-10-29 (A1 feasibility check; the combine route is not viable)
 
-`llm_graph_context::build_attn_mha` (`src/llama-graph.cpp:3139`) is the single funnel both `build_attn`
-variants pass through, so the split is described there; `llama_kv_cache::get_k/get_v` produce the two views
-(resident window + tail).
+**The two-FA-calls-plus-combine design does not work, for a concrete reason: `ggml`/CUDA FA exposes no
+log-sum-exp.**  Grepped: there is no `lse` / `softmax_lse` anywhere in `ggml/src/ggml-cuda/fattn*`.  FA
+returns only the *normalised* output, and two normalised halves cannot be combined without each half's row
+sum.  So the combine route needs an lse output from **every** FA family's epilogue (tile, vec, RDNA/WMMA, MMA,
+QSA) — an epilogue change in the numerics of the most tuned code in the tree.  Rejected.
 
-* **One FA call per segment, then combine.**  The tail is an ordinary `ggml_flash_attn_ext` whose K/V tensor
-  happens to live in the pinned host master — so the *reader* needs no new code, and streaming is a
-  **buffer-type change**, not a kernel change.  The missing piece is the combine (softmax over two normalised
-  halves needs each half's log-sum-exp), which is a small new `GGML_OP_FA_COMBINE` (row-wise
-  `out = (o1*s1 + o2*s2)/(s1+s2)`) — far less surface than teaching every FA kernel family a second address
-  base.
-* Rejected: extending `ggml_flash_attn_ext` with `k_tail`/`v_tail` srcs and combining in-kernel.  It is the
-  more efficient shape (one launch) but it re-parameterises the whole FA kernel family, including the band,
-  the WMMA/tile rows and the QSA variant — the highest-risk code in the tree, for a traffic-bound feature.
+**Chosen instead: a two-base K/V read inside the existing kernels.**  The FA kernels already take one `KV`
+base pointer plus a stride and index rows as `KV + i*stride_KV` (`fattn-tile.cuh:456-715`), and the *caller*
+forms the per-tile base.  A split is therefore an **addressing** change, not a numerics change:
+
+* the op carries a second K/V base (`k_tail`, `v_tail`) and the cell count of the tail segment (`n_tail`);
+* wherever a tile's `KV` base is formed, the segment is chosen: rows below `n_tail` come from the tail base,
+  rows at or above it from the head base (each segment contiguous in its own tensor);
+* **the KV index space stays global**, so the mask, `cell_pos`, `tok_lo`/`tok_hi` and the derived-mask form
+  are untouched — no mask slicing, no per-segment `cell_pos`, no second combine;
+* with `n_tail = 0` every kernel indexes exactly as it does today, so the default path is bit-identical by
+  construction, and with `n_tail > 0` the *accumulation order is unchanged* too (same rows, same order, only
+  a different base address) — which is what makes A1's byte-identical oracle reachable rather than
+  approximate.
+
+**And A1 needs no change to the cache representation at all:** the two segments are two **views of the same
+KV tensor** — tail = cells `[0, s)`, head = cells `[s, n_kv)`.  State io, defrag, `clear`, `seq_rm` and every
+existing cell-range path keep working untouched, because there is still one tensor and one global cell index
+space.  Only in **A2** does the tail's *storage* move (its view resolves to a tensor in the pinned host
+master), and only then do the whole-cache walking paths (state save/restore, defrag) need a second pass.
+
+Coverage plan: implement the two-base read in the families the target shapes actually select — the RDNA
+**band** (RDNA4, head 256, GQA 5..12, `n_q <= 8`: that is the 27B's decode) and the **tile** family (prefill
+and everything else).  Any other family, and any shape where the split cannot be served, **declines the
+split** — and declining means "no spill", i.e. today's fit-or-fail path, which is the correct failure mode
+for an opt-in feature.
 
 ### 6.4 Slice order, with the oracle at each step
 
 | slice | what | oracle |
 |---|---|---|
-| **A1** | the split **mechanically**, both segments still in VRAM: two views, two FA calls, `GGML_OP_FA_COMBINE`, split forced by a knob | **byte-identical text at every split width** — this proves the split is value-preserving with zero host memory involved.  Also `gate-prefill-logits.sh` |
+| **A1** | the split **mechanically**, both segments still in VRAM: two views of one tensor, the FA op's two-base read (`k_tail`/`v_tail` + `n_tail`), split forced by a knob | **byte-identical text at every split width** — same rows, same accumulation order, only a different base address, so this is an equality to *aim for*, not a tolerance.  Also `gate-prefill-logits.sh` |
 | **A2** | move the tail tensor to the pinned host master (one buffer-type change) | the *same* text as A1, plus the measured per-token cost vs the modelled `spilled/28.8 GB/s` |
 | **A3** | auto-size from free VRAM, the opt-in flag, the loud warning, `--fit` reporting, the `MemAvailable` gate | the two OOM configs in §1 now run; the flag-off run is byte-identical to today's binary; slab mode's `SLAB_INIT` shows the arena gaining what the window frees |
 
