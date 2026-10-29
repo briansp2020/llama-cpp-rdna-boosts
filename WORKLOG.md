@@ -16,10 +16,10 @@ the kernel census shows: gfx1201 `rms_norm_mul_rope_f32` **3.20 -> 2.85 µs** (`
 **3.06 -> 2.70 µs** (f32 dst) per launch (-11/-12 %).  Wall clock is inside the noise on RDNA4 (8 such
 launches per token on a 4B is ~2.8 µs of a 9.7 ms token) and real on gfx1100: **+0.65 %** tg128 on
 Qwen3.6-35B-A3B Q4_K_M (137.6 -> 138.6, three alternating rounds), +0.25 % on 27B Q4_K_M and 9B Q8_0 —
-i.e. the +0.4-0.6 % they claimed.  Greedy
-text is byte-identical on 4B Q8_0 / 27B UD-Q4_K_XL / 35B-A3B Q4_K_M (gfx1201) and 9B Q8_0 (gfx1100), and
-the prefill-logit gate reads **0.000000 KLD / 100.000 %** same-top-p at the default ubatch (against a base
-recorded from the r173 release build) and at `-ub 1` (the decode-width probe, with
+i.e. the +0.4-0.6 % they claimed.  Greedy text is byte-identical on 4B Q8_0 / 27B UD-Q4_K_XL / 35B-A3B
+Q4_K_M (gfx1201) and 9B Q8_0 (gfx1100), and the prefill-logit gate reads **0.000000 KLD / 100.000 %**
+same-top-p at the default ubatch (40 chunks, against a base recorded from the r173 release build) and at
+`-ub 1` (the decode-width probe, with
 `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0` as the fallback arm).  `test-backend-ops -o ROPE` 450/450.  The
 `rope_multi` half is upstream code, so an upstream copy ships as `upstream/rope-mrope-powf-hoist/`.
 
