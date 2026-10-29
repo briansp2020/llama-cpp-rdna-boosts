@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r166`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r169`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -1571,6 +1571,29 @@ had no other home.
   2 GPU `-sm tensor`, F1 on/off, `LLAMA_DRAFT_SCHED2=0`, and a deterministic 1-slot server with
   `ngram-mod,draft-dflash`); draft counts and acceptance identical.  No knob: nothing is disabled, the
   reserve is simply smaller (`WORKLOG.md` 261028.004).
+* **The backend-sampling compute buffers are reserved once per sequence, and again only for a WIDER
+  chain (r169, contributor PR #245).**  `llama_context::set_sampler()` set `sched_need_reserve = true` on
+  every set of an offloadable chain **and** on every removal; `sched_reserve()` re-creates the scheduler, so
+  `llama-server --backend-sampling` — which sets a chain per request and clears it on release, and for a
+  grammar request — freed and re-allocated every compute buffer, at the same size, before each first token.
+  `sampling.reserved` now records what the buffers were reserved with and `set_sampler()` reserves only when
+  the record does not cover the chain it is given; a chain set again, a narrower one, or a removal needs
+  none (the graph is rebuilt anyway — `samplers_equal()` is part of the reuse check — the output buffers are
+  sized per decode, and the allocator grows a buffer that needs more).  **The key is the chain's node count
+  (`llama_sampler_backend_n_nodes()`), not the sequence id**, because `graph_max_nodes()` is recomputed only
+  by a reserve and it sizes the graph's node capacity (`llm_graph_result::max_nodes` ->
+  `ggml_new_graph_custom`, which `ggml_build_forward` asserts on), the scheduler's arrays and the
+  compute-metadata arena — the allocator's growth covers buffer *sizes*, not node capacity.  The seq-id-only
+  key the contributor shipped missed exactly one case, and it is the one
+  `tests/test-backend-sampler.cpp`'s `test_set_sampler` performs: a 1-node `dist` chain replaced by
+  `top_k + dist` on the same sequence (1 reserve with the seq-id key, 2 with the node count; PASS either
+  way — the margin on a 27B is `max_nodes` 81920 against a 4076-node decode graph).  `LLAMA_BACKEND_SAMPLER_RESERVE_ONCE=0`
+  restores the per-set reserve.  Numerics-neutral — no kernel, dispatch row or arithmetic touched.  Measured
+  (27B UD-Q4_K_XL, 1x gfx1201, `--backend-sampling -c 65536 -ub 2048 --parallel 2 --kv-unified`, a
+  2396-token prompt, seven requests, two interleaved starts): median prompt time **1963.9 -> 1895.2 ms
+  (-3.5 %)** per sampled request, `sched_reserve` lines over three requests **4 -> 2**, request text
+  byte-identical; dense 4B/27B coherence identical to r168 and prefill-logit KLD **0.000000 / 100.000 %**
+  (`WORKLOG.md` 261028.011; upstream copy: `../upstream/backend-sampler-reserve-once/`).
 * **The DFlash target writes its layer inputs into F1's store from inside the graph (r163, issue #240).**
   F1 kept the extracted layer inputs on the device, but `extract_layer_inputs()` copied them *after* the
   graph ran, so `llm_graph_result::set_outputs()` had to mark them as graph **outputs** — and an output
