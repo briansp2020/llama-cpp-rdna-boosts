@@ -1,0 +1,372 @@
+From ee5f823e56bbc628608eb4c0e4d0d0660da850a9 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 15:44:30 +0800
+Subject: [PATCH 1/2] llama: batched state copies for states above
+ LLAMA_STATE_ASYNC_MAX_MIB too, one band at a time
+
+A state above LLAMA_STATE_ASYNC_MAX_MIB (default 256) - the server's prompt cache saving or restoring a whole slot of
+a long context, gigabytes - took the per-tensor synchronous copies into or out of pageable memory (about 2.4 GB/s on
+gfx1201 + a 3900X: 1.8 s for a 110K-token slot).  It now takes the batched path the checkpoints take (pinned stage,
+pipelined groups, streaming host copies), one band of at most LLAMA_STATE_ASYNC_MAX_MIB bytes at a time through the
+same stage, so it never pins more than one band.  A piece above a band is cut at byte offsets.  The states up to one
+band are copied exactly as before.
+
+LLAMA_STATE_ASYNC_BANDS=0 restores the per-tensor path for the states above a band.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 165 +++++++++++++++++++++++++++++++++---------
+ 1 file changed, 131 insertions(+), 34 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d12b0929c..7fc4a3673 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4284,20 +4284,66 @@ private:
+ // synchronous read costs a device sync plus a bounce through the shared pinned chunk.  Instead, queue them all
+ // as async copies into one reused pinned staging area, synchronize each backend once, and copy to the caller's
+ // buffer on the host.  Restores are batched the same way through the same stage (llama_io_read_host, below;
+-// LLAMA_STATE_ASYNC_READ=0 keeps their per-tensor synchronous sets).  States above LLAMA_STATE_ASYNC_MAX_MIB (default
+-// 256) keep the old path in both directions, so a whole slot save or load never pins gigabytes.
++// LLAMA_STATE_ASYNC_READ=0 keeps their per-tensor synchronous sets).  A state above LLAMA_STATE_ASYNC_MAX_MIB (default
++// 256) - a whole slot of a long context, e.g. the server's prompt cache saving or restoring gigabytes - takes the same
++// path one band of at most that many bytes at a time, through the same stage, so it never pins gigabytes either;
++// LLAMA_STATE_ASYNC_BANDS=0 gives such a state the per-tensor synchronous copies instead (the pre-band behaviour).
+ //
+ // Fold (r96, PR #189): the staging buffer (`state_stage`) is kept by the context across saves and rounded up to
+ // 16 MiB, so a context holds the checkpoint size (never more than LLAMA_STATE_ASYNC_MAX_MIB) in pinned host memory
+ // for its lifetime.  It is ONE buffer per context, so state saves and restores on the same context must not run
+ // concurrently; the llama state API is not documented as thread-safe, and this makes that concrete.
+-static bool llama_state_async_enabled(size_t total) {
++static bool llama_state_async_on() {
+     static const bool on = [] { const char * e = getenv("LLAMA_STATE_ASYNC"); return e == nullptr || atoi(e) != 0; }();
++    return on;
++}
++
++// the most bytes one batched copy moves through the stage
++static size_t llama_state_async_band() {
+     static const size_t max_bytes = [] {
+         const char * e = getenv("LLAMA_STATE_ASYNC_MAX_MIB");
+-        return (size_t) (e != nullptr ? atoll(e) : 256) << 20;
++        return std::max<size_t>(1, e != nullptr ? (size_t) atoll(e) : 256) << 20;
+     }();
+-    return on && total > 0 && total <= max_bytes;
++    return max_bytes;
++}
++
++// whether a state above one band is copied band by band (otherwise it takes the per-tensor synchronous path)
++static bool llama_state_async_bands() {
++    static const bool on = [] { const char * e = getenv("LLAMA_STATE_ASYNC_BANDS"); return e == nullptr || atoi(e) != 0; }();
++    return on;
++}
++
++// A state above one band: its pieces cut to at most a band each (a piece is a byte range of one tensor, so it can be
++// cut anywhere), and [first piece, end) of each band, consecutive pieces of at most `band` bytes together
++template <typename P>
++static std::vector<P> llama_state_cut_pieces(const std::vector<P> & pieces, size_t band) {
++    std::vector<P> out;
++    out.reserve(pieces.size());
++    for (const P & p : pieces) {
++        for (size_t o = 0; o < p.size; o += band) {
++            P q = p;
++            q.ptr    = p.ptr + o;
++            q.offset = p.offset + o;
++            q.size   = std::min(band, p.size - o);
++            out.push_back(q);
++        }
++    }
++    return out;
++}
++
++template <typename P>
++static std::vector<size_t> llama_state_bands(const std::vector<P> & pieces, size_t band) {
++    std::vector<size_t> first = { 0 };
++    size_t acc = 0;
++    for (size_t i = 0; i < pieces.size(); ++i) {
++        if (acc > 0 && acc + pieces[i].size > band) {
++            first.push_back(i);
++            acc = 0;
++        }
++        acc += pieces[i].size;
++    }
++    first.push_back(pieces.size());
++    return first;
+ }
+ 
+ // Pipelined batched state copies (fold r151, PR #233).  The batched copy ran the host memcpy into/out of the
+@@ -4562,22 +4608,47 @@ static bool llama_state_copy_bounces(ggml_backend_buffer_t buf) {
+ }
+ 
+ class llama_io_write_host : public llama_io_write_i {
++    struct write_info;   // a deferred read, below
++
+ public:
+     llama_io_write_host(
+             uint8_t * p, size_t len, llama_context * lctx = nullptr) : ptr(p), buf_size(len), lctx(lctx) {}
+ 
+-    // the batched path (see llama_state_async_enabled); false = not taken, nothing was copied
++    // the batched path (see llama_state_async_on); false = not taken (the caller copies everything itself)
+     bool flush_async() {
+         size_t total = 0;
+         for (const auto & w : winfos) {
+             total += w.size;
+         }
+-        if (lctx == nullptr || !llama_state_async_enabled(total)) {
++        if (lctx == nullptr || total == 0 || !llama_state_async_on()) {
++            return false;
++        }
++        const size_t band = llama_state_async_band();
++        if (total <= band) {
++            return flush_band(winfos.data(), winfos.size(), total);
++        }
++        if (!llama_state_async_bands()) {
+             return false;
+         }
+-        std::vector<ggml_backend_t> bks(winfos.size());
+-        for (size_t i = 0; i < winfos.size(); ++i) {
+-            if ((bks[i] = lctx->state_backend(winfos[i].tensor)) == nullptr) {
++        const std::vector<write_info> pieces = llama_state_cut_pieces(winfos, band);
++        const std::vector<size_t>     first  = llama_state_bands(pieces, band);
++        for (size_t b = 0; b + 1 < first.size(); ++b) {
++            size_t n = 0;
++            for (size_t i = first[b]; i < first[b + 1]; ++i) {
++                n += pieces[i].size;
++            }
++            if (!flush_band(pieces.data() + first[b], first[b + 1] - first[b], n)) {
++                return false;   // the caller copies everything again, the bands done so far included
++            }
++        }
++        return true;
++    }
++
++    // one batched copy of `n_w` pieces, `total` bytes, through the stage
++    bool flush_band(const write_info * w, size_t n_w, size_t total) {
++        std::vector<ggml_backend_t> bks(n_w);
++        for (size_t i = 0; i < n_w; ++i) {
++            if ((bks[i] = lctx->state_backend(w[i].tensor)) == nullptr) {
+                 return false;
+             }
+         }
+@@ -4585,9 +4656,9 @@ public:
+         if (stage == nullptr) {
+             return false;
+         }
+-        std::vector<size_t> sizes(winfos.size());
+-        for (size_t i = 0; i < winfos.size(); ++i) {
+-            sizes[i] = winfos[i].size;
++        std::vector<size_t> sizes(n_w);
++        for (size_t i = 0; i < n_w; ++i) {
++            sizes[i] = w[i].size;
+         }
+         const std::vector<size_t> grp = llama_state_pipe_groups(sizes, total);
+         const size_t n_grp = grp.size() - 1;
+@@ -4613,8 +4684,8 @@ public:
+         size_t off = 0;
+         for (size_t g = 0; g < n_grp; ++g) {
+             for (size_t i = grp[g]; i < grp[g + 1]; ++i) {
+-                ggml_backend_tensor_get_async(bks[i], winfos[i].tensor, stage + off, winfos[i].offset, winfos[i].size);
+-                off += winfos[i].size;
++                ggml_backend_tensor_get_async(bks[i], w[i].tensor, stage + off, w[i].offset, w[i].size);
++                off += w[i].size;
+             }
+             if (piped) {
+                 for (const auto & be : grp_ev[g]) {
+@@ -4626,10 +4697,10 @@ public:
+             llama_state_sync_all(bks);
+         }
+         size_t stage_off = 0;
+-        std::vector<llama_state_copy_piece> pcs(winfos.size());
+-        for (size_t i = 0; i < winfos.size(); ++i) {
+-            pcs[i] = { winfos[i].ptr, stage + stage_off, winfos[i].size };
+-            stage_off += winfos[i].size;
++        std::vector<llama_state_copy_piece> pcs(n_w);
++        for (size_t i = 0; i < n_w; ++i) {
++            pcs[i] = { w[i].ptr, stage + stage_off, w[i].size };
++            stage_off += w[i].size;
+         }
+         const int n_copy_threads = llama_state_copy_threads(total);
+         const int64_t t_copy = ggml_time_us();
+@@ -4644,7 +4715,7 @@ public:
+         if (st_timing) {
+             const int64_t t_end = ggml_time_us();
+             LLAMA_LOG_INFO("state get: %zu pieces, %.1f MiB in %zu group(s): enqueue %.2f ms, copy+wait %.2f ms "
+-                           "(%.1f GiB/s), total %.2f ms\n", winfos.size(), total / 1048576.0, n_grp,
++                           "(%.1f GiB/s), total %.2f ms\n", n_w, total / 1048576.0, n_grp,
+                            (t_copy - t_enq) / 1e3, (t_end - t_copy) / 1e3,
+                            total / 1073741824.0 / std::max(1e-6, (t_end - t_copy) / 1e6), (t_end - t_enq) / 1e3);
+         }
+@@ -4753,6 +4824,8 @@ private:
+ };
+ 
+ class llama_io_read_host : public llama_io_read_i {
++    struct read_info;    // a deferred set, below
++
+ public:
+     llama_io_read_host(const uint8_t * p, size_t len, llama_context * lctx = nullptr) : ptr(p), lctx(lctx), buf_size(len) {}
+ 
+@@ -4769,12 +4842,36 @@ public:
+         for (const auto & r : rinfos) {
+             total += r.size;
+         }
+-        if (!llama_state_async_enabled(total)) {
++        if (total == 0 || !llama_state_async_on()) {
+             return false;
+         }
+-        std::vector<ggml_backend_t> bks(rinfos.size());
+-        for (size_t i = 0; i < rinfos.size(); ++i) {
+-            if ((bks[i] = lctx->state_backend(rinfos[i].tensor)) == nullptr) {
++        const size_t band = llama_state_async_band();
++        if (total <= band) {
++            return flush_band(rinfos.data(), rinfos.size(), total);
++        }
++        if (!llama_state_async_bands()) {
++            return false;
++        }
++        const std::vector<read_info> pieces = llama_state_cut_pieces(rinfos, band);
++        const std::vector<size_t>    first  = llama_state_bands(pieces, band);
++        for (size_t b = 0; b + 1 < first.size(); ++b) {
++            size_t n = 0;
++            for (size_t i = first[b]; i < first[b + 1]; ++i) {
++                n += pieces[i].size;
++            }
++            if (!flush_band(pieces.data() + first[b], first[b + 1] - first[b], n)) {
++                return false;   // the caller sets everything again, the bands done so far included
++            }
++        }
++        return true;
++    }
++
++    // one batched copy of `n_r` pieces, `total` bytes, through the stage; synchronized before it returns, since the
++    // next band (or the next state copy on this context) reuses the stage
++    bool flush_band(const read_info * r, size_t n_r, size_t total) {
++        std::vector<ggml_backend_t> bks(n_r);
++        for (size_t i = 0; i < n_r; ++i) {
++            if ((bks[i] = lctx->state_backend(r[i].tensor)) == nullptr) {
+                 return false;
+             }
+         }
+@@ -4784,17 +4881,17 @@ public:
+         }
+         // the pieces sit between small metadata fields in the caller's buffer, so pack them one by one; a group's device
+         // copies are queued before the next group is packed, so they overlap its memcpy (see llama_state_pipe_groups)
+-        std::vector<size_t> sizes(rinfos.size());
+-        for (size_t i = 0; i < rinfos.size(); ++i) {
+-            sizes[i] = rinfos[i].size;
++        std::vector<size_t> sizes(n_r);
++        for (size_t i = 0; i < n_r; ++i) {
++            sizes[i] = r[i].size;
+         }
+         const std::vector<size_t> grp = llama_state_pipe_groups(sizes, total);
+         // each piece's stage offset, resolved once (the pack loop and the queue loop below then read the same address)
+-        std::vector<llama_state_copy_piece> pcs(rinfos.size());
++        std::vector<llama_state_copy_piece> pcs(n_r);
+         size_t off = 0;
+-        for (size_t i = 0; i < rinfos.size(); ++i) {
+-            pcs[i] = { stage + off, rinfos[i].ptr, rinfos[i].size };
+-            off += rinfos[i].size;
++        for (size_t i = 0; i < n_r; ++i) {
++            pcs[i] = { stage + off, r[i].ptr, r[i].size };
++            off += r[i].size;
+         }
+         static const bool st_timing = getenv("LLAMA_STATE_TIMING") != nullptr;
+         const int n_copy_threads = llama_state_copy_threads(total);
+@@ -4802,11 +4899,11 @@ public:
+         for (size_t g = 0; g + 1 < grp.size(); ++g) {
+             llama_state_copy_pieces(pcs, grp[g], grp[g + 1], n_copy_threads);
+             for (size_t i = grp[g]; i < grp[g + 1]; ++i) {
+-                ggml_backend_tensor_set_async(bks[i], rinfos[i].tensor, pcs[i].dst, rinfos[i].offset, rinfos[i].size);
++                ggml_backend_tensor_set_async(bks[i], r[i].tensor, pcs[i].dst, r[i].offset, r[i].size);
+             }
+         }
+         if (st_timing) {
+-            LLAMA_LOG_INFO("state set: %zu pieces, %.1f MiB in %zu group(s): pack+enqueue %.2f ms\n", rinfos.size(),
++            LLAMA_LOG_INFO("state set: %zu pieces, %.1f MiB in %zu group(s): pack+enqueue %.2f ms\n", n_r,
+                            total / 1048576.0, grp.size() - 1, (ggml_time_us() - t_pack) / 1e3);
+         }
+         llama_state_sync_all(bks);   // the stage is reused by the next state copy on this context
+@@ -5259,7 +5356,7 @@ uint8_t * llama_context::state_stage(size_t size) {
+     if (buf_state_stage == nullptr || ggml_backend_buffer_get_size(buf_state_stage.get()) < size) {
+         buf_state_stage.reset();
+         // the pinned type of the output device (the first simple device of a meta device), as for the outputs
+-        // Fold (r96, PR #189): retained after the save (see the note above `llama_state_async_enabled`); it only
++        // Fold (r96, PR #189): retained after the save (see the note above `llama_state_async_on`); it only
+         // ever grows, so a small save after a large one keeps the large allocation.
+         auto * dev = model.dev_output();
+         ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+-- 
+2.43.0
+
+
+From 3ea0504e667242b05e9de640a0082f583a2ab011 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 16:14:23 +0800
+Subject: [PATCH 2/2] server: a new prompt cache buffer of 64 MiB or more is
+ faulted in with huge pages (Linux)
+
+A prompt cache save of a long context needs a new buffer as large as the slot state (GiBs) whenever no recycled one is
+large enough, and its zero fill faults it in 4 KiB pages: 1.6-1.7 s for 3.5 GiB on a 3900X, most of the save (the state
+copy itself is ~0.3-0.45 s).  take() now reserves such a buffer, advises the 2 MiB-aligned part of it MADV_HUGEPAGE and
+only then zero-fills it: ~0.4 s for the same 3.5 GiB (transparent huge pages in madvise mode).  Recycled buffers keep
+their pages.  LLAMA_SERVER_CACHE_HUGEPAGE=0 restores the 4 KiB pages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/server/server-task.cpp | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 0104e6ac0..caf877377 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -12,6 +12,10 @@
+ 
+ #include <sstream>
+ 
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
+ //
+ // task_params
+ //
+@@ -1751,6 +1755,17 @@ static bool prompt_cache_reuse() {
+     return v;
+ }
+ 
++// a new state buffer of a long context (GiBs) is faulted in by its zero fill, and in 4 KiB pages that fault in is most of
++// a prompt cache save: a 3.5 GiB slot state took 1.6-1.7 s to zero-fill on a 3900X, against ~0.4 s in 2 MiB pages
++// (transparent huge pages, madvise mode) and ~0.3 s for the state copy itself.  LLAMA_SERVER_CACHE_HUGEPAGE=0: 4 KiB pages
++static bool prompt_cache_hugepage() {
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_SERVER_CACHE_HUGEPAGE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return v;
++}
++
+ std::vector<uint8_t> server_prompt_cache::take(size_t n) {
+     // the smallest spare that holds n bytes; resizing it down keeps the memory, resizing it up zero-fills only the tail
+     size_t best = spare.size();
+@@ -1764,6 +1779,19 @@ std::vector<uint8_t> server_prompt_cache::take(size_t n) {
+         buf = std::move(spare[best]);
+         spare.erase(spare.begin() + best);
+     }
++#if defined(__linux__) && defined(MADV_HUGEPAGE)
++    else if (prompt_cache_hugepage() && n >= (64u << 20)) {
++        // reserve() only maps the buffer, so the advice is in place before the zero fill below touches a page; the huge
++        // pages cover the 2 MiB-aligned part of it (a failed madvise leaves 4 KiB pages, as before)
++        buf.reserve(n);
++        const uintptr_t huge = 2u << 20;
++        const uintptr_t beg  = ((uintptr_t) buf.data() + huge - 1) & ~(huge - 1);
++        const uintptr_t end  = ((uintptr_t) buf.data() + n) & ~(huge - 1);
++        if (end > beg) {
++            madvise((void *) beg, end - beg, MADV_HUGEPAGE);
++        }
++    }
++#endif
+     buf.resize(n);
+     return buf;
+ }
+-- 
+2.43.0
+

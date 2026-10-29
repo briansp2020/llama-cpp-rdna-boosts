@@ -48,7 +48,7 @@ only as a rough shape.
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section) | +12697 / −4954 | 78 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
-| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240) | +5073 / −937 | 80 |
+| 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
 
@@ -1774,6 +1774,26 @@ had no other home.
   default and covers both arms.  Measured on gfx1201: conversation switch at 11.5K tokens 0.5 -> 0.2-0.3 s
   (same text), the overflow case 8.3 s recompute -> 0.5 s restore with 4 tokens evaluated, 4-slot concurrent
   storm 13/13 requests green.  Record: `archive/work/server-prompt-cache-lazy/`.
+* **Huge-page prompt-cache buffers** (r173, PR #248, overdoingism): a **new** prompt-cache state buffer of
+  64 MiB or more (`server_prompt_cache::take()`) is reserved, its 2 MiB-aligned part is advised
+  `MADV_HUGEPAGE`, and only then is it zero-filled, so a multi-GiB slot state is faulted in 2 MiB pages
+  instead of 4 KiB ones (Linux; THP in `madvise` mode — `LLAMA_SERVER_CACHE_HUGEPAGE=0` restores 4 KiB
+  pages; a recycled spare keeps its pages).  The zero fill, not the copy, is the dominant term of a
+  whole-slot save on a 4 KiB-paged host: **3.47 GiB alloc+zero 470 -> 125 ms**, and the server's
+  `prompt cache update took` for a 100K-token slot saving into a new 3.4 GiB buffer **828.1 -> 497.0 ms**
+  (-40 %; the recycled-buffer case is unchanged at 292.6 -> 291.0, as is everything copied, so no text or
+  logit can move).  **The submission's other half is deliberately NOT taken**: taking the batched state
+  path for states above `LLAMA_STATE_ASYNC_MAX_MIB` by *cutting* a piece at a byte offset.  A state piece
+  is a window handed to the backend that owns the tensor — under `-sm tensor` that is the meta backend,
+  which only serves a window aligned to the tensor's own layout, so a cut trips
+  `GGML_ASSERT(size % chunk_size_full == 0)` (2-device tensor split, 27B, `-c 266240`, 250K-token slot:
+  the save aborts, where `LLAMA_STATE_ASYNC_BANDS=0` completes with identical logits).  Any future banding
+  must therefore be a run of **whole** pieces, an oversized piece taking a band of its own — the rule
+  `llama_state_copy_staged()` already follows for the device-state class.  It is also not a win here: a
+  whole-slot state's pieces are 1-27 MiB, so the per-tensor path already runs at 8-14 GiB/s and the batched
+  path's extra host copy costs more than the syncs it removes (324 MiB state, 1 GPU: save 32.0 -> 51.9 ms,
+  restore 23.1 -> 53.9 ms; 3.47 GiB: save 304 -> 278, restore 242 -> 281).  Record:
+  `benchmarks/2026-10-29-prompt-cache-hugepage.md`, `archive/work/prompt-cache-save-bands/`.
 * **Idle-slot parking** (r136, PR #225, `archive/work/server-park-idle-slots/`): #210's resident idle slots
   change a request's `n_kv` and cell indices, so a sequence that runs alone no longer sees the empty-cache
   attention layout and near-ties can flip (the reporter's 4/16 repeat test; our same-slot schedule measured

@@ -1,4 +1,4 @@
-From 116afd730b80e8164deea401580bbf0894e9add4 Mon Sep 17 00:00:00 2001
+From be1384b6084031f8bb73c5cac6c99dfd8355b8df Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/14] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -248,6 +248,23 @@ or the compute-metadata arena.  LLAMA_BACKEND_SAMPLER_RESERVE_ONCE=0 restores th
 Contributor: overdoingism (PR #245).
 
 Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
+
+Fold (r173, PR #248, overdoingism): a new prompt-cache state buffer is faulted in with huge pages.
+`server_prompt_cache::take()` reserves a buffer of 64 MiB or more, advises its 2 MiB-aligned part
+`MADV_HUGEPAGE` and only then zero-fills it, so a multi-GiB slot state is faulted in 2 MiB pages
+instead of 4 KiB ones (Linux, THP in `madvise` mode; `LLAMA_SERVER_CACHE_HUGEPAGE=0` restores 4 KiB
+pages), and a recycled spare buffer keeps the pages it already has.  Measured on this box
+(9950X3D/9950X3D2, `hugepage-bench` 3472 MiB): alloc+zero 470 -> 125 ms, and the server's prompt-cache
+update for a 100K-token slot saving into a new 3.4 GiB buffer 828.1 -> 497.0 ms (-40 %); the
+recycled-buffer case is unchanged (292.6 -> 291.0 ms).  Nothing is copied differently, so no text or
+logit can move.  The submission's other half -- taking the batched state path above
+`LLAMA_STATE_ASYNC_MAX_MIB` by cutting a piece at a byte offset -- is deliberately NOT taken: a cut
+piece is not a window the meta backend accepts, so a 2-device `-sm tensor` 27B at `-c 266240` with a
+250K-token slot aborts on the save (`GGML_ASSERT(size % chunk_size_full == 0)`,
+ggml-backend-meta.cpp:2523) where the release path completes with identical logits; and on this box it
+is not a win even single-device (324 MiB state: save 51.9 vs 32.0 ms, restore 53.9 vs 23.1 ms; 3.47 GiB
+at 100K tokens: save 278 vs 304 ms, restore 281 vs 242 ms -- the pieces of a whole-slot state are large
+enough that the per-tensor path already runs at 8-14 GiB/s).  See WORKLOG 261029.004.
 ---
  common/arg.cpp                                |    5 +-
  common/common.cpp                             |    9 +
@@ -326,10 +343,10 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  src/models/qwen4exp.cpp                       |    2 +-
  src/models/sensenova-u1.cpp                   |    2 +-
  tools/server/server-context.cpp               |  218 +-
- tools/server/server-task.cpp                  |   74 +-
+ tools/server/server-task.cpp                  |  104 +-
  tools/server/server-task.h                    |   11 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 80 files changed, 5126 insertions(+), 944 deletions(-)
+ 80 files changed, 5156 insertions(+), 944 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 5be48e428..4c2e0fa63 100644
@@ -9014,16 +9031,40 @@ index 6790efe2f..d8e83c73f 100644
                                      } else {
                                          ++it;
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index d7ac2a1dc..0104e6ac0 100644
+index d7ac2a1dc..b1d345f62 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
-@@ -1743,6 +1743,48 @@ size_t server_prompt_cache::n_tokens() const {
+@@ -12,6 +12,10 @@
+ 
+ #include <sstream>
+ 
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
+ //
+ // task_params
+ //
+@@ -1743,6 +1747,74 @@ size_t server_prompt_cache::n_tokens() const {
      return res;
  }
  
 +static bool prompt_cache_reuse() {
 +    static const bool v = [] {
 +        const char * e = getenv("LLAMA_SERVER_CACHE_REUSE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return v;
++}
++
++// a new state buffer of a long context (GiBs) is faulted in by its zero fill, and in 4 KiB pages that fault in is most of
++// a prompt cache save: a 3.5 GiB slot state took 1.6-1.7 s to zero-fill on a 3900X, against ~0.4 s in 2 MiB pages
++// (transparent huge pages, madvise mode) and ~0.3 s for the state copy itself.  Measured on the 9950X3D, 3.47 GiB
++// alloc+zero: 470 -> 125 ms, and the server's prompt-cache update for a 100K-token slot's new buffer 828 -> 497 ms.
++// LLAMA_SERVER_CACHE_HUGEPAGE=0: 4 KiB pages
++static bool prompt_cache_hugepage() {
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_SERVER_CACHE_HUGEPAGE");
 +        return e == nullptr || atoi(e) != 0;
 +    }();
 +    return v;
@@ -9042,6 +9083,19 @@ index d7ac2a1dc..0104e6ac0 100644
 +        buf = std::move(spare[best]);
 +        spare.erase(spare.begin() + best);
 +    }
++#if defined(__linux__) && defined(MADV_HUGEPAGE)
++    else if (prompt_cache_hugepage() && n >= (64u << 20)) {
++        // reserve() only maps the buffer, so the advice is in place before the zero fill below touches a page; the huge
++        // pages cover the 2 MiB-aligned part of it (a failed madvise leaves 4 KiB pages, as before)
++        buf.reserve(n);
++        const uintptr_t huge = 2u << 20;
++        const uintptr_t beg  = ((uintptr_t) buf.data() + huge - 1) & ~(huge - 1);
++        const uintptr_t end  = ((uintptr_t) buf.data() + n) & ~(huge - 1);
++        if (end > beg) {
++            madvise((void *) beg, end - beg, MADV_HUGEPAGE);
++        }
++    }
++#endif
 +    buf.resize(n);
 +    return buf;
 +}
@@ -9066,7 +9120,7 @@ index d7ac2a1dc..0104e6ac0 100644
  server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
      // first check if the current state is contained fully in the cache
      for (auto it = states.begin(); it != states.end(); ++it) {
-@@ -1776,6 +1818,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1776,6 +1848,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
          if (len == (int) it->prompt.tokens.size()) {
              SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
  
@@ -9075,7 +9129,7 @@ index d7ac2a1dc..0104e6ac0 100644
              it = states.erase(it);
          } else {
              ++it;
-@@ -1788,6 +1832,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1788,6 +1862,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
              SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                      states.front().size() / (1024.0 * 1024.0));
  
@@ -9084,7 +9138,7 @@ index d7ac2a1dc..0104e6ac0 100644
              states.pop_front();
          }
      }
-@@ -1797,8 +1843,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1797,8 +1873,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
  
      // check if we can allocate enough memory for the new state
      try {
@@ -9095,7 +9149,7 @@ index d7ac2a1dc..0104e6ac0 100644
      } catch (const std::bad_alloc & e) {
          SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
  
-@@ -1825,7 +1871,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1825,7 +1901,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
      return &states.back();
  }
  
@@ -9104,7 +9158,7 @@ index d7ac2a1dc..0104e6ac0 100644
      const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
  
      float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-@@ -1837,6 +1883,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -1837,6 +1913,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
  
      // find the most similar cached prompt, that would also preserve the most context
      for (auto it = states.begin(); it != states.end(); ++it) {
@@ -9117,7 +9171,7 @@ index d7ac2a1dc..0104e6ac0 100644
          const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
  
          const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-@@ -1857,8 +1909,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -1857,8 +1939,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
          }
      }
  
@@ -9133,7 +9187,7 @@ index d7ac2a1dc..0104e6ac0 100644
  
          {
              auto & data = it_best->data.main;
-@@ -1871,8 +1929,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -1871,8 +1959,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                  return false;
              }
  
@@ -9144,7 +9198,7 @@ index d7ac2a1dc..0104e6ac0 100644
          }
  
          {
-@@ -1889,8 +1947,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -1889,8 +1977,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                      return false;
                  }
  

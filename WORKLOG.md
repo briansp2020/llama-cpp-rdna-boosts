@@ -1,5 +1,60 @@
 # WORKLOG - dated delivery records
 
+## 261029.004 (r173) -- PR #248 assessed: its huge-page prompt-cache buffer shipped (+331 ms off a 100K slot's new-buffer save), its banded state copies were declined (they abort on `-sm tensor`)
+
+**Released as `v15-6050b467c-r173` (15 blocks, 00-14).**  Contributor PR
+[#248](https://github.com/stew675/llama-cpp-rdna-boosts/pull/248) (`@overdoingism`,
+`archive/work/prompt-cache-save-bands/`) is two independent commits, cut on r170 and applied to r172
+unchanged, and they came out differently.  `benchmarks/2026-10-29-prompt-cache-hugepage.md` holds the
+measurements.
+
+**Commit 2 (taken, block 12): a new prompt-cache state buffer is faulted in with huge pages.**
+`server_prompt_cache::take()` reserves a buffer of 64 MiB or more, advises its 2 MiB-aligned part
+`MADV_HUGEPAGE` and only then zero-fills it, so a multi-GiB slot state is faulted in 2 MiB pages instead of
+4 KiB ones (Linux, THP in `madvise` mode; `LLAMA_SERVER_CACHE_HUGEPAGE=0` restores 4 KiB pages); a recycled
+spare keeps the pages it already has.  This is the other half of r130's buffer-reuse cost, and the zero fill
+— not the copy — was the dominant term: on this box (9950X3D2, THP `madvise`) 3.47 GiB alloc+zero **470 →
+125 ms**, and the server's `prompt cache update took` for a 100K-token slot saving into a new 3.4 GiB buffer
+**828.1 → 497.0 ms** (−40 %), with the recycled-buffer case unchanged (292.6 → 291.0 ms).  Request B's wall
+clock (it waits on that save) 0.93 → 0.60 s.  Nothing copied differs, so no text or logit can move.
+
+**Commit 1 (declined): batched state copies above `LLAMA_STATE_ASYNC_MAX_MIB`, one band at a time, a piece
+larger than a band being cut at a byte offset.**  Two reasons, each sufficient:
+
+* **It aborts on a multi-device tensor split.**  A state piece is a window handed to the backend that owns
+  the tensor, and under `-sm tensor` that is the meta backend, which serves only windows aligned to the
+  tensor's own layout: a cut piece trips `GGML_ASSERT(size % chunk_size_full == 0)`
+  (`ggml-backend-meta.cpp:2523`).  Reproduced at the **default** band — 2× R9700 `-sm tensor`, 27B
+  UD-Q4_K_XL, `-ck/-cv q8_0`, `-c 266240`, a 250,000-token slot: **SIGABRT (exit 134) on the save**, where
+  the same run with `LLAMA_STATE_ASYNC_BANDS=0` completes (save 988.8 / restore 2106.7 ms) with
+  byte-identical logits; also reproducible with `LLAMA_STATE_ASYNC_MAX_MIB=1` at a 4,000-token state.  A cut
+  needs one piece larger than the band, and a piece is one layer's contiguous used-cell run × row bytes, so
+  q8_0 (row 1088 on this model) needs > 246,723 contiguous cells — `-c 262144` with a full slot reaches it.
+  f16 is *accidentally* aligned (2048 divides 256 MiB) and only cuts, which is why the PR's single-device
+  arms never saw it; a 1-GPU arm cannot abort at all, which is why its "not covered: `-sm tensor`" note
+  understates the result.  `llama_state_copy_staged()` (r157) already states the rule for the device-state
+  class — a band is a run of **whole** pieces and an oversized piece takes a band of its own; the host path
+  must obey the same one.
+* **It is not a win here.**  The premise (the per-tensor path above 256 MiB is slow, ~2.4 GB/s) does not
+  hold on this box: a whole-slot state's pieces are 1-27 MiB, so it already runs at **8.3-14 GiB/s** and the
+  batched path's extra host copy costs more than the syncs it removes.  324 MiB state, 1 GPU: save 32.0 →
+  51.9 ms, restore 23.1 → 53.9 ms (2 GPU tensor: 55.5 → 68.1 / 49.0 → 108.2); 3.47 GiB at 100K tokens:
+  save 304 → 278 ms but restore 242 → 281 ms.  The server end-to-end agrees (bands-only vs release
+  799.8/274.1 vs 828.1/292.6 ms).  The batched path's real shape is the opposite one — a checkpoint's ~75
+  small pieces (r96) — which is what its `total <= LLAMA_STATE_ASYNC_MAX_MIB` gate encodes.
+
+**Fixed while folding** (beyond the PR as submitted): `patches/0005-…`-`0011-…` were regenerated, so their
+`From` lines now carry the **canonical** commit ids.  They had been left pointing at a wall-clock-stamped
+re-cut (`git log` shows the same tree/parent with a `committer` date of the re-cut rather than the author
+date), i.e. r172's artifacts and its recorded `.tip` described two different chains.  The trees are
+identical, so nothing about the delivery changes; the artifact hashes do.  Block 12's `+/−` column in
+`patches/README.md` was stale and is corrected.  No `TODO` item was opened: the declined half is a PR reply
+plus the assessment record, not an outstanding delivery defect.
+
+**The PR reply** asks for a re-cut of the declined half with (1) whole-piece bands, (2) a 2- and 3-device
+`-sm tensor` arm whose state holds a piece above one band, and (3) a Linux measurement where the banded path
+beats the per-tensor path at the sizes that occur.
+
 ## 261029.003 (r172) -- PR #247 (the derived kq mask for batches of several sequences) promoted into block 05: 1 GiB of device and 0.9 GiB of pinned host memory back on a 2-slot unified server
 
 **Released as `v15-6050b467c-r172` (15 blocks, 00-14).**  Contributor PR
