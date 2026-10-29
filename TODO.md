@@ -18,52 +18,9 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | # | subject | kind | status |
 |---|---|---|---|
 | **111** | a multi-slot verify step whose slot drafted NOTHING still splits | performance / accepted limitation | open (2026-10-27, r153/r154, issue #234).  `LLAMA_SPEC_ALIGN` equalizes the draft CAPS of the sequences one `draft-mtp-adaptive` call drafts, but a slot that drafted no tokens this round (the last step of a response, or a drafter that gave up) contributes its sampled row only, so the batch is `n_draft + 1` vs `1` and `split_equal()` still produces a second ubatch there.  Truncating the neighbour's good draft to nothing is the worse trade, so that step keeps splitting (measured: 1 such step per ~200 on the 35B-A3B host-expert arm).  **The cross-drafter case is CLOSED, not deferred**: the generic `min` cut of the finished drafts was shipped in r153 and measured -6 % on the reporter's own n-gram-first chain (65.6 -> 61.7 t/s, prose acceptance 74 % -> 50 %, splits 12 -> 1), so r154 removed it: a length mismatch caused by CONTENT rather than a cap is not worth equalizing.  `scripts/gate-spec-align.sh` now gates that chain (inert within 2 %, identical draft counts).  Record: `archive/work/spec-align-234/` |
-| **112** | VRAM-resident slot snapshots for the server | parked idea | **parked** (2026-10-27, r157) — no work implied.  `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` now copies a sequence state at **14.7 / 17.2 ms** on 2 GPUs (was 2.2 s; `WORKLOG.md` 261027.009), so keeping a slot's snapshot **in VRAM** instead of host RAM is usable for the first time — but nothing calls the arm.  Blockers before a server could: no eviction/budget API on `mem_storage` and no `--fit` accounting, the MoE arena would be the OOM chain's sacrifice, and `llama-memory-recurrent.cpp` refuses the flag for more than one cell range (so a hybrid model's interleaved slot cannot be saved at all).  Detail in §112 |
 | **115** | the pair fusion's MMB stand-down and the GLU matcher's MMB predicate disagree | performance / kernel selection | open (2026-10-28, r161, found fixing issue #241).  `mul_mat_q_pair` stands down when `ggml_cuda_mmb_routed_will_take()` says MMB will take both muls (a weak check: `mmb_routed_flag() && mmb_wtype_ok(type)`), while the later `{MUL_MAT_ID, MUL_MAT_ID, GLU}` matcher tests the real `ggml_cuda_mmb_supported_glu()` (which also needs `mmb_glu()`, `K % 64`, `T >= mmb_min_t()`, `n_used <= 64`, a plain unswapped SWIGLU and matching `dst` layout).  When they disagree the pair has already stood down and the MMQ triple takes the gate/up instead of MMB.  Measured neutral-to-positive on gfx1151 (prefill 5421/5425 vs 5397/5398 t/s on LFM2.5-8B-A1B Q6_K), so no change was made: this is a decision to measure, not a known defect.  Detail in §115 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
-
----
-
-## 112. VRAM-resident slot snapshots — PARKED IDEA (not scheduled)
-
-**Status: parked (2026-10-27, r157).**  Not a defect and not a plan.  The delivery's "switch away and come
-back" story stays the host-side pair (the in-memory prompt cache and the context checkpoints), and r157 does
-not change that: nothing in `llama-server`, `llama-cli` or `llama-bench` passes
-`LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`, so the arm is reached by `tests/test-llama-context` only.
-
-**What r157 changed for this.**  That arm keeps a snapshot in a *device* buffer instead of handing the caller
-a host blob, and it used to be unusable: 2.23 s to save / 2.28 s to restore a 213.6 MiB state on 2 GPUs
-(`ggml_backend_tensor_copy`'s pageable bounce per piece), i.e. 58x slower than the host path it replaces.  It
-is now 14.7 / 17.2 ms — faster than the host path's 21.9 / 38.9 ms — so the performance objection is gone and
-what remains is a memory-placement decision.
-
-**Where it would pay.**  A discrete GPU whose model leaves the state comfortable VRAM headroom (the 32 GiB
-cards with a 4B-12B model, i.e. most of this box's own runs): the snapshot costs VRAM instead of host RAM and
-the restore never materialises a host blob.  At 213 MiB that is ~7 ms / ~22 ms; at GB scale (a 100k-token
-dense KV) both paths are bandwidth-bound and the argument becomes **residency, not latency**.  On UMA
-(gfx1151) the latency win is a fraction of that — the pinned staging buffer is the same physical memory — but
-a snapshot that lives in VRAM does not add to the non-swappable host footprint, which is the trade
-`--host-experts pool` exists to manage.
-
-**What is missing before a server could use it.**
-
-1. `mem_storage` (`src/llama-context.h:508`) is a `std::map<seq_id, llama_memory_buffers>` with no erase
-   path, no budget and no participation in VRAM accounting: one snapshot per seq_id, retained until the
-   context is destroyed, invisible to `--fit`.
-2. The MoE arena interaction: a snapshot allocation that fails reaches `ggml_cuda_device_malloc`'s OOM
-   chain, whose last resort is freeing the expert arena — the wrong victim for a cache.
-3. `llama-memory-recurrent.cpp:974` refuses `ON_DEVICE` when the recurrent cell ranges are more than one, so a
-   hybrid/recurrent model's **interleaved** slot (the #210 lazy-idle-slot shape that `LLAMA_SERVER_PARK_IDLE_SLOTS`
-   and `--kv-unified` produce) cannot be saved over this path at all.
-4. `--kv-unified` / `seq_cp` sharing: "this slot's state" is not a cell range once two slots share cells (the
-   checkpoint work had to answer the same question), and the one-stage-per-context rule means a save and a
-   restore must not run concurrently.
-
-**If it is ever picked up**, the oracle is `tests/test-llama-context`'s `cp_d` / `cp_d_s` for the copy itself
-(`-sm tensor`, 2 GPU), then the server path it becomes — `scripts/gate-state-pipe.sh` and
-`scripts/gate-ckpt-reuse.sh` are the closest existing models for "a restored state moves no token".  Records:
-`archive/work/state-device-path/RESOLUTION.md`, `benchmarks/2026-10-27-state-device-path.md`.
 
 ---
 

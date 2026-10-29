@@ -21,6 +21,7 @@ is the signature of a stub, not of a campaign.
 | directory | what | status |
 |---|---|---|
 | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED (2026-09-26) — rebased and building, fully RDNA4-gated, but **gate 2 failed** (the fp8 4B is 0.69x Q8_0 where cllm had 1.16x, because the delivery's MMB/GEMM work made Q8_0 +32 % and the fp8 WMMA path did not follow).  Resume actions are in `PLAN.md`.  Not closed — paused behind the delivery work |
+| [`vram-resident-slots/`](vram-resident-slots/README.md) | VRAM-resident slot snapshots for `llama-server` (`TODO` **#112**, moved here 2026-10-28) | PARKED (2026-10-28) — **scoping note only, nothing implemented**, and not scheduled.  r157 made the `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` arm usable (2.23 s -> **14.7 / 17.2 ms** for a 213.6 MiB state on 2 GPUs, faster than the host path's 21.9 / 38.9 ms), so keeping a slot snapshot in VRAM is a *memory-placement* decision now, not a performance one.  Nothing outside `tests/test-llama-context` calls it, and §4 of the README lists what a server would still need: an explicit snapshot handle (the arm allows one per seq id and keeps it until the context dies), a budget/erase path and a `--fit` term, a refusal policy so the expert arena is not the OOM chain's sacrifice, multi-range support in `llama_memory_recurrent` (a hybrid model's interleaved slot aborts), and invalidation on context recreation (a device snapshot is not portable the way a host blob is) |
 
 **Shipped (2026-10-26, r149, block 09 — `TODO #107` closed).**  `graph-replay-placement/` left `wip/` for
 [`archive/work/graph-replay-placement/`](../archive/work/graph-replay-placement/README.md) and its fix
@@ -534,7 +535,9 @@ are removed.
 
 **Note on the `PARKED` rows.** These are open TODO items that the maintainer has explicitly marked "not planned
 now". They are seeded here as scoping notes (per the `TODO.md` header, which counts parked ideas as still open)
-so a cold session can pick one up without re-deriving it — they are **not** active work.
+so a cold session can pick one up without re-deriving it — they are **not** active work.  `vram-resident-slots/`
+(**`TODO` #112**) joined them on 2026-10-28 and left `TODO.md` at the same time: the handle stays permanent, the
+scoping body lives in that directory's `README.md`.
 
 **Recently archived (2026-10-11 wip audit).**  `mmvq-verify-rows/` (integrated in r21 as PR #57 —
 block-10 + block-13; only the `q5_1`/`iq4_xs` retune remains, now `mmvq-rpb-retune/`),

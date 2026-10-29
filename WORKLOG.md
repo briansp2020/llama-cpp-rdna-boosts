@@ -1,5 +1,39 @@
 # WORKLOG - dated delivery records
 
+## 261028.013 (docs) -- TODO #112 (VRAM-resident slot snapshots) leaves the tracker and is parked as `wip/vram-resident-slots/`
+
+**Docs only: no patch, no `release.json` change, no tree change; `scripts/validate-set.sh` is unaffected.**
+`TODO.md` loses #112 (row + scoping body).  The subject is not dropped and **#112 stays the permanent handle**
+(never reused): the scoping note now lives in `wip/vram-resident-slots/README.md`, unchanged in status —
+**parked, nothing implemented, not scheduled** — with `wip/CAMPAIGNS.md` gaining its row.
+
+**Why the move, and why nothing else changed.**  A parked idea is open work, so it belongs in the `wip/` index
+rather than in the forward-looking TODO table (`wip/CAMPAIGNS.md`'s own rule: parked rows are *scoping notes*,
+not active work).  The README fleshes the idea out instead of restating it, and the two facts worth having
+written down are the ones the TODO row could not carry:
+
+* **the device arm's shape.**  `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` is not a blob: the caller's host buffer holds
+  only the metadata (`state_seq_get_size_ext` sizes it with `llama_io_write_dummy(skip_tensors = true)`), the
+  bytes live in `llama_context::mem_storage` as one device buffer per buft, and the header says a second get
+  for a seq id **invalidates the first**.  A restore is addressed by the *blob's* seq id and asserts this
+  context still holds it, so a device snapshot is valid only for the live context that made it — it is a
+  per-context cache, never a replacement for the host prompt cache or the slot file (which restore into a
+  different slot id and after a model reload).
+* **the budget arithmetic.**  `n_ctx_checkpoints` is 32 and a 27B checkpoint is 150 + 21 MiB, i.e. up to
+  ~4.8 GiB **per slot**, so a device tier is a MiB-budgeted, LRU, spill-to-host cache that must decline on
+  headroom — not a place to keep everything, and never something that may reach `ggml_cuda_device_malloc`'s
+  OOM chain, whose last resort is the expert arena.
+
+The four blockers from the old row are kept and expanded (plus three that only show up when the code is read:
+the single `state_stage` per context, the portability/lifetime question, and the 497/355 ms first-touch stage
+fault), with a phased sketch (P0 = an explicit snapshot handle API, i.e. several snapshots per seq id with a
+free and a size), the gates it would owe, and an explicit "answer this first" question — a *pinned-host* tier
+may capture most of the win without competing with the arena for VRAM.
+
+**Docs.**  `TODO.md` loses #112 (row + body); `wip/vram-resident-slots/README.md` is new;
+`wip/CAMPAIGNS.md` gains the row and names #112 in the parked-rows note.  Nothing in `patches/`, `release.json`,
+`ENVIRONMENT.md`, `GREEDY-PURITY.md` or `patches/README.md` moves.
+
 ## 261028.012 (r170) -- block 07: dense Q6_K VDR=2 is upstream's default on every arch now, so the delivery keeps it (measured) and ships a build-time VDR=1 escape (issue #228 follow-up)
 
 **Release `v15-6050b467c-r170`**, base `6050b467c`, 15 blocks, tip `30855de701d623319da984f9c80f7878e49c7bef`,
