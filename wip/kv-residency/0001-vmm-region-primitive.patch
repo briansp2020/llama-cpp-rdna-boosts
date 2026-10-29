@@ -1,0 +1,493 @@
+From c757b5ea8ceabe1a6fe3604b9debde2b38db8209 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Thu, 29 Oct 2026 15:36:36 -0500
+Subject: [PATCH] wip/kv-residency: grow-only VMM region primitive + its
+ selftest (TODO #117, not for patches/)
+
+First implementation slice of the kv-residency campaign: the "O1 fixed region" primitive the KV
+buffer type will consume, and nothing else. Purely additive -- no existing allocation, kernel or
+code path changes.
+
+* ggml-cuda-vmm-region.h/.cu: one VA reservation, physical mapped per `unit` chunk, grown
+  MONOTONICALLY as the caller's used-byte watermark rises.  Built on the probe in
+  wip/kv-residency/VMM-PROBE.md:
+    - VA-only reserve then map-later works, so "KV-grow" is mechanically available;
+    - one reservation hosts many independent handles, and a chunk's own mapping can be unmapped
+      (neighbours intact) -- but a SUB-range unmap is refused, so the grow is monotone by design
+      and nothing ever unmaps part of a chunk;
+    - create+map / unmap are ~3-4 us at any size, so a grow between two decode steps is free;
+    - a fresh mapping may hold STALE bytes, so grow() memset()s what it maps (490 GB/s measured);
+    - reading reserved-but-unmapped VA FAULTS the GPU, hence the explicit mapped-watermark
+      contract in the header (the KV already sizes its graph view by used, not reserved, cells).
+  Fail-soft throughout: every driver refusal returns false/nullptr and the caller can fall back
+  to the plain allocation path.  Owner + best-effort peer access, mirroring the slab helper.
+
+* GGML_CUDA_VMM_REGION_SELFTEST=1 (one-shot, from ggml_backend_cuda_init): the primitive's only
+  reachable entry point until the KV buffer type lands -- reserve 384 MiB in 6 x 64 MiB units,
+  grow to 1 then 3, verify a pattern survives a grow, verify each new unit is cleared, verify a
+  smaller grow is a no-op and a grow past the reservation refuses instead of aborting, then drain.
+
+  device 0: VMM region available (map unit 2 MiB, driver granularity 2 MiB)
+  device 0: PASS (reserved 384 MiB in 6 x 64 MiB units, grew to 3, watermark contract and
+            clear-on-map verified)
+
+Gate: same-seed greedy text is byte-identical with the arm off and on (4B Q8_0, 32 tokens,
+1109 bytes each), i.e. the selftest's transient 384 MiB mapping perturbs nothing.
+
+Next slice (not in this commit): the KV buffer type (a device buft whose alloc_buffer reserves the
+region and whose clear/init map on demand) plus the llama_kv_cache grow call site at the point the
+used-cell watermark advances, and the --fit term.
+---
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 335 +++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  62 ++++
+ ggml/src/ggml-cuda/ggml-cuda.cu            |  16 +
+ 3 files changed, 413 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
+ create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
+new file mode 100644
+index 000000000..5b6272fa9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
+@@ -0,0 +1,335 @@
++// wip/kv-residency (TODO #117): the grow-only VMM region -- the O1 "fixed KV region" primitive.
++// Contract, driver facts and the two traps: ggml-cuda-vmm-region.h.
++//
++// Nothing in the delivery calls this yet: the KV buffer type that will consume it is the next slice, and
++// until then the only reachable entry point is the GGML_CUDA_VMM_REGION_SELFTEST diagnostic below (the
++// same pattern LLAMA_RS_ROLLBACK_DEBUG / MOE_EXPERT_CACHE_VALIDATE / GGML_META_SS_VERIFY use: the
++// primitive lives inside the backend library, so a diagnostic is the only way to exercise it in-tree).
++
++#include "ggml-cuda-vmm-region.h"
++
++#include "common.cuh"
++#include "ggml-impl.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++struct ggml_cuda_vmm_region {
++    int      device = -1;
++    int      phys   = -1;
++    size_t   size   = 0;   // the VA reservation
++    size_t   unit   = 0;   // map granularity (a whole number of units is always mapped)
++    size_t   mapped = 0;   // the read watermark: bytes [0, mapped) are mapped and cleared
++    void *   base   = nullptr;
++};
++
++namespace {
++
++size_t vmm_up(size_t x, size_t a) {
++    return a == 0 ? x : ((x + a - 1) / a) * a;
++}
++
++// The backend already queried this once at init (`ggml_cuda_info().devices[].vmm_granularity`, the
++// RECOMMENDED granularity) and latched whether the driver offers VMM at all, so there is no second query
++// and no need for the `CUresult`/`CU_MEM_ALLOC_GRANULARITY_MINIMUM` macros -- which `vendors/hip.h` does
++// not map (only the RECOMMENDED one), and adding them would touch a header every backend compiles.
++size_t vmm_granularity(int device) {
++    const ggml_cuda_device_info & info = ggml_cuda_info();
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || !info.devices[device].vmm) {
++        return 0;
++    }
++    const size_t g = info.devices[device].vmm_granularity;
++    return g != 0 ? g : ((size_t) 2 << 20);
++}
++
++// Map `bytes` of fresh physical at `addr` and grant READWRITE to the owner, then each peer on its own
++// (best effort -- a refused peer descriptor must not fail the mapping; the slab's helper documents the
++// `-sm tensor` fault that taught that).  The handle is released after a successful map.
++bool vmm_map(ggml_cuda_vmm_region * r, size_t addr_off, size_t bytes) {
++    CUmemAllocationProp prop = {};
++    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
++    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    prop.location.id   = r->phys;
++
++    CUmemGenericAllocationHandle handle = 0;
++    if (cuMemCreate(&handle, bytes, &prop, 0) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    const CUdeviceptr addr = (CUdeviceptr) ((uintptr_t) r->base + addr_off);
++    if (cuMemMap(addr, bytes, 0, handle, 0) != cudaSuccess) {
++        (void) cudaGetLastError();
++        (void) cuMemRelease(handle);
++        return false;
++    }
++
++    CUmemAccessDesc own = {};
++    own.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    own.location.id   = r->phys;
++    own.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++    if (cuMemSetAccess(addr, bytes, &own, 1) != cudaSuccess) {
++        (void) cudaGetLastError();
++        (void) cuMemUnmap(addr, bytes);
++        (void) cuMemRelease(handle);
++        return false;
++    }
++    const int n_dev = ggml_backend_cuda_get_device_count();
++    for (int d = 0; d < n_dev; d++) {
++        const int p = ggml_cuda_get_physical_device(d);
++        if (p == r->phys) {
++            continue;
++        }
++        CUmemAccessDesc peer = {};
++        peer.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++        peer.location.id   = p;
++        peer.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++        if (cuMemSetAccess(addr, bytes, &peer, 1) != cudaSuccess) {
++            (void) cudaGetLastError();   // owner access stands; copies from that peer stage via host
++        }
++    }
++    (void) cuMemRelease(handle);   // the mapping keeps the physical alive
++    return true;
++}
++
++void vmm_unmap(ggml_cuda_vmm_region * r, size_t addr_off, size_t bytes) {
++    if (bytes == 0) {
++        return;
++    }
++    const CUdeviceptr addr = (CUdeviceptr) ((uintptr_t) r->base + addr_off);
++    if (cuMemUnmap(addr, bytes) != cudaSuccess) {
++        (void) cudaGetLastError();
++    }
++}
++
++}  // namespace
++
++ggml_cuda_vmm_region * ggml_cuda_vmm_region_create(int device, size_t bytes, size_t unit, char * err, size_t errsz) {
++    auto fail = [&](const char * why) -> ggml_cuda_vmm_region * {
++        if (err != nullptr && errsz > 0) {
++            std::snprintf(err, errsz, "%s", why);
++        }
++        return nullptr;
++    };
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return fail("bad device");
++    }
++    if (bytes == 0) {
++        return fail("zero size");
++    }
++
++    const int phys = ggml_cuda_get_physical_device(device);
++    const size_t gran = vmm_granularity(device);
++    if (gran == 0) {
++        return fail("VMM unavailable on this device");
++    }
++    size_t u = unit != 0 ? unit : ((size_t) 64 << 20);
++    u = vmm_up(u, gran);
++
++    auto * r = new ggml_cuda_vmm_region();
++    r->device = device;
++    r->phys   = phys;
++    r->unit   = u;
++    r->size   = vmm_up(bytes, u);
++
++    CUdeviceptr base = 0;
++    if (cuMemAddressReserve(&base, r->size, 0, 0, 0) != cudaSuccess) {
++        (void) cudaGetLastError();
++        delete r;
++        return fail("cuMemAddressReserve refused the VA reservation");
++    }
++    r->base = (void *) base;
++
++    if (err != nullptr && errsz > 0) {
++        err[0] = '\0';
++    }
++    return r;   // nothing is mapped yet: mapped == 0
++}
++
++bool ggml_cuda_vmm_region_grow(ggml_cuda_vmm_region * r, size_t used_bytes) {
++    if (r == nullptr) {
++        return false;
++    }
++    if (used_bytes <= r->mapped) {
++        return true;   // monotone: never shrink, nothing to do
++    }
++    if (used_bytes > r->size) {
++        return false;  // beyond the reservation -- the caller must have sized it for its context
++    }
++    const size_t want = vmm_up(used_bytes, r->unit);
++    if (want > r->size) {
++        return false;
++    }
++    for (size_t off = r->mapped; off < want; off += r->unit) {
++        if (!vmm_map(r, off, r->unit)) {
++            // Leave the watermark at what did map: those bytes are valid and cleared, and the caller can
++            // still run on them (a KV region that is short is a shorter context, not a crash).
++            return false;
++        }
++        r->mapped += r->unit;
++        // A fresh mapping can contain stale bytes (measured), so clear exactly what was just mapped.  The
++        // write runs at VRAM speed (~490 GB/s measured, no fault storm), so this is not a real cost.
++        if (cudaMemset((char *) r->base + off, 0, r->unit) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
++        }
++    }
++    return true;
++}
++
++size_t ggml_cuda_vmm_region_mapped(const ggml_cuda_vmm_region * r) { return r != nullptr ? r->mapped : 0; }
++size_t ggml_cuda_vmm_region_size  (const ggml_cuda_vmm_region * r) { return r != nullptr ? r->size   : 0; }
++size_t ggml_cuda_vmm_region_unit  (const ggml_cuda_vmm_region * r) { return r != nullptr ? r->unit   : 0; }
++void * ggml_cuda_vmm_region_base  (const ggml_cuda_vmm_region * r) { return r != nullptr ? r->base   : nullptr; }
++
++void ggml_cuda_vmm_region_free(ggml_cuda_vmm_region * r) {
++    if (r == nullptr) {
++        return;
++    }
++    vmm_unmap(r, 0, r->mapped);
++    if (r->base != nullptr) {
++        if (cuMemAddressFree((CUdeviceptr) (uintptr_t) r->base, r->size) != cudaSuccess) {
++            (void) cudaGetLastError();
++        }
++    }
++    delete r;
++}
++
++bool ggml_cuda_vmm_region_available(int device) {
++    // One real probe per device: reserve one unit, map it, unmap it, free it.  Cached, because the answer
++    // cannot change inside a process and the probe costs two driver round trips.
++    static bool     ok[GGML_CUDA_MAX_DEVICES] = {};
++    static bool     done[GGML_CUDA_MAX_DEVICES] = {};
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return false;
++    }
++    if (done[device]) {
++        return ok[device];
++    }
++    done[device] = true;
++    const size_t g = vmm_granularity(device);
++    if (g == 0) {
++        return ok[device] = false;
++    }
++    const size_t u = g < ((size_t) 2 << 20) ? ((size_t) 2 << 20) : g;
++    char err[128] = {0};
++    ggml_cuda_vmm_region * r = ggml_cuda_vmm_region_create(device, u, u, err, sizeof(err));
++    if (r == nullptr) {
++        GGML_LOG_INFO("%s: device %d: VMM region unavailable (%s)\n", __func__, device, err);
++        return ok[device] = false;
++    }
++    ok[device] = ggml_cuda_vmm_region_grow(r, u);
++    ggml_cuda_vmm_region_free(r);
++    GGML_LOG_INFO("%s: device %d: VMM region %s (map unit %zu MiB, driver granularity %zu MiB)\n", __func__,
++            device, ok[device] ? "available" : "REFUSED a one-unit map", u >> 20, g >> 20);
++    return ok[device];
++}
++
++// -----------------------------------------------------------------------------------------------
++// GGML_CUDA_VMM_REGION_SELFTEST: the primitive's oracle while nothing in the delivery consumes it yet.
++// -----------------------------------------------------------------------------------------------
++
++namespace {
++
++__global__ void st_fill_kernel(uint32_t * p, size_t n, uint32_t v) {
++    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
++        p[i] = v;
++    }
++}
++
++__global__ void st_check_kernel(const uint32_t * __restrict__ p, size_t n, uint32_t v, int * bad) {
++    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
++        if (p[i] != v) {
++            atomicAdd(bad, 1);
++        }
++    }
++}
++
++bool st_units_are(const ggml_cuda_vmm_region * r, size_t n_units, uint32_t v, int * d_bad, const char * what) {
++    const size_t unit = ggml_cuda_vmm_region_unit(r);
++    const size_t n = n_units * unit / 4;
++    (void) cudaMemset(d_bad, 0, sizeof(int));
++    st_check_kernel<<<256, 256>>>((const uint32_t *) ggml_cuda_vmm_region_base(r), n, v, d_bad);
++    if (cudaDeviceSynchronize() != cudaSuccess) {
++        (void) cudaGetLastError();
++        GGML_LOG_ERROR("%s: %s: check kernel failed\n", __func__, what);
++        return false;
++    }
++    int bad = 0;
++    (void) cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost);
++    if (bad != 0) {
++        GGML_LOG_ERROR("%s: %s: %d mismatching words (expected 0x%x)\n", __func__, what, bad, v);
++        return false;
++    }
++    return true;
++}
++
++}  // namespace
++
++bool ggml_cuda_vmm_region_selftest(int device) {
++    // 6 units of 64 MiB = 384 MiB reserved, 3 mapped -- small enough to run at every start, and enough to
++    // exercise the watermark contract, the stale-content clear, and a growth step of more than one unit.
++    const size_t unit = (size_t) 64 << 20;
++    const size_t n_units = 6;
++
++    char err[128] = {0};
++    ggml_cuda_vmm_region * r = ggml_cuda_vmm_region_create(device, n_units * unit, unit, err, sizeof(err));
++    if (r == nullptr) {
++        GGML_LOG_ERROR("%s: device %d: create failed (%s)\n", __func__, device, err);
++        return false;
++    }
++    bool ok = true;
++    int * d_bad = nullptr;
++    if (cudaMalloc(&d_bad, sizeof(int)) != cudaSuccess) {
++        (void) cudaGetLastError();
++        ggml_cuda_vmm_region_free(r);
++        GGML_LOG_ERROR("%s: device %d: scratch alloc failed\n", __func__, device);
++        return false;
++    }
++
++    auto check = [&](bool cond, const char * what) {
++        if (!cond) {
++            GGML_LOG_ERROR("%s: device %d: FAILED: %s\n", __func__, device, what);
++            ok = false;
++        }
++    };
++
++    check(ggml_cuda_vmm_region_size(r) == n_units * unit, "reservation size");
++    check(ggml_cuda_vmm_region_unit(r) == unit, "unit honoured");
++    check(ggml_cuda_vmm_region_mapped(r) == 0, "a fresh reservation maps nothing");
++
++    // grow one unit: it must be mapped AND cleared (a fresh mapping can hold stale bytes)
++    check(ggml_cuda_vmm_region_grow(r, 1), "grow to one unit");
++    check(ggml_cuda_vmm_region_mapped(r) == unit, "watermark is one unit after grow(1)");
++    if (ok) { check(st_units_are(r, 1, 0u, d_bad, "unit 0 cleared on map"), "unit 0 cleared on map"); }
++
++    // write a distinct value into unit 0, grow to three units, and prove unit 0 survived and 1..2 are clear
++    st_fill_kernel<<<256, 256>>>((uint32_t *) ggml_cuda_vmm_region_base(r), unit / 4, 0x5a5a5a5au);
++    check(cudaDeviceSynchronize() == cudaSuccess, "fill unit 0");
++    check(ggml_cuda_vmm_region_grow(r, 3 * unit), "grow to three units");
++    check(ggml_cuda_vmm_region_mapped(r) == 3 * unit, "watermark is three units");
++    if (ok) {
++        check(st_units_are(r, 1, 0x5a5a5a5au, d_bad, "unit 0 preserved across a grow"), "unit 0 preserved across a grow");
++        const size_t two_units = 2 * unit / 4;
++        (void) cudaMemset(d_bad, 0, sizeof(int));
++        st_check_kernel<<<256, 256>>>((const uint32_t *) ((char *) ggml_cuda_vmm_region_base(r) + unit), two_units, 0u, d_bad);
++        int bad = -1;
++        (void) cudaDeviceSynchronize();
++        (void) cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost);
++        check(bad == 0, "newly mapped units 1..2 are cleared");
++    }
++
++    // a smaller grow is a no-op, and growing past the reservation must refuse rather than abort
++    check(ggml_cuda_vmm_region_grow(r, unit), "a smaller grow is a no-op");
++    check(ggml_cuda_vmm_region_mapped(r) == 3 * unit, "watermark unchanged by a smaller grow");
++    check(!ggml_cuda_vmm_region_grow(r, n_units * unit + unit), "growing past the reservation is refused");
++
++    // and it must survive its own teardown
++    ggml_cuda_vmm_region_free(r);
++    (void) cudaFree(d_bad);
++
++    GGML_LOG_INFO("%s: device %d: %s (reserved %zu MiB in %zu x %zu MiB units, grew to 3, watermark contract "
++                  "and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
++                  (n_units * unit) >> 20, n_units, unit >> 20);
++    return ok;
++}
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
+new file mode 100644
+index 000000000..f27036544
+--- /dev/null
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
+@@ -0,0 +1,62 @@
++#pragma once
++
++// wip/kv-residency (TODO #117): a grow-only VMM region for the KV cache -- the O1 "fixed region" primitive.
++//
++// WHY THIS EXISTS
++//   The KV is a plain `cudaMalloc` (one allocation per buffer type, `llama-kv-cache.cpp:301-320`) sized for
++//   the WHOLE context a user asked for, made BEFORE the movable-boundary slab is created, so `SLAB_INIT`
++//   maps `free VRAM - reserve` and every token of context is taken out of the MoE expert arena 1:1
++//   (measured: +3840 MiB of `-c` = -3.75 GiB of arena on 35B-A3B).  A region that RESERVES its VA once and
++//   maps physical only for the cells the run actually reaches keeps the arithmetic exact at any context
++//   length, and it makes the KV's size and address known before the graph is built.
++//
++// THE DRIVER FACTS THIS IS BUILT ON (measured, `wip/kv-residency/VMM-PROBE.md`)
++//   * VA can be reserved without mapping, and a chunk can be mapped into it later  -> the whole point.
++//   * ONE mapping may host several independent handles, and `hipMemUnmap` works on a chunk's own mapping
++//     (neighbours stay intact) -- but a SUB-range of a mapping is refused (`hipErrorInvalidValue`).
++//     Hence: map in whole `unit` chunks, and grow MONOTONICALLY.  Nothing here ever unmaps part of a chunk.
++//   * create+map and unmap cost ~3-4 us regardless of the chunk size (it is lazy bookkeeping), so a grow
++//     between two decode steps is free.
++//   * a fresh mapping can contain STALE bytes and the first write to it runs at VRAM speed (490 GB/s), so
++//     `grow()` memsets what it maps.  Never rely on the driver zeroing a mapping.
++//   * READING RESERVED-BUT-UNMAPPED VA FAULTS THE GPU (it does not return an error).  The caller must never
++//     let a kernel or a copy touch a byte above `ggml_cuda_vmm_region_mapped()`, which is the same contract
++//     `llama_kv_cache` already keeps for the graph view (it sizes it by the USED cell count, not `kv_size`).
++//
++// All entry points fail soft: a driver refusal returns false/nullptr and leaves nothing half-created, so a
++// caller can fall back to the plain allocation path.  No `GGML_ASSERT` ends the process.
++
++#include <stddef.h>
++#include <stdint.h>
++
++struct ggml_cuda_vmm_region;
++
++// Reserve `bytes` of VA on `device` with nothing mapped.  `unit` is the map/unmap granularity (0 = 64 MiB,
++// rounded up to the driver's recommended granularity).  Returns nullptr when VMM is unavailable or the
++// driver refuses; `err` receives a one-line reason (may be nullptr).
++ggml_cuda_vmm_region * ggml_cuda_vmm_region_create(int device, size_t bytes, size_t unit, char * err, size_t errsz);
++
++// Map whole units until at least `used_bytes` are mapped, and clear what it maps.  Monotone: a smaller
++// `used_bytes` than the current watermark is a no-op, and the region never shrinks.  false = the driver
++// refused (or `used_bytes` exceeds the reservation); the region is left at its previous watermark and the
++// bytes that did map stay mapped (they are valid, just more than asked for).
++bool ggml_cuda_vmm_region_grow(ggml_cuda_vmm_region * r, size_t used_bytes);
++
++// Bytes currently mapped (the read watermark) and the reservation size.
++size_t ggml_cuda_vmm_region_mapped(const ggml_cuda_vmm_region * r);
++size_t ggml_cuda_vmm_region_size  (const ggml_cuda_vmm_region * r);
++size_t ggml_cuda_vmm_region_unit  (const ggml_cuda_vmm_region * r);
++void * ggml_cuda_vmm_region_base  (const ggml_cuda_vmm_region * r);
++
++// Unmap what is mapped, free the VA, destroy the object.
++void   ggml_cuda_vmm_region_free  (ggml_cuda_vmm_region * r);
++
++// Is VMM usable on this device at all (reserve + one map + unmap succeeded once)?  Cached per device.
++bool   ggml_cuda_vmm_region_available(int device);
++
++// Diagnostic (GGML_CUDA_VMM_REGION_SELFTEST=1, run from the CUDA backend init): exercise the primitive on
++// this device -- reserve, grow in steps, verify a pattern per unit, verify the watermark contract, reach
++// past the reservation (must refuse, not abort), and drain.  Logs one PASS/FAIL line.  Returns false on a
++// failed check.  This exists because the primitive lives inside the backend library and nothing above it
++// can call it before the KV buft lands.
++bool   ggml_cuda_vmm_region_selftest(int device);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 92dcfabb5..7de117026 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -110,6 +110,7 @@
+ #include <vector>
+ #include "ggml-cuda-try-fuse.cuh"
+ #include "ggml-cuda-vmm.h"
++#include "ggml-cuda-vmm-region.h"
+ #include "ggml-cuda-moe-cache-hooks.cuh"
+ #include "ggml-cuda-arena.cuh"
+ 
+@@ -8382,6 +8383,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+     // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
+     moe_cache_init(device);
+ 
++    // wip/kv-residency (TODO #117): the grow-only VMM region's oracle.  Nothing in the delivery consumes
++    // the primitive yet (the KV buffer type that will is the next slice), so this is the only place it can
++    // be exercised in-tree.  One-shot, env-gated, and it never changes a run's behaviour or allocation.
++    {
++        static bool vmm_st_done = false;
++        if (!vmm_st_done) {
++            vmm_st_done = true;
++            const char * e = getenv("GGML_CUDA_VMM_REGION_SELFTEST");
++            if (e != nullptr && atoi(e) != 0) {
++                (void) ggml_cuda_vmm_region_available(device);
++                (void) ggml_cuda_vmm_region_selftest(device);
++            }
++        }
++    }
++
+     ggml_backend_t cuda_backend = new ggml_backend {
+         /* .guid    = */ ggml_backend_cuda_guid(),
+         /* .iface   = */ ggml_backend_cuda_interface,
+-- 
+2.55.0
+

@@ -1,6 +1,8 @@
 # wip/kv-residency — the KV cache in VRAM: how much, where, and how little can be resident (OPEN, scoping)
 
-**Status: OPEN / scoping (2026-10-29).  Nothing implemented, nothing in `patches/`, not scheduled.**
+**Status: OPEN — scoping complete, implementation started (2026-10-29).  Nothing here is in `patches/`, and
+nothing is scheduled.  The campaign's code lives on fork branch `wip-kv-residency` (cut from the r174 tip
+`5bdec04ab`); what exists is [`IMPLEMENTATION.md`](IMPLEMENTATION.md).**
 **`TODO` #117 is the permanent handle** for the subject (old and future records that cite `#117` mean this
 document).  `wip/` is never applied to the fork (`AGENTS.md`, WIP rules).
 
@@ -151,7 +153,15 @@ HIP_VISIBLE_DEVICES=0 /tmp/bw-probe 512 5
 
 ## 8. Phases (each env-gated OFF until it is gated; nothing here is in `patches/`)
 
-* **P0 — instruments and a gate.**  A KV-accounting report (per cache: cells, bytes, resident share, the
+* **DONE (2026-10-29) — the VMM probe.**  [`VMM-PROBE.md`](VMM-PROBE.md): reserve-VA-then-map works, many
+  handles per reservation work, a chunk's own mapping can be unmapped (a sub-range cannot), map/unmap cost
+  ~3-4 µs, a fresh mapping can be stale, and **reading reserved-but-unmapped VA faults the GPU**.  That last
+  one is the design's read rule, and it is already the KV's contract.
+* **DONE (2026-10-29) — slice 1: the grow-only VMM region + its selftest** ([`IMPLEMENTATION.md`](IMPLEMENTATION.md)):
+  one VA reservation, chunk-granular monotone growth, clear-on-map, fail-soft; `GGML_CUDA_VMM_REGION_SELFTEST=1`
+  prints PASS, same-seed text is byte-identical off/on, and a slab-armed MoE arm reports an identical
+  `SLAB_INIT` layout.
+* **P0 — a residency gate.**  A KV-accounting report (per cache: cells, bytes, resident share, the
   bookkeeping size, and the arena/`--fit` consequence, from the log rather than a guess) plus a **residency
   gate**: one run with residency at 100 %, one with the pool deliberately undersized (forced misses),
   requiring byte-identical greedy text, identical acceptance, and a miss/hit counter both ways.  This is the
@@ -226,6 +236,10 @@ HIP_VISIBLE_DEVICES=0 /tmp/bw-probe 512 5
 
 * Decision log for this campaign: **scope = the KV cache** and **`wip/moe-cpu-overlap/` is retained**
   (2026-10-29, this file's status block + `wip/CAMPAIGNS.md`).
+* [`VMM-PROBE.md`](VMM-PROBE.md) — what the ROCm driver actually allows (and the two traps: an unmap
+  sub-range is refused, and reading reserved-but-unmapped VA faults the card).
+* [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — the implementation log: branch, slice 1, its gates, and the
+  design of the next slice (the KV buffer type).  Snapshot: `0001-vmm-region-primitive.patch`.
 * [`INVENTORY.md`](INVENTORY.md) — the measured GPU-resident budget (T1–T5; **T2 + the KV cache's own
   bookkeeping is this campaign, T3/T4/T5-outside-the-KV-cache are the deferred later areas**), scaling laws
   with file:line, and the commands.
