@@ -40,7 +40,7 @@ margin on this box is large (27B: `max_nodes = 81920` against a 4076-node decode
 reachable in practice) — the key was fixed because the invariant has to hold, not because it was measured
 to bite.
 
-### Measurements (gfx1201, 1x R9700, 39xxx host CPU idle)
+### Measurements (gfx1201, 1x R9700)
 
 `llama-server -m Qwen3.8-27B-UD-Q4_K_XL --backend-sampling -ngl 99 -c 65536 -ub 2048 -b 2048 --parallel 2
 --kv-unified -fa on -ctk q8_0 -ctv q8_0`, a 2396-token prompt with `cache_prompt: false`, seven sampled
