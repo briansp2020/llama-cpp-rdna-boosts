@@ -1,4 +1,4 @@
-From fb7b244316d1ecdfc0e0b982e352ee3f9674452d Mon Sep 17 00:00:00 2001
+From 30855de701d623319da984f9c80f7878e49c7bef Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: relaxed-tensor split mode

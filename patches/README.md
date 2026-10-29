@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r169`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r170`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -591,7 +591,20 @@ decode path), `mmvq.cu` (the VDR-aware K-split loop and the RDNA3_5 table), `mmq
 `mmq-load-tiles.cuh` / `mmq.cu` (Q6_K MMQ), `common.cuh` (grid pad), and the Q1_0/Q6_K cases in
 `tests/test-backend-ops.cpp`.
 
-**Knobs.**  `GGML_CUDA_GRID_STALL_PAD`, `GGML_CUDA_MMQ_J_MAX`, `GGML_CUDA_OP_TIMING` (diagnostic).
+**Knobs.**  `GGML_CUDA_GRID_STALL_PAD`, `GGML_CUDA_MMQ_J_MAX`, `GGML_CUDA_OP_TIMING` (diagnostic); build-time `-DGGML_HIP_Q6K_DENSE_VDR1` (r170, the dense Q6_K VDR=1 reproducibility escape — see `ENVIRONMENT.md` §14).
+
+**Dense Q6_K VDR is upstream's now, on every arch (r170).**  The block's own per-arch gate
+(`#if defined(RDNA4) || defined(RDNA3_0)` → VDR=2, upstream's VDR=1 elsewhere) went away with the
+`6050b467c` re-base: upstream #30517 (`2744e48d1`, "faster MMVQ for low-bit types") made
+`VDR_Q6_K_Q8_1_MMVQ` 2 unconditionally, so the macro arrives as *context* and RDNA3_5 (gfx1151) moved
+1 → 2 as a side effect.  That is measured and kept: gfx1151 Qwen3.8 Flash-Next Q5_K (13 dense Q6_K
+tensors incl. the lm_head) is within noise of VDR=1 at B=1/B=4 and at `tg128 @ d16384`, and **+1.2 % at
+batched B=8**; width purity is unchanged (`plain == draft-mtp`, `n_max` 3 and 7 byte-identical).  Greedy
+text *does* move against a pre-#30517 build — that is the documented association-order class, not a
+defect.  `-DGGML_HIP_Q6K_DENSE_VDR1` restores the VDR=1 order for a consumer that owns an
+output-identity gate across that base bump (see `ENVIRONMENT.md` §14 and `GREEDY-PURITY.md` §68).  The
+MoE-expert VDR is per kernel (`GGML_CUDA_MMVQ_MOE_DENSE` collapses it to the dense VDR off
+RDNA4/RDNA3_0) and is untouched.
 
 **Purity.**  **This block changes decode numerics on every backend** — same real-number result, different
 fp32 addition order.  Read `GREEDY-PURITY.md` §§1-9 before touching a VDR value: stock bits then require
