@@ -12,52 +12,14 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 still means the same subject after that item is closed and removed from this file.  New items append.
 
 **Current state:** the **15-block V2.1 set** (block 00 + blocks 01-14) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v15-6050b467c-r170`**.  `release.json` is the source of truth for the
+(the 2026-10-25 re-base), release **`v15-6050b467c-r171`**.  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 
 | # | subject | kind | status |
 |---|---|---|---|
-| **115** | the pair fusion's MMB stand-down and the GLU matcher's MMB predicate disagree | performance / kernel selection | open (2026-10-28, r161, found fixing issue #241).  `mul_mat_q_pair` stands down when `ggml_cuda_mmb_routed_will_take()` says MMB will take both muls (a weak check: `mmb_routed_flag() && mmb_wtype_ok(type)`), while the later `{MUL_MAT_ID, MUL_MAT_ID, GLU}` matcher tests the real `ggml_cuda_mmb_supported_glu()` (which also needs `mmb_glu()`, `K % 64`, `T >= mmb_min_t()`, `n_used <= 64`, a plain unswapped SWIGLU and matching `dst` layout).  When they disagree the pair has already stood down and the MMQ triple takes the gate/up instead of MMB.  Measured neutral-to-positive on gfx1151 (prefill 5421/5425 vs 5397/5398 t/s on LFM2.5-8B-A1B Q6_K), so no change was made: this is a decision to measure, not a known defect.  Detail in §115 |
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
-
----
-
-## 115. The pair fusion's MMB stand-down and the GLU matcher's MMB predicate disagree — PERF/KERNEL SELECTION
-
-**Status: open (2026-10-28, r161).  Found while fixing issue #241; measured neutral, so nothing was changed.**
-
-Two matchers decide who serves a routed (MoE) gate/up/GLU prefill, and their MMB predicates are not the same:
-
-* `ggml_cuda_mul_mat_q_pair_try_fuse` (mmq.cu) **stands down** when
-  `ggml_cuda_mmb_active() && ggml_cuda_mmb_routed_will_take(w_gate) && ggml_cuda_mmb_routed_will_take(w_up)`.  That
-  predicate is only `mmb_enabled() && mmb_routed_flag() && mmb_wtype_ok(w->type)`.
-* The later `{MUL_MAT_ID, MUL_MAT_ID, GLU}` matcher (ggml-cuda-try-fuse.cu) asks
-  `ggml_cuda_mmb_supported_glu()`, which additionally requires `mmb_glu()`, `gw->type == uw->type`,
-  `K % 64 == 0` (and `K % 256 == 0` for the k-quant/IQ super-block types), `T >= mmb_min_t()`, `n_used <= 64`,
-  a plain unswapped `SWIGLU`, and a `dst` layout of `[M, n_used, T, 1]`.
-
-So whenever `mmb_routed_will_take` is true but `mmb_supported_glu` is false (a GLU variant MMB does not fuse, a
-shape below `mmb_min_t()`, an expert count above 64, ...), the pair fusion has already stood down for MMB and the
-MMQ triple then takes the gate/up: the two decisions are not consistent with each other.
-
-**Why it matters (and did, once).**  This is the hole issue #241 fell through: on gfx1151 (`routed = 1`) the pair
-stands down for MMB and MMB's fused GLU normally takes the triple, so the delivery's own arms never reached the
-MMQ routed arm, and its dead `!ids` assert went unnoticed for five releases.  With that fixed, the mismatch is
-only a kernel-selection question.
-
-**Measured (gfx1151, LFM2.5-8B-A1B-i1-Q6_K, server, `cache_prompt:false`, 3 requests per arm):** fused MMQ triple
-**5421 / 5425 t/s** prefill vs the MMB-individuals arm (`GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1`) **5397 / 5398**, decode
-identical (128.5-128.7 t/s), output byte-identical (`965 chars sha=d55bc8a8def9`).  No stand-down was added,
-because on the one model that reaches the arm the MMQ path is not a loss.
-
-**What to do when this is picked up.**  Make the stand-down ask the question the GLU matcher asks (the pair site
-can see `i+2`, so it can evaluate the GLU predicate properly, or share one helper), then measure both arms on the
-gfx1151 models that can reach it (an MMB-declined MoE: this LFM2, plus any shape at `T < mmb_min_t()` or
-`n_used > 64`) and on the RDNA4 arm (`mmb_cfg().routed = 0` there, so the pair always wins and the change must be
-inert).  A kernel-selection change of this kind owes the fused-vs-unfused text and prefill-logit check
-(`GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` as the A/B), per `GREEDY-PURITY.md` §65.
 
 ---
 

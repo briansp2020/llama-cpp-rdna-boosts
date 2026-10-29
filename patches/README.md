@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
 **15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r170`; the base is the 2026-10-25 re-base), one
+`v15-6050b467c-r171`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -568,8 +568,7 @@ documented in `ENVIRONMENT.md` §§10/10.1.
 
 **Per-device arch dispatch (r132).**  Every per-arch decision in `mmb.cu` (`mmb_enabled`, `mmb_cfg`,
 `mmb_cfg_dump_once`, `mmb_dense_flag`, `mmb_wtype_mask`, `mmb_dense_tmask`) keys on
-`ggml_cuda_info().devices[ggml_cuda_get_device()].cc` — the device the kernel runs on — not on `devices[0]`.
-MMB is designed off on RDNA2 (no WMMA), so on a mixed-arch box (gfx1100 primary + gfx1030 secondary) the old
+`ggml_cuda_info().devices[ggml_cuda_get_device()].cc` — the device the kernel runs on — not on `devices[0]`.MMB is designed off on RDNA2 (no WMMA), so on a mixed-arch box (gfx1100 primary + gfx1030 secondary) the old
 primary-keyed policy let the RDNA2 card run RDNA3-tuned MMB kernels: byte-exact zero output-projection
 logits (PPL == vocab) or garbled tail layers, depending on where the output projection sat.
 `ggml_backend_cuda_graph_optimize()` selects its own context's device first, because the MMB marking half
@@ -581,6 +580,18 @@ is bit-for-bit the previous behaviour; `GREEDY-PURITY.md` §56.
 change, and the width probe when a fusion/dispatch predicate moves.  For `mmf32` the gate is the
 *`--family-switch`* mode at a confident point (`prompts/kld-corpus-35b-in-domain.txt`), with the same-kernel
 control as the arbiter — see `GREEDY-PURITY.md` §47.
+
+**The BF16-activation mark may not be preempted, and the stand-down predicates are the dispatch ones (r171,
+`TODO` #115).**  The HC16 arm marks an activation **BF16-only** (its producer skips the F32 store) when every
+consumer in the split is a bf16 reader, and a fusion that preempts one of those readers reads the buffer the mark
+declared dead.  Two rules follow, and they live in this block because the predicates and the marking pass do:
+(a) a fusion standing down for MMB asks `ggml_cuda_mmb_supported_mm()` / `_supported_mmid()` — the predicates
+`ggml_cuda_mul_mat()`/`_mul_mat_id()` dispatch on — never a weight-type test (the type answer is a superset and
+stands down for shapes MMB does not claim); (b) `classify_consumers()` no longer elides a F32 output when a
+**routed** `MUL_MAT_ID` reads the activation — it marks the bf16 *copy* instead, so the MMB reader still finds it
+and a preempting mmq fusion still reads live data.  Both predicates are null-safe, and a matcher probing an
+arbitrary node pair must check every source slot first (the r171 first cut segfaulted on gfx1151).  Applied in
+block 10's pair/dispatcher; `GREEDY-PURITY.md` §69.
 
 ---
 
@@ -633,6 +644,20 @@ must be **bit-identical** to what it replaces at the widths it serves.
   #29948's interleaved **`has_fusion`** arm ships beside it, NVIDIA-only, and `static_assert(!(has_fusion &&
   has_gate))` keeps them from ever being on together; r138), the routed-compact dispatch, `mul_mat_q_pair`,
   the FP4/gate precision contract, and the Q6_K compact-J path.
+* **A fusion that stands down for one of the delivery's own fused paths must ask that path's DISPATCH
+  predicate, never a weight-type test (r171, `TODO` #115).**  `mul_mat_q_pair` is the fallback owner of a
+  gate+up pair: it must stand down on `ggml_cuda_mmb_supported_mmid()` / `_supported_mm()` (the predicates
+  `ggml_cuda_mul_mat()`/`_mul_mat_id()` dispatch on, a strict superset of the fused-GLU one) and on nothing
+  weaker.  The type-only helpers this block carried (`ggml_cuda_mmb_dense_will_take` / `_routed_will_take`)
+  are gone: they stood the pair down for shapes MMB never claims (`T < mmb_min_t()`, `n_used > 64`, a `K`
+  that is not a whole super-block count) and, worse, disagreed with block 10's BF16-only activation marking,
+  whose whole point is that a preempted reader's F32 buffer was never written.  With the exact claim the
+  priority chain is well defined: **MMB's fused GLU -> the mmq/mmvq triple -> `mul_mat_q_pair` (the
+  fallback) -> the two plain muls**.  Measured neutral (gfx1151 pair == triple within noise and
+  byte-identical text; gfx1201 inert), and the matcher now null-checks both nodes' source slots because it
+  runs on every graph node — the first cut segfaulted on gfx1151 loading Flash-Next at `-ub 256`.
+  `GGML_PAIR_ROUTED_OFF` is the routed half's A/B arm.  `GREEDY-PURITY.md` §69,
+  [`../benchmarks/2026-10-29-mmb-pair-ownership.md`](../benchmarks/2026-10-29-mmb-pair-ownership.md).
 * **The routed fused-gate arm takes `ids`; the dense arm's `!ids` assert must not gate it (r161, issue #241).**
   `ggml_cuda_mul_mat_q`'s `if (fusion)` preamble carried upstream #29948's dense precondition
   (`gate && !ids && !bias && !scale`) after the r138 re-base, but the same function serves this block's routed
@@ -688,7 +713,8 @@ must be **bit-identical** to what it replaces at the widths it serves.
 **Knobs.**  `GGML_CUDA_DISABLE_FUSION` (master), `_DISABLE_MOE_MMQ_FUSION`, `_DISABLE_MMQ_ROUTED`,
 `_DISABLE_TOPK_MOE_FUSION`, `_DISABLE_CONV_FUSION`, `_DISABLE_NORM_ROWS`, `GGML_CUDA_TOPK_SORTED`,
 `GGML_CUDA_FUSE_GDN_GATE`, `GGML_CUDA_FUSE_Q8_1_VERIFY`, `GGML_CUDA_MMVQ_RDNA3_SMALL_M`,
-`GGML_CUDA_SCALE_UNARY`, `GGML_PAIR_2X`, `GGML_CUDA_Q8_1_ARENA_FREE_OLD`,
+`GGML_CUDA_SCALE_UNARY`, `GGML_PAIR_OFF` / `GGML_PAIR_DENSE_OFF` / `GGML_PAIR_ROUTED_OFF` / `GGML_PAIR_2X`,
+`GGML_CUDA_Q8_1_ARENA_FREE_OLD`,
 `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS`, `GGML_CUDA_STAGE_PIN`.  Block 10 adds the rest of the `_DISABLE_*` / `_FUSE_*`
 family (the qwen4exp/GDN fusions); the full catalogue is `ENVIRONMENT.md` §7.
 

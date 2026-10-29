@@ -1,4 +1,4 @@
-From 632f6814af6c5d5209e1645fada60305f9e9419e Mon Sep 17 00:00:00 2001
+From 32370bba644c9c85a9855334f630e74f6913212d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 06/14] rdna-boosts: block 06: MMB quantized prefill GEMM
@@ -61,15 +61,30 @@ reached that block: the probe reported PASS on every arm while widths 5..8 ran a
 that was not bit-identical to widths 1..4.  At P=4096 the r126 geometry fails it
 (width_purity=FAIL, worst maxdiff 0.199764 on q8_0 K/V, row-0 hash split between W=4 and
 W=5), and the shipped band geometry passes with maxdiff 0.
+
+Amended (r171): the MMB stand-down predicates are gone (TODO #115).  The two type-only helpers this
+block carried -- ggml_cuda_mmb_dense_will_take() / _routed_will_take() -- answered a weight-TYPE
+question while the dispatch asks a SHAPE question, so a fusion that stood down for MMB stood down for
+shapes MMB does not claim at all (T < mmb_min_t(), n_used > 64, a K that is not a whole super-block
+count, a non-contiguous dst, ...) and handed the pair to another fusion instead.  Worse, it disagreed
+with this block's BF16-activation marking, which can leave a preempted reader's F32 buffer unwritten.
+The fusion sites now ask ggml_cuda_mmb_supported_mm() / _supported_mmid(), the predicates
+ggml_cuda_mul_mat() / _mul_mat_id() themselves dispatch on, and both are null-safe now so a matcher can
+probe an arbitrary node pair.  This block's HC16 marking also keeps a ROUTED activation's F32 output
+(marking the bf16 copy instead, so the MMB reader still finds it): the gate+up MUL_MAT_ID pair reading
+it can be served by a mmq fusion rather than by two individual MMB muls.  Inert on the measured arms:
+gfx1201 byte-identical (27B Q8_0, 35B-A3B Q4_K_M at 1 and 3 GPU, LFM2 Q6_K; prefill-logit KLD
+0.000000 / top-p 100.000 % on 27B and 35B-A3B), gfx1151 identical on every arm (LFM2 Q6_K and
+35B-A3B Q4_K_M; the pair and the triple produce the same greedy text).
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu   |   57 +-
  ggml/src/ggml-cuda/mmb.cu         | 2384 +++++++++++++++++++++++++++++
- ggml/src/ggml-cuda/mmb.cuh        |   33 +
+ ggml/src/ggml-cuda/mmb.cuh        |   32 +
  ggml/src/ggml-cuda/mmf32.cu       |  201 +++
  ggml/src/ggml-cuda/mmf32.cuh      |   45 +
  tests/CMakeLists.txt              |    1 +
  tests/test-logits-width-probe.cpp |  196 +++
- 7 files changed, 2914 insertions(+), 3 deletions(-)
+ 7 files changed, 2913 insertions(+), 3 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/mmb.cu
  create mode 100644 ggml/src/ggml-cuda/mmb.cuh
  create mode 100644 ggml/src/ggml-cuda/mmf32.cu
@@ -203,7 +218,7 @@ index ee7f54bbe..80dbd0941 100644
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..e302e941e
+index 000000000..90d921cf8
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
 @@ -0,0 +1,2384 @@
@@ -2131,7 +2146,9 @@ index 000000000..e302e941e
 +}
 +
 +bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-+    if (!mmb_enabled()) return false;
++    // Null-safe: the fusion matchers ask this predicate about arbitrary graph node pairs (TODO #115),
++    // where a short op with no src[1] can sit in front of a MUL_MAT.
++    if (!mmb_enabled() || !src0 || !src1 || !dst) return false;
 +    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
 +    if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
 +    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
@@ -2168,7 +2185,7 @@ index 000000000..e302e941e
 +}
 +
 +bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
-+    if (!mmb_enabled() || !mmb_routed_flag()) return false;
++    if (!mmb_enabled() || !mmb_routed_flag() || !src0 || !src1 || !ids || !dst) return false;
 +    const bool wtype = mmb_wtype_ok(src0->type);
 +    if (!wtype || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
 +    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
@@ -2328,14 +2345,12 @@ index 000000000..e302e941e
 +// True while the MMB gate is on; used by the graph optimizer to stand its own IQ4_NL MoE MMQ
 +// fusions down so the ops reach the mmb dispatch in ggml_cuda_mul_mat / _mul_mat_id instead.
 +bool ggml_cuda_mmb_active() { return mmb_enabled(); }
-+bool ggml_cuda_mmb_dense_will_take(const ggml_tensor * w) {
-+    if (!mmb_enabled() || !w) return false;
-+    return mmb_wtype_ok(w->type) && mmb_dense_type_ok(w->type);
-+}
-+bool ggml_cuda_mmb_routed_will_take(const ggml_tensor * w) {
-+    if (!mmb_enabled() || !w) return false;
-+    return mmb_routed_flag() && mmb_wtype_ok(w->type);
-+}
++// NOTE (TODO #115): there is deliberately no type-only "would MMB take this weight" predicate here.
++// A fusion that stands down for MMB must ask ggml_cuda_mmb_supported_mm()/_supported_mmid(), the
++// predicates the dispatch itself uses -- a weight-type-only answer stands down for shapes MMB does
++// not claim (T < mmb_min_t(), n_used > 64, a K that is not a whole super-block count, ...) and,
++// worse, disagrees with the graph optimizer's BF16-only activation marking, which may leave a
++// preempted reader's F32 buffer unwritten.
 +bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
 +bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? atoi(getenv("LLAMA_HC_BLK16")) : mmb_cfg().blk16; return v != 0; }
 +bool ggml_cuda_mmb_res16()  { static const int v = getenv("LLAMA_HC_RES16") ? atoi(getenv("LLAMA_HC_RES16")) : mmb_cfg().res16; return v != 0; }
@@ -2593,10 +2608,10 @@ index 000000000..e302e941e
 +}
 diff --git a/ggml/src/ggml-cuda/mmb.cuh b/ggml/src/ggml-cuda/mmb.cuh
 new file mode 100644
-index 000000000..270cb0fc4
+index 000000000..fd8085897
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cuh
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,32 @@
 +#pragma once
 +#include "common.cuh"
 +// MMB: dequant-to-BF16 WMMA GEMM path for IQ4_NL weights on gfx1151 (RDNA3.5). Env-gated: LLAMA_MMB=1, LLAMA_MMB_MIN_T (default 512).
@@ -2617,11 +2632,10 @@ index 000000000..270cb0fc4
 +bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t);
 +bool ggml_cuda_mmb_gatemix();
 +bool ggml_cuda_mmb_active();
-+// True iff MMB will actually take a dense MUL_MAT / a routed MUL_MAT_ID or its SWIGLU pair for this
-+// weight type. The graph optimizer stands its own fusions down on this predicate rather than on the
-+// global gate, so enabling MMB on a model whose expert type it does not support keeps the fusions.
-+bool ggml_cuda_mmb_dense_will_take(const ggml_tensor * w);
-+bool ggml_cuda_mmb_routed_will_take(const ggml_tensor * w);
++// A fusion that stands down for MMB must ask ggml_cuda_mmb_supported_mm()/_supported_mmid() (the top
++// of this header), i.e. the same predicate the dispatch uses -- never a weight-type-only test (TODO
++// #115; the removed _dense_will_take/_routed_will_take answered only the type question and stood
++// down for shapes MMB does not claim, disagreeing with the BF16-only activation marking).
 +bool ggml_cuda_mmb_down16();
 +bool ggml_cuda_mmb_res16();
 +bool ggml_cuda_mmb_blk16();

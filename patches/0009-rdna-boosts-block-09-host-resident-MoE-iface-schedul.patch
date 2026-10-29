@@ -1,4 +1,4 @@
-From d020daaadb05d02450242d2b57d69649c4acf20d Mon Sep 17 00:00:00 2001
+From ef761cf07f11d4104169b9ec4bce8c8fae42b246 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/14] rdna-boosts: block 09: host-resident MoE (iface,

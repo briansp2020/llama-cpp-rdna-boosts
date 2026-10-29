@@ -1142,6 +1142,22 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   (pp2048 +5.3 % gfx1151 / +9.4 % gfx1100).  `ggml_cuda_should_fuse_mul_mat_q` is non-static and declared in
   `ggml-cuda-try-fuse.cuh` because block 10's moved dispatcher calls it.  Record:
   `archive/work/rebase-2026-10b/DECISIONS.md`.
+- **A fusion that stands down for MMB must ask the DISPATCH predicate, and the BF16-only activation mark may not be
+  preempted (r171, TODO #115).**  A gate+up pair is owned in this order: **MMB's fused GLU -> the mmq/mmvq triple ->
+  `mul_mat_q_pair` (the fallback) -> the two plain muls**.  The pair stands down on
+  `ggml_cuda_mmb_supported_mmid()` / `_supported_mm()` — the predicates `ggml_cuda_mul_mat()`/`_mul_mat_id()` dispatch
+  on, a strict superset of the fused-GLU one — and never on a weight-type test: the type-only helpers
+  (`ggml_cuda_mmb_dense_will_take` / `_routed_will_take`) are **gone** because they stood the pair down for shapes MMB
+  never claims (`T < mmb_min_t()`, `n_used > 64`, a `K` that is not a whole super-block count, ...) and, worse,
+  disagreed with the graph optimizer's HC16 **BF16-only** marking, which skips a producer's F32 store when every
+  consumer is a bf16 reader — a fusion that preempts such a reader then reads a buffer nobody wrote.  So the marking
+  pass also refuses to elide an activation with a **routed** `MUL_MAT_ID` reader (it marks the bf16 *copy* instead).
+  The two live in different passes (`graph_optimize` vs `graph_compute`) and each must hold on its own.  A matcher
+  that probes an arbitrary node pair owes null-safe predicates (`supported_mm`/`_mmid` are, and the pair matcher
+  checks both nodes' source slots): the first r171 cut segfaulted on gfx1151 loading Flash-Next at `-ub 256`.  Pair and
+  triple are bit-identical (same dot order, same `J` tile) and time-neutral (gfx1151), and RDNA4 is inert
+  (`mmb_cfg().routed = 0`).  `GGML_PAIR_ROUTED_OFF` is the routed half's A/B arm.  `GREEDY-PURITY.md` §69,
+  `benchmarks/2026-10-29-mmb-pair-ownership.md`.
 - **`ggml_cuda_mul_mat_q`'s `if (fusion)` assert is the ARM's precondition, not the function's: `ids` is legal
   on the routed arm (r161, issue #241).**  Upstream #29948's
   `GGML_ASSERT(gate && !ids && !x_bias && !gate_bias && !x_scale && !gate_scale)` is the *dense* interleaved

@@ -1,4 +1,4 @@
-From 67459a69a03dc8dcc4643183b48364469c1640e4 Mon Sep 17 00:00:00 2001
+From b943a9f6e72dfdc494edad712f0b5b5ea9244e3e Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/14] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -81,6 +81,21 @@ and the GLU write -- validate their sources with q8_1_src_range_ok() before laun
 the rule and the validation are recorded with block 08.
 
 Co-authored-by: Slava P. <slavap@users.noreply.github.com>
+
+Amended (r171): the pair fusion's MMB stand-down asks the dispatch, not the weight type (TODO #115).
+`mul_mat_q_pair` stood down for any weight type MMB supports, a superset of the shapes MMB actually
+claims, so on a shape MMB declines (T < mmb_min_t(), n_used > 64, a K that is not a whole super-block
+count, ...) the pair had already stood down and the mmq/mmvq triple took the gate+up pair instead.
+It now stands down on the predicate the mmb dispatch uses (both muls claimed), which is a strict
+SUPERSET of the fused-GLU predicate, so the priority chain is well defined and cannot preempt an MMB
+claim: MMB's fused GLU -> the mmq/mmvq triple -> this pair (the fallback for shapes none of them takes)
+-> the two plain muls.  The routed SWIGLU -> MMQ matcher's stand-down is the same exact claim (its GLU
+output can be marked BF16-only for an MMB reader).  GGML_PAIR_ROUTED_OFF is the new A/B arm for the
+routed half; GGML_PAIR_OFF still means both halves.  Measured neutral: gfx1151 pair vs triple
+(LFM2 Q6_K 3379/3399 vs 3348/3407, 35B-A3B Q4_K_M 2304/2312 vs 2296/2313 t/s at pp512, interleaved
+r=3, dense MMB path untouched) and byte-identical greedy text on pair == triple == unfused ==
+GGML_CUDA_MMB=0 (LFM2 765 chars, 35B-A3B 723 chars); gfx1201 inert (routed = 0 there, so the pair
+already won before this change).
 ---
  ggml/include/ggml-alloc.h                     |   13 +
  ggml/include/ggml.h                           |    1 -
@@ -116,11 +131,11 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 2743 ++++++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh     |   38 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   60 +
- ggml/src/ggml-cuda/ggml-cuda.cu               | 5953 ++++++-----------
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 5960 ++++++-----------
  ggml/src/ggml-cuda/mmb.cu                     |  275 +-
  ggml/src/ggml-cuda/mmb.cuh                    |   24 +
  ggml/src/ggml-cuda/mmid.cu                    |  240 +-
- ggml/src/ggml-cuda/mmq.cu                     |  141 +
+ ggml/src/ggml-cuda/mmq.cu                     |  166 +
  ggml/src/ggml-cuda/mmq.cuh                    |    6 +
  ggml/src/ggml-cuda/mmvf.cu                    |  289 +-
  ggml/src/ggml-cuda/mmvf.cuh                   |   10 +-
@@ -160,7 +175,7 @@ Co-authored-by: Slava P. <slavap@users.noreply.github.com>
  tests/test-fusion-gate-beta-multiseq.cpp      |  278 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 78 files changed, 12855 insertions(+), 4988 deletions(-)
+ 78 files changed, 12887 insertions(+), 4988 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
@@ -8861,7 +8876,7 @@ index 8005b57b4..7570a3b06 100644
 +void   ggml_cuda_slab_reserve_wide(int device, size_t bytes);
 +size_t ggml_cuda_slab_seed_floor(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e9d9d9695..48b30c657 100644
+index e9d9d9695..05d7b86a6 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -15071,7 +15086,7 @@ index e9d9d9695..48b30c657 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -8415,7 +6228,196 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8415,7 +6228,203 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // when the device already matches.
      ggml_cuda_set_device(cuda_ctx->device);
  
@@ -15179,10 +15194,12 @@ index e9d9d9695..48b30c657 100644
 +            const ptrdiff_t split_end = split_off + cgraph->n_nodes;
 +            // classify the consumers of `root` (through views), looking at the whole graph:
 +            //  0 = no consumer at all, 1 = every consumer is an in-split BF16 reader, 2 = otherwise
-+            // (a non-BF16 consumer, or any consumer in another split) -- 2 means the F32 output must
-+            // be kept (mark copy), 0 means nothing to do.
++            // (a non-BF16 consumer, any consumer in another split, or a routed MMB reader whose node
++            // a mmq fusion may consume instead -- see the MUL_MAT_ID arm below) -- 2 means the F32
++            // output must be kept (mark copy), 0 means nothing to do.
 +            auto classify_consumers = [&](const ggml_tensor * root) -> int {
 +                bool any = false;
++                bool routed_reader = false;   // a MUL_MAT_ID consumer MMB claims: F32 must stay (TODO #115)
 +                for (int i = 0; i < full->n_nodes; ++i) {
 +                    const ggml_tensor * t = full->nodes[i];
 +                    bool uses = false;
@@ -15193,8 +15210,13 @@ index e9d9d9695..48b30c657 100644
 +                    if (i < split_off || i >= split_end) return 2;   // consumer in another split
 +                    if (t->op == GGML_OP_MUL_MAT && t->src[1] && rootof(t->src[1]) == root && t->src[0] &&
 +                            ggml_cuda_mmb_reads_bf16_act(t->src[0], t->src[1], t)) continue;
++                    // A routed MMB reader does NOT authorise eliding the F32 output (TODO #115): the
++                    // gate+up MUL_MAT_ID pair that reads this activation may be served by the mmq
++                    // triple (block 08's routed gate/up+GLU fusion) or by mul_mat_q_pair instead of
++                    // by the two individual MMB muls, and both read the F32 tensor.  Keep the F32
++                    // output (mark the bf16 copy instead) so a preempting fusion is still correct.
 +                    if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] && rootof(t->src[1]) == root &&
-+                            ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t)) continue;
++                            ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t)) { routed_reader = true; continue; }
 +                    // dsv4_hc_pre reads src[0] (the HC normalized stream) through the bf16 cache when
 +                    // the activation is marked BF16-only (dsv4-hc.cu's xbf16 arm).  It is the one
 +                    // consumer that runs well after the producer, so give xn a dedicated slot: the
@@ -15206,7 +15228,7 @@ index e9d9d9695..48b30c657 100644
 +                    }
 +                    return 2;
 +                }
-+                return any ? 1 : 0;
++                return (any && !routed_reader) ? 1 : (routed_reader ? 2 : 0);
 +            };
 +            for (int i = 0; i < cgraph->n_nodes; ++i) {
 +                const ggml_tensor * t = cgraph->nodes[i];
@@ -15269,7 +15291,7 @@ index e9d9d9695..48b30c657 100644
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
  
-@@ -8494,8 +6496,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8494,8 +6503,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  continue;
              }
  
@@ -15281,7 +15303,7 @@ index e9d9d9695..48b30c657 100644
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
                  if (match.expert_scale != nullptr) {
-@@ -8564,14 +6567,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8564,14 +6574,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -15299,7 +15321,7 @@ index e9d9d9695..48b30c657 100644
  
      static bool enable_graph_optimization = [] {
          const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-@@ -8582,6 +6580,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8582,6 +6587,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          return;
      }
  
@@ -15319,7 +15341,7 @@ index e9d9d9695..48b30c657 100644
      ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
      stream_context.reset();
  
-@@ -8807,179 +6818,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8807,179 +6825,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -15499,7 +15521,7 @@ index e9d9d9695..48b30c657 100644
  
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
-@@ -9034,6 +6872,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -9034,6 +6879,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -15514,7 +15536,7 @@ index e9d9d9695..48b30c657 100644
      return description;
  }
  
-@@ -9827,6 +7673,25 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -9827,6 +7680,25 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -15540,7 +15562,7 @@ index e9d9d9695..48b30c657 100644
  static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes) {
      ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
-@@ -9836,12 +7701,19 @@ static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev,
+@@ -9836,12 +7708,19 @@ static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev,
          ggml_cuda_slab_set_aux_reserve(aux_reserve_bytes);
          // wip/slab-ring-region: size the slab's reserved, non-evictable H2D-ring hole from the largest
          // host-resident weight table.  Done here, before the slab is created, so the hole is part of the
@@ -15562,7 +15584,7 @@ index e9d9d9695..48b30c657 100644
      }
      return on;
  }
-@@ -9898,6 +7770,35 @@ static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
+@@ -9898,6 +7777,35 @@ static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      return ggml_cuda_slab_active(ctx->device) ? ggml_cuda_slab_work_size(ctx->device) : 0;
  }
  
@@ -15598,7 +15620,7 @@ index e9d9d9695..48b30c657 100644
  static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t dev) {
      // wip/fit-slab-accounting (Phase 1, re-cut for r37): the configured slab headroom, reported even
      // though the slab is not armed yet.  `--fit` runs BEFORE the MoE preflight arms the slab, and r37
-@@ -9913,17 +7814,18 @@ static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t de
+@@ -9913,17 +7821,18 @@ static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t de
  }
  
  static void ggml_backend_cuda_device_slab_ring_set(ggml_backend_dev_t dev, bool arm) {
@@ -15627,7 +15649,7 @@ index e9d9d9695..48b30c657 100644
      ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
      ggml_cuda_slab_ring_set(ctx->device, arm);
  }
-@@ -9934,6 +7836,12 @@ static void ggml_backend_cuda_device_slab_narrow_floor(ggml_backend_dev_t dev, s
+@@ -9934,6 +7843,12 @@ static void ggml_backend_cuda_device_slab_narrow_floor(ggml_backend_dev_t dev, s
      ggml_cuda_slab_set_narrow_floor(ctx->device, bytes);
  }
  
@@ -15640,7 +15662,7 @@ index e9d9d9695..48b30c657 100644
  static void ggml_backend_cuda_device_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes) {
      // wip/moe-verify-fusions (narrow-2): pin (idempotently) the MTP draft's compute region from its
      // measured narrow size.  No-op when the slab is not live on this device.
-@@ -9946,16 +7854,12 @@ static void ggml_backend_cuda_device_slab_compute_narrow2(ggml_backend_dev_t dev
+@@ -9946,16 +7861,12 @@ static void ggml_backend_cuda_device_slab_compute_narrow2(ggml_backend_dev_t dev
      // Default: route them to the slab's pinned second narrow region.  `GGML_CUDA_SLAB_NARROW2=0` is the
      // A/B arm -- the draft bypasses the slab entirely (raw cudaMalloc), the session's quick fix.
      GGML_UNUSED(dev);
@@ -15663,7 +15685,7 @@ index e9d9d9695..48b30c657 100644
  }
  
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
-@@ -9982,18 +7886,16 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -9982,18 +7893,16 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_headroom_bytes     = */ ggml_backend_cuda_device_slab_headroom_bytes,
      /* .slab_ring_set           = */ ggml_backend_cuda_device_slab_ring_set,
      /* .slab_narrow_floor       = */ ggml_backend_cuda_device_slab_narrow_floor,
@@ -15688,7 +15710,7 @@ index e9d9d9695..48b30c657 100644
      /* .moe_cache_band            = */ ggml_backend_cuda_device_moe_cache_band,
  };
  
-@@ -10076,8 +7978,21 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -10076,8 +7985,21 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
      GGML_UNUSED(reg);
  }
  
@@ -15711,7 +15733,7 @@ index e9d9d9695..48b30c657 100644
          return (void *)ggml_backend_cuda_comm_init;
      }
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index e302e941e..ebdd5d5f0 100644
+index 90d921cf8..59aa44a8f 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
 @@ -1280,7 +1280,7 @@ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo
@@ -16007,7 +16029,7 @@ index e302e941e..ebdd5d5f0 100644
      g_mmb_shadow.clear();
      g_mmb_shadow_pair.clear();
      g_mmb_shadow_bytes = 0;
-@@ -1958,6 +2107,17 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+@@ -1960,6 +2109,17 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
      return ggml_nrows(dst) == T;
  }
  
@@ -16023,9 +16045,9 @@ index e302e941e..ebdd5d5f0 100644
 +}
 +
  bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
-     if (!mmb_enabled() || !mmb_routed_flag()) return false;
+     if (!mmb_enabled() || !mmb_routed_flag() || !src0 || !src1 || !ids || !dst) return false;
      const bool wtype = mmb_wtype_ok(src0->type);
-@@ -1992,12 +2152,27 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+@@ -1994,12 +2154,27 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
              const int eff  = wide ? 1 : (tt >= 4 ? 4 : (tt == 2 ? 2 : 1));
              dim3 tg((T + NWARPS * eff - 1) / (NWARPS * eff));
              const float * Wf = (const float *) src0->data;
@@ -16058,7 +16080,7 @@ index e302e941e..ebdd5d5f0 100644
              CUDA_CHECK(cudaGetLastError()); return;
          }
          dim3 grid((M + 127) / 128, (T + 127) / 128);
-@@ -2018,18 +2193,23 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+@@ -2020,18 +2195,23 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
          if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
          else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
          CUDA_CHECK(cudaGetLastError());
@@ -16146,7 +16168,7 @@ index e302e941e..ebdd5d5f0 100644
 +    static unsigned hits = 0; if (mmb_dbg() && (hits++ < 3 || (hits % 50) == 0)) fprintf(stderr, "MMB_SHADOW %s [%lld x %lld] -> BF16 (%.1f MB total)\n", w->name, (long long) w->ne[0], (long long) w->ne[1], g_mmb_shadow_bytes / 1048576.0);
  }
 diff --git a/ggml/src/ggml-cuda/mmb.cuh b/ggml/src/ggml-cuda/mmb.cuh
-index 270cb0fc4..c02087781 100644
+index fd8085897..491c52bc9 100644
 --- a/ggml/src/ggml-cuda/mmb.cuh
 +++ b/ggml/src/ggml-cuda/mmb.cuh
 @@ -3,19 +3,43 @@
@@ -16192,7 +16214,7 @@ index 270cb0fc4..c02087781 100644
 +bool ggml_cuda_mmb_wants_bf16_copy(const ggml_tensor * t);
  bool ggml_cuda_mmb_gatemix();
  bool ggml_cuda_mmb_active();
- // True iff MMB will actually take a dense MUL_MAT / a routed MUL_MAT_ID or its SWIGLU pair for this
+ // A fusion that stands down for MMB must ask ggml_cuda_mmb_supported_mm()/_supported_mmid() (the top
 diff --git a/ggml/src/ggml-cuda/mmid.cu b/ggml/src/ggml-cuda/mmid.cu
 index cdb5b5972..7d6513e9b 100644
 --- a/ggml/src/ggml-cuda/mmid.cu
@@ -16480,7 +16502,7 @@ index cdb5b5972..7d6513e9b 100644
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 89989372e..2d0208d92 100644
+index 89989372e..e811e119b 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -1,5 +1,7 @@
@@ -16506,26 +16528,49 @@ index 89989372e..2d0208d92 100644
          const mmq_args args = {
              (const char *) src0_i->data, src0_i->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), (float *) dst_i->data,
              nullptr,
-@@ -893,3 +903,134 @@ bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows
+@@ -893,3 +903,159 @@ bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows
      const int64_t tiles_efficiency_percent = 100 * ntiles / (nsm*tiles_nwaves);
      return tiles_efficiency_percent >= 90;
  }
 +
 +// Two consecutive MUL_MAT(_ID) nodes sharing src1/ids (the qwen4exp sparse-MoE gate+up pair or the
 +// shared-expert up+gate pair): merge into one shared activation quantize + one mm_ids_helper.
-+// Returns 1 when fused, 0 otherwise.  GGML_PAIR_OFF / GGML_PAIR_DENSE_OFF are the A/B kill switches.
++// Returns 1 when fused, 0 otherwise.  GGML_PAIR_OFF / GGML_PAIR_DENSE_OFF / GGML_PAIR_ROUTED_OFF are
++// the A/B kill switches.
++//
++// PRIORITY CHAIN for a gate+up pair (TODO #115): a pair the MMB dispatch claims is MMB's, so this
++// fusion must stand down on exactly that claim -- and on nothing weaker.  The three matchers that can
++// serve such a pair are, in order: MMB's fused GLU triple (a strict subset of the individual claim),
++// the decode/prefill triple fusions (mmvq/mmq), and this shared-quantize pair, which is the fallback
++// for the shapes none of them takes.  Asking the *type-only* question here (the pair stood down for
++// any weight type MMB supports) made the pair stand down for shapes MMB does not claim at all
++// (T < mmb_min_t(), n_used > 64, a K that is not a whole super-block count, ...), which handed those
++// to the mmq triple instead of the pair; and it is also a correctness rule, not only a preference:
++// the graph optimizer may mark a shared activation BF16-only (so its F32 buffer is never written)
++// when *every* consumer is an MMB reader, and a fusion that preempts such a reader must read F32.
 +int ggml_cuda_mul_mat_q_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
-+    static const bool pair_off          = getenv("GGML_PAIR_OFF") != nullptr;
-+    static const bool disable_pair_dense = getenv("GGML_PAIR_DENSE_OFF") != nullptr;
++    static const bool pair_off           = getenv("GGML_PAIR_OFF") != nullptr;
++    static const bool disable_pair_dense  = getenv("GGML_PAIR_DENSE_OFF") != nullptr;
++    static const bool disable_pair_routed = getenv("GGML_PAIR_ROUTED_OFF") != nullptr;
 +    ggml_tensor * node = cgraph->nodes[i];
 +    const int cc = ggml_cuda_info().devices[ctx.device].cc;
-+    // Stand the pair fusion down only when MMB will actually take BOTH muls (checklist #5).
-+    const bool mmb_pair_taken = ggml_cuda_mmb_active() && i + 1 < cgraph->n_nodes && node->src[0] && cgraph->nodes[i + 1]->src[0] &&
++    // Stand down only when the MMB dispatch claims BOTH muls (checklist #5): the predicates are the
++    // SAME ones ggml_cuda_mul_mat()/_mul_mat_id() dispatch on, so this is the exact claim.  Both
++    // nodes' source slots are checked here because the predicates dereference them, and this matcher
++    // runs on EVERY node: an op with no src[1] followed by a MUL_MAT must not reach them.
++    ggml_tensor * node_next = i + 1 < cgraph->n_nodes ? cgraph->nodes[i + 1] : nullptr;
++    const bool both_muls = node->src[0] && node->src[1] && node_next && node_next->src[0] && node_next->src[1] &&
++        node_next->op == node->op;
++    const bool mmb_pair_taken = both_muls &&
 +        (node->op == GGML_OP_MUL_MAT_ID
-+            ? (ggml_cuda_mmb_routed_will_take(node->src[0]) && ggml_cuda_mmb_routed_will_take(cgraph->nodes[i + 1]->src[0]))
-+            : (ggml_cuda_mmb_dense_will_take(node->src[0])  && ggml_cuda_mmb_dense_will_take(cgraph->nodes[i + 1]->src[0])));
++            ? (node->src[2] && node_next->src[2] &&
++               ggml_cuda_mmb_supported_mmid(node->src[0], node->src[1], node->src[2], node) &&
++               ggml_cuda_mmb_supported_mmid(node_next->src[0], node_next->src[1], node_next->src[2], node_next))
++            : (node->op == GGML_OP_MUL_MAT &&
++               ggml_cuda_mmb_supported_mm(node->src[0], node->src[1], node) &&
++               ggml_cuda_mmb_supported_mm(node_next->src[0], node_next->src[1], node_next)));
 +    if (pair_off || mmb_pair_taken ||
-+            !(node->op == GGML_OP_MUL_MAT_ID || (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) ||
++            !(node->op == GGML_OP_MUL_MAT_ID ? !disable_pair_routed : (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) ||
 +            i + 1 >= cgraph->n_nodes) {
 +        return 0;
 +    }
@@ -16571,10 +16616,12 @@ index 89989372e..2d0208d92 100644
 +    if (node->op != GGML_OP_GLU || i + 1 >= cgraph->n_nodes || ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU || !node->src[1]) {
 +        return 0;
 +    }
-+    // MMB's fused GLU covers the IQ4_NL experts only; stand down then (checklist #5).
-+    const bool mmb_glu_taken = ggml_cuda_mmb_active() &&
-+        cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[i + 1]->src[0] &&
-+        ggml_cuda_mmb_routed_will_take(cgraph->nodes[i + 1]->src[0]);
++    // The down projection is the next node: stand down when the MMB dispatch claims it (checklist #5,
++    // TODO #115 -- the exact claim, not the type-only one: the GLU output may be marked BF16-only for
++    // an MMB reader, in which case folding this GLU into the mmq quantize would read a dead F32 row).
++    const ggml_tensor * down = cgraph->nodes[i + 1];
++    const bool mmb_glu_taken = down->op == GGML_OP_MUL_MAT_ID && down->src[0] && down->src[1] && down->src[2] &&
++        ggml_cuda_mmb_supported_mmid(down->src[0], down->src[1], down->src[2], down);
 +    if (mmb_glu_taken) {
 +        return 0;
 +    }

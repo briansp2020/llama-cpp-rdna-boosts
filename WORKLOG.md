@@ -1,5 +1,65 @@
 # WORKLOG - dated delivery records
 
+## 261029.001 (r171) -- `TODO` #115: a fusion that stands down for MMB asks the dispatch predicate, and the BF16-only activation mark can no longer be preempted
+
+**Release `v15-6050b467c-r171`**, base `6050b467c`, 15 blocks, tip
+`060dc264f8ad1e19dd5ff22902c7a285ce479ef6`, tree `2f5870713e94ae8532e7e616887aec27e1833673`.  Two code changes
+(blocks 06 and 10), `+62 / -31` over 4 files, no kernel arithmetic touched; `TODO.md` loses #115 (row + body), the
+handle is kept here and in `GREEDY-PURITY.md` §69.
+
+**The item.**  `mul_mat_q_pair_try_fuse` stood down for MMB on a weight-*type* test
+(`ggml_cuda_mmb_dense_will_take` / `_routed_will_take`) while the fused-GLU and mmq-triple matchers decide on the
+*shape* (`ggml_cuda_mmb_supported_mm` / `_supported_mmid`).  The type answer is a superset, so on any shape MMB
+declines (`T < mmb_min_t()`, `n_used > 64`, a `K` that is not a whole super-block count, ...) the pair had already
+stood down and the **mmq triple** served the gate/up pair instead of the **pair** (one shared activation quantize).
+
+**What it turned out to be.**  Three things, only the first of which the item named:
+
+1. **The stand-down predicate.**  Both pair arms now ask the dispatch predicates (`supported_mmid` for the routed
+   pair, `supported_mm` for the dense one), a strict superset of the fused-GLU predicate — so the priority chain is
+   well defined and can never preempt an MMB claim: **MMB's fused GLU -> the mmq/mmvq triple -> the shared-quantize
+   pair (the fallback) -> the two plain muls**.  `GGML_PAIR_ROUTED_OFF` is the new A/B arm for the routed half
+   (`GGML_PAIR_OFF` still means both halves, `GGML_PAIR_DENSE_OFF` the dense one).
+2. **A latent correctness hole in the BF16-only activation marking.**  The same shape predicates are what the
+   optimizer's HC16 pass uses to decide that an activation's F32 output may be skipped; a fusion that preempts one
+   of those readers reads the buffer the mark declared dead.  The marking pass now refuses to elide an activation
+   with a routed `MUL_MAT_ID` consumer (it marks the bf16 *copy* instead, so the MMB reader still finds it).  Not
+   reachable on the model set measured (a MoE layer's F32 router GEMM is usually a co-consumer of the same
+   activation, which already forced the copy arm) — but the two decisions now hold on their own.
+3. **A crash in the first cut, found only on gfx1151.**  The matcher runs on *every* graph node, so probing
+   `supported_mm()` on an arbitrary `i, i+1` pair dereferenced a null `src[1]` on an op that merely preceded a
+   `MUL_MAT`: Flash-Next IQ4_NL at `-ub 256` SIGSEGV'd inside `common_init_from_params`'s warm-up decode (2/2,
+   GDB stack in `ggml_cuda_mmb_supported_mm` under `mul_mat_q_pair_try_fuse`), while every other arm on both boxes
+   was fine.  Both nodes are now required to be the same op with every source slot present, and
+   `supported_mm`/`supported_mmid` are null-safe.  A type-only predicate could not have crashed (it takes a weight).
+
+**The item's premise did not hold, and the measurement says so.**  `TODO` #115 called LFM2 Q6_K an "MMB-declined
+MoE" and read r161's fused-vs-`GGML_CUDA_DISABLE_MOE_MMQ_FUSION` A/B as MMQ-vs-MMB.  On the current tree, with
+gfx1151's type mask, **MMB's fused GLU accepts** it (`GGML_CUDA_MMB_LOG=1` -> `MMB_GLU fused` per MoE layer;
+`M=1792 K=2048 T=512 n_used=4`), so that env was inert in both arms and the r161 pair of numbers compared two
+MMB-GLU arms.  The decision is still the right one to fix; the number was not evidence about it.
+
+**Measured.**
+
+| check | result |
+|---|---|
+| gfx1151, pair vs triple (`GGML_CUDA_MMB_ROUTED=0`, `GGML_PAIR_ROUTED_OFF=1` as the triple arm; dense MMB path untouched), pp512 `-r 3`, interleaved x2 | LFM2 Q6_K **3379 / 3399** vs 3348 / 3407; 35B-A3B Q4_K_M **2304 / 2312** vs 2296 / 2313 — neutral |
+| gfx1151, the shape the change moves (`GGML_CUDA_MMB_MIN_T=1024`, `-ub 512`), greedy 48 tokens | r170 == r171 == triple == unfused == `GGML_CUDA_MMB=0`: LFM2 `765 chars sha=d120b56017c2`, 35B-A3B `723 chars sha=44cbb654f6db` (the pair and the triple share the dot-product order and the `J` tile, so this is kernel *selection*, not a re-baseline) |
+| gfx1151, Flash-Next IQ4_NL `-ub 256` (also exercises the routed-SWIGLU->MMQ matcher, exact stand-down now) | r170 `682 chars sha=488f8aa2f2e8` == r171; prompt 543.6 -> 546.2 t/s |
+| gfx1151, `GGML_CUDA_PAIR_DEBUG=1` | `fused routed=1 T=512 type=q6_K n_experts=32` — the pair really is the arm now |
+| gfx1201 (inert: `mmb_cfg().routed = 0`), r170 vs r171 same-seed 128-token text | 27B Q8_0 `da2e2d192e21`, 35B-A3B Q4_K_M `5d485275db6d` (1 GPU **and** 3 GPU `-sm tensor -ncmoe 40`), LFM2 Q6_K `0b02fbdc4bd3` — all **byte-identical** |
+| gfx1201 prefill `-p 2048 -r 2`, 1 GPU | 35B-A3B Q4_K_M 4856 -> 4894 t/s, LFM2 Q6_K 9177 -> 9166 (noise) |
+| `scripts/gate-prefill-logits.sh` (recorded gfx1201 bases) | 27B Q8_0 **0.000000 / 100.000 %**, 35B-A3B Q4_K_M **-0.000000 / 100.000 %** |
+| `scripts/validate-set.sh` | strict 15/15, tree `2f5870713`, Windows portability scan OK (282 files) |
+
+Record: `benchmarks/2026-10-29-mmb-pair-ownership.md`.  Rule: `GREEDY-PURITY.md` §69.  Pointers:
+`ENVIRONMENT.md` §7.4 (`GGML_PAIR_ROUTED_OFF`), `patches/README.md` (blocks 06 and 10), `AGENTS.md` (critical
+facts).
+
+**Not run, deliberately.**  MTP Protocol A and the arch sweeps: the change touches no arithmetic on any arm
+(the pair and the triple are bit-identical, measured), and both boxes' coherence + the prefill-logit gate cover it.
+The gfx1151 numbers above are the A/B the item asked for; the gfx1201 arm is inert by construction and verified.
+
 ## 261028.014 (docs) -- TODO #111 (a verify step whose slot cannot draft at all) is investigated, DECLINED and retired; the gate gains the instrument, and `GREEDY-PURITY.md` §63's determinism claim is scoped
 
 **Docs + one gate script: no patch, no `release.json` change, no tree change; `scripts/validate-set.sh` is

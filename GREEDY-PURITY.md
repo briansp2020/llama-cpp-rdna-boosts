@@ -130,6 +130,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§66** | a copy that exists only to keep a tensor alive is a graph node, not a graph output: the copy's position in the node order is the whole memory win, the store's row index must be a graph input (never a baked view offset), and a graph built without the store must not be reused once the stores exist | doctrine (r163, issue #240) |
 | **§67** | an all-reduce *arm* is a prefill-numerics reference, so swapping it is gated at the prefill-logit level (multi-device, `-sm tensor`) and never by text; and a device with **peer access enabled** charges the host submission path, which is invisible to a synced loop and to kernel microbenchmarks and only shows where the host limits a replaying decode | doctrine (r165, `TODO #109` closed; `benchmarks/2026-10-28-allreduce-peer-access.md`) |
 | **§68** | a re-base that inherits an upstream **association-order** change is a *re-baseline*, not a purity break: classify a cross-release text move by *what* moved (a VDR/nwarps/norm-grouping carrier is a re-baseline; a scale or tensor-identity carrier is a defect), judge it by width purity and a distribution check, and answer a consumer's output-identity gate with a build-time escape — never a runtime arm | doctrine (r170, issue #228 follow-up; `prompts/` payload, gfx1151) |
+| **§69** | a fusion that stands down for MMB must ask the **dispatch** predicate (the exact shape claim), never a weight-type test: a type-only answer stands down for shapes MMB does not take and, worse, disagrees with the graph optimizer's BF16-only activation marking, so the marking pass must also refuse to elide an activation whose reader a fusion may consume; a matcher that probes arbitrary node pairs owes null-safe predicates | fix + doctrine (r171, `TODO` #115; `benchmarks/2026-10-29-mmb-pair-ownership.md`) |
 
 ---
 
@@ -2187,3 +2188,51 @@ that actually matters, and the one the reporter's gate cannot see.
 4. **Re-base checklist item:** diff `vecdotq.cuh`'s `VDR_*` defines and the `get_vec_dot_q_cuda()` dispatch
    against the previous base.  An upstream default flip re-scopes the delivery's own per-arch gate silently,
    turning a block-07 tuning decision into an inherited one — which is how this report became possible.
+
+
+---
+
+## 69. A fusion that stands down for MMB must ask the dispatch predicate, not a weight type (r171, `TODO` #115 closed)
+
+**The claim.**  Two matchers decide who serves a routed (MoE) or dense gate+up pair, and one of them decided on a
+different question than the other: `mul_mat_q_pair_try_fuse` stood down whenever
+`ggml_cuda_mmb_routed_will_take(w)` / `_dense_will_take(w)` said MMB supported the **weight type**, while the later
+`{MUL_MAT_ID, MUL_MAT_ID, GLU}` triplet matcher (and the `mmb` dispatch itself) decides on the **shape**
+(`ggml_cuda_mmb_supported_mmid()` / `_supported_mm()`: `T >= mmb_min_t()`, `n_used <= 64`, `K` a whole super-block
+count, a contiguous `dst` of the expected layout, ...).  The type-only predicate is a *superset*, so the pair stood
+down for shapes MMB never claims — and the mmq/mmvq triple took the gate/up instead, i.e. the pair never ran as the
+fallback it exists to be.
+
+**Why it is a correctness rule and not only a preference.**  The same shape predicates are what the graph optimizer
+uses to mark an activation **BF16-only**: when every consumer of an activation in the split is a bf16 reader, the
+producer skips its F32 store entirely (`ggml_cuda_mmb_mark_bf16_only`, gfx1151's HC16 arm).  A fusion that preempts
+one of those readers must therefore not read the F32 tensor — a pair or triple that fuses a pair of MMB-claimed
+muls reads exactly the buffer the mark declared dead.  Two rules follow, and they are the invariant:
+
+1. **A fusion stands down on the exact claim** — both muls `ggml_cuda_mmb_supported_mmid()` (routed) /
+   `_supported_mm()` (dense).  That is a strict superset of the fused-GLU predicate (MMB's GLU additionally requires
+   `mmb_glu()`, a plain unswapped SWIGLU and a matching `dst` layout), so the priority chain is well defined and can
+   never preempt an MMB claim: **MMB's fused GLU -> the mmq/mmvq triple -> the shared-quantize pair -> the two plain
+   muls**.  The pair is the fallback for the shapes none of them takes.
+2. **The marking pass must not elide an activation whose reader a fusion may consume.**  A routed `MUL_MAT_ID`
+   consumer no longer authorises `mark_bf16_only` (it marks the bf16 *copy* instead, so the MMB reader still finds
+   it).  With (1) in place this is belt-and-braces — the fusion and the mark cannot both be wrong — but the two live
+   in different passes (marking in `graph_optimize`, matchers in `graph_compute`), so each must hold on its own.
+
+**Purity is preserved because the arms are the same arithmetic.**  The mmq pair and the mmq triple accumulate the
+same dot products with the same `J` tile and apply the GLU elementwise, so the arms produce **bit-identical** output
+on every model measured, not merely similar: gfx1151 (LFM2 Q6_K 765 chars, 35B-A3B Q4_K_M 723 chars) reads the same
+text for pair == triple == unfused (`GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) == `GGML_CUDA_MMB=0`, and gfx1201 is inert
+(`mmb_cfg().routed = 0` there, so the pair already won).  The prefill-logit gate reads 0.000000 / 100.000 % on 27B
+Q8_0 and 35B-A3B Q4_K_M.  Time is neutral: gfx1151 pair vs triple 3379/3399 vs 3348/3407 t/s (LFM2) and 2304/2312 vs
+2296/2313 (35B-A3B) at pp512, interleaved `r=3` with the dense MMB path untouched.
+
+**Two traps this cost.**  (a) A matcher that probes an *arbitrary* node pair must null-check every source slot
+before calling these predicates: the pair matcher runs on every graph node, and its first version dereferenced a
+missing `src[1]` on an op followed by a `MUL_MAT` — an instant SIGSEGV, found only because a gfx1151 model's warm-up
+graph happened to have that shape (`ggml_cuda_mmb_supported_mm`/`_mmid` are null-safe now too).  (b) A model whose
+GRAPH the item was filed against is not necessarily one that reaches the arm: with the gfx1151 weight-type mask,
+LFM2 Q6_K is accepted by MMB's **fused GLU** (`M=1792 K=2048 T=512 n_used=4`, `MMB_GLU fused` in the log), so the
+"MMB-declined MoE" premise of `TODO` #115 did not hold and the original fused-vs-`GGML_CUDA_DISABLE_MOE_MMQ_FUSION`
+A/B compared two MMB-GLU arms.  Reproduce the *decision* with `GGML_CUDA_MMB_LOG=1` before attributing a number to a
+matcher.
