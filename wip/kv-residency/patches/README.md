@@ -17,7 +17,7 @@ base `6050b467c`).
 cd ~/llama.cpp
 git checkout rdna-boosts && git checkout 5bdec04ab        # or: scripts/apply-all.sh after a fresh clone
 git checkout -b wip-kv-residency
-git am ~/llama-cpp-rdna-boosts/wip/kv-residency/patches/000[12]-*.patch
+git am ~/llama-cpp-rdna-boosts/wip/kv-residency/patches/000[123]-*.patch
 ~/bin/build-llama-rocm
 ```
 
@@ -30,6 +30,8 @@ If `5bdec04ab` is not available (an old checkout), re-cut it first from this rep
 |---|---|---|
 | `0001-ggml-cuda-grow-only-VMM-region-primitive.patch` | `ggml/src/ggml-cuda/ggml-cuda-vmm-region.{h,cu}`: one VA reservation, physical mapped per `unit` chunk, grown monotonically, clear-on-map, fail-soft.  The mapped extent is a **set of spans** (`grow_span`/`is_mapped`/`clear` over a per-unit bitmap), because a KV buffer lays its tensors out consecutively and a single prefix watermark would map ~the whole region even for a 4-token run.  Plus a one-shot `GGML_CUDA_VMM_REGION_SELFTEST=1` hook in `ggml_backend_cuda_init`.  Purely additive — no existing path changes. | **applied, building, selftest PASS**; gates green (see `../IMPLEMENTATION.md`) |
 | `0002-ggml-cuda-KV-region-buffer-type.patch` | `ggml_backend_cuda_kv_region_buffer_type` (ggml-cuda.cu) + the `llama_kv_cache` selection and the `apply()` grow (src/llama-kv-cache.{h,cpp}).  Env-gated OFF (`LLAMA_KV_REGION=1`), plain device buffer type as the mandatory fallback. | **applied, building**, all gates green — but see the KNOWN LIMIT in `../IMPLEMENTATION.md`: on a slab-armed MoE config the arena keeps the VRAM the KV no longer takes up front, so a run that uses most of `-c` refuses where the plain arm completes |
+
+| `0003-llama-model-MTP-draft-KV-window.patch` | **O3, the drafter ring**: the MTP draft cache can be a sliding window (`LLAMA_SPEC_DRAFT_WINDOW=<cells>`, default off) — one `create_memory` branch plus a helper, reusing `find_slot`'s reclaim and the cache's own `n_swa` for the mask.  **Implemented and measured; a poor product trade** (-6..-9 % decode, +8 % prefill, and the freed VRAM does not reach the arena) — see `../O3-DRAFTER-RING.md` §2.2 | **applied, building, gates green** |
 
 `diffstat.txt` is the net diff of the series against `5bdec04ab`.
 

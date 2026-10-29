@@ -78,6 +78,56 @@ Consequence for the plan: **Step A is done and Step B is smaller than expected**
 plumbing); the derived-mask exclusion is a new, explicit item.  Revised order: B (placement + sizing) ->
 C (rollback) -> D (acceptance).
 
+## 2.2 Step B implemented and measured (2026-10-29) — it works, and it is a poor trade
+
+Implemented as a single change plus a helper: the MTP `create_memory` branch of the hybrid Qwen3.5 path
+(`llama-model.cpp`, the `GGML_ASSERT(!hparams.is_swa_any())` plain `llama_kv_cache` for the nextn layer) builds
+the draft cache at `GGML_PAD(min(n_ctx_seq, win + n_ubatch), 256)` cells with `n_swa = win`,
+`swa_type = STANDARD`, when `LLAMA_SPEC_DRAFT_WINDOW` (cells) is set.  No mask change, no new allocator, no
+`cparams` field: the reclaim in `find_slot` is the ring, and `set_input_kq_mask` already reads the cache's own
+`n_swa`.  Floor: `GGML_PAD(n_ubatch + 256, 256)` (a whole ubatch must always be placeable).
+
+**Purity — green.**  Target greedy text is byte-identical with the window off and on: 27B 303 chars
+`sha=c437759e06e3` at off / 4096 / 2048 (`-c 8192`, 5256-token prompt so the window is genuinely active);
+35B-A3B `-ncmoe 24` 262 chars `sha=e9db5cb8db0b`.  `check-gpu-faults.sh` clean.
+
+**The draft cache shrinks as designed:**
+
+| model / `-c` | draft KV off | window 4096 | window 2048 |
+|---|---:|---:|---:|
+| 27B, 16384 | 64 MiB | **18 MiB** | — |
+| 27B, 12288 | 192 MiB | **72 MiB** | **36 MiB** |
+| 35B-A3B, 131072 | 256 MiB | **9 MiB** | — |
+
+The ceiling is structural: the draft is **one layer**, so the saving is one layer's worth of KV
+(~2-4 KiB/token) — about **1 GiB at `-c 262144` on the 27B**, not GiBs.
+
+**The cost, 27B `-c 12288`, 5256-token prompt, `-n 1000`, `--reasoning on`, `--spec-draft-n-max 3` (1 GPU):**
+
+| window | acceptance | gen t/s |
+|---|---|---|
+| off | 0.6381 | 63.24 |
+| 8192 (never truncates — the sanity arm) | 0.6381 | 63.13 |
+| 4096 | 0.5712 | **58.79 (-7.0 %)** |
+| 2048 | 0.5519 | **57.61 (-8.9 %)** |
+
+35B-A3B `-ncmoe 24 -c 131072`, `-n 200`: acceptance 0.7611 -> 0.6927 (-9.0 %), generation 193.6 -> 181.8 t/s
+(-6.1 %), **prefill 1956 -> 2116 t/s (+8.2 %)** — the smaller draft cache makes the draft's own prefill cheaper,
+and that is the only thing that got faster.
+
+**The finding that decides O3's value: the freed VRAM does not reach the arena.**  On the MoE arm
+`SLAB_INIT` reads `arena 14.44 GiB` with the window **off and on**, because the draft context's KV lives inside
+the slab's `aux_reserve` (4.25 GiB on that arm) — a reserve sized *for* the draft and otherwise unused, so
+shrinking the draft just leaves part of the reserve unspent.  To convert O3 into an arena win the draft-reserve
+estimate has to know about the window (`common/draft-reserve.h` / the `--fit` measurement of the extra model),
+which is a separate, small change — and even then the prize is one layer (~220 MiB there).
+
+**So, as a product: -6..-9 % decode when the window is active, +8 % prefill, and ~1 GiB at `-c 262144` that
+currently buys nothing.**  As a *rehearsal* it did its job: the policy (window + residency map sized up front)
+is now concrete, gated, measured and cheap to lift onto O2's page table — and it definitively answers the
+"is the window free?" question: **no, it costs ~7 % of decode at a window that truncates real context**, which
+is the number O2 needs when it decides how much window to keep resident.
+
 ## 3. Invariants the slice must keep
 
 1. **The target is untouched.**  Only the draft context's cache gets a window.  A wrong draft is a slower
