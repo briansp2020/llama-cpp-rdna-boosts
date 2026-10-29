@@ -24,6 +24,20 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-10-29 — MMB owns what MMB claims: the pair fusion's stand-down predicate (r171, `TODO` #115 closed)
+
+**`WORKLOG.md` 261029.001** + [`2026-10-29-mmb-pair-ownership.md`](2026-10-29-mmb-pair-ownership.md) —
+`mul_mat_q_pair` stood down for MMB on a weight-*type* test while the mmb dispatch, the fused-GLU matcher and the
+mmq triple decide on the *shape*, so on every shape MMB declines (`T < mmb_min_t()`, `n_used > 64`, ...) the pair
+had already stood down and the triple served the gate+up pair.  Both pair arms now ask
+`ggml_cuda_mmb_supported_mm()`/`_supported_mmid()` (the dispatch predicates, a superset of the fused-GLU one), which
+also closes a latent hole in the optimizer's BF16-only activation marking, and the marking pass no longer elides an
+activation with a routed `MUL_MAT_ID` reader.  Measured **inert-to-neutral**: gfx1201 byte-identical text on 27B
+Q8_0 / 35B-A3B Q4_K_M (1 and 3 GPU) / LFM2 Q6_K with prefill-logit KLD 0.000000 / 100.000 %; gfx1151 pair == triple
+== unfused == `GGML_CUDA_MMB=0` byte-identical, pp512 pair vs triple 3379/3399 vs 3348/3407 (LFM2) and
+2304/2312 vs 2296/2313 (35B-A3B).  The exercise also found a first-cut **SIGSEGV** (a null `src[1]` probed on an
+arbitrary node pair) that only gfx1151's Flash-Next warm-up graph hit.
+
 ## 2026-10-26 — decode graphs replay: the graph-cache key must name the layer, not only the activation (r149, TODO #107 closed)
 
 **`WORKLOG.md` 261026.007** + [`2026-10-26-graph-replay-keys.md`](2026-10-26-graph-replay-keys.md) —
