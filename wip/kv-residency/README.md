@@ -1,5 +1,8 @@
 # wip/kv-residency — the KV cache in VRAM: how much, where, and how little can be resident (OPEN, scoping)
 
+**Cold start: read [`HANDOVER.md`](HANDOVER.md) first** — it is self-contained and says what to do in the
+first 30 minutes.
+
 **Status: OPEN — scoping complete, implementation started (2026-10-29).  Nothing here is in `patches/`, and
 nothing is scheduled.  The campaign's code lives on fork branch `wip-kv-residency` (cut from the r174 tip
 `5bdec04ab`); what exists is [`IMPLEMENTATION.md`](IMPLEMENTATION.md).**
@@ -239,7 +242,8 @@ HIP_VISIBLE_DEVICES=0 /tmp/bw-probe 512 5
 * [`VMM-PROBE.md`](VMM-PROBE.md) — what the ROCm driver actually allows (and the two traps: an unmap
   sub-range is refused, and reading reserved-but-unmapped VA faults the card).
 * [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — the implementation log: branch, slice 1, its gates, and the
-  design of the next slice (the KV buffer type).  Snapshot: `0001-vmm-region-primitive.patch`.
+  design of the next slice (the KV buffer type).  Snapshot: `patches/` (`patches/README.md` has the apply
+  instructions).
 * [`INVENTORY.md`](INVENTORY.md) — the measured GPU-resident budget (T1–T5; **T2 + the KV cache's own
   bookkeeping is this campaign, T3/T4/T5-outside-the-KV-cache are the deferred later areas**), scaling laws
   with file:line, and the commands.

@@ -2,7 +2,7 @@
 
 **Nothing here is delivery work.** The campaign's code lives on the fork branch `wip-kv-residency`
 (cut from the r174 tip `5bdec04ab`), is **not** in `patches/`, and is applied to no checkout other than the
-one it is developed and measured in. Snapshot: `0001-vmm-region-primitive.patch` in this directory.
+one it is developed and measured in. Snapshot: `patches/0001-ggml-cuda-grow-only-VMM-region-primitive.patch` (see `patches/README.md`).
 
 ## Slice 1 (2026-10-29) — the grow-only VMM region + its selftest
 
