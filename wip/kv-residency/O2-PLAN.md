@@ -125,3 +125,61 @@ indirection for nothing.
 
 Nothing from `wip/kv-residency/` is in `patches/`, `release.json` or any block, and none of it may be
 promoted.  The fork branch `wip-kv-residency` is the record.
+
+---
+
+## 6. Goal A build contract (agreed 2026-10-29)
+
+### 6.1 The opt-in rule (the maintainer's spec)
+
+* **Default off.**  With the flag unset the behaviour is **byte-identical to today**, *including the OOM*:
+  "it either fits or it doesn't".  Nothing about the resident path changes; no extra allocation, no extra
+  tensor, no warning.
+* **Opt-in.**  The user chooses to let the KV's tail spill into system RAM and accepts the consequence.  The
+  flag says "do not deny me because the tail will spill"; it does not silently enable anything.
+  This is the `--n-cpu-moe` category (a user-requested escape hatch), **not** the default-on category: it is
+  not "on because it helps", it is "on because the alternative is not running at all"
+  (`AGENTS.md`, default-on policy — a known-risky tradeoff may stay opt-in).
+* **Loud.**  One warning at start-up, always (not only under `-v`), naming: resident MiB of total KV MiB,
+  spilled MiB, the resident window in cells, and the **modelled** cost at the current depth
+  (`spilled_bytes / 28.8 GB/s` per token).  Plus one line whenever the split is recomputed.
+* **`--fit` reports, never repairs.**  With the flag on, an over-budget KV is not a refusal: `--fit` prints
+  the split it would produce and the modelled cost.  With the flag off, `--fit` keeps refusing as today.
+
+### 6.2 Where the split is decided
+
+* **Before `SLAB_INIT`**, because the slab maps `free VRAM - reserve` once and the KV's resident part must be
+  accounted for first — the arena then gets the remainder **by construction**.  (This is the O1 lesson,
+  done deterministically: O1 grew lazily and the arena took the VRAM first.)
+* Two ways to size the resident window: **auto** (as much as fits after the weights and the slab floor) or
+  explicit (`--kv-resident-mib N`).  Auto is the maintainer's framing ("full speed until we run out of VRAM").
+* **The host master is pinned** (a kernel reads it, and gfx1201 has XNACK off), so the spilled part is
+  **non-swappable RAM**: 4.25 GiB at `-c 131072` q8_0 on the 27B, 8.5 GiB at 262144.  It must be gated on
+  `MemAvailable` (the `MOE_HOST_POOL_RAM_PCT` pattern) and refuse loudly before `cudaHostAlloc` fails.
+
+### 6.3 Mechanism (chosen: two FA passes + a combine, **not** a FA kernel rewrite)
+
+`llm_graph_context::build_attn_mha` (`src/llama-graph.cpp:3139`) is the single funnel both `build_attn`
+variants pass through, so the split is described there; `llama_kv_cache::get_k/get_v` produce the two views
+(resident window + tail).
+
+* **One FA call per segment, then combine.**  The tail is an ordinary `ggml_flash_attn_ext` whose K/V tensor
+  happens to live in the pinned host master — so the *reader* needs no new code, and streaming is a
+  **buffer-type change**, not a kernel change.  The missing piece is the combine (softmax over two normalised
+  halves needs each half's log-sum-exp), which is a small new `GGML_OP_FA_COMBINE` (row-wise
+  `out = (o1*s1 + o2*s2)/(s1+s2)`) — far less surface than teaching every FA kernel family a second address
+  base.
+* Rejected: extending `ggml_flash_attn_ext` with `k_tail`/`v_tail` srcs and combining in-kernel.  It is the
+  more efficient shape (one launch) but it re-parameterises the whole FA kernel family, including the band,
+  the WMMA/tile rows and the QSA variant — the highest-risk code in the tree, for a traffic-bound feature.
+
+### 6.4 Slice order, with the oracle at each step
+
+| slice | what | oracle |
+|---|---|---|
+| **A1** | the split **mechanically**, both segments still in VRAM: two views, two FA calls, `GGML_OP_FA_COMBINE`, split forced by a knob | **byte-identical text at every split width** — this proves the split is value-preserving with zero host memory involved.  Also `gate-prefill-logits.sh` |
+| **A2** | move the tail tensor to the pinned host master (one buffer-type change) | the *same* text as A1, plus the measured per-token cost vs the modelled `spilled/28.8 GB/s` |
+| **A3** | auto-size from free VRAM, the opt-in flag, the loud warning, `--fit` reporting, the `MemAvailable` gate | the two OOM configs in §1 now run; the flag-off run is byte-identical to today's binary; slab mode's `SLAB_INIT` shows the arena gaining what the window frees |
+
+A1 is the whole risk and it is entirely in the resident path, so it can be gated before a single byte goes to
+host memory.  A2 is then a genuine one-line move, which is the strongest evidence that the split is right.
