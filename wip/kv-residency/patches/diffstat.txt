@@ -1,4 +1,6 @@
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 335 +++++++++++++++++++++++++++++
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  62 ++++++
- ggml/src/ggml-cuda/ggml-cuda.cu            |  16 ++
- 3 files changed, 413 insertions(+)
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 437 +++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  84 ++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 389 +++++++++++++++++++++++++
+ src/llama-kv-cache.cpp                     |  89 ++++++
+ src/llama-kv-cache.h                       |  11 +
+ 5 files changed, 1010 insertions(+)

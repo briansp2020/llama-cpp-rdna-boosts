@@ -40,7 +40,7 @@ pointless).  Both are generic over *dense vs MoE* and *slab vs no-slab* by const
 |---|---|---|
 | **A. the KV cache's own bookkeeping** | can the device-resident part of the KV cache shrink? | it is already small (`cell_pos`/`tok_lo`/`tok_hi` ≈ 1 MiB; the packed `kq_mask` that used to be 960 MiB is lazy since r160 and derived by default since r172).  A residency map *adds* `≈ n_cells/page × 20 B` (1.2 MiB at 245760 with a 4-cell page), so this axis is a budget to hold, not a win to chase |
 | **B. KV data** | can part of the K/V (and the indexer keys) live outside VRAM and be streamed in a window? | **only where the attended set is bounded** (§4).  Full attention: no, not at any useful speed |
-| **C. placement control** | can the KV be a *fixed region* whose size and address are known before the graph is built? | **yes, and it is the part worth doing first** (§5, O1) — the slab exists, the KV is currently outside it |
+| **C. placement control** | can the KV be a *fixed region* whose size and address are known before the graph is built? | yes, but it is **not** the campaign's goal (see the SCOPE DECISION below) — a fixed *region* is not a fixed *footprint*; only axis B's window gives that |
 
 ## 2. What is resident today (measured, r174, 1 GPU)
 
@@ -98,14 +98,44 @@ so **1 GiB of misses per token = 37 ms/token**, and the question is only ever "h
 | the **drafter** (MTP / DFlash) | bounded by construction — it only proposes | a ring (Strata's `--mtp-window`) is an *acceptance* trade, zero correctness risk (the target verifies) |
 
 **So the honest headline is: "windowed KV" is a qwen4exp/DSA feature, not a dense-model feature.**  For dense
-models the win in axis C (a fixed, lazily-mapped KV region) is real but it is a *sizing and placement* win, and
-it changes nothing about a full context.
+models the win in axis C (a fixed, lazily-mapped KV region) is a *sizing and placement* win only, and it
+changes nothing about a full context — which is why O1 is parked (SCOPE DECISION).
+
+## 4.1 SCOPE DECISION (2026-10-29) — the goal is the window, not the region
+
+**The ask was, and is, a Strata-style windowed KV cache (O2): the KV's VRAM footprint is a *fixed window*
+(host master + residency page table + in-graph resolve), so a large `-c` stops costing VRAM the expert arena
+could use.**  Order: **O3 first, then O2.**
+
+**O1 (`--kv-grow`) is PARKED.**  The seeding session called it "the part worth doing first" and slice 2 was
+built on that; that was a scope error, corrected here.
+
+* O1 is **not a step toward O2** — O2's provider is a *fully mapped fixed pool* + a host master + a page
+  table, which lazy growth does not help (`STRATA-KV-STREAMING.md` §1: `--kv-grow` "is *not* streaming … and
+  needs no page table" — it is a separate, orthogonal thing in Strata too).
+* O1 **regressed** a config that uses most of `-c` on a slab-armed MoE model: 35B-A3B `-ncmoe 24 -c 262144`
+  on a 253k-token prompt completes with the region off (1201.2 / 51.2 t/s) and refuses at 41216 cells with it
+  on, because `SLAB_INIT` had already handed the freed VRAM to the arena.  Numbers:
+  [`IMPLEMENTATION.md`](IMPLEMENTATION.md) "KNOWN LIMIT".
+* It is **parked, not refuted**, because of the maintainer's crossover argument: O1 is a *temporal* window —
+  the arena is big early and shrinks as the context grows, and it converges on fully-resident-KV speed once
+  the context is large.  Until the window fills it is **no faster than the windowed design at all**; the only
+  open question is what costs more **past** the window — windowing misses through the link, or the shrinking
+  arena's expert-cache misses and the r117 identity cliff.  Growing is probably a little faster for a while
+  after the window fills; we do not know when (or whether) the arena's miss rate takes it back.  **Only a
+  built O2 can measure that**, so O1 is waiting on O2, not dismissed.
+
+**O3 first** because it is genuinely windowed residency (`--mtp-window`: the draft KV is `O(window)`), it is
+family-independent, it runs on the 27B dense that fits the one attached card, and its cost is a clean
+acceptance number.  Its *standalone* VRAM win is modest (~256 MiB at `-c 65536` on the 27B — 1 draft layer);
+its value is that it is the smallest complete instance of the policy O2 needs.
+Design: [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md).
 
 ## 5. Options
 
 | # | option | what it buys | kernel change | works dense + MoE | effort |
 |---|---|---|---|---|---|
-| **O1** | **KV-grow**: a fixed VA region for K/V (+ indexer keys), physical mapped per high-water mark | exact `--fit`/arena arithmetic; a 256 K context on a 32 GiB card *as long as the used context is smaller*; no "reserve 16 GiB and never use it" | none | yes | **S** |
+| **O1** | **KV-grow**: a fixed VA region for K/V (+ indexer keys), physical mapped per high-water mark | exact `--fit`/arena arithmetic; a 256 K context on a 32 GiB card *as long as the used context is smaller*; no "reserve 16 GiB and never use it".  **PARKED (§4.1) — not on the path to O2** | none | yes | **S** (done, parked) |
 | **O2** | **windowed residency** (Strata's design): host master + page table + in-graph resolve | the real VRAM cut, only for bounded attended sets (§4) | FA index computation + the KV write path + defrag/shift/state | yes, *where eligible* | **XL** |
 | **O3** | **drafter ring** (`--mtp-window` analogue, `block % n_slots`) | draft KV from `O(n_ctx)` to `O(window)` | draft's mask/pos only | yes | **M** |
 | **O4** | **indexer diet** (`q8_0` indexer keys; lean harder on the derived block-vector cache) | Flash-Next 3 GiB → 1.5 GiB at 256 K | none (type change) | n/a (qwen4exp) | **S** |

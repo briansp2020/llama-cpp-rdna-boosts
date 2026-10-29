@@ -1,7 +1,7 @@
-From c757b5ea8ceabe1a6fe3604b9debde2b38db8209 Mon Sep 17 00:00:00 2001
+From 973e166e128a895d60744423407d7520d1a71f63 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 29 Oct 2026 15:36:36 -0500
-Subject: [PATCH] wip/kv-residency: grow-only VMM region primitive + its
+Subject: [PATCH 1/2] wip/kv-residency: grow-only VMM region primitive + its
  selftest (TODO #117, not for patches/)
 
 First implementation slice of the kv-residency campaign: the "O1 fixed region" primitive the KV
@@ -38,19 +38,19 @@ Next slice (not in this commit): the KV buffer type (a device buft whose alloc_b
 region and whose clear/init map on demand) plus the llama_kv_cache grow call site at the point the
 used-cell watermark advances, and the --fit term.
 ---
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 335 +++++++++++++++++++++
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  62 ++++
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 437 +++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  84 ++++
  ggml/src/ggml-cuda/ggml-cuda.cu            |  16 +
- 3 files changed, 413 insertions(+)
+ 3 files changed, 537 insertions(+)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
 new file mode 100644
-index 000000000..5b6272fa9
+index 000000000..2612bb7b3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,437 @@
 +// wip/kv-residency (TODO #117): the grow-only VMM region -- the O1 "fixed KV region" primitive.
 +// Contract, driver facts and the two traps: ggml-cuda-vmm-region.h.
 +//
@@ -67,14 +67,19 @@ index 000000000..5b6272fa9
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
++#include <vector>
 +
 +struct ggml_cuda_vmm_region {
-+    int      device = -1;
-+    int      phys   = -1;
-+    size_t   size   = 0;   // the VA reservation
-+    size_t   unit   = 0;   // map granularity (a whole number of units is always mapped)
-+    size_t   mapped = 0;   // the read watermark: bytes [0, mapped) are mapped and cleared
-+    void *   base   = nullptr;
++    int      device  = -1;
++    int      phys    = -1;
++    size_t   size    = 0;   // the VA reservation
++    size_t   unit    = 0;   // map granularity (mapping is always a whole number of units)
++    size_t   n_units = 0;   // size / unit -- the bitmap's length
++    size_t   mapped  = 0;   // bytes mapped (a count, not a watermark: the set can have holes)
++    void *   base    = nullptr;
++    // One byte per unit: is that unit mapped (and therefore cleared)?  `size / unit` is a few KiB even for a
++    // 16 GiB region at 2 MiB units, and it makes `is_mapped()` a pure range scan with no driver call.
++    std::vector<uint8_t> unit_map;
 +};
 +
 +namespace {
@@ -184,6 +189,8 @@ index 000000000..5b6272fa9
 +    r->phys   = phys;
 +    r->unit   = u;
 +    r->size   = vmm_up(bytes, u);
++    r->n_units = r->size / u;
++    r->unit_map.assign(r->n_units, 0);
 +
 +    CUdeviceptr base = 0;
 +    if (cuMemAddressReserve(&base, r->size, 0, 0, 0) != cudaSuccess) {
@@ -199,35 +206,92 @@ index 000000000..5b6272fa9
 +    return r;   // nothing is mapped yet: mapped == 0
 +}
 +
-+bool ggml_cuda_vmm_region_grow(ggml_cuda_vmm_region * r, size_t used_bytes) {
++bool ggml_cuda_vmm_region_grow_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes) {
 +    if (r == nullptr) {
 +        return false;
 +    }
-+    if (used_bytes <= r->mapped) {
-+        return true;   // monotone: never shrink, nothing to do
++    if (bytes == 0) {
++        return true;
 +    }
-+    if (used_bytes > r->size) {
-+        return false;  // beyond the reservation -- the caller must have sized it for its context
++    if (off > r->size || bytes > r->size - off) {
++        return false;   // outside the reservation -- the caller sized the region for its own extent
 +    }
-+    const size_t want = vmm_up(used_bytes, r->unit);
-+    if (want > r->size) {
-+        return false;
++    // Whole units only: a sub-range of a mapping cannot be unmapped later (VMM-PROBE T5), so the mapping
++    // granularity is the unit and every span is rounded OUTWARDS to it.  Rounding outwards can only touch
++    // more VA than asked for, never a byte outside the reservation (`last` is clamped).
++    const size_t first = off / r->unit;
++    size_t       last  = (off + bytes + r->unit - 1) / r->unit;
++    if (last > r->n_units) {
++        last = r->n_units;
 +    }
-+    for (size_t off = r->mapped; off < want; off += r->unit) {
-+        if (!vmm_map(r, off, r->unit)) {
-+            // Leave the watermark at what did map: those bytes are valid and cleared, and the caller can
-+            // still run on them (a KV region that is short is a shorter context, not a crash).
++    for (size_t u = first; u < last; ++u) {
++        if (r->unit_map[u] != 0) {
++            continue;   // already mapped (and cleared once): never re-clear, data must survive
++        }
++        const size_t addr_off = u * r->unit;
++        if (!vmm_map(r, addr_off, r->unit)) {
++            // Leave what did map: those bytes are valid and cleared, so the caller can still run on a shorter
++            // extent instead of falling over.
 +            return false;
 +        }
++        r->unit_map[u] = 1;
 +        r->mapped += r->unit;
 +        // A fresh mapping can contain stale bytes (measured), so clear exactly what was just mapped.  The
 +        // write runs at VRAM speed (~490 GB/s measured, no fault storm), so this is not a real cost.
-+        if (cudaMemset((char *) r->base + off, 0, r->unit) != cudaSuccess) {
++        if (cudaMemset((char *) r->base + addr_off, 0, r->unit) != cudaSuccess) {
 +            (void) cudaGetLastError();
 +            return false;
 +        }
 +    }
 +    return true;
++}
++
++bool ggml_cuda_vmm_region_grow(ggml_cuda_vmm_region * r, size_t used_bytes) {
++    if (r == nullptr) {
++        return false;
++    }
++    if (used_bytes == 0) {
++        return true;
++    }
++    return ggml_cuda_vmm_region_grow_span(r, 0, used_bytes);
++}
++
++bool ggml_cuda_vmm_region_is_mapped(const ggml_cuda_vmm_region * r, size_t off, size_t bytes) {
++    if (r == nullptr) {
++        return false;
++    }
++    if (bytes == 0) {
++        return off <= r->size;
++    }
++    if (off > r->size || bytes > r->size - off) {
++        return false;
++    }
++    const size_t first = off / r->unit;
++    size_t       last  = (off + bytes + r->unit - 1) / r->unit;
++    if (last > r->n_units) {
++        last = r->n_units;
++    }
++    for (size_t u = first; u < last; ++u) {
++        if (r->unit_map[u] == 0) {
++            return false;
++        }
++    }
++    return true;
++}
++
++void ggml_cuda_vmm_region_clear(ggml_cuda_vmm_region * r, uint8_t value) {
++    if (r == nullptr) {
++        return;
++    }
++    for (size_t u = 0; u < r->n_units; ++u) {
++        if (r->unit_map[u] == 0) {
++            continue;
++        }
++        if (cudaMemset((char *) r->base + u * r->unit, value, r->unit) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return;
++        }
++    }
 +}
 +
 +size_t ggml_cuda_vmm_region_mapped(const ggml_cuda_vmm_region * r) { return r != nullptr ? r->mapped : 0; }
@@ -239,7 +303,15 @@ index 000000000..5b6272fa9
 +    if (r == nullptr) {
 +        return;
 +    }
-+    vmm_unmap(r, 0, r->mapped);
++    // A mapping is a whole unit and units are disjoint, so the mapped set is unmapped unit by unit -- there is
++    // never a sub-range unmap (which the driver refuses, VMM-PROBE T5).
++    for (size_t u = 0; u < r->n_units; ++u) {
++        if (r->unit_map[u] != 0) {
++            vmm_unmap(r, u * r->unit, r->unit);
++            r->unit_map[u] = 0;
++        }
++    }
++    r->mapped = 0;
 +    if (r->base != nullptr) {
 +        if (cuMemAddressFree((CUdeviceptr) (uintptr_t) r->base, r->size) != cudaSuccess) {
 +            (void) cudaGetLastError();
@@ -377,21 +449,51 @@ index 000000000..5b6272fa9
 +    check(ggml_cuda_vmm_region_mapped(r) == 3 * unit, "watermark unchanged by a smaller grow");
 +    check(!ggml_cuda_vmm_region_grow(r, n_units * unit + unit), "growing past the reservation is refused");
 +
-+    // and it must survive its own teardown
++    // SPAN growth: a KV buffer lays its tensors out consecutively (K0, V0, K1, V1, ...), so what a batch needs
++    // is the first n_kv cells of EACH tensor -- disjoint spans -- and never the gaps between them.  A span must
++    // map whole units inside itself only, must not re-clear an already mapped unit, and must round a range that
++    // starts mid-unit outwards.
++    check(ggml_cuda_vmm_region_is_mapped(r, 0, 3 * unit), "a prefix grow maps its units");
++    check(!ggml_cuda_vmm_region_is_mapped(r, 0, 4 * unit), "a prefix grow leaves the next unit unmapped");
++    check(ggml_cuda_vmm_region_grow_span(r, 4 * unit, unit), "span grow");
++    check(ggml_cuda_vmm_region_is_mapped(r, 4 * unit, unit), "the span is mapped");
++    check(!ggml_cuda_vmm_region_is_mapped(r, 3 * unit, unit), "the gap between the spans is NOT mapped");
++    check(ggml_cuda_vmm_region_mapped(r) == 4 * unit, "4 of 6 units are mapped");
++    // data in the spanning unit survives a repeat (a grow is not a re-clear)
++    st_fill_kernel<<<256, 256>>>((uint32_t *) ((char *) ggml_cuda_vmm_region_base(r) + 4 * unit), unit / 4, 0xa5a5a5a5u);
++    check(cudaDeviceSynchronize() == cudaSuccess, "fill the span");
++    check(ggml_cuda_vmm_region_grow_span(r, 4 * unit, unit), "a repeated span grow is a no-op");
++    if (ok) {
++        check(st_units_are(r, 1, 0x5a5a5a5au, d_bad, "prefix unit 0 is unchanged by a span grow"), "prefix unit 0 unchanged");
++        (void) cudaMemset(d_bad, 0, sizeof(int));
++        st_check_kernel<<<256, 256>>>((const uint32_t *) ((char *) ggml_cuda_vmm_region_base(r) + 4 * unit), unit / 4,
++                0xa5a5a5a5u, d_bad);
++        int bad = -1;
++        (void) cudaDeviceSynchronize();
++        (void) cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost);
++        check(bad == 0, "the spanning unit's data survives a repeated grow");
++    }
++    // a range that starts mid-unit rounds outwards, and a range past the reservation is refused
++    check(ggml_cuda_vmm_region_grow_span(r, 5 * unit + 1, 8), "a mid-unit span grow");
++    check(ggml_cuda_vmm_region_is_mapped(r, 5 * unit + 1, 8), "a mid-unit span is mapped");
++    check(!ggml_cuda_vmm_region_grow_span(r, 5 * unit, 2 * unit), "a span past the reservation is refused");
++    check(!ggml_cuda_vmm_region_is_mapped(r, 0, n_units * unit), "the reserved tail stays unmapped");
++
++    // and it must survive its own teardown (with holes in the mapped set)
 +    ggml_cuda_vmm_region_free(r);
 +    (void) cudaFree(d_bad);
 +
-+    GGML_LOG_INFO("%s: device %d: %s (reserved %zu MiB in %zu x %zu MiB units, grew to 3, watermark contract "
-+                  "and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
++    GGML_LOG_INFO("%s: device %d: %s (reserved %zu MiB in %zu x %zu MiB units, prefix + span growth, "
++                  "the watermark contract and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
 +                  (n_units * unit) >> 20, n_units, unit >> 20);
 +    return ok;
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
 new file mode 100644
-index 000000000..f27036544
+index 000000000..493a6a2cc
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,84 @@
 +#pragma once
 +
 +// wip/kv-residency (TODO #117): a grow-only VMM region for the KV cache -- the O1 "fixed region" primitive.
@@ -414,8 +516,17 @@ index 000000000..f27036544
 +//   * a fresh mapping can contain STALE bytes and the first write to it runs at VRAM speed (490 GB/s), so
 +//     `grow()` memsets what it maps.  Never rely on the driver zeroing a mapping.
 +//   * READING RESERVED-BUT-UNMAPPED VA FAULTS THE GPU (it does not return an error).  The caller must never
-+//     let a kernel or a copy touch a byte above `ggml_cuda_vmm_region_mapped()`, which is the same contract
-+//     `llama_kv_cache` already keeps for the graph view (it sizes it by the USED cell count, not `kv_size`).
++//     let a kernel or a copy touch a byte that is not mapped, which is the same contract `llama_kv_cache`
++//     already keeps for the graph view (it sizes it by the USED cell count, not `kv_size`).
++//
++// WHY THE MAPPED EXTENT IS A SET OF SPANS AND NOT ONE WATERMARK
++//   The consumer is the KV buffer type, and a KV buffer lays its tensors out CONSECUTIVELY: layer 0's K, then
++//   layer 0's V, then layer 1's K, ...  A prefix watermark covering `n_kv` cells therefore has to reach the
++//   LAST tensor's offset, i.e. almost the whole region, even for a 4-token run (measured on a 27B at
++//   -c 65536: 4092 of 4096 MiB for 256 cells).  What a run actually needs is the first `n_kv` cells of EACH
++//   tensor -- 32 disjoint spans -- which is 64 MiB instead of 4 GiB at 8 MiB units.  So `grow_span()` maps
++//   whole units inside one arbitrary byte range and `is_mapped()` answers for a range; `grow()` is kept as
++//   the contiguous-waiter convenience form (`grow_span(r, 0, used)`).
 +//
 +// All entry points fail soft: a driver refusal returns false/nullptr and leaves nothing half-created, so a
 +// caller can fall back to the plain allocation path.  No `GGML_ASSERT` ends the process.
@@ -430,13 +541,26 @@ index 000000000..f27036544
 +// driver refuses; `err` receives a one-line reason (may be nullptr).
 +ggml_cuda_vmm_region * ggml_cuda_vmm_region_create(int device, size_t bytes, size_t unit, char * err, size_t errsz);
 +
-+// Map whole units until at least `used_bytes` are mapped, and clear what it maps.  Monotone: a smaller
-+// `used_bytes` than the current watermark is a no-op, and the region never shrinks.  false = the driver
-+// refused (or `used_bytes` exceeds the reservation); the region is left at its previous watermark and the
-+// bytes that did map stay mapped (they are valid, just more than asked for).
++// Map whole units until at least `used_bytes` are mapped from the base, and clear what it maps.  Monotone: a
++// smaller `used_bytes` than what is already mapped is a no-op, and the region never shrinks.  false = the
++// driver refused (or `used_bytes` exceeds the reservation); the region is left with what did map (those
++// bytes are valid and cleared, so a caller can still run on a shorter extent).
 +bool ggml_cuda_vmm_region_grow(ggml_cuda_vmm_region * r, size_t used_bytes);
 +
-+// Bytes currently mapped (the read watermark) and the reservation size.
++// Map whole units covering [off, off + bytes) and clear what it maps; a unit already mapped is left alone
++// (and never re-cleared, so data survives).  Same monotone/false semantics as `grow()`.  This is the form a
++// consumer with a strided layout uses: the mapped extent is a SET of spans, not a single watermark.
++bool ggml_cuda_vmm_region_grow_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes);
++
++// Are all the units touching [off, off + bytes) mapped?  This is the read/write legality check: ANY access
++// to a byte outside the mapped set faults the GPU, so a caller gates every copy on it.  A zero-length range
++// is trivially "mapped" only when it does not itself start outside the reservation.
++bool ggml_cuda_vmm_region_is_mapped(const ggml_cuda_vmm_region * r, size_t off, size_t bytes);
++
++// memset every mapped byte (a buffer type's `clear` must not touch unmapped VA).
++void ggml_cuda_vmm_region_clear(ggml_cuda_vmm_region * r, uint8_t value);
++
++// Total bytes mapped (not a watermark -- see `is_mapped`) and the reservation size.
 +size_t ggml_cuda_vmm_region_mapped(const ggml_cuda_vmm_region * r);
 +size_t ggml_cuda_vmm_region_size  (const ggml_cuda_vmm_region * r);
 +size_t ggml_cuda_vmm_region_unit  (const ggml_cuda_vmm_region * r);

@@ -1,8 +1,10 @@
 # HANDOVER — `wip/kv-residency` (TODO #117), cold-session start
 
-Written 2026-10-29 at the end of the session that seeded the campaign and landed its first slice.
-Read this top to bottom before touching anything; it is deliberately self-contained (do not assume the
-previous session's context).  Cross-references: [`README.md`](README.md) (the campaign and its options),
+Written 2026-10-29 at the end of the session that seeded the campaign and landed its first slice;
+**updated at the end of slice 2** (same date, second session), then **re-scoped**: the goal is the *windowed*
+KV cache (O2), O1 is parked, and the next slice is O3.  Read `README.md` §4.1 and `TODO.md` §117 first —
+they are the decision of record.  Read this top to bottom before touching
+anything; it is deliberately self-contained (do not assume the previous session's context).  Cross-references: [`README.md`](README.md) (the campaign and its options),
 [`INVENTORY.md`](INVENTORY.md) (measurements), [`VMM-PROBE.md`](VMM-PROBE.md) (driver facts),
 [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md) (the reference design), [`IMPLEMENTATION.md`](IMPLEMENTATION.md)
 (the code log).
@@ -15,15 +17,15 @@ previous session's context).  Cross-references: [`README.md`](README.md) (the ca
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main` |
 | release the campaign is cut against | **r174**, `v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`, 15 blocks |
-| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, cut from `5bdec04ab`, one commit `c757b5ea8` |
+| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, cut from `5bdec04ab`: `973e166e1` (slice 1) + `6bf445b34` (slice 2) |
 | the release chain | `rdna-boosts` in `~/llama.cpp` — **still at `5bdec04ab`, untouched.** The campaign code is NOT in it, is NOT in `patches/`, and must never be folded in without the promotion rule |
-| patch snapshot (the backup) | [`patches/0001-ggml-cuda-grow-only-VMM-region-primitive.patch`](patches/0001-ggml-cuda-grow-only-VMM-region-primitive.patch) + `patches/README.md` |
-| what exists | the ROCm VMM probe (`vmm-probe.cc`, 0 failing checks) and slice 1: `ggml/src/ggml-cuda/ggml-cuda-vmm-region.{h,cu}` + one env-gated hook in `ggml_backend_cuda_init` |
-| what is next | **slice 2: the KV buffer type** (§7) — the first change that actually moves VRAM |
+| patch snapshot (the backup) | `patches/0001-…` (slice 1) + `patches/0002-…` (slice 2) + `patches/README.md`; `patches/diffstat.txt` is the net diff |
+| what exists | the ROCm VMM probe (`vmm-probe.cc`, 0 failing checks), slice 1 (the grow-only region primitive + selftest) and **slice 2: the KV buffer type** (`ggml_backend_cuda_kv_region_buffer_type`, env-gated off by `LLAMA_KV_REGION`) |
+| what is next | **O3, the drafter ring** — genuinely windowed residency, measurable on the one attached card: [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md).  **O1 (the region's growth) is PARKED** — see §10 Q1 and `README.md` §4.1 |
 | scope (decided) | **the KV cache only** (K/V + the qwen4exp/DSA indexer cache + their bookkeeping). The rest of the device-resident non-weight budget is deferred (§5) |
 
-`~/llama.cpp` is left **checked out on `wip-kv-residency`** with a matching build, so the tree is ready to
-continue.  `git checkout rdna-boosts` + a rebuild returns it to the release state.  `scripts/fork-refresh.sh`
+`~/llama.cpp` is left **checked out on `wip-kv-residency`** with a matching build (built
+`build-rocm/bin/llama-cli` at `6bf445b34`), so the tree is ready to continue.  `git checkout rdna-boosts` + a rebuild returns it to the release state.  `scripts/fork-refresh.sh`
 re-cuts `rdna-boosts` from `release.json.base` and is unaffected by the extra branch (it requires a clean
 checkout, and this one is clean).
 
@@ -87,15 +89,29 @@ staging arena, the recurrent/GDN state (T3).  They are listed in `INVENTORY.md` 
 explicit.  "Reduce the GPU-resident metadata" was read as **the KV cache**; other areas are a later
 exploration.
 
-## 6. What exists in code (slice 1) and how to exercise it
+## 6. What exists in code (slices 1 and 2) and how to exercise it
 
-Branch `wip-kv-residency`, commit `c757b5ea8`, 413 insertions in 3 files, purely additive:
+Branch `wip-kv-residency`: `973e166e1` (slice 1) + `6bf445b34` (slice 2), 1010 insertions in 5 files
+against `5bdec04ab`, purely additive (`git diff 5bdec04ab` deletes nothing).
+
+Slice 1 — the primitive:
 
 | file | what |
 |---|---|
 | `ggml/src/ggml-cuda/ggml-cuda-vmm-region.h` | the contract + the driver facts and traps it is built on |
-| `ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu` | `ggml_cuda_vmm_region_{create,grow,mapped,size,unit,base,free,available,selftest}`; one VA reservation, physical mapped per `unit` chunk (default 64 MiB, rounded to the driver's 2 MiB granularity), grown monotonically, memset on map, owner + best-effort peer ACCESS (the slab helper's pattern), fail-soft everywhere |
+| `ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu` | `ggml_cuda_vmm_region_{create,grow,grow_span,is_mapped,clear,mapped,size,unit,base,free,available,selftest}`; one VA reservation, physical mapped per `unit` chunk (default 64 MiB, rounded to the driver's 2 MiB granularity), grown monotonically, memset on map, owner + best-effort peer ACCESS (the slab helper's pattern), fail-soft everywhere.  **The mapped extent is a SET of spans** (a per-unit bitmap), not one prefix watermark — a KV buffer's tensors are laid out consecutively, so a watermark would map ~the whole region even for a 4-token run |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | one one-shot env-gated call at the end of `ggml_backend_cuda_init` |
+
+Slice 2 — the KV buffer type (see `IMPLEMENTATION.md` for the full design and the numbers):
+
+| file | what |
+|---|---|
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | `ggml_backend_cuda_kv_region_buffer_type(device)` and its vtable, `ggml_backend_cuda_kv_region_grow_cells()`, the `ggml_backend_cuda_kv_region_buft` / `_grow` proc addresses, and a `vmm_region` member on `ggml_backend_cuda_buffer_context` whose dtor frees the region instead of calling `cudaFree` |
+| `src/llama-kv-cache.{h,cpp}` | the buffer-type selection (`LLAMA_KV_REGION`), `grow_regions()`, and one call in `llama_kv_cache_context::apply()` — grown to the **padded** `get_n_kv()`, the width the graph views use |
+
+Env: `LLAMA_KV_REGION=1` (enable, default off) · `LLAMA_KV_REGION_UNIT_MIB` (map unit, default 4) ·
+`LLAMA_KV_REGION_MAP_MAX_MIB` (cap on the mapped extent, the negative-test knob, default 0 = no cap) ·
+`LLAMA_KV_REGION_DEBUG=1` (one line per growth step).
 
 ```bash
 cd ~/llama.cpp && ~/bin/build-llama-rocm          # or: cmake --build build-rocm --target llama-cli -j 16
@@ -105,15 +121,34 @@ HIP_VISIBLE_DEVICES=0 GGML_CUDA_VMM_REGION_SELFTEST=1 \
   grep -E "vmm_region"
 # expect:
 #   ... ggml_cuda_vmm_region_available: device 0: VMM region available (map unit 2 MiB, driver granularity 2 MiB)
-#   ... ggml_cuda_vmm_region_selftest: device 0: PASS (reserved 384 MiB in 6 x 64 MiB units, grew to 3, ...)
+#   ... ggml_cuda_vmm_region_selftest: device 0: PASS (reserved 384 MiB in 6 x 64 MiB units,
+#                                                       prefix + span growth, ...)
+
+# and the region itself (blocking, so it needs the env switch):
+HIP_VISIBLE_DEVICES=0 LLAMA_KV_REGION=1 LLAMA_KV_REGION_DEBUG=1 \
+  ./build-rocm/bin/llama-cli -m /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
+  -ngl 99 -ncmoe 24 -c 65536 -t 8 -p hi -n 4 --temp 0 --no-display-prompt --single-turn -v 2>&1 |
+  grep -E "KV region reserved|kv_region_grow_cells|SLAB_INIT|slab .* work"
+#   KV region reserved 1280.00 MiB (VA only, nothing mapped; 4 MiB map unit)
+#   256 cells -> mapped 80.00 of 1280.00 MiB (+80.00 MiB)      (then 80 MiB per 4096 cells)
+#   SLAB_INIT dev=0 free=22.46 GiB ... work 0.56 GiB + arena 20.88 GiB     (vs 21.21 / 19.62 with the region off)
 ```
 
-Gates already run for slice 1 (both green, re-run them after any edit):
-same-seed greedy text byte-identical with the arm **off and on** (4B Q8_0, 32 tokens, 1109 bytes each), and a
-slab-armed 35B-A3B arm reports an **identical** `SLAB_INIT` (`free=21.21 GiB`, `work 0.56 + arena 19.62 GiB`,
-arena 11238.0 MiB / 100.0 %).
+Gates already run (all green; re-run them after any edit).  Slice 1: same-seed greedy text byte-identical
+with the arm off and on, and a slab-armed 35B-A3B arm with an identical `SLAB_INIT`.  Slice 2: identity text on
+three families (`b065f37593b3` / `40e29c2b46b6` / `392abe9d2bd6`), `gate-prefill-logits.sh` **0.000000 /
+100.000 %** region-on vs region-off, `gate-ckpt-reuse.sh` PASS with a q8_0 region-backed KV, and the mapping
+cap refusing loudly with no GPU fault.  Numbers and commands: `IMPLEMENTATION.md` §"Slice 2".
 
-## 7. NEXT SLICE — the KV buffer type (`ggml_backend_cuda_kv_region_buffer_type`)
+## 7. DONE (slice 2) — the KV buffer type (`ggml_backend_cuda_kv_region_buffer_type`)
+
+**Landed.**  Kept below because it is the design record; the two places it was *wrong* are marked [NOTE]
+inline, and `IMPLEMENTATION.md` section "Slice 2" is the authoritative account.
+
+Note (a): 7.2's "reserve the full KV and grow to the padded n_kv" cannot use one prefix watermark — the
+tensors are consecutive, so the watermark reaches the last tensor's offset (4092 of 4096 MiB at 256 cells).
+The shipped design grows **per tensor span**.
+Note (b): 7.6's `--fit` residency term is deliberately NOT added; see `IMPLEMENTATION.md`.
 
 This is the first change that moves VRAM.  Build it in this order; each step is separately testable.
 
@@ -173,15 +208,37 @@ HIP_VISIBLE_DEVICES=0 GGML_CUDA_SLAB_STATS=1 LLAMA_KV_REGION=1 timeout 900 ./bui
   -t 8 -p hi -n 4 --temp 0 --no-display-prompt --single-turn -v 2>&1 |
   grep -E "SLAB_INIT|slab .*work|arena .*of .*host experts|KV buffer"
 
-# 3. prefill purity (a residency path is new, so it owes the strict arm)
-./scripts/gate-prefill-logits.sh --ab "LLAMA_KV_REGION=1"
+# 3. prefill purity (a residency path is new, so it owes the strict arm).  Record the REGION-ON arm as the
+#    base and compare the default (region-off) against it -- that is the "residency moves bytes, not values"
+#    statement.  Use a throwaway BASE_DIR so the delivery's own recorded base is not overwritten.
+BASE_DIR=/tmp/kv-gate ./scripts/gate-prefill-logits.sh --record --ab "LLAMA_KV_REGION=1"
+#    (runs: base PPL=5.9325 -> candidate mean KLD 0.000000 / same-top-p 100.000 %)
 
 # 4. same-seed coherence on all three families that fit one card (4B dense, 35B-A3B MoE, 27B+MTP)
-# 5. a negative test: -c larger than the region's reservation must refuse/limit loudly, never fault
+# 5. a negative test: a context that cannot be mapped must refuse loudly, never fault.  The cap is the knob
+#    (`LLAMA_KV_REGION_MAP_MAX_MIB`), because `-c` itself can never exceed the reservation: the reservation IS
+#    the KV's size.  Small caps refuse at the first grow; a cap just under the region refuses mid-prompt.
+HIP_VISIBLE_DEVICES=0 LLAMA_KV_REGION=1 LLAMA_KV_REGION_MAP_MAX_MIB=250 ./build-rocm/bin/llama-cli \
+  -m /llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf -ngl 99 -c 8192 -t 8 \
+  -f prompts/prose-rdna-boosts.txt -n 4 --temp 0 --no-display-prompt --single-turn
 ```
 
 Acceptance bar: (1) identical text, (3) KLD 0.000000 / 100.000 %, (2) a strictly better arena/free-VRAM
 layout, (5) a clear refusal.  Anything less is a failed slice.
+
+### Results of the 2026-10-29 slice-2 session — all five met (1 GPU)
+
+| # | gate | result |
+|---|---|---|
+| 1 | identity text | 4B `-c 4096`: 147 chars `sha=b065f37593b3` for off / on / `LLAMA_KV_REGION_UNIT_MIB=2`.  35B-A3B `-ncmoe 24`, 22.3k-token prompt: 572 chars `sha=40e29c2b46b6` both arms.  27B + `draft-mtp` (two caches): 89 chars `sha=392abe9d2bd6` both arms |
+| 2 | layout | `-c 65536`: free 21.21 -> **22.46** GiB, arena 19.62 -> **20.88** GiB.  `-c 262144`: free 17.46 -> **22.46** GiB, arena 15.88 -> **20.88** GiB (+5.00 GiB = the whole KV).  The arena no longer depends on `-c` |
+| 3 | prefill logits | `--record --ab "LLAMA_KV_REGION=1"` -> **0.000000 / 100.000 %** |
+| 4 | coherence, 3 families | the three rows in (1) |
+| 5 | negative test | `MAP_MAX_MIB=1` refuses at the first grow; `=250` on a 256 MiB region starts, maps 192 MiB, refuses at 5376 cells.  ERROR + abort, **no GPU fault** in either |
+
+Plus two extra arms: `gate-ckpt-reuse.sh` PASS with `LLAMA_KV_REGION=1` (q8_0 KV, 4 seqs, 3 restores kept,
+identical text/timings — the only gate that reaches `state_read_data()`'s grow-on-write), and a 253k-token
+prompt on 35B-A3B `-ncmoe 24 -c 262144` that **regressed** (see §10 Q1).
 
 ## 9. Pitfalls that cost time last session (do not repeat)
 
@@ -201,14 +258,45 @@ layout, (5) a clear refusal.  Anything less is a failed slice.
 
 ## 10. Open questions still waiting on the maintainer
 
-1. **Priority after slice 2:** P2 indexer diet (q8_0 indexer keys, Flash-Next 3 GiB → 1.5 GiB at 256 K) or
+**From the slice-2 session — Q1 is now ANSWERED (2026-10-29): O1 is parked; order is O3 then O2.**  See
+`README.md` §4.1 and `TODO.md` §117.  The regression below is why slice 2 must not be promoted, and the
+maintainer's crossover argument (O1 is a *temporal* window: big arena early, shrinking as the context grows,
+converging on fully-resident speed; only a built O2 can say which is cheaper past the window) is why it is
+parked rather than refuted.
+
+1. **The arena does not yield (measured regression — this is the reason slice 2's growth is parked).**  `SLAB_INIT` still maps `free VRAM - reserve` once, so on
+   a slab-armed MoE config the arena now holds the VRAM the KV no longer takes up front.  35B-A3B `-ncmoe 24
+   -c 262144` on a 253k-token prompt: region **off** completes (1201.2 / 51.2 t/s, 534 chars), region **on**
+   refuses at 41216 cells (mapped 848 MiB, wanted ~3.1 GiB of a 5120 MiB reservation) and aborts.  Options:
+   (a) implement the yield — a grow that cannot get physical makes the slab give the range back (evict arena
+   tables in those chunks / shrink the boundary) and retries; (b) gate the provider on a headroom estimate so
+   the region is simply not taken when the whole reservation cannot be honoured (a no-loss change, but it also
+   recovers nothing on a slab-armed config); (c) accept it and document "keep the context below what the arena
+   left free".  **Recommended: (a), with (b) as the short-term guard.**
+2. **Is an abort the right refusal?**  (Only relevant if O1 is ever revived.)  A refused grow `GGML_ABORT`s (a mid-graph write above the extent faults
+   the GPU, and the buffer type cannot be swapped mid-run).  The alternative is a memory-module policy that
+   refuses the *batch* (`prepare()` -> `FAILED_PREPARE`) and runs a shorter context.  That is a bigger change
+   and it changes `llama_kv_cache`'s capacity contract, so it needs a decision.
+3. **The per-tensor map-unit floor.**  The mapped extent is at least ~`n_tensors * unit` (32 tensors x 4 MiB =
+   128 MiB on a 27B), which is negligible at a large `-c` but 50-100 % of the KV at `-c 2048..4096` — i.e. no
+   gain on a small context (never a loss: the last tensor is clamped, so it can never exceed the reservation).
+   Fix if it matters: size the unit from the real tensor count via `alloc_buffer_n`, or clamp per tensor to its
+   own extent.  Recommended: defer.
+4. **Nothing was measured on multi-GPU.**  Only one R9700 was attached, so the `-sm tensor` arms, the
+   cross-device KV split and the region's best-effort peer grant are unvalidated.  Each device's KV buffer is
+   its own region and the bound checks are per buffer, so the design should carry over — but say so, do not
+   claim it.
+
+**Older, still open:**
+
+5. **Priority after slice 2:** P2 indexer diet (q8_0 indexer keys, Flash-Next 3 GiB → 1.5 GiB at 256 K) or
    go straight at O2/P3 (qwen4exp QSA windowed residency, the XL piece)?
-2. **Drafter ring** (O3): an acceptance trade as a shipped default (Strata ships `--mtp-window` default-on at
+6. **Drafter ring** (O3): an acceptance trade as a shipped default (Strata ships `--mtp-window` default-on at
    32768 and reports the cost), or opt-in only?
-3. **Host master budget** for O2: `MOE_HOST_POOL_RAM_PCT`-style percentage of `MemAvailable`, or an explicit
+7. **Host master budget** for O2: `MOE_HOST_POOL_RAM_PCT`-style percentage of `MemAvailable`, or an explicit
    MiB flag?
-4. **qwen4exp only, or DSA too?**  No GLM-5 GGUF on this fleet (`TODO` #108), so DSA could only be reasoned.
-5. **O1 on dense:** worth shipping?  It changes nothing at a full context and only helps a config that
+8. **qwen4exp only, or DSA too?**  No GLM-5 GGUF on this fleet (`TODO` #108), so DSA could only be reasoned.
+9. **O1 on dense:** worth shipping?  It changes nothing at a full context and only helps a config that
    over-reserves — which is *most* server configs.
 
 ## 11. Records produced by the seeding session
@@ -221,7 +309,8 @@ layout, (5) a clear refusal.  Anything less is a failed slice.
 | [`bw-probe.cc`](bw-probe.cc) | the link/kernel-read probe: H2D/D2H pinned 28.8/28.2 GB/s, kernel read of pinned 29.0, VRAM 565, D2D 291 |
 | [`vmm-probe.cc`](vmm-probe.cc) | the VMM probe (reserve/map/unmap/count/latency/staleness) |
 | [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md) | Strata's `kv_stream.hpp` read in full, the 1:1 mapping onto this tree, what transfers and what does not |
-| [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | slice 1 + the written-down shape of slice 2 |
+| [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | slice 1, slice 2 (PARKED), and the measured regression that parked it |
+| [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md) | **the next slice**: the windowed draft KV, its design, invariants, gates, and the SWA-cache finding that should make it cheap |
 | `patches/` | the fork commit as a patch, with apply instructions |
 
 ## 12. First 30 minutes of the next session
@@ -229,8 +318,13 @@ layout, (5) a clear refusal.  Anything less is a failed slice.
 1. `cd ~/llama-cpp-rdna-boosts && git pull` — the campaign docs may have moved.
 2. `cd ~/llama.cpp && git branch --show-current` — expect `wip-kv-residency`; if it is `rdna-boosts`, the
    branch exists but is not checked out (`git checkout wip-kv-residency`, then rebuild).  Verify
-   `git log --oneline -2` shows `c757b5ea8` on top of `5bdec04ab`.
+   `git log --oneline -3` shows `6bf445b34` -> `973e166e1` -> `5bdec04ab`.
 3. If the campaign patch is not applied in the tree (fresh clone, or the branch is gone):
-   `git am patches/0001-*.patch` from this directory — see [`patches/README.md`](patches/README.md).
+   `git am patches/000[12]-*.patch` from this directory — see [`patches/README.md`](patches/README.md).
+   The series reproduces the five touched files byte-for-byte on a clean `5bdec04ab`.
 4. `~/bin/build-llama-rocm` and run the §6 selftest; it must print PASS before anything else.
-5. Re-read §3 and §4, then start §7.1 (the buft) — nothing above it is blocking.
+5. Read `README.md` §4.1 + `TODO.md` §117 (the scope decision: the goal is the **window**, O1 is parked),
+   then start **O3** at [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md) §5 Step A — *"can the draft cache take a
+   window at all?"*  Do **not** continue slice 2: it is parked, and its regression reproduction
+   (`IMPLEMENTATION.md` §"KNOWN LIMIT"; prompt = `9 x prompts/kld-corpus-35b-in-domain.txt`) exists only as
+   the record of why.

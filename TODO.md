@@ -20,6 +20,8 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | **117** | `llama_model_moe_cache_band()` reports a device band with no host experts on single-device / `-sm layer` configs, so the n-gram clamp and every band-bounded multi-slot alignment fire without an arena | correctness of a predicate / perf | **OPEN** (2026-10-29, found in the PR #244 v5 assessment on r175).  The API contract is "0 when the cache is not active", but the CUDA iface returns the device band whenever `moe_cache_enabled()` (true by default via AUTO, with no registered table) and `llama_model_moe_cache_band()` falls back to `model->devices` when `moe_host_expert_bytes` is empty.  Measured on the dense 27B, 1 GPU: `ngram-mod --spec-ngram-mod-n-max 64` logs `draft length 64 -> 15` with no routed experts at all (`MOE_EXPERT_CACHE_MIB=0` does not), and a DFlash2 3-slot arm was band-bounded to width 4 and lost 7.5 % wall.  Detail in §117 |
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
 
+| **117** | windowed / streamed KV cache ("Strata-style"): host master + residency page table + in-graph resolve, so the KV's VRAM footprint is a **fixed window** instead of `O(-c)` (campaign `wip/kv-residency/`) | performance / memory | **OPEN — scope corrected 2026-10-29.** The goal is the windowed design (the campaign's **O2**). **O1 (`--kv-grow`, lazy physical mapping) is PARKED, not on the path** — see §117. Order: **O3 (drafter ring, measurable on one card) -> O2** |
+
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
 ---
@@ -284,3 +286,42 @@ so the usual coherence + arch sweeps plus a `-ncmoe` n-gram arm.  Record: `WORKL
 - **Purity/invariant analysis and the instrument rules:** `GREEDY-PURITY.md`.
 - **Benchmarks + gates:** `benchmarks/` (the adaptive-MTP baseline gate: `mtp-adaptive-methodology.md`).
 - **Upstream PR candidates:** `upstream/README.md`.
+
+---
+
+## 117. Windowed / streamed KV cache — scope decision 2026-10-29 (campaign `wip/kv-residency/`)
+
+**The ask was, and is, a Strata-style windowed KV cache: the KV's VRAM footprint is a *fixed window*
+(host master + residency page table + in-graph resolve), so a large `-c` no longer costs VRAM that the
+expert arena could use.**  That is the campaign's **O2** (`wip/kv-residency/README.md`, cost XL).
+
+**O1 (`--kv-grow`: reserve the KV's VA, map physical lazily) is PARKED.**  It was proposed by the seeding
+session as "the cheap win, do it first" (`README.md` line 43) and slice 2 (the KV region buffer type) was
+built on that basis.  It is **not a step toward O2** — O2's provider is a *fully mapped fixed pool* plus a
+host master and a page table, which lazy growth does not help — and it was measured to regress a config that
+uses most of `-c` on a slab-armed MoE model (35B-A3B `-ncmoe 24 -c 262144` at 253k tokens: region off
+completes, region on refuses at 41k cells because `SLAB_INIT` had already given the freed VRAM to the arena).
+Detail and numbers: `wip/kv-residency/IMPLEMENTATION.md` ("Slice 2" / "KNOWN LIMIT").
+
+**Why it is parked rather than refuted — the maintainer's framing (2026-10-29).**  O1 is a *temporal*
+version of the window: the arena is bigger early and shrinks as the context grows, and once the context is
+large it converges on fully-resident-KV speed.  Until the window fills it is **no faster than the windowed
+design at all**.  The open question is only the crossover: past the window, what costs more — windowing
+(misses through the link) or the shrinking arena (expert-cache misses and the identity cliff)?  There is
+probably a brief window just after it fills where growing is a little faster, and then the arena's miss rate
+steals it back.  **We do not know, and O2 has to be built to find out** — so O1 is waiting on a measurement
+that only O2 can provide, not dismissed.
+
+**Order (decided).**  **O3 (drafter ring) first, then O2.**
+* **O3** is genuinely windowed residency (`--mtp-window` analogue: the draft KV is `O(window)`, not
+  `O(-c)`), it is family-independent, it runs on the 27B dense that fits one card, and its cost is a clean
+  acceptance number.  It is the smallest complete instance of the policy O2 needs — a rehearsal, not a
+  detour.  Note its *standalone* VRAM win is modest (~256 MiB at `-c 65536` on the 27B: 1 draft layer).
+* **O2** then reuses that policy on the K/V page table, on the eligible (bounded attended set) families.
+  Blocked for *measurement* while only one 32 GiB card is attached: its target family is qwen4exp/QSA
+  (Flash-Next, 75 GB).  Correctness work can proceed on a small model with a forced small window.
+
+**Nothing from `wip/kv-residency/` is in `patches/` or `release.json`, and nothing may be applied from it
+without an explicit go-ahead.**  The slice-1/2 code is the record, not a candidate: sub-slice 2's *growth*
+must not be promoted; its KV **buffer-type skeleton** (a custom buft carrying a host master + device pool +
+page table, selected per device with a plain-buft fallback) is the container O2 needs and is worth reusing.
