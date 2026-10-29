@@ -1,9 +1,9 @@
 # HANDOVER — `wip/kv-residency` (TODO #117), cold-session start
 
-Written 2026-10-29 at the end of the session that seeded the campaign and landed its first slice;
-**updated at the end of slice 2** (same date, second session), then **re-scoped**: the goal is the *windowed*
-KV cache (O2), O1 is parked, and the next slice is O3.  Read `README.md` §4.1 and `TODO.md` §117 first —
-they are the decision of record.  Read this top to bottom before touching
+Written 2026-10-29 by the session that seeded the campaign; updated at the end of slice 2 and again after O3.
+**The campaign is O2 (the windowed KV cache) and nothing else — [`O2-PLAN.md`](O2-PLAN.md) is the plan of
+record.**  O1 and O3 were built and measured, were never asked for, and are closed (`O2-PLAN.md` §5);
+`README.md` §0 says why that happened so it does not happen again.  Read this top to bottom before touching
 anything; it is deliberately self-contained (do not assume the previous session's context).  Cross-references: [`README.md`](README.md) (the campaign and its options),
 [`INVENTORY.md`](INVENTORY.md) (measurements), [`VMM-PROBE.md`](VMM-PROBE.md) (driver facts),
 [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md) (the reference design), [`IMPLEMENTATION.md`](IMPLEMENTATION.md)
@@ -21,7 +21,7 @@ anything; it is deliberately self-contained (do not assume the previous session'
 | the release chain | `rdna-boosts` in `~/llama.cpp` — **still at `5bdec04ab`, untouched.** The campaign code is NOT in it, is NOT in `patches/`, and must never be folded in without the promotion rule |
 | patch snapshot (the backup) | `patches/0001-…` (slice 1) + `patches/0002-…` (slice 2) + `patches/README.md`; `patches/diffstat.txt` is the net diff |
 | what exists | the ROCm VMM probe (`vmm-probe.cc`, 0 failing checks), slice 1 (the grow-only region primitive + selftest) and **slice 2: the KV buffer type** (`ggml_backend_cuda_kv_region_buffer_type`, env-gated off by `LLAMA_KV_REGION`) |
-| what is next | **O3, the drafter ring** — genuinely windowed residency, measurable on the one attached card: [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md).  **O1 (the region's growth) is PARKED** — see §10 Q1 and `README.md` §4.1 |
+| what is next | **O2, the windowed KV cache — the ask, and the only plan: [`O2-PLAN.md`](O2-PLAN.md).**  O1 and O3 are **closed detours** (both built, both measured, neither requested) — see `O2-PLAN.md` §5.  The first O2 slice is a *correctness scaffold*, because O2's payoff shape (small window + a big expert set) cannot be measured with one 32 GiB card attached: `README.md` §4 |
 | scope (decided) | **the KV cache only** (K/V + the qwen4exp/DSA indexer cache + their bookkeeping). The rest of the device-resident non-weight budget is deferred (§5) |
 
 `~/llama.cpp` is left **checked out on `wip-kv-residency`** with a matching build (built

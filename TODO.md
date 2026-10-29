@@ -312,7 +312,16 @@ probably a brief window just after it fills where growing is a little faster, an
 steals it back.  **We do not know, and O2 has to be built to find out** — so O1 is waiting on a measurement
 that only O2 can provide, not dismissed.
 
-**Order (decided).**  **O3 (drafter ring) first, then O2.**
+**CORRECTION 2026-10-29 (immediately after the above was written).**  The "O3 first" order was chosen from
+this file's own option menu and produced a third session on a non-goal.  **The campaign is O2, and only O2**
+(`wip/kv-residency/O2-PLAN.md`).  O1 and O3 are **closed detours**: both were built and measured, neither was
+ever requested, and neither is a step toward the windowed cache.  **Do not restart either.**  Root cause, worth
+remembering: O2's payoff shape (a small window beside a big expert set) needs Flash-Next plus 2-3 GPUs, and only
+one 32 GiB card is attached — so each session quietly substituted something that *was* measurable.  The rule
+from here: if the ask cannot be measured on the attached hardware, say so and build it for correctness with no
+perf claim, or stop.
+
+**The historical order line, kept for the record.**  **O3 (drafter ring) first, then O2.**
 * **O3** is genuinely windowed residency (`--mtp-window` analogue: the draft KV is `O(window)`, not
   `O(-c)`), it is family-independent, it runs on the 27B dense that fits one card, and its cost is a clean
   acceptance number.  It is the smallest complete instance of the policy O2 needs — a rehearsal, not a

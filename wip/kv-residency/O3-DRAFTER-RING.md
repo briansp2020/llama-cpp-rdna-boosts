@@ -122,11 +122,51 @@ shrinking the draft just leaves part of the reserve unspent.  To convert O3 into
 estimate has to know about the window (`common/draft-reserve.h` / the `--fit` measurement of the extra model),
 which is a separate, small change — and even then the prize is one layer (~220 MiB there).
 
-**So, as a product: -6..-9 % decode when the window is active, +8 % prefill, and ~1 GiB at `-c 262144` that
-currently buys nothing.**  As a *rehearsal* it did its job: the policy (window + residency map sized up front)
-is now concrete, gated, measured and cheap to lift onto O2's page table — and it definitively answers the
-"is the window free?" question: **no, it costs ~7 % of decode at a window that truncates real context**, which
-is the number O2 needs when it decides how much window to keep resident.
+### 2.2.1 CORRECTION — at a *usable* window O3 is essentially free
+
+The numbers above were measured at windows (2048/4096) far below the context, i.e. on the **tail** of the
+cost curve, and the blunt "poor trade" verdict drawn from them was wrong.  Re-measured with the window at a
+realistic size (**27B, `-c 65536`, a 46k-token context, `-n 400`, `--reasoning on`, `-nmax 3`, 1 GPU**):
+
+| window | context truncated to | acceptance | gen t/s | prefill t/s |
+|---|---|---:|---:|---:|
+| off | 46k | 0.5499 | 50.61 | 990.9 |
+| 16384 | 35 % of the context | 0.5371 | **50.79** | 1001.4 |
+| 32768 | 72 % of the context | 0.5383 | **50.34** | 994.1 |
+
+Acceptance -2.3 % relative, **generation flat** (50.61 vs 50.79 / 50.34, i.e. within the run-to-run spread) and
+prefill flat.  The cost of a window is therefore a function of *how much of the context it drops relative to
+what the drafter actually uses*, and the drafter works off the recent ~10-30 k tokens: truncating a 5 k context
+to 2-4 k is expensive, truncating a 46 k context to 32 k is free.  **With `W` at or above the working context
+the feature costs nothing measurable and still removes the whole draft KV** (256 MiB at `-c 65536`, ~1 GiB at
+`-c 262144`) — which is exactly Strata's reason for shipping `--mtp-window` default-on at 32768.
+
+So the two numbers to carry forward are:
+* **`W` must be chosen from the working context, not the context limit.**  A window well below it is a real
+  -7..-9 % decode regression (the 4096/2048 rows); a window at/above it is free.
+* the VRAM prize is one draft layer (2-4 KiB/token): ~1 GiB at `-c 262144` on the 27B.
+
+### 2.2.2 What O2 changes for O3 (and why O3 "comes into its own" then)
+
+Two independent reasons, both architectural rather than magnitude:
+
+1. **The budget.**  Today the draft's `-c`-sized KV is invisible beside a 16 GiB target KV.  Once O2 makes the
+   target's *resident* KV a window, the draft's fully-resident `-c` cache becomes the largest remaining fixed
+   KV term in the same budget -- so removing it stops being a rounding error and starts being the next thing
+   the arena wants.
+2. **O3 is the cheap answer for the one cache O2 should NOT page-table.**  If the target gets a residency page
+   table, a resolve kernel and a host master, the drafter would otherwise need all three as well (a second page
+   table, a second resolve, a second master) or stay as a resident `-c` exception.  O3 says a *placement policy
+   on a small resident cache* is sufficient, because the drafter only ever reads its last `W` cells -- which is
+   precisely Strata's split (page table for the K/V, ring for the drafter, `STRATA-KV-STREAMING.md` §1).
+
+**Constraint this puts on O2:** do not extend O2's page table / host master to the draft context.  The draft
+cache stays a plain resident `llama_kv_cache` with a window; a ring and a page table on the same cache would
+double the indirection for no gain.
+
+**The one thing that still does not follow from O2:** the freed VRAM reaches the arena only if the draft-reserve
+estimate knows about the window (`common/draft-reserve.h` / the `--fit` measurement of the extra model).  O2
+does not fix that; it makes it matter more.
 
 ## 3. Invariants the slice must keep
 

@@ -34,6 +34,17 @@ pointless).  Both are generic over *dense vs MoE* and *slab vs no-slab* by const
 
 ---
 
+## 0. READ THIS FIRST (2026-10-29) — the plan is O2, and only O2
+
+The ask was a **Strata-style windowed KV cache**: the KV's VRAM footprint is a **fixed window**, not `O(-c)`.
+That is **O2** below.  [`O2-PLAN.md`](O2-PLAN.md) is the plan of record.
+
+**Two sessions were spent on options from the §5 menu that were never asked for** — O1 (`--kv-grow`, lazy
+physical mapping) and O3 (drafter ring).  Neither is a step toward O2; both are recorded and closed in
+[`O2-PLAN.md`](O2-PLAN.md) §5.  **Do not restart either.**  If O2 cannot be measured on the attached
+hardware, say so — do not substitute something that can be.
+
+
 ## 1. The three axes, as they apply to the KV cache
 
 | axis | question | answer in this tree |
