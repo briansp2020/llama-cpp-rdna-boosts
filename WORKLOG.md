@@ -57,8 +57,9 @@ prescan first — and then show a measured win on both arch generations; today i
 **Gates run for the release:** `validate-set.sh` (strict fresh-tarball apply, tree `85a84972c…`),
 `gate-per-block-build.sh --changed-from 8b4592334 --fast` (block 10 + tip rebuilt, 2/2), the prefill-logit
 gate at the default and `-ub 1` ubatches, MTP Protocol A on the dense 27B UD-Q4_K_XL at 3 devices (**layer
-51.6 t/s, acceptance 0.621; tensor 101.1 t/s, acceptance 0.608**, both above their plain arms 25.0 / 51.0
-and matching the recorded reference 51.7 / 90.7 with acceptance 0.62 / 0.60), the rule-5 stock-relative
+51.6 t/s, acceptance 0.621; tensor 101.1 t/s, acceptance 0.608**, both above their plain arms 25.0 / 51.0;
+the layer arm is the recorded reference (51.7 t/s, acceptance 0.62) and the tensor arm reads higher than
+the 90.7 / 0.60 in `AGENTS.md` at the same acceptance), the rule-5 stock-relative
 band gate (`llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8`, q8_0 KV: 1.065 / 1.319 / 1.713 vs stock
 1.064 / 1.313 / 1.703, no worse at B=4/B=8), and `test-backend-ops -o ROPE` 450/450.
 
