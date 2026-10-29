@@ -1,5 +1,80 @@
 # WORKLOG - dated delivery records
 
+## 261029.002 (no release) -- PR #244 v3 (DFlash2 adaptive verify width) assessed and not promoted: on r171 it is a 1-15 % loss on every payload we have
+
+**No delivery change, no release, nothing in `patches/`.**  Contributor PR
+[#244](https://github.com/stew675/llama-cpp-rdna-boosts/pull/244) (`@overdoingism`, `wip/dflash-adaptive-width/`) was
+re-submitted as **v3** after the r164-era review: opt-in (`LLAMA_DFLASH_ADAPTIVE=1`), count-based per-position
+estimates with a prior from the previous position, down two widths at a time / up one / at most once in 8 drafts, the
+expert cache's band bound on the aligned width, and a cost model re-measured on the release (`COST` 0.09 per verified
+row, `JUMP` 0).  It was assessed against the r171 tree (`6050b467c`, +0 the delivery) and **not promoted**; the PR is
+left open with the review comment below.  This entry is the record so the next round starts from the numbers.
+
+**What is right with it.**  `git am`s clean on r171 (the release tip, not just the r164/r167/r168/r170 the PR names)
+and builds clean (`all`, 32 jobs); every new line is behind `if (adapt)`, and the hoisted `n_draft` is `params.n_max`
+when `adapt` is false, so the **default path is byte-identical to the canonical r171 build** (27B + DFlash2, prose,
+`-n 192`: `e350796383c675fc` on both).  The band bound is `align_draft_caps()`'s expression exactly
+(`band > 1` -> `band / n_drafting - 1`, read from `llama_model_moe_cache_band(llama_get_model(ctx_tgt))` after the
+context exists); `result_q` is resized with `result`; the alignment is inert with one drafting sequence.  **Text was
+byte-identical between the adaptive and fixed arms in every arm and at every width** (27B 1 GPU / 2 GPU tensor, the
+host-expert arm, 3 slots), no abort and `scripts/check-gpu-faults.sh` clean on all 19 logs.  It is also a genuine
+improvement on v2: the width now *moves* (v2 sat at `n_max` and lost 10.9 % on `code-python.txt`); on this tree
+`code-python` is within 1.1 % of the best fixed width.
+
+**Why it is still not promoted: the width decisions cost 1-15 %, and the two arms the PR's "not covered" list
+skipped are the worst.**  Greedy, `ROCBLAS_USE_HIPBLASLT=0`, one server start per arm, raw `/completion`, `-n 192`.
+27B UD-Q4_K_XL + DFlash2-Q4_K_M, `-sm tensor`:
+
+| arm | code-python | prose | recall | reasoning |
+|---|---|---|---|---|
+| 1 GPU, fixed 7 / fixed 6 / fixed 5 | 113.1 / 107.2 / 106.8 | 84.1 / **87.0** / 83.7 | 144.9 / 132.7 / 122.2 | 98.5 |
+| 1 GPU, adaptive @7 | 111.9 (-1.1 %) | 79.1 (-5.9 %) | 142.6 (-1.6 %) | **101.5 (+3.1 %)** |
+| 2 GPU tensor, pair aggregate | fixed 7 137.4 / adaptive 136.4 (-0.7 %) | | | |
+| 1 GPU, prose `-n 512` | fixed 7 112.3 / fixed 6 110.5 / adaptive 108.7 (-3.2 %) | | | |
+
+35B-A3B UD-Q4_K_M + DFlash2-Q8_0, 2 GPU tensor, `-ncmoe 40`, `MOE_EXPERT_CACHE_MIB=6000` (arena 11955.3 MiB,
+0.90-0.94 hit, `band 16` — the production surface the review asked for):
+
+| arm | prose `-n 192` | prose `-n 512` | recall `-n 192` | pair aggregate |
+|---|---|---|---|---|
+| fixed 7 | 128.3 | 174.6 | 202.9 | 70.67 |
+| adaptive @7 | **108.8 (-15.2 %)** | **153.5 (-12.1 %)** | 201.0 (-0.9 %) | 68.15 (-3.6 %) |
+| adaptive, `LLAMA_DFLASH_ADAPTIVE_COST=0.001` (width pinned at 7) | 129.7 | 174.4 | -- | -- |
+
+**The control is what makes the finding precise.**  `COST=0.001` makes `adapt_value()` monotone in the width, so the
+controller stays at 7: the arm then lands on fixed 7 (129.7 vs 128.3, 174.4 vs 174.6) with *identical* `draft_n` /
+`draft_n_accepted` (300/148, 623/421).  The probe drafts, the per-draft review and the cut are free; **the whole
+loss is the width decisions themselves.**
+
+**The trace.**  Prose, 1 GPU, `LLAMA_DFLASH_ADAPTIVE=2`, deterministic (two starts, 79.07 / 79.45 t/s,
+same text): `7 -> 5` on the **first** decision (8 drafts, decayed counts, a 0.5 first-position prior),
+`5 -> 4` eight drafts later (a second downward move), then `4 -> 5 -> 6 -> 7` one width per 8 drafts — about **24
+drafts, a third of a 192-token response, at the wrong width**.  The arena arm's trace is the same shape (7->5->3).
+At `-n 512` it ends on 7, i.e. it converges to the value the fixed arm starts at.
+
+**And on this tree the optimum *is* `n_max`, so there is nothing to win.**  At `-n 512` fixed 7 wins on all three
+prompts (prose 112.3 vs 110.5 for fixed 6; code and recall likewise), so a controller that converges to 7 can only
+pay the transient.  The PR's headline (+18.4-18.7 % on a 30K zh continuation, widths 1-2) is the one shape it wins
+on and we have no such payload; our nearest low-acceptance one (`reasoning.txt`) is +3.1 %.  Note the acceptance
+profile moved under the PR's own r168 table: it measured `mean len` 3.5 at width 7 on prose/code, r171 measures
+5.3-5.6 (the r170 Q6_K VDR and r171 fusion changes are decode-numerics changes that the *draft* context also runs),
+so the best fixed width on the current release is 7, not 5.
+
+**What was measured of the alignment.**  The band bound is **inert at <= 2 drafting sequences**: the DFlash2 draft
+reports `dflash.block_size=8`, so `--spec-draft-n-max` is clamped to 7, and `band / 2 - 1 = 7` — the bound never
+binds.  It binds at 3 (`16 / 3 - 1 = 4`); a `--parallel 3` arm exercises that path and runs clean (no abort, no
+GPU fault).  So the band half of the patch is correct and, on RDNA4, almost unreachable.
+
+**Decision.**  Not promoted; the PR keeps its `needs more info` state and the reply asks for (1) a start/seed fix so
+the first decisions are not taken on 8 decayed drafts — e.g. seed from the model's observed full-block acceptance
+(`draft_n_accepted / draft_n` at `n_max`), or defer the first decision until the counts are dense, and forbid a
+second downward move inside one window; (2) the `-ncmoe` + arena and 2-slot `-sm tensor` arms re-measured with it,
+as this entry does; (3) a self-calibrating `COST` (or a per-config default) — a 4x-wrong constant moves the width
+three positions.  If it comes back with those, re-run this table plus `prompts/reasoning.txt` and the arena arm
+before anything is folded into block 12 (which owns the DFlash drafter; block 02 owns `align_draft_caps()` and
+`spec_align_enabled()`).  Records: this entry; the arm harness was throw-away (`/tmp`), reproducible from the table
+above.
+
 ## 261029.001 (r171) -- `TODO` #115: a fusion that stands down for MMB asks the dispatch predicate, and the BF16-only activation mark can no longer be preempted
 
 **Release `v15-6050b467c-r171`**, base `6050b467c`, 15 blocks, tip
