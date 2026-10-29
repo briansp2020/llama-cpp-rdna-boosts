@@ -1,0 +1,228 @@
+# wip/kv-residency — GPU-resident KV, its metadata, and how to make less of it (OPEN, scoping)
+
+**Status: OPEN / scoping (2026-10-29).  Nothing implemented, nothing in `patches/`, not scheduled.**
+**`TODO` #117 is the permanent handle** for the subject (old and future records that cite `#117` mean this
+document).  `wip/` is never applied to the fork (`AGENTS.md`, WIP rules).
+
+**Why it exists.**  The ask this session was "reduce the amount of metadata held on the GPU", with
+`~/Strata`'s **windowed KV streaming** as the reference (§3, and
+[`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md)).  Answering it properly took one measurement and one
+reading of the code that changes the shape of the question:
+
+* the strict-metadata device footprint on our default paths is **~1 MiB plus MiB-scale expert-cache tables**
+  — r160/r172 already removed the one big term (the packed `kq_mask`, 960 MiB at `-c 245760 -ub 2048`, now
+  lazy and derived by default).  So "metadata" as a byte mass is already handled
+  ([`INVENTORY.md`](INVENTORY.md) §3);
+* the byte mass is the **KV data itself**, and windowed streaming of it only pays when the per-token
+  *attended set* is bounded.  On this box the host link is **28.8 GB/s** measured, so a byte that attention
+  reads but that is not resident costs 1/28.8 GB/s ≈ 0.035 ms per MiB — every token
+  ([`INVENTORY.md`](INVENTORY.md) §4).
+
+That splits the campaign into one cheap-and-generic half (residency/placement control, no kernel change) and
+one model-specific half (true streaming, where QSA/DSA make it possible and full attention makes it
+pointless).  Both are generic over *dense vs MoE* and *slab vs no-slab* by construction — §6.
+
+---
+
+## 1. The three axes of the ask
+
+| axis | question | answer in this tree |
+|---|---|---|
+| **A. metadata (strict)** | can the device-resident bookkeeping shrink? | mostly already done (r160/r172); the remaining items are small and listed in `INVENTORY.md` §3 |
+| **B. KV data** | can part of the K/V live outside VRAM and be streamed in a window? | **only where the attended set is bounded** (§4).  Full attention: no, not at any useful speed |
+| **C. placement control** | can the KV be a *fixed region* whose size and address are known before the graph is built? | **yes, and it is the part worth doing first** (§5, O1) — the slab exists, the KV is currently outside it |
+
+## 2. What is resident today (measured, r174, 1 GPU)
+
+Full log lines and arithmetic in [`INVENTORY.md`](INVENTORY.md) §1.
+
+| shape | weights | KV (T2) | state (T3) | scratch (T5) | metadata (T4) |
+|---|---:|---:|---:|---:|---:|
+| 27B UD-Q4_K_XL + MTP, `-c 65536` | 16.4 GiB | **4.25 GiB** (4096 + 256 draft) | 0.58 GiB (GDN `S` 576 MiB) | 0.17 GiB | ~1 MiB |
+| 35B-A3B Q4_K_M `-ncmoe 24`, `-c 65536` | 21.1 GiB | 1.25 GiB | 0.06 GiB | 0.56 GiB (slab work) + arena 19.6 GiB | ~1 MiB |
+| the same, `-c 262144` | 21.1 GiB | 5.0 GiB | 0.06 GiB | 0.56 GiB + arena **15.9 GiB** | ~1 MiB |
+
+Two facts fall out, and they are the reason for the campaign:
+
+1. **Every extra token of context is taken out of the expert arena, 1:1.**  The KV is a plain `cudaMalloc`
+   made *before* the slab exists, and `SLAB_INIT` maps `free VRAM - reserve`; on the 35B-A3B 3840 MiB more
+   context cost 3.75 GiB of arena (§1.C).  On a shape where the arena binds, 1024 tokens of context ≈
+   **20 MiB** of lost expert residency — and the r117 identity cliff turns a small shortfall into
+   −30 % decode.
+2. **T3 (the recurrent state) is context-independent and cannot be windowed** — 598.5 MiB of GDN `S` on the
+   27B.  Any "reduce the KV" story must leave it alone; it is a precision/layout question.
+
+## 3. The reference design
+
+[`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md) has the read (their `kv_stream.hpp` is a 121-line
+contract worth reading in full).  In one paragraph: the authoritative K/V lives in pinned device-mapped host
+memory; VRAM holds `n_slots` pages; the page table becomes a *residency map*; `kv_stream_resolve()` runs
+**inside the captured graph** and, per attention call, stamps the blocks the selection names, claims misses
+with a CLOCK sweep, and copies them from the host copy with a second kernel; writers write host **always**
+and the slot only if resident, so nothing is ever invalidated.  The drafter is a plain ring
+(`block % n_slots`) because it only reads its last window.  Two features are separable and one of them is not
+about streaming at all: `--kv-grow` (reserve VA, map physical lazily) is their cheap half.
+
+Two things make it work there and would have to be built here: their **reader already walks a block list**
+(QSA), so streaming needed *no reader change*; and their VMM lets them reserve a region without mapping it
+(`--kv-grow`).
+
+## 4. The eligibility rule (the finding that decides the port)
+
+A streamed KV's resident pool must contain **everything attention reads this step**.  A miss therefore costs
+link bytes on the critical path, and the link is the constraint:
+
+```
+H2D pinned / D2H pinned / kernel read of a pinned mapping : 28.8 / 28.2 / 29.0 GB/s   (measured, §7)
+kernel read of VRAM                                       : 565 GB/s
+```
+
+so **1 GiB of misses per token = 37 ms/token**, and the question is only ever "how small is the attended set".
+
+| family | attended set per token | verdict |
+|---|---|---|
+| dense/full attention (qwen35 27B, 35B-A3B) | the whole used context | **no streaming**.  At 100 K cells on the 27B that is ~6.1 GiB of K/V → ~228 ms/token if none of it is resident.  Measured stand-in: KV wholly on the host (`-nkvo`, pageable) on a 4B at 4096 depth = **100.67 → 38.71 t/s** tg, 7640 → 5061 t/s pp |
+| **qwen4exp QSA** (Flash-Next) | `indexer.top_k 2048` blocks × `compress_ratio 4` = **8192 cells = 3.1 % of 262144** | **the target.**  The attention K/V is 5.9 GiB at 256 K and a 32 K-cell pool of 0.75 GiB serves it, with the reader already walking a block list.  Note the *indexer* keys (3.0 GiB at 256 K) are scored for **every** cell and so stay `O(n_ctx)` — that is O4, and it is the second-biggest term |
+| deepseek4 / glm-dsa (`llama_kv_cache_dsa`) | bounded light-indexer selection | same shape, same design; no glm5-next GGUF on this fleet (`TODO` #108) |
+| gemma4 iSWA | the SWA half is *already* bounded (its own smaller cache); the full half is not | the SWA cache could become a ring with no behavioural change; the full half does not stream |
+| the **drafter** (MTP / DFlash) | bounded by construction — it only proposes | a ring (Strata's `--mtp-window`) is an *acceptance* trade, zero correctness risk (the target verifies) |
+
+**So the honest headline is: "windowed KV" is a qwen4exp/DSA feature, not a dense-model feature.**  For dense
+models the win in axis C (a fixed, lazily-mapped KV region) is real but it is a *sizing and placement* win, and
+it changes nothing about a full context.
+
+## 5. Options
+
+| # | option | what it buys | kernel change | works dense + MoE | effort |
+|---|---|---|---|---|---|
+| **O1** | **KV-grow**: a fixed VA region for K/V (+ indexer keys), physical mapped per high-water mark | exact `--fit`/arena arithmetic; a 256 K context on a 32 GiB card *as long as the used context is smaller*; no "reserve 16 GiB and never use it" | none | yes | **S** |
+| **O2** | **windowed residency** (Strata's design): host master + page table + in-graph resolve | the real VRAM cut, only for bounded attended sets (§4) | FA index computation + the KV write path + defrag/shift/state | yes, *where eligible* | **XL** |
+| **O3** | **drafter ring** (`--mtp-window` analogue, `block % n_slots`) | draft KV from `O(n_ctx)` to `O(window)` | draft's mask/pos only | yes | **M** |
+| **O4** | **indexer diet** (`q8_0` indexer keys; lean harder on the derived block-vector cache) | Flash-Next 3 GiB → 1.5 GiB at 256 K | none (type change) | n/a (qwen4exp) | **S** |
+| **O5** | **metadata diet** — the `INVENTORY.md` §3 list | MiB, not GiB; a regression budget | none | yes | **S** |
+| **O6** | **provider P0** (plain pool + pinned master, no VMM) | the same layer on CUDA/Windows/other backends | none | yes | **M** |
+| — | KV quantisation (`-ctk/-ctv`) | 2× the whole T2 term | none | yes | already shipped (block 04) |
+| — | all-KV-on-host (`-nkvo`) | frees T2 entirely | none | yes | exists, **measured hopeless** (§4) |
+
+## 6. Genericity — dense and MoE, slab and no-slab
+
+This is the design constraint the ask names, and it is achievable because the layer decomposes into
+**policy** (arch/allocator-agnostic) and **provider** (device-specific):
+
+* **Residency metadata** (page table, slot table, stamps/refs, ctl, miss lists; `≈ n_cells/page × 20 B` =
+  1.2 MiB at 245760 with a 4-cell page) lives in the **memory module** (`llama-kv-cache*`), not in a backend,
+  and is allocated once per cache.  Same code for a dense 4B and a 512-expert Flash-Next.
+* **Physical provider**, three arms behind one interface:
+  * **P0 — plain pool**: `cudaMalloc` page pool + pinned host master + `hipMemcpy` per page.  No VMM.  This
+    is the arm CUDA/Windows get, and it must be the *default* fallback.
+  * **P1 — private VMM region**: `hipMemAddressReserve` + per-page `hipMemCreate`/`hipMemMap`
+    (`ggml-cuda-slab.cu`'s primitives, currently `static`).  Dense models without the slab.
+  * **P2 — slab carve**: the region is a slice of the existing slab, so the KV and the arena share one
+    reservation and the boundary arithmetic is exact.  MoE only, because the slab is MoE only.
+* **The slab must stay MoE-only.**  `ggml_cuda_slab_enabled()` is `env && g_slab_armed`, and the only arm
+  site is the host-expert preflight (`ggml-cuda.cu:7960`), on purpose: r37 and issues #118/#120 are what
+  happens when the slab parks a dense model's free VRAM.  So a design that *requires* the slab would be
+  MoE-only by construction — which is exactly why P0/P1 are not optional.
+* **The drafter is a second cache of the same shape**, already with its own `llama_kv_cache` (r125: its type
+  follows `-ctk`).  Whatever the target gets, the draft gets for free — that half of Strata's design ports
+  directly.
+
+## 7. Instruments
+
+```bash
+# the link constant this campaign turns on (28.8 GB/s here; read the ROOT PORT's width, not the card's)
+/opt/rocm-10.1.0-gfx120X/bin/hipcc -O3 --offload-arch=gfx1201 wip/kv-residency/bw-probe.cc -o /tmp/bw-probe
+HIP_VISIBLE_DEVICES=0 /tmp/bw-probe 512 5
+```
+
+* `GGML_CUDA_SLAB_STATS=1` — the layout instrument: `SLAB_INIT` (VA, mapped, boundary, free), the
+  work/arena split, the free-VRAM low-water mark, and every layout assertion a fixed-region design must hold.
+* `llama_kv_cache::memory_breakdown()` (`llama-kv-cache.cpp:1021`) — per-buft KV size, the API path.
+* `llama-cli -v` prints `KV buffer size` / `size = … cells` / `compute buffer size` / `recurrent: size`.
+* `common/fit.cpp:287-360` — where `--fit` already models "weights + KV are one per-device pool": the place a
+  residency term goes, so an over-budget config is *reported*, not silently repaired (`AGENTS.md`).
+* `--vram-elastic`-style residency accounting would reuse `MOE_HOST_POOL_RAM_PCT`'s precedent (a percentage of
+  `MemAvailable`, default 85) for the host master's budget.
+
+## 8. Phases (each env-gated OFF until it is gated; nothing here is in `patches/`)
+
+* **P0 — instruments and a gate.**  A VRAM-accounting report (`T1..T5` per context, from the log, not a
+  guess) plus a **residency gate**: one run with residency at 100 %, one with the pool deliberately
+  undersized (forced misses), requiring byte-identical greedy text, identical acceptance, and a
+  miss/hit counter both ways.  This is the gate O2/O3 cannot ship without — and the one Strata's own docs
+  say their port still lacks ("Keep draft until long-context, cancellation, and image-history tests pass").
+* **P1 — O1 KV-grow (P1/P2 providers).**  No kernel change.  Assert: `SLAB_INIT` layout identical when the
+  used context equals `-c`; a small used context leaves the arena *larger* than today; `--fit` sees the term.
+* **P2 — O5/O4 metadata diet** with a MiB budget asserted in the gate.
+* **P3 — O2 on qwen4exp QSA** (the only place it can pay): `page = compress_ratio` cells, reader = the
+  existing block selection, resolve = Strata's two kernels.  This is the campaign's real body of work.
+* **P4 — O3 drafter ring**, measured as an acceptance trade à la Strata's `--mtp-window` (they report a few
+  points of acceptance at 30 K and −6 % decode on a P100).
+* **P5 — O6 portable provider** so the layer is not RDNA-only.
+
+## 9. Blockers and unknowns (answer before any code)
+
+1. **ROCm refuses a sub-range `hipMemUnmap`** (`ggml-cuda-vmm.h`, the retired per-allocation pool).  A
+   lazily-mapped KV therefore needs **one handle per page (or per page group)** so a handle's mapped range is
+   exactly what gets unmapped — and the slab's own path must keep its single-handle assumption.  *Probe: 30
+   lines, reserve 1 GiB, create/map 256 × 4 MiB handles, unmap one, re-map a different physical.*
+2. **Graph capture.**  A VMM map/unmap is a host call and cannot be captured, and a host sync per decode step
+   is forbidden.  So *streaming* can only be the in-graph page-table form (O2); *growing* (O1) can only happen
+   between steps, which is fine because it is monotonic.
+3. **The host master's RAM tax** — the same bytes again, `-c × bytes/token` (16 GiB at 262144 f16 on the 27B,
+   8 GiB at q8_0).  Pinned, budgeted, and it is the *whole* point of the trade; nothing in the delivery
+   currently budgets host memory except `MOE_HOST_POOL_RAM_PCT`.
+4. **The FA indirection surface.**  Strata needed no reader change because its reader already walked a block
+   list.  Ours: the band kernel, the tile/WMMA kernels, the QSA kernels, the KV write (`SET_ROWS` and the
+   fused rope+KV writes), `defrag`/`seq_rm`/`shift`, `seq_cp`, and the state save/restore.  On qwen4exp the
+   reader set is QSA-only, which is why P3 comes before "stream a dense model".
+5. **The writer rule** (host authoritative) makes invalidation trivial but doubles every KV write's
+   destinations.  A cheaper variant — writers write the slot if resident *and* record a host "line" only when
+   evicted — needs an eviction-time read-back of the slot (Strata chose not to).
+6. **Eligibility must be a hard predicate, not a heuristic.**  A model whose attention reads an unbounded set
+   must *refuse* residency (and say so), or the first long prompt turns into a 200 ms/token crawl.
+7. **Purity.**  Residency moves bytes; it must not change a value.  The oracle is byte-identical greedy text
+   *and* prefill-logit KLD 0.000000 / 100.000 % between the resident and the forced-miss arms (a residency
+   defect is a wrong answer, not a crash — `GREEDY-PURITY.md` §46's rule for any new path).
+8. **The OOM chain must not sacrifice the arena.**  Any allocation for this layer has to check headroom and
+   decline *before* calling `ggml_cuda_device_malloc` (the `vram-resident-slots` §4.2 lesson, `#112`).
+
+## 10. Non-goals
+
+* Not "run a 27B at 256 K on a 32 GiB card" via full-attention streaming — §4 says no.
+* Not a KV *quantisation* change (block 04 owns the KV types) and not a KV *dedup/sharing* scheme.
+* Not the recurrent/GDN state (T3): it is `O(1)` per layer and cannot be windowed.
+* Not a slab-for-dense revival (§6): the slab stays MoE-only.
+* Not a `--fit` rewrite; the term is additive.
+* Nothing from `wip/` goes into `patches/` without the promotion rule being followed.
+
+## 11. Open questions for the maintainer
+
+1. **Priority:** axis A/O5 (MiB, cheap, generic) + O1 (sizing control) first, or go straight at O2/P3 for
+   qwen4exp?  The measurement says the former is a week and the latter is a campaign.
+2. **"Metadata" scope:** if the ask meant something narrower than `INVENTORY.md`'s T4 (e.g. only the
+   *expert-cache* tables, or only the per-context graph inputs), say so — that is a different, much smaller
+   note and §3 of the inventory is already its answer.
+3. **Drafter ring:** is an acceptance trade acceptable as a shipped default (Strata ships `--mtp-window`
+   default-on at 32768 and reports the cost), or opt-in only?
+4. **Host master budget:** `MOE_HOST_POOL_RAM_PCT`-style percentage of `MemAvailable`, or an explicit MiB flag?
+5. **qwen4exp first only, or DSA too?**  DSA has no GLM-5 GGUF on this fleet (`TODO` #108), so it could only
+   be validated on qwen4exp and reasoned for glm.
+6. **O1 on dense:** worth it?  It changes nothing at a full context and only helps a config that over-reserves
+   — but that is *most* server configs (`-c` is usually set well above the used context).
+
+## 12. Records
+
+* [`INVENTORY.md`](INVENTORY.md) — the measured GPU-resident budget (T1–T5), scaling laws with file:line, and
+  the commands.
+* [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md) — the reference design read, and the 1:1 mapping.
+* [`bw-probe.cc`](bw-probe.cc) — the link/kernel-read probe (28.8 GB/s here; the card is x16 but its host
+  uplink is x8 behind its switch, so read the **root port's** `max_link_width`).
+* `AGENTS.md` — the slab invariants (§"The movable-boundary slab is MoE-only"), the cross-device peer copy
+  rule, the `-ncmoe` host-master rule, and the disk-tier arithmetic this campaign's link figure mirrors.
+* `ENVIRONMENT.md` §1.2.1/§4 — the host-master/`--host-experts` and state-copy families the provider arms
+  would extend; `patches/README.md` blocks 04 (KV types), 05 (FA), 09/10 (headroom/slab), 11 (qwen4exp), 12.
+* `GREEDY-PURITY.md` §46 (a new path owes a KLD-0 identity arm), §50 (a draft length is a verify width),
+  §63 (never judge a verify-width change on a two-slot text diff).
+* `wip/vram-resident-slots/README.md` (`TODO` #112) — the same "who gets the OOM chain's victim" question for
+  device-resident state; its §4.2 is blocker 8 above.
