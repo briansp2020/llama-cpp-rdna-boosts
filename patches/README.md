@@ -1498,6 +1498,76 @@ about.  r159 adds two **opt-in** bounds; the default arm is unchanged and bit-id
   starting size and the context kept laddering (64 -> 417.5 MiB, late steps at 2:08), so it did not do what
   its name promised; `GGML_CUDA_FA_STAGE_MAX_MB` is the knob that actually bounds a draft.
 
+### The RDNA3 decode fusions (r175, PR #250)
+
+**What they are.**  Seven decode fusions contributed by `@briansp2020`, folded here because this block owns
+the fusion dispatcher, the rope matcher and the MoE multi-token kernel (`mmvq-moe`) — no earlier block can
+carry them.  Every one is **default-on with a `=0` kill switch**, bit-identical to the launch(es) it
+replaces, and validated on the launch it removes:
+
+| patch | what | knob | cost when off (30B-A3B, gfx1100/gfx1201) |
+|---|---|---|---|
+| FA combine publishes its output's Q8_1 | the attention output projection skips `quantize_q8_1` | `GGML_CUDA_FA_COMBINE_Q8` | 2.5 / 2.2 % |
+| MoE gate/up+GLU publishes the down projection's Q8_1 | the down `MUL_MAT_ID` skips `quantize_q8_1` | `GGML_CUDA_MOE_GLU_Q8` | 2.1 / 1.0 % |
+| the fused K norm+rope+SET_ROWS also writes the V row | the V `set_rows` launch goes away | `GGML_CUDA_ROPE_SET_ROWS_V` | 2.2 / — |
+| MoE GEMV takes 4 rows per block (RDNA3_0) | half the y loads and warp reductions per wave | `GGML_CUDA_MOE_RPB_WIDE` | 3.6 / inert |
+| MoE down + weighted reduction in one launch | the reduction node launches nothing | `GGML_CUDA_MWR_FOLD` | 1.0 / — |
+| Q and K norm+rope in one launch | one launch per layer instead of two | `GGML_CUDA_ROPE_QK_PAIR` | 3.7 / 3.0 % |
+| dense V/K/Q projections in one launch (RDNA3_0) | one ksplit launch instead of 2-3 | `GGML_CUDA_MMVQ_ROW_CONCAT` | 2.8 / inert |
+
+**Facts a future edit must keep.**
+
+* **The Q8_1 publishes write exactly what `quantize_q8_1` writes, including the padding.**  Both the FA
+  combine and the GLU publish use its 32-lane `warp_reduce_max/sum` + `roundf` arithmetic verbatim; the GLU
+  publish's row length is generally **not** a multiple of `MATRIX_ROW_PADDING` (768 on Qwen3-30B), so the
+  block that completes a row's **last** group also zeroes that row's padding blocks — the arena is reused
+  across graphs, so anything that walks a padded row later must not find stale blocks.  The FA publish takes
+  only an unpadded row (`ne10 % MATRIX_ROW_PADDING == 0`), where the two layouts coincide.
+* **The combine publish is indexed by the combine kernel's own unrolling,** `j_dst_unrolled*D + tid` where
+  `j_dst_unrolled = (sequence*n_head + head)*n_tokens + token`, i.e. the flat element offset of the
+  contiguous `[D*n_head, n_tokens*n_seqs]` row layout — correct for any token/sequence count because the
+  q8 rows are in `(i13, i12, i11)` order.  Do not "simplify" it to a per-row index: that is the same value
+  only at one token.
+* **Neither publish checks that its consumer takes the mmvq path** (the `fwht_q8_1` matcher does, because it
+  runs in the dispatcher; these run in the kernel).  That is harmless — an unused entry costs arena space for
+  one graph — and at prefill the FA combine is not reached (`parallel_blocks == 1`), so measured peak VRAM is
+  unchanged (27B, `pp8192`: 20.17 GiB both).  Re-check that if the combine ever runs at prefill widths.
+* **A publish needs a self-resetting counter, and its `cudaMalloc` must not land in a captured graph.**  The
+  counters (`GGML_CUDA_MOE_GLU_Q8_CNT`/`GGML_CUDA_MOE_RED_CNT`) follow block 10's existing `hc_q8_cnt`
+  pattern: allocated on first use and zeroed once on the stream, then each kernel resets the counters it
+  completes.  Both fire first on a 1-token decode step, i.e. after the prefill that has already sized the
+  decode graphs' memory — do not move an allocation into a 1-token-only path that can run inside a capture.
+* **The MoE down fold writes the reduction from the last expert lane of a row block,** in
+  `moe_weighted_reduction`'s own order and expression (`sum = (e*scale)*w`, experts in order), and therefore
+  also takes `8` rows per block to quarter the counter atomics.  It steps aside when the reduction output
+  overlaps the expert-id tensor (later blocks of the same launch still read the ids).  Both fold paths are
+  gated on `dst->ne[2] == dst->ne[3] == 1`, i.e. **one token**: a verify batch never takes them.
+* **The row concat runs ahead of the dual-output fusion** (the submitter's order).  It preempts the
+  dual-output on a pair of *equal-height* matmuls over one src1 — the dense FFN gate/up pair — which the
+  dual-output is the older owner of.  Measured **neutral** on a dense 27B (row-concat off 43.05 vs on 43.13
+t/s, gfx1100) and, once the submitter's `qwen3moe` model reorder is dropped, **identical either way**
+  (30B: 192.8-193.6 vs 192.5-193.6 t/s, three alternating rounds), so it is kept as submitted and recorded
+  here rather than reordered.  A `row_cat` template instance keeps the plain ksplit kernels byte-unchanged
+  (an in-kernel segment check cost Qwen3.6 2 % with the feature off).
+* **The submitter's `qwen3moe.cpp` graph reorder is NOT taken** (`LLAMA_QK_ADJACENT` does not exist here).
+  It expands V and the raw K projection before the Q norm so the two norm+rope chains are adjacent, which is
+  worth ~3.3 % of the 30B on top (that is the difference between +12 % and +19.6 %) — but it edits **upstream
+  model code for all backends** to enable a CUDA fusion, on an arch family that is retired.  Without it the
+  Q/K pair fires where the graph is already adjacent (Qwen3.6) and qwen3moe pairs rarely; the row concat
+  still takes V/K/Q when the heights differ.
+* **`GGML_CUDA_MOE_RPB_WIDE` and `GGML_CUDA_MMVQ_ROW_CONCAT` are RDNA3_0-gated** (`ggml_cuda_get_arch()` /
+  the mmvq table id) because their launch geometry is row-count-only through `small_m` and the rows per
+  block.  RDNA4's config depends on the row count twice more, so neither is armed there — do not widen the
+  gate without that model.  Everything else is arch-free and fires on RDNA4 too (measured: 30B-A3B
+  +10.9 %, 35B-A3B +2.5 %, dense 27B +0.4 % on gfx1201).
+
+**Gates.**  Greedy text byte-identical to the previous release on 30B-A3B (both arches), 35B-A3B and dense
+27B; `plain == draft-mtp` (width purity) on 27B dense and 35B-A3B at 1500 tokens, on 1 GPU and 2-GPU
+`-sm tensor`, and 35B-A3B `-sm tensor -ncmoe 40`; prefill-logit KLD **-0.000000 / 100.000 %**; MTP Protocol A
+unchanged (27B 3 GPU layer 51.6, tensor 100.5 -> 100.8); rule-5 `llama-batched-bench -npl 1,4,8` flat; the
+per-patch switch-off deltas above; `test-backend-ops -o ROPE,MUL_MAT_ID` OK; no GPU faults.  Numbers:
+`benchmarks/2026-10-29-rdna3-decode-fusions.md`.
+
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 
 **What it is.**  The qwen4exp (Qwen3.8-Flash-Next) architecture support, split out of block 10 in r109 so
@@ -1507,6 +1577,11 @@ the fusion dispatcher and the async input ring.  QSA moves with the model by the
 slab/dispatcher/ring code of its own beyond the arms implemented in its own TUs.
 
 **Contents.**
+
+* **The QSA combine launch passes the FA combine's new `q8` argument as `nullptr` (r175).**  Block 10's
+  FA-combine Q8_1 publish added a `block_q8_1 * q8` parameter to `flash_attn_combine_results`; QSA's own
+  combine (`fattn-qsa.cu`, created by this block) publishes nothing because its output is not fed to a
+  quantized matmul.  A new combine call site owes that decision explicitly.
 
 * **The HC down/inject pairs are one tensor (r138, upstream #31028).**  `create_merged(
   LLM_TENSOR_HC_{ATTN,FFN}_DOWN_INJECT, …)` accepts the converter's merged weight and `build_hc_mix(…,

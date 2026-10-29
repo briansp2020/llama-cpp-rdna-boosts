@@ -1,5 +1,63 @@
 # WORKLOG - dated delivery records
 
+## 261029.006 (r175) -- PR #250's seven RDNA3 decode fusions shipped (block 10); its qwen3moe graph reorder declined, its Q8_1 padding gap fixed here
+
+**Released as `v15-6050b467c-r175` (15 blocks, 00-14; block 10 amended).**  Contributor PR
+[#250](https://github.com/stew675/llama-cpp-rdna-boosts/pull/250) (`@briansp2020`) is seven independent
+decode fusions filed as `wip/decode-fusions-rdna3/`, cut against r174 and applying with `git am -3`
+unchanged.  `benchmarks/2026-10-29-rdna3-decode-fusions.md` holds every number below.
+
+**Taken (block 10, default-on, `=0` switch each):** the FA combine publishes its output's Q8_1
+(`GGML_CUDA_FA_COMBINE_Q8`); the 1-token MoE gate/up+GLU publishes the down projection's Q8_1
+(`GGML_CUDA_MOE_GLU_Q8`); the fused K norm+rope+SET_ROWS kernel also writes the V row
+(`GGML_CUDA_ROPE_SET_ROWS_V`); MoE GEMV takes 4 rows per block on RDNA3_0 (`GGML_CUDA_MOE_RPB_WIDE`);
+the 1-token MoE down writes the weighted reduction (`GGML_CUDA_MWR_FOLD`); Q and K norm+rope run as one
+launch (`GGML_CUDA_ROPE_QK_PAIR`); dense V/K/Q projections run as one ksplit launch on RDNA3_0
+(`GGML_CUDA_MMVQ_ROW_CONCAT`).  They are folded into **block 10** rather than appended as a new block:
+block 10 owns the fusion dispatcher, the rope matcher and `mmvq-moe`, and it is the block that *creates*
+`ggml-cuda-try-fuse.cu` and `mmvq-moe.cu`, so no earlier block can carry them.  Blocks 00-09 are
+byte-unchanged; 0010-0014 were re-cut (block 11's `fattn-qsa.cu` call site takes the new combine
+argument).
+
+**The claims reproduce.**  gfx1100 (7900 XTX, 1 GPU, 3 alternating rounds), Qwen3-30B-A3B Q4_K_M:
+tg128 **172.3 -> 206.2 (+19.6 %)** and d4096 **153.6 -> 179.6 (+17.0 %)** with the series as submitted
+(they claimed +20.6 / +17.7); Qwen3.6-35B-A3B **138.2 -> 141.0 (+2.0 %)** (claimed +2.5); dense 27B
++0.5 %; prefill flat.  **The submitter could not test RDNA4 and it wins there too, with only five of the
+seven patches armed** (0006/0009 are RDNA3_0-gated): gfx1201, 1 GPU, 30B-A3B **131.4 -> 145.7
+(+10.9 %)**, 35B-A3B **102.1 -> 104.6 (+2.5 %)**, dense 27B +0.4 %.  Every switch was verified live by
+its own switch-off delta (2.5 / 2.1 / 2.2 / 3.6 / 1.0 / 3.7 / 2.8 % on the 30B at gfx1100).
+
+**Declined: the `src/models/qwen3moe.cpp` graph reorder** (`LLAMA_QK_ADJACENT` does not exist here).  It
+expands V and the raw K projection before the Q norm so the Q and K norm+rope chains are adjacent, which
+is worth 3.3 of the 30B's points (that is the whole difference between +12.2 % and +19.6 %) — but it edits
+upstream model code for **every** backend to enable a CUDA fusion, for a retired arch family.  Without it
+Qwen3.6 pairs anyway, qwen3moe pairs rarely, and the row concat is unaffected; the shipped 30B arm is
+192.8-193.6 t/s at gfx1100 and 143.9-147.4 at gfx1201.  This is a maintainer decision, recorded here per
+the report-findings rule.
+
+**Fixed here (the submitter flagged it):** the MoE GLU Q8_1 publish wrote the row's real blocks but not
+the zero padding up to `MATRIX_ROW_PADDING`, which `quantize_q8_1` writes.  The cache arena is reused
+across graphs, so any future padded-row reader would have found stale blocks; the block that completes a
+row's last group now zeroes that row's tail (30B `n_ff` 768 = 8 padding blocks per row).  Text and the
+prefill-logit KLD are unchanged.
+
+**Matcher order kept as submitted** (row concat ahead of the dual-output fusion), after measuring that
+the choice only matters *with* the model reorder: with the reorder dropped both orders are identical
+(30B 192.8-193.6 vs 192.5-193.6; dense 27B 43.11/43.03 vs 43.06/43.03).  The dense FFN gate/up pair is
+therefore still taken by the row concat rather than the r171 dual-output fusion — neutral on the 27B, and
+recorded in `patches/README.md` (block 10) as the open ownership note.
+
+**Gates run for the release:** `validate-set.sh` (strict fresh-tarball apply, tree
+`b635dc3786021fc8466ce6982e81db70ff86d673`, 15/15), `gate-per-block-build.sh --changed-from 5bdec04ab
+--fast` (blocks 10-14 rebuilt after the re-cut, plus the tip), the tip built with `all`, the
+prefill-logit gate (**-0.000000 KLD / 100.000 %** same-top-p, against the r174 base), coherence on
+30B-A3B / 35B-A3B / 27B (byte-identical, `plain == draft-mtp` at 1500 tokens, 1 GPU and 2-GPU
+`-sm tensor`, and 35B-A3B `-sm tensor -ncmoe 40`), MTP Protocol A on the dense 27B at 3 devices (layer
+51.6, tensor 100.5 -> 100.8, `n_accepted` identical at 1951/1937, acceptance 0.51), the rule-5 batched
+bench (flat), `test-backend-ops -o ROPE,MUL_MAT_ID` (OK) and `check-gpu-faults.sh` (clean on both
+boxes).  Not covered: `0006`/`0009` are RDNA3_0-only and the gfx1100 box here is single-GPU, so their
+multi-GPU behaviour is unverified (on RDNA4 they are inert and the 2-GPU arms are clean).
+
 ## 261029.005 (r174) -- PR #249 assessed: its M-RoPE powf hoist shipped (block 10), its 1-token GDN direct conv declined (0 % on the submitter's own arm, -1.1 % on RDNA4 dense)
 
 **Released as `v15-6050b467c-r174` (15 blocks, 00-14).**  Contributor PR
