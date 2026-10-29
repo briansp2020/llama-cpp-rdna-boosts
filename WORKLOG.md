@@ -1,5 +1,71 @@
 # WORKLOG - dated delivery records
 
+## 261029.005 (r174) -- PR #249 assessed: its M-RoPE powf hoist shipped (block 10), its 1-token GDN direct conv declined (0 % on the submitter's own arm, -1.1 % on RDNA4 dense)
+
+**Released as `v15-6050b467c-r174` (15 blocks, 00-14).**  Contributor PR
+[#249](https://github.com/stew675/llama-cpp-rdna-boosts/pull/249) (`@briansp2020`) is two independent
+patches cut against r171 and applied to r173 unchanged, and they came out differently.
+`benchmarks/2026-10-29-gdn-direct-conv-decode.md` holds the measurements.
+
+**Patch 1 (taken, block 10): the M-RoPE section power is computed once.**  In `rope_multi` and in the
+M-RoPE arm of the fused `rms_norm_mul_rope_f32`, every section arm multiplied its position index by the
+same `powf(theta_scale, iw/2)`; adjacent lanes take different arms (`sector % 3`), so the divergent arms
+were serialized within a wave and `powf` executed once per arm taken.  The power is now hoisted before the
+branch — same input, same value, so nothing can move — and the submitter's own diagnosis is exactly what
+the kernel census shows: gfx1201 `rms_norm_mul_rope_f32` **3.20 -> 2.85 µs** (`__half` dst) and
+**3.06 -> 2.70 µs** (f32 dst) per launch (-11/-12 %).  Wall clock is inside the noise on RDNA4 (8 such
+launches per token on a 4B is ~2.8 µs of a 9.7 ms token) and real on gfx1100: **+0.65 %** tg128 on
+Qwen3.6-35B-A3B Q4_K_M (137.6 -> 138.6, three alternating rounds), +0.25 % on 27B Q4_K_M and 9B Q8_0 —
+i.e. the +0.4-0.6 % they claimed.  Greedy
+text is byte-identical on 4B Q8_0 / 27B UD-Q4_K_XL / 35B-A3B Q4_K_M (gfx1201) and 9B Q8_0 (gfx1100), and
+the prefill-logit gate reads **0.000000 KLD / 100.000 %** same-top-p at the default ubatch (against a base
+recorded from the r173 release build) and at `-ub 1` (the decode-width probe, with
+`GGML_CUDA_FUSE_GDN_CONV_VERIFY=0` as the fallback arm).  `test-backend-ops -o ROPE` 450/450.  The
+`rope_multi` half is upstream code, so an upstream copy ships as `upstream/rope-mrope-powf-hoist/`.
+
+**Patch 2 (declined): a GDN direct conv for 1-token decode.**  Dropping `gdn_conv_check`'s `T >= 2` gate
+alone is not enough (`ssm_conv_in` still claims the concat and the direct conv then reads a matmul output
+nobody wrote), so the submission also stands the `ssm_conv_in` epilogue down when the direct matcher takes
+the concat.  That is the right shape, and it is numerics-neutral (ub-1 KLD 0.000000 / 100.000 %, text
+identical everywhere), but it buys nothing and costs a launch:
+
+* **It does not reproduce on the submitter's own arm.**  gfx1100 (7900 XTX), their model and flags,
+  three alternating rounds: stock 137.4-137.8 tg128, `+0001` 138.5-138.6, `+0001+0002` 138.6-138.7,
+  `+0001+0002` with `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0` 138.7-138.9 — the conv change is **0 %**, not the
+  +1.2-1.3 % claimed.  Same on 27B Q4_K_M and 9B Q8_0 (0 %).
+* **Where the q/k norm fold is refused it is a regression.**  The direct kernel only repays if it also
+  elides the norm pair (which it does on 35B-A3B MoE: same launch count, 0 %).  On the dense Q8_0 models
+  `gdn_conv_norm_match()` returns -1 (its overlap guard refuses at T=1), so the `ssm_conv_in` epilogue —
+  which wrote the whole CONCAT inside the mmvq, for free — stands down and `gdn_concat_tail` takes its
+  place: **+1 launch per GDN layer per token** (1560 over 64 decode tokens, 1.44 µs each) while the fused
+  conv is *not* faster than `ssm_conv_f32` (1.30 vs 1.43 µs).  Measured on gfx1201, Qwen3.5-4B Q8_0 tg256
+  (3 rounds): stock **103.57**, `+0001` 103.58, `+0001+0002` **102.43 (-1.10 %)**, and the `VERIFY=0`
+  control 103.56 — the loss is entirely the T=1 case.  Their "the same launch count" holds only in the
+  norm-fold case.
+* Two smaller points, for the record: at the SSM_CONV node the direct conv is tried before the decode-only
+  `ssm_prescan` 15-node fusion, so on the archs it targets it can no longer be preempted into prescan (no
+  model here reaches prescan — `ssm_conv_l2_gatebeta` appears in no trace, and
+  `GGML_CUDA_DISABLE_SSM_PRESCAN=1` changes nothing on stock — but a Q8_0 GDN model with matching wiring
+  could); and the new call site returns 0 instead of `continue`, which abandons the remaining candidate
+  CONCATs in the 8-node window.  The submitter flagged the (pre-existing) missing conv-output aliasing
+  check themselves; T=1 is the least exposed shape for it (each thread reads and writes only its own
+  index), so it is not the blocker.
+
+A fix would have to gate the decode case on `gdn_conv_norm_match() > 0` (so no launch is added) and check
+prescan first — and then show a measured win on both arch generations; today it has none on either.
+
+**Gates run for the release:** `validate-set.sh` (strict fresh-tarball apply, tree `85a84972c…`),
+`gate-per-block-build.sh --changed-from 8b4592334 --fast` (block 10 + tip rebuilt, 2/2), the prefill-logit
+gate at the default and `-ub 1` ubatches, MTP Protocol A on the dense 27B UD-Q4_K_XL at 3 devices (**layer
+51.6 t/s, acceptance 0.621; tensor 101.1 t/s, acceptance 0.608**, both above their plain arms 25.0 / 51.0
+and matching the recorded reference 51.7 / 90.7 with acceptance 0.62 / 0.60), the rule-5 stock-relative
+band gate (`llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8`, q8_0 KV: 1.065 / 1.319 / 1.713 vs stock
+1.064 / 1.313 / 1.703, no worse at B=4/B=8), and `test-backend-ops -o ROPE` 450/450.
+
+**Artifacts:** `release.json` = `v15-6050b467c-r174`, tip `5bdec04ab`, tree
+`85a84972c3f4e974ad352ad210d4500e2103226a`; the patch set was regenerated from the canonical chain and the
+fork branch re-cut from it.
+
 ## 261029.004 (r173) -- PR #248 assessed: its huge-page prompt-cache buffer shipped (+331 ms off a 100K slot's new-buffer save), its banded state copies were declined (they abort on `-sm tensor`)
 
 **Released as `v15-6050b467c-r173` (15 blocks, 00-14).**  Contributor PR

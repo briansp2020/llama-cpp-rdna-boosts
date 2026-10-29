@@ -61703,7 +61703,7 @@ index 5f08dcbfe..76e09ee49 100644
 +                                    const int       n_chunks,
                                      cudaStream_t    stream);
 diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
-index 45e813406..ff41a2baf 100644
+index 45e813406..f9c649e50 100644
 --- a/ggml/src/ggml-cuda/rope.cu
 +++ b/ggml/src/ggml-cuda/rope.cu
 @@ -1,7 +1,20 @@
@@ -61749,7 +61749,45 @@ index 45e813406..ff41a2baf 100644
      ggml_cuda_pdl_sync();
  
      // Fusion optimization: ROPE + VIEW + SET_ROWS.
-@@ -493,11 +514,13 @@ static void rope_multi_cuda(const T *            x,
+@@ -262,26 +283,29 @@ static __global__ void rope_multi(const T *            x,
+     const int sec_w = sections.v[1] + sections.v[0];
+     const int sector = (iw / 2) % sect_dims;
+ 
++    // the same power in every section arm: computed once so a divergent wave does not run powf per arm
++    const float theta_pow = powf(theta_scale, iw / 2.0f);
++
+     float theta_base = 0.0;
+     if (is_imrope) {
+         if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 1] * theta_pow;
+         } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 2] * theta_pow;
+         } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2] * theta_pow;
+         } else {
+-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 3] * theta_pow;
+         }
+     } else {
+         if (sector < sections.v[0]) {
+-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2] * theta_pow;
+         } else if (sector >= sections.v[0] && sector < sec_w) {
+-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 1] * theta_pow;
+         } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 2] * theta_pow;
+         } else if (sector >= sec_w + sections.v[2]) {
+-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 3] * theta_pow;
+         }
+     }
+ 
+@@ -493,11 +517,13 @@ static void rope_multi_cuda(const T *            x,
          ggml_cuda_kernel_launch(rope_multi<forward, false, T, D>, launch_params,
              x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, n_offs, pos, freq_scale, ext_factor,
              attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, row_indices, set_rows_stride, inplace);
@@ -61763,7 +61801,7 @@ index 45e813406..ff41a2baf 100644
      }
  }
  
-@@ -572,8 +595,8 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+@@ -572,8 +598,8 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
      GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
      GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
      // When not fused, src0 and dst types must match
@@ -61774,7 +61812,7 @@ index 45e813406..ff41a2baf 100644
  
      const int64_t ne00 = src0->ne[0]; // head dims
      const int64_t ne01 = src0->ne[1]; // num heads
-@@ -656,6 +679,16 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+@@ -656,6 +682,16 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                                                  s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale, freq_base,
                                                  ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
                                                  set_rows_stride, inplace, stream);
@@ -61791,7 +61829,7 @@ index 45e813406..ff41a2baf 100644
          } else {
              GGML_ABORT("fatal error");
          }
-@@ -665,16 +698,29 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+@@ -665,16 +701,29 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                                                     s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale, freq_base,
                                                     ext_factor, attn_factor, corr_dims, freq_factors, sections, is_imrope,
                                                     row_indices, set_rows_stride, inplace, stream);
@@ -61821,7 +61859,7 @@ index 45e813406..ff41a2baf 100644
          } else {
              GGML_ABORT("fatal error");
          }
-@@ -706,6 +752,16 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+@@ -706,6 +755,16 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                                                  s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale, freq_base,
                                                  ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
                                                  set_rows_stride, inplace, stream);
@@ -61838,7 +61876,7 @@ index 45e813406..ff41a2baf 100644
          } else {
              GGML_ABORT("fatal error");
          }
-@@ -724,9 +780,26 @@ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rope
+@@ -724,9 +783,26 @@ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rope
      ggml_cuda_op_rope_impl<true>(ctx, rope, set_rows);
  }
  
@@ -61866,7 +61904,7 @@ index 45e813406..ff41a2baf 100644
  static __global__ void rms_norm_mul_rope_f32(
          const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
          const int64_t s01, const int64_t s02, const int64_t s03,
-@@ -741,12 +814,15 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -741,12 +817,15 @@ static __global__ void rms_norm_mul_rope_f32(
          const rope_corr_dims corr_dims, const float theta_scale,
          const float * freq_factors,
          const int64_t * row_indices, const int set_rows_stride,
@@ -61883,7 +61921,7 @@ index 45e813406..ff41a2baf 100644
  
      ggml_cuda_pdl_sync();
  
-@@ -760,6 +836,15 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -760,6 +839,15 @@ static __global__ void rms_norm_mul_rope_f32(
              const uint32_t mul_sample  = fastmodulo(sample,  mul_nsamples_packed);
              const float * mulc = mul + mul_sample*mul_s03 + mul_channel*mul_s02 + mul_row*mul_s01;
  
@@ -61899,7 +61937,7 @@ index 45e813406..ff41a2baf 100644
              float tmp = 0.0f;
  
              for (int col = tid; col < ncols; col += block_size) {
-@@ -777,10 +862,18 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -777,10 +865,18 @@ static __global__ void rms_norm_mul_rope_f32(
              }
              D * dstc = dst + idst;
  
@@ -61919,7 +61957,7 @@ index 45e813406..ff41a2baf 100644
                      ix0 = i0/2;
                      ix1 = i0/2 + n_dims/2;
                  } else {
-@@ -792,20 +885,72 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -792,20 +888,74 @@ static __global__ void rms_norm_mul_rope_f32(
                  const float x1 = scale * xc[ix1] * mulc[fastmodulo(ix1, mul_ncols_packed)];
  
                  if (i0 >= n_dims) {
@@ -61939,26 +61977,28 @@ index 45e813406..ff41a2baf 100644
 +                    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
 +                    const int sec_w     = sections.v[1] + sections.v[0];
 +                    const int sector    = (i0 / 2) % sect_dims;
++                    // the same power in every section arm (see rope_multi)
++                    const float theta_pow = powf(theta_scale, i0 / 2.0f);
 +                    theta_base = 0.0;
 +                    if (mrope == 2) {
 +                        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
-+                            theta_base = pos[channel + nchannels * 1] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 1] * theta_pow;
 +                        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
-+                            theta_base = pos[channel + nchannels * 2] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 2] * theta_pow;
 +                        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
-+                            theta_base = pos[channel] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel] * theta_pow;
 +                        } else {
-+                            theta_base = pos[channel + nchannels * 3] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 3] * theta_pow;
 +                        }
 +                    } else {
 +                        if (sector < sections.v[0]) {
-+                            theta_base = pos[channel] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel] * theta_pow;
 +                        } else if (sector >= sections.v[0] && sector < sec_w) {
-+                            theta_base = pos[channel + nchannels * 1] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 1] * theta_pow;
 +                        } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
-+                            theta_base = pos[channel + nchannels * 2] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 2] * theta_pow;
 +                        } else if (sector >= sec_w + sections.v[2]) {
-+                            theta_base = pos[channel + nchannels * 3] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 3] * theta_pow;
 +                        }
 +                    }
 +                }
@@ -61997,7 +62037,7 @@ index 45e813406..ff41a2baf 100644
              }
  
              if constexpr (block_size > WARP_SIZE) {
-@@ -832,7 +977,8 @@ static void rms_norm_mul_rope_cuda(
+@@ -832,7 +982,8 @@ static void rms_norm_mul_rope_cuda(
          const rope_corr_dims corr_dims,
          const float * freq_factors,
          const int64_t * row_indices, const int set_rows_stride,
@@ -62007,7 +62047,7 @@ index 45e813406..ff41a2baf 100644
      GGML_ASSERT(ncols % 2 == 0);
  
      const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
-@@ -844,6 +990,41 @@ static void rms_norm_mul_rope_cuda(
+@@ -844,6 +995,41 @@ static void rms_norm_mul_rope_cuda(
      const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
      const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
  
@@ -62049,7 +62089,7 @@ index 45e813406..ff41a2baf 100644
      if (ncols < 1024) {
          const dim3 block_dims(256, 1, 1);
          const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32*sizeof(float), stream};
-@@ -852,13 +1033,13 @@ static void rms_norm_mul_rope_cuda(
+@@ -852,13 +1038,13 @@ static void rms_norm_mul_rope_cuda(
                  x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                  mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                  n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
@@ -62065,7 +62105,7 @@ index 45e813406..ff41a2baf 100644
          }
      } else {
          const dim3 block_dims(1024, 1, 1);
-@@ -868,19 +1049,20 @@ static void rms_norm_mul_rope_cuda(
+@@ -868,19 +1054,20 @@ static void rms_norm_mul_rope_cuda(
                  x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                  mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                  n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
@@ -62089,7 +62129,7 @@ index 45e813406..ff41a2baf 100644
      const ggml_tensor * x = rms_norm->src[0];
      const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
  
-@@ -897,6 +1079,35 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+@@ -897,6 +1084,35 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
      const int64_t * row_indices     = nullptr;
      int             set_rows_stride = 0;
  
@@ -62125,7 +62165,7 @@ index 45e813406..ff41a2baf 100644
      if (set_rows != nullptr) {
          dst_d           = set_rows->data;
          dst_type        = set_rows->type;
-@@ -928,6 +1139,11 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+@@ -928,6 +1144,11 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
  
      const float * freq_factors = rope->src[2] != nullptr ? (const float *) rope->src[2]->data : nullptr;
  
@@ -62137,7 +62177,7 @@ index 45e813406..ff41a2baf 100644
      rope_corr_dims corr_dims;
      ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
  
-@@ -956,14 +1172,14 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+@@ -956,14 +1177,14 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
              (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
              mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
              n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,

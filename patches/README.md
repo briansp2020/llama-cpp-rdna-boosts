@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section) | +12697 / −4954 | 78 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249) | +12718 / −4970 | 78 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -1413,6 +1413,28 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
   even pinned to 2 CPU cores +0.7 %); it is worth what it saves on a host-limited box — CPU time, bus
   traffic and RAM.  The census is unchanged (`replay` identical in every pair) and greedy text is
   byte-identical in every arm; prefill-logit KLD 0.000000 / 100.000 %.
+* **The M-RoPE section power is computed once** (r174, PR #249, briansp2020): in `rope_multi` and in the
+  M-RoPE arm of the fused `rms_norm_mul_rope_f32`, every section arm multiplied its position index by the
+  *same* `powf(theta_scale, iw/2)`, and adjacent lanes take different arms (`sector % 3`), so the divergent
+  arms were serialized and `powf` executed once per arm taken.  It is hoisted once before the branch: same
+  input, same value, i.e. **bit-identical** (the non-M-RoPE path and the "no arm matched, `theta_base`
+  stays 0" case are untouched).  Kernel level on gfx1201: `rms_norm_mul_rope_f32` **3.20 -> 2.85 µs**
+  (`__half` dst) and **3.06 -> 2.70 µs** (f32 dst) per launch, which is inside the wall-clock noise on
+  RDNA4 (8 launches/token on a 4B) and **+0.25 to +0.65 % tg** on gfx1100 (7900 XTX: 35B-A3B Q4_K_M
+  137.6 -> 138.6, 27B Q4_K_M +0.25 %, 9B Q8_0 +0.25 %).  Greedy text byte-identical on 4B Q8_0 / 27B
+  UD-Q4_K_XL / 35B-A3B Q4_K_M, and the prefill-logit gate reads 0.000000 KLD / 100.000 % top-p at the
+  default ubatch and at `-ub 1`; `test-backend-ops -o ROPE` 450/450.  **The submission's other half is
+  deliberately NOT taken**: a GDN direct conv for 1-token decode (`gdn_conv_check`'s `T >= 2` gate dropped,
+  with `ggml_cuda_ssm_conv_in_try_fuse` standing down so the two fusions cannot both claim the concat).  It
+  only repays where the direct kernel also elides the q/k norm pair: there the launch count is equal and it
+  measures **0 %** (its own author's gfx1100 35B-A3B Q4_K_M arm: 138.6 both arms, `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0`
+  control 138.7); where `gdn_conv_norm_match()` is refused (dense Qwen3.5 4B/9B/27B Q8_0) the `ssm_conv_in`
+  epilogue was writing the whole CONCAT inside the mmvq for free, so the decode path gains a launch per GDN
+  layer (`gdn_concat_tail`, 1.44 µs) and loses **-1.1 %** tg256 on gfx1201 — a fix would have to make the
+  decode case conditional on the norm fold, and it would still need a measured win.  It also preempts the
+  decode-only `ssm_prescan` 15-node fusion unconditionally, which no model here reaches but a Q8_0 GDN
+  model with matching wiring could (`ssm_conv_l2_gatebeta` appears in no trace taken so far).  Record:
+  `benchmarks/2026-10-29-gdn-direct-conv-decode.md`.
 
 **Knobs.**  The slab/cache set listed under block 09, plus `GGML_CUDA_POOL_WIDE[_MIN_MIB]`,
 `GGML_CUDA_SLAB_STATS` / `_GRAPH_TRACE`, `GGML_CUDA_ASYNC_INPUT_BATCH` / `_LAZY_DONE` / `_DEBUG`,
