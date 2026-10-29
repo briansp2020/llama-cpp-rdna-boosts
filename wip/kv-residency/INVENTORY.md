@@ -6,16 +6,20 @@ the multi-GPU arms only change *where* the buffers are, not their size.
 
 ## 0. Taxonomy — say which "metadata" is meant
 
+**Scope (2026-10-29): this campaign is the KV cache.**  T2 and the KV cache's own bookkeeping are in scope;
+T3, the non-KV parts of T4 and T5 are recorded here only so the boundary is explicit and a later exploration
+starts from measurements instead of re-deriving them (`README.md` §10).
+
 The ask ("reduce the metadata held on the GPU") can mean four different things, and they have very different
 prices.  This campaign keeps them apart; §2 is the byte mass, §3 is bookkeeping.
 
-| tier | what | scaling | device? |
-|---|---|---|---|
-| T1 | weights | model | always |
-| T2 | **KV data** — K/V per layer per stream, the qwen4exp **indexer keys**, the DSA light-indexer keys | `O(n_ctx)` | always |
-| T3 | **state data** — GDN recurrence `S` + conv `R`, MLA/latent caches, F1 layer-input stores | `O(1)` per layer, `O(ub)` for the stores | always |
-| T4 | **bookkeeping (metadata proper)** — kq mask, `cell_pos`/`tok_lo`/`tok_hi`, per-stream cell copies, the expert cache's page/remap/heat tables, graph input scalars | `O(n_ctx)`, `O(n_ctx×ub)`, `O(#experts)` | mostly |
-| T5 | **scratch** — the scheduler's compute buffers (per graph, reserved at the widest shape), the FA prefill staging arena, the H2D ring, the q8_1 arena | `O(ub)`, `O(ub²)` | yes |
+| tier | what | scaling | device? | in scope |
+|---|---|---|---|---|
+| T1 | weights | model | always | — |
+| T2 | **KV data** — K/V per layer per stream, the qwen4exp **indexer keys**, the DSA light-indexer keys | `O(n_ctx)` | always | **yes** |
+| T3 | **state data** — GDN recurrence `S` + conv `R`, MLA/latent caches, F1 layer-input stores | `O(1)` per layer, `O(ub)` for the stores | always | no (deferred) |
+| T4 | **bookkeeping (metadata proper)** — kq mask, `cell_pos`/`tok_lo`/`tok_hi`, per-stream cell copies, the expert cache's page/remap/heat tables, graph input scalars | `O(n_ctx)`, `O(n_ctx×ub)`, `O(#experts)` | mostly | **only the KV cache's own** (mask inputs, cell metadata, a residency map) |
+| T5 | **scratch** — the scheduler's compute buffers (per graph, reserved at the widest shape), the FA prefill staging arena, the H2D ring, the q8_1 arena | `O(ub)`, `O(ub²)` | yes | no (deferred) |
 
 Only T4 is "metadata" in the strict sense, and on the shipped default paths it is **small** (§3) — the
 r160/r172 work already removed the one T4 term that was not (`kq_mask` packed).  The byte mass in the ask is
@@ -117,6 +121,8 @@ KV bytes per token = `n_kv_layers × n_head_kv × (n_embd_head_k + n_embd_head_v
 `-ctk/-ctv q8_0` halves every row (block 04); the ratio does not change with type, only the multiplier.
 
 ## 3. T4 — the bookkeeping that is device-resident
+
+Rows marked **in scope** are the KV cache's own; the rest are the deferred later areas.
 
 | item | size | device-resident today? | where |
 |---|---|---|---|

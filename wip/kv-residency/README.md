@@ -1,35 +1,40 @@
-# wip/kv-residency — GPU-resident KV, its metadata, and how to make less of it (OPEN, scoping)
+# wip/kv-residency — the KV cache in VRAM: how much, where, and how little can be resident (OPEN, scoping)
 
 **Status: OPEN / scoping (2026-10-29).  Nothing implemented, nothing in `patches/`, not scheduled.**
 **`TODO` #117 is the permanent handle** for the subject (old and future records that cite `#117` mean this
 document).  `wip/` is never applied to the fork (`AGENTS.md`, WIP rules).
 
-**Why it exists.**  The ask this session was "reduce the amount of metadata held on the GPU", with
-`~/Strata`'s **windowed KV streaming** as the reference (§3, and
-[`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md)).  Answering it properly took one measurement and one
-reading of the code that changes the shape of the question:
+**Scope decision (maintainer, 2026-10-29): the subject is the KV cache.**  "Reduce the GPU-resident
+metadata" is read as *the KV cache* — the K/V tensors, the qwen4exp/DSA indexer cache, and the bookkeeping
+that exists to serve them — for now.  The rest of the device-resident non-weight budget (the expert-cache
+tables, the F1 layer-input store, the q8_1 arena, the scheduler's graph inputs, the FA staging arena) is a
+**separate later exploration**, kept in `INVENTORY.md` only so the boundary is explicit (§10).
 
-* the strict-metadata device footprint on our default paths is **~1 MiB plus MiB-scale expert-cache tables**
-  — r160/r172 already removed the one big term (the packed `kq_mask`, 960 MiB at `-c 245760 -ub 2048`, now
-  lazy and derived by default).  So "metadata" as a byte mass is already handled
+**Why it exists.**  The ask this session was to cut what the context holds on the GPU, with `~/Strata`'s
+**windowed KV streaming** as the reference (§3, and [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md)).
+Answering it took one measurement and one reading of the code that changes the shape of the question:
+
+* the KV cache is the byte mass: **4.25 GiB** on a 27B at `-c 65536` (64 KiB/token of f16 K/V, plus the
+  MTP draft's own cache), **1.25 GiB** on the 35B-A3B at the same context, and Flash-Next carries a *second*
+  O(n_ctx) cache (the indexer keys) on top.  Everything else the device holds per context is either weights,
+  a context-independent state (GDN `S`, 598.5 MiB), scratch, or ~1 MiB of bookkeeping
   ([`INVENTORY.md`](INVENTORY.md) §3);
-* the byte mass is the **KV data itself**, and windowed streaming of it only pays when the per-token
-  *attended set* is bounded.  On this box the host link is **28.8 GB/s** measured, so a byte that attention
-  reads but that is not resident costs 1/28.8 GB/s ≈ 0.035 ms per MiB — every token
-  ([`INVENTORY.md`](INVENTORY.md) §4).
+* windowed streaming of the KV only pays when the per-token *attended set* is bounded.  On this box the host
+  link is **28.8 GB/s** measured, so a KV byte that attention reads but that is not resident costs
+  1/28.8 GB/s ≈ 0.035 ms per MiB — on every token ([`INVENTORY.md`](INVENTORY.md) §4).
 
-That splits the campaign into one cheap-and-generic half (residency/placement control, no kernel change) and
-one model-specific half (true streaming, where QSA/DSA make it possible and full attention makes it
+That splits the campaign into one cheap-and-generic half (KV residency/placement control, no kernel change)
+and one model-specific half (true streaming, where QSA/DSA make it possible and full attention makes it
 pointless).  Both are generic over *dense vs MoE* and *slab vs no-slab* by construction — §6.
 
 ---
 
-## 1. The three axes of the ask
+## 1. The three axes, as they apply to the KV cache
 
 | axis | question | answer in this tree |
 |---|---|---|
-| **A. metadata (strict)** | can the device-resident bookkeeping shrink? | mostly already done (r160/r172); the remaining items are small and listed in `INVENTORY.md` §3 |
-| **B. KV data** | can part of the K/V live outside VRAM and be streamed in a window? | **only where the attended set is bounded** (§4).  Full attention: no, not at any useful speed |
+| **A. the KV cache's own bookkeeping** | can the device-resident part of the KV cache shrink? | it is already small (`cell_pos`/`tok_lo`/`tok_hi` ≈ 1 MiB; the packed `kq_mask` that used to be 960 MiB is lazy since r160 and derived by default since r172).  A residency map *adds* `≈ n_cells/page × 20 B` (1.2 MiB at 245760 with a 4-cell page), so this axis is a budget to hold, not a win to chase |
+| **B. KV data** | can part of the K/V (and the indexer keys) live outside VRAM and be streamed in a window? | **only where the attended set is bounded** (§4).  Full attention: no, not at any useful speed |
 | **C. placement control** | can the KV be a *fixed region* whose size and address are known before the graph is built? | **yes, and it is the part worth doing first** (§5, O1) — the slab exists, the KV is currently outside it |
 
 ## 2. What is resident today (measured, r174, 1 GPU)
@@ -99,7 +104,7 @@ it changes nothing about a full context.
 | **O2** | **windowed residency** (Strata's design): host master + page table + in-graph resolve | the real VRAM cut, only for bounded attended sets (§4) | FA index computation + the KV write path + defrag/shift/state | yes, *where eligible* | **XL** |
 | **O3** | **drafter ring** (`--mtp-window` analogue, `block % n_slots`) | draft KV from `O(n_ctx)` to `O(window)` | draft's mask/pos only | yes | **M** |
 | **O4** | **indexer diet** (`q8_0` indexer keys; lean harder on the derived block-vector cache) | Flash-Next 3 GiB → 1.5 GiB at 256 K | none (type change) | n/a (qwen4exp) | **S** |
-| **O5** | **metadata diet** — the `INVENTORY.md` §3 list | MiB, not GiB; a regression budget | none | yes | **S** |
+| **O5** | *deferred*: the non-KV metadata diet (the `INVENTORY.md` §3 items outside the KV cache) | MiB, not GiB | none | yes | **S** |
 | **O6** | **provider P0** (plain pool + pinned master, no VMM) | the same layer on CUDA/Windows/other backends | none | yes | **M** |
 | — | KV quantisation (`-ctk/-ctv`) | 2× the whole T2 term | none | yes | already shipped (block 04) |
 | — | all-KV-on-host (`-nkvo`) | frees T2 entirely | none | yes | exists, **measured hopeless** (§4) |
@@ -146,14 +151,16 @@ HIP_VISIBLE_DEVICES=0 /tmp/bw-probe 512 5
 
 ## 8. Phases (each env-gated OFF until it is gated; nothing here is in `patches/`)
 
-* **P0 — instruments and a gate.**  A VRAM-accounting report (`T1..T5` per context, from the log, not a
-  guess) plus a **residency gate**: one run with residency at 100 %, one with the pool deliberately
-  undersized (forced misses), requiring byte-identical greedy text, identical acceptance, and a
-  miss/hit counter both ways.  This is the gate O2/O3 cannot ship without — and the one Strata's own docs
-  say their port still lacks ("Keep draft until long-context, cancellation, and image-history tests pass").
+* **P0 — instruments and a gate.**  A KV-accounting report (per cache: cells, bytes, resident share, the
+  bookkeeping size, and the arena/`--fit` consequence, from the log rather than a guess) plus a **residency
+  gate**: one run with residency at 100 %, one with the pool deliberately undersized (forced misses),
+  requiring byte-identical greedy text, identical acceptance, and a miss/hit counter both ways.  This is the
+  gate O1/O2/O3 cannot ship without — and the one Strata's own docs say their port still lacks ("Keep draft
+  until long-context, cancellation, and image-history tests pass").
 * **P1 — O1 KV-grow (P1/P2 providers).**  No kernel change.  Assert: `SLAB_INIT` layout identical when the
   used context equals `-c`; a small used context leaves the arena *larger* than today; `--fit` sees the term.
-* **P2 — O5/O4 metadata diet** with a MiB budget asserted in the gate.
+* **P2 — O4 indexer diet** (`q8_0` indexer keys / the derived block-vector cache) with its MiB asserted in
+  the gate.  In scope because the indexer cache *is* part of the KV cache for qwen4exp and DSA.
 * **P3 — O2 on qwen4exp QSA** (the only place it can pay): `page = compress_ratio` cells, reader = the
   existing block selection, resolve = Strata's two kernels.  This is the campaign's real body of work.
 * **P4 — O3 drafter ring**, measured as an acceptance trade à la Strata's `--mtp-window` (they report a few
@@ -192,29 +199,36 @@ HIP_VISIBLE_DEVICES=0 /tmp/bw-probe 512 5
 * Not "run a 27B at 256 K on a 32 GiB card" via full-attention streaming — §4 says no.
 * Not a KV *quantisation* change (block 04 owns the KV types) and not a KV *dedup/sharing* scheme.
 * Not the recurrent/GDN state (T3): it is `O(1)` per layer and cannot be windowed.
+* **Not the non-KV device-resident budget** — the expert-cache tables, the F1 layer-input store, the q8_1
+  arena, the scheduler's graph inputs and the FA staging arena are **deferred** by the 2026-10-29 scope
+  decision.  They stay listed in `INVENTORY.md` §3 so a later exploration starts from the measured numbers
+  instead of re-deriving them.
 * Not a slab-for-dense revival (§6): the slab stays MoE-only.
 * Not a `--fit` rewrite; the term is additive.
 * Nothing from `wip/` goes into `patches/` without the promotion rule being followed.
 
 ## 11. Open questions for the maintainer
 
-1. **Priority:** axis A/O5 (MiB, cheap, generic) + O1 (sizing control) first, or go straight at O2/P3 for
-   qwen4exp?  The measurement says the former is a week and the latter is a campaign.
-2. **"Metadata" scope:** if the ask meant something narrower than `INVENTORY.md`'s T4 (e.g. only the
-   *expert-cache* tables, or only the per-context graph inputs), say so — that is a different, much smaller
-   note and §3 of the inventory is already its answer.
-3. **Drafter ring:** is an acceptance trade acceptable as a shipped default (Strata ships `--mtp-window`
+*(The scope question — "which metadata?" — is **decided**: the KV cache, 2026-10-29.  Same for "leave
+`wip/moe-cpu-overlap/` alone": retained deliberately, see `wip/CAMPAIGNS.md`.)*
+
+1. **Priority:** O1 (fixed-region sizing control, no kernel change) first, or go straight at O2/P3 for
+   qwen4exp?  The measurement says the former is ~a week and the latter is a campaign.
+2. **Drafter ring:** is an acceptance trade acceptable as a shipped default (Strata ships `--mtp-window`
    default-on at 32768 and reports the cost), or opt-in only?
-4. **Host master budget:** `MOE_HOST_POOL_RAM_PCT`-style percentage of `MemAvailable`, or an explicit MiB flag?
-5. **qwen4exp first only, or DSA too?**  DSA has no GLM-5 GGUF on this fleet (`TODO` #108), so it could only
+3. **Host master budget:** `MOE_HOST_POOL_RAM_PCT`-style percentage of `MemAvailable`, or an explicit MiB flag?
+4. **qwen4exp first only, or DSA too?**  DSA has no GLM-5 GGUF on this fleet (`TODO` #108), so it could only
    be validated on qwen4exp and reasoned for glm.
-6. **O1 on dense:** worth it?  It changes nothing at a full context and only helps a config that over-reserves
+5. **O1 on dense:** worth it?  It changes nothing at a full context and only helps a config that over-reserves
    — but that is *most* server configs (`-c` is usually set well above the used context).
 
 ## 12. Records
 
-* [`INVENTORY.md`](INVENTORY.md) — the measured GPU-resident budget (T1–T5), scaling laws with file:line, and
-  the commands.
+* Decision log for this campaign: **scope = the KV cache** and **`wip/moe-cpu-overlap/` is retained**
+  (2026-10-29, this file's status block + `wip/CAMPAIGNS.md`).
+* [`INVENTORY.md`](INVENTORY.md) — the measured GPU-resident budget (T1–T5; **T2 + the KV cache's own
+  bookkeeping is this campaign, T3/T4/T5-outside-the-KV-cache are the deferred later areas**), scaling laws
+  with file:line, and the commands.
 * [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md) — the reference design read, and the 1:1 mapping.
 * [`bw-probe.cc`](bw-probe.cc) — the link/kernel-read probe (28.8 GB/s here; the card is x16 but its host
   uplink is x8 behind its switch, so read the **root port's** `max_link_width`).
