@@ -24,6 +24,20 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-10-29 — the derived kq mask for batches of several sequences (r172, PR #247)
+
+**`WORKLOG.md` 261029.003** + [`2026-10-29-derived-kq-multiseq.md`](2026-10-29-derived-kq-multiseq.md) —
+`--parallel > 1 --kv-unified` gives each of the ubatch's sequences its own position range (`k * 2^23`), so the one
+predicate `tok_lo <= cell_pos <= tok_hi` stays exact for a multi-sequence batch with **no kernel change**, and a
+context no longer reserves the packed mask it could not consume: **-1.031 GiB device and -0.937 GiB pinned host** at
+`-c 245760 -ub 2048 --parallel 2 -ctk/-ctv q8_0` (dense 27B), with two concurrent 16K prefills unchanged (26.96 vs
+27.23 s at 1 GPU, 17.07 vs 17.09 s at 2 GPU `-sm tensor`) and a 112K-resident decode beside a 16K prefill unchanged
+(13.97 vs 13.96 s).  The predicate is the packed one, verified cell by cell (0 mismatches on dense 27B at 1 and 2 GPU
+tensor, Qwen3.5-4B hybrid, Gemma4-12B and gpt-oss-20b iSWA, 4 sequences per perplexity batch) and at the logits
+(**0.000000 / 100.000 %** at f16 and q8_0 KV), with `plain == draft-mtp` intact.  Two negatives are recorded there: it
+buys nothing on qwen4exp/Flash-Next (its QSA builder keeps the packed mask anyway) and a server that really shares
+prefixes through `llama_memory_seq_cp` latches once and keeps the packed mask.
+
 ## 2026-10-29 — MMB owns what MMB claims: the pair fusion's stand-down predicate (r171, `TODO` #115 closed)
 
 **`WORKLOG.md` 261029.001** + [`2026-10-29-mmb-pair-ownership.md`](2026-10-29-mmb-pair-ownership.md) —

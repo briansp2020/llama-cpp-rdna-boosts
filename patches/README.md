@@ -41,7 +41,7 @@ only as a rough shape.
 | 02 | `0002-…-block-02-adaptive-MTP-draft-depth` | adaptive MTP draft depth | +1186 / −54 | 24 |
 | 03 | `0003-…-block-03-chunked-gated-delta-net-prefill` | chunked GDN prefill + rollback tracker | +3182 / −15 | 22 |
 | 04 | `0004-…-block-04-BF16-KV-cache-and-native-BF16-f` | BF16 KV cache + native-BF16 FA | +630 / −214 | 8 |
-| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133; + r160: the packed kq mask is only **reserved** where a batch needing it is reachable, issue #238; + r164: the derived input is reusable on hybrid models, PR #242) | +5285 / −624 | 294 |
+| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133; + r160: the packed kq mask is only **reserved** where a batch needing it is reachable, issue #238; + r164: the derived input is reusable on hybrid models, PR #242; + r172: the derived mask covers batches of several sequences — 1.03 GiB device + 0.94 GiB host back on a 2-slot unified server, PR #247) | +5545 / −624 | 295 |
 | 06 | `0006-…-block-06-MMB-quantized-prefill-GEMM` | MMB quantized prefill GEMM (+ r132: the per-arch dispatch keys on the running device, not the primary) | +2903 / −3 | 7 |
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
@@ -421,13 +421,43 @@ almost all of them `template-instances/*.cu`.
   on the first batch that actually carries a non-degenerate 2-D position; the latch forces one
   **re-reserve** with the packed mask before that batch is split, so an undeclared 2-D caller (a library
   that submits M-RoPE image chunks itself) is repaired once instead of relying on a per-graph growth.
-  Multi-sequence, alibi and the `allow_derived == false` builders are unchanged (they keep the packed
-  reserve).  No kernel, no logit and no runtime path changes: the derived form still serves every
+  Multi-sequence batches were unchanged by r160 (they kept the packed reserve; r172 extends them, see below),
+  as are alibi and the `allow_derived == false` builders.  No kernel, no logit and no runtime path changes: the derived form still serves every
   derivable batch.  `LLAMA_KQ_MASK_PACKED_RESERVE=1` restores the pre-r160 worst-case reserve for every
   M-RoPE context (the A/B arm); `=0` forces the derived one and disables the latch.  Measured (see
   `WORKLOG.md` 261028.001): a text-only 27B at `-c 220160 -ub 2048` reserves **569.20 / 161.21 MiB**
   (device / host) instead of **1428.34 / 1020.36**; a `--mmproj` context reserves exactly what it did
   before; and an undeclared 2-D batch re-reserves to exactly that layout with byte-identical text.
+* **The derived kq mask covers batches of several sequences (r172, PR #247).**  A `--parallel > 1
+  --kv-unified` server (two slots prefilling or verifying together, one slot's prefill next to another's
+  decode) used to keep the packed mask for every multi-sequence ubatch, and because the reserve measures
+  with `n_seq_max` sequences it reserved it even when no batch ever held two — `n_kv × n_ubatch × 2` bytes
+  on each device **and again pinned on the host** (**1.03 GiB + 0.94 GiB** at `-c 245760 -ub 2048
+  --parallel 2`, dense 27B).  Sequence `k` of the ubatch now has its cells and its tokens' `[lo, hi]`
+  shifted by `k * 2^23` (`KQ_DERIVED_SEQ_STRIDE`; the ranges are provably disjoint for `pos < 2^23`, and
+  `static_assert((int64_t) KQ_DERIVED_SEQ_STRIDE*LLAMA_MAX_SEQ - 1 <= INT32_MAX)` makes an upstream
+  `LLAMA_MAX_SEQ` bump a build error), so the one predicate `tok_lo <= cell_pos <= tok_hi` keeps every
+  token inside its own sequence's range and **no kernel changes**.  Taken only when one KV stream holds the
+  batch, every token is in exactly one sequence, no cell carries two of the batch's sequences (`llama_kv_cells`
+  keeps an O(1) shared-cell counter; 0 unless `llama_memory_seq_cp` was used, in which case one O(used
+  cells) scan decides) and every position is below the stride; a multi-sequence batch of at most
+  **32 tokens** (the multi-slot verify steps, i.e. exactly the `gate-spec-align` boundary) and every other
+  refused shape keep the packed mask.  `kq_mask_packed_reachable()` loses its `n_seq_max > 1` term and
+  `decode()` latches `kq_mask_multiseq_seen` on the first pre-split batch the form cannot serve, then
+  **re-reserves once** with the packed mask (the r160 2-D latch pattern, so no later batch grows the
+  compute buffer — issue #42).  A memory `kq_mask_kvs()` does not cover (any other `llama_memory_i`) keeps
+  the packed reserve untouched, and a graph that also holds an `allow_derived == false` builder
+  (qwen4exp/QSA, MLA) creates and fills its packed mask anyway — measured identical VRAM and RSS on
+  Flash-Next, so the win is a dense/plain-cache one.  Purity: the derived predicate *is* the packed one —
+  the author's host oracle compares the two fills cell by cell (0 mismatches over llama-perplexity at 4
+  sequences per ubatch and the 2-slot server shape, re-run on gfx1201 for dense 27B at 1 and 2 GPU
+  tensor, Qwen3.5-4B hybrid, Gemma4-12B and gpt-oss-20b iSWA), and `gate-prefill-logits.sh --ub 2048 --ab
+  "LLAMA_KQ_MASK_DERIVED_MULTISEQ=0"` reads **0.000000 / 100.000 %** at f16 and q8_0 KV.  Prefill time is
+  unchanged (2 × 16K concurrent: 26.96 vs 27.23 s at 1 GPU, 17.07 vs 17.09 s at 2 GPU `-sm tensor`), single
+  -sequence greedy text is byte-identical and `plain == draft-mtp` still holds.  `LLAMA_KQ_MASK_DERIVED_MULTISEQ=0`
+  restores the single-sequence rule and the packed reserve.  A server that shares a prefix through
+  `llama_memory_seq_cp` pays the one re-reserve and then keeps the packed mask — that is the documented
+  trade, not a defect.  `GREEDY-PURITY.md` §70, `WORKLOG.md` 261029.003.
 * **q8_0 fetch-ahead variant (r98, PR #195)**: with q8_0 K and V read in place (decode/verify, `n_q <= 8`,
   head 256) the band launches a second kernel, `flash_attn_ext_f16<..., band_fetch_ahead = true>`, that
   fetches the raw q8_0 bytes of the next K/V batches into registers ahead of use and converts each batch
@@ -656,7 +686,12 @@ must be **bit-identical** to what it replaces at the widths it serves.
   fallback) -> the two plain muls**.  Measured neutral (gfx1151 pair == triple within noise and
   byte-identical text; gfx1201 inert), and the matcher now null-checks both nodes' source slots because it
   runs on every graph node — the first cut segfaulted on gfx1151 loading Flash-Next at `-ub 256`.
-  `GGML_PAIR_ROUTED_OFF` is the routed half's A/B arm.  `GREEDY-PURITY.md` §69,
+  `GGML_PAIR_ROUTED_OFF` is the routed half's A/B arm.  **Chain hygiene (r172):** this block's
+  `ggml_cuda_graph_optimize` also called `_routed_will_take` at one site, and r171 removed the helper from block
+  06 — so blocks 08 and 09 no longer compiled as intermediate trees (the call site was only deleted later, by
+  block 10's dispatcher move; found by walking the ladder instead of `--changed-from`).  That call site now asks
+  `ggml_cuda_mmb_supported_mmid()` (its four arguments are the following `MUL_MAT_ID`'s), so every block builds
+  again; the **tip tree is unchanged**, because block 10 deletes the whole region.  `GREEDY-PURITY.md` §69,
   [`../benchmarks/2026-10-29-mmb-pair-ownership.md`](../benchmarks/2026-10-29-mmb-pair-ownership.md).
 * **The routed fused-gate arm takes `ids`; the dense arm's `!ids` assert must not gate it (r161, issue #241).**
   `ggml_cuda_mul_mat_q`'s `if (fusion)` preamble carried upstream #29948's dense precondition

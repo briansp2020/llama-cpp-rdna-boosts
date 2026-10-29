@@ -131,6 +131,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§67** | an all-reduce *arm* is a prefill-numerics reference, so swapping it is gated at the prefill-logit level (multi-device, `-sm tensor`) and never by text; and a device with **peer access enabled** charges the host submission path, which is invisible to a synced loop and to kernel microbenchmarks and only shows where the host limits a replaying decode | doctrine (r165, `TODO #109` closed; `benchmarks/2026-10-28-allreduce-peer-access.md`) |
 | **§68** | a re-base that inherits an upstream **association-order** change is a *re-baseline*, not a purity break: classify a cross-release text move by *what* moved (a VDR/nwarps/norm-grouping carrier is a re-baseline; a scale or tensor-identity carrier is a defect), judge it by width purity and a distribution check, and answer a consumer's output-identity gate with a build-time escape — never a runtime arm | doctrine (r170, issue #228 follow-up; `prompts/` payload, gfx1151) |
 | **§69** | a fusion that stands down for MMB must ask the **dispatch** predicate (the exact shape claim), never a weight-type test: a type-only answer stands down for shapes MMB does not take and, worse, disagrees with the graph optimizer's BF16-only activation marking, so the marking pass must also refuse to elide an activation whose reader a fusion may consume; a matcher that probes arbitrary node pairs owes null-safe predicates | fix + doctrine (r171, `TODO` #115; `benchmarks/2026-10-29-mmb-pair-ownership.md`) |
+| **§70** | a second sequence in a batch is a **stride** in the mask predicate, not a new mask: sequence `k`'s cells and tokens shift by `k * 2^23`, so `tok_lo <= cell_pos <= tok_hi` stays exact with no kernel change — but only with one KV stream, one sequence per token, **no cell carrying two of the batch's sequences** (the shared-cell counter is a fast path, never the semantics), positions below the stride, and > 32 tokens; the reserve latch is a reserve optimization only, because `kq_mask_derivable()` re-runs per ubatch | doctrine + measured (r172, PR #247; `benchmarks/2026-10-29-derived-kq-multiseq.md`) |
 
 ---
 
@@ -2236,3 +2237,68 @@ LFM2 Q6_K is accepted by MMB's **fused GLU** (`M=1792 K=2048 T=512 n_used=4`, `M
 "MMB-declined MoE" premise of `TODO` #115 did not hold and the original fused-vs-`GGML_CUDA_DISABLE_MOE_MMQ_FUSION`
 A/B compared two MMB-GLU arms.  Reproduce the *decision* with `GGML_CUDA_MMB_LOG=1` before attributing a number to a
 matcher.
+
+---
+
+## 70. A second sequence in a batch is a *stride* in the mask predicate, not a new mask (r172, PR #247)
+
+**The claim.**  The derived kq mask's encoding is one predicate, `tok_lo <= cell_pos <= tok_hi`, evaluated per
+(cell, query token) by both FA kernel families.  It separates "own" cells from "foreign" ones with the `INT32_MIN`
+sentinel, which only works while a ubatch holds **one** sequence — so a `--parallel > 1 --kv-unified` context (two
+slots prefilling or verifying together, one slot's prefill next to another's decode) kept the packed mask *and*
+reserved it, because `sched_reserve()` measures with `n_seq_max` sequences.  Giving sequence `k` of the ubatch its own
+position range — cells and tokens both shifted by `k * KQ_DERIVED_SEQ_STRIDE` (`2^23`) — makes the same predicate
+exact for a batch of several sequences with **no kernel change**: for `0 <= pos < 2^23` and `k' != k`, a `k'`-cell
+lands at `pos + k'*2^23`, which is `>= (k+1)*2^23 > tok_hi + k*2^23 <= (k+1)*2^23 - 1` for `k' > k` and
+`<= k*2^23 - 1 < tok_lo + k*2^23` for `k' < k`, so the ranges cannot overlap.
+
+**The rule.**  Four conditions, and every one of them is a refusal, not a fallback surprise: one KV stream
+(`n_stream == 1`), every token in exactly one sequence (`n_seq_id == 1`), **no cell carrying two of the batch's
+sequences** (a prefix copied with `llama_memory_seq_cp` — the shared system prompt — would have to be visible to two
+ranges at once, which one shifted window cannot express), and every position below the stride.  A multi-sequence
+batch of **at most 32 tokens** keeps the packed mask: that is exactly the multi-slot verify width
+(`2 x 16` rows at `--spec-draft-n-max 15`), the reserve's slack covers its few MiB, and it keeps the per-ubatch
+M-RoPE degeneracy scan and the O(used cells) sharing scan off the per-step path.
+
+**Correctness never depends on the reserve latch.**  `kq_mask_derivable()` is evaluated per ubatch when the graph is
+built and re-runs the whole predicate, so a batch the form cannot serve takes the packed mask by itself.  The latch
+(`kq_mask_multiseq_seen`) exists only for the *reserve*: a pre-split batch that cannot be served sets it, `decode()`
+re-reserves once with the packed mask, and no later batch has to grow the compute buffer (issue #42, the same pattern
+as the r160 2-D latch).  A multi-sequence batch is the one shape whose refusal depends on the **cache**, not only on
+the batch, which is why the reserve cannot predict it and the latch must exist.
+
+**How to judge a change here.**  The oracle is the packed fill itself: the author's diagnostic
+(`LLAMA_KQ_MASK_DERIVED_VERIFY=1`) rebuilds each derived ubatch's mask with `set_input_kq_mask` and compares
+visibility cell by cell.  Re-run on gfx1201 with **0 mismatches** on every derived multi-sequence ubatch of
+llama-perplexity at `-c 512 -b 2048 -ub 2048 --kv-unified` (4 sequences per batch) for dense 27B (1 GPU and 2 GPU
+`-sm tensor`), Qwen3.5-4B (hybrid attention+GDN), Gemma4-12B and gpt-oss-20b (both iSWA, the latter with a live SWA
+window), plus the 2-slot server shape.  Logit level:
+`gate-prefill-logits.sh --ctx 512 --ub 2048 --ab "LLAMA_KQ_MASK_DERIVED_MULTISEQ=0"` reads **0.000000 / 100.000 %**
+at f16 and q8_0 KV.  `gate-park-idle-slots.sh` passes (3 GPU tensor, Flash-Next + MTP, 3 slots).  Single-sequence
+inputs are byte-identical by construction (offset 0, unbounded non-causal window): dense 27B, 35B-A3B `-ncmoe 30`
+and hybrid 4B greedy text is unchanged, and `plain == draft-mtp` still holds (2 GPU tensor, 400 tokens).
+
+**The shared-cell counter is the one thing that can silently lie.**  `llama_kv_cells::get_n_multi_seq()` is a
+`uint32_t` maintained by every mutator (`rm`, `seq_rm`, `seq_keep`, `seq_add`, `pos_add`'s empty-out branch, both
+`cp` forms, both `set` forms, `reset`; `mv` is net-neutral because its destination is asserted empty).  An
+**under**-count is a wrong mask — the fast path would claim "no shared cells" and derive — so the counter is not a
+cache: the O(used cells) scan is the semantic answer and the counter only licenses skipping it.  Validate it with the
+randomized test (`wip`-side, 400 000 random operations of every kind on 512 cells x 6 sequences, counter == recount
+after each, shared cells present in 96 % of the states), and re-run it when a new mutator appears.  The audit warning
+the same way: a *new* way to put two sequences in one cell (a future `seq_cp` variant) must bump the counter or the
+whole predicate is unsound.
+
+**What it costs, and what it does not buy.**  The batch-wide skip bitmap
+(`flash_attn_kq_derived_blocks`, §37) is a *window* over the whole batch, so a multi-sequence prefill loses the
+packed path's per-tile skip: the shifted union covers every batch cell and no group is skipped.  That is measurable
+in principle and neutral here — two concurrent 16K prefills measure 26.96 s (packed) vs 27.23 s (derived) at 1 GPU and
+17.07 vs 17.09 s at 2 GPU `-sm tensor`, and a 112K-resident decode beside a 16K prefill 13.97 vs 13.96 s, because the
+removed host fill (`n_kv x n_ubatch x 2` bytes per ubatch) was the larger term.  The win is memory: **27.51 -> 26.41 GB
+device and 1.97 -> 0.98 GiB server RSS** at load on `-c 245760 -ub 2048 --parallel 2 -ctk/-ctv q8_0`, dense 27B.  It
+is **zero** on a graph that also holds an `allow_derived == false` builder (qwen4exp/QSA, MLA): that builder creates
+and fills the packed mask anyway, so Flash-Next measures identical VRAM and RSS — the win is a dense/plain-cache one,
+not a universal one.  And a server that actually shares prefixes through `llama_memory_seq_cp` pays one re-reserve and
+then keeps the packed mask for the rest of the run: the memory is given back, the 1 GiB is not.
+
+**Record:** `WORKLOG.md` 261029.003, `archive/work/kq-derived-multiseq/`, `patches/README.md` (block 05),
+`benchmarks/2026-10-29-derived-kq-multiseq.md`, `ENVIRONMENT.md` (`LLAMA_KQ_MASK_DERIVED_MULTISEQ`).

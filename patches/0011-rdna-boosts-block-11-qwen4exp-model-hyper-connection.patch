@@ -1,4 +1,4 @@
-From 19bfe76589f17720b8c0494d226d378b4c1fa1e7 Mon Sep 17 00:00:00 2001
+From eb6bc8cce8ee99ce1918effa4b57e21ae954cf17 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/14] rdna-boosts: block 11: qwen4exp (model,
@@ -8350,10 +8350,10 @@ index ea13e9c3f..029359724 100644
              return true;
      }
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index dcf66990c..79cd1c973 100644
+index 32176212b..ff6e9fdf1 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -690,6 +690,10 @@ llama_context::llama_context(
+@@ -733,6 +733,10 @@ llama_context::llama_context(
              /*.ctx_type  =*/ cparams.ctx_type,
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
          };
@@ -8365,7 +8365,7 @@ index dcf66990c..79cd1c973 100644
          memory.reset(model.create_memory(params_mem, cparams));
      }
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 0705efb84..71da32dbd 100644
+index b74678447..9800a4f14 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -62,6 +62,29 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -8458,7 +8458,7 @@ index 0705efb84..71da32dbd 100644
      }
  
      return result;
-@@ -3046,7 +3087,7 @@ bool llama_kv_cache_context::apply() {
+@@ -3139,7 +3180,7 @@ bool llama_kv_cache_context::apply() {
      }
  
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
@@ -8468,7 +8468,7 @@ index 0705efb84..71da32dbd 100644
      return true;
  }
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 6e34d8a54..4667c447c 100644
+index c7c774a83..c27db61a6 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -114,7 +114,10 @@ public:
@@ -8492,7 +8492,7 @@ index 6e34d8a54..4667c447c 100644
  
      // get views of the current state of the cache
      ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-@@ -282,6 +285,9 @@ private:
+@@ -291,6 +294,9 @@ private:
      // required padding
      const uint32_t n_pad = 1;
  

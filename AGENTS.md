@@ -624,14 +624,32 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   VRAM plus 860 MiB of pinned host memory** per context that was never allocated.  The M-RoPE term is now
   `cparams.kq_mask_pos_2d` (`llama_context_params.pos_2d`, set by `common` when `--mmproj` is given) or the
   `kq_mask_pos_2d_seen` latch that `decode()` sets on the first batch carrying a non-degenerate 2-D (embd)
-  position, which forces one **re-reserve** with the packed mask before that batch is split.  Multi-sequence,
-  alibi and the `allow_derived == false` builders keep the packed reserve; the runtime mask path is
-  unchanged (every derivable batch still takes the derived form).  So: a context that can receive
+  position, which forces one **re-reserve** with the packed mask before that batch is split.  Alibi and the
+  `allow_derived == false` builders keep the packed reserve, and a multi-sequence batch does too **unless** the
+  derived form can serve it (r172 - see the next bullet); the runtime mask path is unchanged (every derivable
+  batch still takes the derived form).  So: a context that can receive
   image/audio chunks must be created with `pos_2d` (a caller that submits 2-D positions and skips it pays
   one re-reserve, which on a `-ncmoe` config can cost the expert-cache arena - declare it); do not
   reintroduce an `n_pos_per_embd()`-only reserve test, and do not remove the latch - it is the only thing
   that keeps an undeclared multimodal caller correct.  A/B arm: `LLAMA_KQ_MASK_PACKED_RESERVE=1` (the
   pre-r160 worst case).  `WORKLOG.md` 261028.001.
+- **A second sequence in a batch is a position *stride*, not a new mask (r172, PR #247).**  On a `--parallel > 1
+  --kv-unified` context sequence `k` of the ubatch gets its own range (`k * 2^23`, `KQ_DERIVED_SEQ_STRIDE`), so the one
+  predicate `tok_lo <= cell_pos <= tok_hi` stays exact and **no kernel changes** - which is also why the batch-wide
+  skip window stays conservative under it.  The form is taken only with one KV stream, one sequence per token, **no
+  cell carrying two of the batch's sequences** (a prefix shared through `llama_memory_seq_cp`), every position below
+  the stride, and **more than 32 tokens**: the multi-slot verify width keeps the packed mask, and so does every other
+  refused shape - `kq_mask_derivable()` re-runs the whole predicate per ubatch, so correctness never depends on the
+  reserve latch (`kq_mask_multiseq_seen` saves only the one growth the r160 latch pattern also prevents, and is the
+  one refusal that depends on the *cache* rather than on the batch).  The shared-cell counter
+  (`llama_kv_cells::get_n_multi_seq`) is a **fast path, never the semantics**: an under-count is a silently wrong
+  mask, so the O(used cells) scan is the answer it licenses skipping, and a new way to put two sequences in one cell
+  must bump it.  Measured -1.03 GiB device + 0.94 GiB pinned host at `-c 245760 -ub 2048 --parallel 2` (dense 27B),
+  prefill neutral, and **zero** on a graph that also holds an `allow_derived == false` builder (qwen4exp/QSA, MLA -
+  Flash-Next measures identical VRAM and RSS); a server that really shares prefixes pays one re-reserve and then
+  keeps the packed mask.  `LLAMA_KQ_MASK_DERIVED_MULTISEQ=0` is the A/B arm (and the packed reserve); judge it with
+  `gate-prefill-logits.sh --ctx 512 --ub 2048 --ab "LLAMA_KQ_MASK_DERIVED_MULTISEQ=0"` (0.000000 / 100.000 %) plus a
+  cell-by-cell oracle run, **never** with a two-slot text diff.  `GREEDY-PURITY.md` §70, `WORKLOG.md` 261029.003.
 - **A graph-reuse predicate must look through the memory-context wrappers, and a hybrid context has exactly one
   attention cache to look through (r164, PR #242).**  `llm_graph_input_kq_derived::can_reuse()` sees
   `params.mctx` (the wrapper), never the cache the input was built from, and the pre-r164 code rejected on that

@@ -1,0 +1,66 @@
+From c590e21f4c7ada6666325a0521934d32fdc7c9e2 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 06:26:35 +0800
+Subject: [PATCH] DIAGNOSTIC (not for delivery): LLAMA_KQ_MASK_DERIVED_VERIFY=1
+ compares the derived kq mask with the packed fill cell by cell
+
+---
+ src/llama-kv-cache.cpp | 42 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index b3f3a9c87..2b2bbbc7d 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2414,6 +2414,48 @@ void llama_kv_cache::set_input_kq_derived(
+         tok_lo_data[ii] = (int32_t) lo + seq_offset(seq_id);
+         tok_hi_data[ii] = (int32_t) hi + seq_offset(seq_id);
+     }
++
++    // DIAGNOSTIC oracle, not for delivery (LLAMA_KQ_MASK_DERIVED_VERIFY=1): rebuild the packed mask of this ubatch with the
++    // packed fill itself and compare its visibility with the derived predicate, cell by cell (O(n_kv*n_tps) host work)
++    static const bool verify = [] {
++        const char * e = getenv("LLAMA_KQ_MASK_DERIVED_VERIFY");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (verify) {
++        std::vector<float> packed((size_t) n_kv*n_tps);
++        const args_set_input_kq_mask args = {
++            /*.hparams          =*/ hparams,
++            /*.ubatch           =*/ ubatch,
++            /*.v_cells          =*/ v_cells,
++            /*.seq_to_stream    =*/ seq_to_stream,
++            /*.n_swa            =*/ n_swa,
++            /*.swa_type         =*/ swa_type,
++            /*.n_kv             =*/ n_kv,
++            /*.n_stream         =*/ n_stream_l,
++            /*.n_tps            =*/ n_tps,
++        };
++        set_input_kq_mask_impl<float>(args, packed.data(), causal_attn);
++        int64_t n_vis = 0;
++        int64_t n_bad = 0;
++        for (int64_t i = 0; i < n_tps; ++i) {
++            for (int64_t j = 0; j < n_kv; ++j) {
++                const bool vis_packed  = packed[(size_t) n_kv*i + j] != -INFINITY;
++                const int32_t cp       = cell_pos_data[j];
++                const bool vis_derived = cp != INT32_MIN && cp >= tok_lo_data[i] && cp <= tok_hi_data[i];
++                n_vis += vis_packed;
++                n_bad += vis_packed != vis_derived;
++            }
++        }
++        // the shared-cell counter against a recount
++        const auto & cells_v = v_cells[0];
++        uint32_t n_multi_recount = 0;
++        for (uint32_t j = 0; j < cells_v.size(); ++j) {
++            n_multi_recount += cells_v.seq_get_all(j).count() > 1;
++        }
++        LLAMA_LOG_WARN("%s: verify: n_tps = %lld, n_seqs = %u, n_kv = %lld, visible = %lld, mismatches = %lld, n_multi = %u (recount %u)\n", __func__,
++                (long long) n_tps, ubatch->n_seqs_unq, (long long) n_kv, (long long) n_vis, (long long) n_bad,
++                cells_v.get_n_multi_seq(), n_multi_recount);
++    }
+ }
+ // ==============================================================================================
+ 
+-- 
+2.43.0
+

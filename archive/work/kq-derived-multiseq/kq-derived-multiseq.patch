@@ -1,0 +1,551 @@
+From 72f052486ad725cd0403f73de6c21da766a91a07 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 06:28:20 +0800
+Subject: [PATCH] llama: derived kq mask for batches of several sequences
+ (LLAMA_KQ_MASK_DERIVED_MULTISEQ)
+
+The derived kq mask (V3, block 05) covered single-sequence batches only, so a context with --parallel > 1 and a unified KV
+cache still reserved and filled the packed mask (n_kv x n_ubatch x 2 bytes on the device and again in pinned host memory)
+for its multi-sequence batches: two slots prefilling or verifying together, one slot's prefill next to another's decode.
+The reserve itself measures with n_seq_max sequences, so it always holds the packed mask in such a context.
+
+Several sequences now derive their mask with the same predicate: sequence k of the ubatch (seq_idx) has its cells and its
+tokens' [tok_lo, tok_hi] shifted by k * 2^23, so a token's window never reaches another sequence's cells and the kernels
+are unchanged.  It needs one KV stream, every token in one sequence, no cell shared between two of the batch's sequences
+(llama_memory_seq_cp) and positions below 2^23 (llama_kv_cells now counts the cells that carry more than one sequence,
+so the sharing check costs nothing unless a cell is shared); a batch that does not qualify takes the packed mask, and decode() checks
+each batch before it is split: the first one that cannot be served latches kq_mask_multiseq_seen and re-reserves once
+with the packed mask (as the 2-D position latch does), so a later batch never has to grow the compute buffer.
+The reserve drops the packed mask for n_seq_max > 1 on a plain cache, the attention part of a hybrid memory and both
+caches of an iSWA memory.
+Batches of several sequences of at most 32 tokens (multi-slot verify steps) keep the packed mask, which the reserve covers;
+one sequence keeps offset 0: its inputs are unchanged.
+
+LLAMA_KQ_MASK_DERIVED_MULTISEQ=0 restores the single-sequence rule.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp  |  74 ++++++++++++++++++++++++-
+ src/llama-context.h    |  10 ++++
+ src/llama-kv-cache.cpp | 121 ++++++++++++++++++++++++++++++++++++-----
+ src/llama-kv-cache.h   |   9 +++
+ src/llama-kv-cells.h   |  53 ++++++++++++++++++
+ 5 files changed, 251 insertions(+), 16 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b52cc3ceb..ff03035fb 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -11,6 +11,9 @@
+ #include "llama-batch.h"
+ #include "llama-io.h"
+ #include "llama-memory.h"
++#include "llama-kv-cache.h"
++#include "llama-memory-hybrid.h"
++#include "llama-kv-cache-iswa.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
+@@ -36,6 +39,44 @@
+ // llama_context
+ //
+ 
++// a batch of several sequences the derived kq mask cannot serve (see llama_kv_cache::kq_mask_derivable_seqs); a batch of
++// at most KQ_DERIVED_MULTISEQ_MIN_TOKENS tokens has only ubatches that keep the packed mask, which the reserve covers
++static bool batch_needs_packed_multiseq(const llama_batch_ext & batch, const std::vector<llama_kv_cache *> & kvs) {
++    if (kvs.empty() || batch.tokens.size() <= llama_kv_cache::KQ_DERIVED_MULTISEQ_MIN_TOKENS) {
++        return false;
++    }
++
++    std::vector<llama_seq_id> seqs;
++    std::vector<bool> seen(LLAMA_MAX_SEQ, false);
++    llama_pos pos_max = 0;
++
++    for (const auto & tok : batch.tokens) {
++        if (tok.seq_ids.size() > 1) {
++            return true;
++        }
++        for (const llama_seq_id s : tok.seq_ids) {
++            if (s < 0 || s >= LLAMA_MAX_SEQ) {
++                return true;
++            }
++            if (!seen[s]) {
++                seen[s] = true;
++                seqs.push_back(s);
++            }
++        }
++        pos_max = std::max(pos_max, tok.pos[0]);
++    }
++
++    if (seqs.size() <= 1) {
++        return false;
++    }
++    for (const auto * kv : kvs) {
++        if (!kv->kq_mask_derivable_seqs(seqs.data(), (uint32_t) seqs.size(), pos_max)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ // issue #238: does this batch carry a non-degenerate 2-D (M-RoPE) position?  Only an embedding entry (an
+ // image/audio chunk, i.e. no token id) can: the batch allocator expands a text entry to [p, p, p, 0], so a
+ // text token is degenerate by construction.  This mirrors what llama_ubatch::is_pos_2d() + the check in
+@@ -1221,6 +1262,19 @@ bool llama_context::sched_alt_for(const llama_ubatch & ubatch) const {
+     return n_outputs > 0;
+ }
+ 
++std::vector<llama_kv_cache *> llama_context::kq_mask_kvs() const {
++    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
++        return { kv };
++    }
++    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
++        return { hybrid->get_mem_attn() };
++    }
++    if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
++        return { iswa->get_base(), iswa->get_swa() };
++    }
++    return {};
++}
++
+ bool llama_context::kq_mask_packed_reachable() const {
+     // issue #238: an explicit LLAMA_KQ_MASK_PACKED_RESERVE=1 restores the pre-r160 worst-case reserve for
+     // every model (an A/B arm and a safety valve, not a policy)
+@@ -1228,6 +1282,14 @@ bool llama_context::kq_mask_packed_reachable() const {
+         return true;
+     }
+ 
++    // several sequences in one batch: on a single-stream cache they derive their mask too (each in its own position
++    // range, llama_kv_cache::kq_mask_derivable_seqs); a batch they cannot serve latches `kq_mask_multiseq_seen` in
++    // decode() and re-reserves once.  Without the multi-sequence form (LLAMA_KQ_MASK_DERIVED_MULTISEQ=0, or a memory
++    // it does not cover) such batches take the packed mask.
++    const bool multiseq_packed = cparams.n_seq_max > 1 &&
++            (kq_mask_multiseq_seen || !cparams.kq_mask_derived || kq_mask_kvs().empty() ||
++             !llama_kv_cache::kq_mask_derived_multiseq_enabled());
++
+     if (model.hparams.n_pos_per_embd() > 1) {
+         // 2-D (M-RoPE) positions.  Only a caller that can submit them (a multimodal projector) needs the
+         // packed mask reserved up front; a 2-D batch that arrives on a context which did not declare it
+@@ -1237,10 +1299,10 @@ bool llama_context::kq_mask_packed_reachable() const {
+         if (cparams.kq_mask_packed_reserve == 0) {
+             return false;
+         }
+-        return cparams.kq_mask_pos_2d || kq_mask_pos_2d_seen;
++        return cparams.kq_mask_pos_2d || kq_mask_pos_2d_seen || multiseq_packed;
+     }
+ 
+-    if (cparams.n_seq_max > 1) {
++    if (multiseq_packed) {
+         return true;
+     }
+ 
+@@ -2874,6 +2936,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         LLAMA_LOG_INFO("%s: 2-D (M-RoPE) positions in this batch - re-reserving with the packed kq mask\n", __func__);
+     }
+ 
++    // the same for a batch of several sequences the derived kq mask cannot serve together
++    if (!kq_mask_multiseq_seen && cparams.kq_mask_packed_reserve != 0 && cparams.n_seq_max > 1 && cparams.kq_mask_derived &&
++            llama_kv_cache::kq_mask_derived_multiseq_enabled() && batch_needs_packed_multiseq(batch_inp, kq_mask_kvs())) {
++        kq_mask_multiseq_seen = true;
++        sched_need_reserve = true;
++        LLAMA_LOG_INFO("%s: a batch of several sequences the derived kq mask cannot serve - re-reserving with the packed kq mask\n", __func__);
++    }
++
+     sched_reserve();
+ 
+     bool did_optimize = false;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index b634acd74..49993fd96 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -19,6 +19,7 @@
+ struct llama_model;
+ class llama_batch_allocr;
+ class llama_moe_cache;
++class llama_kv_cache;
+ 
+ class llama_io_read_i;
+ class llama_io_write_i;
+@@ -470,6 +471,15 @@ private:
+     // kq_mask_packed_reachable()
+     bool kq_mask_pos_2d_seen = false;
+ 
++    // latched by decode() when a batch of several sequences arrives that the derived kq mask cannot serve (a cell shared
++    // between two of them, a token in several, a position past the stride - llama_kv_cache::kq_mask_derivable_seqs), so
++    // the packed kq mask is reserved from then on - see kq_mask_packed_reachable()
++    bool kq_mask_multiseq_seen = false;
++
++    // the attention KV caches the derived kq mask is decided on: the cache itself, the attention part of a hybrid memory, or
++    // both caches of an iSWA memory; empty for any other memory
++    std::vector<llama_kv_cache *> kq_mask_kvs() const;
++
+     // whether the reserve graph has a logits tensor, set in sched_reserve()
+     // true until then, because the first output_reserve() runs before any graph is reserved
+     bool graph_has_logits = true;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index cd5865fdd..b3f3a9c87 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2172,6 +2172,54 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+ // (M-RoPE) positions with a live ext clause.  Everything else keeps the packed mask.  Note that
+ // this is not a correctness escape hatch - the host oracle has to be re-run on every model when
+ // this predicate is extended.
++// Several sequences in one batch (`--kv-unified` with more than one slot: two slots verifying together, or one slot's
++// prefill next to another's decode) derive their mask with the same predicate: sequence k of the ubatch (seq_idx) has
++// its cells and its tokens' window shifted by k*KQ_DERIVED_SEQ_STRIDE, so a token's [tok_lo, tok_hi] never reaches
++// another sequence's cells and the kernels need no change.  This holds when every cell carries at most one of the
++// batch's sequences (a cell copied to two of them with llama_memory_seq_cp would have to be visible to both ranges)
++// and every position stays below the stride; 2^23 positions per sequence keep all LLAMA_MAX_SEQ ranges inside int32.
++static constexpr llama_pos KQ_DERIVED_SEQ_STRIDE = 1 << 23;
++static_assert((int64_t) KQ_DERIVED_SEQ_STRIDE*LLAMA_MAX_SEQ - 1 <= INT32_MAX, "the shifted ranges must fit in int32");
++
++bool llama_kv_cache::kq_mask_derived_multiseq_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("LLAMA_KQ_MASK_DERIVED_MULTISEQ");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled;
++}
++
++bool llama_kv_cache::kq_mask_derivable_seqs(const llama_seq_id * seqs, uint32_t n_seqs, llama_pos pos_max) const {
++    if (!kq_mask_derived_multiseq_enabled() || n_stream != 1 || n_seqs > LLAMA_MAX_SEQ || pos_max >= KQ_DERIVED_SEQ_STRIDE) {
++        return false;
++    }
++
++    const auto & cells = v_cells[0];
++
++    llama_kv_cells::seq_set_t in_batch;
++    for (uint32_t k = 0; k < n_seqs; ++k) {
++        if (seqs[k] < 0 || seqs[k] >= LLAMA_MAX_SEQ || cells.seq_pos_max(seqs[k]) >= KQ_DERIVED_SEQ_STRIDE) {
++            return false;
++        }
++        in_batch.set(seqs[k]);
++    }
++
++    // no cell carries two sequences at all (the common case: nothing was copied with llama_memory_seq_cp)
++    if (cells.get_n_multi_seq() == 0) {
++        return true;
++    }
++
++    // O(used cells): about 2 ms at 245760 cells, so only when some cell is shared
++    const uint32_t n_used = cells.used_max_p1();
++    for (uint32_t j = 0; j < n_used; ++j) {
++        if ((cells.seq_get_all(j) & in_batch).count() > 1) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
+ bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
+     // alibi writes a distance into the mask, that is a value, not a predicate
+     if (hparams.use_alibi) {
+@@ -2187,20 +2235,31 @@ bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
+         return false;
+     }
+ 
+-    // single sequence, single stream:
+-    //  - a single sequence means every cell is either "own" or "foreign", which is what the
+-    //    INT32_MIN sentinel encodes (no per-sequence bitset is needed)
+-    //  - a single unique sequence also makes the ubatch's stream count 1, whatever kv_unified says
+-    if (ubatch.n_seqs_unq != 1) {
+-        return false;
+-    }
+-
+     // prefill-shaped batches only: below this the packed mask is a few hundred KiB, the launcher may
+     // pick the vec/tile kernels and decode has to stay on the packed path
+     if (ubatch.n_tokens <= 8) {
+         return false;
+     }
+ 
++    // one sequence: every cell is either "own" or "foreign", which is what the INT32_MIN sentinel encodes.
++    // Several sequences (one KV stream, as checked above): each gets its own position range, see
++    // kq_mask_derivable_seqs - every token in one sequence, no cell shared between two of them
++    if (ubatch.n_seqs_unq != 1) {
++        if (ubatch.n_tokens <= KQ_DERIVED_MULTISEQ_MIN_TOKENS) {
++            return false;
++        }
++        llama_pos pos_max = 0;
++        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++            if (ubatch.n_seq_id[i] != 1) {
++                return false;
++            }
++            pos_max = std::max(pos_max, ubatch.pos[i]);
++        }
++        if (!kq_mask_derivable_seqs(ubatch.seq_id_unq, ubatch.n_seqs_unq, pos_max)) {
++            return false;
++        }
++    }
++
+     // M-RoPE: the derived form carries no 2-D ext clause, so it is only usable while the positions
+     // are degenerate (x == y == pos).  qwen35 is IMROPE, so this is hit even for text input.
+     if (ubatch.is_pos_2d()) {
+@@ -2215,8 +2274,13 @@ bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
+ 
+         const auto & cells = v_cells.at(seq_to_stream[ubatch.seq_id[0][0]]);
+ 
++        llama_kv_cells::seq_set_t in_batch;
++        for (uint32_t k = 0; k < ubatch.n_seqs_unq; ++k) {
++            in_batch.set(ubatch.seq_id_unq[k]);
++        }
++
+         for (uint32_t j = 0; j < cells.size(); ++j) {
+-            if (cells.is_empty(j) || !cells.seq_has(j, ubatch.seq_id[0][0])) {
++            if (cells.is_empty(j) || (cells.seq_get_all(j) & in_batch).none()) {
+                 continue;
+             }
+ 
+@@ -2248,7 +2312,13 @@ void llama_kv_cache::set_input_kq_derived(
+     // the derived form is only created for the shape kq_mask_derivable() accepts; the asserts above
+     // and here keep the fill aligned with the packed fill in set_input_kq_mask
+     GGML_ASSERT(n_stream_l == 1);
+-    GGML_ASSERT(ubatch->n_seqs_unq == 1);
++
++    // several sequences: sequence k of the ubatch lives in [k*KQ_DERIVED_SEQ_STRIDE, (k + 1)*KQ_DERIVED_SEQ_STRIDE)
++    // (see kq_mask_derivable_seqs); one sequence keeps offset 0 and the unbounded non-causal window
++    const bool multi_seq = ubatch->n_seqs_unq > 1;
++    auto seq_offset = [&](llama_seq_id s) -> int32_t {
++        return multi_seq ? ubatch->seq_idx[s]*KQ_DERIVED_SEQ_STRIDE : 0;
++    };
+ 
+     // see llama_non_causal_type - same adjustment as set_input_kq_mask
+     if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+@@ -2273,7 +2343,7 @@ void llama_kv_cache::set_input_kq_derived(
+     int32_t * tok_hi_data   = (int32_t *) tok_hi->data;
+ 
+     // per-cell positions (INT32_MIN = never visible)
+-    {
++    if (!multi_seq) {
+         const llama_seq_id seq_id = ubatch->seq_id[0][0];
+ 
+         const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+@@ -2283,6 +2353,29 @@ void llama_kv_cache::set_input_kq_derived(
+ 
+             cell_pos_data[j] = own ? (int32_t) cells.pos_get(j) : INT32_MIN;
+         }
++    } else {
++        const auto & cells = v_cells.at(seq_to_stream[ubatch->seq_id[0][0]]);
++
++        llama_kv_cells::seq_set_t in_batch;
++        for (uint32_t k = 0; k < ubatch->n_seqs_unq; ++k) {
++            in_batch.set(ubatch->seq_id_unq[k]);
++        }
++
++        for (int64_t j = 0; j < n_kv; ++j) {
++            cell_pos_data[j] = INT32_MIN;
++
++            if (cells.is_empty(j) || (cells.seq_get_all(j) & in_batch).none()) {
++                continue;
++            }
++
++            // kq_mask_derivable_seqs: exactly one of the batch's sequences
++            for (uint32_t k = 0; k < ubatch->n_seqs_unq; ++k) {
++                if (cells.seq_has(j, ubatch->seq_id_unq[k])) {
++                    cell_pos_data[j] = (int32_t) cells.pos_get(j) + seq_offset(ubatch->seq_id_unq[k]);
++                    break;
++                }
++            }
++        }
+     }
+ 
+     // per-token visibility window
+@@ -2290,7 +2383,7 @@ void llama_kv_cache::set_input_kq_derived(
+         const llama_seq_id seq_id = ubatch->seq_id[ii][0];
+ 
+         const llama_pos p1   = ubatch->pos[ii];
+-        const llama_pos hi   = causal_attn ? p1 : INT32_MAX;
++        const llama_pos hi   = causal_attn ? p1 : (multi_seq ? KQ_DERIVED_SEQ_STRIDE - 1 : INT32_MAX);
+ 
+               llama_pos lo   = 0;
+ 
+@@ -2318,8 +2411,8 @@ void llama_kv_cache::set_input_kq_derived(
+             lo = 0;
+         }
+ 
+-        tok_lo_data[ii] = (int32_t) lo;
+-        tok_hi_data[ii] = (int32_t) hi;
++        tok_lo_data[ii] = (int32_t) lo + seq_offset(seq_id);
++        tok_hi_data[ii] = (int32_t) hi + seq_offset(seq_id);
+     }
+ }
+ // ==============================================================================================
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 563631163..6bf874cb5 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -257,6 +257,15 @@ public:
+     // per-cell state (see set_input_kq_derived).  The predicate is exactly the shape the phase-1
+     // host oracle proved bit-exact against the packed fill - extend it only with new coverage.
+     bool kq_mask_derivable(const llama_ubatch & ubatch) const;
++
++    // the derived kq mask over several sequences (LLAMA_KQ_MASK_DERIVED_MULTISEQ, on unless 0): each sequence of the
++    // batch gets its own position range, so it needs every cell to carry at most one of `seqs` and every position below
++    // the range stride (see kq_mask_derivable_seqs in the .cpp)
++    static bool kq_mask_derived_multiseq_enabled();
++    // a batch of several sequences takes the derived form only above this many tokens: the multi-slot verify batches below
++    // it (2 x 6, 4 x 6, 2 x 16 rows) keep the packed mask, whose few MiB the reserve covers, and the per-ubatch checks
++    static constexpr uint32_t KQ_DERIVED_MULTISEQ_MIN_TOKENS = 32;
++    bool kq_mask_derivable_seqs(const llama_seq_id * seqs, uint32_t n_seqs, llama_pos pos_max) const;
+     void set_input_kq_derived(
+             ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+             const llama_ubatch * ubatch, bool causal_attn) const;
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index e6d40c6b4..6374d95b5 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -53,6 +53,8 @@ public:
+         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+             seq_pos[s].clear();
+         }
++
++        n_multi = 0;
+     }
+ 
+     void reset_shift() {
+@@ -170,6 +172,10 @@ public:
+             res.ext[j] = ext[idx];
+             res.seq[j] = seq[idx];
+ 
++            if (res.seq[j].count() > 1) {
++                res.n_multi++;
++            }
++
+             assert(shift[idx] == 0);
+         }
+ 
+@@ -189,6 +195,10 @@ public:
+             res.ext[j] = ext[idx];
+             res.seq[j] = seq[idx];
+ 
++            if (res.seq[j].count() > 1) {
++                res.n_multi++;
++            }
++
+             assert(shift[idx] == 0);
+         }
+ 
+@@ -214,10 +224,18 @@ public:
+                 seq_pos_rm(i + j);
+             }
+ 
++            if (seq[idx].count() > 1) {
++                n_multi--;
++            }
++
+             pos[idx] = other.pos[j];
+             ext[idx] = other.ext[j];
+             seq[idx] = other.seq[j];
+ 
++            if (seq[idx].count() > 1) {
++                n_multi++;
++            }
++
+             if (pos[idx] != -1) {
+                 seq_pos_add(i + j);
+             }
+@@ -245,10 +263,18 @@ public:
+                 seq_pos_rm(idx);
+             }
+ 
++            if (seq[idx].count() > 1) {
++                n_multi--;
++            }
++
+             pos[idx] = other.pos[j];
+             ext[idx] = other.ext[j];
+             seq[idx] = other.seq[j];
+ 
++            if (seq[idx].count() > 1) {
++                n_multi++;
++            }
++
+             if (pos[idx] != -1) {
+                 seq_pos_add(idx);
+             }
+@@ -263,6 +289,9 @@ public:
+         assert(pos[i] != -1);
+ 
+         seq_pos_rm(i);
++        if (seq[i].count() > 1) {
++            n_multi--;
++        }
+         seq[i].reset();
+ 
+         pos[i] = -1;
+@@ -280,6 +309,9 @@ public:
+         assert(pos[i] != -1);
+         assert(seq_id >= 0);
+ 
++        if (seq[i].count() == 2) {
++            n_multi--;
++        }
+         seq[i].reset(seq_id);
+         seq_pos_dec(seq_id, i);
+ 
+@@ -302,6 +334,9 @@ public:
+ 
+         if (seq[i].test(seq_id)) {
+             seq_pos_rm(i);
++            if (seq[i].count() > 1) {
++                n_multi--;
++            }
+             seq[i].reset();
+ 
+             seq[i].set(seq_id);
+@@ -312,6 +347,9 @@ public:
+ 
+         if (seq[i].any()) {
+             seq_pos_rm(i);
++            if (seq[i].count() > 1) {
++                n_multi--;
++            }
+             seq[i].reset();
+ 
+             pos[i] = -1;
+@@ -336,6 +374,11 @@ public:
+         return seq[i].count();
+     }
+ 
++    // the number of cells that carry more than one sequence
++    uint32_t get_n_multi_seq() const {
++        return n_multi;
++    }
++
+     // the full set of sequences this cell is visible to
+     const seq_set_t & seq_get_all(uint32_t i) const {
+         assert(i < pos.size());
+@@ -385,6 +428,10 @@ public:
+ 
+         seq[i].set(seq_id);
+         seq_pos_inc(seq_id, i);
++
++        if (seq[i].count() == 2) {
++            n_multi++;
++        }
+     }
+ 
+     // return the sequence id of this cell
+@@ -490,6 +537,9 @@ public:
+         has_shift = true;
+ 
+         if (pos[i] < 0) {
++            if (seq[i].count() > 1) {
++                n_multi--;
++            }
+             seq[i].reset();
+             pos[i] = -1;
+             shift[i] = 0;
+@@ -554,6 +604,9 @@ private:
+     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
+     std::vector<seq_set_t> seq;
+ 
++    // the number of cells that carry more than one sequence (llama_memory_seq_cp); 0 lets kq_mask_derivable_seqs skip its scan
++    uint32_t n_multi = 0;
++
+     // the set seq_pos[s] holds one (pos, cell) pair per cell that carries sequence s, ordered by position
+     // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache
+     // and upper_bound() on a position finds the nearest cell of the sequence in logarithmic time
+-- 
+2.43.0
+

@@ -1,5 +1,77 @@
 # WORKLOG - dated delivery records
 
+## 261029.003 (r172) -- PR #247 (the derived kq mask for batches of several sequences) promoted into block 05: 1 GiB of device and 0.9 GiB of pinned host memory back on a 2-slot unified server
+
+**Released as `v15-6050b467c-r172` (15 blocks, 00-14).**  Contributor PR
+[#247](https://github.com/stew675/llama-cpp-rdna-boosts/pull/247) (`@overdoingism`, `wip/kq-derived-multiseq/`) extends
+block 05's derived kq mask to ubatches holding several sequences, which is the r160-era hole with money in it: a
+`--parallel > 1 --kv-unified` server could never derive a multi-sequence batch, and because `sched_reserve()` measures
+with `n_seq_max` sequences it reserved the packed mask even when no batch ever held two.  Folded into **block 05**
+(where the derived mask lives); the PR's record moved to `archive/work/kq-derived-multiseq/`.
+
+**The change.**  Sequence `k` of the ubatch gets its own position range: its cells and its tokens' `[lo, hi]` both
+shift by `k * 2^23` (`KQ_DERIVED_SEQ_STRIDE`), so the single predicate `tok_lo <= cell_pos <= tok_hi` keeps every token
+inside its own sequence's window and **no kernel changes** (both FA families, and the batch-wide skip window stays
+conservative).  The ranges are provably disjoint for `pos < 2^23`, and
+`static_assert((int64_t) KQ_DERIVED_SEQ_STRIDE*LLAMA_MAX_SEQ - 1 <= INT32_MAX)` turns an upstream `LLAMA_MAX_SEQ` bump
+into a build error rather than an overflow.  It is taken only with one KV stream, every token in exactly one sequence,
+**no cell carrying two of the batch's sequences** (a prefix copied with `llama_memory_seq_cp`) and every position below
+the stride; a multi-sequence batch of **at most 32 tokens** - exactly the multi-slot verify width - and every other
+refused shape keep the packed mask.  `llama_kv_cells` gains an O(1) shared-cell counter, so the sharing check costs
+nothing unless something was copied.  `kq_mask_packed_reachable()` loses its `n_seq_max > 1` term and `decode()` latches
+`kq_mask_multiseq_seen` on the first pre-split batch the form cannot serve, then re-reserves once with the packed mask
+(the r160 2-D pattern, so no batch grows the compute buffer - issue #42).
+
+**Purity: the derived predicate *is* the packed one, verified cell by cell.**  Re-ran the contributor's diagnostic
+oracle (`LLAMA_KQ_MASK_DERIVED_VERIFY=1`, which rebuilds each derived ubatch's mask with `set_input_kq_mask` and
+compares visibility per (token, cell)) on gfx1201: **0 mismatches** on every derived multi-sequence ubatch of
+`llama-perplexity -c 512 -b 2048 -ub 2048 --kv-unified` (4 sequences per batch) for dense 27B Q8_0 (1 GPU and 2 GPU
+`-sm tensor`), Qwen3.5-4B (hybrid attention + GDN), Gemma4-12B and gpt-oss-20b (both iSWA, the latter with a live SWA
+window: `visible = 229632`), 2-4 derived multi-sequence ubatches each, per-chunk PPL identical to the packed arm.  The
+shared-cell counter passed its randomized check locally too (400 000 random operations over 512 cells x 6 sequences,
+counter == recount after each, shared cells in 385 495 of the states).  Logit level:
+`gate-prefill-logits.sh --ctx 512 --chunks 40 --ub 2048 --ab "LLAMA_KQ_MASK_DERIVED_MULTISEQ=0"` reads **0.000000 /
+100.000 %** at **f16 and q8_0** KV; the release-standard gate (`--ctx 512`, single sequence) also reads 0.000000 /
+100.000 %, so nothing outside the multi-sequence path moved.
+
+**Measured (gfx1201, dense 27B UD-Q4_K_XL, `-c 245760 -ub 2048 -b 2048 --parallel 2 --kv-unified -fa on -ctk/-ctv
+q8_0`, 1 GPU).**  After load: device **27 513 004 032 -> 26 405 838 848 B (-1.031 GiB)** and server **RSS 1 964 904 ->
+982 872 kB (-0.937 GiB)** - the contributor's 1.03 / 0.94 GiB reproduce exactly.  Prefill is neutral: two concurrent
+16K-token prompts 26.96 s (packed) vs 27.23 s (derived) at 1 GPU and 17.07 vs 17.09 s at 2 GPU `-sm tensor`; a
+112K-resident decode beside a 16K prefill 13.97 vs 13.96 s.  That is the trade the batch-wide skip window makes (a
+multi-sequence derived ubatch loses the packed path's per-tile group skip) and it is smaller than the host fill the
+derived form removes.  Single-sequence greedy text is byte-identical on and off (dense 27B, 35B-A3B `-ncmoe 30`, hybrid
+4B) and `plain == draft-mtp` still holds (2 GPU `-sm tensor`, 400 tokens).  `gate-park-idle-slots.sh` passes (3 GPU
+tensor, Flash-Next IQ3_XXS + MTP, 3 slots, park moves traced, park == lazyoff byte-identical).
+
+**Two negatives worth recording.**  (1) It buys **nothing on qwen4exp/Flash-Next**: that graph also holds an
+`allow_derived == false` builder (QSA), which creates and fills the packed mask anyway - measured RSS 30 932 856 ->
+30 933 612 kB and identical VRAM, as designed (a memory `kq_mask_kvs()` does not cover keeps the packed reserve, and a
+partially covered one simply gains nothing).  (2) A server that really shares prefixes through `llama_memory_seq_cp`
+(the shared-system-prompt shape) will latch and then keep the packed mask: the 1 GiB is given back for the rest of the
+run.  The latch could not be triggered on this box at all (this server never `seq_cp`s across slots while a slot is
+busy, and prompt-split children run as single-sequence ubatches), so its firing is documented from the contributor's
+`llama-parallel -pps` evidence plus code review; `-pps` here did show `n_multi = 282 (recount 282)` with the derived
+form correctly withheld from the multi-sequence ubatches and identical output.
+
+**Fixed during the fold** (beyond the PR as submitted): the block-10 comment block above
+`kq_mask_packed_reachable()` still claimed multi-sequence batches always need the packed mask (rewritten with the r172
+rule, including the fact that the reserve's own measure batch carries `n_seq_max` sequences); `kq_mask_kvs()` was
+returning a freshly allocated `std::vector` and running 2-3 `dynamic_cast`s on **every** `decode()` batch until a latch
+fires (now resolved once and cached - `memory` is immutable for a context), and `batch_needs_packed_multiseq()`'s
+per-call `std::vector<bool>`/`std::vector` allocations became fixed-size arrays.  No semantic change (the gates above
+were re-run on the folded build).
+
+**A pre-existing chain defect the fold surfaced and fixed.**  Walking the per-block ladder honestly (the rebase
+changes blob hashes, so `--changed-from` selects more than the touched block) failed at **block 09**, and the cause is
+not this PR: r171's `TODO #115` fold removed `ggml_cuda_mmb_routed_will_take` from **block 06** while **block 08** still
+called it, and only **block 10** (which moves the graph optimizer into `ggml-cuda-try-fuse.cu`) deleted that call
+site — so the intermediate trees of blocks 08 and 09 have not compiled since r171, which no release noticed because
+r171's own ladder used `--changed-from` and selected blocks 06, 10 and the tip.  The call site in block 08 now asks
+`ggml_cuda_mmb_supported_mmid()` (r171's rule, and its four arguments are the following `MUL_MAT_ID`'s), so the ladder
+is **5/5** (blocks 05, 08, 09, 10, 14) and the **tip tree is byte-identical** (`83ddc559`) because block 10 deletes the
+region anyway.  `patches/README.md` (block 08) carries the note.
+
 ## 261029.002 (no release) -- PR #244 v3 (DFlash2 adaptive verify width) assessed and not promoted: on r171 it is a 1-15 % loss on every payload we have
 
 **No delivery change, no release, nothing in `patches/`.**  Contributor PR
