@@ -338,6 +338,23 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   pre-existing, not a re-base defect).  So gate a build change **within** each device count (as r116's own
   gates did); use `-sm layer` when a cross-count text comparison is required; never read a 2-vs-3 text
   difference as a purity defect.
+- **The backend-sampling compute buffers are reserved once per sequence, and again only for a WIDER chain
+  (r169, contributor PR #245).**  `llama_context::set_sampler()` used to set `sched_need_reserve` on every set
+  of an offloadable chain **and** on every removal, and `sched_reserve()` re-creates the scheduler (every
+  compute buffer freed and re-allocated, at the same size) — so `llama-server --backend-sampling`, which sets a
+  chain per request and clears it on release (and for a grammar request), paid that before each first token.
+  The buffers now remember what they were reserved with (`sampling.reserved`: per sequence, the chain's
+  `llama_sampler_backend_n_nodes()`) and a reserve is asked for only when a sequence gets a **wider** chain
+  than that.  **The key is the node count, not the sequence id**: `graph_max_nodes()` is recomputed only by a
+  reserve and it sizes the graph's node capacity (`llm_graph_result::max_nodes` -> `ggml_new_graph_custom`,
+  which `ggml_build_forward` asserts on), the scheduler's arrays and the compute-metadata arena, while the
+  allocator's on-demand growth only covers buffer *sizes* — a seq-id-only key misses the widening that
+  `tests/test-backend-sampler.cpp`'s `test_set_sampler` performs (`dist` -> `top_k + dist` on one sequence: 1
+  reserve with the seq-id key, 2 with the node count).  `LLAMA_BACKEND_SAMPLER_RESERVE_ONCE=0` restores the
+  per-set reserve; the change is numerics-neutral (no kernel or dispatch touched), so every greedy-text arm
+  and the prefill logits are byte-identical.  Measured median server prompt time 1963.9 -> 1895.2 ms per
+  sampled request (27B, `-c 65536 --parallel 2 --kv-unified`).  `patches/README.md` (block 12),
+  `upstream/backend-sampler-reserve-once/`, `WORKLOG.md` 261028.011.
 - **The disk tier is bounded by this box's SSD at ~1.8 GB/s, so the cache's currency is `L3 MiB/token`, not
   `h`.**  1 MiB/token of reads that neither VRAM nor the pinned pool holds is ~0.55 ms/token of unavoidable
   stall (~1800 t/s of pure read budget at a 1 MiB/token traffic level, ~100 t/s at 18 MiB/token).  Every

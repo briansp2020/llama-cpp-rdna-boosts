@@ -1,5 +1,85 @@
 # WORKLOG - dated delivery records
 
+## 261028.011 (r169) -- block 12: the backend-sampling compute buffers are reserved once per sequence, and again only for a WIDER chain (contributor PR #245)
+
+**Release `v15-6050b467c-r169`**, base `6050b467c`, 15 blocks, tip `fb7b244316d1ecdfc0e0b982e352ee3f9674452d`,
+tree `a54e74175e9bb1314b5d8bf8a4efb175642aff71`.  **Block 12 amended** (`src/llama-context.cpp` +37/-11,
+`src/llama-context.h` +7/-3, on top of the contributor's patch — see "the key" below for what had to change).
+New kill switch **`LLAMA_BACKEND_SAMPLER_RESERVE_ONCE`** (default on).  No kernel, dispatch row or numerics
+path touched: every greedy-text arm is byte-identical to r168 and `gate-prefill-logits.sh` reads
+**0.000000 / 100.000 %**.
+
+### The defect (llama.cpp's own, not the delivery's)
+
+`llama_context::set_sampler()` set `sched_need_reserve = true` on every set of an offloadable sampler
+chain **and** on every removal, and `sched_reserve()` re-creates the scheduler — freeing and re-allocating
+every compute buffer again, at the same size.  `llama-server --backend-sampling` sets a new chain per
+request (and clears it when a slot is released, or when a grammar request's chain cannot be offloaded), so
+each request paid that before its first token.  The behaviour is upstream's, unchanged on `ggml-org` master
+as of 2026-10-29, so `upstream/backend-sampler-reserve-once/` carries a copy cut against plain `6050b467c`.
+
+### What shipped
+
+`sched_reserve()` records what the buffers were reserved with (`sampling.reserved`) and `set_sampler()`
+asks for a reserve only when that record does not cover the chain it is being given.  A chain set again, a
+narrower one, or a removal needs none: the graph is rebuilt anyway (the samplers are part of the graph-reuse
+check, `llm_graph_params::allow_reuse()` -> `samplers_equal()`), the output buffers are sized per decode
+(`output_reserve()` runs `has_sampling` every batch), and the graph allocator grows a buffer if a chain
+needs more.
+
+**The key is the chain's node count, not the sequence id.**  `graph_max_nodes()` is recomputed *only* by a
+reserve, and it is what sizes the graph's node capacity (`llm_graph_result::max_nodes` ->
+`ggml_new_graph_custom`; `ggml_build_forward` asserts `cgraph->n_nodes < cgraph->size`), the scheduler's
+node/leaf arrays and the compute-metadata arena.  The allocator's on-demand growth covers buffer *sizes*,
+so a chain that is merely bigger in bytes is safe — a chain with **more nodes** is not, and the
+contributor's seq-id-only key missed exactly that case.  `tests/test-backend-sampler.cpp`'s
+`test_set_sampler` *is* that case (a 1-node `dist` chain replaced by `top_k + dist` on the same sequence):
+with the seq-id key it reserved **1** time (the widening was not covered), with the node-count key **2**
+(both size increases covered, the removal and the same-size set still skipped), and it PASSES in both.  The
+margin on this box is large (27B: `max_nodes = 81920` against a 4076-node decode graph, so nothing was
+reachable in practice) — the key was fixed because the invariant has to hold, not because it was measured
+to bite.
+
+### Measurements (gfx1201, 1x R9700, 39xxx host CPU idle)
+
+`llama-server -m Qwen3.8-27B-UD-Q4_K_XL --backend-sampling -ngl 99 -c 65536 -ub 2048 -b 2048 --parallel 2
+--kv-unified -fa on -ctk q8_0 -ctv q8_0`, a 2396-token prompt with `cache_prompt: false`, seven sampled
+requests plus a grammar request and one more sampled request, `ROCBLAS_USE_HIPBLASLT=0`, two interleaved
+starts:
+
+| | r168 | r169 |
+|---|---|---|
+| median prompt time | 1963.9 ms | **1895.2 ms (-68.7 ms, -3.5 %)** |
+| median client time to first token | 2750 ms | 2682 ms |
+| `sched_reserve` lines over 3 requests | 4 | **2** (bring-up only) |
+
+The contributor measured -423 ms on a 3900X; the absolute cost of the reserve is host-dependent, the
+direction and the mechanism are the same.  Request text is byte-identical between the arms in all three
+shapes (`f2b480f90a04abaf` for greedy and for seeded temperature 0.7, `e95291773c15cb25` for the grammar
+fallback).
+
+### Release gates
+
+* **Coherence**: 4B `220 chars sha=6ff72e08d38b` (1 GPU, `-sm tensor`) and 27B `138 chars sha=55824e640aa0`
+  (2 GPU `-sm tensor`), each identical to the r168 build in the same build dir.
+* **MTP Protocol A** (27B UD-Q4_K_XL, `-n 3000`, prose, 3 GPU): layer **51.74 t/s** / acceptance **0.62134**,
+  tensor **101.05 t/s** / acceptance **0.60816**, plain arms 24.99 / 50.69 — i.e. draft-mtp >= plain in
+  both split modes and acceptance at the recorded reference level.  A `-n 600` tensor arm generated
+  byte-identical text to r168 (only the build-id banner line and the perf line differ), as expected: no
+  backend sampler is set there, so `sampling.samplers` is empty in both builds.
+* **Prefill logits**: `gate-prefill-logits.sh` **0.000000 / 100.000 %**.
+* **Batched bench** (`-npp 16 -ntg 32 -npl 1,4,8`, q8_0 KV, 1 GPU): B=1/4/8 **30.24 / 98.19 / 151.28** t/s
+  against r168's 30.28 / 98.50 / 151.70 — within noise (this change is not on that path).
+* **Per-block build**: `--fast --changed-from fcf00b46c` -> **2/2 built, 0 failed** (blocks 12 and 14; every
+  other block's delta is unchanged).
+* **`validate-set.sh`**: green — checksums, strict 15/15 apply on a fresh tarball, tree equality, the
+  conflict-marker/subject scan and the Windows portability lint (282 files).
+* **`fork-refresh.sh`** re-cut the set from `patches/` at `6050b467c` and reproduced tip
+  `fb7b244316d1ecdfc0e0b982e352ee3f9674452d` / tree `a54e74175e9bb1314b5d8bf8a4efb175642aff71` exactly.
+* **No GPU fault** in any run (`check-gpu-faults.sh`).
+
+The convention holds: the delivery's copy keeps the kill switch, the `upstream/` copy does not.
+
 ## 261028.010 (r168) -- TODO #70 closed: a re-arm is layer-uniform or the layer is stood down, and a starved wide-aux growth is decided once per wide pass
 
 **Release `v15-6050b467c-r168`**, base `6050b467c`, 15 blocks, tip `fcf00b46cff86b07100536a8174498ddd49b2d1c`,
