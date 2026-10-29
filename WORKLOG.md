@@ -65,6 +65,38 @@ reports `dflash.block_size=8`, so `--spec-draft-n-max` is clamped to 7, and `ban
 binds.  It binds at 3 (`16 / 3 - 1 = 4`); a `--parallel 3` arm exercises that path and runs clean (no abort, no
 GPU fault).  So the band half of the patch is correct and, on RDNA4, almost unreachable.
 
+**What a fix would take (measured, not asserted).**  The true fixed-width optima on the same arms, and two
+controller prototypes (both throw-away edits in the scratch tree, `first decision deferred to 32 reviews` +
+`no second downward move inside 16`):
+
+| fixed-width optimum | 5 | 6 | 7 |
+|---|---|---|---|
+| 35B-A3B arena, prose `-n 192` | 132.8 | **135.5** | 128.3 |
+| 35B-A3B arena, prose `-n 512` | -- | 174.5 | 174.6 (flat) |
+| 27B dense, prose `-n 192` | 83.7 | **87.0** | 84.1 |
+| 27B dense, prose `-n 512` | -- | 110.5 | 112.3 |
+| 27B dense, code / recall `-n 192` | 106.8 / 122.2 | 107.2 / 132.7 | **113.1 / 144.9** |
+
+| arm | shipped | deferral prototype | deferral + `COST=0.15` |
+|---|---|---|---|
+| 27B prose / code / recall / reasoning, 1 GPU | 79.1 / 111.9 / 142.6 / 101.5 | **83.8 / 112.5 / 144.6 / 99.3** | -- |
+| 35B arena prose `-n 192` / `-n 512` | 108.8 / 153.5 | **130.1 / 175.0** | 127.1 / -- |
+
+So deferring the first decision removes the whole loss (prose 79.1 -> 83.8 against fixed 84.1; arena 108.8 ->
+130.1 against 128.3) and also makes the controller **inert** — `draft_n`/`draft_n_accepted` come out identical to
+the fixed-7 arm (280/150, 300/148, 623/421), i.e. with only 35-45 drafts in a 192-token response it never moves.
+Raising `COST` to this arm's own step-time fit (~0.15; `a + b*rows` over the fixed 5/6/7 arms) makes it move
+7 -> 6 exactly once — at review 32 — which is too late to pay (127.1 against fixed 6's 135.5).  Both are needed
+and neither is sufficient inside a short response, so the ranked fixes are: (1) **carry the width across requests
+per slot** (`adapt_reset()` in `begin()` throws away the one thing the first response learned; a chat session is
+hundreds of drafts, a response is ~40) — the transient then costs once per session; (2) **do not compare widths
+whose positions are unobserved** (`adapt_value()`'s prior chain turns a 2/7 streak into p~0.3 at positions 5-7,
+which is what produced 7 -> 5 -> 3); (3) one width per decision plus the no-repeat window; (4) measure the cost
+rather than model it — the interval between two `draft()` calls divided by `1 + accepted` is tokens-per-ms per
+width, and the accepted count is already in `n_hit`/`n_seen`, so `COST` (0.09 here, ~0.15 on the arena arm — a 2x
+error worth ~5 % of width) disappears.  A perfect controller buys 0-5.6 % on our short responses and ~0 at 512;
+the `zh` +18 % class is where the feature earns its keep.
+
 **Decision.**  Not promoted; the PR keeps its `needs more info` state and the reply asks for (1) a start/seed fix so
 the first decisions are not taken on 8 decayed drafts — e.g. seed from the model's observed full-block acceptance
 (`draft_n_accepted / draft_n` at `n_max`), or defer the first decision until the counts are dense, and forbid a
