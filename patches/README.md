@@ -215,8 +215,12 @@ aggregate **104.8-108.3 -> 140.1-140.6 t/s at 2 GPU (+30..34 %)**, **86.5-87.0 -
 (+54 %)**, 35B-A3B `-ncmoe 40` **116.2 -> 149.0 (+28 %)**; split decode steps 58 -> 0 at each; equal-length arm
 -0.4..-2.1 %; single-sequence text byte-identical.  The low-acceptance slot of a mixed pair verifies at its
 neighbour's width, which is a new numerics reference for that config rather than a defect: each config is
-deterministic run to run, and `LLAMA_SPEC_ALIGN=0` vs `=1` differ just as `--spec-draft-n-max 4` vs `5` do
-(`GREEDY-PURITY.md` §63).  Record: `archive/work/spec-align-234/`.
+deterministic run to run -- a **single-slot** statement: a two-slot aligned pair is not reliably stable across
+runs, because the alignment couples the slots (`GREEDY-PURITY.md` §63) -- and `LLAMA_SPEC_ALIGN=0` vs `=1` differ
+just as `--spec-draft-n-max 4` vs `5` do.  **A slot that cannot draft at all** (its last token, or a full
+context) still splits that one step, deliberately: that ubatch carries the neighbour's genuine draft rows, and
+both alternatives measured neutral (`TODO.md` #111, analysed and declined).  Record:
+`archive/work/spec-align-234/`.
 
 **The draft's KV cache type follows the main `-ctk` / `-ctv` (r125, issue #216).**  Upstream gives the
 speculative draft context its own KV type pair (`--spec-draft-type-k` / `-ctvd`, defaulting to **f16**)

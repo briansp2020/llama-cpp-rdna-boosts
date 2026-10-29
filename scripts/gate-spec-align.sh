@@ -17,9 +17,9 @@
 #   multi-slot server with two concurrently verifying slots, and it shows up only as throughput.
 #
 #   The fix (`LLAMA_SPEC_ALIGN`, default ON) raises every drafting sequence's cap to the deepest one in the
-#   same draft call, and cuts the drafts to the shortest when the lengths still differ (a different drafter
-#   per slot).  Padding the shorter sequence is NOT an option: a padded row advances the recurrent state in
-#   `mem_recr->prepare()`.
+#   same draft call (bounded by the smallest hard cap and by the expert cache's band).  Padding the shorter
+#   sequence is NOT an option: a padded row advances the recurrent state in `mem_recr->prepare()`, and cutting
+#   the other slots' finished drafts down is a measured loss (see the mixed-drafter bullet below).
 #
 # WHAT IT CHECKS
 #   HARD  * no arm aborts (GGML_ASSERT / terminate / segfault in its log) and
@@ -60,6 +60,16 @@
 #   HARD  * the control arm actually DIVERGED: it must split at least one decode step into several ubatches
 #           (read from the recurrent memory's `RSPREP` trace, `LLAMA_RS_ROLLBACK_DEBUG=1`).  Without that the
 #           gate would pass having measured nothing, so it fails with an explanation instead.
+#   HARD  * the knob-on arm's SINGLE-ROW split steps stay within `TAIL_MAX` (default 2, i.e. one per response
+#           boundary).  Two kinds of split are counted separately: a draft-length split (every ubatch >= 2 rows
+#           -- the defect this gate exists for, which must be 0 with the knob on) and a tail split (one ubatch
+#           of a single row, i.e. a slot that could not draft at all because it is on its last token or its
+#           context is full).  The tail split is DELIBERATE and bounded rather than fixed: `TODO.md` #111 was
+#           analysed and declined, because that second ubatch carries the neighbour's genuine draft rows, so the
+#           pass count is equivalent either way (`benchmarks/2026-10-28-spec-align-111.md`).  Counting and
+#           bounding it is what makes a regression visible -- before that count existed, single-row groups were
+#           excluded from the split count entirely, so a change that MANUFACTURED them (a slot that stopped
+#           drafting, a slot cut to one row to dodge a mismatch) passed silently.
 #   INFO  per-slot and aggregate t/s per arm, the aggregate ratio, the split-step counts, and (--with-fixed)
 #           the checkpoints the fix recovers against a fixed-depth `--spec-type draft-mtp -n 3` arm
 #
@@ -99,6 +109,8 @@
 #   CTX           context               (default: 32768)
 #   RECOVER       min aggregate gain of the diverging pair (default: 1.10)
 #   REGRESS       max aggregate loss of the equal-length arm (default: 0.98)
+#   TAIL_MAX      max single-row split decode steps per arm (default 2).  One per response boundary is the
+#                 deliberate TODO #111 residual; the count is reported and bounded, never required to be 0
 #   REF_HASH      expected `extract-generated.py` sha of the n_seq==1 arm; empty = do not check
 #   PORT          server port           (default: 18301)
 #   EXTRA_ARGS    extra llama-server args
@@ -134,6 +146,7 @@ RECOVER="${RECOVER:-1.10}"
 REGRESS="${REGRESS:-0.90}"
 REGRESS_MIXED="${REGRESS_MIXED:-0.98}"
 REF_HASH="${REF_HASH:-}"
+TAIL_MAX="${TAIL_MAX:-2}"
 PORT="${PORT:-18301}"
 EXTRA_ARGS="${EXTRA_ARGS:--fa on}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
@@ -190,11 +203,20 @@ devs_for() {
 # bound: its prompt chunk is hundreds of rows, and even its tail is wider than a verify group.  Raise the
 # bound if NMAX or the slot count goes up, or the control arm's count reads low.)
 #
-# A group containing a SINGLE-row ubatch is excluded: that is a slot that drafted nothing this step (the last
-# step of a response, or a drafter that gave up), so there is no draft length to align there, and cutting the
-# neighbour's good draft down to nothing would be the worse trade.  Those steps still split, in both arms.
+# A group containing a SINGLE-row ubatch is counted SEPARATELY (`tail`): that is a slot that drafted nothing
+# this step, so there is no draft length to align there.  Two causes: a CAP (the slot has no room for a draft --
+# its last token of the response, or a full context) and CONTENT (a drafter that gave up, or an implementation
+# that returned nothing).  Either way that step keeps splitting: the neighbour's good draft still has to be
+# verified, and cutting it is a measured loss.  So a tail split is not a defect on its own -- the COUNT is the
+# signal (`TAIL_MAX`), and it is reported per arm.
 cat > "$KEEPOUT/splits.awk" <<'AWK'
-function flush() { if (total > 1 && maxnt > 0 && maxnt <= 16 && minnt >= 2) n++; maxnt = 0; minnt = 0 }
+function flush() {
+    if (total > 1 && maxnt > 0 && maxnt <= 16) {
+        if (minnt >= 2)      n++
+        else if (minnt == 1) tail++
+    }
+    maxnt = 0; minnt = 0
+}
 /RSPREP/ {
     if ($0 ~ /prep=1\//) flush()
     for (i = 1; i <= NF; i++) {
@@ -204,7 +226,7 @@ function flush() { if (total > 1 && maxnt > 0 && maxnt <= 16 && minnt >= 2) n++;
         if ($i ~ /^prep=/)     { split($i, b, "="); split(b[2], c, "/"); total = c[2] + 0 }
     }
 }
-END { flush(); print n + 0 }
+END { flush(); print n + 0, tail + 0 }
 AWK
 
 SRV_PID=""
@@ -395,13 +417,14 @@ if [ "$FAULTS" -eq 1 ]; then
     fi
 fi
 
-python3 - "$KEEPOUT" "$RECOVER" "$REGRESS" "$REGRESS_MIXED" "$REF_HASH" "$ARMS" "$REPO_DIR" "$FIXED_ARM" "$NGEN" <<'PY'
+python3 - "$KEEPOUT" "$RECOVER" "$REGRESS" "$REGRESS_MIXED" "$REF_HASH" "$ARMS" "$REPO_DIR" "$FIXED_ARM" "$NGEN" "$TAIL_MAX" <<'PY'
 import json, subprocess, sys
 
 root, recover, regress = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 regress_mixed = float(sys.argv[4])
 ref_hash, tags, repo, fixed = sys.argv[5], sys.argv[6].split(), sys.argv[7], sys.argv[8] == "1"
 ngen = float(sys.argv[9])
+tail_max = int(sys.argv[10])
 
 def load(arm):
     try:
@@ -411,12 +434,18 @@ def load(arm):
         return None
 
 def splits(arm):
+    # (full, tail): decode steps split into >1 ubatch.  `full` excludes a single-row ubatch (which counts as
+    # `tail`); see splits.awk.  See TAIL_MAX for why only `full` must be 0.
     try:
         out = subprocess.run(["awk", "-f", root + "/splits.awk", "%s/%s/log.txt" % (root, arm)],
                              capture_output=True, text=True)
-        return int(out.stdout.strip() or 0)
+        parts = [int(x) for x in out.stdout.split()]
+        return tuple((parts + [0, 0])[:2]) if parts else (0, 0)
     except Exception:
-        return -1
+        return (-1, -1)
+
+def split_str(s):
+    return "n/a" if s[0] < 0 else "%d+%d" % s
 
 def text_of(r, key):
     v = r.get(key)
@@ -436,7 +465,7 @@ def hashof(knob):
 fails = 0
 
 print()
-print("%-12s %8s %16s %8s %8s  %s" % ("arm", "aloneA", "pair", "agg", "same-agg", "split steps"))
+print("%-12s %8s %16s %8s %8s  %s" % ("arm", "aloneA", "pair", "agg", "same-agg", "split steps (full+tail)"))
 for tag in tags:
     for knob in ("off", "on"):
         arm = "%s-%s" % (knob, tag)
@@ -459,7 +488,7 @@ for tag in tags:
         n = splits(arm)
         print("%-12s %8.1f %16s %8.1f %8.1f  %s" % (
             arm, r["alone_a"]["tps"], "/".join("%.1f" % x["tps"] for x in r["pair"]), r["pair_agg"],
-            r["pair_same_agg"], "n/a" if n < 0 else n))
+            r["pair_same_agg"], split_str(n)))
 
 print()
 for tag in tags:
@@ -491,8 +520,10 @@ for tag in tags:
         print("PASS  %s: equal-length arm %.1f -> %.1f t/s (%+.1f %%, inert)"
               % (tag, off["pair_same_agg"], on["pair_same_agg"], 100 * (loss - 1)))
 
-    # HARD: the control arm really diverged, and the knob-on arm has no split left
-    n_off, n_on = splits("off-%s" % tag), splits("on-%s" % tag)
+    # HARD: the control arm really diverged, the knob-on arm has no draft-length split left, and its
+    # single-row (tail) splits stay at or below TAIL_MAX -- the deliberate residual of TODO #111
+    n_off, t_off = splits("off-%s" % tag)
+    n_on,  t_on  = splits("on-%s" % tag)
     if n_off <= 0:
         print("FAIL  %s: the knob-off arm never split a decode step, so this arm measured nothing.  Use a "
               "prompt pair with different acceptance (PROMPT_A/PROMPT_B) or raise NMAX." % tag)
@@ -500,9 +531,16 @@ for tag in tags:
     elif n_on != 0:
         print("FAIL  %s: %d decode step(s) still split with the knob on" % (tag, n_on))
         fails += 1
+    elif t_on > tail_max:
+        print("FAIL  %s: %d single-row split decode step(s) with the knob on, above TAIL_MAX=%d.  One such step "
+              "per response boundary is the deliberate residual (a slot with no draft budget, TODO #111); more "
+              "means something stopped drafting early -- a slot's draft was suppressed or cut to one row -- so "
+              "this is a regression even though the throughput may look fine." % (tag, t_on, tail_max))
+        fails += 1
     else:
-        print("PASS  %s: the control arm split %d decode step(s), the knob-on arm split 0 (the depths "
-              "diverged, then aligned)" % (tag, n_off))
+        print("PASS  %s: the control arm split %d decode step(s) (%d of them single-row), the knob-on arm split "
+              "0 draft-length steps and %d single-row step(s) (<= TAIL_MAX=%d: the deliberate residual, the step "
+              "on which a slot runs out of draft budget)" % (tag, n_off, t_off, t_on, tail_max))
 
     # HARD: the single-slot requests must be byte-identical (nothing to align => unchanged verify width)
     bad = [k for k in ("alone_a", "alone_b") if text_of(off, k) != text_of(on, k)]
@@ -537,8 +575,13 @@ if off and on and not off.get("error") and not on.get("error"):
               % (off["pair_agg"], on["pair_agg"], 100 * (gain - 1)))
         fails += 1
     else:
-        print("PASS  ncmoe: host-expert pair %.1f -> %.1f t/s (%+.1f %%): split steps %d -> %d"
-              % (off["pair_agg"], on["pair_agg"], 100 * (gain - 1), splits("off-ncmoe"), splits("on-ncmoe")))
+        print("PASS  ncmoe: host-expert pair %.1f -> %.1f t/s (%+.1f %%): split steps %s -> %s"
+              % (off["pair_agg"], on["pair_agg"], 100 * (gain - 1),
+                 split_str(splits("off-ncmoe")), split_str(splits("on-ncmoe"))))
+    if splits("on-ncmoe")[0] != 0 or splits("on-ncmoe")[1] > tail_max:
+        print("FAIL  ncmoe: the aligned host-expert pair split %s (draft-length steps must be 0, single-row "
+              "steps <= TAIL_MAX=%d)" % (split_str(splits("on-ncmoe")), tail_max))
+        fails += 1
     if text_of(off, "alone_a") != text_of(on, "alone_a") or text_of(off, "alone_b") != text_of(on, "alone_b"):
         print("FAIL  ncmoe: a single-slot request's greedy text differs on/off")
         fails += 1
@@ -560,8 +603,9 @@ if "mixed" in tags:
                   % (off["pair_agg"], on["pair_agg"], 100 * (ratio - 1)))
             fails += 1
         else:
-            print("PASS  mixed: n-gram-first chain %.1f -> %.1f t/s (%+.1f %%, inert); split steps %d -> %d"
-                  % (off["pair_agg"], on["pair_agg"], 100 * (ratio - 1), splits("off-mixed"), splits("on-mixed")))
+            print("PASS  mixed: n-gram-first chain %.1f -> %.1f t/s (%+.1f %%, inert); split steps %s -> %s"
+                  % (off["pair_agg"], on["pair_agg"], 100 * (ratio - 1),
+                     split_str(splits("off-mixed")), split_str(splits("on-mixed"))))
         dn = [(k, [x["draft_n"] for x in off[k]] if isinstance(off[k], list) else [off[k]["draft_n"]],
                  [x["draft_n"] for x in on[k]] if isinstance(on[k], list) else [on[k]["draft_n"]])
               for k in ("pair", "pair_same")]

@@ -2,7 +2,9 @@
 
 **Status:** promoted 2026-10-27 in `v15-6050b467c-r153` (blocks 02 + 09) and **corrected the same day in
 `v15-6050b467c-r154`** (block 02), which removed the generic cut after it measured -6 % on the reporter's other
-chain; see "The r153 cut, and why r154 removed it" below.  `release.json` carries the r154 tip and tree.  Reported by **@overdoingism** in
+chain; see "The r153 cut, and why r154 removed it" below; the one residual split step (`TODO.md` #111) was
+**investigated and declined** on 2026-10-28 -- see the closing section.  `release.json` carries the r154 tip and
+tree.  Reported by **@overdoingism** in
 [issue #234](https://github.com/stew675/llama-cpp-rdna-boosts/issues/234) with a measurement, an analysis and a
 patch (`0015-6055-spec-align-v1`) cut on two drafters of their own.  The release record is `WORKLOG.md`
 261016.001; the rule is `GREEDY-PURITY.md` §63.
@@ -147,3 +149,33 @@ LLAMA_SERVER=~/llama.cpp/build-rocm/bin/llama-server ./scripts/gate-spec-align.s
 # the split itself, before/after
 LLAMA_RS_ROLLBACK_DEBUG=1 <server> ... 2>&1 | grep -c 'RSPREP prep=1/[2-9]'
 ```
+
+## 2026-10-28 -- the residual single-row split (TODO #111): analysed and DECLINED
+
+The one split step per response that survived r154 is the step on which a slot runs out of generation budget:
+`get_n_draft_max()` is `n_remaining() - 1`, so that slot never enters the draft call and presents its sampled row
+alone while its neighbour presents `n_draft + 1`.  It is a **cap** case, not content, so it *can* be equalized --
+and a candidate fix was implemented and measured: decide the step's verify width before any draft is set up, and
+if any generating slot in that step cannot draft, let nobody draft (one row per sequence, the drafter resuming on
+the next step).
+
+**Declined.**  There is no throughput gain: that second ubatch carries the neighbour's **genuine draft rows**, so
+split (`2 passes / ~6 tokens`) and suppressed (`1 pass` now + the next step's `1 pass`, `~7 tokens`) are two passes
+either way -- measured **-0.3 %**, below the floor.  There is no correctness gain either: a verify width is a
+numerics/config axis, nothing aborts, and the split stays reachable through content-caused mismatches, prompt/decode
+mixes, the mixed-drafter chain and the `LLAMA_SPEC_ALIGN=0` arm.  And the fix would widen a **cross-slot coupling**
+(one slot's draft suppressed by a neighbour's budget) for a neutral result.  Shipping it would be change for
+change's sake.
+
+What did change is the **instrument**: `scripts/gate-spec-align.sh` now reports `full+tail` split counts and bounds
+the single-row kind with `TAIL_MAX` (default 2 = one per response boundary), where it previously excluded those
+groups from its count entirely -- so a future change that *manufactures* single-row ubatches fails the gate
+instead of being invisible.
+
+**Determinism correction (a real fix, unrelated to the candidate).**  The same session found that the two-slot
+*aligned* pair is not run-to-run deterministic: four runs of one unchanged binary at 3 GPUs landed in two text
+basins (1237 and 1232 characters, 159 vs 174 t/s), and the candidate build landed in the same basins as the
+baseline.  Per-config determinism is therefore a **single-slot** statement, and a two-slot text diff is not an
+instrument at all.  `GREEDY-PURITY.md` §63 carries the correction.
+
+Details and numbers: `benchmarks/2026-10-28-spec-align-111.md`.

@@ -1,5 +1,56 @@
 # WORKLOG - dated delivery records
 
+## 261028.014 (docs) -- TODO #111 (a verify step whose slot cannot draft at all) is investigated, DECLINED and retired; the gate gains the instrument, and `GREEDY-PURITY.md` §63's determinism claim is scoped
+
+**Docs + one gate script: no patch, no `release.json` change, no tree change; `scripts/validate-set.sh` is
+unaffected.**  `TODO.md` loses #111 (row + handle kept in this entry and in the record, never reused).  Nothing in
+the delivery's runtime behaviour changed: the item was implemented as a candidate, measured, and **reverted** —
+"if it isn't broken, don't fix it".
+
+**What the item was.**  `LLAMA_SPEC_ALIGN`'s cap alignment (r153) removed 58 split decode steps per 400-token
+pair, but one step per response survived: a slot whose `get_n_draft_max()` is `<= 0` (its last token of the
+response, or a full context) never enters the draft call, so it presents its sampled row **alone** while its
+neighbour presents `n_draft + 1`, `split_equal()` stops at the shortest set, and the target runs a second pass for
+that step.  Measured shape (`LLAMA_RS_ROLLBACK_DEBUG=1`, 35B-A3B `-ncmoe 40`, 2 GPU):
+`prep=1/2 n_tokens=6 seq_ids=[0]` + `prep=2/2 n_tokens=1 seq_ids=[1]`, the step on which seq 1 finishes.
+
+**Root cause is a CAP, not content** — which is why it was worth re-opening at all (the r154 rule says a
+cap-caused mismatch IS worth equalizing).  The candidate fix: decide the step's verify width before any draft is
+set up, and if any generating slot in that step cannot draft, let nobody draft (one row per sequence, the drafter
+resuming next step).  A slot that gave up mid-draft (`--spec-draft-p-min`, default 0) or is replaying a partial
+draft stays CONTENT and keeps its split.
+
+**Why it was declined** (all measured, `benchmarks/2026-10-28-spec-align-111.md`):
+
+* **no throughput gain.**  Unlike the depth-mismatch case, that second ubatch carries the neighbour's **genuine
+  draft rows**, so both arms are two passes: split = `2 passes / ~6 tokens` in that window, suppressed = `1 pass`
+  (1 token) + the next step's normal `1 pass` (~6 tokens).  A/B behind a temporary switch (6 alternating pair arms
+  each): **-0.3 %**, i.e. below the floor.
+* **no correctness gain.**  A verify width is a numerics/config axis (`GREEDY-PURITY.md` §63); nothing aborts and
+  the split stays reachable anyway through content mismatches, prompt/decode mixes, the mixed-drafter chain and
+  the `LLAMA_SPEC_ALIGN=0` arm.
+* it would add a **cross-slot coupling** (one slot's draft suppressed by a neighbour's budget) for a neutral
+  result.
+
+**What did ship (the instrument).**  `scripts/gate-spec-align.sh` now counts two kinds of split separately —
+`full+tail` — where `full` (every ubatch >= 2 rows, the r153 defect) must be **0** with the knob on, and `tail`
+(one ubatch of a single row, this item) is **bounded** by `TAIL_MAX` (default 2, one per response boundary) and
+reported per arm.  Before this, single-row groups were excluded from the split count entirely, so a change that
+*manufactured* them (a slot that stopped drafting, a slot cut to one row to dodge a mismatch) was invisible.
+Measured counts with the shipped build: 27B 2 GPU `0+0`, 27B 3 GPU `0+0`, 35B-A3B `-ncmoe 40` `0+1`,
+mixed-drafter `24+0` — all <= the bound, so the gate stays green while the count is now visible.
+
+**Finding (a real correction to the rulebook): the two-slot pair is not run-to-run deterministic.**  Two gate runs
+of one build diverged on the 3-GPU pair, so four runs of one **unchanged** binary were taken: two landed on
+`c05fb93d34/1237` chars at 159 t/s and two on `5bf3146c79/1232` at 174 t/s.  The basin is a property of the *run*
+(the candidate build landed in the same ones), and the alignment is why — it makes one slot's verify width depend
+on its neighbour's adaptive state and on which rows share its batch.  So per-config determinism is a
+**single-slot** statement, the gate's INFO divergence line moves between runs by design, and a two-slot text diff
+is not an instrument.  `GREEDY-PURITY.md` §63 carries the correction (and the index row), `ENVIRONMENT.md` §3 and
+`AGENTS.md` say the same in one line each.
+
+**Also along the way:** the gate's header still described the r153 generic cut, which r154 removed — corrected.
+
 ## 261028.013 (docs) -- TODO #112 (VRAM-resident slot snapshots) leaves the tracker and is parked as `wip/vram-resident-slots/`
 
 **Docs only: no patch, no `release.json` change, no tree change; `scripts/validate-set.sh` is unaffected.**

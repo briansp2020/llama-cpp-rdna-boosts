@@ -17,7 +17,6 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 
 | # | subject | kind | status |
 |---|---|---|---|
-| **111** | a multi-slot verify step whose slot drafted NOTHING still splits | performance / accepted limitation | open (2026-10-27, r153/r154, issue #234).  `LLAMA_SPEC_ALIGN` equalizes the draft CAPS of the sequences one `draft-mtp-adaptive` call drafts, but a slot that drafted no tokens this round (the last step of a response, or a drafter that gave up) contributes its sampled row only, so the batch is `n_draft + 1` vs `1` and `split_equal()` still produces a second ubatch there.  Truncating the neighbour's good draft to nothing is the worse trade, so that step keeps splitting (measured: 1 such step per ~200 on the 35B-A3B host-expert arm).  **The cross-drafter case is CLOSED, not deferred**: the generic `min` cut of the finished drafts was shipped in r153 and measured -6 % on the reporter's own n-gram-first chain (65.6 -> 61.7 t/s, prose acceptance 74 % -> 50 %, splits 12 -> 1), so r154 removed it: a length mismatch caused by CONTENT rather than a cap is not worth equalizing.  `scripts/gate-spec-align.sh` now gates that chain (inert within 2 %, identical draft counts).  Record: `archive/work/spec-align-234/` |
 | **115** | the pair fusion's MMB stand-down and the GLU matcher's MMB predicate disagree | performance / kernel selection | open (2026-10-28, r161, found fixing issue #241).  `mul_mat_q_pair` stands down when `ggml_cuda_mmb_routed_will_take()` says MMB will take both muls (a weak check: `mmb_routed_flag() && mmb_wtype_ok(type)`), while the later `{MUL_MAT_ID, MUL_MAT_ID, GLU}` matcher tests the real `ggml_cuda_mmb_supported_glu()` (which also needs `mmb_glu()`, `K % 64`, `T >= mmb_min_t()`, `n_used <= 64`, a plain unswapped SWIGLU and matching `dst` layout).  When they disagree the pair has already stood down and the MMQ triple takes the gate/up instead of MMB.  Measured neutral-to-positive on gfx1151 (prefill 5421/5425 vs 5397/5398 t/s on LFM2.5-8B-A1B Q6_K), so no change was made: this is a decision to measure, not a known defect.  Detail in §115 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
@@ -62,6 +61,20 @@ inert).  A kernel-selection change of this kind owes the fused-vs-unfused text a
 ---
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
+
+* **A verify step whose slot cannot draft at all still splits into two ubatches** (TODO #111, investigated and
+  declined 2026-10-28).  A slot with `get_n_draft_max() <= 0` -- its last token of the response, or a full
+  context waiting for a shift -- presents its sampled row alone while its neighbour presents `n_draft + 1`, so
+  `split_equal()` puts the neighbour's draft rows in a second ubatch: `0+1` split decode steps per pair run on
+  the 35B-A3B `-ncmoe 40` arm (`0+0` on the dense 27B arms, where the two responses do not overlap at a
+  boundary).  Both alternatives were measured, one of them implemented and reverted: suppressing that step's
+  drafts measures **-0.3 %** (below the floor, because the second ubatch carries the neighbour's *genuine*
+  draft rows, so both arms are two passes), and cutting the neighbour's draft is the r153 cut, a **-6 %** loss.
+  There is no correctness at stake (a verify width is a numerics axis, `GREEDY-PURITY.md` §63) and the candidate
+  would add a cross-slot coupling, so nothing changed -- what did is the instrument:
+  `scripts/gate-spec-align.sh` now counts these single-row splits separately and bounds them (`TAIL_MAX`,
+  default 2) where it previously excluded them, so a change that *manufactures* them is still caught.
+  Record: `benchmarks/2026-10-28-spec-align-111.md`.
 
 * **Parking a memory whose second cache mirrors the attention cells is validated on qwen4exp only** (TODO
   #108, r146): `llama_memory_hybrid_idx` also serves glm5-next, whose indexer is the k-pool

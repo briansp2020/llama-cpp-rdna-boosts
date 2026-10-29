@@ -124,7 +124,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§60** | a reduction-order change is a new numerics reference: one reduction (the strided one), and every fused norm kernel reduces like the chain it replaces | doctrine (r145, issue #229) |
 | **§61** | a fused op must reproduce the *model's own chain*, not its fused sibling: an intermediate tensor's scale convention belongs to the emitter, so a pair of fused ops that agree with each other can still be wrong — and the arms they select into are the oracle | fix + doctrine (r148, issue #228; the DSV4 pre/post pair re-baselined to a reported arm at r157) |
 | **§62** | a captured graph is pure only while its **key** names every dimension the subgraph varies in and its **property compare** still sees every baked pointer: a cache key is not a guard, and an identity-free compare is not "purity-neutral" — it is the removal of the only check that a replay's baked kernel arguments still point at the tensors they were captured from. The compare runs on *every* `graph_compute` (its `uid` early-out cannot fire), so its cost is reduced by comparing the live tensors in place over a source-packed store, never by comparing less | doctrine (r149, TODO #107; r158 compare rework; `archive/work/graph-replay-keys/`) |
-| **§63** | a verify batch is only as cheap as its *widest* sequence set: aligning the sequences of one step into one ubatch changes a slot's verify width, so the text-level oracle is the single-sequence arm and a verify-width control, never a two-slot text diff | fix + doctrine (r153, issue #234; `archive/work/spec-align-234/`) |
+| **§63** | a verify batch is only as cheap as its *widest* sequence set: aligning the sequences of one step into one ubatch changes a slot's verify width, so the text-level oracle is the single-sequence arm and a verify-width control -- never a two-slot text diff, and a two-slot *aligned* pair is not stable run to run either, so per-config determinism is a single-slot statement | fix + doctrine (r153, issue #234; the 2026-10-28 addendum scoped the determinism claim; `archive/work/spec-align-234/`) |
 | **§64** | a restored state may stand in for a fresh save only because the restore re-establishes *everything* a save would capture: the guard is the position alone, so a new per-checkpoint payload must be restored (or stashed before the keep check), and the path only exists where a restore lands on the checkpoint's own position (a hybrid/recurrent memory) | doctrine (r155, PR #236; `archive/work/server-ckpt-reuse/`) |
 | **§65** | a fusion's precondition belongs to the arm it dispatches to: an assert in a shared entry point must state the *union* of its arms', and each arm asserts its own where it dispatches — a dense-only `!ids` assert must not gate the routed fused-gate arm | fix (r161, issue #241) |
 | **§66** | a copy that exists only to keep a tensor alive is a graph node, not a graph output: the copy's position in the node order is the whole memory win, the store's row index must be a graph input (never a baked view offset), and a graph built without the store must not be reused once the stores exist | doctrine (r163, issue #240) |
@@ -1897,7 +1897,11 @@ slot's acceptance falls 74 % -> 50 %: splits 12 -> 1, and the lost proposals cos
 r154 removed it, so a chain of different drafters behaves exactly as before (measured inert: 64.6 vs 64.4 t/s,
 identical draft counts) and `gate-spec-align.sh` gates that arm.  A corollary worth stating: a length mismatch is
 only worth equalizing when a CAP caused it; when the content did, the two drafts are not comparable and the
-second ubatch is the cheaper arm.  A slot that drafted **nothing** is left alone for the same reason.
+second ubatch is the cheaper arm.  A slot that drafted **nothing** is split by cause: a drafter that gave up (a
+`--spec-draft-p-min` cutoff, or an implementation that returns no tokens) is CONTENT, while a slot that could not
+draft at all -- `get_n_draft_max() <= 0`, i.e. its last token of the response or a full context waiting for a
+shift -- is a CAP.  That cap case is deliberately **not** equalized (2026-10-28, TODO #111: the step keeps
+splitting, and the gate counts and bounds it -- see the addendum below).
 
 **The oracle: the promise is PER CONFIG, and that is what makes a two-slot text diff the wrong instrument.**
 Any fix for this must change some slot's verify width (align up, or cut the other slot down), and a verify
@@ -1911,6 +1915,8 @@ Both halves of that promise were measured, and neither is a "near-tie that might
   arm -- reproduced its text **character for character across every run** (4/4 runs at 2 GPU, 2/2 at 3 GPU and
   on the host-expert arm), with `ROCBLAS_USE_HIPBLASLT=0` (§44).  The on/off delta itself is stable: the same
   divergence character, char 220 of 1202/1352 at 2 GPUs and char 627 of 1234/1315 at 3 GPUs, in every run.
+  **(2026-10-28) this is scoped to the single-slot arms:** a two-slot *aligned* pair is not reliably stable
+  across runs -- see the addendum below, which records two basins on one unchanged binary.
 * **The delta is the width, not the change.**  A **fixed `draft-mtp` pair at depth 5 against depth 4** -- both
   slots equal length in both arms, no alignment in play -- moves the same slot at the same kind of point
   (char 259: "Ada not on Monday" vs "but Ada not on Monday").
@@ -1931,6 +1937,35 @@ is owed on the arms where the width does not change (single-sequence, single-slo
 control; a cross-width text difference is a new per-config reference, not a defect.  It is still worth knowing
 that a multi-slot server upgraded across such a change can produce different -- equally valid -- text, which is
 why the delivery's release note says so rather than a gate failing.
+
+**Addendum (2026-10-28, TODO #111) -- a slot that cannot draft at all is declined, and the determinism claim is
+corrected.**
+
+The last exception (the single-row split step of the paragraph above) was investigated in full and
+**deliberately left as it is**; nothing in the delivery changed for it.  Two things are worth recording, because
+one of them contradicts what this section said before:
+
+* **The trade had to be checked, not assumed, because it differs from the depth-mismatch case.**  There the
+  second ubatch is pure overhead -- aligning up keeps every row and removes a pass, which is the +23..+30 %.
+  Here the second ubatch carries the neighbour's **genuine draft rows**, i.e. real work: split = `2 passes /
+  ~6 tokens`, while the only fix that removes the split (suppress that step's drafts for everybody) = `1 pass +
+  the next step's 1 pass / ~7 tokens`.  Two passes either way, so it measured **-0.3 %** (below the floor) and
+  was declined -- change for change's sake.  There is no correctness at stake either: a verify width is a width,
+  and both arms emit the target's own greedy sample at every position.  The residual is now **counted and
+  bounded** by `scripts/gate-spec-align.sh` (`TAIL_MAX`, default 2 = one per response boundary) instead of being
+  excluded from its split count, so a change that manufactures single-row ubatches is visible.
+  Record: `benchmarks/2026-10-28-spec-align-111.md`.
+* **The two-slot pair is NOT reliably deterministic, and this section was wrong to say it was.**  With four runs
+  of one **unchanged** binary at 3 GPUs the pair landed in two basins -- 1237 and 1232 characters for the
+  low-acceptance slot, with a 9 % aggregate t/s difference between them (159 vs 174 t/s) -- so the basin is a
+  property of the *run*, not of a build.  The alignment is why: it makes one slot's verify width depend on its
+  neighbour's adaptive state and on which rows share its batch, so an innocent difference in batch composition
+  propagates into a near-tie.  The gate never gated the pair's text (it reports the divergence point as INFO, and
+  that point moves between runs -- char 942 and char 34 in two runs of the same binary), which is the right
+  call; what follows is that a two-slot text diff is not an instrument at all, and that the rulebook's
+  determinism claim is scoped to the **single-slot** arms.  Judge this code by the split count, the single-slot
+  text identity and the pair's aggregate t/s (which spreads ~10 % for the same reason), never by cross-run pair
+  text.
 
 ---
 

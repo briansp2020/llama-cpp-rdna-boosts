@@ -527,11 +527,16 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   advances the recurrent state in `mem_recr->prepare`), and **cutting the adaptive depth to the shallowest is the
   wrong direction** (adaptive depth is worth +13 % over a fixed one at equal lengths).  The band applies to the
   whole batch: the aligned depth is `band / n_drafting - 1` rows per sequence (two slots at depth 7 fill the
-  RDNA4 band), never lowering a sequence below its own cap.  On a host-expert config a slot that drafted
-  *nothing* is left alone (that step still splits -- the cheaper arm).  Gate: `scripts/gate-spec-align.sh` (2 and 3
-  GPUs, host experts, and a mixed-drafter arm that must stay inert).  Purity: a verify-width change moves
+  RDNA4 band), never lowering a sequence below its own cap.  **A slot that cannot draft at all** (its last
+  token, or a full context waiting for a shift) still splits that step, **deliberately**: that second ubatch
+  carries the neighbour's genuine draft rows, and both removing it (suppress the step's drafts) and cutting the
+  neighbour's draft measured neutral (`TODO.md` #111, analysed and declined — do not "fix" it; the gate counts
+  those single-row splits separately and bounds them with `TAIL_MAX`).  Gate: `scripts/gate-spec-align.sh` (2 and
+  3 GPUs, host experts, and a mixed-drafter arm that must stay inert).  Purity: a verify-width change moves
   greedy text by itself, so the oracle is the **single-sequence** byte-identity (`n_seq == 1` and every
-  single-slot request) plus a same-width control, never a two-slot text diff (`GREEDY-PURITY.md` §63).
+  single-slot request) plus a same-width control, never a two-slot text diff (`GREEDY-PURITY.md` §63) — and a
+  two-slot **aligned** pair is not even stable run to run (one unchanged binary, two text basins at 3 GPUs), so
+  judge this code by the split count and the single-slot text.
   Record: `archive/work/spec-align-234/`.
 - **The draft context's KV cache type follows the main `-ctk` / `-ctv` (r125, block 02).**  Upstream gives
   the speculative draft its own type pair (`-ctkd` / `-ctvd`, default f16) and applies it unconditionally;
