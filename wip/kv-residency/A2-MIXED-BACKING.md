@@ -81,7 +81,35 @@ flat at a shallow depth.  This is the second half of the ask ("free VRAM for the
 hit rates"), and unlike O1 it is not a lazy growth fighting an arena that already owns the VRAM: the KV never
 commits it.
 
-## 4. FINDING — a static window anchored at the end of `-c` is the wrong product shape
+## 3.4 The SLIDING window (built 2026-10-29, `9190fde16`)
+
+The static window above anchored the resident set at the end of `-c`, so a run that has not filled the context
+spills its whole used extent (§4).  The window now slides: **the resident set is the newest `W` cells of the
+USED extent** and the host/VRAM boundary moves forward with the watermark.
+
+* `ggml_cuda_vmm_region_ensure_span(off, bytes, host)` maps a piece whose kind is right, and **flips** one
+  whose kind is wrong: stage the bytes out through a pinned scratch → `hipMemUnmap` → map the other kind →
+  stage them back, with a device synchronise around the unmap.  The VA never changes, so captured graphs and
+  every existing data path stay valid; the table stays one entry per mapping (the driver refuses a sub-range
+  unmap, so a flip is a whole-mapping operation).
+* The boundary is quantised **down to whole map units**, so a batch does nothing but map its delta (one cell
+  normally) and a remap happens once per `unit/nb1` cells — ~1900 cells on the 27B, ~3900 on the 35B.  Cells
+  between quantised boundaries stay resident a little longer, which is free.
+* Monotone: a cell handed to system RAM is not taken back.
+
+| arm (1 GPU) | before the slide | **with the slide** |
+|---|---|---|
+| 27B Q8_0 `-c 262144`, 51 475 tok, `W=49152` | 8.9 t/s | **18.6 t/s** (= the 18.7 t/s fully-resident reference) |
+| 27B Q8_0 `-c 262144`, 51 475 tok, `W=16384` | 10.8 t/s | 10.3 t/s (same 1.19 GiB/token of spill; within this box's run-to-run spread) |
+| 35B-A3B **Q8_0** `-ncmoe 24 -c 262144`, 5256 tok, `W=32768` | arena 15070 MiB, **58.2 t/s** (the whole used extent spilled) | arena 12393 → **15070 MiB**, residency 63.3 → **77.0 %**, prefill 602 → 615, decode **64.5 → 64.9 t/s with zero spill** |
+
+Text is byte-identical to the fully resident arm on every one of those, **and byte-identical to the pre-slide
+hash** (`ef279d67a708` 4B, `5ba44647188f` 27B q8_0) — which is the proof that a remap preserves every staged
+chunk, since a lost chunk would have changed the generated text.
+
+**Default `W = -c`** (no spill, today's cache); the opt-in (`LLAMA_KV_RESIDENT_CELLS`) is what spills.
+
+## 4. FINDING (fixed by §3.4) — a static window anchored at the end of `-c` is the wrong product shape
 
 The window is cells `[kv_size − W, kv_size)`: the **last** W cells of the *context*, not of the *used
 extent*.  So at 51 475 tokens in a `-c 262144` cache, the entire used extent (cells `[0, 51475)`) is still in
@@ -109,13 +137,15 @@ Until one of those lands, `W` must be chosen with the intended depth in mind —
 
 ## 5. Still owed before this can be called done
 
+* ~~the sliding window~~ — **done, §3.4**.
+
 * `scripts/gate-ckpt-reuse.sh` and `scripts/gate-state-pipe.sh` — **the two gates A1 never needed**: state
   save/restore now crosses the host/VRAM boundary.  The probe showed the copy engine handles it (T5) and the
   code maps the right kind by position, but the gates are what prove the whole path.
 * the `MemAvailable` gate before pinning (4.35 GiB at `-c 131072`, 8.5 GiB at 262144, non-swappable).
 * `--fit` reporting the resident bytes instead of the whole KV, so an over-budget config is *reported*
   rather than warned about and then run.
-* the sliding window (finding §4) if that is the chosen shape.
+* sizing `W` from the depth (`--fit`), now that the slide makes W a *cache* rather than a cap.
 * MTP verify widths on the windowed arm (A1 gated it; A2 changes the memory, not the kernel, so the risk is
   lower — but it is cheap).
 * a 2–3 device arm: only one card is attached, so nothing here says anything about `-sm tensor`.
