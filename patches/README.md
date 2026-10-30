@@ -781,6 +781,25 @@ with the bound on 35B-A3B `-ncmoe 40`, 2 GPU: 116.2 -> 149.0 t/s (+28 %), split 
 value lives in block 09 because that is where the band API is (a block may not use a later block's symbol,
 which the per-block build gate enforces).
 
+**A band is answered only for a model with HOST-RESIDENT experts (r176, TODO #117).**
+`llama_model_moe_cache_band()` used to consider `moe_host_expert_bytes` and then **fall back to
+`model->devices`**; because the CUDA device hook is `moe_cache_enabled() ? moe_cache_max_tok_dev(dev) : 0`
+and `g_enabled` is **true by default** (unset `MOE_EXPERT_CACHE_MIB` = AUTO), a **dense** model on a single
+GPU — or any `-sm layer` run — answered **16** with no routed expert anywhere, against this function's own
+"0 when the cache is not active" contract (a `-sm tensor` model was already 0, because the Meta device has no
+band).  Two consumers then acted on a band that does not exist: `common`'s n-gram clamp cut a 64-token draft
+to 15, and `align_draft_caps()` (block 12) bounded a multi-slot adaptive verify width to
+`band / n_drafting - 1`.  The function now considers `model->moe_host_expert_bytes` alone, so it is empty
+exactly when no routed expert is streamed from a host master (r97: a pageable CPU-only placement is
+deliberately not accounted).  The device hook's `moe_cache_enabled()` gate is kept, so a slab-declined or
+arena-released host-expert config still reports 0 (the r129 / TODO #96 case); `moe_cache_has_tables()` is
+deliberately **not** used here, because tables register during the first compute, after
+`llama_init_from_model`, which is exactly the r129 bug.  Measured (dense 27B UD-Q4_K_XL, 1 GPU,
+`ngram-mod --spec-ngram-mod-n-max 64`, `prompts/recall.txt`, `-n 200`): **142.1 -> 186.8 t/s (+31 %)** with
+the text byte-identical, and the pre-fix build's `LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP=0` control reads 187.9, so
+the whole delta is the clamp.  `-ncmoe` / `-cmoe` configs still clamp (verified incl. `-sm tensor`), and
+`MOE_EXPERT_CACHE_MIB=0` still reports no band.  `WORKLOG.md` 261029.008.
+
 **Contents.**
 
 * **A device allocation budget, and an over-budget `--fit` that says so (r135, issue #219).**  Two things,
@@ -862,8 +881,7 @@ which the per-block build gate enforces).
   expert path (band 0): there the wide draft is the win (378.7 vs 144.7 t/s).  `LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP=0`
   restores the uncapped draft; a `draft.n_max` above the band warns instead of clamping (the 15 bound is a
   correctness one).  **Since r129 the clamp runs after `llama_init_from_model`, on the arena's real state
-  (TODO #96, block 09 + block 10).**  `llama_model_moe_cache_band()` answers from `moe_cache_enabled()`, and
-  the slab is only *armed* at model load — it is created or declines at the first compute-buffer allocation,
+  (TODO #96, block 09 + block 10).**  the slab is only *armed* at model load — it is created or declines at the first compute-buffer allocation,
   which is inside the context's widest reserve.  Clamping on the model-load answer clamped a slab-declined
   config that runs the stock streaming path with no arena at all (issue #214's reporter class) and cost it
   the wide draft (2x R9700 control: 67.6 vs 52.2 capped t/s).  The deferral is free (the speculator is built
@@ -878,6 +896,11 @@ which the per-block build gate enforces).
   `GGML_CUDA_SLAB_MIN_ARENA_MIB` for the floor, `GGML_CUDA_SLAB_RING_MIB` for the H2D-ring hole,
   `GGML_CUDA_SLAB_RESERVE_MIB` for the reserve) and print the ring term it previously only mentioned.
   `GREEDY-PURITY.md` §50, `ENVIRONMENT.md` §3, `WORKLOG.md` 261024.002 / 261024.006 / 261024.010.
+* **A band only exists where host experts do (r176, TODO #117).**  The clamp above, and the multi-slot
+  alignment in `align_draft_caps()`, now see `0` for any model with no host-resident experts: see block 09's
+  entry for the predicate, the measurements and the traps (`moe_cache_enabled()` is true by default with no
+  table; `moe_cache_has_tables()` is the r129 bug and must not be used; the slab/arena state still gates it).
+  `WORKLOG.md` 261029.008.
 * **int64_t min/max in this file use local helpers, not `std::min`/`std::max` (r124, issue #217).**  With
   HIP on Windows (clang + the MSVC STL) clang's force-included `cuda_wrappers/algorithm` and the MSVC STL
   `<utility>` each define an inline `std::min<long long>`; `int64_t` is `__int64` there, the `enable_if`

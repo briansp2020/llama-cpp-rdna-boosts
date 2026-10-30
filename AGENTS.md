@@ -575,7 +575,18 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `band - 1` whenever the arena is active — `LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP=0` opts out, and a
   `draft.n_max` above the band warns (not clamped: its 15 is a correctness bound).  A device-resident model
   or the CPU expert path reports band 0 and is **never** clamped (wide drafts are the win there: 144.7 ->
-  378.7 t/s; a naked `--spec-ngram-mod-n-max` below `n_min` silently disables ngram-mod instead).  **The
+  378.7 t/s; a naked `--spec-ngram-mod-n-max` below `n_min` silently disables ngram-mod instead).  **That
+  "0" is a property of the PREDICATE, not of `moe_cache_enabled()` (r176, TODO #117):** a band is answered
+  only for a device that carries **host-resident experts** (`model->moe_host_expert_bytes`), because
+  `moe_cache_enabled()` is true by default (AUTO) even with no registered table, and the old
+  `model->devices` fallback made a **dense** model on a single GPU or any `-sm layer` run answer 16 — which
+  n-gram-clamped a 64-token draft to 15 (the warning's routed-expert premise false) and bounded every
+  multi-slot MTP/DFlash alignment to `band / n_drafting - 1` rows.  Measured: dense 27B 1 GPU
+  `ngram-mod --spec-ngram-mod-n-max 64` on `prompts/recall.txt` **142.1 -> 186.8 t/s (+31 %), text
+  byte-identical** (the r175 `LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP=0` control reads 187.9, so the whole delta is
+  the clamp).  Keep the device hook's `moe_cache_enabled()` gate (a slab-declined/arena-released host-expert
+  config still reports 0) and do **not** test `moe_cache_has_tables()` there — tables register during the
+  first compute, which is exactly the r129 bug below.  **The
   clamp runs AFTER `llama_init_from_model`, on the arena's real state (r129, TODO #96):** the model-load band
   only says the slab was *armed*, so clamping there clamped slab-declined (streaming, no-arena) configs.  It
   therefore no longer lowers `cparams.n_rs_batch` — that stays the **unclamped** safety bound (a partial
@@ -583,7 +594,8 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   so an ngram speculator's prefill *tail* ubatches take the sequential bit-identical GDN path) — and the
   slab's narrow verify reserve takes the band-limited width instead (`llama_context::verify_batch_width()`),
   so a live arena reserves exactly what it did before.  Rule:
-  `GREEDY-PURITY.md` §50; record: `archive/work/ngram-mod-host-experts/EVIDENCE-2026-10-24.md`.
+  `GREEDY-PURITY.md` §50; records: `archive/work/ngram-mod-host-experts/EVIDENCE-2026-10-24.md`,
+  `WORKLOG.md` 261029.008.
 - **The mmvq band-uniform knobs are a purity requirement *and* a perf trap.** `nwarps` and the vec_dot
   VDR participate in the mmvq K-split order, so one value must hold across the whole band (`W=1..8`)
   and must be tuned at the **verify widths**. RDNA4 dense `nwarps=1`; dense VDR=2, MoE-expert VDR=4.

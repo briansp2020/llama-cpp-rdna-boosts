@@ -1,4 +1,4 @@
-From 7d6e74965b669e1625a0c6b41a0e86329b0a6946 Mon Sep 17 00:00:00 2001
+From 9b8d0c52a6fc500caa53c8b827dba0ab3fed81ff Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -83,7 +83,7 @@ index 4c2e0fa63..5a3a44ff5 100644
          {"--spec-draft-n-min"}, "N",
          string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
 diff --git a/common/common.cpp b/common/common.cpp
-index fcf1a32e1..b793a427f 100644
+index 4465dcccd..5a137512e 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1290,7 +1290,8 @@ common_init_result::common_init_result(common_params & params, bool model_only,
@@ -189,7 +189,7 @@ index bad820033..68f2161fe 100644
          GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
          GGML_ASSERT(split_state.nr[0] != 0);
 diff --git a/include/llama.h b/include/llama.h
-index 38a45acac..8222184a1 100644
+index 077a9eba2..0d0d155ee 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -402,6 +402,7 @@ extern "C" {
@@ -322,7 +322,7 @@ index ff5518983..8eef59917 100644
  
      llm_graph_result * res;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 1d73dcd10..b17b3c4f3 100644
+index 12fa43a9b..fb4a7dd00 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -23,6 +23,7 @@

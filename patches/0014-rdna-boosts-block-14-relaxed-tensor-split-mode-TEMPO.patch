@@ -1,4 +1,4 @@
-From 9d1b59f2cb137df8add7627e26f4e178f329ea51 Mon Sep 17 00:00:00 2001
+From 0cc6f408df82943e2d21255518a54782b5a696a6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: relaxed-tensor split mode
@@ -309,7 +309,7 @@ index 68f2161fe..05fad4da3 100644
                          id++;
                          idr = id;
 diff --git a/include/llama.h b/include/llama.h
-index 8222184a1..c354de783 100644
+index 0d0d155ee..6b0f13693 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -202,6 +202,15 @@ extern "C" {
@@ -386,7 +386,7 @@ index 884dca647..f72c29d30 100644
  static inline dst_t llama_cast(src_t v) {
      if constexpr (std::is_same_v<src_t, dst_t>) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index b17b3c4f3..48da1ecf0 100644
+index fb4a7dd00..17cd2b9d4 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -382,7 +382,13 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param

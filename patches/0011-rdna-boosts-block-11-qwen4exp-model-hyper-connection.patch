@@ -1,4 +1,4 @@
-From e8c7e7f28c0c09a65906070eee5ee850207a7cee Mon Sep 17 00:00:00 2001
+From e112b3fcf0a398091cf5c1559012107e0bfc2f2c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/14] rdna-boosts: block 11: qwen4exp (model,
@@ -10197,7 +10197,7 @@ index 6600480c8..d13253e84 100644
          // file-mapped.  An explicit `--lazy-mode off` overrides the mmap-backed buffer for
          // the tensors the arch marks TENSOR_READ_LAZY (the PLE / engram tables): without
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 51bc1a629..e3cfbceb1 100644
+index 227ca47b6..4d450842b 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -3196,10 +3196,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
@@ -10253,7 +10253,7 @@ index 51bc1a629..e3cfbceb1 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -4041,7 +4082,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+@@ -4045,7 +4086,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
      TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),

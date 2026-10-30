@@ -1,5 +1,76 @@
 # WORKLOG - dated delivery records
 
+## 261029.008 (r176) -- TODO #117 closed: the expert-cache band is answered only for a model with HOST-RESIDENT experts (a dense single-GPU / `-sm layer` run no longer n-gram-clamps or bounds multi-slot draft widths)
+
+**Released as `v15-6050b467c-r176` (15 blocks, 00-14; blocks 09 and 12 amended).**  `TODO.md` item
+**#117** (filed by the PR #244 v5 assessment, `WORKLOG.md` 261029.007) is closed.  No kernel, op or numerics
+change: the whole delivery change is one predicate in `src/llama-model.cpp` (block 09) plus its contract
+comments (`include/llama.h`, block 09; `common/common.cpp`, block 12).
+
+**The defect.**  `llama_model_moe_cache_band()` documents "0 when the cache is not active, i.e. there is no
+band to respect", but it considered `model->moe_host_expert_bytes` first and then **fell back to
+`model->devices`**.  The CUDA device hook is `moe_cache_enabled() ? moe_cache_max_tok_dev(dev) : 0` and
+`g_enabled` is **true by default** (unset `MOE_EXPERT_CACHE_MIB` = AUTO), so on any non-Meta device list -- a
+single GPU, or any `-sm layer` run -- a model with **no routed expert at all** answered **16** on RDNA4.  Two
+consumers then acted on a band that does not exist: `common_speculative_clamp_ngram_n_max()` cut a 64-token
+n-gram draft to 15 on a dense model, and `align_draft_caps()` bounded a multi-slot MTP-adaptive verify width
+to `band / n_drafting - 1` rows.  Under `-sm tensor` the Meta device reports no band, which is why earlier
+tensor-split checks never saw it.
+
+**The fix.**  Only a device that actually carries host-resident experts has a band: the function now
+considers `model->moe_host_expert_bytes` alone.  That account is filled by the loader for a pinned host
+expert master (r97: a pageable CPU-only placement is deliberately not accounted), so it is empty exactly when
+no routed expert is streamed from a host master.  The device hook's `moe_cache_enabled()` gate is kept, so a
+slab-declined or arena-released host-expert config still reports 0 (the r129 / TODO #96 case), and
+`moe_cache_has_tables()` is deliberately **not** used: tables register during the first compute, after
+`llama_init_from_model`, which is exactly the r129 bug.  The in-tree consumers needed no change
+(`verify_batch_width()`'s two call sites are already inside `!moe_host_expert_bytes.empty()` blocks).
+
+**Measured (Qwen3.8-27B UD-Q4_K_XL, 1 GPU, greedy, seed 42, `--spec-type ngram-mod
+--spec-ngram-mod-n-max 64`, `-n 200`).**  `prompts/recall.txt`: r175 **142.1 / 142.4 t/s**, r176
+**186.8 / 186.9 t/s (+31.4 %)** with the generated text **byte-identical** (1104 chars, sha `80309046174e`).
+Control isolating the clamp from the tree: **r175 with `LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP=0` = 187.9 / 188.3
+t/s**, i.e. the whole delta is the clamp and nothing else moved.  `prompts/prose-rdna-boosts.txt` is neutral
+(30.3/30.3 -> 30.2/30.2, text identical -- n-gram acceptance ~0 there, which is why 261029.007 read the
+severity as neutral on that prompt).  This is the delivery's own record of the wide-draft win (144.7 -> 378.7
+t/s) reaching a class it could not previously reach.
+
+**The predicate's own matrix** (all `-v`, so the warning is visible): dense 27B 1 GPU **no clamp** (was
+`draft length 64 -> 15`); dense 27B 2 GPU `-sm layer` **no clamp**; dense 2 GPU `-sm tensor` no clamp (as
+before); 35B-A3B `-ncmoe 40` 1 GPU **clamps 64 -> 15**; 35B-A3B `-ncmoe 40 -sm tensor` 2 GPU **clamps**;
+35B-A3B `-cmoe` (all experts on the host) **clamps**; 35B-A3B `-ncmoe 40` with `MOE_EXPERT_CACHE_MIB=0`
+**no clamp** (the cache is off, so there is no arena to respect -- unchanged).
+
+**Gates run for the release.**  Coherence against a kept r175 build, byte-identical on every arm: dense 27B
+1 GPU (`-n 128`, sha `980623270508`), dense 27B 2 GPU `-sm tensor` (sha `dad22c4270ab`), dense 27B
+`--spec-type draft-mtp n3` (same sha as plain), 35B-A3B `-ncmoe 40` (sha `5d0d8db7bb9b`) and 4B Q8_0
+(sha `11e3fdd3d795`).  **MTP Protocol A** (27B UD-Q4_K_XL, 3 devices, prose, `-n 2000`, bf16 KV): layer
+plain 25.0 -> `draft-mtp` **62.1** t/s, tensor plain 50.9 -> **120.9** t/s against r175's 61.9 / 120.6, text
+byte-identical in all four arms (`--spec-type none` and `draft-mtp` each match their own r175 run and each
+other), acceptance **identical** (layer 0.81015, tensor 0.80385) and `n_accepted` identical.  **Prefill-logit
+gate**: **mean KLD 0.000000 / same-top-p 100.000 %** against the recorded base.  **`gate-spec-align.sh` PASS**
+(gate 9 -- this change alters `align_draft_caps`'s band input): 2 GPU diverging pair 117.4 -> 145.3 t/s
+(+24 %), 3 GPU 138.9 -> 178.0 (+28 %), host-expert arm 125.3 -> 151.5 (+21 %) with split steps 58+1 -> 0+1 --
+i.e. the multi-slot alignment still merges widths **with** host experts present -- the equal-length arms inert
+(-0.9 / +0.6 / +1.0 %), the mixed-drafter chain inert (+1.0 %, identical draft counts), every single-slot
+request byte-identical on/off and the `n_seq == 1` text byte-identical (`b8775233a93a`); `check-gpu-faults.sh`
+clean on the journal and on every arm log (coherence, MTP, n-gram and spec-align runs).  **Per-block build**
+`--changed-from cc1def018 --fast`: 3/3 (block 09 32 s, block 12 356 s, the tip 12 s); blocks 00-08 and 10-11,
+13-14 byte-unchanged.  **`validate-set.sh`** green (fresh codeload tarball, strict `git am`, 15/15, tree
+`e990c8611b715dcba923b36c91baeaf436c02d2b`, Windows-path and Windows-portability scans clean).
+
+**Note on r176 vs the r175 band.**  Nothing changes for a config that has host experts: the band there was
+already answered from `moe_host_expert_bytes`.  The dense `-sm tensor` answer was already 0.  So the change is
+confined to host-expert-free models on a non-Meta device list, and no arm above moved a token.
+
+**Also fixed (doc):** the `TODO.md` table's `#118` row had been appended after a blank line, so it rendered as
+a stray paragraph instead of a table row; it is now the first row (newest first) with `#117` retired.
+
+**Artifacts:** `release.json` = `v15-6050b467c-r176`, tip `19dec99a0`
+(tree `e990c8611b715dcba923b36c91baeaf436c02d2b`); the patch set was regenerated from the canonical chain,
+the fork branch re-cut from it (`19dec99a0` reproduced by `fork-refresh.sh`) and force-with-lease pushed to
+the personal fork.
+
 ## 261029.007 (no release) -- PR #244 v5 (DFlash2 adaptive verify width) assessed on r175 and closed: inert on our dense payloads, still a loss on the arena arm, and a band-bound loss on a dense 3-slot server
 
 **No delivery change, no release.**  Contributor PR

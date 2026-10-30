@@ -1,4 +1,4 @@
-From 1adf38b300cafea40192d3c27efa534667820b4a Mon Sep 17 00:00:00 2001
+From b6f2157d8e1723fc655b3c534cdad55914b49ab2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/14] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -22041,7 +22041,7 @@ index 13729e2a5..c2317fe60 100644
              return false;
          }
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index df67c91f7..51bc1a629 100644
+index df9db771e..227ca47b6 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -399,7 +399,46 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
@@ -22119,7 +22119,7 @@ index df67c91f7..51bc1a629 100644
  uint64_t llama_model::n_elements() const {
      return pimpl->n_elements;
  }
-@@ -4155,22 +4214,3 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
+@@ -4159,22 +4218,3 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
      return n_tokens * (uint32_t) tensor->ne[0];
  }
  

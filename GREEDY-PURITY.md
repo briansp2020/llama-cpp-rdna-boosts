@@ -1261,7 +1261,14 @@ run whose experts are not served through the arena:
   (r123, block 09; `LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP=0` is the A/B).  A deep draft also cost ~5 GiB of
   arena, because the slab's narrow verify floor is measured at `n_rs_batch` (32938 -> 27814 MiB).
 * A model with **no active arena** — fully device-resident, or the CPU expert path
-  (`MOE_EXPERT_CACHE_MIB=0`) — reports no band and is never clamped.  The same holds for a host-expert
+  (`MOE_EXPERT_CACHE_MIB=0`) — reports no band and is never clamped.  **A band is answered only where
+  host-resident experts exist (r176, TODO #117):** `llama_model_moe_cache_band()` considers
+  `model->moe_host_expert_bytes` alone, because `moe_cache_enabled()` is true by default (AUTO) even with no
+  registered table, and the pre-r176 `model->devices` fallback made a **dense** model on a single GPU or any
+  `-sm layer` run answer 16 — which clamped `ngram-mod --spec-ngram-mod-n-max 64` to 15 and bounded every
+  multi-slot MTP/DFlash alignment to `band / n_drafting - 1` rows on a model with no routed expert at all.
+  Measured on the dense 27B, 1 GPU, `prompts/recall.txt` (`-n 200`): **142.1 -> 186.8 t/s (+31 %)** with
+  byte-identical text, the pre-fix `LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP=0` control reading 187.9.  The same holds for a host-expert
   config whose movable-boundary slab is armed and then **declines** (a card too small for the work buffer +
   `GGML_CUDA_SLAB_MIN_ARENA_MIB` + the ring hole): it runs the same streaming path, where the wide draft is
   the win (2x R9700: 67.6 wide vs 52.2 capped t/s).  **Since r129 that case is handled**: the clamp is
