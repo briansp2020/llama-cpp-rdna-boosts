@@ -1,5 +1,72 @@
 # WORKLOG - dated delivery records
 
+## 261029.007 (no release) -- PR #244 v5 (DFlash2 adaptive verify width) assessed on r175 and closed: inert on our dense payloads, still a loss on the arena arm, and a band-bound loss on a dense 3-slot server
+
+**No delivery change, no release.**  Contributor PR
+[#244](https://github.com/stew675/llama-cpp-rdna-boosts/pull/244) (`@overdoingism`, `wip/dflash-adaptive-width/` in the
+PR branch only) was re-submitted as **v5** (patch sha256 `6d8bec95…`; steps timed per width, no width move on
+unobserved positions, one width per move with a 24-draft first window / 8-draft later windows, the width carried into
+the next turn of a conversation, and the measured step time proposing moves).  It was applied to the **r175 tip**
+(`cc1def018`; `git apply --check` clean, builds `all`), assessed against the same arms as the v3 review, and **not
+adopted; the PR is closed** with the review and an invitation to open a focused opt-in PR carrying only this feature
+plus the precise config/prompt/conditions where the gain reproduces.  **`TODO #117` is filed** for the delivery bug
+the assessment found (the band predicate, below).
+
+**The default path is genuinely inert.**  With `LLAMA_DFLASH_ADAPTIVE` unset, the scratch build's text sha and
+`draft_n`/`draft_n_accepted` are identical to the canonical r175 build on all four prompts.  Dense 27B UD-Q4_K_XL +
+DFlash2-Q4_K_M, 1 GPU, greedy, `-n 192`, two starts each: prose **80.6 / 79.4** fixed 7 vs **80.0 / 79.3** adaptive;
+code **99.0 / 97.5** vs **98.1 / 97.7**; recall **142.4 / 140.6** vs **141.2 / 140.6**; reasoning **101.7 / 100.3** vs
+**100.9 / 100.6** — the same drafts, i.e. the controller never leaves width 7.  At `-n 512` prose 104.0 fixed 7 /
+102.2 fixed 6 / 103.3 adaptive (drafts 600/425 identical to fixed 7); reasoning 512 86.4 vs 86.3.  This is the v3
+review's ask satisfied and is a real improvement on v3 (which lost 5.9 % on prose).
+
+**The machinery is free; the decisions are the whole difference.**  `LLAMA_DFLASH_ADAPTIVE_COST=0.001` (monotone, so
+the width stays at 7) lands on fixed 7 with identical drafts: **117.6** vs 116.2/117.1 on the arena arm at `-n 192`
+(drafts 335/143) and **167.5** vs 168.9 at `-n 512` (drafts 656/417).
+
+**The `-ncmoe` + arena arm is still a loss.**  35B-A3B UD-Q4_K_M + DFlash2-Q8_0, 2 GPU `-sm tensor`, `-ncmoe 40`,
+`MOE_EXPERT_CACHE_MIB=6000`, prose: fixed 5 / 6 / 7 = 116.3 / **118.0** / 116.2-117.1 at `-n 192`, adaptive **105.6 /
+105.7 (-9.4 %)**; fixed 5 / 6 / 7 = 159.8 / 168.3 / **168.9** at `-n 512`, adaptive **156.6 (-7.3 %)**.  Better than
+v3 (-15.2 / -12.1 %) but still below every fixed width.  The trace is 7→6 at review 24, 6→5 at 32, then 5→6→7 at
+40/48; at 512 the per-width histogram is 5:8, 6:19, 7:70.  The fixed widths are within ~1 %, so the search does not
+recover the transient.
+
+**Why a move costs more than the width it lands on (new instrument).**  `GGML_CUDA_GRAPH_TRACE=1` over three sequential
+192-token prose requests on the arena arm: fixed 7 `capture=1574 properties_changed=1782 direct=6838`; adaptive
+**`capture=3628 properties_changed=2974 direct=8390`**, and the adaptive arm is still **-8 % on the third request**
+(143.6 vs 158.1 t/s), so it is not a one-time cold cache.  Each verify width is a distinct set of captured graphs and
+the repeated width changes churn that cache (replay refused, nodes run direct).  A step-time-only cost model does not
+price that, which is why a marginal width change looks cheap.
+
+**The band bound fires with no arena (the delivery bug).**  On the dense 27B, 1 GPU, `--parallel 3`, the adaptive
+alignment computes `band / 3 - 1 = 4` and loses **7.5 %** wall (4.82 s vs 4.46 s; recall 152/152 vs 167/167 accepted);
+`LLAMA_SPEC_ALIGN=0` restores 4.42 s.  `llama_model_moe_cache_band()` answers 16 because `moe_cache_enabled()` is true
+by default (AUTO) even with no registered table, and the function falls back to `model->devices` when
+`moe_host_expert_bytes` is empty — against its own "0 when the cache is not active" contract.  The same mis-detection
+makes v5 print `cost 0.150` on the dense 1-GPU run (README says 0.09) and clamps **our** canonical r175,
+`ngram-mod --spec-ngram-mod-n-max 64` on the same dense 1-GPU model, **64 -> 15** (the warning's routed-expert premise
+is false there; `MOE_EXPERT_CACHE_MIB=0` lifts it).  Filed as `TODO #117` with the fix direction (consider only
+`moe_host_expert_bytes`, keep the `moe_cache_enabled()` gate; not `moe_cache_has_tables()`, which is the r129 bug).
+Measured n-gram severity on `prose` was neutral (acceptance ~0: 29.99 vs 29.61 t/s), but the clamp can only cost where
+a wide n-gram draft would hit.
+
+**No measurable gain on any arm we can run.**  Dense 1 GPU greedy: inert on all four prompts and at 512.  Dense 1 GPU,
+prose 512 at T 0.7: 55.1/54.8 fixed vs **55.2/55.5** adaptive (neutral; the width walks 7→3→4→5), `COST=0.09` 55.0.
+2-slot 27B `-sm tensor` concurrent pair: max wall 3.17-3.26 s fixed vs 3.09-3.21 s adaptive (neutral; the sum of the
+per-slot `predicted_per_second` over-counts when the slots finish at different times).  3 slots dense 1 GPU: -7.5 % from
+the band bound.  Arena: -9.4/-7.3 %.  Text matched the fixed arm in every greedy arm and slot count; all logs
+`check-gpu-faults.sh` clean.  The contributor's +13-21 % is on Thai/zh/low-acceptance continuations we do not have;
+their own added cost is a timing-driven width, so a run whose width moves is not reproducible start to start wherever
+the width changes text — a property that rules out default-on for a delivery feature (the greedy gates rely on
+start-to-start identity).
+
+**Decision.**  Not adopted; closed.  The reply asks for a focused opt-in PR (only this feature), with the exact model
+files, full server command, prompt (or hash + attachment), `n_predict`, sampling/slot setup and repeated baseline-vs-
+adaptive starts, and says we will re-run those conditions.  Our own controller prototypes from the previous rounds
+(defer the first decision to 32 reviews, raise `COST` to the measured step fit, no-repeat window) only made it inert on
+our short responses, so the ask is for a payload where the gain is measurable, not another controller revision on the
+same payloads.
+
 ## 261029.006 (r175) -- PR #250's seven RDNA3 decode fusions shipped (block 10); its qwen3moe graph reorder declined, its Q8_1 padding gap fixed here
 
 **Released as `v15-6050b467c-r175` (15 blocks, 00-14; block 10 amended).**  Contributor PR

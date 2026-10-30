@@ -12,11 +12,12 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 still means the same subject after that item is closed and removed from this file.  New items append.
 
 **Current state:** the **15-block V2.1 set** (block 00 + blocks 01-14) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v15-6050b467c-r171`**.  `release.json` is the source of truth for the
+(the 2026-10-25 re-base), release **`v15-6050b467c-r175`**.  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 
 | # | subject | kind | status |
 |---|---|---|---|
+| **117** | `llama_model_moe_cache_band()` reports a device band with no host experts on single-device / `-sm layer` configs, so the n-gram clamp and every band-bounded multi-slot alignment fire without an arena | correctness of a predicate / perf | **OPEN** (2026-10-29, found in the PR #244 v5 assessment on r175).  The API contract is "0 when the cache is not active", but the CUDA iface returns the device band whenever `moe_cache_enabled()` (true by default via AUTO, with no registered table) and `llama_model_moe_cache_band()` falls back to `model->devices` when `moe_host_expert_bytes` is empty.  Measured on the dense 27B, 1 GPU: `ngram-mod --spec-ngram-mod-n-max 64` logs `draft length 64 -> 15` with no routed experts at all (`MOE_EXPERT_CACHE_MIB=0` does not), and a DFlash2 3-slot arm was band-bounded to width 4 and lost 7.5 % wall.  Detail in §117 |
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
@@ -75,6 +76,49 @@ dequant+hipBLAS (`ggml-cuda/mmq.cu:608`, PR #18537) — so the win must come fro
 4B result may not scale (the 27B has different shapes, a bigger lm_head and more attention).  Promotion shape,
 if it ever gets there: a new weight type + kernels + loader + converter is a **large block** and a maintainer
 call.
+
+## 117. `llama_model_moe_cache_band()` answers with a device band when there is no arena (single-device / `-sm layer`)
+
+**Status: open (2026-10-29). Found while assessing PR #244 v5 on r175; not fixed.**  The affected code is the host-resident
+MoE iface (block 09) and the two consumers (block 12: `common_speculative_clamp_ngram_n_max`, and
+`align_draft_caps()` in `common/speculative.cpp`).
+
+**The contract vs the implementation.**  `include/llama.h` documents `llama_model_moe_cache_band()` as "the MoE expert
+cache's decode/verify band, in tokens, for this model (0 when the cache is not active, i.e. there is no band to respect)".
+The implementation (`src/llama-model.cpp`) considers `model->moe_host_expert_bytes` first and then **falls back to
+`model->devices`**, and the CUDA iface (`ggml_backend_cuda_device_moe_cache_band`) returns
+`moe_cache_enabled() ? moe_cache_max_tok_dev(device) : 0`.  `g_enabled` is **true by default** (`parse_env()`: unset
+`MOE_EXPERT_CACHE_MIB` = AUTO = enabled), so on a single GPU — or any non-Meta device list, e.g. `-sm layer` — a model
+with **no host-resident expert at all** answers 16 on RDNA4.  On a `-sm tensor` dense model the Meta device has no band,
+so the answer is 0; that is why earlier tensor-split checks did not see this.
+
+**What fires without an arena.**
+
+1. `common`'s n-gram band clamp (`TODO #96`): a dense 27B Q4_K_XL, 1 GPU, `--spec-type ngram-mod
+   --spec-ngram-mod-n-max 64` logs `draft length 64 -> 15` and clamps, with the warning's premise (routed experts
+   streamed from a host master) false for that run.  `MOE_EXPERT_CACHE_MIB=0` (cache off) does not clamp.  This
+   contradicts `AGENTS.md`'s "a device-resident model ... reports band 0 and is never clamped" for single-device / layer
+   configs.  Measured severity there was neutral on the `prose` prompt (n-gram acceptance ~0: 29.99 vs 29.61 t/s at 15
+   vs 64), but the clamp can only cost wherever a wide n-gram draft would hit (the record for the wide-draft win is
+   144.7 -> 378.7 t/s on a device-resident config; the affected class is the one that cannot reach it).
+2. Any band-bounded multi-slot alignment: `align_draft_caps()` (MTP-adaptive) and PR #244 v5's DFlash2 alignment both
+   compute `max(0, band / n_drafting - 1)`.  Measured on the dense 27B, 1 GPU, `--parallel 3` + DFlash2: a band of 16
+   forces every slot to width 4 and costs **7.5 % wall** (4.82 s vs 4.46 s; recall 152/152 vs 167/167 accepted).  A
+   3-slot MTP-adaptive arm still wins from the merge even with the clamp (5.14 s aligned vs 6.68 s unaligned; raising
+   the band to 64 gives 5.26 s), so the MTP case is not demonstrably harmful here — the DFlash2 case, where the fixed
+   widths were already equal, is.
+
+**Fix direction.**  Return 0 unless the model actually has host-resident experts, i.e. only consider
+`model->moe_host_expert_bytes` (drop the `model->devices` fallback) and keep the existing `moe_cache_enabled()` gate so a
+slab-declined host-expert config still reports 0 (the r129/`TODO #96` case).  Do **not** use `moe_cache_has_tables()` at
+the n-gram clamp point: tables register during the first compute, after `llama_init_from_model`, which is exactly the
+r129 bug.  The PR #244 v5 cost default (`band > 0 ? 0.15 : 0.09`) has the same mis-detection and would be fixed by the
+same predicate.
+
+**Validation when fixed.**  `-ncmoe` / `-cmoe` configs must still clamp (the wide-n-gram trap on the arena); a dense
+single-GPU and an `-sm layer` config must not; `ngram-mod --spec-ngram-mod-n-max 64` on the dense 1-GPU 27B must log no
+clamp; multi-slot MTP/DFlash alignment must still merge widths when host experts are present; no kernel or numeric change,
+so the usual coherence + arch sweeps plus a `-ncmoe` n-gram arm.  Record: `WORKLOG.md` 261029.007.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
