@@ -1,5 +1,65 @@
 # WORKLOG - dated delivery records
 
+## 261030.005 (r181) -- block 15: `--fit` + `-sm tensor` fixed properly (three asserts), plus three `auto` wiring defects
+
+**Released as `v16-6050b467c-r181` (16 blocks; block 15 amended).**  Found while gating r180's multi-GPU arms
+(the PR #252 work): **default `--fit` aborted on every multi-device `-sm tensor` run in r178/r179/r180.**  The
+block-15 KV-region plumbing reaches its backend entry points through `ggml_backend_dev_backend_reg(dev)`, and a
+**Meta** (tensor-split) device has no backend reg (`device->reg == NULL`), so
+`ggml_backend_reg_get_proc_address(NULL, …)` hit `GGML_ASSERT(reg)` (`ggml-backend.cpp:1052`) at model load,
+before a token.  Three separate paths asserted: the fit's KV probes (any run, model-independent), the runtime
+region-buffer lookup (a numeric `W`), and the spill budget/link lookups (a numeric `W` below `-c`).  The
+campaign's own box is single-GPU, which is why nothing caught it.
+
+**The fix, and why this is the right one rather than a null guard.**  The window is one VMM region **per
+device**, and a tensor split has no per-device region buffer type to hand out (its KV lives on the Meta
+wrapper), so the backend genuinely has no answer there.  A reg-less device now reads as "the backend does not
+provide this" (`src/llama-kv-cache.cpp`: one `llama_kv_region_dev_reg()` helper behind all five lookups), the
+window is **declined** with one message naming the tensor split from the fit and one from the cache, and the KV
+stays fully resident; `-sm layer` and one device keep their per-device region buffers.  In `common/fit.cpp` the
+probe reg is resolved through the Meta wrapper to a **simple child** (the same walk the split accounting
+already does), so the identification stays exact if a multi-device window ever exists, and a `nullptr` there
+means "unknown", never an abort.
+
+**Three wiring defects in the same code, all reproducible on ONE device:**
+
+* **`auto`'s decision was indistinguishable from "nobody decided".**  `--fit` handed down `0` for "the KV fits
+  fully resident, keep it", which the cache read as "the fit did not run" — so a run that had just been sized
+  correctly still warned `LLAMA_KV_RESIDENT_CELLS=auto is sized by --fit, which did not run`.  A decided-0 flag
+  (`llama_kv_region_resident_cells_decided`) makes the three states distinct: window, decided-no-window
+  (silent), undecided (warns).
+* **Every run without the knob logged a KV warning.**  "the windowed KV is unavailable for this cache (no
+  spilled cells)" fired on the default path; it now only fires when a window was requested and declined for a
+  real reason (non-uniform cell geometry, or a region-less device).
+* **The pinned-RAM clamp could be taken past the VRAM budget.**  `LLAMA_KV_SPILL_RAM_PCT`'s clamp raises `W`
+  so the worst-case spill fits RAM; the fit applied it unconditionally and then reported the result as
+  "does not make this fit either".  It is now taken only while the wider window still meets the VRAM target;
+  otherwise the fit reports that the ceiling cannot be served at this `-c` and drops the window, and the
+  normal path shrinks the context.  **This is not cosmetic:** an intermediate form of the fix accepted a
+  **235 GiB** pinned-spill plan for a 4B at `-c 8388608`, and creating it OOM-killed the test box (83 GB
+  anon-rss, kernel OOM, session lost).  Any future change here must bound the *planned spill*, not just the
+  resident window.
+
+**Verified (gfx1201).**  `--fit on` (the default) at **2 and 3 devices**, `-sm tensor`, with no knob / a
+numeric `W` / `auto`, fit on and off: no assert, tokens produced, exactly one message per requested window.
+`-sm layer` 2 devices and 1 GPU still take the window per device, and `auto` still sizes the 27B Q8_0
+`-c 262144 -ctk/-ctv q8_0` arm identically to r179/r180 (**123265 of 262144 cells**, 4092.8 MiB resident /
+4611.2 MiB spilling).  One device with no knob: **no KV message at all**.  Purity unchanged: plain vs a
+**spilling** windowed arm prefill-logit KLD **0.000000 / 99.990 %** (q8_0 KV) and greedy text byte-identical on
+that arm; 35B-A3B (1 GPU and 2-GPU `-sm tensor`), dense 27B and the canonical 27B Q8_0 prefill-logit gate
+(**0.000000 / 100.000 %**) are byte-identical to r180; MTP Protocol A unchanged (tensor acceptance **0.60816**
+= 1937/3185, `plain == draft-mtp`); `validate-set.sh` green; `gate-per-block-build.sh --changed-from d23cd1dbe
+--fast` 1/1; no GPU faults.
+
+**Re-cut.**  Block 15 amended (`d23cd1dbe` -> `83d2c391a`), everything else byte-unchanged; `release.json`
+`tip 83d2c391a` / `tree 7a139daded`.
+
+**Left open for the campaign (not delivery work):** the window is single-device only (a tensor split declines
+it, now by design and with a message), and the `auto` **policy** questions are unchanged by this fix — `auto`
+still only spills a `-c` the user pinned, and it still sizes the window against the VRAM left after the
+expert-cache arena reserve, so on a `-ncmoe` config the arena wins the VRAM.  Both are recorded in
+`wip/kv-residency/A2-MIXED-BACKING.md` §3.7.12 for the campaign's resume.
+
 ## 261030.004 (r180) -- PR #252's GDN small-projection gather ships (block 10): +2.8 % decode on the quantized-GDN shape, bit-identical
 
 **Released as `v16-6050b467c-r180` (16 blocks; block 10 amended).**  Contributor PR

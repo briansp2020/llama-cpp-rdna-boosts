@@ -2509,6 +2509,17 @@ byte-identical to a build without this block, including its OOM.
   a `no_alloc` probe that declines a window — so the probe takes the region buffer explicitly
   (`llama_kv_region_set_probe`, internal).  Without that (r178) the fit could not see the KV, reported an
   over-budget config and aborted instead of sizing the window (fixed in r179).
+* **One device only (r181).**  The window is one VMM region per device, and a tensor split (`-sm tensor`) has
+  no per-device region buffer type to hand out: its KV lives on the Meta wrapper, which has no backend reg, so
+  the region proc addresses cannot be reached through it.  A tensor split therefore **declines** the window
+  (one message from the fit and one from the cache, naming the split) and keeps the KV fully resident;
+  `-sm layer` and one device are unaffected.  Before r181 the reg lookup was an assert, so default `--fit`
+  aborted on **every** multi-device `-sm tensor` run (see the block-15 note in `WORKLOG.md` 261030.005).
+* **`auto` is a decision, not a guess (r181).**  The fit hands down three distinct states — a window, "the KV
+  fits fully resident, keep it" (silent), and "nobody decided" (which still warns) — and it only takes the
+  pinned-RAM clamp while the widened window still meets the VRAM target.  If the `MemAvailable` ceiling would
+  need a window wider than VRAM allows, the fit says so and drops the window (then fits the context by
+  shrinking `-c`), instead of planning a pinned spill larger than the machine.
 * `LLAMA_KV_REGION=0` disables the provider; `LLAMA_KV_REGION_QUARANTINE=0` is the diagnosis switch that
   reproduces the driver hazard (never ship it), and `LLAMA_KV_REGION_DEBUG/TRACE/CANARY/DUMP` are the
   instruments.  `GGML_CUDA_VMM_REGION_SELFTEST=1` runs the provider's own selftest (it must PASS, and must

@@ -27,17 +27,20 @@ build — **§3.7.11 is this session**) and [`MIXED-BACKING.md`](MIXED-BACKING.m
 > H2D / 56.8 D2H.  Every pre-swap t/s number in this campaign is at 28.8 GB/s and **must not be compared**
 > with a new one; the cost model is `bytes / 55.7 GB/s`.
 >
-> **New, unowned item (found 2026-10-30 during the r180 PR #252 gating): `--fit` (default on) aborts on ANY
-> multi-device `-sm tensor` run.**  The KV probes this block added to `common/fit.cpp`
-> (`fit_buft_is_kv_region`, `fit_kv_spill_ram_budget`, `fit_kv_link_gbps`) call
-> `ggml_backend_dev_backend_reg(dev)` for every model device, and a **Meta** (tensor-split) device has no
-> backend reg (`device->reg == NULL`), so `ggml_backend_reg_get_proc_address(NULL, …)` hits
-> `GGML_ASSERT(reg)` (`ggml-backend.cpp:1052`) at model load, on every model, before a token runs.
-> Reproduced with the plain r179 release binary; `--fit off` completes.  Fix in
-> [`fit-meta-reg-guard.patch`](fit-meta-reg-guard.patch): one `fit_dev_reg()` helper that answers "none"
-> for a reg-less device (the window is a single-region feature anyway, so the fit's answer can only be "not
-> the KV buft" / "unknown").  **Not shipped in r180** — the maintainer is handling the multi-GPU/KV
-> interaction separately; the r180 PR gates ran their 2- and 3-device arms with `--fit off`.
+> **FIXED in r181 (was the unowned item found during the r180 gating): `--fit` + `-sm tensor` aborted.**  The KV
+> probes this block added look up backend proc addresses through `ggml_backend_dev_backend_reg(dev)`, and a
+> **Meta** (tensor-split) device has no reg (`device->reg == NULL`), so every multi-device `-sm tensor` run hit
+> `GGML_ASSERT(reg)` at model load (three paths: the fit probe, the runtime buft lookup with a numeric `W`, and
+> the spill budget/link lookups with a `W` below `-c`).  r181 makes a reg-less device read as "the backend does
+> not answer": the window is **declined** on a tensor split with one message from the fit and one from the
+> cache (the window is one VMM region per device; a split has no per-device region buft), while `-sm layer`
+> and one device are untouched.  The same change fixed three `auto` wiring defects (a decided "no window" was
+> reported as "the fit did not run"; every no-knob run logged a KV warning; the pinned-RAM clamp could be
+> taken past the VRAM budget).  **That last one is a live hazard worth remembering: an intermediate form
+> accepted a 235 GiB pinned-spill plan for a 4B at `-c 8388608` and OOM-killed the box.**  See
+> `WORKLOG.md` 261030.005 and [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) §3.7.12.  **Not done, and still
+> the campaign's**: making the window work across a tensor split (per-device region bufts wrapped in a split
+> buft), and the `auto` policy questions (it only spills a pinned `-c`, and the arena reserve wins the VRAM).
 
 ---
 

@@ -751,3 +751,47 @@ reports 54-55 GB/s here), so its own arithmetic already reflects this.
    It now needs a decision on §3.7.11.3 (park) and, if the arena half is wanted, on the `auto`-policy gap
    (§3.7.11.4 C).
 5. Goal B is still not started; multi-device is still not measurable here (one card).
+
+## 3.7.12 r181: the multi-device `--fit` crash, and three `auto` wiring defects (found while gating r180's PR work)
+
+The campaign's box is single-GPU, so nothing here had ever run `-sm tensor` with the block-15 KV plumbing.  It
+**aborted at model load on every multi-device tensor split, with `--fit` at its default**: the KV-region glue
+gets its backend entry points from `ggml_backend_dev_backend_reg(dev)` and a **Meta** (tensor-split) device has
+no backend reg (`device->reg == NULL`), so `ggml_backend_reg_get_proc_address(NULL, …)` asserts
+(`ggml-backend.cpp:1052`).  Three paths, all reachable from a plain `llama-cli`:
+
+1. `common/fit.cpp`'s KV probes (`fit_buft_is_kv_region` / `fit_kv_spill_ram_budget` / `fit_kv_link_gbps`) —
+   any run, any model, because `--fit` walks the buffer types of every model device.
+2. `llama_kv_cache`'s region-buffer lookup (`llama_kv_region_buft_split(meta_dev, W)`) — a numeric `W`.
+3. the spill budget / link lookups in the same constructor — a numeric `W` below `-c`.
+
+Fixed in r181 by reading a reg-less device as "the backend does not answer": the window is **declined** on a
+tensor split (one message from the fit, one from the cache), and `-sm layer` / one device keep their region
+buffers.  The fit additionally resolves the Meta wrapper to a **simple child** so the identification is still
+the backend's answer if a multi-device window ever exists.
+
+**Still open (the campaign's, not the delivery's):** a window *across* a tensor split would need per-device
+region bufts wrapped in a split buft plus a fit that sizes them together; nothing here implements or validates
+that, and this box still has one card.
+
+Three `auto` wiring defects were fixed in the same change, all reproducible on ONE device:
+
+* `auto`'s decided "no window needed" (`0`) was reported by the cache as *"--fit did not run"*, because 0 was
+  indistinguishable from "nobody decided".  Now a decided-0 flag exists (silent) and only a genuinely
+  undecided `auto` warns.
+* every run **without** the knob logged "the windowed KV is unavailable for this cache (no spilled cells)".
+  It now fires only when a window was requested and declined for a real reason.
+* the `LLAMA_KV_SPILL_RAM_PCT` clamp was applied without checking the VRAM budget, so the fit could report a
+  window that the ceiling had already made unfittable (or, worse, accept one).  **That is a live hazard:** an
+  intermediate form of the fix accepted a **235 GiB** pinned-spill plan for a 4B at `-c 8388608`; creating it
+  OOM-killed the box (83 GB anon-rss, kernel OOM).  The clamp is now taken only while the widened window still
+  meets the VRAM target; otherwise the fit reports that the ceiling cannot be served at this `-c` and drops the
+  window (then fits by shrinking `-c`).
+
+**The `auto` policy itself is unchanged, and still the maintainer's call** (§3.7.11.4 C): `auto` sizes the
+window to the VRAM left after the weights, the margin **and the arena/slab reserve**, so on a `-ncmoe` config
+the arena wins the VRAM and the KV window comes out small by design; and it only spills a `-c` the user pinned
+(with `-c` unset the fit prefers a fully resident context).  A window that is "too small to be worth it" is
+therefore usually the arena reservation showing up in `margins[0]`, not a sizing bug: the arithmetic is
+`free − margin − everything-but-the-KV`, and it reproduces to the MiB on both boxes (27B Q8_0
+`-c 262144 -ctk/-ctv q8_0`: 123265 of 262144 cells, 4092.8 MiB resident, 4611.2 MiB spilled).

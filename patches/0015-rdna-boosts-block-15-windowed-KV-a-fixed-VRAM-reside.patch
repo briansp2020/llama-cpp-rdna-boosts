@@ -1,4 +1,4 @@
-From d23cd1dbe1bc7fc087a320603db286e54fe287aa Mon Sep 17 00:00:00 2001
+From 83d2c391a1f193461e71a383535ec38dee1ad099 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Fri, 30 Oct 2026 11:56:35 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: windowed KV (a fixed-VRAM
@@ -57,24 +57,57 @@ widths on spilling arms; `test-backend-ops -o FLASH_ATTN_QSA` 26/26; `check-gpu-
 Not in this block: the campaign's Goal B (a sparse attended set) and Goal C (the MTP drafter ring,
 `LLAMA_SPEC_DRAFT_WINDOW`) -- both remain campaign work -- and A1 (the superseded two-base FA read).
 Records: `wip/kv-residency/A2-MIXED-BACKING.md` (§3.7.9, §3.7.11), `HANDOVER.md`.
+
+MULTI-DEVICE `--fit` (r181): the KV-region glue is now safe on a Meta (tensor-split) device, and `auto`'s
+decision reaches the cache as a decision.  r178 made default `--fit` abort on ANY `-sm tensor` run with more
+than one device: the fit's KV probes and the cache's own region lookups call
+`ggml_backend_dev_backend_reg(dev)` and hand it to `ggml_backend_reg_get_proc_address`, and a Meta device has
+no backend reg (`device->reg == NULL`), so `GGML_ASSERT(reg)` fired at model load.  Three paths asserted: the
+fit probe (any run), the runtime buft lookup (a numeric W), and the spill budget/link lookups (a numeric W
+below `-c`).  The window is one VMM region per device and a tensor split has no per-device region buffer type,
+so the backend simply has no answer there -- which is now what it says: a null reg reads as "not provided",
+the window is declined with one message naming the tensor split (fit and cache), and the KV stays fully
+resident.  A resolved-to-child reg in the fit (the same Meta->simple-device walk the split accounting already
+does) keeps the identification exact if a multi-device window ever exists.
+
+Three wiring defects in the same code, all visible on ONE device:
+- `auto`'s "no window needed" decision (0) was indistinguishable from "nobody decided", so the cache warned
+  "--fit did not run" immediately after the fit had decided exactly that.  `llama_kv_region_set_resident_cells`
+  now records that a decision was made (`llama_kv_region_resident_cells_decided`), and a decided 0 is silent.
+- every run without the knob logged "the windowed KV is unavailable for this cache (no spilled cells)".
+  That message now only fires when a window was actually requested and declined for a real reason.
+- the pinned-RAM ceiling clamp could raise W past the VRAM budget and then be reported as "does not make this
+  fit either".  It is now only taken while the wider window still meets the VRAM target; otherwise the fit
+  says the ceiling cannot be served at this `-c` and drops the window (which the fit then fits by reducing the
+  context).  That ordering is not cosmetic: an intermediate form of this fix accepted a 235 GiB pinned spill
+  plan for a 4B at `-c 8388608`, and creating it OOM-killed the test box.
+
+GATES (gfx1201): `--fit on` (default) at 2 and 3 devices, `-sm tensor`, with no knob / a numeric W / `auto`,
+fit on and off: no assert, tokens produced, exactly one message per requested window.  `-sm layer` 2 devices
+and 1 GPU still take the window per device (numeric W), and `auto` still sizes the 27B Q8_0 `-c 262144` q8_0
+arm identically (123265 of 262144 cells, 4092.8 MiB resident / 4611.2 MiB spilling).  One device, no knob: no
+KV message at all.  Purity unchanged: plain vs a SPILLING windowed arm prefill-logit KLD 0.000000 / 99.990 %
+(q8_0 KV), greedy text byte-identical on that arm; 35B-A3B (1 GPU and 2-GPU `-sm tensor`), dense 27B and the
+canonical 27B Q8_0 prefill-logit gate (0.000000 / 100.000 %) byte-identical to r180; MTP Protocol A unchanged
+(tensor acceptance 0.60816 = 1937/3185, plain == draft-mtp); no GPU faults.
 ---
- common/fit.cpp                             |  181 ++-
+ common/fit.cpp                             |  240 +++-
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1208 ++++++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  122 ++
  ggml/src/ggml-cuda/ggml-cuda.cu            |  861 +++++++++++++-
  ggml/src/ggml-cuda/vendors/hip.h           |    4 +
- src/llama-ext.h                            |   24 +
- src/llama-kv-cache.cpp                     |  353 ++++++
+ src/llama-ext.h                            |   28 +
+ src/llama-kv-cache.cpp                     |  417 +++++++
  src/llama-kv-cache.h                       |   16 +
- 8 files changed, 2762 insertions(+), 7 deletions(-)
+ 8 files changed, 2889 insertions(+), 7 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
 
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 29d9dbbd0..ca06dc053 100644
+index 29d9dbbd0..516aca339 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
-@@ -105,6 +105,38 @@ struct common_fit_cache_reserve {
+@@ -105,6 +105,70 @@ struct common_fit_cache_reserve {
  
  } // namespace
  
@@ -85,13 +118,37 @@ index 29d9dbbd0..ca06dc053 100644
 +// RESIDENT part is ever committed to VRAM (the rest is pinned host memory).  Fit therefore needs the KV's own
 +// bytes, split from the rest of the context tier, which is what `kv_bytes_out` carries out of the measurement
 +// below (a `no_alloc` probe builds no window, so the numbers are the whole KV at that `-c`).
++// The backend reg a device's proc addresses are reached through, or nullptr when there is none.  A Meta
++// (tensor-split) device carries no reg of its own (`device->reg == NULL`), so `--fit` must not feed it to
++// `ggml_backend_reg_get_proc_address`: it resolves to one of the Meta device's SIMPLE children instead (the
++// same resolution the split accounting below uses), which is the device the backend actually answers for.
++// nullptr = there is no backend to ask, and every probe then reports "unknown" rather than aborting.
++static ggml_backend_reg_t fit_dev_reg(ggml_backend_dev_t dev) {
++    if (dev == nullptr) {
++        return nullptr;
++    }
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    if (reg != nullptr || !ggml_backend_dev_is_meta(dev)) {
++        return reg;
++    }
++    const size_t n_dev = ggml_backend_meta_dev_n_devs(dev);
++    for (size_t i = 0; i < n_dev; i++) {
++        ggml_backend_reg_t child = ggml_backend_dev_backend_reg(ggml_backend_meta_dev_simple_dev(dev, i));
++        if (child != nullptr) {
++            return child;
++        }
++    }
++    return nullptr;
++}
++
 +static bool fit_buft_is_kv_region(ggml_backend_buffer_type_t buft) {
 +    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-+    if (dev == nullptr) {
++    ggml_backend_reg_t reg = fit_dev_reg(dev);
++    if (reg == nullptr) {
 +        return false;
 +    }
 +    auto fn = (int (*)(ggml_backend_buffer_type_t)) ggml_backend_reg_get_proc_address(
-+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_is_kv_buft");
++            reg, "ggml_backend_cuda_kv_region_is_kv_buft");
 +    return fn != nullptr && fn(buft) != 0;
 +}
 +
@@ -99,21 +156,29 @@ index 29d9dbbd0..ca06dc053 100644
 +// constant the cost model divides by, in GB/s (0 = unknown).  Both come from the backend so there is one
 +// number in the process.
 +static size_t fit_kv_spill_ram_budget(ggml_backend_dev_t dev) {
++    ggml_backend_reg_t reg = fit_dev_reg(dev);
++    if (reg == nullptr) {
++        return SIZE_MAX;
++    }
 +    auto fn = (size_t (*)(void)) ggml_backend_reg_get_proc_address(
-+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_spill_ram_budget");
++            reg, "ggml_backend_cuda_kv_region_spill_ram_budget");
 +    return fn != nullptr ? fn() : SIZE_MAX;
 +}
 +
 +static float fit_kv_link_gbps(ggml_backend_dev_t dev) {
++    ggml_backend_reg_t reg = fit_dev_reg(dev);
++    if (reg == nullptr) {
++        return 0.0f;
++    }
 +    auto fn = (float (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(
-+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_link_gbps");
++            reg, "ggml_backend_cuda_kv_region_link_gbps");
 +    return fn != nullptr ? fn(dev) : 0.0f;
 +}
 +
  static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
          const char * path_model,
          const llama_model_params * mparams,
-@@ -115,7 +147,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+@@ -115,7 +179,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
          uint32_t & hp_n_expert,
          ggml_log_level log_level,
          std::vector<size_t> * host_expert_bytes_out = nullptr,
@@ -123,7 +188,7 @@ index 29d9dbbd0..ca06dc053 100644
      struct user_data_t {
          struct {
              ggml_log_callback callback;
-@@ -155,6 +188,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+@@ -155,6 +220,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
  
      llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
  
@@ -136,7 +201,7 @@ index 29d9dbbd0..ca06dc053 100644
      for (const auto & [buft, mb] : memory_breakdown) {
          if (ggml_backend_buft_is_host(buft)) {
              ret.back().mb.model   += mb.model;
-@@ -172,6 +211,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+@@ -172,6 +243,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                  ret[i].mb.model   += mb.model;
                  ret[i].mb.context += mb.context;
                  ret[i].mb.compute += mb.compute;
@@ -148,7 +213,7 @@ index 29d9dbbd0..ca06dc053 100644
                  break;
              }
          }
-@@ -416,12 +460,26 @@ static void common_params_fit_impl(
+@@ -416,12 +492,26 @@ static void common_params_fit_impl(
          }
      };
  
@@ -176,7 +241,7 @@ index 29d9dbbd0..ca06dc053 100644
  
      // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
      const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
-@@ -433,9 +491,13 @@ static void common_params_fit_impl(
+@@ -433,9 +523,13 @@ static void common_params_fit_impl(
          if (n_streams > 1) {
              LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                  __func__, n_ctx_max, n_streams);
@@ -191,7 +256,24 @@ index 29d9dbbd0..ca06dc053 100644
      add_extra_memory(dmds_full);
  
      const size_t nd = devs.size(); // number of devices
-@@ -732,6 +794,119 @@ static void common_params_fit_impl(
+@@ -516,6 +610,16 @@ static void common_params_fit_impl(
+     // proportional sharding leaves every device at the same fill fraction), then reduces n_ctx and,
+     // if needed, n_gpu_layers until the estimate fits the summed targets.
+     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR || mparams->split_mode == LLAMA_SPLIT_MODE_RELAXED_TENSOR) {
++        // The windowed KV is one VMM region per device, and a tensor split has no per-device region buffer type
++        // to hand out (its KV lives on the Meta wrapper), so `auto` cannot be sized and a numeric W is declined
++        // by the cache itself.  Say so once, before the split's own decisions, rather than leaving
++        // LLAMA_KV_RESIDENT_CELLS a silent no-op.
++        if (llama_kv_region_is_enabled() && llama_kv_region_resident_cells_requested() != 0 &&
++                !devs.empty() && ggml_backend_dev_is_meta(devs[0])) {
++            LOG_WRN("%s: LLAMA_KV_RESIDENT_CELLS is set, but the windowed KV is one VMM region per device and this "
++                    "run puts the KV on a Meta (tensor-split) device, so the window is not sized; use one device, "
++                    "or -sm layer, for the window\n", __func__);
++        }
+         std::vector<ggml_backend_dev_t> tdevs; // the "simple" devices behind the Meta wrapper
+         for (ggml_backend_dev_t dev : devs) {
+             if (ggml_backend_dev_is_meta(dev)) {
+@@ -732,6 +836,136 @@ static void common_params_fit_impl(
          return;
      }
  
@@ -246,25 +328,42 @@ index 29d9dbbd0..ca06dc053 100644
 +                    }
 +                }
 +                bool ram_clamped = false;
++                bool ram_overshoot = false;
 +                if (ram_budget != SIZE_MAX && cell_bytes != 0 && kv_cells > w &&
 +                        (size_t) (kv_cells - w) * cell_bytes > ram_budget) {
 +                    // the spill is PINNED, non-swappable RAM: widen the window until the worst case fits
 +                    // (`llama_kv_cache` applies the same clamp at creation; doing it here keeps the report and
-+                    // the decision in one place)
++                    // the decision in one place).  This is a HOST constraint, so only take it while the wider
++                    // window still meets the VRAM target: otherwise it would "fix" the RAM ceiling by breaking
++                    // the VRAM one, and the config would be reported as unfittable for the wrong reason.
 +                    const size_t tail_cells = ram_budget / cell_bytes;
 +                    const size_t w_ram      = kv_cells > tail_cells ? (size_t) kv_cells - tail_cells : (size_t) kv_cells;
 +                    if (w_ram > w) {
-+                        w = w_ram;
-+                        ram_clamped = true;
++                        if (free_dev - used_other - (int64_t) ((size_t) w_ram * cell_bytes) >= margins[0]) {
++                            w = w_ram;
++                            ram_clamped = true;
++                        } else {
++                            ram_overshoot = true;
++                        }
 +                    }
 +                }
-+                const size_t spill_bytes = kv_cells > w ? (size_t) (kv_cells - w) * cell_bytes : 0;
-+                const size_t res_bytes   = kv_cells > w ? (size_t) w * cell_bytes : kv_bytes;
++                const size_t spill_bytes = ram_overshoot ? 0 : (kv_cells > w ? (size_t) (kv_cells - w) * cell_bytes : 0);
++                const size_t res_bytes   = ram_overshoot ? kv_bytes : (kv_cells > w ? (size_t) w * cell_bytes : kv_bytes);
 +                const int64_t projected  = used_other + (int64_t) res_bytes;
 +                const int64_t proj_free  = free_dev - projected;
 +                const float   gbps       = fit_kv_link_gbps(devs[0]);
 +
-+                if (w >= kv_cells) {
++                if (ram_overshoot) {
++                    // The pinned-RAM ceiling is a HARD constraint: the window it demands is wider than VRAM
++                    // allows, so no window can serve this `-c`.  Drop it and let the fit reduce the context --
++                    // the honest answer, instead of a window whose spill the ceiling refuses at creation.
++                    LOG_WRN("%s: the windowed KV cannot serve %u cells: the pinned, NON-SWAPPABLE RAM ceiling "
++                            "(%.1f MiB, LLAMA_KV_SPILL_RAM_PCT) needs a window wider than the VRAM budget allows; "
++                            "the window is dropped and the context is fitted as before.  Lower -c, or raise "
++                            "LLAMA_KV_SPILL_RAM_PCT, to use the window here.\n",
++                            __func__, cparams->n_ctx, (double) ram_budget / MiB);
++                    llama_kv_region_set_resident_cells(0);
++                } else if (w >= kv_cells) {
 +                    // a zero-width spill saves nothing: either the whole KV already fits (the common case) or
 +                    // it does not fit at all, and today's fit-or-fail is then the honest answer
 +                    if (kv_auto) {
@@ -2613,10 +2712,10 @@ index 7343e230d..b3b113388 100644
  #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
  #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 0079595f5..9258dd0b3 100644
+index 0079595f5..b0243d8dc 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
-@@ -216,3 +216,27 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
+@@ -216,3 +216,31 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
  
  // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
  LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
@@ -2644,11 +2743,15 @@ index 0079595f5..9258dd0b3 100644
 +// Hand a window (in cells) down to every context created afterwards; 0 clears it.  `common_params_fit` calls
 +// this before the real contexts exist.  One W covers every cache in the process (the A2 rule).
 +LLAMA_API void llama_kv_region_set_resident_cells(uint32_t cells);
++
++// Did `--fit` hand a decision down?  Writes it to `cells` (0 = it decided no window is needed) and returns
++// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
++LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index b3f3a9c87..8ad3335c1 100644
+index b3f3a9c87..8d334dddf 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -18,6 +18,173 @@ static bool ggml_is_power_of_2(int n) {
+@@ -18,6 +18,212 @@ static bool ggml_is_power_of_2(int n) {
      return (n & (n - 1)) == 0;
  }
  
@@ -2680,6 +2783,16 @@ index b3f3a9c87..8ad3335c1 100644
 +    return on;
 +}
 +
++// The backend reg a device's KV-region proc addresses hang off, or nullptr when the device has none.  A Meta
++// (tensor-split) device carries no reg of its own (`device->reg == NULL`), so `ggml_backend_dev_backend_reg`
++// must not be fed to `ggml_backend_reg_get_proc_address` for it: every caller below reads nullptr as "the
++// backend does not provide this", which is how the window is DECLINED on a tensor split instead of aborting
++// inside an assert.  (A Meta device could not host a per-device VMM region anyway: the window is one VA range
++// per device, and a tensor split combines the plain buffer types.)
++static ggml_backend_reg_t llama_kv_region_dev_reg(ggml_backend_dev_t dev) {
++    return dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
++}
++
 +// The backend's region buffer type WITHOUT a window (`cells = 0`, the O1 shape).  Only the `--fit` probe uses
 +// it: the fit identifies the KV's share of the device tier by this buffer TYPE, and the probe context is a
 +// `no_alloc` one (so it declines a window), which would otherwise leave the fit unable to see the KV at all --
@@ -2693,7 +2806,11 @@ index b3f3a9c87..8ad3335c1 100644
 +    if (!llama_kv_region_enabled() || dev == nullptr) {
 +        return nullptr;
 +    }
-+    auto fn = (llama_kv_region_buft_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
++    ggml_backend_reg_t reg = llama_kv_region_dev_reg(dev);
++    if (reg == nullptr) {
++        return nullptr;
++    }
++    auto fn = (llama_kv_region_buft_fn) ggml_backend_reg_get_proc_address(reg,
 +            "ggml_backend_cuda_kv_region_buft");
 +    return fn != nullptr ? fn(dev) : nullptr;
 +}
@@ -2707,8 +2824,12 @@ index b3f3a9c87..8ad3335c1 100644
 +    if (!llama_kv_region_enabled() || dev == nullptr || cells == 0) {
 +        return nullptr;
 +    }
++    ggml_backend_reg_t reg = llama_kv_region_dev_reg(dev);
++    if (reg == nullptr) {
++        return nullptr;
++    }
 +    auto fn = (llama_kv_region_buft_split_fn) ggml_backend_reg_get_proc_address(
-+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_buft_split");
++            reg, "ggml_backend_cuda_kv_region_buft_split");
 +    return fn != nullptr ? fn(dev, cells) : nullptr;
 +}
 +
@@ -2736,9 +2857,24 @@ index b3f3a9c87..8ad3335c1 100644
 +// and one W covers every KV cache the process creates (the A2 rule: one window for every tensor and
 +// cache).
 +static uint32_t g_kv_resident_cells_override = 0;
++// ...and whether that 0 is a DECISION (`auto` sized by the fit: the KV fits fully resident, keep it) or just
++// "nothing set".  Without the second flag the cache cannot tell them apart, and it reported "--fit did not
++// run" after the fit had decided exactly that.
++static bool     g_kv_resident_cells_decided  = false;
 +
 +void llama_kv_region_set_resident_cells(uint32_t cells) {
 +    g_kv_resident_cells_override = cells;
++    g_kv_resident_cells_decided  = true;
++}
++
++bool llama_kv_region_resident_cells_decided(uint32_t * cells) {
++    if (!g_kv_resident_cells_decided) {
++        return false;
++    }
++    if (cells != nullptr) {
++        *cells = g_kv_resident_cells_override;
++    }
++    return true;
 +}
 +
 +bool llama_kv_region_is_enabled(void) {
@@ -2768,11 +2904,12 @@ index b3f3a9c87..8ad3335c1 100644
 +// The PCIe link constant every spill cost model divides by: the backend's own calibrated H2D number
 +// (~28.8 GB/s when the campaign was written, ~55 GB/s after the 2026-10 PCIe rework).  0 = unknown.
 +static float llama_kv_region_link_gbps(ggml_backend_dev_t dev) {
-+    if (dev == nullptr) {
++    ggml_backend_reg_t reg = llama_kv_region_dev_reg(dev);
++    if (reg == nullptr) {
 +        return 0.0f;
 +    }
 +    auto fn = (llama_kv_link_gbps_fn) ggml_backend_reg_get_proc_address(
-+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_link_gbps");
++            reg, "ggml_backend_cuda_kv_region_link_gbps");
 +    return fn != nullptr ? fn(dev) : 0.0f;
 +}
 +
@@ -2780,21 +2917,26 @@ index b3f3a9c87..8ad3335c1 100644
 +
 +// What is left of the pinned-spill ceiling for a NEW cache to plan, in bytes (SIZE_MAX = no ceiling).
 +static size_t llama_kv_region_spill_budget(ggml_backend_dev_t dev) {
-+    if (dev == nullptr) {
++    ggml_backend_reg_t reg = llama_kv_region_dev_reg(dev);
++    if (reg == nullptr) {
 +        return SIZE_MAX;
 +    }
 +    auto fn = (llama_kv_spill_budget_fn) ggml_backend_reg_get_proc_address(
-+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_spill_ram_budget");
++            reg, "ggml_backend_cuda_kv_region_spill_ram_budget");
 +    return fn != nullptr ? fn() : SIZE_MAX;
 +}
 +
 +// Account this cache's planned worst-case spill against that ceiling.
 +static void llama_kv_region_spill_reserve(ggml_backend_dev_t dev, size_t bytes) {
-+    if (dev == nullptr || bytes == 0) {
++    if (bytes == 0) {
++        return;
++    }
++    ggml_backend_reg_t reg = llama_kv_region_dev_reg(dev);
++    if (reg == nullptr) {
 +        return;
 +    }
 +    auto fn = (llama_kv_spill_reserve_fn) ggml_backend_reg_get_proc_address(
-+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_spill_ram_reserve");
++            reg, "ggml_backend_cuda_kv_region_spill_ram_reserve");
 +    if (fn != nullptr) {
 +        fn(bytes);
 +    }
@@ -2822,7 +2964,7 @@ index b3f3a9c87..8ad3335c1 100644
  // orthonormal Walsh-Hadamard rotation matrix
  // note: res^2 == I
  static void ggml_gen_hadamard(ggml_tensor * tensor) {
-@@ -187,6 +354,93 @@ llama_kv_cache::llama_kv_cache(
+@@ -187,6 +393,118 @@ llama_kv_cache::llama_kv_cache(
  
      const bool is_mla = hparams.is_mla();
  
@@ -2834,16 +2976,40 @@ index b3f3a9c87..8ad3335c1 100644
 +    //   One W covers every tensor, so the cell geometry has to be uniform across the layers this cache holds
 +    //   (K and V included).  Anything else DECLINES the window -- no spill, today's fit-or-fail -- not a guess.
 +    if (llama_kv_region_enabled() && other == nullptr && !v_trans && !hparams.no_alloc) {
-+        const uint32_t w = llama_kv_region_resident_cells_requested();
++        uint32_t w = llama_kv_region_resident_cells_requested();
++        // A window needs a per-device VMM region buffer type, and the backend answers for it through the
++        // device's own backend reg.  A Meta (tensor-split) device has none (`-sm tensor` combines the plain
++        // per-device buffer types), so a tensor split cannot carry the window at all.
++        const bool region_capable = llama_kv_region_dev_reg(model.dev_layer(0)) != nullptr;
 +        if (w == UINT32_MAX) {
-+            // `LLAMA_KV_RESIDENT_CELLS=auto` with nobody to decide: `--fit` owns the sizing (it is the only
-+            // thing that knows the free-VRAM budget the ARENA also draws on, and the RAM budget the spill
-+            // draws on).  Declining keeps the run honest -- today's fully resident cache, today's OOM.
-+            LLAMA_LOG_WARN("%s: LLAMA_KV_RESIDENT_CELLS=auto is sized by --fit, which did not run (or could not "
-+                           "decide); the KV stays fully resident.  Pass the window explicitly "
-+                           "(LLAMA_KV_RESIDENT_CELLS=<cells>) or run with --fit.\n", __func__);
++            // `LLAMA_KV_RESIDENT_CELLS=auto`: `--fit` owns the sizing (it is the only thing that knows the
++            // free-VRAM budget the ARENA also draws on, and the RAM budget the spill draws on).  Three states,
++            // and they are not the same thing: the fit decided a window, the fit decided the KV fits fully
++            // resident (0 -- keep it, say nothing), or nobody decided (decline, and say why).
++            uint32_t decided = 0;
++            if (llama_kv_region_resident_cells_decided(&decided)) {
++                w = decided;
++            } else if (region_capable) {
++                LLAMA_LOG_WARN("%s: LLAMA_KV_RESIDENT_CELLS=auto is sized by --fit, which did not run (or could not "
++                               "decide); the KV stays fully resident.  Pass the window explicitly "
++                               "(LLAMA_KV_RESIDENT_CELLS=<cells>) or run with --fit.\n", __func__);
++            }
++            // ... and when the device cannot host a region, the tensor-split message below is the whole story.
 +        }
-+        const uint32_t n_tail = (w != 0 && w != UINT32_MAX && kv_size > w) ? kv_size - w : 0;
++        // Decline a requested window on a region-less device once, naming the reason, instead of letting the
++        // per-layer buft lookup decline it silently.
++        if (w != 0 && !region_capable) {
++            static bool warned_no_region = false;
++            if (!warned_no_region) {
++                warned_no_region = true;
++                LLAMA_LOG_WARN("%s: the windowed KV is one VMM region per device, and this cache's KV lives on a "
++                               "Meta (tensor-split) device, which has no buffer type of its own; the KV stays "
++                               "fully resident.  Use one device, or -sm layer, for the window "
++                               "(LLAMA_KV_RESIDENT_CELLS).\n", __func__);
++            }
++            w = 0;
++        }
++        const uint32_t n_tail = (w != 0 && kv_size > w) ? kv_size - w : 0;
 +        size_t cell = 0;
 +        size_t n_tens = 0;
 +        bool   uniform = n_tail != 0;
@@ -2891,10 +3057,11 @@ index b3f3a9c87..8ad3335c1 100644
 +            // account the plan, so a second cache (Flash-Next has two) sizes against what is left
 +            llama_kv_region_spill_reserve(model.dev_layer(0), (size_t) ((size_t) kv_size - w_eff) * cell_all);
 +        }
-+        if (!uniform) {
-+            LLAMA_LOG_WARN("%s: the windowed KV is unavailable for this cache (%s); the KV stays fully "
-+                           "resident\n", __func__,
-+                           n_tail == 0 ? "no spilled cells" : "non-uniform K/V cell geometry across layers");
++        if (n_tail == 0) {
++            // No window asked for, or it was declined above with its own message: fully resident, nothing to add.
++        } else if (!uniform) {
++            LLAMA_LOG_WARN("%s: the windowed KV is unavailable for this cache (non-uniform K/V cell geometry "
++                           "across layers); the KV stays fully resident\n", __func__);
 +        } else if (w_eff < kv_size) {
 +            const size_t tail = (size_t) kv_size - w_eff;
 +            const float  gbps = llama_kv_region_link_gbps(model.dev_layer(0));
@@ -2916,7 +3083,7 @@ index b3f3a9c87..8ad3335c1 100644
      for (uint32_t il = 0; il < n_layer; il++) {
          if (!hparams.has_kv(il)) {
              LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
-@@ -243,6 +497,40 @@ llama_kv_cache::llama_kv_cache(
+@@ -243,6 +561,40 @@ llama_kv_cache::llama_kv_cache(
              buft = ggml_backend_dev_buffer_type(dev);
  
              dev_name = ggml_backend_dev_name(dev);
@@ -2957,7 +3124,7 @@ index b3f3a9c87..8ad3335c1 100644
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-@@ -798,6 +1086,33 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+@@ -798,6 +1150,33 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
      if (!can_park()) {
          return false;
      }
@@ -2991,7 +3158,7 @@ index b3f3a9c87..8ad3335c1 100644
      if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
          return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
      }
-@@ -1026,6 +1341,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1026,6 +1405,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
          if (hparams.no_alloc) {
              GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
              ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
@@ -3011,7 +3178,7 @@ index b3f3a9c87..8ad3335c1 100644
          } else {
              // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
              ret[buft] += ggml_backend_buffer_get_size(buf.get());
-@@ -1612,6 +1940,26 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1612,6 +2004,26 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -3038,7 +3205,7 @@ index b3f3a9c87..8ad3335c1 100644
  uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
      uint32_t result = 0;
  
-@@ -3487,6 +3835,11 @@ bool llama_kv_cache_context::apply() {
+@@ -3487,6 +3899,11 @@ bool llama_kv_cache_context::apply() {
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
      n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
  
