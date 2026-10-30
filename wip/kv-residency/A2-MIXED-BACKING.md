@@ -126,15 +126,30 @@ here is a 2000-token decode after a 5256-token prompt.
 | **122B-A10B Q4_K_XL `-ncmoe 48` (ALL 48 layers) plain** | 19 661 MiB | 29.3 % | 202.8 t/s | 22.9 t/s |
 | **122B-A10B Q4_K_XL `-ncmoe 48` window `W=16384`** | 22 807 (**+3.15**) | **34.0 %** | **220.3 t/s** | **24.7 t/s (+7.9 %)** |
 
+| **Flash-Next GSQ-IQ3_XXS** (qwen4exp) `-ncmoe 48` plain | 22 061 MiB | 53.9 % | 394.0 t/s | 40.8 t/s |
+| **Flash-Next GSQ-IQ3_XXS** `-ncmoe 48` window `W=16384` | 25 818 (**+3.63**) | **63.1 %** | **445.6 (+13.1 %)** | 41.6 (**+2.0 %**) |
+
 `-ncmoe` **must** be the model's full layer count when the point is the arena: at `-ncmoe 40` eight layers of
 experts (218.6 MiB per expert across the host layers) still sit on the device, so the arena is only 8.7 GiB of
 the 65.5 GiB host set (15.6 %); at `-ncmoe 48` it is 19.7 GiB (29.3 %).  That is the config that matters for
 this model, and it is also its fastest: **24.7 t/s** with the window vs 22.9 plain.
 
-**The arena's value is largest where the arena is smallest**: the 122B gains **+7.9 to +10.1 %** decode from
-~3.2 GiB (15.6-34 % of its host set cached), while the 35B-A3B — already at 70-77 % — gains 1-2 %.  Prefill
-moves the same way and further on the 122B (**+8.6 %** at `-ncmoe 48`), because the prefill staging is what
-hits the arena hardest.  122B numbers:
+**The window's benefit splits into prefill and decode, and they have different laws.**
+
+* **Prefill is capacity-bound.**  A prefill routes *every* expert of every layer, so the arena size is
+  directly the staged-bytes saved: 35B-A3B +1.8 %, 122B-A10B +5.9 % (`-ncmoe 40`) / **+8.6 %** (`-ncmoe 48`),
+  **Flash-Next +13.1 %** (512 experts × 48 layers, the hungriest set here).  This is the most consistent win
+  in the whole table.
+* **Decode is hotness-bound.**  10 of 512 experts are routed per token, and the hot set is lopsided, so at
+  ~54-85 % residency the extra GiB mostly holds *cold* experts the run never re-routes: +1.2-2.0 % on the 35B
+  and Flash-Next.  It only converts to a large decode gain where the arena is genuinely starved — the 122B at
+  **15.6 %** residency gains **+10.1 %** (and +7.9 % at `-ncmoe 48`).
+
+Flash-Next also widens the picture on the caches themselves: it has **two** `llama_kv_cache` instances (the
+attention KV, 3264 MiB, and the QSA **indexer** cache, 408 MiB) and the window applies to both — the log shows
+one `WINDOWED KV ENABLED` per cache (0.5 KiB/cell and 0.1 KiB/cell).  The indexer cache is the O(n_ctx) term
+the campaign's Goal B/O4 notes call the second-biggest, so it now participates in the window instead of being a
+fixed VRAM cost.  122B numbers:
 48 layers, 256 experts, 8 used, `n_embd_k_gqa` 512, 55 974 MiB of host experts, 218.6 MiB per expert across
 its 40 host layers.
 
