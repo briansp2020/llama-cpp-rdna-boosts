@@ -73,6 +73,89 @@ of hit rate) — a clear loss, and exactly the gap Goal B exists to close.**  Tw
 * **Prefill gets faster when the KV leaves VRAM** (+3.5 %): prefill is capacity-bound (a prefill routes every
   expert), so the freed VRAM is worth more there than the spilled read costs.  Decode is where the loss is.
 
+## 3.1 B1's first finding (2026-10-30, same session) — **gfx1201 decode is DENSE by default**, so B0 was
+streaming a *dense* read.  The goal's premise is depth-dependent, not unconditional.
+
+The campaign's arch policy says it plainly, in code: `src/models/qwen4exp.cpp:2506` sets
+`qsa_dense_decode_until = (arch == gfx1151 ? 32768 : 1<<62)` — **on gfx1201 the single-token decode takes the
+dense masked arm at every depth** (the sparse QSA arm is prefill-only there; the comment records dense winning
+"flat ~8 %" at 8K-160K on 3x R9700).  So B0's `W=1` arm was reading the *whole spilled tail* per token, and the
+W-sweep proves it: the cost tracks `depth − W`, not a constant attended set.
+
+Attribution arms (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, `-c 65536`, q8_0, 51 475-token prompt, `-n 400`,
+1 GPU, interleaved in one batch; the diagnostic knob is B1(a), below):
+
+| arm | decode t/s | Δ | reads (model) |
+|---|---|---|---|
+| plain (dense decode, KV resident) | **46.52 / 46.46** | — | 816 MiB dense |
+| sparse decode (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`), KV resident | **38.03 / 38.01 / 38.02 / 38.06** | **−18.3 %** | ~108 MiB |
+| sparse decode, attention KV streamed (`_ATTN=1`, `_IDX=0`) | **37.22** (2nd rep 31.26, drifted) | **−2.1 % vs sparse-resident** | ~108 MiB from host |
+| dense decode, attention KV streamed (`_ATTN=1`, `_IDX=0`) | 27.77 → 33.39 (W-sweep: W=49152 free, W=8192 −24 %, W=1 −28 %) | −28…−41 % | 816 MiB from host |
+| dense decode, indexer streamed only (`_IDX=1`) | 38.30 | −18.4 % | 82 MiB from host |
+
+**What this says.**  (i) The streaming mechanism itself is cheap *when the reader is sparse*: 2.1 % for the
+attention tail.  (ii) But sparse decode costs **18.3 %** against dense decode at 51k on this quant/device count,
+so the *net* is a loss today.  (iii) The dense arm's cost is `O(depth)`: 816 MiB/token at 51k → ~3.2 GiB/token
+at 250k (~57 ms), while sparse + streamed stays ~108 MiB/token at 51k and grows only with the *indexer* term
+(~0.4 GiB at 250k).  **So Goal B's crossover is at depth, not at 51k** — the sparse arm is expected to win
+decisively somewhere between 64k and 250k, which is exactly the "one card, large `-c`" shape this campaign is
+for.  **The next measurement (B1-deep) is that crossover**, and it is a decision input, not a detail: if sparse
+streamed does not beat dense streamed at 250k, Goal B has no shape on gfx1201 and the campaign should say so.
+
+**The memory that is given back is exact** (the maintainer's check, 2026-10-30).  The window commits *per
+tensor*, rounded up to one 4 MiB map unit (`KVREGION_FREE`: at `W=1`, attention `mapped=672 host=576` → 96 MiB
+resident over 24 tensors; the indexer 48 MiB).  Against plain, the arena grows **+160 MiB at `W=49152`**,
+**+640 at `W=8192`** and **+719 at `W=1`** — and the cell math agrees: `W=8192` commits 8192 × 544 B = 4.25 MiB
+per tensor → **8 MiB after unit rounding** (192 MiB, not 102), `W=1` commits 4 MiB per tensor (96 MiB).  So a
+small `W` returns slightly *less* than `W × cell_bytes` implies (rounding), never more, and nothing leaks;
+the KV's **VA** reservation is never returned by design, and the resident window is what the slab then takes.
+
+### B1(a) — the instrument (campaign branch `wip-kv-residency-b`, commit `9108f454f`)
+
+`LLAMA_KV_RESIDENT_CELLS_ATTN=<cells>` / `LLAMA_KV_RESIDENT_CELLS_IDX=<cells>` override the window of one cache
+kind (the indexer cache is the one created with the `idx_` name tag); `0` = that cache stays fully resident.
+Unset = the shipped single-W behaviour.  **Diagnostic only, never shipped**; it is a ~15-line block in
+`llama_kv_cache`'s window gate.
+
+## 3.2 B1's second finding — the crossover is a **placement** crossover, and the win is already reachable
+without a page table
+
+Same box/model/`-ncmoe 48`/q8_0, `-n 400`, every arm with the KV placement it names (streamed arms `W=1`,
+proved by `KVREGION_FREE … host=` > 0).  Three depths, four arms each:
+
+| depth (`-c`) | dense + resident | sparse + resident | dense + **streamed** | sparse + **streamed** | streamed sparse vs streamed dense |
+|---|---|---|---|---|---|
+| 51 475 (`65536`) | **46.5** | 38.0 (−18 %) | 27.8…33.4 | 37.2 | **+34 %** (at W=1: 33.4 → 37.2) |
+| 102 899 (`131072`) | **42.4** | 32.6 (−23 %) | 21.0 | **27.8** | **+32.5 %** |
+| 180 035 (`196608`) | **37.0** | 25.3 (−32 %) | 14.7 | **21.9** | **+49 %** |
+| arena (MiB) / residency | 23 580 / 57.6 % → 22 701 / 55.5 % | same | 25 338 / 61.9 % | same | +1.8…2.6 GiB for the arena |
+
+**Read it as three rules, and they are not the same feature:**
+
+1. **Resident KV → dense decode, always, on this hardware.**  Dense's read is `O(depth)` but VRAM reads are ~10×
+   the link (`A2 §3.7.9`: 565 vs 55.7 GB/s), so at 180k the 2.3 GiB/token dense read is ~4 ms on-device; the
+   sparse arm adds the indexer score + top-k over every block, which is also `O(depth)` and *compute*.  The
+   shipped arch policy (`qsa_dense_decode_until = 1<<62` on gfx1201) is right, and gets more right with depth.
+2. **Streamed KV → sparse decode**, by **+32…+49 %** and growing with depth.  This is the only regime where
+   Goal B's premise holds, and the reason is placement, not mechanism: the same `O(depth)` dense read that is
+   free from VRAM costs `bytes/55.7 GB/s` from host.
+3. **Goal B is a fittability/arena feature, not a speed feature.**  Even at its best (streamed + sparse at
+   180k, 21.9 t/s) it is 41 % behind the resident arm (37.0) — what it buys is the KV's 2.3 GiB of VRAM back
+   for the expert arena.  That is block 15's argument, and it means **a page table (B-A) or a compact gather
+   (B-B) is not on the critical path for the win in rule 2**: block 15's window already streams, and the sparse
+   arm already exists.  What is missing is only that **the arm policy does not know the KV is streaming** —
+   `qwen4exp`'s decode gate keys on depth (`qsa_dense_decode_until`), never on the cache's residency/watermark.
+   A predicate like "the attention cache's mapped extent is below its used extent (a window is active and
+   spilling) → take the sparse arm" turns every windowed run from rule 3's 14.7 t/s into 21.9 at 180k, with no
+   new mechanism at all.
+
+**Consequence for the plan: B2 changes shape.**  It becomes a *policy* slice (arm selection under a streaming
+KV) with the four arms above as its gate, and only if that gate shows a loss somewhere does the mechanism work
+(B-A/B-B) come back.  The purity note: the sparse arm is a *different attention regime*, so its greedy text
+differs from the dense arm by construction (a config difference, `GREEDY-PURITY.md` §45/§63, exactly like a
+verify width); prefill is unchanged (always sparse today), so the prefill-logit gate is untouched.  That is a
+documentation obligation, not a correctness risk.
+
 ## 4. The three candidate mechanisms
 
 **B-A — page table + resolve inside the graph (Strata's form).**  The KV becomes a bounded pool of `n_slot`
@@ -103,7 +186,10 @@ is 26 MiB/token or 108 MiB/token.
 
 ## 5. The staged plan
 
-**B1 — attribute the cost (no mechanism).**  Reproduce B0 and split the 4.18 ms:
+**B1 — attribute the cost (no mechanism).**  *(Done 2026-10-30: §3.1 — the dense-decode default is why B0's
+streaming looked expensive; the mechanism costs 2.1 % when the reader is sparse, but sparse decode itself is
+18.3 % behind dense at 51k, so the decisive arm is the **deep crossover** — `-c ~196608`, depth ~180k,
+streamed KV, dense vs sparse decode.)*  The remainder of B1 as written:
 1. a **per-cache window exemption** (`LLAMA_KV_RESIDENT_CELLS_IDX`-style, wip only) so the attention cache can
    spill while the indexer stays resident — the difference isolates the indexer's share;
 2. a **scattered-read probe** (extend `bw-probe.cc`: random 4 MiB-unit reads vs linear) — the effective GB/s a
@@ -112,8 +198,11 @@ is 26 MiB/token or 108 MiB/token.
    readback in a non-captured arm.
 *Gate*: the three numbers add up to the measured `W=1` delta within ~10 %.  Cheap: 3-4 arms, no mechanism.
 
-**B2 — the residency policy on a bounded set.**  Prototype one of B-A/B-B behind `LLAMA_QSA_STREAM` (0 = off,
-byte-identical) on the campaign fork branch `wip-kv-residency`.  Invariants: exactness (a page is staged before
+**B2 — the residency policy on a bounded set.**  *(Revised 2026-10-30 by §3.2: **first the policy slice** — the
+sparse decode arm under a streaming KV cache, which is worth +32…49 % on the four-arm gate above and needs no
+new mechanism.  The B-A/B-B prototype is only justified if a gate arm shows the policy is not enough.)*
+Prototype one of B-A/B-B behind `LLAMA_QSA_STREAM` (0 = off, byte-identical) on the campaign fork branch
+`wip-kv-residency-b` (branch `wip-kv-residency` is Goal A's measurement tree, cut against r174).  Invariants: exactness (a page is staged before
 it is read; writers write host always), the indexer cache stays resident, prefill may stream its union or stay
 resident (decide from B1's census), and the pool is sized from `top_k` + headroom, not from `-c`.
 *Gates*: prefill-logit KLD **0.000000 / 100.000 %** on a streaming arm (it must be exact, unlike the drafter
@@ -127,7 +216,10 @@ nothing leaves `wip/`.
 
 ## 6. Eligibility, risks, and what must not be done
 
-* **Eligible models are the ones whose attended set is bounded**: qwen4exp/QSA (Flash-Next) first, DSA next.
+* **Eligible models are the ones whose attended set is bounded**, **and whose decode actually takes the sparse
+  arm**: qwen4exp/QSA (Flash-Next) first, DSA next.  On gfx1201 that is *not* the default for single-token
+  decode (`qsa_dense_decode_until = 1<<62`, §3.1), so on this arch B is a **deep-context** feature at best and
+  its first question is the 180k-250k crossover, not a policy.
   **Not** full-attention dense/MoE, where the attended set is the whole used context (`STRATA-KV-STREAMING.md`
   §4/§5: Strata never streams a full-attention layer either).
 * **The indexer cache is not streamable** in the same policy (it is read in full to score) — keep it resident
@@ -148,7 +240,9 @@ nothing leaves `wip/`.
 ## 7. Open questions for the maintainer
 
 1. **Is B-A's pool-of-slots (a real page table, one per layer, with a resolve kernel in the graph) sanctioned
-   work**, or is B-B's compact gather (simpler, 2× traffic) the preferred first cut?
+   work**, or is B-B's compact gather (simpler, 2× traffic) the preferred first cut?  *(Deferred by the
+   maintainer 2026-10-30: "not enough information yet".  §3.1's deep-crossover arm is that information — and if
+   sparse streamed does not beat dense streamed at 250k, neither mechanism has a shape on gfx1201.)*
 2. **The target context**: does Goal B aim at `-c 262144` Flash-Next on 1 GPU (where the attention KV is
    3.3 GiB and B frees most of it), or at the multi-device `-ncmoe` server shape (where the freed VRAM is
    ~1 GiB/device of arena)?  The measurement arms differ.

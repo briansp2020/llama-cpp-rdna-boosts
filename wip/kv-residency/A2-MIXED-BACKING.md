@@ -879,3 +879,20 @@ Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, `-c 65536`, q8_0 KV, 51 475-token prompt, `
   points back.  Prefill moves the other way (+3.5 %, capacity-bound), so the loss is a decode-side read.
 * Purity is not in question for a mechanism of this class (residency changes *where* the bytes live): the oracle
   is the prefill-logit gate at **100.000 %**, not the drafter ring's acceptance trade.
+
+### B1 (same session) — the crossover is placement, not mechanism
+
+The B0 arm was measuring a **dense** read: on gfx1201 single-token decode is dense at every depth by arch policy
+(`qwen4exp.cpp:2506`, `qsa_dense_decode_until = 1<<62`).  Forcing the sparse arm (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`)
+and moving the KV between VRAM and host gives four arms per depth (Flash-Next IQ3, `-ncmoe 48`, q8_0, `-n 400`):
+
+| depth | dense+resident | sparse+resident | dense+streamed | sparse+streamed |
+|---|---|---|---|---|
+| 51 475 | **46.5** | 38.0 | 33.4 | 37.2 |
+| 102 899 | **42.4** | 32.6 | 21.0 | 27.8 |
+| 180 035 | **37.0** | 25.3 | 14.7 | **21.9** |
+
+⇒ **resident → dense** (VRAM is ~10x the link; sparse adds `O(depth)` indexer compute), **streamed → sparse**
+(+32…49 %, growing with depth), and the whole of Goal B is a *fittability/arena* feature like block 15, not a
+speed one.  The one missing piece is that the decode-arm policy does not know the KV is streaming — no page
+table is needed for the win.  Plan §3.2 has the detail and the revised B2.
