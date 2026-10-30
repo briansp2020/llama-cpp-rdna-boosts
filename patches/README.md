@@ -1631,11 +1631,11 @@ idempotent (`j == i + 5` is the rotated shape, so a second pass declines).
   `calc_nwarps_weight` row-independent, and that `two_rows` / `GGML_MMVQ_RDNA4_DECODE_GRID` / the
   `grid_stall_pad` block only change *which* block computes a row — a future row-count-dependent nwarps or
   VDR would break it silently, so re-check that predicate before touching it.
-* **The submitter's third patch is NOT taken** (`GGML_CUDA_MMVQ_CONCAT_REORDER`, `wip/graph-order-r176`
-  0003): it gathers small GDN projections into the row concat, but it needs a **quantized** `<= 256`-row
-  weight and skips `Q8_0`, and in every GGUF we hold the GDN `ssm_alpha`/`ssm_beta` are **F32** (the UD
-  quants) or `Q8_0` (the Q8_0 quant), so it cannot fire — measured neutral to −0.7 % on the 35B on both
-  arches.  Held as `TODO` #119 pending the submitter's model/quant and configuration.
+* **The submitter's third patch ships since r180** (`GGML_CUDA_MMVQ_CONCAT_REORDER`, PR #252 0003; see the
+  r180 subsection below).  It needs a **quantized** `<= 256`-row weight and skips `Q8_0`, so it cannot fire
+  in the UD quants (F32 `ssm_alpha`/`ssm_beta`) or in the Q8_0 quant; the measurement that took it is on the
+  submitter's llama.cpp-quantized Qwen3.6-35B-A3B Q4_K_M (whose GDN small projections are Q4_K), and it is
+  inert on every other GGUF we hold.
 
 **Gates.**  Greedy text byte-identical to r176 on 30B-A3B (1 GPU and 2-GPU `-sm tensor`), 35B-A3B, dense
 27B, Gemma4-31B and Flash-Next (`-ncmoe 48`, 2 GPU tensor); prefill-logit KLD **0.000000 / 100.000 %** at the
@@ -1644,6 +1644,52 @@ t/s, acceptance 0.621; tensor 50.8 -> 101.2, acceptance 0.608; `plain == draft-m
 split modes); rule-5 `llama-batched-bench -npl 1,4,8` flat (31.91/102.11/156.90 -> 31.94/102.20/157.18);
 2-GPU `-sm tensor` 30B-A3B +4.7 % (d0) / +3.9 % (d4096); per-block build 2/2; `validate-set.sh` green;
 no GPU faults.  Numbers: `benchmarks/2026-10-30-graph-order-r176.md`.
+
+#### r180 — the GDN small-projection gather (PR #252's third patch)
+
+**What it is.**  A second structural pass in `ggml_backend_cuda_graph_optimize`, placed right after the V/K
+rotate and gated on RDNA3_0/RDNA4.  The Qwen3.5/3.6 GDN layers read the same normed input with
+`ssm_beta` (32 rows), `ssm_alpha` (32 rows) and the `attn_gate` z projection (4096 rows), but sigmoid /
+softplus / reshape nodes sit between them, so each ran as its own GEMV launch.  From the first
+**quantized** `MUL_MAT` of `<= 256` rows (`a`), the pass scans up to 24 nodes ahead for `MUL_MAT`s with the
+same `src1`, the same weight type, the same `K` and the same row stride (at most one of them larger than
+256 rows), and `std::rotate`s up to 2 of them directly after `a`, so a group is at most 3 `MUL_MAT`s (the row
+concat's cap) and `ggml_cuda_mul_mat_row_concat_try_fuse` runs them as one launch.
+
+**Worth (gfx1201, 1 GPU, 3 interleaved rounds, `-fa 1 -p 0 -n 128 -d 0,4096 -r 10`).**  On the submitter's
+file (lmstudio-community `Qwen3.6-35B-A3B-Q4_K_M`, sha256 `4ac6a06b…a410d`, 40 blocks with
+`full_attention_interval = 4` → 30 GDN layers): tg128 **129.35 -> 132.93 (+2.8 %)**, d4096 **126.16 ->
+129.65 (+2.8 %)**; `=0` returns 129.45 (≡ base).  With `GGML_CUDA_MMVQ_ROW_CONCAT=0` (gather on, concat off)
+it is 130.7, i.e. the gain is the concat the gather enables.  Kernel census (`rocprofv3`, 44 decode steps):
+44 808 -> 42 231 dispatches = **60 fewer launches per token** (30 layers x 2).  The submitter's +3.0 / +2.9 %
+reproduce; their gfx1100 +3.5 % is their box.
+
+**Facts a future edit must keep.**
+
+* **Both skip guards are load-bearing, and neither is a tuning choice.**  A `MUL_MAT` whose output feeds a
+  `CONCAT` within 8 nodes is never moved, because `ggml_cuda_ssm_conv_in_try_fuse` returns `j - i` and the
+  nodes in between are never executed — so a node moved into that window would silently never run.  A
+  `Q8_0` weight is never moved, because `ggml_cuda_ssm_prescan_try_fuse` matches the 16-node SSM chain **by
+  position** (`alpha_w` at `i + 7`, `beta_w` at `i + 13`) and only fires when both small weights are `Q8_0`;
+  moving one out of the window would silently drop the whole conv + l2-norm + gate/beta fusion.
+* **The pass only reorders; it never fuses or elides.**  It moves a node earlier across nodes that a valid
+  topological order guarantees cannot read it (its sources are the anchor's activation and its own leaf
+  weight), so no reader is skipped and no buffer lifetime shortens.  Anything it enables is enabled by a
+  fusion's own predicate at compute time.
+* **It is arch-gated (unlike the V/K rotate) because it is a tuning pass, not a correctness enabler** — the
+  fusion it feeds carries its own RDNA3_0/RDNA4 gate.  A new arch that wants it needs its own row-concat
+  proof, not a wider arch list.
+* **Purity is a decode-width property and was measured as one**: prefill-logit KLD **0.000000 / 100.000 %**
+  at the default ubatch, at `-ub 1` and at `-ub 8` (the gather runs at every ubatch size; the row concat is
+  `ne[1] == 1` only), greedy text byte-identical on 1 / 2 / 3 devices, in both MTP split modes (layer and
+  tensor) and on the DFlash2 draft arm, whose `selector_hidden` is the only other `<= 256`-row quantized
+  weight we hold (Q4_K, 256 rows) and which the gather does not match.
+
+**Gates.**  The above plus MTP Protocol A unchanged (layer acceptance 0.62134 = 1951/3140, 51.6 t/s; tensor
+0.60816 = 1937/3185, 101.5 t/s; `plain == draft-mtp` byte-identical in both split modes), rule-5
+`llama-batched-bench -npl 1,4,8` flat (124.3 -> 127.2 / 322.5 -> 319.5 / 414.7 -> 417.3), the canonical
+27B Q8_0 prefill-logit gate **0.000000 / 100.000 %**, per-block build 2/2, `validate-set.sh` green, no GPU
+faults.  Numbers: `benchmarks/2026-10-30-graph-order-0003-r180.md`.
 
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 

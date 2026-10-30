@@ -26,6 +26,18 @@ build — **§3.7.11 is this session**) and [`MIXED-BACKING.md`](MIXED-BACKING.m
 > **The box.**  One R9700 (gfx1201), 32 624 MiB; the PCIe rework (2026-10-30) makes the link **55.7 GB/s**
 > H2D / 56.8 D2H.  Every pre-swap t/s number in this campaign is at 28.8 GB/s and **must not be compared**
 > with a new one; the cost model is `bytes / 55.7 GB/s`.
+>
+> **New, unowned item (found 2026-10-30 during the r180 PR #252 gating): `--fit` (default on) aborts on ANY
+> multi-device `-sm tensor` run.**  The KV probes this block added to `common/fit.cpp`
+> (`fit_buft_is_kv_region`, `fit_kv_spill_ram_budget`, `fit_kv_link_gbps`) call
+> `ggml_backend_dev_backend_reg(dev)` for every model device, and a **Meta** (tensor-split) device has no
+> backend reg (`device->reg == NULL`), so `ggml_backend_reg_get_proc_address(NULL, …)` hits
+> `GGML_ASSERT(reg)` (`ggml-backend.cpp:1052`) at model load, on every model, before a token runs.
+> Reproduced with the plain r179 release binary; `--fit off` completes.  Fix in
+> [`fit-meta-reg-guard.patch`](fit-meta-reg-guard.patch): one `fit_dev_reg()` helper that answers "none"
+> for a reg-less device (the window is a single-region feature anyway, so the fit's answer can only be "not
+> the KV buft" / "unknown").  **Not shipped in r180** — the maintainer is handling the multi-GPU/KV
+> interaction separately; the r180 PR gates ran their 2- and 3-device arms with `--fit off`.
 
 ---
 

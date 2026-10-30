@@ -42,8 +42,9 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 16 blocks + b
 ## Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v15-6050b467c-r177`**; the
-`v16-*` tags are the historical 16-block set.  `r1` is the
+(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-6050b467c-r180`**; the block
+count in the tag follows the set, so `v15-*` tags are the 15-block releases up to r177 and `v16-*` the
+16-block releases from r178 on.  `r1` is the
 re-base of the set onto that fork point and every later `rN` is a dated change recorded in
 [`WORKLOG.md`](WORKLOG.md), newest first).
 

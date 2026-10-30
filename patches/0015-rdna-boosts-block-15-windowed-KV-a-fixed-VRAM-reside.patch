@@ -1,4 +1,4 @@
-From b35a3354e80af42514d9caeb0796becf0d2b7784 Mon Sep 17 00:00:00 2001
+From d23cd1dbe1bc7fc087a320603db286e54fe287aa Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Fri, 30 Oct 2026 11:56:35 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: windowed KV (a fixed-VRAM
@@ -1654,7 +1654,7 @@ index 000000000..5d2618b48
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index be2e59c7e..0f3b17ea2 100644
+index bf13bea24..05c5157dd 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -110,6 +110,7 @@
@@ -2520,7 +2520,7 @@ index be2e59c7e..0f3b17ea2 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      CUDA_CHECK(cudaMemcpy2DAsync(
-@@ -8322,8 +9114,54 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -8380,8 +9172,54 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -2575,7 +2575,7 @@ index be2e59c7e..0f3b17ea2 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -8435,6 +9273,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8493,6 +9331,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  
@@ -3085,5 +3085,5 @@ index 6bf874cb5..e9b68c867 100644
      // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
      std::vector<uint32_t> v_heads;
 -- 
-2.55.0
+2.56.0
 

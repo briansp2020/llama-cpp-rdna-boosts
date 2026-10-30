@@ -11,8 +11,8 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **15-block V2.1 set** (block 00 + blocks 01-14) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v15-6050b467c-r176`**.  `release.json` is the source of truth for the
+**Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`6050b467c`**
+(the 2026-10-25 re-base), release **`v16-6050b467c-r180`**.  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 
 | # | subject | kind | status |
@@ -314,29 +314,3 @@ must not be promoted; its KV **buffer-type skeleton** (a custom buft carrying a 
 page table, selected per device with a plain-buft fallback) is the container O2 needs and is worth reusing.
 
 ---
-
-## 119. PR #252 patch 0003 (GDN small-projection gather) — held off, waiting on the submitter's configuration
-
-**State: declined for r177, not refuted.**  `wip/graph-order-r176` 0003 adds a `graph_optimize` pass
-(`GGML_CUDA_MMVQ_CONCAT_REORDER`, RDNA3_0 + RDNA4) that moves a later `MUL_MAT` next to an earlier one with
-the same activation, weight type and `K` (at most one of them larger than 256 rows), so the dense row concat
-runs the Qwen3.5/3.6 GDN `ssm_beta` + `ssm_alpha` + `attn_gate` projections as one launch.  The submitter
-measured **+3.0 %** (Qwen3.6-35B-A3B tg128, gfx1201) and **+3.5 %** (gfx1100) for it.
-
-**It cannot fire on any GGUF we hold.**  The pass needs a **quantized** `<= 256`-row weight and explicitly
-skips `Q8_0`.  In every Qwen3.6-35B quant here the GDN `ssm_alpha`/`ssm_beta` are **F32** (UD-Q3_K_M,
-UD-Q4_K_M, UD-Q5_K_M, Q6_K, Q8_K_XL — unsloth keeps small tensors high-precision) or **Q8_0** (the Q8_0
-quant); `attn_gate` is Q8_0 in the UD quants as well.  A scan of every model on both boxes finds exactly one
-`<=256`-row quantized weight anywhere (the DFlash2 drafter's `selector_hidden`, Q4_K).  Measured on the 35B,
-switch on vs off: **gfx1201 104.4 vs 105.1 t/s, gfx1100 141.1 vs 141.1** — neutral to −0.7 %.
-
-**What unblocks it:** the exact GGUF (name **and** sha256) and the command line the +3.0 / +3.5 % was
-measured with, i.e. a build whose GDN small projections are quantized (a standard, non-UD k-quant is the
-likely shape).  With that we can (a) reproduce the delta on both arches, (b) decide whether it is worth the
-positional risk the pass carries (`ggml_cuda_ssm_conv_in_try_fuse` skips the nodes up to its `CONCAT`, and
-the GDN prescan matches nodes by position, which is why the pass skips `Q8_0` and refuses anything feeding a
-`CONCAT` within 8 nodes), and (c) if it ships, gate it on whatever actually selects those weights rather than
-on the arch.
-
-**Not in `patches/`.**  The submitted patch is preserved in `archive/work/graph-order-r176/` (0003) with the
-two taken patches, and r177's block-10 note records the decline.

@@ -1,5 +1,64 @@
 # WORKLOG - dated delivery records
 
+## 261030.004 (r180) -- PR #252's GDN small-projection gather ships (block 10): +2.8 % decode on the quantized-GDN shape, bit-identical
+
+**Released as `v16-6050b467c-r180` (16 blocks; block 10 amended).**  Contributor PR
+[#252](https://github.com/stew675/llama-cpp-rdna-boosts/pull/252) (`@briansp2020`) patch **0003**
+(`GGML_CUDA_MMVQ_CONCAT_REORDER`).  Its siblings shipped in r177; this one was *declined, not refuted*
+(`TODO` #119, now closed) because it needs a **quantized `<= 256`-row** weight and skips `Q8_0`, and every
+Qwen3.6-35B GGUF we held keeps the GDN `ssm_alpha`/`ssm_beta` at **F32** (the unsloth UD quants) or `Q8_0`
+(skipped by design).  The submitter then supplied the exact file and command line, and the claim reproduced.
+
+**What it does.**  A structural pass in `ggml_backend_cuda_graph_optimize`, right after the r177 V/K rotate,
+RDNA3_0 + RDNA4: from the first quantized `MUL_MAT` of `<= 256` rows it moves up to 2 later `MUL_MAT`s with
+the same `src1`, weight type, `K` and row stride directly after it (at most one of them larger than 256
+rows), so the Qwen3.5/3.6 GDN `ssm_beta` + `ssm_alpha` + `attn_gate` projections run as **one** ksplit launch
+via the r177 row concat.  Same nodes, one stream, every ubatch size, idempotent; `=0` is the kill switch.
+
+**Reproduced on their exact model** (`lmstudio-community/Qwen3.6-35B-A3B-Q4_K_M`, sha256
+`4ac6a06bce551257267f49ad2226f8671a22519ccc1a4dde9d5b433d1f2a410d` — downloaded and verified, with
+`ssm_alpha`/`ssm_beta`/`attn_gate` all Q4_K and 40 blocks at `full_attention_interval = 4`, i.e. 30 GDN
+layers).  1 GPU gfx1201, 3 interleaved rounds, `-fa 1 -p 0 -n 128 -d 0,4096 -r 10`: tg128 **129.35 ->
+132.93 (+2.8 %)**, d4096 **126.16 -> 129.65 (+2.8 %)**; `=0` returns 129.45 (≡ base).  The submitter's
++3.0 / +2.9 % reproduce (theirs on a R9700, gfx1100 +3.5 % on their 7900 XTX).  Attribution: with the row
+concat itself disabled it is 130.7, i.e. the win is the concat the gather enables.  Kernel census
+(`rocprofv3`): 44 808 -> 42 231 dispatches over 43 decode steps = **exactly 60 fewer launches per token**,
+as claimed (30 layers x 2).
+
+**Purity.**  Prefill-logit KLD **-0.000000 / 99.990 %** at the default ubatch and **0.000000 / 100.000 %** at
+`-ub 1` and `-ub 8` (`--ab GGML_CUDA_MMVQ_CONCAT_REORDER=0`); greedy text byte-identical on 1, 2 and 3
+devices for that model, and on Qwen3-30B-A3B Q4_K_M, dense 27B UD-Q4_K_XL, Gemma4-31B QAT UD-Q4_K_XL,
+Flash-Next Q4_K_M (`-sm tensor -ncmoe 48`) and the DFlash2 draft arm.  MTP Protocol A unchanged (3 devices:
+layer acceptance 0.62134 = 1951/3140 at 51.6 t/s, tensor 0.60816 = 1937/3185 at 101.5 t/s; `on == off` and
+`plain == draft-mtp` byte-identical in both split modes).  Rule-5 `llama-batched-bench -npl 1,4,8` flat
+(124.3 -> 127.2 / 322.5 -> 319.5 / 414.7 -> 417.3), the canonical 27B Q8_0 prefill-logit gate
+**0.000000 / 100.000 %**, `gate-per-block-build.sh --changed-from 898103305 --fast` 2/2, `validate-set.sh`
+green, no GPU faults.
+
+**Two guards in the pass are load-bearing, not tuning** (`patches/README.md`, block 10, "r180"): never move a
+`MUL_MAT` whose output feeds a `CONCAT` within 8 nodes (`ggml_cuda_ssm_conv_in_try_fuse` skips those nodes,
+so a node moved in would silently never run) and never move a `Q8_0` weight (`ggml_cuda_ssm_prescan_try_fuse`
+matches its 16-node chain by position and only fires on `Q8_0`).  A future edit that relaxes either is a
+wrong-answer bug, not a missed optimisation.
+
+**Scope, stated plainly:** the pass cannot fire where the GDN small projections are `F32` (unsloth UD
+quants, and even their "True" Q3_K_M) or `Q8_0`, so the win is real on llama.cpp-quantized files
+(lmstudio-community's are) and inert on most of the GGUF set this box holds.  It is inert on a dense model
+and on the qwen4exp/Flash-Next arm.
+
+**Re-cut.**  Block 10 amended (`f71e0a024` -> `e809fb56f`), blocks 11-15 re-cut on top; `release.json`
+`tip d23cd1dbe` / `tree 3b094bcfd1bb411e49275284af43852c09d46ae7`.  Blocks 00-09 differ from r179's patches
+only in `format-patch`'s git-version trailer (2.55.0 -> 2.56.0); their bodies are unchanged.  The submission
+stays preserved in `archive/work/graph-order-r176/` (now all three patches taken).
+
+**Also found this session (not shipped, separate work):** `--fit` (default on) **aborts on any multi-device
+`-sm tensor` run** in r178/r179 — the KV probes block 15 added to `common/fit.cpp` look up the backend reg of
+the **Meta** device, which has none, so `ggml_backend_reg_get_proc_address(NULL, …)` asserts at model load.
+Reproduced with the plain r179 binary on two models; `--fit off` completes.  The null-reg guard is parked
+with the campaign that owns block 15 (`wip/kv-residency/fit-meta-reg-guard.patch`, noted in its HANDOVER);
+the maintainer is handling the multi-GPU/KV interaction separately, so the r180 PR gates ran their 2- and
+3-device arms with `--fit off`.  Numbers: `benchmarks/2026-10-30-graph-order-0003-r180.md`.
+
 ## 261030.003 (r179) -- hotfix: `--fit` could not size the window (a probe-context bug in r178's block 15)
 
 **Released as `v16-6050b467c-r179` (16 blocks; block 15 amended).**  r178 shipped a regression that made block

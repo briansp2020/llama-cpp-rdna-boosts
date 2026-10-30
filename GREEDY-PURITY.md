@@ -11,7 +11,7 @@ which false trails were ruled out) are in
 numbers.  The delivery-side record of each amendment is in `patches/README.md` and `WORKLOG.md`.  Section
 numbers are **stable** — dozens of docs cite them — so they are never renumbered; new findings append.
 
-> **Numbering.**  This document uses the **V2.1 block** numbering for new text (14 blocks, `00`-`13`; r109
+> **Numbering.**  This document uses the **V2.1 block** numbering for new text (16 blocks, `00`-`15`; r109
 > split the old block 10 into block 10 = infrastructure and block 11 = qwen4exp, and moved the campaign
 > remainder to block 12 and the MTP-vocab trim to block 13).  Entries written
 > before 2026-10-13 use the **pre-V2.0 16-block** numbering ("block 10" = the k-quant/VDR umbrella, now
@@ -2309,3 +2309,44 @@ then keeps the packed mask for the rest of the run: the memory is given back, th
 
 **Record:** `WORKLOG.md` 261029.003, `archive/work/kq-derived-multiseq/`, `patches/README.md` (block 05),
 `benchmarks/2026-10-29-derived-kq-multiseq.md`, `ENVIRONMENT.md` (`LLAMA_KQ_MASK_DERIVED_MULTISEQ`).
+
+## 71. A graph-reorder pass is pure only while it moves nodes alone and the positional matchers are excluded (r180, PR #252)
+
+**The claim.**  Two structural passes in `ggml_backend_cuda_graph_optimize` move `MUL_MAT` nodes earlier in
+the graph (`GGML_CUDA_QK_ROTATE`, r177; `GGML_CUDA_MMVQ_CONCAT_REORDER`, r180).  A reorder cannot change a
+result: the moved node's sources (its activation and its own leaf weight) are already earlier in the graph,
+and the nodes it crosses are guaranteed by topological order not to read it, so no reader is skipped and no
+buffer lifetime shortens.  What a reorder *can* break is a **positional consumer** — a matcher that reads
+`cgraph->nodes[i + k]` and, having declared the region fused, returns a skip count so those nodes are never
+executed.
+
+**The rule.**  Before a reorder is allowed, enumerate the try-fuse entries that (a) anchor at a fixed index
+and (b) skip nodes without validating each one, and exclude every input they depend on:
+
+* `ggml_cuda_ssm_conv_in_try_fuse` returns `j - i` having validated only its `MUL_MAT` and the `CONCAT` —
+  so **never move a node whose output feeds a `CONCAT` within 8 nodes**: it would land inside the skipped
+  window and silently never run;
+* `ggml_cuda_ssm_prescan_try_fuse` matches a 16-node chain **by position** (`alpha_w` at `i + 7`,
+  `beta_w` at `i + 13`) and only fires when both GDN small weights are `Q8_0` — so **never move a `Q8_0`
+  weight**; doing so drops the whole conv + l2-norm + gate/beta fusion (a perf loss, not a wrong answer, but
+  it silently disables a shipped win).
+
+Both guards live in the r180 pass and are load-bearing, not tuning.  A pass that gathers *other* families'
+small projections owes the same enumeration.
+
+**How to judge a change here.**  A reorder runs at every ubatch size, so the prefill-logit gate must be run
+at **three** widths, not one: the default ubatch (prefill shape), `-ub 1` (the decode-width graph) and
+`-ub 8` (the captured-graph band).  All three read **0.000000 / 100.000 %** for r180
+(`--ab GGML_CUDA_MMVQ_CONCAT_REORDER=0`, on the only GGUF the pass fires on).  Text is the second instrument
+and it must be run **within** one device count: 1 / 2 / 3 devices, both MTP split modes, and the DFlash2
+draft arm (whose `selector_hidden` is the only other `<= 256`-row quantized weight we hold and which the
+pass deliberately does not match) are all byte-identical for r180.
+
+**A reorder's *reach* is a model property, not a kernel property.**  The r180 pass fires only where a
+**quantized `<= 256`-row** projection exists: llama.cpp-quantized GGUFs (lmstudio-community's Qwen3.6 range)
+keep the GDN `ssm_alpha`/`ssm_beta` at Q4_K, while the unsloth UD quants keep them `F32` and the Q8_0 quant
+is excluded — so the same build measures +2.8 % on one file and is inert on another.  Quote the GGUF's
+sha256 with any claim about this pass; "inert on our models" is not "does not work".
+
+**Record:** `WORKLOG.md` 261030.004, `patches/README.md` (block 10, "r180"),
+`benchmarks/2026-10-30-graph-order-0003-r180.md`, `ENVIRONMENT.md` (`GGML_CUDA_MMVQ_CONCAT_REORDER`).
