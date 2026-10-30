@@ -1,28 +1,19 @@
 # HANDOVER — `wip/kv-residency` (TODO **#118**), cold-session start
 
-**Rewritten 2026-10-29 at the end of the fourth session.**  Read this top to bottom before touching anything;
-it is self-contained.  **The plan of record is [`O2-PLAN.md`](O2-PLAN.md)** — read it immediately after this
-file, then [`README.md`](README.md) §4.0 (the goal) and §4.1 (the speed rule).
+**Rewritten 2026-10-29 at the end of the sixth session.**  Read this top to bottom before touching anything;
+it is self-contained.  Then read [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) (the measured state of the
+build) and [`MIXED-BACKING.md`](MIXED-BACKING.md) (the design + the driver probe).
 
-> **The one thing to know:** three sessions were spent building options off this campaign's own menu that the
-> maintainer never asked for (`O1 --kv-grow`, `O3` drafter ring).  The ask is a **windowed KV**, Goal A.  Do
-> not substitute.  See §9.
+> **The one thing to know:** the ask is a **windowed KV** — Goal A, fittability on one 32 GiB card — and it is
+> **built and measured**.  A 27B Q8_0 at `-c 262144` that used to OOM now runs, the spill cost matches
+> `(used − resident) × cell_bytes / H2D bandwidth` to a few percent, and slab mode's expert arena gains
+> ~3-5 GiB which is worth **+7.9 to +10.1 % decode on the models whose arena is starved** and **+8.6 to
+> +13.1 % prefill everywhere**.  What is left is **`--fit` sizing** (the break-even decision) plus three
+> robustness/correctness gates.  See §7.
 >
-> **Update 2026-10-29 (later the same day): A2 IS BUILT AND MEASURED.**  [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md):
-> the 27B Q8_0 `-c 262144` config that OOMed **runs** (8704 MiB KV = 8160 MiB system RAM + 544 MiB VRAM),
-> the spill costs exactly `(used − resident) × cell_bytes / ~28 GB/s` (18.7 / 13.6 / 10.8 t/s at 51 475 tokens
-> for windows of all / 32 768 / 16 384 cells), and slab mode's arena gains **+2.69 GiB** on 35B-A3B
-> `-ncmoe 24 -c 262144` with decode flat.  **Open finding:** a static window anchored at the end of `-c` only
-> helps once the run reaches it, so the product knob has to follow the watermark (sliding) or be sized from
-> the depth — see that file's §4.
->
-> **Earlier update (fifth session): A1 is built, gated and SUPERSEDED, and the A2 design is settled.**
-> A1 — the two-base K/V read inside the FA kernels — is on its own branch (`A1-TWO-BASE-KV.md`) as the record
-> and the fallback.  A probe (`mixed-backing-probe.cc`) then showed that **one** VMM reservation can be backed
-> partly by pinned host memory (device read 28.4 GB/s, device-writable, copy-engine-visible, re-mappable), so
-> **A2 is mixed backing** (`MIXED-BACKING.md`): one KV tensor, the resident window in VRAM, the tail in host
-> pages — **no kernel change, no op change**, and defrag / `seq_add` / state io / the writers stay untouched.
-> The next work is A2 §3 there, not A1.
+> **And: the box is about to change.**  The maintainer is re-doing the PCIe layout for ~**56 GB/s** H2D (from
+> 28.8) and a faster model SSD.  Every number in this campaign is at 28.8 GB/s — see §9 before quoting any of
+> them again.
 
 ---
 
@@ -30,207 +21,210 @@ file, then [`README.md`](README.md) §4.0 (the goal) and §4.1 (the speed rule).
 
 | what | where |
 |---|---|
-| delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, pushed to `origin` (`git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
-| release the campaign is cut against | **r174**, `v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`, 15 blocks.  **r176 is now the delivery's current release** (`release.json`) — the campaign's fork branch is based on r174 and its patches apply to r174; a promotion re-cuts against the then-current release |
-| the campaign's TODO handle | **#118** (cited as `#117` until 2026-10-29, when that number was allocated to the MoE band-predicate item — see `TODO.md` §118) |
-| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, local only: `973e166e1` (O1 slice 1) → `6bf445b34` (O1 slice 2) → `a93dee7a9` (O3) → `e49e1cef4` (A1, superseded; also branch `wip-kv-residency-a1-two-base`) → `0e5b0d59d` (A2, mixed backing, measured) |
-| the release chain | `rdna-boosts` in `~/llama.cpp` — **still `5bdec04ab`, untouched.** Nothing in this campaign is in `patches/`, `release.json` or any block |
-| patch snapshot (the backup) | `patches/0001`…`0004` + `patches/README.md` + `patches/diffstat.txt` (1534 insertions, 15 files) |
-| **Goal A (the ask)** | **A2 built and measured** ([`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md)): the OOM config runs, the spill cost matches the model, the slab arena gains 2.69 GiB.  **Open:** the window must follow the watermark (that file §4), the ckpt/state-pipe gates, the `MemAvailable` gate, `--fit` reporting → A3.  A1 ([`A1-TWO-BASE-KV.md`](A1-TWO-BASE-KV.md)) is the superseded fallback. |
-| O1 (`--kv-grow`) | built, measured, **PARKED** — it regresses a config that uses most of `-c` on a slab-armed MoE model (`IMPLEMENTATION.md` "KNOWN LIMIT") |
-| O3 (drafter ring) | built, pure, measured, **Goal C / last** — `O3-DRAFTER-RING.md` |
-| box | **one R9700 (gfx1201), 32 624 MiB.**  Pin `HIP_VISIBLE_DEVICES=0` on every arm.  Every number below is 1-GPU; say so, never claim multi-GPU |
+| delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, **pushed** (`origin` = `git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
+| delivery release | **r176** (`release.json`) — the campaign is cut against **r174** (`v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`); a promotion re-cuts against the then-current release |
+| the campaign's TODO handle | **#118** (`TODO.md` §118 + the table row; the older text says `#117`, which was a dangling reference — see the number note there) |
+| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`ba5c7205e`** |
+| the A1 fallback | fork branch `wip-kv-residency-a1-two-base` (`e49e1cef4`), also pushed |
+| `rdna-boosts` | **never touched by this campaign.**  Locally `5bdec04ab`; the fork's branch is at r176's tip (moved by the r176 release) |
+| patch snapshot | `patches/0001`…`0008` + `patches/README.md` + `patches/diffstat.txt` (2024 insertions, 16 files) — apply **in order** to `5bdec04ab` |
+| box | **one R9700 (gfx1201), 32 624 MiB.**  Pin `HIP_VISIBLE_DEVICES=0` on every arm.  Every number here is 1-GPU; say so, never claim multi-GPU |
 
-## 2. The ask, in the maintainer's words (2026-10-29)
+## 2. What Goal A asked for (the maintainer's words, unchanged)
 
 > a **Windowed KV** … for **fully resident dense/MoE models**, because doing so would allow users to run large
 > contexts with a Q8_0 quantization of Qwen3.8-27B, or a Q6_K quantization of 35B-A3B, on a 32 GB card, and
-> **not run out of VRAM** … and for **host-resident MoE's (slab mode)**, because it would free up more VRAM for
-> the decode arena, allowing for higher expert hit rates, leading to higher decode speeds.  Once that is in
-> place, we could then look at improving the drafter via a ring too.
+> **not run out of VRAM** … and for **host-resident MoE's (slab mode)**, because it would free up more VRAM
+> for the decode arena, allowing for higher expert hit rates, leading to higher decode speeds.
 
-| # | goal | mechanism | status |
-|---|---|---|---|
-| **A** | **fittability** on dense/full attention (+ free VRAM for the slab arena) | **static split**: recent `W` cells resident, the tail read in place from a pinned device-mapped host master | **the ask, next** |
-| **B** | a *sparse* attended set streamed cheaply (QSA/DSA) | residency **page table** (the attended set is scattered, so reuse exists) | later; needs Flash-Next + 2-3 GPUs |
-| **C** | the drafter ring | built (O3) | done, last priority |
-
-**Opt-in semantics (agreed):** default **off** = byte-identical to today **including the OOM**; the user opts in
-to "the tail may spill into system RAM"; the warning is loud and always printed; `--fit` reports the split
+**Opt-in semantics (agreed):** default **off** = byte-identical to today including the OOM; the user opts in
+to "the KV's tail may spill into system RAM"; the warning is loud and always printed; `--fit` reports the split
 instead of refusing.
 
-## 3. Why Goal A is not a speed feature (do not re-derive this)
+## 3. The mechanism as built (do not re-derive)
 
-For **full attention** every decode step reads the whole used context, so:
+**One KV tensor, one VA reservation, mixed backing.**  The cells below the window are backed by **pinned system
+RAM**, the window by **VRAM**, in the same VA range.  That is why there is **no kernel change and no op change**:
+the `set_rows` writers, the in-place rope shift behind defrag/`seq_add`, `state_write`/`state_read`, `clear`, the
+kq mask and the FA kernels all keep addressing one contiguous range.  (A1 — a two-base read inside the FA
+kernels — was built, gated byte-identical, and **superseded**; kept on its branch as the fallback.)
 
-* the streaming cost is **deterministic**: `spilled_bytes / 28.8 GB/s` per token (link constant measured,
-  `INVENTORY.md` §1.D; a kernel reading pinned host gets 29.0 GB/s, VRAM 565 GB/s);
-* the comparison is **"windowed vs OOM"**, not "windowed vs resident";
-* **there is no temporal reuse**, so an LRU/CLOCK page table is pointless for Goal A — *which* cells are
-  resident does not change the traffic.  Hence a **static split**.  The page table is Goal B.
-* **no staging ring**: a copy to VRAM costs the same one link crossing and adds VRAM pressure (the scarce
-  resource).  Read the tail in place.  Overlap hides latency, not bandwidth — the link is ~93 % of the wall
-  time at a deep tail, so overlap's ceiling is the compute fraction (~7 %).
+| piece | where |
+|---|---|
+| the mapping **table** `(off, bytes, kind)`; `map_span(off, bytes, host)`; `ensure_span(...)` which **flips** a mapping's kind through a pinned scratch; `mapped_host()`; the minimum-granularity query | `ggml/src/ggml-cuda/ggml-cuda-vmm-region.{h,cu}` (extends O1's slice 1/2) |
+| `ggml_backend_cuda_kv_region_buffer_type_split(dev, cells)`; `grow_cells` (host + device as the watermark advances); `grow_for` (arbitrary-index writes, state restore); the INFO line that reports RAM vs VRAM bytes | `ggml/src/ggml-cuda/ggml-cuda.cu` |
+| the window decision (`LLAMA_KV_RESIDENT_CELLS=W`), the loud warning, the uniform-geometry decline | `src/llama-kv-cache.cpp` |
+| the A1 policy half (still used) | `llama_kv_cache::get_kv_split_n_tail` |
 
-**The failure this fixes, measured on this box** (reproduce it before building):
+**The invariants that cost real time to find — keep them:**
 
-| config | KV | result |
-|---|---|---|
-| 27B Q8_0 (27.1 GiB) `-c 262144`, `-ctk/-ctv q8_0` | 8704 MiB | **`cudaMalloc failed: out of memory`** |
-| 27B Q8_0 (27.1 GiB) `-c 131072`, f16 KV | 8192 MiB | **`cudaMalloc failed: out of memory`** |
-| 27B Q8_0 (27.1 GiB) `-c 131072`, q8_0 KV | 4352 MiB | fits, ~nothing left over |
+1. **The resident window's VRAM must be committed *before* `SLAB_INIT`** (`init_tensor`).  The slab maps
+   `free VRAM − reserve`; a lazily-mapped window has no physical left by the time the watermark advances and the
+   batch **aborts** (`growth refused … free=0.0 MiB`, measured on Flash-Next).  The **host** half is meant to be
+   lazy (do not pin 7 GiB for a 50k-token run); the resident half is not.  (`ba5c7205e`)
+2. **The slide boundary is quantised in BYTES to a whole map unit**, never in cells.  `unit/nb1` is not
+   unit-aligned, so a cell-quantised boundary makes every unit straddle it and creates a 4 KiB **host** chunk per
+   tensor per token (~130 µs each ≈ 4 ms/token: **14.7 → 18.6 t/s**).  (`f50c33be5`)
+3. **The slide is monotone** (a cell handed to system RAM is not taken back) and flips the trailing unit to host
+   *before* mapping a new one above, so the window's steady-state VRAM is exactly W cells.
+4. **One W for every tensor** ⇒ the K/V cell geometry must be uniform across the layers a cache holds; anything
+   else **declines** the window (warn once, no spill, today's fit-or-fail) rather than guess.
+5. **Every `llama_kv_cache`** is windowed independently — Flash-Next has two (the attention KV and the QSA
+   **indexer** cache) and both take the window, one warning line each.
+6. A `remap`/flip destroys a chunk's contents: `ensure_span` stages it through a pinned scratch with a device
+   synchronise around the unmap.  A capture/graph holds the **VA**, which never changes, so graphs stay valid.
 
-Expected envelope at `-c 131072` on the 27B (34 KiB/cell, modelled): resident window 98304 → ~16 t/s,
-65536 → ~10 t/s, 32768 → ~7 t/s; full speed below the window.  **The claim is "runs where it used to OOM", not
-"fast at 262 K".**
+Knobs (all campaign-only, default off except where noted): `LLAMA_KV_REGION=1` (enables the provider),
+`LLAMA_KV_RESIDENT_CELLS=W` (the window; **unset = no window**, i.e. today's cache), `LLAMA_KV_REGION_DEBUG=1`,
+`GGML_CUDA_VMM_REGION_SELFTEST=1`, `GGML_CUDA_SLAB_STATS=1`.
 
-## 4. The mechanism (corrected 2026-10-29 — the combine route is dead)
+## 4. Environment and build
 
-**`ggml`/CUDA FA exposes NO log-sum-exp** (no `lse`/`softmax_lse` under `ggml/src/ggml-cuda/fattn*`), and two
-normalised attention halves cannot be combined without each half's row sum.  "Two FA calls + a combine op"
-would need an `lse` epilogue in every FA family — numerics changes in the most tuned code in the tree.  **Dead;
-do not revive it.**
+* Build: `~/bin/build-llama-rocm` (ROCm 10.1.0 → `build-rocm/`, gfx1201, ccache).  **Never** pass
+  `-DCMAKE_HIP_FLAGS`.  A warm `llama-cli` relink ≈ 5 s; a `.cu` delta 15-30 s; a ubiquitous header
+  (`fattn-common.cuh`, `ggml-cuda.cu`) 7-9 min.  Keep ccache ≥ 30 GiB.
+* `LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib`; **`HIP_VISIBLE_DEVICES=0`** always.
+* `llama-cli` prints its accounting **only with `-v`** — and `-v` interleaves log text into the generation, so
+  **hash text from a run WITHOUT `-v`** with `~/llama-cpp-rdna-boosts/scripts/extract-generated.py`.  Read timings
+  and the cache/arena lines from a **separate `-v` run** of the same command.
+* `--single-turn --no-display-prompt` always; wrap everything in `timeout`; **never two GPU jobs at once**.
+* Models: `/llm/models/Qwen3.8/27B/Q8_0` (the Goal A target, 27.1 GiB weights), `…/27B/Q4_K_XL` (iteration),
+  `Qwen3.6/35B-A3B/Q8_0` (the Q8_0 MoE arm), `Qwen3.6/35B-A3B/Q4_K_M`, `Qwen3.5/122B-A10B/Q4_K_XL` (48 layers,
+  **the arm that shows the arena's value**), `Qwen3.8/Flash-Next/GSQ-IQ3_XXS` (qwen4exp, 512 experts, two KV
+  caches; **supported** — qwen4exp is in r174's block 11), `Qwen3.5/4B/Q8_0` (fast smoke).
+* Prompts: `prompts/prose-rdna-boosts.txt` (5256 tokens at the 27B), `prompts/kld-corpus-35b-in-domain.txt`
+  (23k; `cat` it twice into `/tmp/prompt-46k.txt` for a 51 475-token prompt).
 
-**Instead: a two-base K/V read inside the existing kernels.**  FA already takes one `KV` base plus a stride and
-indexes rows as `KV + i*stride_KV`, with the *caller* forming the per-tile base — so a split is an
-**addressing** change:
+## 5. Measurement rules (each of these cost a session)
 
-* the op carries `k_tail`, `v_tail` and the tail's cell count `n_tail`;
-* where a tile's base is formed, rows `< n_tail` take the tail base, the rest the head base;
-* **the KV index space stays GLOBAL** ⇒ the mask, `cell_pos`, `tok_lo`/`tok_hi` and the derived-mask form are
-  untouched.  No mask slicing, no combine, no second graph node;
-* `n_tail = 0` indexes exactly as today (**bit-identical by construction**), and `n_tail > 0` keeps the
-  accumulation **order** — same rows, same order, only a different base ⇒ A1's oracle is a real equality.
+1. **`-n 2000` for anything about the expert arena.**  A short run's decode is drowned out by the cache warm-up:
+   the same 35B-A3B Q8_0 arm reads 54.6 t/s at `-n 128` and 66.3 at `-n 2000`.  (Maintainer's rule.)
+2. **`-ncmoe` must be the model's full layer count** when the point is the arena (35B-A3B 48, 122B-A10B 48,
+   Flash-Next 48).  `-ncmoe 40` left eight layers of experts on the device and the arena was half the size.
+3. **Read a delta only from arms interleaved back-to-back in one batch** — this box's clocks drift.
+4. **Never judge run-to-run determinism on a greedy text hash** (hipBLASLt per-process solving, `AGENTS.md`).
+5. Two `llama-cli` runs of the same command differ in text only if something is wrong; the identity gates below
+   are the oracle.
 
-**A1 needs no cache-representation change:** the two segments are two **views of the same KV tensor** — tail =
-cells `[0, s)`, head = cells `[s, n_kv)`.  State io, defrag, `clear`, `seq_rm` and every cell-range path stay
-untouched.  Only **A2** moves the tail's storage (and only then do state save/restore and defrag need a second
-pass).
+## 6. Gates — the exact commands and what they must read
 
-**Coverage:** implement the two-base read in the **RDNA band** (`fattn-rdna.cuh`; RDNA4 + head 256 + GQA 5..12 +
-`n_q <= 8` is the 27B's decode — the case that matters) and the **tile** family (`fattn-tile.cuh`, ~103 KB, the
-kernel body; `fattn-tile.cu` is only the instantiation TU).  Any other family/shape **declines the split**, and
-declining = **no spill** = today's fit-or-fail path.
+```bash
+cd ~/llama.cpp
+export LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib HIP_VISIBLE_DEVICES=0
+P=~/llama-cpp-rdna-boosts
 
-## 5. A1 — DONE (superseded).  A2's anchors are in `MIXED-BACKING.md` §3
+# 0. the primitive (it now also maps a HOST-backed span and has the device write it)
+GGML_CUDA_VMM_REGION_SELFTEST=1 ./build-rocm/bin/llama-cli -v -m /llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf \
+  -ngl 99 -c 512 -p hi -n 2 --no-display-prompt --single-turn 2>&1 | grep "selftest.*PASS"
 
-The anchors below are the record of the A1 build (branch `wip-kv-residency-a1-two-base`); they stay useful
-because mixed backing reuses A1's *policy* half (`get_kv_split_n_tail`, the knobs) and none of its kernel half.
+# 1. text identity: plain vs window (must be byte-identical).  Hash from runs WITHOUT -v.
+for W in "" 2048 4096; do
+  LLAMA_KV_REGION=${W:+1} LLAMA_KV_RESIDENT_CELLS=$W ./build-rocm/bin/llama-cli \
+    -m /llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 99 -c 8192 -ctk q8_0 -ctv q8_0 \
+    -f $P/prompts/prose-rdna-boosts.txt -n 128 --seed 42 --temp 0 --no-display-prompt --single-turn > /tmp/id$W.log 2>&1
+  python3 $P/scripts/extract-generated.py /tmp/id$W.log          # all three must print the same 526 chars/sha
+done
+#   known-good: 27B q8_0 = 526 chars sha=5ba44647188f ; 4B f16 = 591 chars sha=ef279d67a708 ;
+#               35B-A3B -ncmoe 24 -c 16384 = 339 chars sha=061add8deaba
 
-| step | where | note |
-|---|---|---|
-| 1. op plumbing | `ggml/include/ggml.h` (`ggml_flash_attn_ext`, line ~2524; the `_add_kq_derived`/`_set_n_kv_max` setters are the pattern), `ggml/src/ggml.c`, `ggml/src/ggml-cuda/fattn.cu` | `k_tail`/`v_tail` as extra srcs + `n_tail` in `op_params`; **inert when 0** |
-| 2. the two views | `llama_kv_cache::get_k/get_v` (`src/llama-kv-cache.cpp:1712`, `:1735`) and `llama_kv_cache_context::get_k/get_v` (`:3560`) | return the head view as today plus an optional tail view; the split point `s` comes from a knob |
-| 3. pass them through | `llm_graph_context::build_attn_mha` (`src/llama-graph.cpp:3139`) — the single funnel both `build_attn` variants use (`:3325`, `:3416`) | only place the op is created |
-| 4. tile family | `fattn-tile.cuh:456-715` (`KV + i*stride_KV` indexing) | prove **byte-identical text** at a forced split |
-| 5. band | `fattn-rdna.cuh` | re-prove; this is the 27B decode path |
+# 2. prefill logits (a residency change moves bytes, not values): must read 0.000000 / 100.000 %
+$P/scripts/gate-prefill-logits.sh --ctx 2048 --chunks 8 --base /tmp/kld.kld \
+  --ab "LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=1024"
 
-**Oracle at every step:** same-seed greedy text **identical** to the unsplit arm at several forced split widths
-(use `scripts/extract-generated.py`, and *not* with `-v`).  Plus `scripts/gate-prefill-logits.sh`.
+# 3. GPU faults (never grep a log for "page fault" by hand)
+$P/scripts/check-gpu-faults.sh --since "<session start>" --log /tmp/id.log … 
 
-**A2** = move the tail view's storage to the pinned host master (a buffer-type change) → same text, measured
-cost.  **A3** = auto-size the window from free VRAM, the opt-in flag, the loud warning, `--fit` reporting, and
-the `MemAvailable` gate.  Details: `O2-PLAN.md` §6.
+# 4. the OOM baseline must still OOM with the feature OFF
+./build-rocm/bin/llama-cli -m /llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf -ngl 99 -c 262144 \
+  -ctk q8_0 -ctv q8_0 -p hi -n 4 … 2>&1 | grep "cudaMalloc failed: out of memory"
+```
 
-## 6. What is already measured (do not re-derive)
+**Still owed** (no gate exists yet for these — see §7): `scripts/gate-ckpt-reuse.sh`,
+`scripts/gate-state-pipe.sh` (state io now crosses a boundary that *moves*), and a `MemAvailable` check before
+pinning the spill.
 
-**Link constants** (`INVENTORY.md` §1.D, `bw-probe.cc`): H2D/D2H pinned 28.8/28.2 GB/s, kernel read of pinned
-**29.0**, VRAM **565**, D2D 291.
+## 7. What remains, in priority order
 
-**O1, slice 2 (PARKED)** — `IMPLEMENTATION.md`: same-seed text identical off/on/tiny-unit (4B 147 chars
-`b065f37593b3`; 35B-A3B 572 `40e29c2b46b6`; 27B+MTP 89 `392abe9d2bd6`); prefill-logit KLD **0.000000 /
-100.000 %**; `SLAB_INIT` at `-c 262144` moved free 17.46 → 22.46 GiB and arena 15.88 → 20.88 GiB.  **And it
-regressed**: 35B-A3B `-ncmoe 24 -c 262144` on a 253k-token prompt completes with the region off (1201.2 /
-51.2 t/s) and refuses at 41216 cells with it on, because `SLAB_INIT` had already given the freed VRAM to the
-arena.  That is the lesson behind "the split is decided before `SLAB_INIT`".
+1. **`--fit` sizing of the window** (the agreed shape: the window slides, and `W` is *sized from the depth*;
+   default `W = -c` = no spill).  This is now a **measurable break-even decision**:
+   * the window pays when `(kv_size − depth) × cell_bytes` of VRAM freed is worth more than
+     `(depth − W) × cell_bytes` of per-token spill;
+   * one side of it, measured: Flash-Next at `-c 65536` (≈depth) frees **0.39 GiB** and costs **14.6 %** decode;
+     at `-c 262144` (≈4× depth) the same model frees **3.63 GiB** and costs **0 %** (nothing spills at 5256
+     tokens) with prefill **+13.1 %**.  See `A2-MIXED-BACKING.md` §3.5–§3.6.
+   * `--fit` must also **report** the split (resident MiB of total, spilled MiB, the window in cells, and the
+     modelled cost at the current depth) instead of warning and running anyway.
+2. **`gate-ckpt-reuse.sh` + `gate-state-pipe.sh`** — the only paths the slide touches that the identity arms do
+   not (a restore writes arbitrary cell indices; `grow_for` maps the right kind by position).
+3. **The `MemAvailable` gate** before pinning the spill (`MOE_HOST_POOL_RAM_PCT` pattern; up to 8.5 GiB at
+   `-c 262144` on a 27B, non-swappable).
+4. **MTP verify widths** on a windowed arm (A1 gated them; A2 changes memory, not kernels — lower risk, cheap).
+5. **Multi-device**: not measurable here (one card).  Nothing in this campaign says anything about `-sm tensor`
+   or `-sm layer` beyond what the delivery already documents.
+6. **Goal B** (the sparse attended set, QSA/DSA) is *not* started and is not next; the indexer cache now
+   participates in the window, which is where Goal B would begin.
 
-**O3 drafter ring (Goal C, patch `0003`)** — `O3-DRAFTER-RING.md`: pure (text identical, 27B 303 chars
-`c437759e06e3`, 35B-A3B 262 `e9db5cb8db0b`); the draft KV shrinks exactly (27B `-c 12288`: 192 → 72 MiB at a
-4096 window); **at a usable window it is free** (46k context, 27B `-c 65536`: acceptance 0.5499 → 0.5371,
-gen 50.61 → 50.79 t/s) and **at a too-small window it is not** (0.6381 → 0.5712, −7 % at 4096 against a 5 k
-context).  Its prize is one draft layer (~1 GiB at `-c 262144`) and the freed VRAM does **not** reach the
-arena (the draft KV sits inside the slab's `aux_reserve`).
+## 8. The numbers (1 GPU; all at **28.8 GB/s** H2D — see §9)
 
-## 7. Invariants that still hold (from the first session, unchanged)
+**Fittability** (27B **Q8_0**, 51 475-token prompt → 53 475 used, `-n 2000`):
 
-* **Policy in the memory module, physical from a provider.**  Residency metadata belongs in `llama-kv-cache*`;
-  physical comes from P0 (plain pool + pinned master), P1 (a private VMM region) or P2 (a slab carve).
-* **The slab stays MoE-only** (`ggml_cuda_slab_enabled()` = `env && g_slab_armed`, armed only by the host-expert
-  preflight).  Nothing in this campaign may *require* the slab.
-* **Never map/grow anything past what is resident** — reading reserved-but-unmapped VA faults the GPU
-  (`VMM-PROBE.md`).
-* **A refused residency must never reach `ggml_cuda_device_malloc`'s OOM chain** (it frees the expert arena; the
-  r117 identity cliff is 46.7 → 65.0 t/s).  Decline loudly instead.
-* **Purity:** residency moves bytes, never values.  Oracle = byte-identical greedy text **and**
-  `gate-prefill-logits.sh`.
-* The host master is **pinned** (gfx1201 has XNACK off → a kernel cannot read pageable host memory), so the
-  spilled part is non-swappable RAM: 4.25 GiB at `-c 131072` q8_0 on the 27B, 8.5 GiB at 262144.  Gate on
-  `MemAvailable` (`MOE_HOST_POOL_RAM_PCT` pattern).
+| arm | decode |
+|---|---|
+| `-c 65536` fully resident (the reference) | 18.4 t/s |
+| `-c 262144`, `W=55296` (nothing spills) | **18.6 t/s** |
+| `-c 262144`, `W=49152` (131 MiB/token of spill) | **18.6 t/s** |
 
-## 8. Environment and pitfalls (this box, this tree)
+The OOM config runs (8704 MiB KV = 8160 MiB system RAM + 544 MiB VRAM), prefill 933-1113 t/s, and the spill
+hides behind that arm's 1.29 GiB/token of CPU-mapped weights.
 
-* Build: `~/bin/build-llama-rocm` (ROCm 10.1.0, `build-rocm/`, gfx1201, ccache).  **Never** pass
-  `-DCMAKE_HIP_FLAGS`.  A warm `llama-cli` relink is ~5 s; a `.cu` delta 15-30 s; a widely included header
-  3-5 min.  Keep ccache ≥ 30 GiB.
-* `LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib`; **`HIP_VISIBLE_DEVICES=0`** always (the iGPU is a second HIP
-  device the build does not support).
-* `llama-cli` prints its INFO/accounting lines **only with `-v`** — and `-v` interleaves log text into the
-  generation, so **hash text from a run WITHOUT `-v`**, and use `~/llama-cpp-rdna-boosts/scripts/extract-generated.py`
-  (a naive `sed`/`grep` slice does not reproduce the hash; the backspace-correction stream is why).
-* **Never** run two GPU jobs at once.  Always `--single-turn --no-display-prompt`, always `timeout`.
-* `llama-bench` has no `-c` in this tree.  `llama-cli` has no `--prompt-cache` any more (state save/restore is
-  reachable only through the server; `scripts/gate-ckpt-reuse.sh` drives it).
-* Streaming a `-v` run into `grep` floods: the whole generation arrives as JSON chunks.  Capture to a file and
-  extract the **last** `"draft_n"/"predicted_per_second"` pair (see the O3 session's python snippet pattern).
-* **Read a delta only from within one interleaved batch** — this box's clocks drift between batches (r175's
-  docs record a 4-point disagreement on identical binaries).  The A/Bs recorded in this campaign were
-  interleaved arm-to-arm inside one session, so their deltas stand; do not compare an absolute t/s from one
-  session with one from another.
-* `scripts/check-gpu-faults.sh --since "HH:MM" --log FILE` is the fault check (defaults to "today"; the journal
-  still holds 10 gfxhub faults from 2026-10-29 15:33:40 that predate this campaign's sessions).
-* Models: `/llm/models/Qwen3.8/27B/Q8_0/…` (27.1 GiB, the Goal-A target), `Qwen3.8/27B/Q4_K_XL/…` (**use this one
-  for iteration** — Q8_0 leaves no headroom), `Qwen3.6/35B-A3B/Q4_K_M/…` (MoE + slab),
-  `Qwen3.5/4B/Q8_0/…` (fast smoke).  Flash-Next (75 GB) does **not** fit one card — Goal B territory.
-* `prompts/prose-rdna-boosts.txt` (5256 tokens at the 27B) and `prompts/kld-corpus-35b-in-domain.txt` (23 k
-  tokens) are convenient; a 2x/9x `cat` of the latter makes 46k/253k-token contexts.
+**The arena's value** (`-c 262144`, `-n 2000`, all experts on the host):
 
-## 9. Scope discipline (the rule that exists because of three wasted sessions)
+| model | arena | residency | prefill | decode |
+|---|---|---|---|---|
+| 35B-A3B Q8_0 `-ncmoe 40` | 25 245 → 27 922 MiB | 77.3 → 85.5 % | +1.8 % | +1.7 % |
+| 122B-A10B Q4_K_XL `-ncmoe 48` | 19 661 → 22 807 | 29.3 → 34.0 % | +8.6 % | **+7.9 %** |
+| Flash-Next IQ3_XXS `-ncmoe 48` | 22 061 → 25 818 | 53.9 → 63.1 % | **+13.1 %** | +2.0 % |
 
-1. **The campaign is Goal A, then B/C.  No other option off the `README.md` §5 menu is in scope.**
-2. **If the ask cannot be measured on the attached hardware, say so** — then build it for *correctness* with no
-   perf claim, or stop.  **Never substitute something that is measurable.**
-3. **Do not pick scope.**  Present findings; the maintainer decides.
-4. **Surface findings and open questions before a delivery-affecting commit**, not after.
-5. Nothing from `wip/` goes into `patches/`, `release.json` or any block without the promotion rule.
+**Prefill is capacity-bound** (a prefill routes *every* expert); **decode is hotness-bound** (10 of 512 routed,
+and the hot set already fits where residency is high) — it only converts to a big decode gain where the arena
+is starved (the 122B at 15.6 % residency gained **+10.1 %**).
+
+## 9. THE BOX IS CHANGING — re-baseline before quoting anything
+
+The maintainer is swapping components: the PCIe layout is being re-done for **~56 GB/s H2D** (from the measured
+**28.8 GB/s** this whole campaign is calibrated on) and the model SSD becomes more responsive.  So:
+
+* **Re-measure the link constant first**: `wip/kv-residency/bw-probe.cc` (and `INVENTORY.md` §1.D).  Every cost
+  model here is `bytes / 28.8 GB/s`; at 56 GB/s the spill cost **halves**, so a window that was break-even at
+  `-c ≈ 1.4 × depth` may become clearly positive, and the `--fit` break-even of §7.1 moves with it.
+* **Re-run `mixed-backing-probe.cc`** — it should still pass, but the T3/T4 bandwidth numbers and the T8 chunk
+  timing will change (~130 µs per host chunk may improve or worsen).
+* **Re-record the prefill-logit base** if the box's *build* is unaffected but the GPU changes; a new GPU or a
+  different PCIe slot does not change logits, but a fresh base costs 30 s and removes the question.
+* Do **not** compare a post-swap t/s number against a pre-swap one, even for the plain arm.
 
 ## 10. Records
 
 | record | content |
 |---|---|
-| [`O2-PLAN.md`](O2-PLAN.md) | **the plan of record**: the three goals, the root cause of the drift, the Goal A build contract (§6: opt-in rule, where the split is decided, the corrected mechanism, the A1/A2/A3 order) |
-| [`README.md`](README.md) | the campaign: §0 read-first, §4.0 the ask + the OOM evidence, §4.1 the speed rule (Goal B), §4.2 the scope decision, §5 the option menu (**mostly out of scope**) |
-| [`INVENTORY.md`](INVENTORY.md) | T1-T5 taxonomy, 4 measured shapes, the link constants, per-token arithmetic |
-| [`VMM-PROBE.md`](VMM-PROBE.md) | the 9 driver tests + the two traps (unmapped-read fault, stale fresh mapping) |
-| [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) | **A2 as built**: the mapping-table primitive, the buffer type, the gates, the measured numbers (OOM config runs; spill cost curve; slab arena +2.69 GiB), and the static-window finding |
-| [`MIXED-BACKING.md`](MIXED-BACKING.md) | **the A2 design of record**: the mixed-backing probe's results (one VA range, host-backed chunks, 28.4 GB/s, device-writable, copy-engine-visible, 3264 chunks at real size), the shape, what A2 has to build, and the residual risks |
-| [`A1-TWO-BASE-KV.md`](A1-TWO-BASE-KV.md) | A1, the two-base K/V read: what was built, every gate, the negative control, and why it was superseded (kept as the fallback) |
-| [`mixed-backing-probe.cc`](mixed-backing-probe.cc) | the probe behind MIXED-BACKING.md (T1-T8) |
-| [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md) | Strata's `kv_stream.hpp` read in full and mapped onto this tree |
-| [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | O1 slice 1 + slice 2 (PARKED) with the measured regression |
-| [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md) | Goal C: design, implementation, measurements, both corrections |
-| `patches/` | `0001`-`0003` + `README.md` + `diffstat.txt` — the campaign's code as applied patches (apply to `5bdec04ab`) |
-| `bw-probe.cc`, `vmm-probe.cc` | the two standalone probes |
+| [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) | **the state of the build**: what is implemented, every gate, §3.5 the arena numbers, §3.6 the deep arm + the break-even, and the two bugs the measurements found |
+| [`MIXED-BACKING.md`](MIXED-BACKING.md) | the design + the driver probe (one VA range can be backed partly by pinned host memory; host chunks; the real shape at scale) |
+| [`A1-TWO-BASE-KV.md`](A1-TWO-BASE-KV.md) | A1 (two-base read in the FA kernels): built, gated, **superseded**, kept as the fallback |
+| [`O2-PLAN.md`](O2-PLAN.md) | the plan of record as written (its §6.3 mechanism is now historical — mixed backing won) |
+| [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | O1 (the growable KV region) — **parked**; A2 reuses its buffer-type skeleton |
+| [`INVENTORY.md`](INVENTORY.md), [`VMM-PROBE.md`](VMM-PROBE.md) | the taxonomy and link constants; the VMM driver facts |
+| [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md), [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md) | reference designs; Goal C (done, last priority) |
+| `patches/` | `0001`-`0008` + `README.md` + `diffstat.txt` — the campaign's code, apply to `5bdec04ab` in order |
+| `mixed-backing-probe.cc`, `vmm-probe.cc`, `bw-probe.cc` | the three standalone probes |
 
 ## 11. First 30 minutes of the next session
 
-1. `cd ~/llama-cpp-rdna-boosts && git pull`; read `O2-PLAN.md` (whole file) and this file.
-2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** at `a93dee7a9`; if it is
-   `rdna-boosts`, `git checkout wip-kv-residency` and rebuild.  Verify `git rev-parse --short rdna-boosts` is
-   still `5bdec04ab` (**never** commit campaign code there).
-3. `~/bin/build-llama-rocm` (expect ~5 s warm), then reproduce the Goal A baseline: the 27B Q8_0 OOM at
-   `-c 262144` (`-ctk q8_0 -ctv q8_0`) from §3.  That is the "before" number.
-4. Read [`MIXED-BACKING.md`](MIXED-BACKING.md) — that is the build spec now — and re-run its probe
-   (`hipcc … mixed-backing-probe.cc`; T1-T8 are all green; re-run it if the driver or ROCm moves).
-5. Start A2 §3 step 1: re-point `ggml_backend_cuda_kv_region_buffer_type` from O1's lazy growth to an up-front
-   `[host tail | device head]` mapping per tensor, with the split point from
-   `llama_kv_cache::get_kv_split_n_tail()`.  A1's kernel half is **not** on this path — leave it on its branch.
+1. `cd ~/llama-cpp-rdna-boosts && git pull`; read this file, then `A2-MIXED-BACKING.md`.
+2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** at **`ba5c7205e`**
+   (`git log --oneline -6` should show the four A2 commits).  `git rev-parse --short rdna-boosts` must not
+   matter to you; never commit campaign code there.
+3. `~/bin/build-llama-rocm` (expect ~5 s warm), then run §6 gate 0 and gate 1 — if the text hashes match the
+   values in §6, the tree is the one that was measured.
+4. **Re-measure the link constant** (§9) if the hardware swap has happened, and note the new value in
+   `INVENTORY.md` §1.D and in the top of `A2-MIXED-BACKING.md`.
+5. Start §7 item 1 (`--fit` sizing) — that is the only thing between this and a product-shaped opt-in.
