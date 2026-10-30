@@ -33,9 +33,14 @@ If `5bdec04ab` is not available (an old checkout), re-cut it first from this rep
 | `0001-ggml-cuda-grow-only-VMM-region-primitive.patch` | `ggml/src/ggml-cuda/ggml-cuda-vmm-region.{h,cu}`: one VA reservation, physical mapped per `unit` chunk, grown monotonically, clear-on-map, fail-soft.  The mapped extent is a **set of spans** (`grow_span`/`is_mapped`/`clear` over a per-unit bitmap), because a KV buffer lays its tensors out consecutively and a single prefix watermark would map ~the whole region even for a 4-token run.  Plus a one-shot `GGML_CUDA_VMM_REGION_SELFTEST=1` hook in `ggml_backend_cuda_init`.  Purely additive — no existing path changes. | **applied, building, selftest PASS**; gates green (see `../IMPLEMENTATION.md`) |
 | `0002-ggml-cuda-KV-region-buffer-type.patch` | `ggml_backend_cuda_kv_region_buffer_type` (ggml-cuda.cu) + the `llama_kv_cache` selection and the `apply()` grow (src/llama-kv-cache.{h,cpp}).  Env-gated OFF (`LLAMA_KV_REGION=1`), plain device buffer type as the mandatory fallback. | **applied, building**, all gates green — but see the KNOWN LIMIT in `../IMPLEMENTATION.md`: on a slab-armed MoE config the arena keeps the VRAM the KV no longer takes up front, so a run that uses most of `-c` refuses where the plain arm completes |
 
+| `0004-ggml-fa-A1-two-base-KV-read-SUPERSEDED.patch` | **A1, the two-base K/V read** — the op carries `k_tail`/`v_tail` + `n_tail`, and the tile and MMA-f16 kernels select the segment where a KV tile's base is formed (the cell index space stays global).  Gated byte-identical at several window widths on both families, MTP verify widths, and a negative control.  **SUPERSEDED 2026-10-29** by mixed backing (`../MIXED-BACKING.md`: one VA range backed partly by pinned host memory, measured at 28.4 GB/s) — kept as the record and the fallback, see `../A1-TWO-BASE-KV.md` | **applied, building, all gates green** (not the A2 path) |
+
 | `0003-llama-model-MTP-draft-KV-window.patch` | **O3, the drafter ring**: the MTP draft cache can be a sliding window (`LLAMA_SPEC_DRAFT_WINDOW=<cells>`, default off) — one `create_memory` branch plus a helper, reusing `find_slot`'s reclaim and the cache's own `n_swa` for the mask.  **Implemented and measured; a poor product trade** (-6..-9 % decode, +8 % prefill, and the freed VRAM does not reach the arena) — see `../O3-DRAFTER-RING.md` §2.2 | **applied, building, gates green** |
 
 `diffstat.txt` is the net diff of the series against `5bdec04ab`.
+
+The A1 slice is also a **named branch** in `~/llama.cpp`: `wip-kv-residency-a1-two-base` (`e49e1cef4`), so the
+fallback can be checked out without replaying any patch.
 
 As slice 2 (the KV buffer type) lands, it is appended as `0002-…`: re-cut with
 `git format-patch 5bdec04ab..wip-kv-residency`, replacing the series rather than adding a patch on top of an

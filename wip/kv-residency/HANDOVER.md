@@ -5,8 +5,16 @@ it is self-contained.  **The plan of record is [`O2-PLAN.md`](O2-PLAN.md)** — 
 file, then [`README.md`](README.md) §4.0 (the goal) and §4.1 (the speed rule).
 
 > **The one thing to know:** three sessions were spent building options off this campaign's own menu that the
-> maintainer never asked for (`O1 --kv-grow`, `O3` drafter ring).  The ask is a **windowed KV**, Goal A.  It has
-> **not been started**.  Do not substitute.  See §9.
+> maintainer never asked for (`O1 --kv-grow`, `O3` drafter ring).  The ask is a **windowed KV**, Goal A.  Do
+> not substitute.  See §9.
+>
+> **Update 2026-10-29 (fifth session): A1 is built, gated and SUPERSEDED, and the A2 design is settled.**
+> A1 — the two-base K/V read inside the FA kernels — is on its own branch (`A1-TWO-BASE-KV.md`) as the record
+> and the fallback.  A probe (`mixed-backing-probe.cc`) then showed that **one** VMM reservation can be backed
+> partly by pinned host memory (device read 28.4 GB/s, device-writable, copy-engine-visible, re-mappable), so
+> **A2 is mixed backing** (`MIXED-BACKING.md`): one KV tensor, the resident window in VRAM, the tail in host
+> pages — **no kernel change, no op change**, and defrag / `seq_add` / state io / the writers stay untouched.
+> The next work is A2 §3 there, not A1.
 
 ---
 
@@ -17,10 +25,10 @@ file, then [`README.md`](README.md) §4.0 (the goal) and §4.1 (the speed rule).
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, pushed to `origin` (`git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
 | release the campaign is cut against | **r174**, `v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`, 15 blocks.  **r175 is now the delivery's current release** (`tip cc1def018`) — the campaign's fork branch is based on r174 and its patches apply to r174; a promotion re-cuts against r175 |
 | the campaign's TODO handle | **#118** (cited as `#117` until 2026-10-29, when that number was allocated to the MoE band-predicate item — see `TODO.md` §118) |
-| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, local only: `973e166e1` (O1 slice 1) → `6bf445b34` (O1 slice 2) → `a93dee7a9` (O3) |
+| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, local only: `973e166e1` (O1 slice 1) → `6bf445b34` (O1 slice 2) → `a93dee7a9` (O3) → `e49e1cef4` (A1, superseded; also branch `wip-kv-residency-a1-two-base`) |
 | the release chain | `rdna-boosts` in `~/llama.cpp` — **still `5bdec04ab`, untouched.** Nothing in this campaign is in `patches/`, `release.json` or any block |
-| patch snapshot (the backup) | `patches/0001`…`0003` + `patches/README.md` + `patches/diffstat.txt` (1076 insertions, 6 files) |
-| **Goal A (the ask)** | **not started.**  Build spec: [`O2-PLAN.md`](O2-PLAN.md) §6; the mechanism is corrected (§6.3) and A1's edit points are known (§5 below) |
+| patch snapshot (the backup) | `patches/0001`…`0004` + `patches/README.md` + `patches/diffstat.txt` (1534 insertions, 15 files) |
+| **Goal A (the ask)** | **A1 done + superseded** ([`A1-TWO-BASE-KV.md`](A1-TWO-BASE-KV.md)).  **A2 = mixed backing** ([`MIXED-BACKING.md`](MIXED-BACKING.md)) — that file is the build spec now; `O2-PLAN.md` §6.3's two-base read is the fallback, not the plan |
 | O1 (`--kv-grow`) | built, measured, **PARKED** — it regresses a config that uses most of `-c` on a slab-armed MoE model (`IMPLEMENTATION.md` "KNOWN LIMIT") |
 | O3 (drafter ring) | built, pure, measured, **Goal C / last** — `O3-DRAFTER-RING.md` |
 | box | **one R9700 (gfx1201), 32 624 MiB.**  Pin `HIP_VISIBLE_DEVICES=0` on every arm.  Every number below is 1-GPU; say so, never claim multi-GPU |
@@ -96,7 +104,10 @@ pass).
 kernel body; `fattn-tile.cu` is only the instantiation TU).  Any other family/shape **declines the split**, and
 declining = **no spill** = today's fit-or-fail path.
 
-## 5. A1 — the next work, with its anchors
+## 5. A1 — DONE (superseded).  A2's anchors are in `MIXED-BACKING.md` §3
+
+The anchors below are the record of the A1 build (branch `wip-kv-residency-a1-two-base`); they stay useful
+because mixed backing reuses A1's *policy* half (`get_kv_split_n_tail`, the knobs) and none of its kernel half.
 
 | step | where | note |
 |---|---|---|
@@ -192,6 +203,9 @@ arena (the draft KV sits inside the slab's `aux_reserve`).
 | [`README.md`](README.md) | the campaign: §0 read-first, §4.0 the ask + the OOM evidence, §4.1 the speed rule (Goal B), §4.2 the scope decision, §5 the option menu (**mostly out of scope**) |
 | [`INVENTORY.md`](INVENTORY.md) | T1-T5 taxonomy, 4 measured shapes, the link constants, per-token arithmetic |
 | [`VMM-PROBE.md`](VMM-PROBE.md) | the 9 driver tests + the two traps (unmapped-read fault, stale fresh mapping) |
+| [`MIXED-BACKING.md`](MIXED-BACKING.md) | **the A2 design of record**: the mixed-backing probe's results (one VA range, host-backed chunks, 28.4 GB/s, device-writable, copy-engine-visible, 3264 chunks at real size), the shape, what A2 has to build, and the residual risks |
+| [`A1-TWO-BASE-KV.md`](A1-TWO-BASE-KV.md) | A1, the two-base K/V read: what was built, every gate, the negative control, and why it was superseded (kept as the fallback) |
+| [`mixed-backing-probe.cc`](mixed-backing-probe.cc) | the probe behind MIXED-BACKING.md (T1-T8) |
 | [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md) | Strata's `kv_stream.hpp` read in full and mapped onto this tree |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | O1 slice 1 + slice 2 (PARKED) with the measured regression |
 | [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md) | Goal C: design, implementation, measurements, both corrections |
@@ -206,7 +220,8 @@ arena (the draft KV sits inside the slab's `aux_reserve`).
    still `5bdec04ab` (**never** commit campaign code there).
 3. `~/bin/build-llama-rocm` (expect ~5 s warm), then reproduce the Goal A baseline: the 27B Q8_0 OOM at
    `-c 262144` (`-ctk q8_0 -ctv q8_0`) from §3.  That is the "before" number.
-4. Start **A1 step 1** (the op plumbing, inert when `n_tail = 0`) and confirm the default path is unchanged by
-   hashing a same-seed text run against the current binary **before** touching any kernel.
-5. Do **not** open the kernel edit (step 4) unless steps 1-3 are done and the inert default is proven — a
-   half-changed FA path is the one thing worse than no change.
+4. Read [`MIXED-BACKING.md`](MIXED-BACKING.md) — that is the build spec now — and re-run its probe
+   (`hipcc … mixed-backing-probe.cc`; T1-T8 are all green; re-run it if the driver or ROCm moves).
+5. Start A2 §3 step 1: re-point `ggml_backend_cuda_kv_region_buffer_type` from O1's lazy growth to an up-front
+   `[host tail | device head]` mapping per tensor, with the split point from
+   `llama_kv_cache::get_kv_split_n_tail()`.  A1's kernel half is **not** on this path — leave it on its branch.

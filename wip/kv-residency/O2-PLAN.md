@@ -157,7 +157,17 @@ promoted.  The fork branch `wip-kv-residency` is the record.
   **non-swappable RAM**: 4.25 GiB at `-c 131072` q8_0 on the 27B, 8.5 GiB at 262144.  It must be gated on
   `MemAvailable` (the `MOE_HOST_POOL_RAM_PCT` pattern) and refuse loudly before `cudaHostAlloc` fails.
 
-### 6.3 Mechanism — CORRECTED 2026-10-29 (A1 feasibility check; the combine route is not viable)
+### 6.3 Mechanism — CORRECTED AGAIN 2026-10-29 (`MIXED-BACKING.md` is the design of record)
+
+> **Read [`MIXED-BACKING.md`](MIXED-BACKING.md) instead of this section.**  The two-base read below was built
+> (A1, gated, exact — [`A1-TWO-BASE-KV.md`](A1-TWO-BASE-KV.md)) and then superseded the same day: a probe
+> (`mixed-backing-probe.cc`) showed that **one** VMM reservation can be backed partly by pinned host memory
+> (device read 28.4 GB/s, device-writable, copy-engine-visible, re-mappable, 3264 chunks at real size).  That
+> needs **no kernel and no op change** and leaves the in-place rope shift (defrag/`seq_add`), state
+> save/restore, `clear` and the writers untouched — which the two-base read would each have had to split.  The
+> two-base read stays as the fallback design and as the proof that a split KV read is an exact equality.
+
+### 6.3 (historical) Mechanism — CORRECTED 2026-10-29 (A1 feasibility check; the combine route is not viable)
 
 **The two-FA-calls-plus-combine design does not work, for a concrete reason: `ggml`/CUDA FA exposes no
 log-sum-exp.**  Grepped: there is no `lse` / `softmax_lse` anywhere in `ggml/src/ggml-cuda/fattn*`.  FA
@@ -195,8 +205,8 @@ for an opt-in feature.
 
 | slice | what | oracle |
 |---|---|---|
-| **A1** | the split **mechanically**, both segments still in VRAM: two views of one tensor, the FA op's two-base read (`k_tail`/`v_tail` + `n_tail`), split forced by a knob | **byte-identical text at every split width** — same rows, same accumulation order, only a different base address, so this is an equality to *aim for*, not a tolerance.  Also `gate-prefill-logits.sh` |
-| **A2** | move the tail tensor to the pinned host master (one buffer-type change) | the *same* text as A1, plus the measured per-token cost vs the modelled `spilled/28.8 GB/s` |
+| **A1** | ~~the split mechanically, both segments still in VRAM~~ — **DONE, superseded** (`A1-TWO-BASE-KV.md`): byte-identical text at every split width on both families + MTP verify widths, KLD 0.000000 / 100.000 %, and a negative control that proves the second base is read | n/a (kept as the fallback) |
+| **A2** | **mixed backing** (`MIXED-BACKING.md`): one VA range, resident cells mapped from VRAM, the tail from pinned host chunks, at 2 MiB bulk granularity with the per-tensor boundary at 4 KiB.  Split decided before `SLAB_INIT`. | text identical at several window widths (with a mis-mapped-chunk negative control), KLD 0.000000 / **the two OOM configs now run** at the measured `(used−W)/28.8 GB/s` cost, `gate-ckpt-reuse.sh` + `gate-state-pipe.sh` (state io now crosses the boundary), `SLAB_INIT` shows the arena gaining what the window frees |
 | **A3** | auto-size from free VRAM, the opt-in flag, the loud warning, `--fit` reporting, the `MemAvailable` gate | the two OOM configs in §1 now run; the flag-off run is byte-identical to today's binary; slab mode's `SLAB_INIT` shows the arena gaining what the window frees |
 
 A1 is the whole risk and it is entirely in the resident path, so it can be gated before a single byte goes to

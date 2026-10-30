@@ -1,0 +1,1083 @@
+From e49e1cef473e20e0ad8cc6e0c439fb0aa62c1c71 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Thu, 29 Oct 2026 20:34:02 -0500
+Subject: [PATCH] wip-kv-residency: A1 -- the two-base K/V read, gated
+ (SUPERSEDED by mixed backing)
+
+TODO #118 Goal A, slice A1: a split KV read inside the existing FA kernels.  The op carries a
+second K/V base pair (k_tail/v_tail, src[8]/src[9]) plus n_tail (op_params i32 5); where a KV tile's
+base is formed the segment is selected, so the cell index space stays GLOBAL and the mask,
+cell_pos/tok_lo/tok_hi and the derived-mask form are untouched.  n_tail == 0 indexes exactly as
+before (byte-identical text, KLD -0.000000).
+
+Implemented in the tile family and the MMA-f16 kernel (the RDNA4 band AND prefill -- on this box the
+band does not cover prefill, so the handover's "tile + band" would have been un-exercisable).  The
+frontend split point lives in llama_kv_cache::get_kv_split_n_tail (LLAMA_KV_RESIDENT_CELLS=W),
+rounded to 256 cells so no tile straddles the boundary.
+
+Gates (1 GPU, gfx1201): text byte-identical at several window widths on 27B q8_0 (MMA family), 27B
+with GGML_CUDA_FA_WMMA_256=0 (tile, f16 and q8_0/native), 4B default config (both families in one
+run), and 27B MTP verify widths 2..4; prefill-logit KLD 0.000000 / 100.000 % (f16 and q8_0); a new
+NEGATIVE control (LLAMA_KV_SPLIT_POISON_CELLS) proves the second base is really read, since in A1
+both views resolve to the same addresses and the equality alone cannot see a wrong base choice.
+
+SUPERSEDED 2026-10-29: wip/kv-residency/mixed-backing-probe.cc proves one VMM reservation can be
+backed partly by pinned host memory (28.4 GB/s device read, device-writable, copy-engine-visible,
+remappable), so A2 goes that way -- no kernel or op change and every cell-walking path untouched.
+This commit is kept as the record and as the fallback if the mapping route fails somewhere.
+
+Not for patches/: nothing here is in the delivery set.
+---
+ ggml/include/ggml.h                  | 19 ++++++
+ ggml/src/ggml-cuda/fattn-common.cuh  | 91 ++++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh | 90 ++++++++++++++++++---------
+ ggml/src/ggml-cuda/fattn-tile.cuh    | 54 +++++++++++++----
+ ggml/src/ggml-cuda/fattn-vec.cuh     |  4 +-
+ ggml/src/ggml-cuda/fattn.cu          | 29 ++++++++-
+ ggml/src/ggml.c                      | 51 ++++++++++++++++
+ src/llama-graph.cpp                  | 57 ++++++++++++++++-
+ src/llama-graph.h                    |  9 ++-
+ src/llama-kv-cache.cpp               | 80 +++++++++++++++++++++++-
+ src/llama-kv-cache.h                 | 29 +++++++++
+ 11 files changed, 458 insertions(+), 55 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 704e25b44..1f285b1dc 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2565,6 +2565,25 @@ extern "C" {
+             struct ggml_tensor * tok_lo,
+             struct ggml_tensor * tok_hi);
+ 
++    // wip/kv-residency (TODO #118) A1: TWO-BASE K/V READ.  The KV cell index space stays GLOBAL;
++    // a tile whose rows are all below n_tail takes its base from k_tail/v_tail (whose row 0 is
++    // cell 0), a tile at or above it from k/v (whose row 0 is cell n_tail).  The accumulation
++    // order is unchanged, so n_tail cells of the same values read through two bases produce the
++    // same result; n_tail == 0 (the default) indexes exactly as before.  n_tail must be a
++    // multiple of 256 (GGML_CUDA_FA_KV_SPLIT_GRAN) so no kernel tile straddles the boundary.
++    // The alignment n_tail must satisfy: a multiple of every FA kernel's KV tile height, so no tile
++    // straddles the segment boundary (see ggml_flash_attn_ext_set_kv_split).
++#define GGML_FA_KV_SPLIT_GRAN 256
++
++    GGML_API void ggml_flash_attn_ext_set_kv_split(
++            struct ggml_tensor * a,
++            struct ggml_tensor * k_tail,
++            struct ggml_tensor * v_tail,
++            int32_t              n_tail);
++
++    GGML_API int32_t ggml_flash_attn_ext_get_kv_split_n_tail(
++            const struct ggml_tensor * a);
++
+     // qwen4exp QSA sparse attention: attend only over the cells that the
+     // indexer's top-k names, instead of the whole KV cache.  The mask is the
+     // base kq_mask and is gathered in-kernel at the idx positions.
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 2049ca53a..960d3309c 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -121,7 +121,14 @@ typedef void (* fattn_kernel_t)(
+         // First KV row of the launched extent in the whole op's cell space (0 unless KV-chunked): used
+         // only by the two exactly-sliceable absolute-KV optimizations (the masked-group bitmap and the
+         // KV_max bound), so a chunk keeps both.
+-        const int kv_start);
++        const int kv_start,
++        // wip/kv-residency (TODO #118) A1: the two-base K/V read (ggml_flash_attn_ext_set_kv_split).
++        // K/V above are the HEAD segment: their row 0 is cell n_tail.  K_tail/V_tail are the TAIL
++        // segment: their row 0 is cell 0, i.e. the same global index space, a different base.  The
++        // cell index space, the mask and the derived-mask state are unchanged -- only the base a
++        // whole KV tile reads from is chosen.  n_tail == 0 (nullptr/0 for the pointers) means the op
++        // carries no split and every read is the single-base read it always was.
++        const char * K_tail, const char * V_tail, const int n_tail);
+ 
+ typedef float (*vec_dot_KQ_t)(
+     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
+@@ -192,6 +199,56 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
+ 
+ #include "fattn-rdna.cuh"
+ 
++// wip/kv-residency (TODO #118) A1: the TWO-BASE K/V READ (see ggml_flash_attn_ext_set_kv_split).
++//
++// FA already takes one K/V base plus a row stride and indexes rows as `base + i*stride`, with the
++// caller forming the per-tile base -- so a split is an ADDRESSING change, not a numerics change.
++// The op carries a second base pair (`k_tail`/`v_tail`, op src[8]/src[9]) plus `n_tail` (op_params
++// i32 5, the number of cells the tail segment holds), and the K/V CELL INDEX SPACE STAYS GLOBAL:
++// cell i < n_tail is read from the tail base, cell i >= n_tail from the head base, so the mask,
++// cell_pos/tok_lo/tok_hi and the derived-mask form are untouched.
++//
++// `n_tail` is a multiple of GGML_CUDA_FA_KV_SPLIT_GRAN, which is a multiple of every kernel's KV
++// tile height (nbatch_fa is 32/64/128 in the tile and MMA config tables, and a V tile divides the K
++// tile), so a KV tile never straddles the boundary and the split costs a per-tile base selection --
++// the in-tile row index, the accumulation order and the staged values are all unchanged.  That is
++// what makes A1's oracle an EQUALITY (same rows, same order, a different base address).
++//
++// n_tail == 0 is the no-split op and every read is the single-base read it always was.
++#define GGML_CUDA_FA_KV_SPLIT_GRAN GGML_FA_KV_SPLIT_GRAN
++
++// Per (sequence, KV head) segment bases: the tail segment's row-0 base, with the same head/sequence
++// offsets applied as the head segment's `K_h2`/`kv_native.K`, plus its cell count.  A kernel builds
++// this once per block; n_tail == 0 means "no split" and the pointers are unused.
++struct fattn_kv_split_t {
++    const char * K_tail = nullptr; // row 0 == cell 0
++    const char * V_tail = nullptr; // row 0 == cell 0
++    int n_tail = 0;
++};
++
++static __device__ __forceinline__ fattn_kv_split_t fattn_kv_split_make(
++        const char * K_tail, const char * V_tail, const int n_tail,
++        const int64_t nb13, const int64_t nb12, const int64_t nb23, const int64_t nb22,
++        const int64_t sequence, const int64_t z_KV, const bool v_is_k_view) {
++    fattn_kv_split_t s;
++    if (n_tail > 0) {
++        s.K_tail = K_tail + nb13*sequence + nb12*z_KV;
++        s.V_tail = v_is_k_view ? s.K_tail : (V_tail + nb23*sequence + nb22*z_KV);
++        s.n_tail = n_tail;
++    }
++    return s;
++}
++
++// The base a whole KV tile (the nbatch_fa rows starting at cell `k0`) reads from: rows below n_tail
++// come from the TAIL segment, the rest from the HEAD segment.  Both bases are addressed by the GLOBAL
++// cell number -- which is what makes this a base selection and nothing else: the in-tile row index,
++// the accumulation order, the mask and every staged value are unchanged.  `n_tail <= 0` returns the
++// head unchanged, so the no-split op compiles to the single-base read it always was.
++static __device__ __forceinline__ const char * fattn_kv_split_sel(
++        const char * head, const char * tail, const int n_tail, const int k0) {
++    return (n_tail > 0 && k0 < n_tail) ? tail : head;
++}
++
+ // Byte-addressed K/V rows for a native (non-F16-staged) operand.  The tile staging is unchanged
+ // (F16 half2 tiles); only the source of the staged values differs.  `type_K`/`type_V` is
+ // FATTN_KV_NATIVE_NONE when the operand is not native, i.e. the usual F16 conversion/scratch path.
+@@ -1635,6 +1692,28 @@ void launch_fattn(
+     const ggml_tensor * mask  = dst->src[3];
+     const ggml_tensor * sinks = dst->src[4];
+ 
++    // wip/kv-residency (TODO #118) A1: the two-base K/V read (see fattn_kv_split_t).  n_tail == 0
++    // for every op that does not opt in, and then both pointers are nullptr and everything below is
++    // the single-base launch it always was.
++    const int kv_split_n_tail = ggml_flash_attn_ext_get_kv_split_n_tail(dst);
++    const char * K_tail_data  = kv_split_n_tail > 0 ? (const char *) dst->src[8]->data : nullptr;
++    const char * V_tail_data  = kv_split_n_tail > 0 ? (const char *) dst->src[9]->data : nullptr;
++
++    // wip/kv-residency (TODO #118) A1: the two-base K/V read is served by the tile and the MMA-f16
++    // kernels (the two families this box selects for the shapes Goal A cares about).  A family that
++    // ignores src[8] reads src[1] alone, which still holds every cell in A1 -- so a decline is the
++    // single-base read, i.e. no spill and today's fit-or-fail path, never a wrong answer.  A split op
++    // additionally forbids the KV-chunked prefill (it slices K by chunk) and the sparse index path,
++    // and requires a natively readable K/V (one base cannot be staged and the other raw).
++    if (kv_split_n_tail > 0) {
++        GGML_ASSERT(kv_split_n_tail % GGML_CUDA_FA_KV_SPLIT_GRAN == 0);
++        GGML_ASSERT(kv_split_n_tail < K->ne[1]);
++        GGML_ASSERT(!use_sparse);
++        GGML_ASSERT(dst->src[8] != nullptr && dst->src[9] != nullptr);
++        GGML_ASSERT(ggml_cuda_fattn_kv_native_type(K) != FATTN_KV_NATIVE_NONE || K->type == GGML_TYPE_F16);
++        GGML_ASSERT(ggml_cuda_fattn_kv_native_type(V) != FATTN_KV_NATIVE_NONE || V->type == GGML_TYPE_F16);
++    }
++
+     // V3 derived kq mask: present instead of the mask tensor above.
+     const ggml_tensor * cell_pos = dst->src[5];
+     const ggml_tensor * tok_lo   = dst->src[6];
+@@ -1693,7 +1772,10 @@ void launch_fattn(
+     // gap growing with it (gfx1151 9B q8_0 pp16k 1405 vs 1410, pp20k 1359 vs 1369, pp32k 1253 vs
+     // 1266, pp65k 1043 vs 1059), so it keeps the native read at prefill too.
+     const bool prefill_stages = !GGML_CUDA_CC_IS_RDNA3_5(cc);
+-    const bool native_width = Q->ne[1] <= 8 || !prefill_stages;
++    // wip/kv-residency (TODO #118) A1: a split op reads the raw cache (see the assertions below), so its
++    // native width is the whole launch -- a staged whole-cache F16 copy would leave the tail's rows in
++    // their original type behind the kernel's back.
++    const bool native_width = Q->ne[1] <= 8 || !prefill_stages || kv_split_n_tail > 0;
+ 
+     // A native-capable operand that stages takes its scratch from the per-context, per-stream arena
+     // rather than the generic CUDA pool.  The pool grows by exact fit and *retains* every distinct
+@@ -2403,7 +2485,7 @@ void launch_fattn(
+                 tok_lo   ? ((const int *) tok_lo  ->data) : nullptr,
+                 tok_hi   ? ((const int *) tok_hi  ->data) : nullptr,
+                 FATTN_KV_NATIVE_NONE, FATTN_KV_NATIVE_NONE,
+-                part_meta, (int) k0);
++                part_meta, (int) k0, nullptr, nullptr, 0);
+             CUDA_CHECK(cudaGetLastError());
+ 
+             sk_fold(ntiles_kv_c, nblocks, part, chunk_fix.ptr, part_meta);
+@@ -2445,7 +2527,8 @@ void launch_fattn(
+         kv_native_kernel_K, kv_native_kernel_V,
+         // wip/fa-stage-chunking: the whole-prefix launch keeps the shipping (final, normalized)
+         // contract; only the chunk loop above uses the partial one.
+-        nullptr, 0
++        nullptr, 0,
++        K_tail_data, V_tail_data, kv_split_n_tail
+     );
+     CUDA_CHECK(cudaGetLastError());
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 551ff565d..b8a0057a4 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -1041,6 +1041,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+         const int jt,
+         const int kb0,
+         const int k_VKQ_sup, const kq_derived_t derived, const fattn_kv_native_t kv_native,
++        // wip/kv-residency (TODO #118) A1: the two-base K/V read (see fattn_kv_split_t)
++        const fattn_kv_split_t kv_split,
+         // RDNA4 band fetch-ahead (see flash_attn_ext_f16_band_depth): the caller's ring of fetched batches, which holds
+         // the first batches of this iteration when band_on, and the next iteration's kb0 (-1: none).
+         void * const band_ring_v = nullptr, const bool band_on = false, const int band_kb0_next = -1) {
+@@ -1076,12 +1078,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+     const bool band_q8 = band_fetch && band_on;
+ 
+     const int k_VKQ_0 = kb0 * nbatch_fa;
++
++    // A1 two-base K/V read: the base a KV tile reads from.  Both bases are addressed by the GLOBAL cell
++    // number, and n_tail is a multiple of nbatch_fa (the launcher guarantees it), so every tile this
++    // iteration loads -- its own, the double-buffered next one and the band's fetched-ahead one -- is
++    // entirely inside one segment.  With no split each lookup returns the head base unchanged.
++    const char * const K_head_b = reinterpret_cast<const char *>(K_h2);
++    const char * const V_head_b = reinterpret_cast<const char *>(V_h2);
++    auto K_seg = [&](const int k0) { return fattn_kv_split_sel(K_head_b, kv_split.K_tail, kv_split.n_tail, k0); };
++    auto V_seg = [&](const int k0) { return fattn_kv_split_sel(V_head_b, kv_split.V_tail, kv_split.n_tail, k0); };
++
+     if constexpr (band_fetch && !band_cross) {
+         if (band_q8) {
+ #pragma unroll
+             for (int t = 0; t < band_depth; ++t) {
+                 flash_attn_ext_f16_band_fetch<nwarps, nbatch_fa, nbatch_K2, false>
+-                    (band_ring[t], kv_native.K, kv_native.stride_K, 2*t*nbatch_K2, k_VKQ_0, nbatch_fa);
++                    (band_ring[t], K_seg(k_VKQ_0), kv_native.stride_K, 2*t*nbatch_K2, k_VKQ_0, nbatch_fa);
+             }
+         }
+     }
+@@ -1098,10 +1110,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+             }
+             if (tb < n_band_K) {
+                 flash_attn_ext_f16_band_fetch<nwarps, nbatch_fa, nbatch_K2, false>
+-                    (band_ring[t % band_depth], kv_native.K, kv_native.stride_K, 2*tb*nbatch_K2, kv, nbatch_fa);
++                    (band_ring[t % band_depth], K_seg(kv), kv_native.stride_K, 2*tb*nbatch_K2, kv, nbatch_fa);
+             } else {
+                 flash_attn_ext_f16_band_fetch<nwarps, nbatch_fa, nbatch_V2, false>
+-                    (band_ring[t % band_depth], kv_native.V, kv_native.stride_V, 2*(tb - n_band_K)*nbatch_V2, kv, nbatch_fa);
++                    (band_ring[t % band_depth], V_seg(kv), kv_native.stride_V, 2*(tb - n_band_K)*nbatch_V2, kv, nbatch_fa);
+             }
+         }
+     };
+@@ -1121,8 +1133,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+         cp_async_wait_all();
+         __syncthreads();
+         flash_attn_ext_f16_load_tile<stride_tile_V, swz, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+-            (V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_0, k_VKQ_sup, nullptr,
+-             kv_native.V, kv_native.stride_V, 0, kv_native.type_V);
++            (reinterpret_cast<const half2 *>(V_seg(k_VKQ_0)), tile_V, nbatch_V2, stride_V, k_VKQ_0, k_VKQ_sup, nullptr,
++             V_seg(k_VKQ_0), kv_native.stride_V, 0, kv_native.type_V);
+     } else {
+         // the sparse mask values are gathered per element, always load them synchronously
+         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
+@@ -1158,8 +1170,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+             }
+             if (!staged) {
+                 flash_attn_ext_f16_load_tile<stride_tile_K, swz, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+-                    (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices,
+-                     kv_native.K, kv_native.stride_K, 2*k0_start, kv_native.type_K);
++                    (reinterpret_cast<const half2 *>(K_seg(k_VKQ_0)) + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices,
++                     K_seg(k_VKQ_0), kv_native.stride_K, 2*k0_start, kv_native.type_K);
+                 if (use_cp_async) {
+                     cp_async_wait_all();
+                 }
+@@ -1497,8 +1509,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+                     (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr, derived);
+             }
+             flash_attn_ext_f16_load_tile<stride_tile_K, swz, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+-                (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr,
+-                 kv_native.K, kv_native.stride_K, 0, kv_native.type_K);
++                (reinterpret_cast<const half2 *>(K_seg(k_VKQ_0 + nbatch_fa)), tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr,
++                 K_seg(k_VKQ_0 + nbatch_fa), kv_native.stride_K, 0, kv_native.type_K);
+         }
+     }
+ 
+@@ -1524,8 +1536,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+                 }
+                 if (!staged) {
+                     flash_attn_ext_f16_load_tile<stride_tile_V, swz, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+-                        (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices,
+-                         kv_native.V, kv_native.stride_V, i0_start, kv_native.type_V);
++                        (reinterpret_cast<const half2 *>(V_seg(k_VKQ_0)) + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices,
++                         V_seg(k_VKQ_0), kv_native.stride_V, i0_start, kv_native.type_V);
+                     if (use_cp_async) {
+                         cp_async_wait_all();
+                     }
+@@ -1767,7 +1779,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+         // means this launch publishes partials (no normalize, and the no-seam case must publish meta)
+         // -- see the kernel signature.  `kv_start` is this launch's first KV row in the whole op's
+         // cell space (0 unless KV-chunked).
+-        float2 * const meta_kv, const int kv_start,
++        float2 * const meta_kv, const int kv_start, const fattn_kv_split_t kv_split,
+         // > 1 only in the decode/verify band, where the block processes the KV iterations
+         // kb0_start, kb0_start + kb0_step, ... (< kb0_stop) and may own none of them.
+         const int kb0_step = 1) {
+@@ -1909,8 +1921,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr, derived);
+         }
+         flash_attn_ext_f16_load_tile<stride_tile_K, swz, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+-            (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, nullptr,
+-             kv_native.K, kv_native.stride_K, 0, kv_native.type_K);
++            (reinterpret_cast<const half2 *>(fattn_kv_split_sel(reinterpret_cast<const char *>(K_h2), kv_split.K_tail, kv_split.n_tail, kb0*nbatch_fa)),
++             tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, nullptr,
++             fattn_kv_split_sel(kv_native.K, kv_split.K_tail, kv_split.n_tail, kb0*nbatch_fa),
++             kv_native.stride_K, 0, kv_native.type_K);
+     }
+ 
+     // kb0_start < kb0_stop for every stream-k block, so the last iter can be executed unconditionally.
+@@ -1935,7 +1949,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                      T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, band_fetch_ahead, band_wide>
+                     (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                      ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native);
++                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, kv_split);
+             }
+         } else {
+         for (; kb0 + kb0_step < kb0_stop; kb0 += kb0_step) {
+@@ -1946,7 +1960,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, band_fetch_ahead, band_wide>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native);
++                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, kv_split);
+         }
+         constexpr bool last_iter = true;
+         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
+@@ -1955,7 +1969,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, band_fetch_ahead, band_wide>
+             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native);
++             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, kv_split);
+         }
+     } else {
+         constexpr bool oob_check = false;
+@@ -1975,7 +1989,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+ #pragma unroll
+                     for (int t = 0; t < band_depth; ++t) {
+                         flash_attn_ext_f16_band_fetch<nwarps, nbatch_fa, nbatch_K2, false>
+-                            (band_ring[t], kv_native.K, kv_native.stride_K, 2*t*nbatch_K2, kb0_first*nbatch_fa, nbatch_fa);
++                            (band_ring[t], fattn_kv_split_sel(kv_native.K, kv_split.K_tail, kv_split.n_tail, kb0_first*nbatch_fa),
++                             kv_native.stride_K, 2*t*nbatch_K2, kb0_first*nbatch_fa, nbatch_fa);
+                     }
+                 }
+             }
+@@ -2003,7 +2018,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                      T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, band_fetch_ahead, band_wide>
+                     (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                      ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, band_ring_v, band_q8, kb0_next < kb0_stop ? kb0_next : -1);
++                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, kv_split, band_ring_v, band_q8, kb0_next < kb0_stop ? kb0_next : -1);
+                 kb0 = kb0_next;
+             }
+           } else {
+@@ -2018,7 +2033,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                      T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, band_fetch_ahead, band_wide>
+                     (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                      ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, band_ring_v, band_q8, -1);
++                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, kv_split, band_ring_v, band_q8, -1);
+             }
+           }
+         } else {
+@@ -2031,7 +2046,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, band_fetch_ahead, band_wide>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, band_ring_v, band_q8, kb0 + kb0_step);
++                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, kv_split, band_ring_v, band_q8, kb0 + kb0_step);
+         }
+         constexpr bool last_iter = true;
+         constexpr int  k_VKQ_sup = nbatch_fa;
+@@ -2040,7 +2055,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, band_fetch_ahead, band_wide>
+             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, band_ring_v, band_q8, -1);
++             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, derived, kv_native, kv_split, band_ring_v, band_q8, -1);
+         }
+     }
+     } // kb0 < kb0_stop
+@@ -2511,7 +2526,9 @@ static __global__ void flash_attn_ext_f16(
+         // block publishes (unnormalized numerator, max, rowsum) for its rows here (element-major) and
+         // the launcher merges KV chunks.  nullptr = the shipping behaviour, bit-identical.  `kv_start`
+         // is the first KV row of the launched extent in the whole op's cell space (0 unless chunked).
+-        float2 * __restrict__ kv_partial_meta_ptr, const int kv_start) {
++        float2 * __restrict__ kv_partial_meta_ptr, const int kv_start,
++        // A1 two-base K/V read (see fattn_kernel_t): the tail segment's row-0 bases and its cell count
++        const char * K_tail_ptr, const char * V_tail_ptr, const int n_tail) {
+     ggml_cuda_pdl_sync(); // TODO optimize placement
+ #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
+     const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
+@@ -2628,7 +2645,11 @@ static __global__ void flash_attn_ext_f16(
+                 kv_native_K, kv_native_V,
+             };
+             const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
+-            const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
++            // A1 two-base K/V read (see fattn_kv_split_t): 0 when the op carries no split
++            const fattn_kv_split_t kv_split = fattn_kv_split_make(
++                K_tail_ptr, V_tail_ptr, n_tail,
++                nb13, nb12, nb23, nb22, sequence, z_KV, V_is_K_view);
++        const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
+             // The packed fully-masked group bitmap of this (Q stream, query tile), when the launcher
+             // built one (GGML_CUDA_FA_BAND_SKIP): the round-robin split stays, the masked iterations
+             // in it are skipped.  Same layout the prefill path reads below.
+@@ -2649,14 +2670,14 @@ static __global__ void flash_attn_ext_f16(
+                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead, band_wide>
+                     (Q_f2, K_h2, V_h2, mask_h, nullptr, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                      ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa,
+-                     kb0_start, kb0_stop, derived, kv_native, nullptr, 0, kb0_step);
++                     kb0_start, kb0_stop, derived, kv_native, nullptr, 0, kv_split, kb0_step);
+             } else {
+                 constexpr bool needs_fixup = false;
+                 constexpr bool is_fixup    = true;
+                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead, band_wide>
+                     (Q_f2, K_h2, V_h2, mask_h, nullptr, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                      ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa,
+-                     kb0_start, kb0_stop, derived, kv_native, nullptr, 0, kb0_step);
++                     kb0_start, kb0_stop, derived, kv_native, nullptr, 0, kv_split, kb0_step);
+             }
+             return;
+         }
+@@ -2712,6 +2733,11 @@ static __global__ void flash_attn_ext_f16(
+             kq_blocks_tile = kq_blocks + int64_t(sequence*iter_j + jt)*kq_words_per_tile;
+         }
+ 
++        // A1 two-base K/V read (see fattn_kv_split_t): 0 when the op carries no split
++        const fattn_kv_split_t kv_split = fattn_kv_split_make(
++            K_tail_ptr, V_tail_ptr, n_tail,
++            nb13, nb12, nb23, nb22, sequence, z_KV, V_is_K_view);
++
+         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
+ 
+         if (use_sparse) {
+@@ -2727,13 +2753,13 @@ static __global__ void flash_attn_ext_f16(
+             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead, band_wide>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, derived, kv_native,
+-                 meta_kv, kv_start);
++                 meta_kv, kv_start, kv_split);
+         } else {
+             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
+             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead, band_wide>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, derived, kv_native,
+-                 meta_kv, kv_start);
++                 meta_kv, kv_start, kv_split);
+         }
+ 
+         // The next process_tile call reuses the tile_Q buffer for its Q/K tiles, so all warps must
+@@ -2784,6 +2810,12 @@ static __global__ void flash_attn_ext_f16(
+         kq_blocks_tile = kq_blocks + int64_t(sequence*iter_j + jt)*kq_words_per_tile;
+     }
+ 
++    // A1 two-base K/V read: the tail segment's bases for this (sequence, KV head), 0 when the op
++    // carries no split (see fattn_kv_split_t)
++    const fattn_kv_split_t kv_split = fattn_kv_split_make(
++        K_tail_ptr, V_tail_ptr, n_tail,
++        nb13, nb12, nb23, nb22, sequence, z_KV, V_is_K_view);
++
+     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
+ 
+     if (use_sparse) {
+@@ -2798,7 +2830,7 @@ static __global__ void flash_attn_ext_f16(
+     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead, band_wide>
+         (Q_f2, K_h2, V_h2, mask_h, indices, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, derived, kv_native,
+-         meta_kv, kv_start);
++         meta_kv, kv_start, kv_split);
+ #else
+     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, kq_blocks_ptr, dst_ptr, dst_meta_ptr, scale,
+         max_bias, m0, m1, n_head_log2, logit_softcap,
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index f8b0de4e9..f857a343b 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -780,7 +780,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+         const int k_VKQ_sup,
+         const int k_KQ_0,
+         float * KQ_acc,
+-        const fattn_kv_native_t kv_q8) {
++        const fattn_kv_native_t kv_q8,
++        // wip/kv-residency (TODO #118) A1: the two-base K/V read (see fattn_kv_split_t)
++        const fattn_kv_split_t kv_split) {
+     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+     constexpr int cpy_ne = cpy_nb / 4;
+ 
+@@ -788,17 +790,26 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
+     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
+ 
++    // A1 two-base K/V read: this iteration's KV tile is entirely inside one segment (n_tail is a
++    // multiple of nbatch_fa and the iteration starts on an nbatch_fa boundary), so one base covers
++    // the whole tile.  With no split this is the head base, unchanged.
++    const char * K_seg = fattn_kv_split_sel(reinterpret_cast<const char *>(K_h2),
++                                            kv_split.K_tail, kv_split.n_tail, k_VKQ_0);
++
+     // Issue #30 item 2: this must test the same set the native dequant loaders support, i.e. the
+     // kernels' compile-time K/V type, not a hand-written list -- when this tested only q8_0/q4_0,
+     // the q4_1/q5_0/q5_1/iq4_nl instantiations took the F16 branch and read a staging buffer that
+     // need_f16_K == false had left unwritten (NaN in the KQ dot product).
+     if constexpr (ggml_cuda_fattn_native_type_from_kernel<type_KV>() != FATTN_KV_NATIVE_NONE) {
+         // V4: read and dequantize the raw quantized cache rows instead of an F16 staging copy.
++        // A1: the native row base is byte-addressed, so the segment base is used directly.
++        const char * const K_row0 = kv_split.n_tail > 0 && k_VKQ_0 < kv_split.n_tail ?
++            kv_split.K_tail : kv_q8.K;
+         flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+-            (kv_q8.K + int64_t(k_VKQ_0)*kv_q8.stride_K, KV_tmp, kv_q8.stride_K, k_KQ_0, k_VKQ_sup);
++            (K_row0 + int64_t(k_VKQ_0)*kv_q8.stride_K, KV_tmp, kv_q8.stride_K, k_KQ_0, k_VKQ_sup);
+     } else {
+         flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+-            (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
++            (reinterpret_cast<const T_KV *>(K_seg) + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+     }
+     __syncthreads();
+ 
+@@ -932,7 +943,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+         const int k_VKQ_0,
+         const int k_VKQ_max,
+         const int col_Q_0,
+-        const fattn_kv_native_t kv_q8) {
++        const fattn_kv_native_t kv_q8,
++        // wip/kv-residency (TODO #118) A1: the two-base K/V read (see fattn_kv_split_t)
++        const fattn_kv_split_t kv_split) {
+     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+     constexpr int cpy_ne = cpy_nb / 4;
+ 
+@@ -956,6 +969,11 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+     static_assert(cpw % KQ_cs == 0, "bad KQ_cs");
+     const int k_VKQ_sup = k_VKQ_max - k_VKQ_0; // k supremum, only smaller k values have valid KV data
+ 
++    // A1: the V side of this iteration's tile (one base covers the whole tile -- see the K side in
++    // flash_attn_tile_iter_KQ).  With no split this is the head base, unchanged.
++    const char * V_seg = fattn_kv_split_sel(reinterpret_cast<const char *>(V_h2),
++                                            kv_split.V_tail, kv_split.n_tail, k_VKQ_0);
++
+     float KQ_max_new[cpw];
+ #pragma unroll
+     for (int jc0 = 0; jc0 < cpw; ++jc0) {
+@@ -969,12 +987,12 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+ #pragma unroll
+     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
+         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>(
+-            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8);
++            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8, kv_split);
+     }
+     if (nbatch_K_last > 0) {
+         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
+         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, type_KV>(
+-            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8);
++            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8, kv_split);
+     }
+ 
+     // Apply logit softcap + mask, update KQ_max:
+@@ -1120,11 +1138,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+ #pragma unroll
+     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
+         if constexpr (ggml_cuda_fattn_native_type_from_kernel<type_KV>() != FATTN_KV_NATIVE_NONE) {
++            const char * const V_row0 = kv_split.n_tail > 0 && k_VKQ_0 < kv_split.n_tail ?
++                kv_split.V_tail : kv_q8.V;
+             flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+-                (kv_q8.V + int64_t(k_VKQ_0 + k0)*kv_q8.stride_V, KV_tmp, kv_q8.stride_V, 0, k_VKQ_sup - k0);
++                (V_row0 + int64_t(k_VKQ_0 + k0)*kv_q8.stride_V, KV_tmp, kv_q8.stride_V, 0, k_VKQ_sup - k0);
+         } else {
+             flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+-                (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
++                (reinterpret_cast<const T_KV *>(V_seg) + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+         }
+         __syncthreads();
+ 
+@@ -1311,7 +1331,9 @@ static __global__ void flash_attn_tile(
+                             const int, const int,
+                             // wip/fa-stage-chunking (TODO #114): the per-row partial contract is
+                             // MMA-prefill only; the tile kernel keeps its single whole-prefix launch.
+-                            float2 *, const int) {
++                            float2 *, const int,
++                            // A1 two-base K/V read (see fattn_kernel_t)
++                            const char * K_tail_ptr, const char * V_tail_ptr, const int n_tail) {
+ #ifdef FLASH_ATTN_AVAILABLE
+     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
+     const char * GGML_CUDA_RESTRICT K        = K_ptr;
+@@ -1374,6 +1396,12 @@ static __global__ void flash_attn_tile(
+         kv_native_self,
+     };
+ 
++    // A1 two-base K/V read: the tail segment's bases for this (sequence, KV head), 0 when the op
++    // carries no split (see fattn_kv_split_t)
++    const fattn_kv_split_t kv_split = fattn_kv_split_make(
++        K_tail_ptr, V_tail_ptr, n_tail,
++        nb13, nb12, nb23, nb22, sequence, head0 / gqa_ratio, false);
++
+     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
+ 
+     const int stride_K2   = nb11 / sizeof(half2);
+@@ -1550,14 +1578,14 @@ static __global__ void flash_attn_tile(
+             constexpr bool oob_check = false;
+             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
+                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+-                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0_cur, k_VKQ_max, col_Q_0, kv_q8);
++                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0_cur, k_VKQ_max, col_Q_0, kv_q8, kv_split);
+         }
+         if (k_VKQ_0 < k_VKQ_max &&
+                 !(kq_blocks != nullptr && fattn_kq_group_masked(kq_blocks_tile, k_VKQ_0/nbatch_fa, nbatch_fa))) {
+             constexpr bool oob_check = true;
+             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
+                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+-                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
++                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8, kv_split);
+         }
+     } else {
+         // Branch without out-of-bounds checks.  The last tile may extend past k_VKQ_max, where the
+@@ -1577,14 +1605,14 @@ static __global__ void flash_attn_tile(
+                 constexpr bool oob_check_tail = true;
+                 flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check_tail, type_KV>
+                     (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+-                    stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
++                    stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8, kv_split);
+                 continue;
+             }
+ #endif // defined(RDNA2)
+             constexpr bool oob_check = false;
+             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
+                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+-                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
++                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8, kv_split);
+         }
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index b5188e76e..6588f172a 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -47,7 +47,9 @@ static __global__ void flash_attn_ext_vec(
+                             const int *, const int *, const int *,
+                             const int, const int,
+                             // wip/fa-stage-chunking (TODO #114): MMA-prefill only.
+-                            float2 *, const int) {
++                            float2 *, const int,
++                            // A1 two-base K/V read (see fattn_kernel_t)
++                            const char *, const char *, const int) {
+     ggml_cuda_pdl_lc();
+ #ifdef FLASH_ATTN_AVAILABLE
+     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index e3a9707f3..5247b9bc4 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -900,9 +900,36 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+     return f16_extra.end - (uintptr_t) dst->data;
+ }
+ 
++// wip/kv-residency (TODO #118) A1: report which kernel family serves a split op, once per family, so a
++// gate can state that coverage actually reached the shapes it claims.  Diagnostic only.
++static void ggml_cuda_fattn_kv_split_report(const best_fattn_kernel kernel, const ggml_tensor * dst) {
++    static const bool enabled = getenv("GGML_CUDA_FA_SPLIT_DEBUG") != nullptr;
++    if (!enabled) {
++        return;
++    }
++    const int32_t n_tail = ggml_flash_attn_ext_get_kv_split_n_tail(dst);
++    if (n_tail <= 0) {
++        return;
++    }
++    static bool seen[4] = {false, false, false, false};
++    const int idx = kernel == BEST_FATTN_KERNEL_TILE ? 1 : kernel == BEST_FATTN_KERNEL_MMA_F16 ? 2 : kernel == BEST_FATTN_KERNEL_VEC ? 3 : 0;
++    if (seen[idx]) {
++        return;
++    }
++    seen[idx] = true;
++    GGML_LOG_WARN("FA_KV_SPLIT kernel=%s n_tail=%d n_kv=%lld n_q=%lld type_K=%s\n",
++        kernel == BEST_FATTN_KERNEL_TILE ? "tile" : kernel == BEST_FATTN_KERNEL_MMA_F16 ? "mma-f16" :
++        kernel == BEST_FATTN_KERNEL_VEC  ? "vec"  : "none",
++        (int) n_tail, (long long) dst->src[1]->ne[1], (long long) dst->src[0]->ne[1],
++        ggml_type_name(dst->src[1]->type));
++}
++
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
+-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
++    // one chooser evaluation (it is on the per-op host path)
++    const best_fattn_kernel best = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
++    ggml_cuda_fattn_kv_split_report(best, dst);
++    switch (best) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
+         case BEST_FATTN_KERNEL_TILE:
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index dc4883db3..3a11b29bc 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5692,6 +5692,57 @@ void ggml_flash_attn_ext_add_kq_derived(
+     a->src[7] = tok_hi;
+ }
+ 
++// wip/kv-residency (TODO #118) A1: the two-base K/V read (see ggml.h).  src[8]/src[9] carry the
++// tail segment's K/V (row 0 == cell 0) and op_params i32 5 carries n_tail, the number of cells that
++// segment holds.  The head segment is src[1]/src[2] unchanged, EXCEPT that its row 0 is cell n_tail;
++// the kernels index both bases with the global cell number.  n_tail == 0 disables the split and
++// leaves every read exactly as it was.
++void ggml_flash_attn_ext_set_kv_split(
++        struct ggml_tensor * a,
++        struct ggml_tensor * k_tail,
++        struct ggml_tensor * v_tail,
++        int32_t              n_tail) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT(n_tail >= 0);
++
++    if (k_tail == NULL || n_tail == 0) {
++        a->src[8] = NULL;
++        a->src[9] = NULL;
++        ggml_set_op_params_i32(a, 5, 0);
++        return;
++    }
++
++    {
++    const struct ggml_tensor * k = a->src[1];
++    const struct ggml_tensor * v = a->src[2];
++
++    GGML_ASSERT(a->src[8] == NULL);
++    GGML_ASSERT(v_tail != NULL);
++    GGML_ASSERT(n_tail < k->ne[1]);
++
++    GGML_ASSERT(k_tail->type == k->type);
++    GGML_ASSERT(v_tail->type == v->type);
++    // same head/stream layout, one contiguous run of cells at the front of the same index space
++    GGML_ASSERT(k_tail->ne[0] == k->ne[0] && k_tail->ne[1] == n_tail);
++    GGML_ASSERT(k_tail->ne[2] == k->ne[2] && k_tail->ne[3] == k->ne[3]);
++    GGML_ASSERT(v_tail->ne[0] == v->ne[0] && v_tail->ne[1] == n_tail);
++    GGML_ASSERT(v_tail->ne[2] == v->ne[2] && v_tail->ne[3] == v->ne[3]);
++    // the rows the kernels index are a plain cell step in both segments
++    GGML_ASSERT(k_tail->nb[1] == k->nb[1] && v_tail->nb[1] == v->nb[1]);
++
++    a->src[8] = k_tail;
++    a->src[9] = v_tail;
++    ggml_set_op_params_i32(a, 5, n_tail);
++    }
++}
++
++int32_t ggml_flash_attn_ext_get_kv_split_n_tail(const struct ggml_tensor * a) {
++    if (a->op != GGML_OP_FLASH_ATTN_EXT || a->src[8] == NULL) {
++        return 0;
++    }
++    return ggml_get_op_params_i32(a, 5);
++}
++
+ void ggml_flash_attn_ext_add_sinks(
+         struct ggml_tensor * a,
+         struct ggml_tensor * sinks) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8acbf41e1..70d59f77e 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3146,9 +3146,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+          ggml_tensor * v_mla,
+              int64_t   n_kv_max,
+                float   kq_scale,
+-                 int   il) const {
++                 int   il,
++         ggml_tensor * k_tail,
++         ggml_tensor * v_tail,
++              int32_t  n_tail) const {
+     const bool v_trans = v->nb[1] > v->nb[2];
+ 
++    GGML_ASSERT((k_tail == nullptr) == (n_tail == 0));
++    GGML_ASSERT(k_tail == nullptr || v_tail != nullptr);
++
+     // split the batch into streams if needed
+     const auto n_stream = k->ne[3];
+ 
+@@ -3161,6 +3167,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+ 
++    // wip/kv-residency (TODO #118) A1: the tail segment's views take exactly the same permutation
++    // and type conversions as the head's, so both bases describe the same row layout.
++    if (k_tail) {
++        k_tail = ggml_permute(ctx0, k_tail, 0, 2, 1, 3);
++        v_tail = ggml_permute(ctx0, v_tail, 0, 2, 1, 3);
++    }
++
+     ggml_tensor * cur;
+ 
+     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+@@ -3169,15 +3182,24 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+ 
+         if (v_trans) {
+             v = ggml_transpose(ctx0, v);
++            if (v_tail) {
++                v_tail = ggml_transpose(ctx0, v_tail);
++            }
+         }
+ 
+         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
+         if (k->type == GGML_TYPE_F32) {
+             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
++            if (k_tail) {
++                k_tail = ggml_cast(ctx0, k_tail, GGML_TYPE_F16);
++            }
+         }
+ 
+         if (v->type == GGML_TYPE_F32) {
+             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
++            if (v_tail) {
++                v_tail = ggml_cast(ctx0, v_tail, GGML_TYPE_F16);
++            }
+         }
+ 
+         // V3: the mask may have a derived form registered by build_attn_inp_kq_mask - in that case
+@@ -3204,6 +3226,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         ggml_flash_attn_ext_add_sinks(cur, sinks);
+         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
++
++        // wip/kv-residency (TODO #118) A1: the two-base K/V read.  Set after the op exists so the
++        // setter can validate the two segments against it; n_tail == 0 leaves the op exactly as it
++        // was built above.
++        ggml_flash_attn_ext_set_kv_split(cur, k_tail, v_tail, n_tail);
+         ggml_prec_set_acc(cur, GGML_PREC_F32);
+ 
+         if (v_mla) {
+@@ -3449,6 +3476,9 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * q = q_cur;
+     ggml_tensor * k;
+     ggml_tensor * v;
++    ggml_tensor * k_tail = nullptr;
++    ggml_tensor * v_tail = nullptr;
++    int32_t       n_tail = 0;
+ 
+     if (cparams.training) {
+         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
+@@ -3466,11 +3496,20 @@ ggml_tensor * llm_graph_context::build_attn(
+ 
+         k = mctx_cur->get_k(ctx0, il);
+         v = mctx_cur->get_v(ctx0, il);
++
++        // wip/kv-residency (TODO #118) A1: the tail segment of the two-base K/V read, when the memory
++        // module offers one (it needs the narrow llama_kv_cache context, so a hybrid/dsa/msa memory
++        // declines here and the op stays the single-base read).  0 = no split.
++        n_tail = (int32_t) mctx_cur->get_kv_split_n_tail();
++        if (n_tail > 0) {
++            k_tail = mctx_cur->get_k_tail(ctx0, il, (uint32_t) n_tail);
++            v_tail = mctx_cur->get_v_tail(ctx0, il, (uint32_t) n_tail);
++        }
+     }
+ 
+     ggml_tensor * kq_mask = inp->get_kq_mask();
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, k_tail, v_tail, n_tail);
+     cb(cur, "kqv_out", il);
+ 
+     if (inp->self_v_rot) {
+@@ -3557,7 +3596,19 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    // wip/kv-residency (TODO #118) A1: the tail segment of the two-base K/V read (0 = no split).  This
++    // is a K-only cache, so its V tail is the same view shape taken from the K tail.
++    ggml_tensor * k_tail = nullptr;
++    ggml_tensor * v_tail = nullptr;
++    int32_t       n_tail = 0;
++    n_tail = (int32_t) mctx_cur->get_kv_split_n_tail();
++    if (n_tail > 0) {
++        k_tail = mctx_cur->get_k_tail(ctx0, il, (uint32_t) n_tail);
++        v_tail = ggml_view_4d(ctx0, k_tail, v_cur->ne[0], k_tail->ne[1], k_tail->ne[2], k_tail->ne[3],
++                              k_tail->nb[1], k_tail->nb[2], k_tail->nb[3], 0);
++    }
++
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, k_tail, v_tail, n_tail);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 8eef59917..0d2a1dc64 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1355,7 +1355,14 @@ struct llm_graph_context {
+             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                 int64_t   n_kv_max,
+                   float   kq_scale,
+-                    int   il) const;
++                    int   il,
++            // wip/kv-residency (TODO #118) A1: the two-base K/V read.  Non-null k_tail (with
++            // n_tail > 0) makes `k`/`v` the HEAD segment, whose row 0 is cell n_tail, and k_tail/v_tail
++            // the TAIL segment, whose row 0 is cell 0 -- the cell index space stays global, so the
++            // mask, cell_pos and the derived mask are untouched.  Default = the single-base read.
++            ggml_tensor * k_tail = nullptr, // [n_embd_head_k, n_head_k, n_tail]
++            ggml_tensor * v_tail = nullptr, // [n_embd_head_v, n_head_v, n_tail]
++                 int32_t  n_tail = 0) const;
+ 
+     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 6ec5ab273..7177b782c 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1729,7 +1729,62 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
+     return result;
+ }
+ 
++// wip/kv-residency (TODO #118) A1: the windowed KV's resident window, in CELLS.  0/unset = off.
++//
++// A1 keeps both segments in VRAM (two views of the same KV tensor), so this only forces a split at a
++// chosen width -- it is the test lever for the two-base read, not a memory feature yet.  A2 moves the
++// tail's storage to the pinned host master and A3 sizes the window from free VRAM and turns this into
++// the opt-in flag (O2-PLAN.md §6.1).
++static uint32_t kv_resident_cells() {
++    static const uint32_t v = []() {
++        const char * e = getenv("LLAMA_KV_RESIDENT_CELLS");
++        return e != nullptr ? (uint32_t) strtoul(e, nullptr, 10) : 0u;
++    }();
++    return v;
++}
++
++uint32_t llama_kv_cache::get_kv_split_n_tail(uint32_t n_kv) const {
++    const uint32_t w = kv_resident_cells();
++    if (w == 0) {
++        return 0; // default: no split, byte-identical to the single-base read (including the OOM)
++    }
++    if (v_trans) {
++        return 0; // a transposed V cache has its cell axis on dim 0: not served, so no split
++    }
++    if (n_kv <= w) {
++        return 0; // everything is resident: no tail to read from a second base
++    }
++    // the tail is rounded DOWN to the granularity every FA kernel tile satisfies, so a tile never
++    // straddles the boundary and the split is a base selection rather than a numeric change
++    return ((n_kv - w)/GGML_FA_KV_SPLIT_GRAN)*GGML_FA_KV_SPLIT_GRAN;
++}
++
++// wip/kv-residency (TODO #118) A1 NEGATIVE CONTROL.  `LLAMA_KV_SPLIT_POISON_CELLS=N` (default 0) shifts
++// the TAIL view by N cells, so every kernel tile below n_tail reads the wrong rows.  A1's oracle is an
++// equality (both segments are views of one tensor, so a wrong base choice is invisible to it), and this
++// is what makes the equality meaningful: with the poison on the text MUST change, which is the only
++// evidence that the kernels actually read the second base.  Never a shipping knob.
++static uint32_t kv_split_poison_cells() {
++    static const uint32_t v = []() {
++        const char * e = getenv("LLAMA_KV_SPLIT_POISON_CELLS");
++        return e != nullptr ? (uint32_t) strtoul(e, nullptr, 10) : 0u;
++    }();
++    return v;
++}
++
++ggml_tensor * llama_kv_cache::get_k_tail(ggml_context * ctx, int32_t il, uint32_t n_tail, const slot_info & sinfo) const {
++    return get_k_cells(ctx, il, n_tail, kv_split_poison_cells(), sinfo);
++}
++
++ggml_tensor * llama_kv_cache::get_v_tail(ggml_context * ctx, int32_t il, uint32_t n_tail, const slot_info & sinfo) const {
++    return get_v_cells(ctx, il, n_tail, kv_split_poison_cells(), sinfo);
++}
++
+ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
++    return get_k_cells(ctx, il, n_kv, 0, sinfo);
++}
++
++ggml_tensor * llama_kv_cache::get_k_cells(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t cell_off, const slot_info & sinfo) const {
+     const int32_t ikv = map_layer_ids.at(il);
+ 
+     auto * k = layers[ikv].k;
+@@ -1746,10 +1801,15 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
+             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+             ggml_row_size(k->type, n_embd_k_gqa),
+             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
+-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
++            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0 +
++            ggml_row_size(k->type, n_embd_k_gqa)*(int64_t) cell_off);
+ }
+ 
+ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
++    return get_v_cells(ctx, il, n_kv, 0, sinfo);
++}
++
++ggml_tensor * llama_kv_cache::get_v_cells(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t cell_off, const slot_info & sinfo) const {
+     const int32_t ikv = map_layer_ids.at(il);
+ 
+     auto * v = layers[ikv].v;
+@@ -1769,7 +1829,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
+                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
+                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
+-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
++                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0 +
++                ggml_row_size(v->type, n_embd_v_gqa)*(int64_t) cell_off);
+     }
+ 
+     // note: v->nb[1] > v->nb[2]
+@@ -1778,7 +1839,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+             ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
+             ggml_row_size(v->type, kv_size),                        // v->nb[2]
+             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
+-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
++            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0 +
++            ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il))*(int64_t) cell_off);
+ }
+ 
+ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+@@ -3609,6 +3671,18 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
+     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+ }
+ 
++uint32_t llama_kv_cache_context::get_kv_split_n_tail() const {
++    return kv->get_kv_split_n_tail(n_kv);
++}
++
++ggml_tensor * llama_kv_cache_context::get_k_tail(ggml_context * ctx, int32_t il, uint32_t n_tail) const {
++    return kv->get_k_tail(ctx, il, n_tail, sinfos[i_cur]);
++}
++
++ggml_tensor * llama_kv_cache_context::get_v_tail(ggml_context * ctx, int32_t il, uint32_t n_tail) const {
++    return kv->get_v_tail(ctx, il, n_tail, sinfos[i_cur]);
++}
++
+ ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 42b96b268..cdea74468 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -219,6 +219,29 @@ public:
+     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+ 
++    // wip/kv-residency (TODO #118) A1: the two-base K/V read (ggml_flash_attn_ext_set_kv_split).
++    //
++    // The split point of a `n_kv`-row view: the number of LEADING cells that form the tail segment
++    // (0 = no split).  The tail is cells [0, n_tail) and the head [n_tail, n_kv), so the most recent
++    // cells are the resident head -- a window `LLAMA_KV_RESIDENT_CELLS` wide.  A1 keeps both
++    // segments in VRAM (two views of the same tensor, get_*_tail below), so this is only the lever
++    // that forces a split at a chosen width; it exists on the memory module because that is where
++    // the residency decision belongs (A2 moves the tail's storage, A3 sizes it from free VRAM).
++    //
++    // Returns 0 (no split) when the knob is off, when it cannot be served (a transposed V cache has
++    // its cell axis on dim 0) or when the cache does not exceed the window.  The result is rounded
++    // DOWN to GGML_FA_KV_SPLIT_GRAN cells so no FA kernel tile straddles the boundary.
++    uint32_t get_kv_split_n_tail(uint32_t n_kv) const;
++
++    // the tail segment's views: the same layout as get_k/get_v, cells [0, n_tail) of the same stream.
++    // Both are views of the ONE KV tensor (A1): the segments differ only in where they start.
++    ggml_tensor * get_k_tail(ggml_context * ctx, int32_t il, uint32_t n_tail, const slot_info & sinfo) const;
++    ggml_tensor * get_v_tail(ggml_context * ctx, int32_t il, uint32_t n_tail, const slot_info & sinfo) const;
++
++    // the same views with the first cell shifted by cell_off (the A1 negative control, see the .cpp)
++    ggml_tensor * get_k_cells(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t cell_off, const slot_info & sinfo) const;
++    ggml_tensor * get_v_cells(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t cell_off, const slot_info & sinfo) const;
++
+     // store k_cur and v_cur in the cache based on the provided head location
+     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
+     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+@@ -471,6 +494,12 @@ public:
+     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+ 
++    // wip/kv-residency (TODO #118) A1: the split point of this context's views (0 = no split) and
++    // the tail segment's views -- see llama_kv_cache::get_kv_split_n_tail
++    uint32_t get_kv_split_n_tail() const;
++    ggml_tensor * get_k_tail(ggml_context * ctx, int32_t il, uint32_t n_tail) const;
++    ggml_tensor * get_v_tail(ggml_context * ctx, int32_t il, uint32_t n_tail) const;
++
+     // store k_cur and v_cur in the cache based on the provided head location
+     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
+     //   - k_cur  [n_embd_head_k, n_head_k, n_tokens]
+-- 
+2.55.0
+
