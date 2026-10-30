@@ -25,12 +25,12 @@ owed (items 1, 2, 4) is done; the one follow-up is the parking gate not recognis
 | what | where |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, **pushed** (`origin` = `git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
-| delivery release | **r176** (`release.json`) — the campaign is cut against **r174** (`v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`); a promotion re-cuts against the then-current release |
+| delivery release | **r177** (`release.json`) — the campaign is cut against **r174** (`v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`); a promotion re-cuts against the then-current release |
 | the campaign's TODO handle | **#118** (`TODO.md` §118 + the table row; the older text says `#117`, which was a dangling reference — see the number note there) |
-| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`8788b952a`** (A5 (i): the tensor-placement fix; the tree is the A4 tip plus one file) |
+| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`7c7769e50`** (A5 (ii): the tensor-placement fix `0013` and the park decline `0014`, on top of the A4 tip) |
 | the A1 fallback | fork branch `wip-kv-residency-a1-two-base` (`e49e1cef4`), also pushed (superseded; unchanged this session) |
-| `rdna-boosts` | **never touched by this campaign.**  Locally `5bdec04ab`; the fork's branch is at r176's tip (moved by the r176 release) |
-| patch snapshot | `patches/0001`...`0013` + `patches/README.md` + `patches/diffstat.txt` (3195 insertions, 18 files) -- apply **in order** to `5bdec04ab`; verified: the series reproduces the branch tip's tree exactly (`56cb52e6dcb3`) |
+| `rdna-boosts` | **never touched by this campaign.**  Locally `5bdec04ab`; the fork's branch follows the delivery releases (r177) |
+| patch snapshot | `patches/0001`...`0014` + `patches/README.md` + `patches/diffstat.txt` (3222 insertions, 18 files) -- apply **in order** to `5bdec04ab`; verified: the series reproduces the branch tip's tree exactly (`c94552b26362`) |
 | box | **one R9700 (gfx1201), 32 624 MiB.**  Pin `HIP_VISIBLE_DEVICES=0` on every arm.  Every number here is 1-GPU; say so, never claim multi-GPU |
 
 ## 2. What Goal A asked for (the maintainer's words, unchanged)
@@ -432,33 +432,37 @@ passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 
 | record | content |
 |---|---|
-| [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) | **the state of the build**: what is implemented, every gate, §3.5 the arena numbers, §3.6 the deep arm + the break-even, and the two bugs the measurements found |
+| [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) | **the state of the build**: what is implemented, every gate, §3.5 the arena numbers, §3.6 the deep arm + the break-even, §3.7 the re-baseline at the new link, and **§3.7.11 = the A5 session** (the spilling-arm gates, the Flash-Next arm, the two bugs it found and their fixes, the arena re-measurement) |
 | [`MIXED-BACKING.md`](MIXED-BACKING.md) | the design + the driver probe (one VA range can be backed partly by pinned host memory; host chunks; the real shape at scale) |
 | [`A1-TWO-BASE-KV.md`](A1-TWO-BASE-KV.md) | A1 (two-base read in the FA kernels): built, gated, **superseded**, kept as the fallback |
 | [`O2-PLAN.md`](O2-PLAN.md) | the plan of record as written (its §6.3 mechanism is now historical — mixed backing won) |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | O1 (the growable KV region) — **parked**; A2 reuses its buffer-type skeleton |
 | [`INVENTORY.md`](INVENTORY.md), [`VMM-PROBE.md`](VMM-PROBE.md) | the taxonomy and link constants; the VMM driver facts |
 | [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md), [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md) | reference designs; Goal C (done, last priority) |
-| `patches/` | `0001`-`0008` + `README.md` + `diffstat.txt` — the campaign's code, apply to `5bdec04ab` in order |
+| `patches/` | `0001`-`0014` + `README.md` + `diffstat.txt` — the campaign's code, apply to `5bdec04ab` in order |
+| [`COLD-START-PROMPT.md`](COLD-START-PROMPT.md) | **the prompt to paste into a fresh session** (refreshed for the next one at the end of every session) |
 | `mixed-backing-probe.cc`, `vmm-probe.cc`, `bw-probe.cc` | the three standalone probes |
 | [`hostmap-hazard-probe.cc`](hostmap-hazard-probe.cc) | **the isolated reproducer of the A4 hazard**: replaying the window flip shows a live host mapping being zeroed; `--grab` passes, `--precreate`/`--no-flip`/`--no-stage`/`--vram-mib` still fail |
 
 ## 11. First 30 minutes of the next session
 
-1. `cd ~/llama-cpp-rdna-boosts && git pull`; read this file, then `A2-MIXED-BACKING.md` **§3.7.11** (this
-   session: the spilling-arm gates, the Flash-Next arm, the two bugs, the re-measurement), **§3.7.8** (the hazard
-   and its hold), **§3.7.9** (the spill's cost), and §3.7.6's closure banner.  Skim `§8.1` above — the absolute
-   references for this box, so nothing has to be re-derived before an A/B.
-2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** at **`8788b952a`** or later
-   (`git log --oneline -3`: A5 (i) on A4 (ii) on A4...).  Never commit campaign code to `rdna-boosts`.
-3. `~/bin/build-llama-rocm` (~5 s warm); then gate 0 (VMM selftest, must print **PASS** — and again with
-   `LLAMA_KV_REGION_QUARANTINE=0`, where it must print **FAIL**) and the §6 identity trio (27B Q4_K_XL
-   `-c 8192` q8_0 must hash `5ba44647188f` with the feature off).
-4. The open technical item is **§7.2 item 2's bug 2 / invariant 12**: an idle-slot **park** on a region-backed
-   KV faults the GPU, with the window off too (`gate-park-idle-slots.sh`; `A2-MIXED-BACKING.md` §3.7.11.3).  It
-   needs a maintainer decision (grow the region on park / refuse parking on a region cache / refuse the window),
-   then a gate: `NGPU=1 SM=layer NCMOE=48 ./scripts/gate-park-idle-slots.sh` with
-   `LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=1024` must PASS, and the window-off control must still PASS.
-5. Everything else §7.2 owed is done.  Do not re-derive it: item 1's three gates are green on spilling arms, the
-   Flash-Next arm is pure (KLD −0.000000 / 99.994 %) and the arena half of Goal A is measured (§3.7.11.4).
-   Report findings to the maintainer before committing any delivery-affecting change.
+1. `cd ~/llama-cpp-rdna-boosts && git pull` (and `cd ~/llama.cpp && git fetch origin`); read this file, then
+   `A2-MIXED-BACKING.md` **§3.7.11** (A5: the spilling-arm gates, the Flash-Next arm, **both bugs and their
+   fixes**, the arena re-measurement), **§3.7.8** (the hazard hold), **§3.7.9** (the spill's cost) and §8.1 above
+   (the absolute references — nothing has to be re-derived before an A/B).
+2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** at **`7c7769e50`** or later
+   (`git log --oneline -3`: A5 (ii) on A5 (i) on A4 (ii)).  Never commit campaign code to `rdna-boosts`.
+   `~/bin/build-llama-rocm` (~5 s warm).
+3. **There is no measurement left in §7.2** — items 1, 2 and 4 are done and their evidence is recorded.  The
+   session's work is the **promotion conversation** (the maintainer's) plus the two items below.
+4. **Owed, and it needs the maintainer's go-ahead because it is a DELIVERY change:** `scripts/gate-park-idle-slots.sh`
+   HARD-fails a legitimate outcome — when the park arm's server logs *"cannot park the idle slot: saving it to the
+   prompt cache and clearing it"* (the fallback a region-backed KV now triggers, and which also exists for a slot
+   whose cells are not one run, e.g. a shared prefix), the gate should require `park == lazyoff` and report
+   *"parking declined → save-and-clear fallback"* instead of failing on *"parking moved nothing"*.  Shape and
+   rationale: `A2-MIXED-BACKING.md` §3.7.11.3.
+5. **Deferred by the maintainer (do not re-propose):** expressing `W` as a percentage of the slab.  `W` stays a
+   cell count (numeric or `auto`), and `auto`'s ordering (weights → arena reserve → `W` from the residue, capped
+   at the user's `-c`) is the agreed policy — verified on the 35B-A3B, the 122B-A10B and the 27B Q8_0.
+6. Goal B (a sparse attended set streamed cheaply) is still not started; multi-device is still not measurable
+   here (one card).  Report findings to the maintainer before committing any delivery-affecting change.
