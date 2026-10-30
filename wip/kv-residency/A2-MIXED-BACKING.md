@@ -345,9 +345,32 @@ worst-case spill is exactly the ceiling; the fit reports "(widened by the pinned
 | windowed `draft-mtp` | 96 chars `6541eadb9041` |
 
 Byte-identical, i.e. the verify widths do not interact with the window (as expected: A2 changes memory, not
-kernels).  The 27B is not a usable arm for this until §3.7.6 is resolved (its spilled text already differs).
+kernels).  **Caveat added 2026-10-30 (A4):** this arm did not actually spill (see §3.7.6's closure note), so it
+proves the verify widths are unaffected by the *window*, not that they survive a *spill*.  Re-run it on a
+spilling 27B arm before quoting it for the latter.  The 27B is not a usable arm for this until §3.7.6 is resolved (its spilled text already differs).
 
-## 3.7.6 OPEN — a spilled KV changes the numbers on the 27B (blocker for the purity claim)
+## 3.7.6 CLOSED (A4) — a spilled KV changes the numbers on the 27B
+
+> **CLOSED 2026-10-30 (A4) — see §3.7.8 and §3.7.9.**  The data path this section blamed was correct: the
+> flip's stage-out equals an **independent copy-engine read** of the same mapping byte for byte, and its
+> restore equals the stage byte for byte, both exhaustively over 32/32 flips.  The fault is one level down, in
+> the **VMM primitive**: `cuMemUnmap` of a device mapping, followed by `cuMemCreate`(HOST)/`cuMemMap` at that
+> VA, zeroes a **different, live** host-location mapping in the same reservation.  Fixed with a hold in
+> `vmm_map`.  **Three readings in this section are wrong and must not be re-derived:**
+>
+> 1. **"A 4B arm with the same spill shape is byte-identical" — it never spilled.**  A 4B at `-c 4096` with
+>    `W` 1024/2048 needs `n_cells - W >= unit/nb1 = 3855` cells before `lead_bytes` leaves zero, so `FLIP=0`
+>    (`LLAMA_KV_REGION_DEBUG=1` prints it).  Given `-c 16384` it corrupts exactly like the 27B
+>    (26 chars `158c1671e511` -> 21 `9bef5c01369c`), and with the fix it is identical again.
+> 2. **"It is not the quantized KV type" — right conclusion, wrong evidence.**  The 27B arm diverges with
+>    **f16** KV too (303 -> 289 chars), so the quant path was never involved.
+> 3. **`nb1` 1088 vs 2048 is a red herring.**  The victims are the mappings whose VA offset is 2 MiB-aligned
+>    (34/68/102... MiB) in *both* models; the geometry does not matter, the map sequence does.
+>
+> The step-2 hypothesis ("a lost kernel write") is also excluded: the spilled cells are written *before* the
+> flip and never rewritten, the flip verifies byte-exact, and a 0xAB canary placed after the flip is
+> overwritten with zeros — so the loss is a real write that arrives after the flip, and it is not the KV
+> writer (which only ever writes cells above the watermark).
 
 Found while re-baselining, and **not** resolved:
 
@@ -427,15 +450,106 @@ which is worth checking against every vectorized access (16 B is fine: 1088 = 68
 The VMM selftest (`GGML_CUDA_VMM_REGION_SELFTEST=1`) now covers all of it: an aligned window flip moves
 exactly one mapping and preserves every byte, and a straddling request is refused and moves nothing.
 
-## 3.7.8 What is left (maintainer's decision, 2026-10-30)
+## 3.7.8 The fix (A4, 2026-10-30) — the hazard is in the primitive, and one hold closes it
 
-**§3.7.6 is THE block and is the next session's whole job.**  Items 2-4 of the campaign's owed list are
-verified and closed; the 28.8 GB/s tables in §3.3-§3.6 will be re-measured at the new link **after** §3.7.6 is
-closed (maintainer).  Until then:
+**The finding.**  A `cuMemUnmap` of a device mapping followed by `cuMemCreate`(HOST)/`cuMemMap` at that VA
+**zeroes a different, live host-location mapping elsewhere in the same reservation**.  Whole 4 MiB mappings,
+deterministically, from the 6th flip of a 27B-shaped reservation onward.  Proof that it is a write and not a
+stale read: a 0xAB canary placed in the mapping after its flip reads back as all zeros, and a
+kernel-vs-copy-engine cross-check of the same VA agrees (both see zeros).  The victims are the mapping flipped
+one step earlier, specifically those whose offset is 2 MiB-aligned.
 
-1. **§3.7.6**, which blocks calling the window pure.  Until it is closed: quote text/KLD purity only for
-   **non-spilling** windowed arms; the 4B's spilling arms are the only byte-identity evidence.
-2. The `--fit` numbers above are from `llama-fit-params`/smoke runs at 55.7 GB/s; the **arena** and
-   **deep-arm** tables of §3.3-§3.6 have *not* been re-measured at the new link (`-n 2000`, `-ncmoe` = the
-   model's full layer count) and must not be quoted as post-swap numbers.
-3. Goal B is still not started; multi-device is still not measurable here.
+**Isolation.**  `hostmap-hazard-probe.cc` (this directory) replays the real shape — 32 tensors × 8.5 MiB, a
+4 MiB window mapped from VRAM at setup, flipped to pinned host one tensor at a time, re-verifying every
+previously flipped segment.  Its arms:
+
+| arm | result |
+|---|---|
+| default | **FAIL** (a segment reads all zeros) |
+| `--grab N` — hold the physical the unmap just released, N >= the unit | **PASS** |
+| `--precreate` (create the host handle *before* the unmap) | FAIL — ordering is not the trigger |
+| `--no-flip` (remap as VRAM instead of host) | FAIL — the kind is not the trigger |
+| `--no-stage` (drop the pinned staging round trip) | FAIL |
+| `--vram-mib N` (N GiB already allocated) | FAIL — pressure is not the trigger |
+| `--cpu-store` | **SIGSEGV** — the VMM VA is not CPU addressable, which is why the staging legs are kernels |
+
+**The fix.**  `vmm_map` takes a hold — a `cudaMalloc` of the mapping's size — *before* `cuMemCreate` and
+releases it on return, so the block the unmap released is out of the allocator's free list for the whole
+create.  It is taken on **every** map site, not only the flip, because the hazard belongs to the create that
+follows a release and `ensure_span`/`grow_for`/a state restore can follow one too.
+`LLAMA_KV_REGION_QUARANTINE=0` is the kill-switch (A/B and bisection only — with it off the spill is **not**
+transparent).  A refused hold **fails the mapping loudly** rather than proceeding corrupt: the region's
+contract is to refuse and let the caller fall back to today's fit-or-fail.
+
+**Cost.**  One transient allocation of one map unit (4 MiB) per mapping created, freed on the same call —
+sequential, never nested, so it cannot accumulate; the allocator reuses the block, so it is a plateau of one
+unit, not growth.  Frequency is one per tensor per flip event, i.e. about one per 3855 tokens at 27B geometry.
+It must be the runtime allocator (which owns the free list); a VMM handle of our own does not consume the
+released block.
+
+**Gates (1 GPU, gfx1201, hardened default).**
+
+| gate | result |
+|---|---|
+| 27B q8_0 `-c 8192`, `W=1024`, 64 tok | 305 `e2cea6fa6670` = plain; `QUARANTINE=0` -> 328 `d8a6e67b8a3d` (wrong) |
+| 27B **f16** KV, same shape | identical (it diverged before) |
+| 4B `-c 16384`, `W=1024` (**a real spill**) | 26 `158c1671e511` = plain (was 21 `9bef5c01369c`) |
+| §6 identity trio, `W=2048`/`4096` spilling | 526 `5ba44647188f` x3 |
+| prefill-logit `--ctx 8192 --chunks 4 --kv q8_0`, `W=1024` | **-0.000000 / 100.000 %** (was 0.004973 / 98.761 %) |
+| the same arm with `QUARANTINE=0` | 0.004973 / 98.761 % — the recorded block, reproduced |
+| the §3.7.6 bisect ladder (one tensor / all 32) | both 305 `e2cea6fa6670` |
+| OOM config, feature off | still OOMs (8704.00 MiB) |
+| VMM selftest / `check-gpu-faults.sh` | PASS / clean (14 logs) |
+
+**A gate that is NOT sensitive, and must not be used as the regression test:** the §6 identity trio at
+`W=2048`/`4096` with `-n 128` **passed while the spill was corrupted**.  The sensitive arms are the `W=1024`
+`-n 64` text arm and the prefill-logit gate; prefer the latter, because a text hash is also blind to the
+*magnitude* of a shift.
+
+**And never quote a timing from a `LLAMA_KV_REGION_DEBUG` arm**: its fingerprint re-reads and hashes every host
+mapping at every growth, which is 10-40x on a spilling arm (a 27B read 397 and 936 ms/token where the product
+reads 38.5 and 44.8).
+
+## 3.7.9 What the spill costs at the new link (the descent is linear, not a cliff)
+
+27B Q4_K_XL, depth 25 763, `-c 32768`, q8_0 KV, 1 GPU, 128 tokens, `ROCBLAS_USE_HIPBLASLT=0` (so the absolute
+t/s is lower than a normal run; the deltas are the measurement).  Two reps on the ends, agreement <= 0.1 ms.
+
+| arm | spill read (MiB/token) | decode | delta |
+|---|---|---|---|
+| plain, no window | 0 | 36.07 ms (27.72 t/s) | — |
+| window `W=32768`, nothing spilled | 0 | 34.90 ms (28.65 t/s) | -1.2 ms (noise) |
+| window `W=24576`, nothing spilled | 0 | 34.88 ms (28.67 t/s) | -1.2 ms (noise) |
+| `W=16384` | 256 | 38.51 / 38.55 ms (25.96 t/s) | +3.63 ms |
+| `W=8192` | 512 | 42.68 ms (23.43 t/s) | +7.78 ms |
+| `W=4096` | 640 | 44.76 / 44.78 ms (22.34 t/s) | +9.88 ms |
+
+**A straight line through the origin**: about **16.3 us per MiB of spill/token**, i.e. **~61 GB/s effective**
+(the link is 55.7 GB/s; part of the tail read overlaps compute), intercept ~0, and the two zero-spill arms are
+identical to each other — no fixed cost for enabling the window and no threshold anywhere.  The per-token cost
+is proportional to `(used - W) * cell_bytes`, so the *rate* decays hyperbolically with depth
+(`ms/token ~ base + spill/61 GB/s`), never in steps.  Prefill degrades the same way: 1186.7 t/s plain -> 1170.2
+(window, no spill) -> 1116.0 (512 MiB spill) = -5.9 %.
+
+Rule of thumb at this link: **128 MiB/token ~ +2 ms (-6 %), 256 ~ -9 %, 512 ~ -18 %, 640 ~ -22 %.**
+
+## 3.7.10 What is left (updated 2026-10-30, A4)
+
+**§3.7.6 is CLOSED** (§3.7.8).  The purity claim now holds for a *spilling* windowed arm on 1 GPU.
+
+Owed before promotion, in order:
+
+1. **The correctness corners the fix reopened.**  `gate-ckpt-reuse.sh`, `gate-state-pipe.sh` and the MTP verify
+   widths must be re-run on arms that **provably spill** (`FLIP > 0`, `mapped_host > 0`) — the A3 passes were 4B
+   arms that never reached a flip (§3.7.6's closure note), so they prove nothing about a spill.  The state path
+   is also where a mid-run `map-new` happens, i.e. the other half of the hazard.
+2. **A Flash-Next (qwen4exp) spilling arm** — the only model with **two** KV caches, the attention KV and the
+   **QSA indexer**, plus §3.7.4's park coupling (`llama_memory_hybrid_idx` moves the indexer with the attention
+   cells).  Add `test-backend-ops -o FLASH_ATTN_QSA` on that arm.
+3. **The hazard as a self-test**, not a probe: extend `GGML_CUDA_VMM_REGION_SELFTEST` (map a device span and a
+   host span, remap the device one, verify the host one) so `validate-set.sh` and the per-block ladder catch a
+   driver regression.
+4. **The §7.2 re-measurement** at the new link: the arena tables (`-n 2000`, `-ncmoe` = the model's full layer
+   count, interleaved), the deep arm, and the moved `--fit` break-even.  §3.7.9 covers the cost side.
+5. The promotion conversation (a block, `ENVIRONMENT.md`, the default-on call) — the maintainer's, and it needs
+   1-2 first.  Goal B is still not started; multi-device is still not measurable here (one card).

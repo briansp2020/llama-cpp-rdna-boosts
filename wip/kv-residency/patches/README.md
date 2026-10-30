@@ -19,7 +19,7 @@ because the campaign is not promoted.  A promotion re-cuts the series from the t
 cd ~/llama.cpp
 git checkout rdna-boosts && git checkout 5bdec04ab        # or: scripts/apply-all.sh after a fresh clone
 git checkout -b wip-kv-residency
-git am ~/llama-cpp-rdna-boosts/wip/kv-residency/patches/000[123]-*.patch
+git am ~/llama-cpp-rdna-boosts/wip/kv-residency/patches/00*.patch     # 0001..0011, in order
 ~/bin/build-llama-rocm
 ```
 
@@ -37,8 +37,9 @@ If `5bdec04ab` is not available (an old checkout), re-cut it first from this rep
 | `0006-…-the-SLIDING-window….patch` | the window follows the watermark (the newest W *used* cells stay resident); `ensure_span` flips a mapping's kind through a pinned scratch | applied, measured |
 | `0007-…-quantise-the-slide-boundary-i….patch` | the slide boundary is quantised in BYTES to a whole map unit — without it a host chunk was created per tensor per token (**14.7 → 18.6 t/s**) | applied, measured |
 | `0008-…-commit-the-resident-WINDOW-a….patch` | the resident window's VRAM is committed at buffer creation, **before `SLAB_INIT`** — without it a deep batch aborts (`growth refused`, `free=0.0 MiB`) | applied, measured |
-| `0009-wip-kv-residency-A3-fit-sizing-reporting-of-the-wind.patch` | **A3**: `--fit` sizes + reports the window (`LLAMA_KV_RESIDENT_CELLS=auto`, `llama_kv_region_set_resident_cells`, the KV's bytes-per-cell from the region buffer type, the resident/spill split in `memory_breakdown()`); the pinned-RAM ceiling (`LLAMA_KV_SPILL_RAM_PCT`, creation-time clamp + run-time refusal); the four relaxed async-tensor buffer-type asserts the state gates caught; and the three slide bugs — unit-grid mappings + a refused straddle, kernel-copied staging (a `cudaMemcpy` into a host-location mapping does not land), no coalescing.  See `../A2-MIXED-BACKING.md` §3.7 | **applied, building, gates green** — the state gates + MTP verify widths pass on a windowed arm; **the spilled-KV numeric difference of §3.7.6 is OPEN** |
+| `0009-wip-kv-residency-A3-fit-sizing-reporting-of-the-wind.patch` | **A3**: `--fit` sizes + reports the window (`LLAMA_KV_RESIDENT_CELLS=auto`, `llama_kv_region_set_resident_cells`, the KV's bytes-per-cell from the region buffer type, the resident/spill split in `memory_breakdown()`); the pinned-RAM ceiling (`LLAMA_KV_SPILL_RAM_PCT`, creation-time clamp + run-time refusal); the four relaxed async-tensor buffer-type asserts the state gates caught; and the three slide bugs — unit-grid mappings + a refused straddle, kernel-copied staging (a `cudaMemcpy` into a host-location mapping does not land), no coalescing.  See `../A2-MIXED-BACKING.md` §3.7 | applied, building, gates green on a non-spilling arm; **the spilled-KV numeric difference of §3.7.6 was OPEN at this commit and is closed by `0011`** |
 | `0010-wip-kv-residency-A3-diagnostic-LLAMA_KV_REGION_SPILL.patch` | `LLAMA_KV_REGION_SPILL_SKIP=<tensor indices>`: keeps the listed tensors of a windowed buffer fully resident.  **DIAGNOSTIC ONLY** (unset = shipped behaviour) — it exists to bisect the open finding (§3.7.6): a single 4 MiB tensor spill already moves the 27B's text, while skipping every tensor reproduces the plain hash exactly | applied, building; the bisect ladder is in `../A2-MIXED-BACKING.md` §3.7.6.  This commit also makes the VMM selftest's PASS line describe what it checks (a partial flip is refused) |
+| `0011-wip-kv-residency-A4-close-the-spilled-KV-purity-bloc.patch` | **A4, the purity blocker closed**: a spilled KV is numerically transparent.  The flip was byte-exact all along (stage-out == an independent copy-engine read, restore == stage, exhaustively); the fault is in the primitive -- `cuMemUnmap`(device) + `cuMemCreate`(HOST)/`cuMemMap` at that VA **zeroes a different, live host-location mapping** in the same reservation.  `vmm_map` now holds the released physical for the duration of its create (`LLAMA_KV_REGION_QUARANTINE`, default on, `=0` = the A/B arm), on every map site, and a refused hold fails the mapping loudly.  Plus the instruments: byte-exhaustive restore verify, stage-out cross-check, per-host-mapping fingerprint (reports where and when a spill changes), region dump, canary, `LLAMA_KV_REGION_TRACE`.  See `../A2-MIXED-BACKING.md` §3.7.8 / §3.7.9 | **applied, building**, all gates green: prefill-logit **-0.000000 / 100.000 %** on a spilling arm (was 0.004973 / 98.761 %), 27B q8_0/f16 and 4B text back to the plain hash, OOM config still OOMs with the feature off |
 
 | (A2-early) | **A2, the mixed-backing windowed KV**: one VA reservation, the KV's leading cells backed by pinned system RAM, the rest by VRAM; the mapping-table primitive, the split buffer type, the split point + loud warning.  Measured: the 27B Q8_0 `-c 262144` OOM config runs; `(used − resident) × cell_bytes / ~28 GB/s` matches to ~3 %; slab mode's arena gains 2.69 GiB and the 35B-A3B **Q8_0** expert residency goes 63.3 % → 77.0 %.  See `../A2-MIXED-BACKING.md` | **applied, building, gates green** (the design of record) |
 
@@ -54,7 +55,7 @@ the only remote `~/llama.cpp` has) — that is the backup:
 
 | branch on the fork | tip | what |
 |---|---|---|
-| `wip-kv-residency` | `ba5c7205e` | A2 (mixed backing + the sliding window + both fixes, the design of record) on top of A1 |
+| `wip-kv-residency` | `455d5aa94` | A4 (the hazard hold + the instruments) on top of A3 / A2 / A1 -- **the design of record** |
 | `wip-kv-residency-a1-two-base` | `e49e1cef4` | A1 alone (the two-base K/V read, superseded, kept as the fallback) |
 
 `rdna-boosts` on the fork stays at the release tip and is **not** touched by this campaign.
