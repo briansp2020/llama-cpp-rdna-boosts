@@ -1,7 +1,7 @@
 # Cold-session prompt — `wip/kv-residency` (TODO #118)
 
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from the previous
-session's context).  Rewritten 2026-10-30 at the end of session A9 (Goal B: the plan + the B0 baseline measurement).
+session's context).  Rewritten 2026-10-30 at the end of session A9 (Goal B: B1 measured, B2 implemented and pushed).
 
 ---
 
@@ -47,15 +47,21 @@ without the knob is byte-identical to r177 including its OOM).  The shipped tree
    (`A2-MIXED-BACKING.md` §4).  **All Goal B work stays inside `wip/`** (campaign branch `wip-kv-residency`
    for code) — `patches/` and `release.json` are untouched while the delivery is in flight on other features.
 
-**WHAT IS LEFT — do B2 first (B1 is done and changed the shape of B2):**
+**WHAT IS LEFT — B2 IS DONE (branch `wip-kv-residency-b` `f33a9d8fe`), so start at B3:**
 
-1. **B2 — the decode-arm policy under a streaming KV** (the plan's §3.2): a resident KV wants DENSE decode, a
-   streamed KV wants SPARSE decode (+32 % at 103k, +49 % at 180k on the four-arm matrix), but
-   `qwen4exp`'s decode gate only knows depth (`qsa_dense_decode_until = 1<<62` on gfx1201), never the cache's
-   residency.  Make the arm depend on "the attention cache is windowed and spilling" and gate it on the four-arm
-   matrix at 51k / 103k / 180k.  **No page table, no gather** — B-A/B-B are justified only if a gate arm shows
-   the policy is not enough.  Campaign code goes on branch **`wip-kv-residency-b`** (based on the shipped tip;
-   `wip-kv-residency` is Goal A's measurement tree), pushed after every step.
+0. **Read the measurement rule you will trip over:** every Flash-Next arm needs
+   `-ot per_layer_token_embd.*=CPU -lm none -lzm off`.  The PLE table is 27 465 MiB and is otherwise lazy-mapped;
+   identical runs moved ±20 % without the flags, ±0.2 % with them (HANDOVER §5 rule 7).
+1. **B3 — the arena half at `-n 2000`** (`-ncmoe` = the full layer count): the streamed+B2 arms above carry
+   +1.7…2.6 GiB of arena (57.6 -> 61.9 % residency), which the `-n 400` arms cannot score.  Also re-read the r117
+   identity cliff: record arena MiB, residency % and the count of `identity fast path ON` lines.
+2. **The MTP draft's sparse decode deserves a streamed re-measure** (`qwen4exp_mtp_sparse_arm`): it is default-OFF
+   on resident-cache numbers, and under a *streamed* draft KV the B2 argument applies (`LLAMA_MTP_SPARSE_DECODE=1`).
+3. **Then the promotion decision** (the maintainer's): B2 is a ~15-line policy + an accessor; if it is promoted it
+   is a block amendment, `ENVIRONMENT.md` (`LLAMA_QSA_DENSE_DECODE_STREAM`) and a `GREEDY-PURITY.md` row for the
+   regime change.  **Nothing leaves `wip/` until that call.**
+4. **B-A/B-B (page table / compact gather) are NOT needed for the B2 win** — they come back only if a gate arm
+   shows the policy is insufficient.
 2. **Goal C decisions** (`O3-DRAFTER-RING.md` §7): the MTP drafter ring is measured, not promoted — free at a
    usable window (46k context, `W=32768`: acceptance −2.3 % relative, generation flat), 7-9 % lost far below
    the working context; the prize is one draft layer (~1 GiB at `-c 262144`) and it does not reach the arena.

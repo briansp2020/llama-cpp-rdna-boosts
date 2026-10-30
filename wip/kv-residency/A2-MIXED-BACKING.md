@@ -896,3 +896,19 @@ and moving the KV between VRAM and host gives four arms per depth (Flash-Next IQ
 (+32…49 %, growing with depth), and the whole of Goal B is a *fittability/arena* feature like block 15, not a
 speed one.  The one missing piece is that the decode-arm policy does not know the KV is streaming — no page
 table is needed for the win.  Plan §3.2 has the detail and the revised B2.
+
+### B2 (same session) — implemented: a streaming KV takes the sparse decode arm (+34 / +47 %)
+
+Branch `wip-kv-residency-b` `f33a9d8fe`.  `llama_kv_cache::is_streaming(n_kv)` + `qwen4exp_kv_streams()`; kill
+switch `LLAMA_QSA_DENSE_DECODE_STREAM=0`.  Measured with the **PLE flags** (`-ot per_layer_token_embd.*=CPU -lm
+none -lzm off` — 27 465 MiB of PLE is otherwise lazy-mapped and made identical runs move ±20 %), 1 GPU,
+`-ncmoe 48`, q8_0, `-n 400`, 2 reps, ±0.2 %:
+
+| depth | resident + default | streamed + dense (pre-B2) | streamed + **B2** | arena |
+|---|---|---|---|---|
+| 102 899 | 42.16 | 23.42 / 23.54 | **31.43 / 31.46 (+34.3 %)** | 25 338.3 MiB / 61.9 % |
+| 180 035 | 37.10 | 16.51 / 16.50 | **24.31 / 24.29 (+47.3 %)** | 25 338.3 / 61.9 % |
+
+Text: resident default == `STREAM=0` (853 `77a40bf40be1`, inert on a resident cache); streamed default ==
+forced-sparse (1159 `e6080aaf2318`); streamed dense 1158 `0f1ad14496c9` (a documented regime change).  Prefill
+untouched.  Plan §3.3.
