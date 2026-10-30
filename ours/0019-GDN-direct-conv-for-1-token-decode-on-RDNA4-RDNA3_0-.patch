@@ -1,7 +1,7 @@
 From cac7a262a5b4bb98d0de378c254ada8adf05dea1 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 29 Oct 2026 13:56:12 +0000
-Subject: [PATCH 19/19] GDN direct conv for 1-token decode on RDNA4 / RDNA3_0
+Subject: [PATCH 19/20] GDN direct conv for 1-token decode on RDNA4 / RDNA3_0
  (was 2..255 only); the ssm_conv_in epilogue steps aside when the direct conv
  takes the concat (both fired: the conv read an unwritten matmul output).
  Bit-identical server replies; Qwen3.6 tg128 +7 % on 7900 XTX

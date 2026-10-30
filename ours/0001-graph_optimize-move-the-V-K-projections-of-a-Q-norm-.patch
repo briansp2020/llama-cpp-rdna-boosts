@@ -1,7 +1,7 @@
 From b0008685ec8f4c168b3d794515892335321bb1de Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 03:06:04 +0000
-Subject: [PATCH 01/19] graph_optimize: move the V / K projections of a Q-norm
+Subject: [PATCH 01/20] graph_optimize: move the V / K projections of a Q-norm
  attention layer in front of the Q projection (bit-identical)
 
 The model graph runs the Q projection and its RMS_NORM, MUL, ROPE before the V and K projections, so the Q GEMV cannot join

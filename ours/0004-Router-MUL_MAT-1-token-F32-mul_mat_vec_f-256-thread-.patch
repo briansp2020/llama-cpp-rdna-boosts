@@ -1,7 +1,7 @@
 From a8df0cb5cf769a8fcf08a791e7a71fd50f8976c3 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 29 Oct 2026 17:36:00 +0000
-Subject: [PATCH 04/19] Router MUL_MAT (1 token, F32, mul_mat_vec_f 256-thread
+Subject: [PATCH 04/20] Router MUL_MAT (1 token, F32, mul_mat_vec_f 256-thread
  shape) + topk-moe in one launch: each topk_moe_cuda block computes one logit
  as mul_mat_vec_f does, the last one (self-resetting counter) runs the
  unchanged selection. Bit-identical; on r176 + graph-order 0001, Qwen3-30B-A3B

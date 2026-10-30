@@ -1,7 +1,7 @@
 From dcba8a8ea5ed7155df1242212581973e1024f053 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 03:03:02 +0000
-Subject: [PATCH 02/19] Dense row concat also on RDNA4 (bit-identical)
+Subject: [PATCH 02/20] Dense row concat also on RDNA4 (bit-identical)
 
 On RDNA4 a single-token row's dot product does not depend on the row count (one warp per row, no small_m variant), so
 the V / K / Q projections can share one ksplit launch there too.  The combined launch may take two rows per block, so every

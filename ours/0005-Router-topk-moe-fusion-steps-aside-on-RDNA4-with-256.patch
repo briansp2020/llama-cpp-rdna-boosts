@@ -1,7 +1,7 @@
 From e5f46773b6cab83159761eb6f98f18216b27e108 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 02:45:29 +0000
-Subject: [PATCH 05/19] Router + topk-moe fusion steps aside on RDNA4 with 256
+Subject: [PATCH 05/20] Router + topk-moe fusion steps aside on RDNA4 with 256
  experts: the one launch is slower there (Qwen3.6 tg128 133.2 -> 134.7 on
  R9700; Qwen3-30B keeps +2.1 %). Bit-identical either way
 
