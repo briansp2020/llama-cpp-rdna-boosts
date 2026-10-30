@@ -835,6 +835,28 @@ with it every compute buffer, so `set_sampler()` asks for one only when it has t
 |---|---|---|---|
 | `LLAMA_BACKEND_SAMPLER_RESERVE_ONCE` | **on** | kill-switch (r169, contributor PR #245, block 12) | the compute buffers remember what they were reserved with (`sampling.reserved`: per sequence, the backend sampler chain's node count, `llama_sampler_backend_n_nodes()`) and `set_sampler()` reserves only when a sequence gets a **wider** chain than that, or has no record yet.  A chain set again, a narrower one, or a removal asks for none: the graph is rebuilt anyway (the samplers are part of the graph-reuse check), the output buffers are sized per decode, and the graph allocator grows a buffer if a chain needs more bytes.  The key is the **node count**, not the sequence id, because a reserve is the only thing that recomputes `graph_max_nodes()` — which sizes the graph's node capacity (`llm_graph_result::max_nodes` -> `ggml_new_graph_custom`), the scheduler's node/leaf arrays and the compute-metadata arena — and the allocator's growth covers buffer sizes only.  `0` restores the pre-r169 behaviour (a reserve on every set and every removal: 4 `sched_reserve: reserving ...` lines over three requests instead of 2, and +68.7 ms of median prompt time per sampled request on a 27B at `-c 65536 --parallel 2 --kv-unified`).  No arithmetic changes: request text and the prefill logits are byte-identical across the arms.  Only reaches a context that sets a backend sampler — `llama-cli`/`llama-bench` and a `-sm tensor` context (backend sampling is refused there) never touch it. |
 
+## 17. Windowed KV (block 15, **opt-in**)
+
+The KV cache's VRAM cost becomes a **resident window** of the newest `W` cells; the cells below it live in
+pinned system RAM, in the same VA reservation (so no kernel and no op changes).  **Default: off** — with the
+knob unset the KV takes the plain device buffer and the run is byte-identical to a build without the block,
+including its OOM.  The opt-in semantics are deliberate: a window below the depth you actually run costs
+11-26 %, so it is a decision, not a default.
+
+| variable | default | what it does |
+|---|---|---|
+| `LLAMA_KV_RESIDENT_CELLS` | **unset = off** | `N` = keep the newest `N` cells in VRAM; `auto` = `--fit` sizes it (only for a `-c` the user pinned — the fit then reports the split, the per-token read cost and the depth below which nothing spills).  `0` = off. |
+| `LLAMA_KV_SPILL_RAM_PCT` | **`85`** (**kill switch**: `0` disables the cap) | Cap the pinned spill at this % of `MemAvailable`.  At creation the window is **widened** until the worst case fits; at run time a mapping that would exceed it is refused loudly instead of being OOM-killed. |
+| `LLAMA_KV_REGION` | **on** (**kill switch**: `0` disables the provider) | Whether the region provider may be used at all.  It is only ever *taken* when a window is asked for, so this switch is for A/B testing and bisection. |
+| `LLAMA_KV_REGION_QUARANTINE` | **on** (A/B switch: `0` = the bug) | Holds the physical a `cuMemUnmap` just released across the `cuMemCreate`/`cuMemMap` that follows.  **Without it a spilled KV is silently wrong** (the driver zeroes a neighbouring live host mapping).  Default on; `0` exists only to reproduce the hazard — never ship it in a server config. |
+| `LLAMA_KV_REGION_DEBUG` | unset (presence) | Per-growth lines with the window's own state, a byte-exhaustive restore verify, a stage-out cross-check and a fingerprint of every host mapping.  **10-40x slower on a spilling arm — never quote a timing from it.** |
+| `LLAMA_KV_REGION_TRACE` | unset (presence) | Every address-level map/unmap/memset/ensure.  One line per 4 MiB unit; for sizing, not for a hot loop. |
+| `LLAMA_KV_REGION_CANARY` | unset (presence) | With `DEBUG`: writes a 0xAB pattern into a mapping right after its flip, so a later change proves something *wrote* there. |
+| `LLAMA_KV_REGION_DUMP` | unset (path) | At region free, write the whole mapped extent to this file and print the maps/mapped/host totals.  `= /dev/null` is the cheap **spill proof** (`KVREGION_FREE … host=` > 0). |
+| `GGML_CUDA_VMM_REGION_SELFTEST` | unset (presence) | Run the provider's selftest at backend init: prefix/span growth, a HOST-backed span, aligned window flips (a straddling request is refused), the **host-mapping hazard** (a whole flip sequence re-verified) and the watermark contract.  Must print **PASS**, and must print **FAIL** with `LLAMA_KV_REGION_QUARANTINE=0` — a release gate asks for it explicitly. |
+| `LLAMA_KV_REGION_SPILL_SKIP` | unset (**diagnostic only**) | Comma-separated tensor indices of a windowed buffer that stay fully resident; it bisected the A4 purity hunt and is not shipped behaviour. |
+
+
 ## Maintaining this file
 
 The tables were derived from the code, so re-derive rather than trust them after a block change:

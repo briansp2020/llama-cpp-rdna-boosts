@@ -1,5 +1,53 @@
 # WORKLOG - dated delivery records
 
+## 261030.002 (r178) -- the windowed KV ships as block 15 (Goal A of #118): an opt-in fixed-VRAM resident window with a pinned-host tail
+
+**Released as `v16-6050b467c-r178` (16 blocks, 00-15; block 15 is new).**  Promoted from the
+`wip/kv-residency` campaign (TODO **#118**, Goal A).  Opt-in: `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`; with it
+unset the KV takes the plain device buffer and a run is byte-identical to r177, **including its OOM**
+(verified: `5ba44647188f`, and `cudaMalloc failed: out of memory` on the 27B Q8_0 `-c 262144` baseline).
+
+**What it does.**  The KV's VRAM cost becomes a **window** of the newest `W` cells instead of `-c` cells: one
+VA reservation (a CUDA/HIP VMM region) holds the whole cache, the window's cells are VRAM and everything
+below them pinned system RAM.  `set_rows`, the in-place rope shift, `state_write/read`, the kq mask and the FA
+kernels keep addressing one contiguous range, so **no kernel and no op changes**; the window slides in whole
+map units (once per few thousand tokens), and the apparatus itself is free (a zero-spill arm measures the same
+as plain).  Payoffs: a context that OOMs today runs (27B Q8_0 `-c 262144` = 128 MiB VRAM + 8576 MiB pinned
+host for the KV, 944.8 t/s prefill), and with host-resident MoE experts the VRAM the KV does not need *yet*
+goes to the arena — at `-c 262144`, `-n 2000`, `-ncmoe` = the model's full layer count: **+2.2 to +2.9 GiB of
+arena** (+3.9 to +6.7 points of residency) when `W` is at or above the run's depth, which is 122B-A10B
+Q4_K_XL **+3.8 % decode / +4.7 % prefill** and 35B-A3B Q8_0 -0.9 % / +3 %; a `W` 35 k cells *below* the run
+depth costs 11-26 %, because the spill is read over the link on every step (`(used − W) × cell_bytes /
+55.7 GB/s`).
+
+**Purity.**  A spilled KV is numerically transparent: prefill-logit **KLD −0.000000 / 100.000 %** on a
+spilling 27B arm, **−0.000000 / 99.994 %** on a spilling Flash-Next (the only model with two KV caches — the
+attention KV *and* the QSA indexer), and every text arm byte-identical to its plain reference (27B f16 and
+q8_0, 4B, 35B-A3B, Flash-Next).  `gate-ckpt-reuse.sh`, `gate-state-pipe.sh` and the MTP verify widths pass on
+arms that **provably spill** (`FLIP > 0`, `KVREGION_FREE … host=` > 0), and `test-backend-ops -o
+FLASH_ATTN_QSA` is 26/26.  Two driver hazards are held: a kind flip zeroes a neighbouring live host mapping
+unless the released physical is held across the create (`LLAMA_KV_REGION_QUARANTINE`, default on — `=0`
+reproduces the corruption: 325 chars `fb65430049e9`), and every tensor in a windowed region is placed on the
+driver's map granularity so a slide step coincides with a mapping.
+
+**Shipped as-is from the campaign except two shape changes:** (1) the region buffer is taken **only** when a
+window is active — the campaign's O1 fallback (fully resident, lazily committed) is **not** shipped, because on
+a slab-armed MoE config it `GGML_ABORT`s where the plain arm completes; (2) the provider is on by default with
+`LLAMA_KV_REGION=0` as the kill switch.  **A1** (the superseded two-base FA read) was stripped (6 FA files +
+`ggml.h`/`ggml.c` + the graph plumbing): with one VA range the single-base read is correct, and the windowed
+arms are byte-identical to plain at `W` = 1024/2048/4096 on the shipped tree.  **Goal C** (the MTP drafter
+ring, `LLAMA_SPEC_DRAFT_WINDOW`) is **not** in the block.
+
+**Re-base:** the campaign was cut against r174; block 15 is cut against r177's tip (`acbeeb840`, the r174→r177
+delta in the campaign's files was only `ggml-cuda.cu` +53 lines, so the application was clean).  Patch set
+regenerated: 16 patches, `release.json` `tip 38ef3a767` / `tree 92d087ef`, `validate-set.sh` green (fresh
+tarball, strict `git am`, checksums, Windows path + portability scans).  Blocks 00-14 are byte-unchanged apart
+from their `From` lines and the block-14 re-cut that r177 already carried.
+
+**Owed (campaign, not delivery):** `scripts/gate-park-idle-slots.sh` still fails an arm on "parking moved
+nothing" when the server legitimately saves-and-clears instead of parking — a test gap (with no window the gate
+passes).  Goal B is not started.
+
 ## 261030.001 (r177) -- PR #252: its Q/K/V projection reorder and its RDNA4 row concat shipped (block 10); its GDN projection gather held off (TODO #119)
 
 **Released as `v15-6050b467c-r177` (15 blocks, 00-14; block 10 amended).**  Contributor PR

@@ -1,7 +1,7 @@
 From e3baa3b170fda518ea57ad3fbb105dc0a66be5b9 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
-Subject: [PATCH 05/14] rdna-boosts: block 05: flash-attention band, native
+Subject: [PATCH 05/15] rdna-boosts: block 05: flash-attention band, native
  quantized K/V and derived kq mask
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -10765,5 +10765,5 @@ index 1baeed5d9..660afa273 100644
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
 -- 
-2.56.0
+2.55.0
 

@@ -10,7 +10,7 @@ current delivery.
 
 ## Current delivery
 
-15 blocks (`block 00` + `blocks 01-14`) against `release.json.base`, canonical chain `release.json.tip` /
+16 blocks (`block 00` + `blocks 01-15`) against `release.json.base`, canonical chain `release.json.tip` /
 `.tree`.  `scripts/validate-set.sh` is green (checksums, then a strict 15/15 apply on a fresh tarball,
 tree equality, a conflict-marker/subject scan of every block tree, then the Windows portability lint of
 the files the set adds — issue #231).  **Block 14 is temporary** (`-sm relaxed-tensor`, a local relaxation of an upstream rule,

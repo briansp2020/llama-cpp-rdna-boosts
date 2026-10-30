@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
-**15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r171`; the base is the 2026-10-25 re-base), one
+**16 blocks** (block 00 + blocks 01-15) against `release.json.base` (**`6050b467c`** as of
+`v16-6050b467c-r178`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -21,12 +21,12 @@ and every environment variable is catalogued in [`../ENVIRONMENT.md`](../ENVIRON
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout "$(jq -r .base /path/to/rdna-boosts/release.json)"
-bash /path/to/rdna-boosts/scripts/apply-all.sh .          # creates branch rdna-boosts, 15 commits
+bash /path/to/rdna-boosts/scripts/apply-all.sh .          # creates branch rdna-boosts, 16 commits
 bash /path/to/rdna-boosts/scripts/apply-all.sh --include-beta .   # + beta/*/*.patch (NOT the release tree)
 ```
 
 All blocks with **`git am`**, in order.  `git apply` on the concatenated series silently drops hunks; the
-manual equivalent is `git am patches/000[0-9]-*.patch patches/001[0-4]-*.patch`.  `apply-all.sh` asserts
+manual equivalent is `git am patches/000[0-9]-*.patch patches/001[0-5]-*.patch`.  `apply-all.sh` asserts
 the applied tree equals `release.json.tree` on the strict path.
 
 ## Block index
@@ -51,6 +51,7 @@ only as a rough shape.
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
+| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`): the KV's VRAM cost is a **resident window** of the newest `W` cells, the rest in pinned system RAM, in **one VA reservation** — so `set_rows`, the rope shift, `state_write/read`, the kq mask and the FA kernels keep addressing one contiguous range (**no kernel or op change**).  The window slides in whole map units.  Payoffs: a context that OOMs now runs, and the VRAM the KV does not need *yet* goes to the expert-cache arena.  Unset = plain device buffer, byte-identical including the OOM.  Two driver hazards are held (a kind flip zeroes a neighbouring live host mapping without the `LLAMA_KV_REGION_QUARANTINE` hold; every tensor must start on the map granularity), and an idle-slot park is refused on a region-backed cache.  See below and `../wip/kv-residency/A2-MIXED-BACKING.md` §3.7.9/§3.7.11 |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
 infrastructure split out of `ggml-cuda.cu` (slab/arena/try-fuse TUs) and block 11 is the qwen4exp
@@ -2446,6 +2447,32 @@ kernel confirms each device pools its own 256-wide slice and the per-device maxi
 byte-identical under `tensor` and `relaxed-tensor`, so the mode is a no-op without the amax node;
 `ggml_pool_1d` has exactly one producer in the graph, so the state is unreachable from any other arch.
 Purity notes: `GREEDY-PURITY.md` §58.
+
+## Block 15 — the windowed KV (`LLAMA_KV_RESIDENT_CELLS`, **opt-in**)
+
+Promoted from the `wip/kv-residency` campaign (Goal A of `TODO` #118) in **r178**.  Opt-in: with
+`LLAMA_KV_RESIDENT_CELLS` unset (or `0`) the KV takes the **plain device buffer** and the run is
+byte-identical to a build without this block, including its OOM.
+
+* `LLAMA_KV_RESIDENT_CELLS=<cells>` — keep the newest `<cells>` cells of the KV in VRAM; everything older
+  goes to pinned system RAM.  `=auto` lets `--fit` size it, and only for a context the user pinned with `-c`
+  (the fit then reports the resident/spill split, the per-token read cost and the depth below which nothing
+  spills).  `LLAMA_KV_SPILL_RAM_PCT` (default 85 % of `MemAvailable`) caps the pinned spill and **widens the
+  window** rather than letting the run be OOM-killed.
+* `LLAMA_KV_REGION=0` disables the provider; `LLAMA_KV_REGION_QUARANTINE=0` is the diagnosis switch that
+  reproduces the driver hazard (never ship it), and `LLAMA_KV_REGION_DEBUG/TRACE/CANARY/DUMP` are the
+  instruments.  `GGML_CUDA_VMM_REGION_SELFTEST=1` runs the provider's own selftest (it must PASS, and must
+  FAIL with the hold disabled).
+* **Cost:** the spill is read over the link on every step — `(used − W) × cell_bytes / 55.7 GB/s` on the
+  validation box — so `W` belongs at or above the depth you actually run.  Measured at `-c 262144`, a `W` at
+  the run's depth is free (+2.2…+2.9 GiB of arena, 122B-A10B +3.8 % decode / +4.7 % prefill); a `W` 35 k
+  cells below it costs 11-26 %.
+* **Purity:** a spilled KV is numerically transparent — prefill-logit KLD −0.000000 / 100.000 % on a spilling
+  27B, −0.000000 / 99.994 % on a spilling Flash-Next (two KV caches), and every text arm byte-identical to
+  its plain reference.  The state, context-checkpoint and MTP verify-width gates all pass on arms that
+  provably spill (`FLIP > 0`).
+* **Not in this block:** Goal B (a sparse attended set) and Goal C (the MTP drafter ring,
+  `LLAMA_SPEC_DRAFT_WINDOW`), and the superseded A1 two-base FA read.
 
 ## Dated history
 

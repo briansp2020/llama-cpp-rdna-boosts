@@ -1,7 +1,7 @@
 From f71e0a0246ddf0a6fc580ea40c04826bf363b4d4 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
-Subject: [PATCH 10/14] rdna-boosts: block 10: slab, fusion dispatcher, async
+Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher, async
  input ring (infrastructure)
 
 The infrastructure half of the old block 10.  qwen4exp, QSA and the
@@ -22855,5 +22855,5 @@ index 0e66dfe1e..6790efe2f 100644
                  ctx_dft   = spec_init->context();
  
 -- 
-2.56.0
+2.55.0
 
