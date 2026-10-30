@@ -1,7 +1,7 @@
 From 902f26c5b80c728c2ffe55da9e7f03172317727c Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 14:09:48 +0000
-Subject: [PATCH 19/19] ours: take the reviewed GDN series (rdna3 gdn176 G1-G4,
+Subject: [PATCH 19/20] ours: take the reviewed GDN series (rdna3 gdn176 G1-G4,
  Fable-reviewed): snapshot fold with the cpy_batch run guard, conv-state
  gather fold with the deferred-gather tripwire, the 1-token direct conv only
  where gdn_conv_norm_match() > 0 and the prescan would not match

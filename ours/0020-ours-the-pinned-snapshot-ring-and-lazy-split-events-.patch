@@ -1,0 +1,101 @@
+From ac652f750bd5a556b4580c6f495e78ba5e2fc073 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 30 Oct 2026 21:37:18 +0000
+Subject: [PATCH 20/20] ours: the pinned snapshot ring and lazy split events by
+ default only with more than one device
+
+On a single GPU both measured about -1 % decode each (FINDINGS 639); on 1x R9700 the gate gives tg128 +1.8 % on
+Llama-3.2-1B and +1.9 % on Qwen3-30B-A3B, Qwen3.6-35B-A3B within noise, server replies identical.
+GGML_SCHED_LAZY_EVENTS=0/1 and GGML_CUDA_SNAP_RING=0/1 force them off/on.  Multi-device (Meta backend, or more than
+one non-CPU backend / CUDA device) keeps the previous behaviour.
+---
+ ggml/src/ggml-backend.cpp       | 25 +++++++++++++++++++++----
+ ggml/src/ggml-cuda/ggml-cuda.cu |  8 ++++++--
+ 2 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d9c687bb4..0731b3acd 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1210,7 +1210,11 @@ struct ggml_backend_sched {
+     // next split's input hooks launch, so the event lands at the same stream position or later (a later point is
+     // still a valid wait).  A wait by the same backend needs no event at all (stream order).  Every record is a marker
+     // packet the GPU processes between the two splits, and most split events are never consumed in decode.
++    // On a single GPU the lazy records measured about -1 % decode (FINDINGS 639), so by default they are used only when
++    // the scheduler drives more than one device (a Meta backend or more than one non-CPU backend).
++    // GGML_SCHED_LAZY_EVENTS=0 / =1 forces them off / on.
+     bool events_pending[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
++    bool lazy_events;
+     struct ggml_tensor ** graph_inputs;
+     int n_graph_inputs;
+     int graph_inputs_capacity;
+@@ -2772,9 +2776,9 @@ static bool sched_sync_graph_inputs(void) {
+ }
+ 
+ 
+-static bool sched_lazy_events() {
+-    static const bool on = GGML_ENV_STR("GGML_SCHED_LAZY_EVENTS") == NULL || atoi(GGML_ENV_STR("GGML_SCHED_LAZY_EVENTS")) != 0;
+-    return on;
++static bool sched_lazy_events(bool multi_device) {
++    const char * env = GGML_ENV_STR("GGML_SCHED_LAZY_EVENTS");
++    return env == NULL ? multi_device : atoi(env) != 0;
+ }
+ 
+ // The split event of backend `b`, recorded now if the split end left it pending.
+@@ -3241,7 +3245,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+         // record the event of this split
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+-            if (sched_lazy_events() && sched->n_copies == 1) {   // with pipeline copies a late record would cost overlap
++            if (sched->lazy_events && sched->n_copies == 1) {   // with pipeline copies a late record would cost overlap
+                 sched->events_pending[split_backend_id][sched->cur_copy] = true;
+             } else {
+                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+@@ -3288,6 +3292,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
+ 
+     sched->n_backends = n_backends;
+     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
++    {
++        int n_gpu = 0;
++        bool meta = false;
++        for (int b = 0; b < n_backends; b++) {
++            const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[b]));
++            if (dev_type == GGML_BACKEND_DEVICE_TYPE_META) {
++                meta = true;
++            } else if (dev_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
++                n_gpu++;
++            }
++        }
++        sched->lazy_events = sched_lazy_events(meta || n_gpu > 1);
++    }
+ 
+     // initialize hash table
+     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3ab99d5b9..4cf9bfc47 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5069,14 +5069,18 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+     // where it was before r90: one H2D on this backend's stream, already ordered after the scheduler's
+     // wait.  (local: r90 queued the snapshot on the graph-input upload ring, whose batch kernel /
+     // per-thread-stream copy with cross-stream event waits cost ~2.7 % decode here, at ~13 such small
+-    // uploads per MTP verify cycle.)  Unconditional -- this is a correctness fix.
++    // uploads per MTP verify cycle.)  The snapshot is unconditional -- this is a correctness fix.  On a single GPU the
++    // pinned ring measured about -1 % decode against r90's path (FINDINGS 639), so by default the ring is used only with
++    // more than one device; GGML_CUDA_SNAP_RING=0 / =1 forces r90's path / the ring.
+     if (size > 0 && size <= GGML_CUDA_ASYNC_INPUT_MAX &&
+         ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+         // the meta (tensor-split) backend forwards set_tensor_async per child, so do not assume the
+         // caller left this backend's device current
+         ggml_cuda_set_device(cuda_ctx->device);
+         constexpr size_t half = 4u << 20;   // >= GGML_CUDA_ASYNC_INPUT_MAX
+-        if (cuda_ctx->snap_ring == nullptr && !cuda_ctx->snap_failed) {
++        static const bool snap_ring_on = getenv("GGML_CUDA_SNAP_RING") == nullptr ? ggml_cuda_info().device_count > 1
++                                                                                  : atoi(getenv("GGML_CUDA_SNAP_RING")) != 0;
++        if (snap_ring_on && cuda_ctx->snap_ring == nullptr && !cuda_ctx->snap_failed) {
+             // the ring and both events, or none of them (a failed setup is not retried on every upload)
+             if (cudaMallocHost((void **) &cuda_ctx->snap_ring, 2 * half) != cudaSuccess ||
+                 cudaEventCreateWithFlags(&cuda_ctx->snap_half_ev[0], cudaEventDisableTiming) != cudaSuccess ||
+-- 
+2.53.0
+
