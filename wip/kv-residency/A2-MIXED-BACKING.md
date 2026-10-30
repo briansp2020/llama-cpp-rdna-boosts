@@ -109,6 +109,47 @@ chunk, since a lost chunk would have changed the generated text.
 
 **Default `W = -c`** (no spill, today's cache); the opt-in (`LLAMA_KV_RESIDENT_CELLS`) is what spills.
 
+## 3.5 The arena's value at -n 2000 (and the bigger the model, the more it is worth)
+
+**Rule (maintainer, 2026-10-29): always `-n 2000`.**  A shorter run's decode is drowned out by the expert
+cache's warm-up (the same 35B-A3B Q8_0 arm reads 54.6 t/s at `-n 128` and 66.3 at `-n 2000`), so every number
+here is a 2000-token decode after a 5256-token prompt.
+
+| model / config (1 GPU, `-c 262144`, q8_0 KV unless noted) | arena | host-expert residency | prefill | decode |
+|---|---|---|---|---|
+| 35B-A3B Q8_0 `-ncmoe 40` plain | 25 245 MiB | 77.3 % | 373 t/s | 66.3 t/s |
+| 35B-A3B Q8_0 `-ncmoe 40` window `W=32768` | 27 922 (**+2.62**) | 85.5 % | 382 t/s | 67.4 (**+1.7 %**) |
+| 35B-A3B Q8_0 `-ncmoe 40` **bf16 KV** plain | 22 822 MiB | 69.9 % | 375 t/s | 65.4 t/s |
+| 35B-A3B Q8_0 `-ncmoe 40` **bf16 KV** window | 27 922 (**+5.10**) | 85.5 % | 373 t/s | 66.2 (**+1.2 %**) |
+| **122B-A10B Q4_K_XL** `-ncmoe 40` plain | 8 746 MiB | **15.6 %** | 220 t/s | 21.8 t/s |
+| **122B-A10B Q4_K_XL** `-ncmoe 40` window `W=16384` | 12 026 (**+3.18**) | **21.5 %** | 233 t/s | 24.0 (**+10.1 %**) |
+
+**The arena's value is largest where the arena is smallest**: the 122B (56 GiB of host experts, 15.6 % of it
+cached) gains **+10.1 %** decode from +3.18 GiB, while the 35B-A3B — already at 70-77 % — gains 1-2 %.  Prefill
+moves in the same direction (+2 to +6 %) because the prefill staging hits the arena too.  122B numbers:
+48 layers, 256 experts, 8 used, `n_embd_k_gqa` 512, 55 974 MiB of host experts, 218.6 MiB per expert across
+its 40 host layers.
+
+**The fittability half at `-n 2000`** (27B Q8_0, 51 475-token prompt, 53 475 used by the end):
+
+| arm | decode |
+|---|---|
+| `-c 65536`, fully resident (the reference) | 18.4 t/s |
+| `-c 262144`, `W=55296` (nothing spills) | 18.6 t/s |
+| `-c 262144`, `W=49152` (131 MiB/token of spill) | **18.6 t/s** |
+
+So the 262 144-cell context runs at the small one's speed, and the spill hides behind the 27B Q8_0's 1.29 GiB
+of CPU-mapped weights (which is what actually bounds this arm: ~1.29 GiB/token over the link).
+
+### A bug this measurement found (and fixed): the boundary must be quantised in BYTES
+
+The slide first quantised its boundary in *cells* (`unit/nb1`, integer division), which is not map-unit
+aligned: every unit straddled it, `ensure_span` fell back to 4 KiB pieces, and a **host** chunk costs ~130 µs
+to create (`mixed-backing-probe.cc` T8) — one per tensor per token was ~4 ms/token.  The same arm read
+**14.7 t/s before the fix and 18.6 after** (`f50c33be5`).  The boundary is now `(n_cells − W)·nb1` rounded
+down to whole units, so both segments map in whole units (one chunk per ~3855 cells on a 27B).  `grow_for`
+reads the same byte boundary, so a state restore cannot map into the wrong kind.
+
 ## 4. FINDING (fixed by §3.4) — a static window anchored at the end of `-c` is the wrong product shape
 
 The window is cells `[kv_size − W, kv_size)`: the **last** W cells of the *context*, not of the *used
