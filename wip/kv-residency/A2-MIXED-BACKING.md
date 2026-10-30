@@ -239,3 +239,166 @@ Until one of those lands, `W` must be chosen with the intended depth in mind —
 * MTP verify widths on the windowed arm (A1 gated it; A2 changes the memory, not the kernel, so the risk is
   lower — but it is cheap).
 * a 2–3 device arm: only one card is attached, so nothing here says anything about `-sm tensor`.
+
+---
+
+# §3.7 A3 (2026-10-30) — the re-baseline, `--fit` sizing, the RAM gate, and what the re-baseline broke open
+
+Session scope (the maintainer's list): **(1)** `--fit` sizing + reporting of the window, **(2)** the two state
+gates on a windowed arm, **(3)** a `MemAvailable` gate before pinning the spill, **(4)** MTP verify widths on a
+windowed arm.  All four are done; the re-baseline also found **four** real bugs, and one **open** numeric
+question that blocks the campaign's purity claim (§3.7.6).
+
+## 3.7.1 The hardware swap happened: re-baseline first
+
+`bw-probe.cc` (512 MiB, 5 reps) and `mixed-backing-probe.cc` re-run on the re-cabled box; the PCIe root port
+now reads `current_link_width 16 @ 32 GT/s` (was x8):
+
+```
+bw-probe 1024 MiB:  H2D pinned 55.8   H2D pageable 54.0   D2H pinned 56.8
+                    D2D 286.9        kernel read pinned 55.7   kernel read VRAM 635.1  GB/s
+mixed-backing-probe (--mib 512): T3 device read 54.7 | T4 host-backed 54.8, both halves 105.5 |
+                    T8 768 host chunks 55.0 ms, 53.4 GB/s, 0 failures | 0 failing checks
+```
+
+**The link doubled: 28.8 → 55.7 GB/s.**  Every cost model in this campaign becomes `bytes / 55.7 GB/s`, i.e. the
+spill cost halves and the `--fit` break-even of §3.6 moves.  Do not compare a post-swap t/s number with a
+pre-swap one (not even the plain arm).  The mixed-backing capability is unchanged (T1..T8 all pass).
+
+The identity gates were re-run and re-baselined: 27B Q4_K_XL `-c 8192` q8_0 KV still hashes
+`5ba44647188f`; the prefill-logit base was re-recorded (`PPL 5.0803`, sha256 `8fad054d95af…`) and the window
+arm compared at **0.000000 / 100.000 %**; the plain `-c 262144` 27B Q8_0 arm still OOMs (`cudaMalloc failed:
+out of memory`, 8704.00 MiB) — the feature-off baseline is intact.
+
+## 3.7.2 `--fit` now sizes and reports the window (item 1)
+
+`LLAMA_KV_RESIDENT_CELLS=auto` leaves the number to `--fit`, which is the only thing that knows both budgets
+(the VRAM left after the arena/slab reserve, and the pinned-RAM ceiling).  `common_params_fit` now:
+
+* measures the KV's own bytes (`0e5b0d59d`'s region buffer type is identifiable, so the KV's share of the
+  context tier is known exactly, `kv_bytes / kv_size` = bytes per cell);
+* sizes `W` from `free − margin − everything-but-the-KV`, clamps it against the pinned-RAM ceiling, and hands
+  it down through `llama_kv_region_set_resident_cells()` (a process global the KV cache reads at creation);
+* **returns early** when the windowed config fits, i.e. it keeps the user's `-c` instead of shrinking it;
+* **reports** the split at WARN (visible by default):
+
+```
+W common_params_fit_impl: the KV cache is WINDOWED: 65658 of 262144 cells resident (2180.1 MiB of 8704.0 MiB),
+  6523.9 MiB spilled to pinned system RAM
+W common_params_fit_impl:   -> it costs 6523.9 MiB less VRAM (31386.0 MiB projected vs a 1024 MiB target,
+  1024.0 MiB free); the spill reads 34.0 KiB per cell over the link (53 GB/s, calibrated) on every step, so a
+  token at the full context reads 6523.9 MiB = about 129.3 ms at that rate, and nothing spills below depth 65658
+```
+
+The link constant and the per-cell bytes come from the backend (`ggml_backend_cuda_kv_region_link_gbps`, the
+one-off H2D calibration — it reads 53 GB/s here, and it is why no campaign number is hard-coded any more).
+
+Policies, deliberately: `auto` **only spills a context the user pinned** (with `-c` unset the fit keeps
+choosing a fully resident context and prints how to ask for more); a **numeric** `W` is honoured and reported
+(so `-c 262144 -W 49152` is now *reported as fitting* rather than refused); `auto` without `--fit` declines
+the window with a warning.  `llama_kv_cache::memory_breakdown()` reports only the resident bytes against the
+device buffer type and the spill against the CPU one, so the memory table and `--fit` both see where the KV
+really lives.
+
+Measured end-to-end: the Goal A config (`27B Q8_0 -c 262144 -ctk q8_0`, 35.6 GiB of weights+KV) now runs via
+`--fit` alone (`W=123385`, 4096 MiB resident), and `llama-fit-params` reports the arithmetic in 0.4 s.
+
+## 3.7.3 The `MemAvailable` gate on the spill (item 3)
+
+`LLAMA_KV_SPILL_RAM_PCT` (default **85**, `0` disables) caps the pinned spill at that % of MemAvailable, the
+`MOE_HOST_POOL_RAM_PCT` pattern, with **two** enforcements:
+
+* **creation-time clamp** (`llama_kv_cache`): the worst case — every tail cell of the context — is compared
+  with what is left of the ceiling, and `W` is raised until the spill fits.  A second cache (Flash-Next has
+  two) sees what the first reserved (`..._spill_ram_reserve`).  If the clamp would have to make the whole KV
+  resident, the window declines and says so (today's fit-or-fail).
+* **run-time backstop** (`grow_cells`/`grow_for`): every host mapping asks the ceiling first, and a refusal is
+  a loud error naming the knob instead of an OOM kill.
+
+Measured (`4B Q8_0 -c 262144`, `LLAMA_KV_SPILL_RAM_PCT=1` → 795 MiB): `W` is raised 1024 → 236699 cells so the
+worst-case spill is exactly the ceiling; the fit reports "(widened by the pinned-RAM ceiling)".
+
+## 3.7.4 The state gates on a windowed arm (item 2) — and the abort they found
+
+* `scripts/gate-ckpt-reuse.sh` with `LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=2048` (4B, hybrid, ctx 16384):
+  **PASS** — keep 5 vs eager 8 checkpoints, 3 restored-and-kept, every request byte-identical, no GPU fault.
+* `scripts/gate-state-pipe.sh` (`NGPU=1 SM=layer NCMOE=0`, window on): first run **aborted the server** on the
+  batched save path —
+  `GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(device) && "unsupported buffer type")` at
+  `ggml-cuda.cu:5750`, from `llama_io_write_host::flush_async` → `ggml_backend_cuda_get_tensor_async`.  The
+  batched state copy only accepted the *plain* CUDA buffer type, so a windowed KV (a region buffer type, which
+  is a CUDA buffer by `ggml_backend_buft_is_cuda`, the identity the scheduler itself gates on) aborts the
+  moment a prompt-cache save touches it.  All four sites relaxed to `ggml_backend_buft_is_cuda`; the gate then
+  reads **PASS** (5 arms, byte-identical restored text, pipelined −5.5 %, threaded copy −7.1 %).
+* **This is why the gates were on the list**: no other gate reaches that path, and the failure is a crash at
+  the first prompt-cache save, not a wrong number.
+
+## 3.7.5 MTP verify widths on a windowed arm (item 4)
+
+4B Q8_0, `-c 4096`, q8_0 KV, spilling window (`W=2048`), 96 tokens, prose prompt:
+
+| arm | text |
+|---|---|
+| plain decode | 96 chars `6541eadb9041` |
+| plain `draft-mtp` (`n_max 7`) | 96 chars `6541eadb9041` |
+| windowed decode | 96 chars `6541eadb9041` |
+| windowed `draft-mtp` | 96 chars `6541eadb9041` |
+
+Byte-identical, i.e. the verify widths do not interact with the window (as expected: A2 changes memory, not
+kernels).  The 27B is not a usable arm for this until §3.7.6 is resolved (its spilled text already differs).
+
+## 3.7.6 OPEN — a spilled KV changes the numbers on the 27B (blocker for the purity claim)
+
+Found while re-baselining, and **not** resolved:
+
+* 27B Q4_K_XL, `-c 8192 -ctk q8_0 -ctv q8_0`, 5256-token prose, 64 tokens: plain `305 chars
+  sha=e2cea6fa6670` vs windowed (`W=1024`, a **one-unit = 4 MiB** spill per tensor) `325 chars
+  sha=fb65430049e9`.  `W=1024` and `W=1280` give the same boundary and the same text (so it is
+  deterministic), and it reproduces with `--fit off`.
+* Prefill-logit gate at `--ctx 8192 --chunks 4 --kv q8_0`, `W=1024`: **KLD 0.004973 / 98.761 %** (limit 0.005).
+  `W=8192` (= `-c`, window enabled, nothing spills) reads **0.000000 / 100.000 %**, and the region alone
+  (no window) reads **0.000000**, so it is the *spill*, not the buffer type.  The same point's self-comparison
+  is `-0.000000 / 100 %`, so the point is stable and this is a real difference.
+* A 4B arm with the *same shape* of spill (4 MiB per tensor, f16 **and** q8_0 KV) is byte-identical.  So it is
+  not the quantized KV type and not "any spill".
+* The flip itself is byte-exact: a debug verify (`LLAMA_KV_REGION_DEBUG=1`) reads every flipped mapping back
+  and compares it with the stage — 32/32 flips ok on the 27B arm that produces the divergent text.
+
+So the data path we control is correct and something else about having a spilled KV changes the result.  Two
+hypotheses worth trying first, in order: (a) a **`cudaMemcpy` vs kernel asymmetry on a host-location mapping**
+is gone (both legs now go through a kernel, §3.7.7) but a *stale-L2 / non-coherent load* in the FA kernel for
+system-memory operands would look exactly like this — test by forcing the tile path (`GGML_CUDA_FA_BAND`-family
+knobs) or by copying the spilled cells back to VRAM before the attention of one layer; (b) a **mask/padding**
+interaction: the spilled cells sit under a unit-rounded mapping whose end is clamped to the tensor's unpadded
+extent, so the *last* row's quantized padding may be unmapped where the resident arm has it zeroed — check
+`nb1` vs the padded row size per tensor.
+
+## 3.7.7 The three bugs the re-baseline found in the slide (fixed)
+
+1. **A coalesced mapping straddling the boundary silently undid the spill.**  `ensure_span` flipped the *whole*
+   mapping whose range the boundary fell inside; `vmm_insert` coalesced same-kind neighbours, so the boundary
+   landed inside an entry and the next VRAM step flipped it straight back.  Measured: a 4B arm with
+   `W=2048 -c 16384` mapped **0 bytes** to host while the warning claimed the tail was spilled.  Fix: every
+   mapping in a windowed region is now on the **map-unit grid** (`grow_cells` maps `used_up`, `init_tensor`
+   commits `up(W·nb1, unit)`, `vmm_insert` no longer coalesces), and a flip whose range is not exactly one
+   mapping is **refused loudly** instead of being silently widened.
+2. **`cudaMemcpy` into/out of a host-location mapping does not land.**  A direct H2D restore into a freshly
+   mapped host chunk completed "successfully" and left zeros (measured: `stage=0x53 read=0x00` at byte 0 of a
+   4 MiB restore); a D2D whose *source* is one behaves the same.  Every staging leg now goes through a
+   **device kernel copy** (`vmm_device_copy`), which is the access the probes measured working (53 GB/s).  The
+   debug verify above is the regression test for it.
+3. **A multi-piece rewrite of one mapping is not safe** on this driver: detaching a mapping and re-attaching
+   it as head/mid/tail (the obvious way to honour a boundary inside a mapping) loses the middle piece's bytes.
+   Hence the unit-grid invariant plus the loud refusal, rather than a cleverer flip.
+
+The VMM selftest (`GGML_CUDA_VMM_REGION_SELFTEST=1`) now covers all of it: an aligned window flip moves
+exactly one mapping and preserves every byte, and a straddling request is refused and moves nothing.
+
+## 3.7.8 What is left
+
+1. **§3.7.6**, which blocks calling the window pure.  Until it is closed: quote text/KLD purity only for
+   **non-spilling** windowed arms; the 4B's spilling arms are the only byte-identity evidence.
+2. The `--fit` numbers above are from `llama-fit-params`/smoke runs at 55.7 GB/s; the **arena** and
+   **deep-arm** tables of §3.3-§3.6 have *not* been re-measured at the new link (`-n 2000`, `-ncmoe` = the
+   model's full layer count) and must not be quoted as post-swap numbers.
+3. Goal B is still not started; multi-device is still not measurable here.

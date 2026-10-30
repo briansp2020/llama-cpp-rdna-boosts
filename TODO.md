@@ -291,6 +291,23 @@ perf claim, or stop.
   Blocked for *measurement* while only one 32 GiB card is attached: its target family is qwen4exp/QSA
   (Flash-Next, 75 GB).  Correctness work can proceed on a small model with a forced small window.
 
+**PROGRESS 2026-10-30 (A3; fork `wip-kv-residency` tip `bbd69cda2`, records in
+`wip/kv-residency/A2-MIXED-BACKING.md` §3.7).**  Done: `--fit` **sizes and reports** the window
+(`LLAMA_KV_RESIDENT_CELLS=auto`: bytes-per-cell from the region buffer type, `W` from the VRAM left after the
+arena/slab reserve, the split + modelled cost printed at the calibrated link rate, the user's `-c` kept rather
+than shrunk); the **pinned-RAM ceiling** (`LLAMA_KV_SPILL_RAM_PCT`, clamped at creation and refused at run time
+instead of an OOM kill); `gate-ckpt-reuse.sh` + `gate-state-pipe.sh` **pass on a windowed arm** — and the
+latter found a real ABORT (the batched state save asserted the plain CUDA buffer type, so a windowed KV killed
+the server at the first prompt-cache save); MTP verify widths are byte-identical on a windowed arm (4B).
+Three slide bugs were found and fixed (a coalesced mapping straddling the boundary meant the window spilled
+**nothing**; `cudaMemcpy` into a host-location mapping silently leaves zeros, so the staging is a kernel copy;
+a multi-piece mapping rewrite loses bytes).  The box was re-cabled and re-baselined (**link 28.8 → 55.7 GB/s**).
+
+**OPEN BLOCKER:** at a *spilling* depth the 27B changes its greedy text and its prefill logits (KLD 0.004973 at
+`--ctx 8192 --kv q8_0`) while the flip is byte-exact (verified) and a 4B arm with the same spill shape is
+byte-identical.  Purity may only be claimed for **non-spilling** windowed arms until that is closed; the repro
+and the two hypotheses are `A2-MIXED-BACKING.md` §3.7.6.
+
 **Nothing from `wip/kv-residency/` is in `patches/` or `release.json`, and nothing may be applied from it
 without an explicit go-ahead.**  The slice-1/2 code is the record, not a candidate: sub-slice 2's *growth*
 must not be promoted; its KV **buffer-type skeleton** (a custom buft carrying a host master + device pool +

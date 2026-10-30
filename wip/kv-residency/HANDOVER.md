@@ -4,16 +4,18 @@
 it is self-contained.  Then read [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) (the measured state of the
 build) and [`MIXED-BACKING.md`](MIXED-BACKING.md) (the design + the driver probe).
 
-> **The one thing to know:** the ask is a **windowed KV** — Goal A, fittability on one 32 GiB card — and it is
-> **built and measured**.  A 27B Q8_0 at `-c 262144` that used to OOM now runs, the spill cost matches
-> `(used − resident) × cell_bytes / H2D bandwidth` to a few percent, and slab mode's expert arena gains
-> ~3-5 GiB which is worth **+7.9 to +10.1 % decode on the models whose arena is starved** and **+8.6 to
-> +13.1 % prefill everywhere**.  What is left is **`--fit` sizing** (the break-even decision) plus three
-> robustness/correctness gates.  See §7.
+> **The one thing to know:** the ask is a **windowed KV** — Goal A, fittability on one 32 GiB card — and the
+> *feature set* is now complete: the window slides, **`--fit` sizes and reports it** (`LLAMA_KV_RESIDENT_CELLS=auto`),
+> the spill is gated on `MemAvailable` (`LLAMA_KV_SPILL_RAM_PCT`), and both state gates and the MTP verify
+> widths pass on a windowed arm.  **But the window is NOT yet pure at a spilling depth**: a 1-unit (4 MiB) spill
+> on a 27B changes the greedy text and shifts the prefill logits by KLD 0.004973, deterministically, while the
+> flip itself is byte-exact (verified) and a 4B arm with the same spill shape is byte-identical.  **That is the
+> next thing to work on** — `A2-MIXED-BACKING.md` §3.7.6 has the repro and the two hypotheses.  See §7.
 >
-> **And: the box is about to change.**  The maintainer is re-doing the PCIe layout for ~**56 GB/s** H2D (from
-> 28.8) and a faster model SSD.  Every number in this campaign is at 28.8 GB/s — see §9 before quoting any of
-> them again.
+> **The box changed (2026-10-30).**  The PCIe rework happened: the link is now **55.7 GB/s H2D / 56.8 D2H**
+> (root port x16 @ 32 GT/s, was x8) and the probes were re-run (`A2-MIXED-BACKING.md` §3.7.1).  Every
+> pre-swap t/s number in this campaign is at 28.8 GB/s and **must not be compared** with a new one; the cost
+> model is now `bytes / 55.7 GB/s`.
 
 ---
 
@@ -24,10 +26,10 @@ build) and [`MIXED-BACKING.md`](MIXED-BACKING.md) (the design + the driver probe
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, **pushed** (`origin` = `git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
 | delivery release | **r176** (`release.json`) — the campaign is cut against **r174** (`v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`); a promotion re-cuts against the then-current release |
 | the campaign's TODO handle | **#118** (`TODO.md` §118 + the table row; the older text says `#117`, which was a dangling reference — see the number note there) |
-| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`ba5c7205e`** |
-| the A1 fallback | fork branch `wip-kv-residency-a1-two-base` (`e49e1cef4`), also pushed |
+| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`bbd69cda2`** (A3) |
+| the A1 fallback | fork branch `wip-kv-residency-a1-two-base` (`e49e1cef4`), also pushed (superseded; unchanged this session) |
 | `rdna-boosts` | **never touched by this campaign.**  Locally `5bdec04ab`; the fork's branch is at r176's tip (moved by the r176 release) |
-| patch snapshot | `patches/0001`…`0008` + `patches/README.md` + `patches/diffstat.txt` (2024 insertions, 16 files) — apply **in order** to `5bdec04ab` |
+| patch snapshot | `patches/0001`…`0009` + `patches/README.md` + `patches/diffstat.txt` (2765 insertions, 18 files) — apply **in order** to `5bdec04ab` |
 | box | **one R9700 (gfx1201), 32 624 MiB.**  Pin `HIP_VISIBLE_DEVICES=0` on every arm.  Every number here is 1-GPU; say so, never claim multi-GPU |
 
 ## 2. What Goal A asked for (the maintainer's words, unchanged)
@@ -73,10 +75,24 @@ kernels — was built, gated byte-identical, and **superseded**; kept on its bra
    **indexer** cache) and both take the window, one warning line each.
 6. A `remap`/flip destroys a chunk's contents: `ensure_span` stages it through a pinned scratch with a device
    synchronise around the unmap.  A capture/graph holds the **VA**, which never changes, so graphs stay valid.
+7. **Every mapping in a windowed region must sit on the map-unit grid** (r-A3).  A flip is a whole-mapping
+   operation (the driver refuses a sub-range unmap, and re-attaching one mapping as head/mid/tail loses the
+   middle piece's bytes — measured), so a boundary *inside* a mapping can only be refused.  Hence `grow_cells`
+   maps `used_up` (unit-rounded), `init_tensor` commits `up(W·nb1, unit)`, `vmm_insert` does **not** coalesce,
+   and `ensure_span` refuses a request that is not exactly one mapping.  Before this, a coalesced entry that
+   straddled the boundary was flipped back whole and the window spilled **nothing** while its warning said it
+   had.
+8. **A staging copy to/from a host-location mapping must be a kernel copy** (`vmm_device_copy`), never
+   `cudaMemcpy`: a direct H2D into a freshly mapped host chunk completes "successfully" and leaves zeros, as
+   does a D2D whose source is one (measured: `stage=0x53`, `read=0x00`).  `LLAMA_KV_REGION_DEBUG=1` verifies
+   every flip against its stage.
+9. The spill is **pinned, non-swappable RAM**: `LLAMA_KV_SPILL_RAM_PCT` (85 % of MemAvailable) clamps the
+   window at creation (raising `W`) and refuses a run-time mapping loudly rather than being OOM-killed.
 
 Knobs (all campaign-only, default off except where noted): `LLAMA_KV_REGION=1` (enables the provider),
-`LLAMA_KV_RESIDENT_CELLS=W` (the window; **unset = no window**, i.e. today's cache), `LLAMA_KV_REGION_DEBUG=1`,
-`GGML_CUDA_VMM_REGION_SELFTEST=1`, `GGML_CUDA_SLAB_STATS=1`.
+`LLAMA_KV_RESIDENT_CELLS=W` (the window) or `=auto` (**`--fit` sizes it** — the product shape; unset = no
+window, i.e. today's cache), `LLAMA_KV_SPILL_RAM_PCT` (85, the pinned-RAM ceiling), `LLAMA_KV_REGION_DEBUG=1`
+(per-growth lines + a verify of every flip), `GGML_CUDA_VMM_REGION_SELFTEST=1`, `GGML_CUDA_SLAB_STATS=1`.
 
 ## 4. Environment and build
 
@@ -139,30 +155,45 @@ $P/scripts/check-gpu-faults.sh --since "<session start>" --log /tmp/id.log …
   -ctk q8_0 -ctv q8_0 -p hi -n 4 … 2>&1 | grep "cudaMalloc failed: out of memory"
 ```
 
-**Still owed** (no gate exists yet for these — see §7): `scripts/gate-ckpt-reuse.sh`,
-`scripts/gate-state-pipe.sh` (state io now crosses a boundary that *moves*), and a `MemAvailable` check before
-pinning the spill.
+**Added in A3 (all pass, see `A2-MIXED-BACKING.md` §3.7):**
+
+```bash
+# the RAM ceiling: a tiny ceiling must widen W instead of being OOM-killed
+LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=1024 LLAMA_KV_SPILL_RAM_PCT=1 ... llama-cli -c 262144 ...
+# --fit sizes and reports the window (the product shape)
+LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=auto ./build-rocm/bin/llama-fit-params -m <27B Q8_0> -c 262144 -ctk q8_0 -ctv q8_0
+# the state paths, on a windowed arm (these found an ABORT: the batched save rejected the region buft)
+LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=2048 ./scripts/gate-ckpt-reuse.sh
+LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=2048 NGPU=1 SM=layer NCMOE=0 ./scripts/gate-state-pipe.sh
+# MTP verify widths on a windowed arm (4B, spilling): plain/window x decode/draft-mtp must be one hash
+```
+
+**Owed: §7 item 1 only** — the spilled-KV numeric difference.  Do not claim purity for a *spilling* windowed
+arm until it is closed.
 
 ## 7. What remains, in priority order
 
-1. **`--fit` sizing of the window** (the agreed shape: the window slides, and `W` is *sized from the depth*;
-   default `W = -c` = no spill).  This is now a **measurable break-even decision**:
-   * the window pays when `(kv_size − depth) × cell_bytes` of VRAM freed is worth more than
-     `(depth − W) × cell_bytes` of per-token spill;
-   * one side of it, measured: Flash-Next at `-c 65536` (≈depth) frees **0.39 GiB** and costs **14.6 %** decode;
-     at `-c 262144` (≈4× depth) the same model frees **3.63 GiB** and costs **0 %** (nothing spills at 5256
-     tokens) with prefill **+13.1 %**.  See `A2-MIXED-BACKING.md` §3.5–§3.6.
-   * `--fit` must also **report** the split (resident MiB of total, spilled MiB, the window in cells, and the
-     modelled cost at the current depth) instead of warning and running anyway.
-2. **`gate-ckpt-reuse.sh` + `gate-state-pipe.sh`** — the only paths the slide touches that the identity arms do
-   not (a restore writes arbitrary cell indices; `grow_for` maps the right kind by position).
-3. **The `MemAvailable` gate** before pinning the spill (`MOE_HOST_POOL_RAM_PCT` pattern; up to 8.5 GiB at
-   `-c 262144` on a 27B, non-swappable).
-4. **MTP verify widths** on a windowed arm (A1 gated them; A2 changes memory, not kernels — lower risk, cheap).
-5. **Multi-device**: not measurable here (one card).  Nothing in this campaign says anything about `-sm tensor`
-   or `-sm layer` beyond what the delivery already documents.
-6. **Goal B** (the sparse attended set, QSA/DSA) is *not* started and is not next; the indexer cache now
-   participates in the window, which is where Goal B would begin.
+1. **CLOSE §3.7.6 — the spilled-KV numeric difference (BLOCKER).**  Repro, both arms at 55.7 GB/s:
+   ```bash
+   # 27B Q4_K_XL, q8_0 KV, a ONE-UNIT (4 MiB/tensor) spill; deterministic, `--fit off` included
+   LLAMA_ARG_FIT=0 LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=1024 ./build-rocm/bin/llama-cli \
+     -m /llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 99 -c 8192 -ctk q8_0 -ctv q8_0 \
+     -f ~/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt -n 64 --seed 42 --temp 0 \
+     --no-display-prompt --single-turn        # 325 chars fb65430049e9 vs plain 305 chars e2cea6fa6670
+   # and the same point on the logit gate: 0.004973 KLD / 98.761 % (W=8192, nothing spilled: 0.000000)
+   ```
+   What is already excluded: the quantized KV type (4B q8_0 is identical), a race (two different `W` values
+   that give the same boundary give the same text), the flip losing bytes (the debug verify reads every
+   flipped mapping back and it matches the stage, 32/32), and the buffer type (window enabled, no spill:
+   0.000000).  Start with the two hypotheses in `A2-MIXED-BACKING.md` §3.7.6: a non-coherent/`__ldg` read of
+   system memory in the FA kernel, or the last row's quantized **padding** being unmapped where the resident
+   arm has it zeroed.  Until it is closed, purity may only be claimed for **non-spilling** windowed arms.
+2. **Re-measure the delivered tables at the new link** (§3.3-§3.6 of `A2-MIXED-BACKING.md`: the arena's value
+   and the deep arm + break-even) with the standing rules (`-n 2000`, `-ncmoe` = the model's full layer count,
+   interleaved arms).  The spill cost halves at 55.7 GB/s, so the `--fit` break-even moves.
+3. Then the promotion conversation (a block, an env kill-switch, `ENVIRONMENT.md`), which is the maintainer's
+   call and needs (1) closed first.
+4. Multi-device: still not measurable (one card).  Goal B: not started, not next.
 
 ## 8. The numbers (1 GPU; all at **28.8 GB/s** H2D — see §9)
 
@@ -189,19 +220,20 @@ hides behind that arm's 1.29 GiB/token of CPU-mapped weights.
 and the hot set already fits where residency is high) — it only converts to a big decode gain where the arena
 is starved (the 122B at 15.6 % residency gained **+10.1 %**).
 
-## 9. THE BOX IS CHANGING — re-baseline before quoting anything
+## 9. The box HAS changed (2026-10-30) — re-baselined
 
-The maintainer is swapping components: the PCIe layout is being re-done for **~56 GB/s H2D** (from the measured
-**28.8 GB/s** this whole campaign is calibrated on) and the model SSD becomes more responsive.  So:
+The PCIe rework is done: the root port is x16 @ 32 GT/s, so **H2D 55.7 / D2H 56.8 / kernel read of pinned
+host 55.7 GB/s** (`bw-probe.cc`, 512 MiB and 1024 MiB, 5 reps, best of), and `mixed-backing-probe.cc` still
+passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 
-* **Re-measure the link constant first**: `wip/kv-residency/bw-probe.cc` (and `INVENTORY.md` §1.D).  Every cost
-  model here is `bytes / 28.8 GB/s`; at 56 GB/s the spill cost **halves**, so a window that was break-even at
-  `-c ≈ 1.4 × depth` may become clearly positive, and the `--fit` break-even of §7.1 moves with it.
-* **Re-run `mixed-backing-probe.cc`** — it should still pass, but the T3/T4 bandwidth numbers and the T8 chunk
-  timing will change (~130 µs per host chunk may improve or worsen).
-* **Re-record the prefill-logit base** if the box's *build* is unaffected but the GPU changes; a new GPU or a
-  different PCIe slot does not change logits, but a fresh base costs 30 s and removes the question.
-* Do **not** compare a post-swap t/s number against a pre-swap one, even for the plain arm.
+* the cost model is `bytes / 55.7 GB/s` — a spill costs **half** what the campaign's tables assumed, so the
+  `--fit` break-even of §3.6 moved;
+* the prefill-logit base was re-recorded on the new box (`PPL 5.0803`), and the window arm still compares at
+  **0.000000 / 100.000 %** at `--ctx 2048`;
+* `llama-fit-params` and the KV warning line now read the **calibrated** link from the backend
+  (`ggml_backend_cuda_stage_h2d_gbps`, 53 GB/s here) instead of a hard-coded 28.8;
+* `LLAMA_KV_SPILL_RAM_PCT` (85 %) caps the pinned spill; the campaign's "up to 8.5 GiB at `-c 262144`" is now
+  enforced rather than assumed.
 
 ## 10. Records
 
@@ -219,12 +251,12 @@ The maintainer is swapping components: the PCIe layout is being re-done for **~5
 
 ## 11. First 30 minutes of the next session
 
-1. `cd ~/llama-cpp-rdna-boosts && git pull`; read this file, then `A2-MIXED-BACKING.md`.
-2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** at **`ba5c7205e`**
-   (`git log --oneline -6` should show the four A2 commits).  `git rev-parse --short rdna-boosts` must not
-   matter to you; never commit campaign code there.
-3. `~/bin/build-llama-rocm` (expect ~5 s warm), then run §6 gate 0 and gate 1 — if the text hashes match the
-   values in §6, the tree is the one that was measured.
-4. **Re-measure the link constant** (§9) if the hardware swap has happened, and note the new value in
-   `INVENTORY.md` §1.D and in the top of `A2-MIXED-BACKING.md`.
-5. Start §7 item 1 (`--fit` sizing) — that is the only thing between this and a product-shaped opt-in.
+1. `cd ~/llama-cpp-rdna-boosts && git pull`; read this file, then `A2-MIXED-BACKING.md` **§3.7** (this
+   session's record: the re-baseline, the three fixed bugs, and the open one).
+2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** (the A3 commits on top of the
+   A2 ones).  `git log --oneline -8` should show `A3` subjects.  Never commit campaign code to `rdna-boosts`.
+3. `~/bin/build-llama-rocm` (~5 s warm), then gate 0 + the §6 identity trio — the hashes must match §6.
+4. **Then §7 item 1** (the spilled-KV numeric difference).  It is a real, deterministic, well-scoped bug and it
+   is the only thing between this campaign and its purity claim.
+5. Do **not** quote the arena / deep-arm / break-even numbers in §8 without re-measuring: they are 28.8 GB/s
+   numbers.
