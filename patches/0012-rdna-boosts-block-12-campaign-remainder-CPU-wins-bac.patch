@@ -1,4 +1,4 @@
-From 44577b19cb636ca494c51344f63187c9bb5cdfd3 Mon Sep 17 00:00:00 2001
+From 10de73fca259a46d151fdb708c57e9f2cde62a27 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/15] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -342,11 +342,11 @@ enough that the per-tensor path already runs at 8-14 GiB/s).  See WORKLOG 261029
  src/models/qwen3next.cpp                      |    2 +-
  src/models/qwen4exp.cpp                       |    2 +-
  src/models/sensenova-u1.cpp                   |    2 +-
- tools/server/server-context.cpp               |  218 +-
+ tools/server/server-context.cpp               |  315 ++-
  tools/server/server-task.cpp                  |  104 +-
  tools/server/server-task.h                    |   11 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 80 files changed, 5158 insertions(+), 944 deletions(-)
+ 80 files changed, 5253 insertions(+), 946 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 5be48e428..4c2e0fa63 100644
@@ -8696,20 +8696,25 @@ index c42c604e8..93d31f7c0 100644
          ggml_tensor * inpSA = inpL;
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 6790efe2f..d8e83c73f 100644
+index 6790efe2f..d6aa3c909 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -298,6 +298,9 @@ struct server_slot {
+@@ -298,6 +298,14 @@ struct server_slot {
      llama_tokens spec_prompt;
      std::vector<int32_t> spec_i_batch;
      common_prompt_checkpoint spec_ckpt;
++
++    // where the target's speculative checkpoints of this slot live (LLAMA_SERVER_SPEC_CKPT_DEVICE): 0 not decided yet,
++    // 1 device memory, -1 host memory; decided at the slot's first one and kept (a checkpoint is restored with the flags it
++    // was saved with, and the context keeps the slot's device buffer)
++    int spec_ckpt_device = 0;
 +
 +    // n_tokens of the context checkpoint this task restored, while nothing has been decoded since (-1: none)
 +    int64_t n_tokens_ckpt_restored = -1;
      bool spec_is_replay = false;
      std::mt19937 spec_synth_rng;
  
-@@ -425,6 +428,8 @@ struct server_slot {
+@@ -425,6 +433,8 @@ struct server_slot {
  
          spec_is_replay = false;
  
@@ -8718,7 +8723,7 @@ index 6790efe2f..d8e83c73f 100644
          last_nl_pos    = 0;
          generated      = {};
          has_new_line   = false;
-@@ -1120,6 +1125,71 @@ private:
+@@ -1120,6 +1130,159 @@ private:
  
      std::unique_ptr<server_prompt_cache> prompt_cache;
  
@@ -8753,6 +8758,94 @@ index 6790efe2f..d8e83c73f 100644
 +    }();
 +
 +    std::vector<std::vector<uint8_t>> ckpt_spare;
++
++    // LLAMA_SERVER_SPEC_CKPT_DEVICE: where the target's speculative checkpoint is kept -- the one saved before a verify
++    // whose draft is longer than n_rs_seq (a recurrent or hybrid target: any n-gram draft longer than the rollback window,
++    // i.e. --spec-ngram-mod-n-max against --spec-draft-n-max) and overwritten by the next.  The same state costs
++    // Qwen3.8-27B's 150 MiB: in host memory a save is ~4 ms on this box and ~16 ms on the submitter's, and with
++    // LLAMA_STATE_SEQ_FLAGS_ON_DEVICE (one staging buffer per slot, kept and reused by the context) a save and a restore
++    // are device copies of the same bytes (~0.15 ms for 150 MiB), so the saved time is the host copy, i.e. as much as the
++    // host CPU is slow.  Device memory when the target is on exactly one GPU, its state is offloaded and, at the slot's
++    // first checkpoint, that GPU has the state's size plus SPEC_CKPT_DEVICE_HEADROOM free (the staging buffer is allocated
++    // later, after an expert-cache arena or other caches took the GPU, and a failed allocation inside the io class aborts);
++    // otherwise host memory as before.  Logged once per slot.  LLAMA_SERVER_SPEC_CKPT_DEVICE=0: host memory always.
++    // Context checkpoints are not touched.
++    //
++    // INVARIANT for the device arm: it is NOT a byte image.  The checkpoint's metadata (the io header, the cell ranges) is
++    // written into `data_tgt`, but the payload goes into the context's per-seq staging buffer (llama_context::mem_storage),
++    // keyed by seq id, which the next save overwrites and the restore copies back into the live cells.  So a save must be
++    // restored before the next save for the same sequence -- the speculative path does exactly that (a draft round saves
++    // once and only ever restores that save, including the replay rounds, which save nothing) -- and a checkpoint must not
++    // outlive a stage re-allocation.  A host-flagged save (a context checkpoint, the prompt cache) does not touch the
++    // stage, so those may interleave freely.  Saving one of these into anything persistent (a file, the prompt cache) would
++    // restore whatever the stage holds at load time, not the saved state.
++    const bool spec_ckpt_device = [] {
++        const char * e = getenv("LLAMA_SERVER_SPEC_CKPT_DEVICE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    static constexpr size_t SPEC_CKPT_DEVICE_HEADROOM = 512ull << 20;
++
++    // the one GPU the target runs on, nullptr when there are several (a split model) or none
++    ggml_backend_dev_t spec_ckpt_gpu() const {
++        std::vector<ggml_backend_dev_t> gpus;
++        auto add = [&](ggml_backend_dev_t d, enum ggml_backend_dev_type type) {
++            if (d != nullptr && ggml_backend_dev_type(d) == type) {
++                gpus.push_back(d);
++            }
++        };
++        for (enum ggml_backend_dev_type type : { GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU }) {
++            if (!params_base.devices.empty()) {
++                for (ggml_backend_dev_t d : params_base.devices) {
++                    add(d, type);
++                }
++            } else {
++                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++                    add(ggml_backend_dev_get(i), type);
++                }
++            }
++            if (!gpus.empty()) {
++                break;
++            }
++        }
++        if (params_base.split_mode == LLAMA_SPLIT_MODE_NONE && params_base.main_gpu >= 0 && params_base.main_gpu < (int) gpus.size()) {
++            return gpus[params_base.main_gpu];
++        }
++        return gpus.size() == 1 ? gpus[0] : nullptr;
++    }
++
++    // the flags to save the slot's next target checkpoint with (decides the slot's memory at its first one)
++    llama_state_seq_flags spec_ckpt_save_flags_tgt(server_slot & slot) {
++        if (slot.spec_ckpt_device == 0) {
++            bool dev = false;
++            if (spec_ckpt_device) {
++                // the state must actually be in device memory: with --no-kv-offload (or -ngl 0) the recurrent/attention
++                // state lives in a host buffer, so the device io class would allocate its staging buffer on the CPU buft
++                // and copy host-to-host, and the free-VRAM test below would be about a GPU this context does not use
++                const bool state_on_device = !params_base.no_kv_offload && params_base.n_gpu_layers != 0;
++                ggml_backend_dev_t gpu = state_on_device ? spec_ckpt_gpu() : nullptr;
++                if (gpu == nullptr) {
++                    SLT_INF(slot, "%s\n", state_on_device
++                            ? "speculative checkpoints of the target in host memory: the target is not on exactly one GPU"
++                            : "speculative checkpoints of the target in host memory: the context's state is not offloaded (--no-kv-offload / -ngl 0)");
++                } else {
++                    const size_t need = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                    size_t free = 0;
++                    size_t total = 0;
++                    ggml_backend_dev_memory(gpu, &free, &total);
++                    dev = free >= need + SPEC_CKPT_DEVICE_HEADROOM;
++                    SLT_INF(slot, "speculative checkpoints of the target in %s memory (%.1f MiB; %.1f MiB free on %s)\n",
++                            dev ? "device" : "host", need / 1048576.0, free / 1048576.0, ggml_backend_dev_name(gpu));
++                }
++            }
++            slot.spec_ckpt_device = dev ? 1 : -1;
++        }
++        return spec_ckpt_load_flags_tgt(slot);
++    }
++
++    // the flags the slot's target checkpoints were saved with
++    static llama_state_seq_flags spec_ckpt_load_flags_tgt(const server_slot & slot) {
++        return LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (slot.spec_ckpt_device > 0 ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : 0);
++    }
 +
 +    void ckpt_recycle(common_prompt_checkpoint & ckpt) {
 +        if (!ckpt_reuse) {
@@ -8790,7 +8883,7 @@ index 6790efe2f..d8e83c73f 100644
      server_metrics metrics;
  
      // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-@@ -1886,9 +1956,21 @@ private:
+@@ -1886,9 +2049,21 @@ private:
  
                  const int64_t t_start = ggml_time_us();
  
@@ -8813,7 +8906,7 @@ index 6790efe2f..d8e83c73f 100644
                      ret->prompt_clear();
                  }
  
-@@ -1901,18 +1983,105 @@ private:
+@@ -1901,18 +2076,105 @@ private:
          return ret;
      }
  
@@ -8920,7 +9013,7 @@ index 6790efe2f..d8e83c73f 100644
          for (auto & slot : slots) {
              if (slot.is_processing()) {
                  continue;
-@@ -2693,6 +2862,28 @@ private:
+@@ -2693,6 +2955,28 @@ private:
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
@@ -8949,7 +9042,7 @@ index 6790efe2f..d8e83c73f 100644
          // evict checkpoints within min-step of a previous checkpoint, unless they were
          // created by the current task
          // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-@@ -2704,6 +2895,7 @@ private:
+@@ -2704,6 +2988,7 @@ private:
                  SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                          it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
  
@@ -8957,7 +9050,7 @@ index 6790efe2f..d8e83c73f 100644
                  it = slot.prompt.checkpoints.erase(it);
                  continue;
              }
-@@ -2714,11 +2906,12 @@ private:
+@@ -2714,11 +2999,12 @@ private:
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
              // make room for the new checkpoint, if needed
@@ -8971,7 +9064,7 @@ index 6790efe2f..d8e83c73f 100644
              slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
          }
  
-@@ -2728,6 +2921,7 @@ private:
+@@ -2728,6 +3014,7 @@ private:
              for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                  if (it->n_tokens == n_tokens_new) {
                      SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
@@ -8979,7 +9072,7 @@ index 6790efe2f..d8e83c73f 100644
                      it = slot.prompt.checkpoints.erase(it);
                  } else {
                      ++it;
-@@ -2744,6 +2938,12 @@ private:
+@@ -2744,6 +3031,12 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -8992,7 +9085,7 @@ index 6790efe2f..d8e83c73f 100644
          cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          // stash the draft's speculative state with the checkpoint
-@@ -3031,7 +3231,11 @@ private:
+@@ -3031,7 +3324,11 @@ private:
                          break; // drop the task
                      }
  
@@ -9005,7 +9098,16 @@ index 6790efe2f..d8e83c73f 100644
                          for (auto & slot : slots) {
                              if (!slot.is_processing()) {
                                  SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-@@ -3930,6 +4134,8 @@ private:
+@@ -3859,7 +4156,7 @@ private:
+                 if (use_ckpt_tgt) {
+                     //const int64_t t_start = ggml_time_us();
+ 
+-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                    ckpt.update_tgt(ctx_tgt, slot.id, spec_ckpt_save_flags_tgt(slot));
+ 
+                     //const int64_t t_total = ggml_time_us() - t_start;
+                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+@@ -3930,6 +4227,8 @@ private:
  
                          slot.state = SLOT_STATE_PROCESSING_PROMPT;
  
@@ -9014,7 +9116,7 @@ index 6790efe2f..d8e83c73f 100644
                          if (spec) {
                              common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->tokens.pos_next());
                          }
-@@ -4183,6 +4389,8 @@ private:
+@@ -4183,6 +4482,8 @@ private:
  
                                      bool do_reset = it == slot.prompt.checkpoints.rend();
  
@@ -9023,7 +9125,7 @@ index 6790efe2f..d8e83c73f 100644
                                      if (!do_reset) {
                                          // restore the context checkpoint
                                          if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
-@@ -4202,6 +4410,7 @@ private:
+@@ -4202,6 +4503,7 @@ private:
  
                                          pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -9031,7 +9133,7 @@ index 6790efe2f..d8e83c73f 100644
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                      }
  
-@@ -4220,6 +4429,7 @@ private:
+@@ -4220,6 +4522,7 @@ private:
                                      const auto & cur = *it;
                                      if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                          SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
@@ -9039,6 +9141,15 @@ index 6790efe2f..d8e83c73f 100644
                                          it = slot.prompt.checkpoints.erase(it);
                                      } else {
                                          ++it;
+@@ -4898,7 +5201,7 @@ private:
+ 
+                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+ 
+-                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, spec_ckpt_load_flags_tgt(slot)));
+ 
+                         if (slot.ctx_dft) {
+                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
 index d7ac2a1dc..b1d345f62 100644
 --- a/tools/server/server-task.cpp

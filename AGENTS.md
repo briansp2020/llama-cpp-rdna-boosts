@@ -981,6 +981,20 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   (`GGML_CUDA_ASYNC_INPUT_BATCH`, r89/PR #182) stay default-on inside it.  Self-KLD control 91.0-95.1 %
   -> 99.967-100.000 %; decode +9.3 % (35B-A3B 2 GPU tensor tg400) / +5.2 % (27B MTP n3 end-to-end).
   Evidence: `archive/work/async-input-graph-ordering/` (`RESOLUTION.md`, `FINDINGS-2026-10-19b.md`).
+- **The target's speculative checkpoint lives in device memory when one GPU has room, and that checkpoint is NOT a
+  byte image (r184, PR #254, block 12).**  On a recurrent/hybrid target the server saves the target's state before a verify
+  whose draft is longer than `n_rs_seq` (`use_ckpt_tgt`) and restores it on a partial acceptance; since r184 it carries
+  `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` when the target is on exactly one GPU, its state is offloaded and the GPU has the
+  state's size + 512 MiB free (decided once per slot, logged, `LLAMA_SERVER_SPEC_CKPT_DEVICE=0` = host always; a
+  multi-GPU split and `-nkvo` stay on the host path).  **The device arm stores only the metadata in `data_tgt`** - the
+  payload is the context's per-seq staging buffer (`llama_context::mem_storage`), which the next save overwrites - so a
+  save must be restored before the next save for that sequence (the spec path does: a draft round saves once and only
+  restores that save, and the replay rounds save nothing), and one of these must never reach anything persistent.  A
+  host-flagged save (a context checkpoint / the prompt cache) does not touch the stage and interleaves freely.  The win is
+  (host save cost) x (checkpoints taken) and therefore host-CPU dependent: measured 1 GPU on this box 27B + DFlash2 rewrite
+  +2.1 %, 35B-A3B `-ncmoe 40` +4.3 %, plain prose 0 % (the submitter's slower host measured +10.0 %/+15.8 %); +150 MiB
+  VRAM per used slot on the 27B and nothing in the `--fit` estimate.  Gate: `scripts/gate-spec-ckpt-device.sh`.
+  `benchmarks/2026-10-30-spec-ckpt-device.md`.
 - **The batched state save and restore share one pinned `state_stage` per context (r96/r119, PRs #189/#209), the
   copy is pipelined (r151, PR #233), and its host side is streamed on two threads (r152, PR #235).**
   `LLAMA_STATE_ASYNC` covers saves, `LLAMA_STATE_ASYNC_READ` (default on) covers restores, and
@@ -1351,6 +1365,15 @@ keep arm to have kept and the eager arm to have superseded, and fewer checkpoint
 config that makes no usable checkpoint (a dense/SWA target restores at `pos_max` = `n_tokens - 1`, so nothing
 is re-saved at the same position).  No other gate creates or restores a context checkpoint, and a wrong keep
 is a wrong answer on the *next* resume rather than a crash.
+
+A change to the **server's speculative checkpoint path** (`spec_ckpt*`, `use_ckpt_tgt`'s
+`update_tgt`/`load_tgt`, `LLAMA_SERVER_SPEC_CKPT_DEVICE`) needs `scripts/gate-spec-ckpt-device.sh`: on a
+recurrent/hybrid target the device arm is **not a byte image** (the metadata is in `data_tgt`, the payload in
+the context's per-seq `mem_storage` staging buffer), so a restore whose save it does not match is a *silent*
+wrong answer, and nothing else in the repo reaches that code -- `tests/test-llama-context`'s `cp_d` covers the
+io class, not the server's use of it, and `gate-ckpt-reuse.sh` covers a different object.  The gate requires
+identical text/drafts/accepted between the host and device arms, the kill switch to stay on the host path, and
+`-nkvo` to take the host path with its own reason.
 
 A change to a **qwen4exp hyper-connection** op, its chain or a matcher that fuses it needs
 `scripts/gate-hc-fusions.sh MODEL.gguf`: the four `LLAMA_FUSED_HC_MIX` x `LLAMA_FUSED_HC_COMBINE` arms plus

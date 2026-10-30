@@ -130,6 +130,11 @@ proved by `KVREGION_FREE … host=` > 0).  Three depths, four arms each:
 | 180 035 (`196608`) | **37.0** | 25.3 (−32 %) | 14.7 | **21.9** | **+49 %** |
 | arena (MiB) / residency | 23 580 / 57.6 % → 22 701 / 55.5 % | same | 25 338 / 61.9 % | same | +1.8…2.6 GiB for the arena |
 
+*(Caveat, added with §3.3: this table predates the PLE flags, so its **51 475** row and the absolute levels are
+pre-flag data — the direction was reproduced under the flags at 103k and 180k (§3.3), and only those numbers should
+be quoted.  The 51k row is kept because it is the only 51k arm set measured, and its text hashes were re-checked
+under the flags unchanged.)*
+
 **Read it as three rules, and they are not the same feature:**
 
 1. **Resident KV → dense decode, always, on this hardware.**  Dense's read is `O(depth)` but VRAM reads are ~10×
@@ -155,6 +160,40 @@ KV) with the four arms above as its gate, and only if that gate shows a loss som
 differs from the dense arm by construction (a config difference, `GREEDY-PURITY.md` §45/§63, exactly like a
 verify width); prefill is unchanged (always sparse today), so the prefill-logit gate is untouched.  That is a
 documentation obligation, not a correctness risk.
+
+## 3.3 B2 implemented and measured (2026-10-30) — the policy slice is the whole win
+
+Campaign branch `wip-kv-residency-b` `f33a9d8fe` (based on the shipped r182 tip).  `llama_kv_cache::is_streaming(n_kv)`
++ the context accessor answer "a window is active and the used extent has passed it"; `qwen4exp_kv_streams()`
+skips the dense decode arm when it holds; `LLAMA_QSA_DENSE_DECODE_STREAM=0` restores the pre-B2 behaviour.
+No new mechanism, no page table, no gather.
+
+**Methodology correction that came with it (the maintainer's catch).**  Every Flash-Next arm in this campaign must
+carry `-ot per_layer_token_embd.*=CPU -lm none -lzm off`: the PLE table is **27 465 MiB** and is otherwise loaded
+lazy-mapped + prefetched, so its reads depend on page-cache residency beside 41 GiB of host experts.  Without the
+flags identical runs moved by **±20 %** (46.5 → 38.6 t/s; the earlier B1 pairs read 20.1 vs 23.5 t/s); with them
+the same pair repeats to **±0.2 %**.  *The B1 numbers below were re-measured under the flags; use only these.*
+
+| depth (`-c`) | resident + default (dense) | streamed + dense (pre-B2) | streamed + **default (B2)** | gain | arena (streamed vs resident) |
+|---|---|---|---|---|---|
+| 102 899 (`131072`) | 42.16 | 23.42 / 23.54 | **31.43 / 31.46** | **+34.3 %** | 25 338.3 MiB / 61.9 % vs 23 579.8 / 57.6 % |
+| 180 035 (`196608`) | 37.10 | 16.51 / 16.50 | **24.31 / 24.29** | **+47.3 %** | 25 338.3 / 61.9 % vs 22 700.6 / 55.5 % |
+
+Text (51 475 depth, `-n 64`, same flags): resident default **==** resident `LLAMA_QSA_DENSE_DECODE_STREAM=0`
+(853 chars `77a40bf40be1` — the change is inert on a resident cache); streamed default **==** streamed
+`LLAMA_QSA_DENSE_DECODE_UNTIL=0` (1159, `e6080aaf2318` — the default on a streaming cache *is* the sparse arm);
+streamed dense differs (1158, `0f1ad14496c9` — a documented regime change, `GREEDY-PURITY.md` §45/§63).
+Prefill is untouched (always QSA), so the prefill-logit gate is unaffected by construction.
+
+**What B2 is worth in the product terms.**  A user who needs a context that does not fit (`LLAMA_KV_RESIDENT_CELLS`,
+block 15) now decodes **1.34x (103k) / 1.47x (180k)** faster than before, and still 1.5x slower than a run whose KV
+fits — which is the honest shape: block 15 + B2 is how a large `-c` becomes *usable* on one card, not how it becomes
+*free*.
+
+**Follow-up it exposes (not done).**  The MTP draft's sparse decode (`qwen4exp_mtp_sparse_arm`) is default-OFF on
+the strength of measurements taken with a **res**ident draft KV ("every measured depth lost").  Under a streamed
+draft cache the same argument as B2 applies, so that default deserves a streamed-arm re-measure before it is
+believed (`LLAMA_MTP_SPARSE_DECODE=1`, `O3-DRAFTER-RING.md` territory).
 
 ## 4. The three candidate mechanisms
 

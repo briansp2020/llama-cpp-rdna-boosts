@@ -2248,6 +2248,38 @@ had no other home.
   `0` = the old path) sets the band; 8 MiB already reaches the plateau.  Oracle: `tests/test-llama-context`'s
   `cp_d`/`cp_d_s` (the restored KV blob is compared byte for byte) — nothing in the server or `llama-cli`
   uses this io class, which is why it went unnoticed.  `benchmarks/2026-10-27-state-device-path.md`.
+* **The target's speculative checkpoint goes to device memory when it fits** (r184, PR #254,
+  `archive/work/spec-ckpt-device/`).  On a recurrent or hybrid target the server saves a checkpoint of the
+  target's recurrent state before a verify whose draft is longer than `n_rs_seq` and restores it when only part
+  of the draft is accepted; with an n-gram drafter that is the long-draft steps of any copy-heavy request.  It
+  went to host memory: 149.6 MiB of Qwen3.8-27B state, ~4 ms per save on this box and ~16 ms on a slower CPU.
+  The server now passes `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` for it, so a save and a restore are device copies
+  into one staging buffer per slot that the context keeps and reuses.  Decided once per slot at its first
+  checkpoint and logged: device memory when the target is on exactly one GPU, its state is offloaded and that
+  GPU has the state's size plus 512 MiB free (the staging buffer is allocated lazily, after an expert-cache
+  arena or other caches took the GPU, and a failed allocation inside the io class aborts).  Otherwise host
+  memory as before.  `LLAMA_SERVER_SPEC_CKPT_DEVICE=0` keeps host memory always.  Context checkpoints (the
+  prompt cache) are not touched.  **The device arm is not a byte image**: `data_tgt` carries only the metadata
+  (the io header, the cell ranges) while the payload lives in the context's per-seq staging buffer
+  (`llama_context::mem_storage`), which the next save overwrites and the restore copies back into the live
+  cells, so a save must be restored before the next save for the same sequence (the speculative path does
+  exactly that: a draft round saves once and only ever restores that save, and the replay rounds save nothing)
+  and one of these must never be written to anything persistent.  A host-flagged save (a context checkpoint)
+  does not touch the stage, so those interleave freely.  Single GPU only, by design: under `-sm tensor` or a
+  layer split the state is spread over the devices (and the r157 device io class would bounce through the host
+  anyway), so the multi-GPU arms stay on the host path.  Measured 1 GPU (gfx1201, one binary, kill switch vs
+  default, greedy, `ROCBLAS_USE_HIPBLASLT=0`): 27B UD-Q4_K_XL + DFlash2 + `ngram-mod` rewrite request **310.2
+  -> 316.8 t/s (+2.1 %)**; 27B with `ngram-mod` alone **202.1 -> 205.4 (+1.6 %)**; 35B-A3B UD-Q4_K_M
+  `-ncmoe 40` with the arena (850 MiB free) + DFlash2 **422.1 -> 440.4 (+4.3 %, 63 MiB state, +70 MiB VRAM)**;
+  the zh-short-story and continuation requests **0 %** (they rarely take a checkpoint at all); 2 slots
+  `--kv-unified` **+2.6 %**.  Text, drafted and accepted tokens identical in every arm; +150 MiB VRAM per used
+  slot on the 27B (-150 MiB RSS).  **The submitter's +10.0 %/+15.8 % is host-CPU dependent, and so is this**:
+  the win is exactly (host save cost) x (checkpoints taken), 47 saves in a 3039-token rewrite here at 4.5 ms
+  each (the r96/r151/r152 state-copy folds already took the rest) against their 16 ms on a slower host.  Not in
+  the `--fit` estimate (allocated lazily, at the first checkpoint).  Gate:
+  `scripts/gate-spec-ckpt-device.sh` (text/draft identity across the arms, the kill switch, and the `-nkvo`
+  fallback with its own reason - nothing else in the repo reaches this code);
+  `benchmarks/2026-10-30-spec-ckpt-device.md`.
 * **A restored context checkpoint is not saved again, and dropped checkpoints' buffers are recycled** (r155,
   PR #236, `archive/work/server-ckpt-reuse/`).  On a hybrid/recurrent (or SWA) model the memory cannot roll
   back, so the server saves a **context checkpoint** (`common_prompt_checkpoint`: the recurrent state plus the
