@@ -1,22 +1,24 @@
 # HANDOVER — `wip/kv-residency` (TODO **#118**), cold-session start
 
-**Rewritten 2026-10-30 at the end of the ninth session (A5).**  Read this top to bottom before touching
-anything; it is self-contained.  Then read [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) (the measured state of the
+**Rewritten 2026-10-30 at the end of the tenth session (A6 — the promotion).**  Read this top to bottom
+before touching anything; it is self-contained.  Then read [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) (the measured state of the
 build — **§3.7.11 is this session**) and [`MIXED-BACKING.md`](MIXED-BACKING.md) (the design + the driver probe).
 
-> **State in one line: Goal A's mechanism, purity and cost are all measured on provably spilling arms, and both
-bugs the Flash-Next arm found are FIXED.**  Bug 1 (`0013`): a windowed region's tensors were not placed on the map
-grid, so the *second* tensor's first slide was refused and the process aborted (Flash-Next's QSA indexer pads
-+512 B/tensor; the 27B/4B are unit-sized by luck).  Bug 2 (`0014`): an idle-slot **park** on a region-backed KV
-faults the GPU (a park writes cells above the region's watermark through the copy engine) — **a region-backed KV
-now declines parking** and the server uses its existing save-and-clear fallback, which is byte-identical to the
-parking gate's oracle and costs one state copy per idle transition (timings inside the noise).  Everything §7.2
-owed (items 1, 2, 4) is done; the one follow-up is the parking gate not recognising that fallback.
+> **State in one line: GOAL A IS SHIPPED (r178, block 15).**  The windowed KV is in the delivery as an
+> **opt-in** block (`LLAMA_KV_RESIDENT_CELLS=<cells>|auto`; unset = the plain device buffer, byte-identical
+> including the OOM), with `ENVIRONMENT.md` §17, `patches/README.md` "Block 15", and the release record in
+> `WORKLOG.md` 261030.002.  Both bugs the Flash-Next arm found are fixed in it (`0013` the tensor placement on
+> the map grid, `0014` the park decline).  The shipped form differs from the campaign tree in three ways, by
+> decision: **A1 is stripped** (the superseded two-base FA read — one VA range needs no second base), the
+> **O1 fallback is not shipped** (the region buffer is taken only when a window is active, because O1
+> `GGML_ABORT`s on a slab-armed MoE config where the plain arm completes), and the **provider is on by
+> default** (`LLAMA_KV_REGION=0` is the kill switch).  What is left in the campaign is **Goal B (not
+> started)**, **Goal C** (the drafter ring: measured, not promoted, three questions in `O3-DRAFTER-RING.md`
+> §7) and one owed *test* fix (the parking gate cannot grade the save-and-clear fallback).
 >
-> **The box changed (2026-10-30).**  The PCIe rework happened: the link is now **55.7 GB/s H2D / 56.8 D2H**
-> (root port x16 @ 32 GT/s, was x8) and the probes were re-run (`A2-MIXED-BACKING.md` §3.7.1).  Every
-> pre-swap t/s number in this campaign is at 28.8 GB/s and **must not be compared** with a new one; the cost
-> model is now `bytes / 55.7 GB/s`.
+> **The box.**  One R9700 (gfx1201), 32 624 MiB; the PCIe rework (2026-10-30) makes the link **55.7 GB/s**
+> H2D / 56.8 D2H.  Every pre-swap t/s number in this campaign is at 28.8 GB/s and **must not be compared**
+> with a new one; the cost model is `bytes / 55.7 GB/s`.
 
 ---
 
@@ -25,12 +27,12 @@ owed (items 1, 2, 4) is done; the one follow-up is the parking gate not recognis
 | what | where |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, **pushed** (`origin` = `git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
-| delivery release | **r177** (`release.json`) — the campaign is cut against **r174** (`v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`); a promotion re-cuts against the then-current release |
+| delivery release | **r178** (`v16-6050b467c-r178`, `release.json`) — 16 blocks; **block 15 is this campaign's Goal A**, cut against r177's tip.  The campaign's own patch series is still cut against **r174** (`5bdec04ab`) and is the *measurement* tree, not the shipped one |
 | the campaign's TODO handle | **#118** (`TODO.md` §118 + the table row; the older text says `#117`, which was a dangling reference — see the number note there) |
 | campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`7c7769e50`** (A5 (ii): the tensor-placement fix `0013` and the park decline `0014`, on top of the A4 tip) |
 | the A1 fallback | fork branch `wip-kv-residency-a1-two-base` (`e49e1cef4`), also pushed (superseded; unchanged this session) |
 | `rdna-boosts` | **never touched by this campaign.**  Locally `5bdec04ab`; the fork's branch follows the delivery releases (r177) |
-| patch snapshot | `patches/0001`...`0014` + `patches/README.md` + `patches/diffstat.txt` (3222 insertions, 18 files) -- apply **in order** to `5bdec04ab`; verified: the series reproduces the branch tip's tree exactly (`c94552b26362`) |
+| patch snapshot | `patches/0001`...`0014` + `patches/README.md` + `patches/diffstat.txt` (3222 insertions, 18 files) -- apply **in order** to `5bdec04ab`; verified: the series reproduces the branch tip's tree exactly (`c94552b26362`).  **The shipped form is delivery `patches/0015` (block 15), not this series** |
 | box | **one R9700 (gfx1201), 32 624 MiB.**  Pin `HIP_VISIBLE_DEVICES=0` on every arm.  Every number here is 1-GPU; say so, never claim multi-GPU |
 
 ## 2. What Goal A asked for (the maintainer's words, unchanged)
@@ -446,57 +448,31 @@ passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 
 ## 11. First 30 minutes of the next session
 
-**Read this first: the campaign has three goals and only ONE of them is promotable.**  Do not mix them up (the
-A5 handover did, and it confused the maintainer):
+**Goal A is shipped — do not re-measure it, and do not re-promote it.**  `v16-6050b467c-r178` carries it as
+block 15 (opt-in, `LLAMA_KV_RESIDENT_CELLS`); the delivery's `patches/0015`, `ENVIRONMENT.md` §17,
+`patches/README.md` "Block 15" and `WORKLOG.md` 261030.002 are the shipped description, and the fork's
+`rdna-boosts` carries the re-cut tip `38ef3a767` (tree `92d087ef`).  What is left is **Goal B**, **Goal C**'s
+decisions, and one *test* fix:
 
-| goal | what | state |
-|---|---|---|
-| **A** — a fixed VRAM **window** instead of `O(n_ctx)` (the KV's tail spills to pinned RAM) | payoff (a) a big context on one 32 GB card instead of OOM, (b) the slab/arena gets the freed VRAM | **COMPLETE and promotable**: mechanism, purity, cost, every §7.2 gate, and the arena half are measured (`A2-MIXED-BACKING.md` §3.7.9 + §3.7.11).  **No blockers.** |
-| **B** — a **sparse attended set** (QSA/DSA) streamed cheaply instead of a full KV | a different mechanism (`STRATA-KV-STREAMING.md`), its own plan | **NOT STARTED.**  Independent of A: it does not touch A's code and must not gate A's promotion.  (The delivery already *ships* qwen4exp/QSA model support — block 11 — that is not this.) |
-| **C** — the **drafter ring** (windowed MTP draft KV) | `LLAMA_SPEC_DRAFT_WINDOW`, implemented + measured on the campaign branch (`a93dee7a9`), **not in `patches/`** | **done as an EXPERIMENT, not promoted**: target text byte-identical; at a usable window it is free (46k context, `W=32768`: acceptance −2.3 % rel, generation flat); a window far below the working context costs 7-9 %; the VRAM prize is one draft layer (~1 GiB at `-c 262144`) and the freed VRAM does **not** reach the arena (it lives in the slab's `aux_reserve`).  Three questions for the maintainer are open in `O3-DRAFTER-RING.md` §7 |
-
-So: **"promote" means Goal A only.**  A promotion session's work is: re-cut `patches/0013`-era code against the
-then-current release (now r177) into a delivery block, **first make the two shape changes below**, add the
-`ENVIRONMENT.md` rows for the five campaign env vars (`LLAMA_KV_REGION`, `LLAMA_KV_RESIDENT_CELLS`,
-`LLAMA_KV_SPILL_RAM_PCT`, `LLAMA_KV_REGION_QUARANTINE`, `LLAMA_KV_REGION_DEBUG`/`TRACE`/`CANARY`/`DUMP` +
-`GGML_CUDA_VMM_REGION_SELFTEST`), decide the default-on call, and run the release gates.  It is **not**
-measurement and it is **not** Goal B.
-
-**The two shape changes a promoted build needs (do not ship the campaign's gating as-is):**
-
-1. **Take the region buffer ONLY when a window is actually active** (`kv_resident_cells != 0`), else the plain
-   CUDA KV.  Today's `cells == 0` fallback goes to the **O1** region buft, and O1 is *not* inert —
-   `IMPLEMENTATION.md` → *KNOWN LIMIT*: 35B-A3B `-ncmoe 24 -c 262144` on a 253k-token prompt **completes** plain
-   (1201 t/s prefill, 51.2 t/s decode) and **`GGML_ABORT`s** with the region on, because the slab/arena took the
-   VRAM the KV had not committed up front.  O1 is parked; nothing is lost by dropping it from the default path.
-2. **Then** `LLAMA_KV_RESIDENT_CELLS=auto` can be default-on: it spills only when the KV does **not** fit at the
-   user's pinned `-c` (OOM → a working run, with the WARN line and the `--fit` cost report), and it sets the
-   window to 0 when the KV fits — which, with (1), keeps the plain buffer, so a config that fits stays
-   byte-identical.  A **numeric** `W` stays explicit (a window below the run depth costs 11-26 %), and the env
-   var becomes the kill switch (`=0`).
-
-**What the current gating really is:** the *window* needs **both** `LLAMA_KV_REGION=1` **and**
-`LLAMA_KV_RESIDENT_CELLS=W|auto` (+ a pinned `-c` for `auto`).  `LLAMA_KV_RESIDENT_CELLS` alone is **inert**
-(both buft helpers check the region flag); the provider alone takes the **O1** path, which is what (1) removes.
+| item | state |
+|---|---|
+| **Goal A** — the windowed KV | **SHIPPED (r178, block 15)**.  Opt-in; unset = byte-identical including the OOM.  Gates on the shipped tree: default path `5ba44647188f` and still OOMs; windowed `W=2048`/`4096` `5ba44647188f` = plain; spilling arm prefill-logit **−0.000000 / 100.000 %**; VMM selftest PASS and FAIL with the hold disabled; `check-gpu-faults.sh` clean; `validate-set.sh` green; live-container images built off-host by the tag watcher |
+| **Goal B** — a sparse attended set (QSA/DSA) streamed instead of a full KV | **NOT STARTED.**  A different mechanism (`STRATA-KV-STREAMING.md`); it needs its own plan and its own gates, and it does *not* depend on Goal A's code |
+| **Goal C** — the drafter ring (`LLAMA_SPEC_DRAFT_WINDOW`) | **measured, NOT promoted** (`O3-DRAFTER-RING.md`): at a usable window it is free (46k context, `W=32768`: acceptance −2.3 % rel, generation flat) and a window far below the working context costs 7-9 %; the VRAM prize is one draft layer (~1 GiB at `-c 262144`) and it does not currently reach the arena.  Three questions for the maintainer in §7 |
+| **owed (a TEST gap in the delivery)** | `scripts/gate-park-idle-slots.sh` HARD-fails a legitimate outcome — when the park arm's server logs *"cannot park the idle slot: saving it to the prompt cache and clearing it"* (what a windowed/region-backed KV now triggers, and what already happens for a slot whose cells are not one run), the gate should require `park == lazyoff` and report the fallback instead of failing on *"parking moved nothing"*.  With no window the gate passes today (verified) |
 
 1. `cd ~/llama-cpp-rdna-boosts && git pull` (and `cd ~/llama.cpp && git fetch origin`); read this file, then
-   `A2-MIXED-BACKING.md` **§3.7.11** (A5: the spilling-arm gates, the Flash-Next arm, **both bugs and their
-   fixes**, the arena re-measurement), **§3.7.8** (the hazard hold), **§3.7.9** (the spill's cost) and §8.1 above
-   (the absolute references — nothing has to be re-derived before an A/B).
-2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** at **`7c7769e50`** or later
-   (`git log --oneline -3`: A5 (ii) on A5 (i) on A4 (ii)).  Never commit campaign code to `rdna-boosts`.
-   `~/bin/build-llama-rocm` (~5 s warm).
-3. **Nothing in §7.2 is left to measure** and no Goal-A work is outstanding.  The next session is the promotion
-   decision/conversation (Goal A), optionally followed by the two items below.
-4. **Optional, and it needs the maintainer's go-ahead because it is a DELIVERY change:**
-   `scripts/gate-park-idle-slots.sh` HARD-fails a *legitimate* outcome — when the park arm's server logs *"cannot
-   park the idle slot: saving it to the prompt cache and clearing it"* (the fallback a region-backed KV now
-   triggers, and which also exists for a slot whose cells are not one run, e.g. a shared prefix), the gate should
-   require `park == lazyoff` and report *"parking declined → save-and-clear fallback"* instead of failing on
-   *"parking moved nothing"*.  This is a **test-gap, not a product bug**: with no region the gate passes today
-   (verified), and the fault itself was campaign-only.  Shape: `A2-MIXED-BACKING.md` §3.7.11.3.
-5. **Deferred by the maintainer (do not re-propose):** expressing `W` as a percentage of the slab.  `W` stays a
-   cell count (numeric or `auto`), and `auto`'s ordering (weights → arena reserve → `W` from the residue, capped
-   at the user's `-c`) is the agreed policy — verified on the 35B-A3B, the 122B-A10B and the 27B Q8_0.
-6. Multi-device is still not measurable here (one card).  Report findings to the maintainer before committing any
-   delivery-affecting change.
+   this section, then `A2-MIXED-BACKING.md` **§3.7.11** (A5's measurements, which are what block 15's claims
+   rest on) and `../WORKLOG.md` **261030.002** (what actually shipped and how it differs from the campaign
+   tree).  `patches/README.md` "Block 15" is the user-facing description.
+2. `cd ~/llama.cpp && git branch --show-current` — `rdna-boosts` at **`38ef3a767`** is the shipped tree;
+   **`wip-kv-residency`** at **`7c7769e50`** is the campaign/measurement tree (they differ: the shipped one
+   has A1 stripped, no O1 fallback, and the provider on by default).  Never commit campaign code to
+   `rdna-boosts`.
+3. If you touch the window's code, the gates are: `GGML_CUDA_VMM_REGION_SELFTEST=1` (**PASS**, and **FAIL**
+   with `LLAMA_KV_REGION_QUARANTINE=0`), the coherence trio (`5ba44647188f`; and with
+   `ROCBLAS_USE_HIPBLASLT=0` set for any fresh-process comparison), the prefill-logit gate **on a spilling
+   arm** (`LLAMA_KV_RESIDENT_CELLS=1024`, −0.000000 / 100.000 %), `check-gpu-faults.sh`, and the OOM baseline
+   with the knob unset.  A spill proof comes first: `LLAMA_KV_REGION_DUMP=/dev/null` → `KVREGION_FREE … host=`.
+4. Then pick up Goal B (a plan first — it is a different mechanism) or the Goal C decisions.  Report findings
+   to the maintainer before committing any delivery-affecting change.
