@@ -1,0 +1,107 @@
+From dc122f338629deb340bd01c0730e915e8598ae92 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Fri, 30 Oct 2026 07:52:12 -0500
+Subject: [PATCH] wip/kv-residency: A4 (ii) -- the host-mapping hazard as a VMM
+ selftest case
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The hazard found in A4 (A2-MIXED-BACKING.md §3.7.8) lived in the primitive,
+not in the windowed KV: `cuMemUnmap` of a device mapping followed by
+`cuMemCreate`(HOST)/`cuMemMap` at that VA zeroes a different, LIVE host-location
+mapping in the same reservation.  Until now the only regression test was
+`wip/kv-residency/hostmap-hazard-probe.cc`, which nothing runs.
+
+`GGML_CUDA_VMM_REGION_SELFTEST=1` now replays the shape the hazard was found in
+-- 8 tensors of 8.5 MiB (a 27B q8_0 KV at -c 8192), each with a 4 MiB window, the
+window flipped to pinned host one tensor at a time through the REAL path
+(ensure_span -> vmm_remap -> vmm_map, i.e. the hold) -- and re-verifies EVERY
+earlier window after each flip.
+
+It is a test, not a formality: with the hold enabled the case passes, and with
+`LLAMA_KV_REGION_QUARANTINE=0` it FAILS on exactly one check --
+
+  FAILED: hazard: every already-flipped window still holds its bytes
+
+from the 5th flip on.  So a driver regression, or a hold that stops working,
+fails at backend init instead of silently corrupting a model's KV.
+
+Cost: ~70 MiB reserved and 8 flips, only under the selftest env var; the product
+path is untouched (identity smoke: 27B q8_0 -c 8192, plain and spilling, both 526
+5ba44647188f).
+---
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 52 +++++++++++++++++++++-
+ 1 file changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
+index 154746650..37f34b43f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
+@@ -1148,13 +1148,61 @@ bool ggml_cuda_vmm_region_selftest(int device) {
+         }
+     }
+ 
++    // THE HOST-MAPPING HAZARD (A4, `A2-MIXED-BACKING.md` §3.7.8).  A kind flip is an `unmap` followed by a
++    // `map`, and on this driver that pair ZEROES a different, LIVE host-location mapping in the same
++    // reservation -- deterministically, from the 6th flip of a 27B-shaped reservation onward.  That is the bug
++    // that made a spilled KV silently wrong (a whole 4 MiB mapping of an already-flipped tensor read back as
++    // zeros, KLD 0.004973 on a 27B arm); `vmm_map` now holds the physical an unmap released for the duration of
++    // its create.  This case replays the shape it was found in -- a per-tensor window flipped to host one tensor
++    // at a time -- and re-verifies EVERY earlier window after each flip, so a driver regression, or a hold that
++    // stops working, fails here instead of in a model.  Cross-check it with `LLAMA_KV_REGION_QUARANTINE=0`: the
++    // case must then FAIL, which is what makes it a test rather than a formality.
++    {
++        const size_t hz_tens = 8912896;        // one 27B q8_0 KV tensor at -c 8192 (8192 x 1088 B)
++        const size_t hz_win  = (size_t) 4 << 20;   // the map unit == the minimum resident window
++        const int    hz_nt   = 8;              // >= 6: the hazard needs that many flips to show
++        ggml_cuda_vmm_region * hz = ggml_cuda_vmm_region_create(device, hz_nt * hz_tens, hz_win, err, sizeof(err));
++        check(hz != nullptr, "hazard: create");
++        if (hz != nullptr) {
++            for (int t = 0; t < hz_nt; t++) {
++                check(ggml_cuda_vmm_region_map_span(hz, (size_t) t * hz_tens, hz_win, false), "hazard: map the window");
++                check(ggml_cuda_vmm_region_map_span(hz, (size_t) t * hz_tens + hz_win, hz_win, false),
++                        "hazard: map the resident span");
++            }
++            for (int t = 0; t < hz_nt; t++) {
++                st_fill_kernel<<<256, 256>>>((uint32_t *) ((char *) ggml_cuda_vmm_region_base(hz) + (size_t) t * hz_tens),
++                        hz_win / 4, 0x1000u + (uint32_t) t);
++            }
++            check(cudaDeviceSynchronize() == cudaSuccess, "hazard: fill every window");
++            for (int t = 0; t < hz_nt; t++) {
++                // the real flip path: ensure_span -> vmm_remap -> vmm_detach/attach -> vmm_map (which takes the hold)
++                check(ggml_cuda_vmm_region_ensure_span(hz, (size_t) t * hz_tens, hz_win, /*host=*/ true),
++                        "hazard: flip a window to host");
++                int bad_here = 0;
++                for (int v = 0; v <= t; v++) {
++                    (void) cudaMemset(d_bad, 0, sizeof(int));
++                    st_check_kernel<<<256, 256>>>(
++                            (const uint32_t *) ((char *) ggml_cuda_vmm_region_base(hz) + (size_t) v * hz_tens),
++                            hz_win / 4, 0x1000u + (uint32_t) v, d_bad);
++                    int bad = -1;
++                    (void) cudaDeviceSynchronize();
++                    (void) cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost);
++                    bad_here += bad;
++                }
++                check(bad_here == 0, "hazard: every already-flipped window still holds its bytes");
++            }
++            check(ggml_cuda_vmm_region_mapped_host(hz) == (size_t) hz_nt * hz_win, "hazard: every window is host-backed");
++            ggml_cuda_vmm_region_free(hz);
++        }
++    }
++
+     // and it must survive its own teardown (with holes in the mapped set)
+     ggml_cuda_vmm_region_free(r);
+     (void) cudaFree(d_bad);
+ 
+     GGML_LOG_INFO("%s: device %d: %s (reserved %zu MiB in %zu x %zu MiB units, prefix + span growth, "
+-                  "a HOST-backed span, aligned window flips (a partial one is REFUSED), the watermark contract "
+-                  "and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
++                  "a HOST-backed span, aligned window flips (a partial one is REFUSED), the host-mapping hazard (a whole "
++                  "flip sequence re-verified), the watermark contract and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
+                   (n_units * unit) >> 20, n_units, unit >> 20);
+     return ok;
+ }
+-- 
+2.55.0
+

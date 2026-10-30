@@ -146,7 +146,10 @@ cd ~/llama.cpp
 export LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib HIP_VISIBLE_DEVICES=0
 P=~/llama-cpp-rdna-boosts
 
-# 0. the primitive (it now also maps a HOST-backed span and has the device write it)
+# 0. the primitive -- also covers the HOST-backed span, the aligned window flips, and (A4 (ii)) the
+#    HOST-MAPPING HAZARD: 8 tensors x 8.5 MiB flipped one at a time, every earlier window re-verified.
+#    Run it a second time with LLAMA_KV_REGION_QUARANTINE=0: it MUST then print FAIL (that is what makes it a
+#    test rather than a formality).
 GGML_CUDA_VMM_REGION_SELFTEST=1 ./build-rocm/bin/llama-cli -v -m /llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf \
   -ngl 99 -c 512 -p hi -n 2 --no-display-prompt --single-turn 2>&1 | grep "selftest.*PASS"
 
@@ -238,9 +241,9 @@ read/restore paths.
    attention KV and the **QSA indexer** cache -- both take the window, invariant 5) and the §3.7.4 park coupling
    (`llama_memory_hybrid_idx` moves the indexer with the attention cells).  Run `test-backend-ops -o
    FLASH_ATTN_QSA` there too: a silently-zeroed spill is exactly what that coupling would hide.
-3. **The hazard as a self-test**, not a probe: extend `GGML_CUDA_VMM_REGION_SELFTEST` (map a device span and a
-   host span, remap the device one, verify the host span) so `validate-set.sh` and the per-block ladder catch a
-   driver regression -- the probe lives in `wip/` and nothing runs it automatically.
+3. ~~The hazard as a self-test~~ -- **DONE (A4 (ii))**, `GGML_CUDA_VMM_REGION_SELFTEST=1` now includes it and is
+   **sensitive** (`LLAMA_KV_REGION_QUARANTINE=0` makes it FAIL).  It only runs under that env var, so keep asking
+   for it in every release gate.
 4. **The §7.3 re-measurement** at the new link (below).
 5. **The promotion conversation** (a block, `ENVIRONMENT.md`, and the default-on call for the window itself) --
    the maintainer's, and it needs 1-3 first.

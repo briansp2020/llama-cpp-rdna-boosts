@@ -5,9 +5,9 @@
  ggml/src/ggml-cuda/fattn-tile.cuh          |   54 +-
  ggml/src/ggml-cuda/fattn-vec.cuh           |    4 +-
  ggml/src/ggml-cuda/fattn.cu                |   29 +-
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1160 ++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1208 ++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  122 +++
- ggml/src/ggml-cuda/ggml-cuda.cu            |  832 +++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu            |  832 ++++++++++++++++++-
  ggml/src/ggml-cuda/vendors/hip.h           |    4 +
  ggml/src/ggml.c                            |   51 ++
  src/llama-ext.h                            |   18 +
@@ -16,4 +16,4 @@
  src/llama-kv-cache.cpp                     |  364 ++++++++-
  src/llama-kv-cache.h                       |   45 ++
  src/llama-model.cpp                        |   69 +-
- 18 files changed, 3118 insertions(+), 65 deletions(-)
+ 18 files changed, 3166 insertions(+), 65 deletions(-)

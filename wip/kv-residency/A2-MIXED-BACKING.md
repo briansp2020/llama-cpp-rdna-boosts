@@ -546,9 +546,11 @@ Owed before promotion, in order:
 2. **A Flash-Next (qwen4exp) spilling arm** — the only model with **two** KV caches, the attention KV and the
    **QSA indexer**, plus §3.7.4's park coupling (`llama_memory_hybrid_idx` moves the indexer with the attention
    cells).  Add `test-backend-ops -o FLASH_ATTN_QSA` on that arm.
-3. **The hazard as a self-test**, not a probe: extend `GGML_CUDA_VMM_REGION_SELFTEST` (map a device span and a
-   host span, remap the device one, verify the host one) so `validate-set.sh` and the per-block ladder catch a
-   driver regression.
+3. ~~The hazard as a self-test~~ — **DONE (A4 (ii))**: `GGML_CUDA_VMM_REGION_SELFTEST=1` replays 8 tensors ×
+   8.5 MiB with a per-tensor 4 MiB window flipped one at a time through the real path, re-verifying every earlier
+   window after each flip.  It is sensitive: with `LLAMA_KV_REGION_QUARANTINE=0` it **FAILS** on *"hazard: every
+   already-flipped window still holds its bytes"* from the 5th flip.  Note it runs only when the selftest env var
+   is set, so a release gate still has to ask for it (`gate-per-block-build.sh`/`validate-set.sh` do not).
 4. **The §7.2 re-measurement** at the new link: the arena tables (`-n 2000`, `-ncmoe` = the model's full layer
    count, interleaved), the deep arm, and the moved `--fit` break-even.  §3.7.9 covers the cost side.
 5. The promotion conversation (a block, `ENVIRONMENT.md`, the default-on call) — the maintainer's, and it needs
