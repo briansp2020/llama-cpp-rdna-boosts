@@ -68,18 +68,54 @@ one ggml buffer, one VA range (the KV cache's tensors laid out consecutively, as
 
 ## 3. What A2 has to build (in order)
 
-1. **The buffer type**: extend `ggml_backend_cuda_kv_region_buffer_type` (O1 slice 2, on this branch) from
-   "reserve VA, grow device chunks lazily" to "reserve VA, map `[host tail | device head]` up front, per
-   tensor".  Reuse its registered proc-address selection, its `is_cuda == true` requirement (otherwise the
-   scheduler migrates the whole cache to the host every graph), its plain-buft fallback and its
-   `memory_breakdown`.  Drop the lazy growth: there is nothing to grow.
-2. **The split point through the buffer allocation**: `llama_kv_cache` must know `s` when it allocates, i.e.
-   from the explicit knob first (`--kv-resident-mib` / `LLAMA_KV_RESIDENT_CELLS`), auto-sizing later (A3).
-3. **`clear` walks spans**, not the whole range (a full-range memset over a 6.4 GiB host tail is ~0.25 s at
-   the measured write bandwidth, and the tail holds no live data at creation).
-4. **`--fit` reports the split**: the buffer type reports the *resident* bytes, so an over-budget KV is
-   reported rather than refused (A3's `--fit` half — but the number has to come from the buft, so it belongs
-   to A2's shape).
+### 3.1 The primitive: a mapping TABLE, not a unit bitmap
+
+O1's `ggml-cuda-vmm-region.{h,cu}` models the mapped extent as a **per-unit bitmap** with "whole units from
+the base" span growth.  Mixed backing does not fit that: the bulk is 2 MiB, but each tensor's boundary lands
+at an arbitrary 4 KiB-aligned offset (T8), i.e. the mapping sizes differ *inside* one reservation.  So the
+primitive becomes a small table of `(offset, bytes, kind)` mappings (kind = device | host), where
+`is_mapped(off, bytes)` is a lookup (no overlap is allowed, so a lookup is exact) and `clear` walks the table.
+Everything O1 already got right stays: reserve-then-map, fail-soft, clear-on-map, the "any byte outside the
+table faults the GPU" contract, and the diagnostic hook.
+
+New entry points (the rest of the header is unchanged):
+
+```c
+// Map [off, off+bytes) from `kind`, splitting it into <=`unit`-sized mappings (the last one may be smaller,
+// 4 KiB-granular).  Clears what it maps.  Fails soft; nothing half-created.
+bool ggml_cuda_vmm_region_map_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes, kind);
+```
+
+### 3.2 Where the split point enters (the interface decision)
+
+A ggml buffer type's `alloc_buffer(size)` does not see the tensor layout; the tensors are placed afterwards
+by the allocator, one `init_tensor` call each.  So the split has to reach the buft as a **per-tensor tail
+length** set before placement:
+
+* `llama_kv_cache` computes `s = get_kv_split_n_tail(n_kv)` and `tail_bytes = s * cell_bytes`, where
+  `cell_bytes = ggml_row_size(k->type, n_embd_k_gqa)` — then calls one proc-address entry on the buffer,
+  e.g. `ggml_backend_cuda_kv_region_buffer_set_tail_bytes(buffer, tail_bytes)`, **after** `alloc_buffer` and
+  **before** the tallocr places the tensors.
+* `init_tensor` then maps `[0, tail_bytes)` host and `[tail_bytes, ggml_nbytes(t))` device for every tensor.
+  One number covers all of them because every KV tensor on a target shape has the same cell geometry; when K
+  and V *don't* (V wider than K), the memory module **declines the split** (warn once, no spill) rather than
+  guess — the same "declining means no spill" rule A1 used.
+* A tensor smaller than `tail_bytes` (impossible on a target shape) also declines.
+
+### 3.3 The rest
+
+1. **The buffer type**: re-point `ggml_backend_cuda_kv_region_buffer_type` (O1 slice 2, on this branch) from
+   "reserve VA, grow device chunks lazily" to the up-front per-tensor mapping above.  Reuse its registered
+   proc-address selection, its `is_cuda == true` requirement (otherwise the scheduler migrates the whole cache
+   to the host every graph), its plain-buft fallback and its `memory_breakdown`.  **Drop the lazy growth**:
+   there is nothing to grow, and dropping it is also what removes O1's `KNOWN LIMIT` (the arena can no longer
+   take VRAM the KV will need later, because the tail's VRAM is never committed).
+2. **The knob**: `LLAMA_KV_RESIDENT_CELLS=W` (A1's lever, already in the tree) for the split point, then
+   `--kv-resident-mib`/auto-sizing in A3.  Must be read **before `SLAB_INIT`**.
+3. **`clear` walks the table** and skips nothing (a full-range memset over a 6.4 GiB host tail is ~0.23 s at
+   the measured write bandwidth — a one-off at context creation, but it must not touch unmapped VA).
+4. **`--fit` reports the split**: the buft reports the *resident* bytes so an over-budget KV is reported
+   rather than refused (A3's `--fit` half, but the number has to come from the buft, so it belongs here).
 5. **Gates** (the A1 list, plus the ones mixed backing newly needs):
    * same-seed text byte-identical at several forced window widths (27B q8_0, 27B f16 + tile,
      4B default, 27B MTP verify widths 2..4) — the negative control is now "mis-map one 2 MiB chunk (or
