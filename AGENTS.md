@@ -1155,6 +1155,32 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   reported — judge per node (~1-2 us) or by `FIRSTUSE`.  Also measured there: `hipFuncGetAttributes` in
   these runs is **librccl** (NCCL init), not ours.  Tooling (probe extension + an `LD_PRELOAD` HIP
   call-site interposer): `archive/work/decode-warmup-stall/`.
+- **The GDN decode folds are a 1-GPU win (r183, block 10, PR #256).**  The direct GDN conv now also writes the
+  recurrent **snapshot tails** (`GGML_CUDA_DISABLE_GDN_CONV_SNAP=1` off) and reads the **conv-cache row itself**
+  for `build_rs`'s deferred `GET_ROWS` (`GGML_CUDA_FUSE_GDN_CONV_GATHER=0` off), and the 1-token direct conv
+  ships gated on `gdn_conv_norm_match() > 0` + `ssm_prescan`-first (`GGML_CUDA_FUSE_GDN_CONV_DECODE=0`), which is
+  what lets the two folds fire at one token.  Worth **+5.9 % tg128 on gfx1100 / +3.3 % on gfx1201** (35B-A3B
+  Q4_K_M), +1.7 % dense 27B, neutral on 4B Q8_0; decomposed on gfx1201 the enabler is +0.3 % and the folds are
+  +2.2 % (snapshot) and +1.0 % (gather).  Two rules: the decode gate reads **data pointers**, so it lives in
+  `ggml_cuda_gdn_conv_match_at_concat` / `_at_conv` and `graph_optimize` may only use the structural
+  `ggml_cuda_gdn_conv_pattern_at_concat`, which must stay a **superset** (its alloc deps then cover every case);
+  and a `CONCAT` over a deferred gather the direct conv does not take **aborts** by design.  All three ride the
+  direct conv's single-device gate, so a 2+ device `-sm tensor` / `-sm layer` run (the recommended MoE server
+  shape) is **inert** unless `GGML_CUDA_CONV_FUSION_MULTI=1` — do not quote them as multi-GPU wins.  The
+  shared-expert gate fold (`GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0`) is the fourth patch: it needs a BF16/F32 gate
+  weight, is inert on every quantized model we hold and is +0.6 % on Flash-Next.  Gate: the prefill-logit `--ab`
+  at `--ub 1` (0.000000 / 100.000 %), text identity on a single device *and* a 2-GPU `-sm tensor -ncmoe` arm,
+  and identical MTP draft/accept.  `GREEDY-PURITY.md` §73, `archive/work/gdn-decode-folds/PROMOTED.md`.
+- **A 2-D memcpy of a mirrored weight's view can be refused inside the slab (r183, block 10).**
+  `ggml_cuda_cpy_as_memcpy_2d` (upstream #25057) keeps its `cudaMemcpy2DAsync` path only while the padded span
+  (`height*pitch`) fits the tensor's own allocation.  A 2-D copy of a *view of a mirrored model weight* is
+  rejected with `invalid argument` when the weight sits in the movable-boundary slab, which made
+  `Flash-Next GSQ-IQ3_XXS -sm tensor -ncmoe 48` abort at load on r182 and earlier (`ggml_cuda_cpy`, device 1,
+  qwen4exp's `blk.1.ple_conv1d.weight` column view; `-sm layer` and `GGML_CUDA_SLAB=0` both loaded).  The exact
+  driver rule is unverified (shrinking the 2-D copy by one row still failed), so the guard is deliberately
+  conservative; the scalar kernels are bit-identical and no other model we hold reaches the path (0 2-D copies
+  in an instrumented run of 35B-A3B / 4B / 27B / gpt-oss).  Do not restore the unconditional fast path without
+  reproducing the arm.  `archive/work/cpy-2d-memcpy-guard/README.md`.
 - **A `-sm tensor` model load uploads tensors through a pinned staging buffer, one alloc/free per
   tensor** (`ggml_backend_cuda_buffer_set_tensor_2d`, 678 pairs = 2.2 s + 1.1 s of a ~10.7 s load on a 27B
   Q8_0 at 3 devices).  This is *load* time, not decode.  Since **r116** the staging buffer is grow-only

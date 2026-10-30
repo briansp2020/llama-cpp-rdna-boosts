@@ -1,7 +1,7 @@
 # Cold-session prompt — `wip/kv-residency` (TODO #118)
 
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from the previous
-session's context).  Rewritten 2026-10-30 (after r181) at the end of session A7, the r181 intake.
+session's context).  Rewritten 2026-10-30 at the end of session A9 (Goal B: the plan + the B0 baseline measurement).
 
 ---
 
@@ -31,30 +31,39 @@ without the knob is byte-identical to r177 including its OOM).  The shipped tree
   silent); and the `LLAMA_KV_SPILL_RAM_PCT` clamp could be taken past the VRAM budget (invariant 14 — an
   intermediate form planned a **235 GiB** pinned spill and OOM-killed the box, so **bound the spill PLAN**).
 
-**THIS SESSION'S JOB — the campaign's remainder, in order:**
+**WHAT SESSIONS A8/A9 (2026-10-30) DID — do not redo it:**
 
-1. **A `-sm tensor` window** (the only technical gap left in Goal A).  Today a split declines the window by
-   design.  Doing it needs per-device region bufts wrapped in a Meta split buft plus a fit that sizes the
-   devices together.  **This box has ONE card**, so it cannot be validated here — start with a design note and a
-   cross-check against `common/fit.cpp`'s split accounting, and say plainly that the arms need a 2/3-device
-   host.  Do not implement it blind.
-2. **The `auto` policy questions** (the maintainer's call; unchanged by r181).  `auto` sizes the window to
-   `free − margin − everything-but-the-KV`, where the margin includes the **arena/slab reserve** — so on a
-   `-ncmoe` config the arena wins the VRAM and the window comes out small *by design* — and it only spills a
-   `-c` the user pinned.  The deciding measurements are `A2-MIXED-BACKING.md` §3.7.11.4 A–C.  `W` stays a cell
-   count; a percentage-of-slab form is deferred — do not re-propose it.
-3. **One owed TEST-gap fix in the delivery** (needs the maintainer's go-ahead): `scripts/gate-park-idle-slots.sh`
-   HARD-fails a legitimate outcome — when the park arm's server logs *"cannot park the idle slot: saving it to
-   the prompt cache and clearing it"* (what a windowed KV triggers, and what already happens for a slot whose
-   cells are not one run), it should require `park == lazyoff` and report the fallback instead of failing on
-   *"parking moved nothing"*.  With no window the gate passes today (verified).
-4. **Goal C decisions** (`O3-DRAFTER-RING.md` §7): the MTP drafter ring (`LLAMA_SPEC_DRAFT_WINDOW`) is
-   measured, not promoted — free at a usable window (46k context, `W=32768`: acceptance −2.3 % relative,
-   generation flat), 7-9 % lost far below the working context; the prize is one draft layer (~1 GiB at
-   `-c 262144`) and it does not reach the arena.  Open: default-on or not, one size or per-model, MTP-only or
-   DFlash2 too.
-5. **Goal B** (a sparse attended set streamed cheaply — `STRATA-KV-STREAMING.md`) is **not started**: a different
-   mechanism, needs its own plan before any code, independent of Goal A.
+1. **The parking-gate test gap is FIXED and COMMITTED** (`scripts/gate-park-idle-slots.sh`, commit
+   `5a3d4535`; `WORKLOG.md` 261030.006): it counts park MOVES (it used to count the region refusal warning,
+   logged under the same `seq_park` prefix) and grades the save-and-clear fallback as a PASS with
+   `park == lazyoff` still required.  Verified on a windowed Flash-Next arm and the no-window control.
+2. **A `-sm tensor` window is DESIGNED ONLY and PARKED** — `wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`
+   (+ `A2-MIXED-BACKING.md` §3.7.13 §2), picked up later on the multi-GPU development host.  Read its §4
+   before touching that block: `margins[0]`, the aggregate `cell_bytes`, the mirrored-cache spill plan and the
+   split `estimate()`'s `ntd×` KV are the four findings a blind implementation would get wrong.
+3. **The `auto` policy is settled: capacity-only** (it spills only a pinned `-c`; the arena half needs a
+   numeric `W` at or above the run depth).  Do not re-open it without the maintainer.
+4. **Goal B is IN FLIGHT**: the plan of record is `wip/kv-residency/B1-STRATA-PLAN.md` and B0 is measured
+   (`A2-MIXED-BACKING.md` §4).  **All Goal B work stays inside `wip/`** (campaign branch `wip-kv-residency`
+   for code) — `patches/` and `release.json` are untouched while the delivery is in flight on other features.
+
+**WHAT IS LEFT — do B2 first (B1 is done and changed the shape of B2):**
+
+1. **B2 — the decode-arm policy under a streaming KV** (the plan's §3.2): a resident KV wants DENSE decode, a
+   streamed KV wants SPARSE decode (+32 % at 103k, +49 % at 180k on the four-arm matrix), but
+   `qwen4exp`'s decode gate only knows depth (`qsa_dense_decode_until = 1<<62` on gfx1201), never the cache's
+   residency.  Make the arm depend on "the attention cache is windowed and spilling" and gate it on the four-arm
+   matrix at 51k / 103k / 180k.  **No page table, no gather** — B-A/B-B are justified only if a gate arm shows
+   the policy is not enough.  Campaign code goes on branch **`wip-kv-residency-b`** (based on the shipped tip;
+   `wip-kv-residency` is Goal A's measurement tree), pushed after every step.
+2. **Goal C decisions** (`O3-DRAFTER-RING.md` §7): the MTP drafter ring is measured, not promoted — free at a
+   usable window (46k context, `W=32768`: acceptance −2.3 % relative, generation flat), 7-9 % lost far below
+   the working context; the prize is one draft layer (~1 GiB at `-c 262144`) and it does not reach the arena.
+   Open: default-on or not, one size or per-model, MTP-only or DFlash2 too (the ring is arch-agnostic but the
+   code gates on `LLAMA_CONTEXT_TYPE_MTP`, and there is no DFlash context type).
+3. **The `-sm tensor` window** — implement A6 only on the maintainer's go-ahead and only with a 2/3-device host.
+4. **Goal B's later stages** (B2 residency policy, B3 arena half, B4 promotion) are in the plan; do not start
+   B2 before B1 closes.
 
 START BY READING, in this order: `wip/kv-residency/HANDOVER.md` (**§11 = this work list**, §1 the state, §3 the
 invariants — **13** reg-less Meta devices, **14** bound the planned spill — §5 the measurement rules, §6 the

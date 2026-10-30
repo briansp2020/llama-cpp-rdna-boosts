@@ -20,9 +20,13 @@
 #
 # WHAT IT CHECKS
 #   HARD  * every arm's server survives every request and its log has no `GGML_ASSERT` / abort
-#   HARD  * the park arm actually moved cells (`seq_park` / `seq_unpark` traced) - a run whose parking
+#   HARD  * the park arm actually moved cells (`seq_park` / `seq_unpark` moves traced) - a run whose parking
 #           silently does nothing (a cache it refuses, a slot with no prompt) would otherwise pass by
-#           being trivially equal to itself
+#           being trivially equal to itself.  A DECLINED park is the one legitimate exception: when the cache
+#           refuses (a region-backed/windowed KV, or a slot whose cells are not one run) the server says
+#           "cannot park the idle slot: saving it to the prompt cache and clearing it", which is exactly the
+#           arm this gate compares against - that is reported as a pass with the fallback named, not as
+#           "parking moved nothing".
 #   HARD  * park == lazyoff, byte for byte, on every request (this is what issue #227 broke: only the
 #           attention cache was parked while the qwen4exp QSA indexer cache stayed behind, and the
 #           model aborts on the mismatch - or, on a memory type without that assert, reads wrong cells)
@@ -205,16 +209,33 @@ for arm in park parkoff lazyoff; do
     fi
 done
 
-n_park=$(grep -c "seq_park:" "$KEEPOUT/park/log.txt" || true)
-n_unpark=$(grep -c "seq_unpark:" "$KEEPOUT/park/log.txt" || true)
+# Count MOVES (`seq_park: seq N [lo, hi) -> [dst, bound)`), not every line whose logger prefix is `seq_park`:
+# the region-backed refusal warning is logged under that prefix too, and counting it made a declined park look
+# like a park that never came back.
+n_park=$(grep -cE "seq_park: seq [0-9]+ \[[0-9]+, [0-9]+\) -> " "$KEEPOUT/park/log.txt" || true)
+n_unpark=$(grep -cE "seq_unpark: seq [0-9]+ \[[0-9]+, [0-9]+\) -> " "$KEEPOUT/park/log.txt" || true)
+# the server's fallback: the cache declined the park (region-backed/windowed KV, or cells that are not one run)
+n_fallback=$(grep -c "cannot park the idle slot: saving it to the prompt cache and clearing it" "$KEEPOUT/park/log.txt" || true)
 if grep -qE "GGML_ASSERT|terminate called|Segmentation fault" "$KEEPOUT/park/log.txt"; then
     : # already reported above; an aborted arm cannot have completed the lifecycle
 elif [ "${n_park:-0}" -eq 0 ] || [ "${n_unpark:-0}" -eq 0 ]; then
-    echo "FAIL  park: parking moved nothing (seq_park=$n_park seq_unpark=$n_unpark) - a gate that never parks tests nothing."
-    echo "      The idle slots need a resident prompt to park; check that the requests reached different slots."
-    fails=$((fails + 1))
+    if [ "${n_fallback:-0}" -gt 0 ]; then
+        # A legitimate outcome, and the one the windowed KV (block 15) produces: the cache refuses the park and
+        # the server saves the idle slot to the prompt cache and clears it - the same layout `lazyoff` runs in,
+        # against which `park == lazyoff` below is still the oracle.
+        echo "PASS  park: parking declined -> save-and-clear fallback ($n_fallback idle transition(s))"
+        echo "      The KV cache refused the park (a region-backed/windowed KV, or a slot whose cells are not one"
+        echo "      run: saving it to the prompt cache and clearing it), so parking is compared as the reference."
+    else
+        echo "FAIL  park: parking moved nothing (seq_park=$n_park seq_unpark=$n_unpark) - a gate that never parks tests nothing."
+        echo "      The idle slots need a resident prompt to park; check that the requests reached different slots."
+        fails=$((fails + 1))
+    fi
 else
     echo "PASS  park: $n_park park move(s), $n_unpark unpark move(s) traced"
+    if [ "${n_fallback:-0}" -gt 0 ]; then
+        echo "      note: $n_fallback idle transition(s) in this arm fell back to save-and-clear instead of a park"
+    fi
 fi
 
 # a memory whose second cache mirrors the attention cells (the qwen4exp/glm5-next indexer) must never be told to
@@ -270,7 +291,11 @@ rc=$?
 echo
 if [ "$fails" -eq 0 ]; then
     echo "==> PASS: a request that runs alone is byte-identical to the lazy-off (saved-and-cleared) output,"
-    echo "    and every park moved the attention cache and the indexer cache together."
+    if [ "${n_park:-0}" -eq 0 ] || [ "${n_unpark:-0}" -eq 0 ]; then
+        echo "    with the cache's parks declined to the server's save-and-clear fallback (see above)."
+    else
+        echo "    and every park moved the attention cache and the indexer cache together."
+    fi
     echo "    logs kept in $KEEPOUT"
     [ "${KEEP:-0}" = "1" ] || rm -rf "$KEEPOUT"
     exit 0

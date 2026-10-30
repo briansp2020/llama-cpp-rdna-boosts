@@ -134,6 +134,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§70** | a second sequence in a batch is a **stride** in the mask predicate, not a new mask: sequence `k`'s cells and tokens shift by `k * 2^23`, so `tok_lo <= cell_pos <= tok_hi` stays exact with no kernel change — but only with one KV stream, one sequence per token, **no cell carrying two of the batch's sequences** (the shared-cell counter is a fast path, never the semantics), positions below the stride, and > 32 tokens; the reserve latch is a reserve optimization only, because `kq_mask_derivable()` re-runs per ubatch | doctrine + measured (r172, PR #247; `benchmarks/2026-10-29-derived-kq-multiseq.md`) |
 | **§71** | a graph-reorder pass is pure only while it moves nodes alone: enumerate the positional consumers (a matcher that anchors at a fixed index and returns a skip count) and exclude every input they depend on, judge it at three ubatch widths, and quote the GGUF with any claim because a reorder's reach is a model property | doctrine + measured (r180, PR #252; `benchmarks/2026-10-30-graph-order-0003-r180.md`) |
 | **§72** | a fold that merges two launches with an in-kernel barrier is pure only where it reproduces the first launch's arithmetic **and** keeps writing its output: the predicate must re-check the dispatcher's route in its own order, the width is the gate (one logits row), the elided launch's store stays, and the cross-block counter is a dedicated slot | doctrine + fix (r182, PR #253; `benchmarks/2026-10-30-router-topk-fold.md`) |
+| **§73** | a fold that elides graph nodes is pure only while every reader it could serve is accounted for: an elided store's destination must be span-checked and reproduced exactly, an elided copy's reader must be the kernel (preload the row before writing it back), a compute-time disjunctive predicate must stay a **superset** of the structural one `graph_optimize` uses, a fold that stores no intermediate needs a whole-graph reader count, and reach is a model property (single-device only, BF16/F32 gate weights) | doctrine + fix (r183, PR #256; `benchmarks/2026-10-30-gdn-decode-folds.md`) |
 
 ---
 
@@ -2396,3 +2397,63 @@ oracle for the kernel refactor.
 **Record:** `WORKLOG.md` 261030.006, `patches/README.md` (block 10, "r182"),
 `benchmarks/2026-10-30-router-topk-fold.md`, `archive/work/router-topk-fold/PROMOTED.md`,
 `ENVIRONMENT.md` (`GGML_CUDA_ROUTER_TOPK`).
+
+## 73. A fold that elides graph nodes is pure only while every reader it could serve is accounted for, and the write it elides must still happen (r183, PR #256)
+
+**The claim.**  r183 takes PR #256's three GDN decode folds and its shared-expert gate fold.  They are of two
+kinds, and each has its own failure mode.
+
+* The **snapshot fold** and the **conv-state gather fold** elide *nodes*: the direct conv kernel writes the
+  3-column recurrent snapshot tails (so the `CONCAT` and the snapshot `CPY`s launch nothing), and it reads the
+  conv cache row itself (so the deferred `GET_ROWS` launches nothing).  What they elide is a *store* whose
+  value the kernel now produces, and a *copy* whose value it now reads directly — both are pure only while
+  nothing else depends on the elided node having run.
+* The **shared-expert gate fold** elides three nodes (`SIGMOID`, `MUL`, `ADD`) and never stores the gate, the
+  sigmoid or the product, so it is pure only while no other reader exists.
+
+**The rules.**
+
+1. **An elided store's destination must be accounted for, and its value reproduced exactly.**  The snapshot
+   fold writes what the `CPY`s would have written (`concat[c][col + j]`, i.e. `state[c*3+j]` for `j < 3` and
+   `x[(j-3)*C + c]` otherwise) from the same sources, so it is bit-identical.  It is taken only when a runtime
+   byte-span check shows that nothing between the `CONCAT` and the conv writes over `state`/`x` or touches a
+   snapshot destination, and that the destinations are disjoint from the inputs and from each other.  A new
+   writer, a new alias, or a new window in the graph needs that check extended, not bypassed.
+2. **An elided copy's reader must be the kernel itself.**  The conv-state gather is deferred only for one
+   sequence, at most 16 tokens, with the `CONCAT` as the gather's only reader and only folded snapshot `CPY`s
+   writing the cache before the conv.  The kernel then reads the cache row at `src[1][0]`; it must preload the
+   channel's three state values into registers **before** the snapshot writes, because one of those writes is
+   the write-back to that same row.  Do not reorder that.
+3. **The fallback must be a tripwire, not a silent read.**  The deferral and the conv take the same predicate,
+   so a mismatch is a code error: `write_tail` and the `CONCAT` both abort rather than read an unwritten
+   `GET_ROWS`.  That abort is deliberate; the escape hatch is `GGML_CUDA_FUSE_GDN_CONV_GATHER=0`.
+4. **A compute-time predicate that reads data pointers must not be used before allocation.**  The 1-token
+   direct conv is gated on the q/k-norm matcher (an allocator-overlap check) and on the decode-only
+   `ssm_prescan` matcher, so it lives in `ggml_cuda_gdn_conv_match_at_concat` / `_at_conv`, which every
+   compute-time site calls.  `graph_optimize` runs before allocation and uses the structural
+   `ggml_cuda_gdn_conv_pattern_at_concat`, which must stay a **superset** (its alloc deps then cover every
+   case the compute-time matchers take).  Inverting that would let a conv be taken with no alloc dep.
+5. **A fold that never stores its intermediates needs a whole-graph reader count.**  The shared-expert gate
+   fold refuses when the gate, the sigmoid or the product is an output or has more than one use (counted over
+   every node's `src[]` and `view_src`), and it refuses F16 weights (whose `mul_mat_vec_f` can take a *half*
+   accumulator, which the fused path does not reproduce).  It reproduces `op_sigmoid` verbatim and keeps
+   `#pragma clang fp contract(off)` on `y + x*s`, the directive `sigmoid_mul_add_f32` carries.
+
+**Reach is a model property.**  The GDN folds ride the direct conv's pre-existing **single-device** gate, so a
+`-sm tensor` / `-sm layer` run with two or more devices is inert (`GGML_CUDA_CONV_FUSION_MULTI=1` excepted);
+the shared-expert gate fold needs a **BF16/F32** gate weight, which no quantized model we hold has (it is
+inert on 35B-A3B / 4B / 27B / gpt-oss and fires on qwen4exp/Flash-Next).  A bench arm that says "no change"
+on a quantized model says nothing about the fold.
+
+**How to judge a change here.**  The prefill-logit gate is the instrument for the *values* and text identity
+is the instrument for the *graph*: `gate-prefill-logits.sh --ab "<all four off>" --ub 1` (the decode width,
+which is the only width the 1-token conv fires at) reads **0.000000 KLD / 100.000 % same-top-p**, and the
+canonical gate at the default ubatch reads the same against the previous release's base.  Same-seed text must
+be byte-identical on/off on a single device *and* on a 2-GPU `-sm tensor -ncmoe` arm (inert there, so it
+proves the elision did not leak into the multi-device path).  MTP is the third: on 35B-A3B `n_max 7` the
+draft/accept counts are identical (362/203), because a verify batch is the band where the snapshot fold runs
+on `T >= 2`.
+
+**Record:** `WORKLOG.md` 261030.008, `patches/README.md` (block 10, "r183"),
+`benchmarks/2026-10-30-gdn-decode-folds.md`, `archive/work/gdn-decode-folds/PROMOTED.md`,
+`archive/work/cpy-2d-memcpy-guard/README.md`, `ENVIRONMENT.md` (§7.1/§7.2).

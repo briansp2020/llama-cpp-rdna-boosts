@@ -795,3 +795,104 @@ the arena wins the VRAM and the KV window comes out small by design; and it only
 therefore usually the arena reservation showing up in `margins[0]`, not a sizing bug: the arithmetic is
 `free − margin − everything-but-the-KV`, and it reproduces to the MiB on both boxes (27B Q8_0
 `-c 262144 -ctk/-ctv q8_0`: 123265 of 262144 cells, 4092.8 MiB resident, 4611.2 MiB spilled).
+
+---
+
+# §3.7.13 A6 (2026-10-30, tenth session) — the parking gate's fallback blindness, and the split-window design
+
+Session scope: the campaign's remainder in HANDOVER §11.  Two items were actionable on this box; the rest are
+decisions.  Box: **one R9700 (gfx1201, 32 624 MiB), `HIP_VISIBLE_DEVICES=0`**; every run 1 GPU.
+
+## 1. The owed TEST gap is CLOSED (awaiting the maintainer's commit approval)
+
+`scripts/gate-park-idle-slots.sh` now recognises the server's save-and-clear fallback.  Two things were wrong,
+not one:
+
+* the move counter was `grep -c "seq_park:"` — which also counts the **refusal warning**, logged under the
+  `seq_park` logger prefix, so a region-backed arm read `seq_park=1 seq_unpark=0` and the gate failed on
+  *"parking moved nothing"* while `park == lazyoff` on all four requests.  It now counts actual **moves**
+  (`seq_park: seq N [lo, hi) -> [dst, bound)`).
+* when no move happened **and** the park arm logged *"cannot park the idle slot: saving it to the prompt cache
+  and clearing it"*, that is the legitimate decline (a region-backed/windowed KV, or a slot whose cells are not
+  one run): the gate reports the fallback and still requires `park == lazyoff` — the same arm parking falls
+  back to.  A mixed arm (some parks, some fallbacks) passes with a note.
+
+Measured (Flash-Next GSQ-IQ3_XXS, MTP draft, `NGPU=1 SM=layer NCMOE=48 CTX=40960`, prose prompt, 96 tokens):
+
+| arm | before the fix | after the fix |
+|---|---|---|
+| `LLAMA_KV_RESIDENT_CELLS=1024` (2 windows, 3 fallbacks) | **FAIL** `parking moved nothing (seq_park=1 seq_unpark=0)`; `park == lazyoff` on A-D | **PASS** `parking declined -> save-and-clear fallback (3 idle transitions)`, `park == lazyoff` A-D, `parkoff != lazyoff` on B/C/D (the workload still reproduces #210) |
+| no window (control) | (had passed) | **PASS** `6 park move(s), 2 unpark move(s) traced`, unchanged oracle |
+
+`check-gpu-faults.sh` clean on every arm's log and the kernel journal; no aborts.  Nothing in the delivery's
+patch set changed (the fix is `scripts/`-only, so `release.json`'s artifact hashes are untouched).
+
+## 2. A `-sm tensor` window: [`A6-TENSOR-SPLIT-WINDOW.md`](A6-TENSOR-SPLIT-WINDOW.md) (design only)
+
+Not implemented (one card, nothing to validate against).  The note's cross-check against `common/fit.cpp`
+found four things a blind implementation would get wrong:
+
+1. `margins[0]` in the window block is **simple device 0's** `--fit-target`, not the sum, while `free_dev` is
+   the Meta device's **summed** free — so on a split the budget silently omits `(ntd-1) × target`.
+2. the probe's `kv_bytes_full[0]` is the **whole logical** KV (the probe is `no_alloc`), so `cell_bytes` and
+   `W × cell_bytes` are already **aggregate** figures — correct for the aggregate budget, but they cannot tell
+   whether one device can hold *its* share, so per-device feasibility must be checked separately.
+3. the pinned-spill **plan** (`llama-kv-cache.cpp`, logical `cell_all`) under-counts by `n_devices×` for a
+   **MIRRORED** cache (`cache_idx_*`, the dsv4/glm5-next KV) — invariant 14 says bound the plan, so it must be
+   built from the per-device geometry.
+4. the split branch's `estimate()` is `model + ntd*(ctx+comp)` and its KV component is the whole logical KV, so
+   the KV is counted `ntd×` there — pre-existing, independent of the window, and it is why the window decision
+   (which changes `ttarget`) has to move into that branch rather than follow it.
+
+Two code facts make the split window smaller than it looks: the **cell axis is never split** (axis-0 KV-head
+split ⇒ `W` is shared), and the Meta buft's `alloc_buffer_n` / `init_tensor` / `get`/`set` already fan out per
+child, so the window commit and the lazy host growth need no new per-device logic.  The gaps are the Meta
+buft variant, a grow **fan-out** (the CUDA grow proc currently returns success for any non-CUDA buffer — a
+silent no-op that would fault the GPU), a Meta-aware `is_kv_buft` for the fit, `region_capable`, and C5 above.
+
+## 3. Not started / decisions (unchanged)
+
+The `auto` policy and Goal C's three questions are the maintainer's (HANDOVER §11); Goal B is not started.
+
+## 4. Goal B's baseline (B0) — naive streaming is a 14 % loss
+
+Goal B's plan is [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md).  Its first job was to measure what a *streamed
+attended set* costs today, with no mechanism at all: block 15 at `W=1` puts both KV caches' tails in pinned host
+RAM, and the QSA reader (already sparse and exact, `fattn-qsa.cuh`) then reads its attended set from host.  So
+`W=1` **is** the naive streaming arm.
+
+Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, `-c 65536`, q8_0 KV, 51 475-token prompt, `-n 2000`,
+`ROCBLAS_USE_HIPBLASLT=0`, 1 GPU, interleaved, 1 rep each:
+
+| arm | prefill t/s | decode t/s | ms/token | arena MiB | residency | hit |
+|---|---|---|---|---|---|---|
+| plain | 584.13 | **39.19** | 25.52 | 24 539.0 | 60.0 % | 0.9686 |
+| `W=1` (spilled; `KVREGION_FREE … host=` > 0) | **604.49 (+3.5 %)** | **33.67 (−14.1 %)** | 29.70 | **25 338.3 (+799)** | **61.9 %** | 0.9727 |
+
+* The attended set is `top_k + r - 1 = 2051` cells/query/layer (GGUF: `indexer.top_k 2048`,
+  `compress_ratios 4`) = 3.98 % of a 51 475-token context → ~26 MiB/token of attention read; the indexer scores
+  every block, ~82 MiB/token at this depth.  Together ~108 MiB/token ≈ 2 ms at the peak link rate, but the
+  measured cost is **4.18 ms** ⇒ either scattered host reads run at ~26 GB/s or part of the traffic is
+  unattributed.  **That attribution is B1's job before any policy is designed**, and it is why the plan does
+  not start with a page table.
+* A 799 MiB arena gain for a 14 % decode loss is the wrong trade *as it stands*: Goal B has to earn those ~12
+  points back.  Prefill moves the other way (+3.5 %, capacity-bound), so the loss is a decode-side read.
+* Purity is not in question for a mechanism of this class (residency changes *where* the bytes live): the oracle
+  is the prefill-logit gate at **100.000 %**, not the drafter ring's acceptance trade.
+
+### B1 (same session) — the crossover is placement, not mechanism
+
+The B0 arm was measuring a **dense** read: on gfx1201 single-token decode is dense at every depth by arch policy
+(`qwen4exp.cpp:2506`, `qsa_dense_decode_until = 1<<62`).  Forcing the sparse arm (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`)
+and moving the KV between VRAM and host gives four arms per depth (Flash-Next IQ3, `-ncmoe 48`, q8_0, `-n 400`):
+
+| depth | dense+resident | sparse+resident | dense+streamed | sparse+streamed |
+|---|---|---|---|---|
+| 51 475 | **46.5** | 38.0 | 33.4 | 37.2 |
+| 102 899 | **42.4** | 32.6 | 21.0 | 27.8 |
+| 180 035 | **37.0** | 25.3 | 14.7 | **21.9** |
+
+⇒ **resident → dense** (VRAM is ~10x the link; sparse adds `O(depth)` indexer compute), **streamed → sparse**
+(+32…49 %, growing with depth), and the whole of Goal B is a *fittability/arena* feature like block 15, not a
+speed one.  The one missing piece is that the decode-arm policy does not know the KV is streaming — no page
+table is needed for the win.  Plan §3.2 has the detail and the revised B2.

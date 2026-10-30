@@ -1,0 +1,241 @@
+From 3617f5511b4b9c0376cbcbe3d9ed02ce4f75eedd Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 30 Oct 2026 12:32:32 +0000
+Subject: [PATCH 2/4] GDN conv-state gather fold: build_rs's GET_ROWS of the
+ conv cache feeding a direct-conv CONCAT with the snapshot fold is deferred
+ like the GDN state gather, and the direct kernel reads the cache row itself
+ (row id = the gather's src[1]; the three state values sit in registers before
+ the snapshot writes, one of which is the write-back to that row). Single
+ sequence, <= 16 tokens, the CONCAT is the gather's only reader and only
+ folded snapshot CPYs write the cache before the conv; a CONCAT over a
+ deferred gather that the direct conv does not take aborts. Bit-identical.
+ GGML_CUDA_FUSE_GDN_CONV_GATHER=0 off
+
+---
+ ggml/src/ggml-cuda/gdn-conv.cu            | 45 +++++++++++++++++--
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu  | 53 ++++++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh |  4 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu           |  3 ++
+ 4 files changed, 100 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
+index c66823901..f1aa17db3 100644
+--- a/ggml/src/ggml-cuda/gdn-conv.cu
++++ b/ggml/src/ggml-cuda/gdn-conv.cu
+@@ -1,6 +1,7 @@
+ #include "gdn-conv.cuh"
+ #include "unary.cuh"
+ #include <cstdlib>
++#include <algorithm>
+ 
+ // The direct kernel is bit-identical to the CONCAT+SSM_CONV+SILU reference on a single-device graph
+ // (same 4-tap reduction order, same silu, `gdn_concat_tail` still materializes the snapshot tail).
+@@ -47,10 +48,14 @@ struct gdn_conv_norm_args {
+ template <bool apply_silu, int TT, bool fuse_norm = false>
+ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float * __restrict__ state, const float * __restrict__ x,
+         const float * __restrict__ w, float * __restrict__ y, const int C, const int T, const gdn_conv_snap_args snap,
+-        const gdn_conv_norm_args norm) {
++        const gdn_conv_norm_args norm, const int32_t * __restrict__ state_ids, const int64_t state_row) {
+     const int c  = blockIdx.x * 256 + threadIdx.x;
+     const int t0 = blockIdx.y * TT;
+     if (c >= C) return;
++    // a deferred conv-state gather (ggml_cuda_gdn_conv_gather_deferrable): the state is the cache row itself
++    if (state_ids != nullptr) {
++        state += (int64_t) state_ids[0] * state_row;
++    }
+     // this channel's state, read before the snapshot writes below (one of them may be the write-back to that row)
+     float sr[3] = { 0.0f, 0.0f, 0.0f };
+     if (t0 < 3) {
+@@ -248,6 +253,14 @@ bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cu
+ }
+ 
+ void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m) {
++    {
++        const ggml_tensor * root = m.state;
++        while (root->view_src != nullptr) {
++            root = root->view_src;
++        }
++        GGML_ASSERT(std::find(ctx.gdn_deferred_gathers.begin(), ctx.gdn_deferred_gathers.end(), root) == ctx.gdn_deferred_gathers.end() &&
++                    "a deferred conv-state gather must take the snapshot-fold path");
++    }
+     const int ncols = (int) (m.T + 3 - m.tail_from);
+     if (ncols <= 0) return;
+     const int64_t n = m.C * ncols;
+@@ -266,13 +279,28 @@ void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_
+         snap.n = m.n_snap;
+         for (int a = 0; a < m.n_snap; ++a) { snap.dst[a] = (float *) m.snap_dst[a]->data; snap.col[a] = m.snap_col[a]; }
+     }
+-    const float * state = (const float *) m.state->data;
++    // the state's GET_ROWS was deferred by the graph loop (ggml_cuda_gdn_conv_gather_deferrable): read the cache row
++    const float *   state     = (const float *) m.state->data;
++    const int32_t * state_ids = nullptr;
++    int64_t         state_row = 0;
++    {
++        const ggml_tensor * root = m.state;
++        while (root->view_src != nullptr) {
++            root = root->view_src;
++        }
++        if (std::find(ctx.gdn_deferred_gathers.begin(), ctx.gdn_deferred_gathers.end(), root) != ctx.gdn_deferred_gathers.end()) {
++            GGML_ASSERT(m.snap && m.T <= 16 && m.state->data == root->data);
++            state     = (const float *) root->src[0]->data;
++            state_ids = (const int32_t *) root->src[1]->data;
++            state_row = root->src[0]->nb[1] / sizeof(float);
++        }
++    }
+     if (norm) {
+         gdn_conv_direct_kernel<true, TT, true><<<grid, 256, 0, ctx.stream()>>>(state, (const float *) m.x->data,
+-            (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T, snap, *norm);
++            (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T, snap, *norm, state_ids, state_row);
+     } else {
+         gdn_conv_direct_kernel<true, TT><<<grid, 256, 0, ctx.stream()>>>(state, (const float *) m.x->data,
+-            (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T, snap, gdn_conv_norm_args{});
++            (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T, snap, gdn_conv_norm_args{}, state_ids, state_row);
+     }
+     CUDA_CHECK(cudaGetLastError());
+ }
+@@ -357,6 +385,15 @@ int ggml_cuda_gdn_conv_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgra
+         return 0;
+     }
+     ggml_cuda_gdn_conv_match gm;
++    if (node->op == GGML_OP_CONCAT && !ctx.gdn_deferred_gathers.empty() && !ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
++        const ggml_tensor * root = node->src[0];
++        while (root != nullptr && root->view_src != nullptr) {
++            root = root->view_src;
++        }
++        GGML_ASSERT(std::find(ctx.gdn_deferred_gathers.begin(), ctx.gdn_deferred_gathers.end(), root) == ctx.gdn_deferred_gathers.end() &&
++                    "a CONCAT over a deferred conv-state gather must be taken by the direct conv");
++        return 0;
++    }
+     if (node->op == GGML_OP_CONCAT && ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
+         if (!gm.snap) {
+             ggml_cuda_gdn_conv_write_tail(ctx, gm);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 2d4454c49..3f2a9f2ee 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -442,6 +442,7 @@ void ggml_cuda_gdn_gather_index_build(const ggml_cgraph * cgraph, ggml_cuda_gdn_
+         const bool view_or_noop = ggml_cuda_is_view_or_noop(n);
+         const ggml_tensor * gdn_root =
+             n->op == GGML_OP_GATED_DELTA_NET && n->src[5] != nullptr ? root_of(n->src[5]) : nullptr;
++        const ggml_tensor * concat_root = n->op == GGML_OP_CONCAT && n->src[0] != nullptr ? root_of(n->src[0]) : nullptr;
+ 
+         // a non-view node reading a gather is a reader that blocks the deferral, unless it is that gather's GDN
+         if (!view_or_noop) {
+@@ -459,6 +460,11 @@ void ggml_cuda_gdn_gather_index_build(const ggml_cgraph * cgraph, ggml_cuda_gdn_
+                 if (read[k] == gdn_root) {
+                     continue;
+                 }
++                // read[0] is a CONCAT's src[0] (a CONCAT is no view): its state operand
++                if (k == 0 && concat_root != nullptr && read[k] == concat_root && n->view_src == nullptr &&
++                        (n->src[1] == nullptr || root_of(n->src[1]) != concat_root)) {
++                    continue;   // the CONCAT's state operand: counted below, decided by ggml_cuda_gdn_conv_gather_deferrable
++                }
+                 auto it = idx.gathers.find(read[k]);
+                 if (it != idx.gathers.end()) {
+                     it->second.other_reader = true;
+@@ -472,6 +478,13 @@ void ggml_cuda_gdn_gather_index_build(const ggml_cgraph * cgraph, ggml_cuda_gdn_
+                 it->second.n_gdn++;
+             }
+         }
++        if (concat_root != nullptr) {
++            auto it = idx.gathers.find(concat_root);
++            if (it != idx.gathers.end()) {
++                it->second.concat = j;
++                it->second.n_concat++;
++            }
++        }
+         if (!view_or_noop) {
+             auto it = idx.writers.find(root_of(n));
+             if (it != idx.writers.end()) {
+@@ -485,7 +498,7 @@ void ggml_cuda_gdn_gather_index_build(const ggml_cgraph * cgraph, ggml_cuda_gdn_
+ bool ggml_cuda_gdn_state_gather_deferrable(const ggml_cgraph * cgraph, int node_idx, const ggml_cuda_gdn_gather_index & idx) {
+     const ggml_tensor * gr = cgraph->nodes[node_idx];
+     const auto g = idx.gathers.find(gr);
+-    if (g == idx.gathers.end() || g->second.n_gdn != 1 || g->second.other_reader) {
++    if (g == idx.gathers.end() || g->second.n_gdn != 1 || g->second.n_concat != 0 || g->second.other_reader) {
+         return false;
+     }
+     const int gdn_idx = g->second.gdn;
+@@ -527,6 +540,44 @@ static const struct {
+     { GGML_OP_RESHAPE,  12, -2 }, // 13: [n_expert, n_tokens]
+ };
+ 
++// The conv-state gather (build_rs's GET_ROWS of the recurrent conv cache) feeding a GDN conv CONCAT that the direct conv
++// takes with its snapshot fold: the direct kernel reads the cache row itself (row id = the gather's src[1]) and the
++// GET_ROWS launches nothing.  It holds each channel's three state values in registers before it writes the snapshots,
++// one of which is the write-back to that same row.  Only for a single sequence in the decode / verify band (<= 16
++// tokens), when the CONCAT is the gather's only reader and nothing but the folded snapshot CPYs writes the cache before
++// the conv.  GGML_CUDA_FUSE_GDN_CONV_GATHER=0: off.
++bool ggml_cuda_gdn_conv_gather_deferrable(const ggml_cgraph * cgraph, int node_idx, const ggml_cuda_gdn_gather_index & idx) {
++    static const bool fuse = getenv("GGML_CUDA_FUSE_GDN_CONV_GATHER") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_CONV_GATHER")) != 0;
++    const ggml_tensor * gr = cgraph->nodes[node_idx];
++    const auto g = idx.gathers.find(gr);
++    if (!fuse || g == idx.gathers.end() || g->second.n_gdn != 0 || g->second.n_concat != 1 || g->second.other_reader ||
++            g->second.concat < node_idx) {
++        return false;
++    }
++    ggml_cuda_gdn_conv_match m;
++    if (!ggml_cuda_gdn_conv_match_at_concat(cgraph, g->second.concat, m) || !m.snap || m.T > 16 ||
++            gdn_gather_root_of(m.state) != gr || m.state->data != gr->data || ggml_nelements(gr) != 3 * m.C ||
++            gr->src[1]->ne[0] != 1 || ggml_nrows(gr) != 1) {
++        return false;
++    }
++    const auto w = idx.writers.find(gdn_gather_root_of(gr->src[0]));
++    if (w != idx.writers.end()) {
++        for (const int j : w->second) {
++            if (j <= node_idx || j >= m.conv_idx) {
++                continue;
++            }
++            bool snap = false;
++            for (int a = 0; a < m.n_snap; ++a) {
++                snap = snap || m.snap_idx[a] == j;
++            }
++            if (!snap) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
+ static bool ggml_cuda_topk_moe_fusion_disabled() {
+     // A/B kill-switch for the fused MoE router.  The fused kernel is bit-identical to the generic
+     // softmax -> argsort -> get_rows -> norm chain (both the softmax reduction/normalization and
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh
+index 57733fde2..5e47bcd60 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh
+@@ -27,6 +27,8 @@ struct ggml_cuda_gdn_gather_index {
+         int  gdn          = -1;    // index of the GATED_DELTA_NET whose state (src[5]) roots at the gather
+         int  n_gdn        = 0;
+         bool other_reader = false; // a non-view node other than that GDN reads the gathered rows
++        int  concat       = -1;    // index of the GDN conv CONCAT whose state (src[0]) roots at the gather
++        int  n_concat     = 0;
+     };
+     std::unordered_map<const ggml_tensor *, gather_info>      gathers; // keyed by the candidate GET_ROWS
+     std::unordered_map<const ggml_tensor *, std::vector<int>> writers; // cache root -> non-view nodes rooted at it
+@@ -34,5 +36,7 @@ struct ggml_cuda_gdn_gather_index {
+ };
+ void ggml_cuda_gdn_gather_index_build(const ggml_cgraph * cgraph, ggml_cuda_gdn_gather_index & idx);
+ bool ggml_cuda_gdn_state_gather_deferrable(const ggml_cgraph * cgraph, int node_idx, const ggml_cuda_gdn_gather_index & idx);
++// the conv-state gather of a GDN layer whose direct conv reads the cache row itself (ggml_cuda_gdn_conv_direct)
++bool ggml_cuda_gdn_conv_gather_deferrable(const ggml_cgraph * cgraph, int node_idx, const ggml_cuda_gdn_gather_index & idx);
+ struct ggml_cuda_topk_moe_args;
+ bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, struct ggml_cuda_topk_moe_args & args);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f4089f81a..5f9cb4b14 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5952,6 +5952,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                        i, node->name, (int) deferrable, (int) !deferrable);
+                         }
+                     }
++                    if (!deferrable && gdn_gather_index_mode != 0) {
++                        deferrable = ggml_cuda_gdn_conv_gather_deferrable(cgraph, i, gdn_gather_index);
++                    }
+                     if (deferrable) {
+                         cuda_ctx->gdn_deferred_gathers.push_back(node);
+                         continue;
+-- 
+2.53.0
+

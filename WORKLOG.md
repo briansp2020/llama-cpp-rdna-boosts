@@ -1,5 +1,64 @@
 # WORKLOG - dated delivery records
 
+## 261030.008 (r183) -- PR #256's GDN decode folds ship (block 10): +5.9 % gfx1100 / +3.3 % gfx1201 decode, bit-identical, plus the 2-D copy guard that fixes a Flash-Next `-sm tensor` load abort
+
+**Released as `v16-6050b467c-r183` (16 blocks; block 10 amended).**  Contributor `@briansp2020`'s
+[PR #256](https://github.com/stew675/llama-cpp-rdna-boosts/pull/256), filed as `wip/gdn-decode-folds-r176/`
+against r176 and applying with `git am` unchanged to r182.  It is the follow-up that #249's review asked for
+(the 1-token direct conv gated on `gdn_conv_norm_match() > 0`, `ssm_prescan` checked first, the
+`return 0` -> `continue` slip fixed, measured on both gfx1100 and gfx1201), and the win arrives through the two
+folds that gating enables.  All four patches are taken; the release also carries a load-abort fix found while
+setting up its Flash-Next arm (**not** the PR's: it reproduces on stock r182).
+
+**What shipped.**
+* The direct GDN conv also writes the recurrent **snapshot tails** (`GGML_CUDA_DISABLE_GDN_CONV_SNAP=1` off), so
+  the `CONCAT` and the snapshot `CPY`s launch nothing wherever the direct conv runs.  Taken only when a runtime
+  byte-span check shows nothing between the CONCAT and the conv writes over `state`/`x` or touches a snapshot
+  destination and the destinations are disjoint; the batched-copy run stops at a folded snapshot `CPY`.
+* The **conv-state gather fold** (`GGML_CUDA_FUSE_GDN_CONV_GATHER=0` off): `build_rs`'s `GET_ROWS` of the conv
+  cache, feeding a CONCAT the direct conv takes, is deferred into the kernel, which reads the cache row itself
+  (`row id = src[1]`) and writes it back with the three state values preloaded.  One sequence, <= 16 tokens, the
+  CONCAT the gather's only reader, only folded snapshot `CPY`s writing the cache before the conv; a CONCAT over
+  a deferred gather the direct conv does not take **aborts** by design.
+* The **1-token direct conv** (`GGML_CUDA_FUSE_GDN_CONV_DECODE=0` off): RDNA4 / RDNA3_0, only where it also
+  elides the q/k norm pair and the decode-only `ssm_prescan` would not take the conv first.  The data-dependent
+  gate lives in the compute-time matchers; `graph_optimize` uses the structural
+  `ggml_cuda_gdn_conv_pattern_at_concat`, a superset, so its alloc deps cover every case.
+* The **shared-expert gate fold** (`GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0` off): the gate `MUL_MAT` (one row) +
+  `SIGMOID` + `MUL` + `ADD` in the `mul_mat_vec_f` launch the gate would take, reproducing `op_sigmoid` and
+  `sigmoid_mul_add_f32`'s `contract(off)` expression.  BF16/F32 gate weights only, decode/verify band.
+* The **2-D copy guard**: `ggml_cuda_cpy_as_memcpy_2d` keeps upstream's fast path only while the padded span
+  fits the tensor's own allocation.  A 2-D copy of a view of a mirrored model weight is refused with
+  `invalid argument` when the weight sits in the slab, which made `Flash-Next GSQ-IQ3_XXS -sm tensor -ncmoe 48`
+  abort at load on r182 and earlier (device 1, `blk.1.ple_conv1d.weight`'s column view, the qwen4exp PLE conv;
+  `-sm layer` and `GGML_CUDA_SLAB=0` both loaded).  The scalar kernels are the bit-identical fallback, and no
+  other model we hold reaches the path (0 2-D copies in an instrumented run of 35B-A3B, 4B, 27B, gpt-oss).
+
+**Worth (1 GPU, `llama-bench -r 5`, two interleaved rounds, all four on vs all four off).**  gfx1100
+Qwen3.6-35B-A3B Q4_K_M tg128 **142.3 -> 150.6 (+5.9 %)**, d4096 **139.0 -> 146.9 (+5.6 %)**; gfx1201 the same
+model **105.0 -> 108.4 (+3.3 %)**, d4096 **+3.4 %**; dense 27B UD-Q4_K_XL **+1.7 %**; Qwen3.5-4B Q8_0
+neutral.  Decomposed on gfx1201: `0003` alone **+0.3 %** (the enabler; exactly what #249 measured), the
+snapshot fold **+2.2 %**, the gather fold **+1.0 %**.  The shared-expert gate fold is inert on every quantized
+model we hold and **+0.6 %** on Flash-Next GSQ-IQ3_XXS tg128.  The contributor's +7.2 % (7900 XTX) / +5.6 %
+(R9700) against r176 reproduce in direction; against r182 they measure +5.9 % / +3.3 % here.
+
+**Purity.**  Greedy text byte-identical on/off (35B-A3B 1 GPU, 4B Q8_0, 2-GPU `-sm tensor -ncmoe 40`, Flash-Next
+`-sm layer`); `gate-prefill-logits.sh --ab "<all four off>" --ub 1` (the decode width, where the 1-token conv
+fires) **0.000000 KLD / 100.000 %** on 27B Q8_0; the canonical 27B Q8_0 gate **0.000000 / 100.000 %** against
+the r182 base; MTP on 35B-A3B `n_max 7` identical (draft/accept **362/203**); a `--parallel 2 --kv-unified`
+server run is clean (a multi-sequence batch declines the gather deferral); Flash-Next `-sm tensor -ncmoe 48`
+now loads and decodes and its text matches the `GGML_CUDA_SLAB=0` arm; per-block build 3/3 `--fast`;
+`validate-set.sh` green (tree `3eb7762043`); no GPU faults.
+
+**Scope, stated plainly.**  All three GDN folds ride the direct conv's pre-existing **single-device** gate, so
+a `-sm tensor` / `-sm layer` run with two or more devices gets none of them (`GGML_CUDA_CONV_FUSION_MULTI=1`
+excepted); this is a 1-GPU decode win.  The shared-expert gate fold needs a **BF16/F32** gate weight, so no
+quantized model we hold can exercise it.
+
+Record: `archive/work/gdn-decode-folds/` (the submission verbatim + `PROMOTED.md`),
+`archive/work/cpy-2d-memcpy-guard/README.md`, `benchmarks/2026-10-30-gdn-decode-folds.md`,
+`patches/README.md` (block 10, "r183"), `GREEDY-PURITY.md` §73, `ENVIRONMENT.md` (§7.1/§7.2).
+
 ## 261030.006 (r182) -- PR #253's 1-token router fold ships (block 10): +1.2..+3.1 % MoE decode, bit-identical
 
 **Released as `v16-6050b467c-r182` (16 blocks; block 10 amended).**  Contributor `@briansp2020`'s
@@ -52,6 +111,48 @@ RDNA4 at 256 experts.
 Record: `archive/work/router-topk-fold/` (the submission verbatim + `PROMOTED.md`, the assessment),
 `benchmarks/2026-10-30-router-topk-fold.md`, `patches/README.md` (block 10, "r182"), `GREEDY-PURITY.md`
 §72, `ENVIRONMENT.md` (`GGML_CUDA_ROUTER_TOPK`).
+## 261030.007 -- `gate-park-idle-slots.sh` grades the save-and-clear fallback (a gate fix, no block change)
+
+**Not a release: `patches/` and `release.json` are untouched by this commit and the block set is unchanged
+(r182 is the release current at the time of writing); no re-cut and no tag.**  A scripts-only fix to the server
+parking gate, plus the campaign's decisions.
+
+**The gate HARD-failed a legitimate outcome, for two reasons.**  (1) It counted parks with
+`grep -c "seq_park:"`, which also matches the **region-backed refusal warning** — logged under the `seq_park`
+logger prefix — so a windowed cache read `seq_park=1 seq_unpark=0` and looked like "a park that never came
+back".  (2) When the cache declines the park, the server says *"cannot park the idle slot: saving it to the
+prompt cache and clearing it"* (`server-context.cpp`, `park_idle_slots_for_launch`), which is exactly the arm
+the gate compares against (`lazyoff`); the gate should require `park == lazyoff` and report the fallback, not
+fail on *"parking moved nothing"*.  That path already existed for any slot whose cells are not one run
+(a prefix shared through `seq_cp`); the windowed KV (block 15) made it reachable.
+
+**The fix.**  Count actual **moves** (`seq_park: seq N [lo, hi) -> [dst, bound)`), and when no move happened
+but the park arm logged the fallback line, report *"parking declined -> save-and-clear fallback (N idle
+transitions)"* and keep the `park == lazyoff` oracle.  A mixed arm (some parks, some fallbacks) passes with a
+note; a run that neither parks nor falls back still fails.
+
+**Verified** (Flash-Next GSQ-IQ3_XXS + MTP draft, 1 GPU, `SM=layer NCMOE=48 CTX=40960`, prose prompt, 96
+tokens/request, 1 R9700/gfx1201):
+
+| arm | before | after |
+|---|---|---|
+| `LLAMA_KV_RESIDENT_CELLS=1024` (2 windows) | **FAIL** `parking moved nothing (seq_park=1 seq_unpark=0)`; text `park == lazyoff` on A-D | **PASS** `parking declined -> save-and-clear fallback (3 idle transitions)`, `park == lazyoff` A-D, `parkoff != lazyoff` on B/C/D (the workload still reproduces #210) |
+| no knob (control) | passed | **PASS** `6 park move(s), 2 unpark move(s) traced`, same oracle |
+
+`check-gpu-faults.sh` clean on every arm's log and the kernel journal; no aborts.
+
+**Decisions taken (the campaign's, recorded here so they do not get re-litigated):**
+
+* **`auto` stays capacity-only** — `--fit` sizes a window only when a pinned `-c` does not fit, against
+  `free - margin - everything-but-the-KV` with the arena/slab reserve in the margin.  The arena half
+  (`A2-MIXED-BACKING.md` §3.7.11.4 A: +2.2..2.9 GiB, worth +3.8 % decode at the 122B's residency and ~0 at the
+  35B's) needs a **numeric** `W` at or above the run depth; a policy that spills to grow the arena is not
+  adopted (a percentage-of-slab form of `W` stays deferred).
+* **A window across a `-sm tensor` split stays parked** — designed in
+  `wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md` (design only; its `common/fit.cpp` cross-check lists four things
+  an implementation must honour, `margins[0]` first).  It is picked up on the multi-GPU development host.
+* **Goal B (a sparse attended set streamed cheaply) is next**, developed **inside `wip/` only** until it is
+  promoted; `patches/` is left alone while the other delivery work is in flight.
 
 ## 261030.005 (r181) -- block 15: `--fit` + `-sm tensor` fixed properly (three asserts), plus three `auto` wiring defects
 

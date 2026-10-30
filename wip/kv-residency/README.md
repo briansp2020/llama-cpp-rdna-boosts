@@ -135,16 +135,22 @@ A streamed KV's resident pool must contain **everything attention reads this ste
 link bytes on the critical path, and the link is the constraint:
 
 ```
-H2D pinned / D2H pinned / kernel read of a pinned mapping : 28.8 / 28.2 / 29.0 GB/s   (measured, §7)
+H2D pinned / D2H pinned / kernel read of a pinned mapping : 55.7 / 56.8 / 55.7 GB/s   (re-cabled 2026-10-30, §7)
 kernel read of VRAM                                       : 565 GB/s
 ```
 
-so **1 GiB of misses per token = 37 ms/token**, and the question is only ever "how small is the attended set".
+so **1 GiB of misses per token = 18 ms/token**, and the question is only ever "how small is the attended set".
+(Corrected 2026-10-30 in A9: the 28.8 GB/s figures were pre-re-cable.  A *scattered* read of the same pinned
+mapping is NOT the linear rate — B0 implies ~26 GB/s; `B1-STRATA-PLAN.md` §3.)
 
 | family | attended set per token | verdict |
 |---|---|---|
 | dense/full attention (qwen35 27B, 35B-A3B) | the whole used context | **no streaming**.  At 100 K cells on the 27B that is ~6.1 GiB of K/V → ~228 ms/token if none of it is resident.  Measured stand-in: KV wholly on the host (`-nkvo`, pageable) on a 4B at 4096 depth = **100.67 → 38.71 t/s** tg, 7640 → 5061 t/s pp |
-| **qwen4exp QSA** (Flash-Next) | `indexer.top_k 2048` blocks × `compress_ratio 4` = **8192 cells = 3.1 % of 262144** | **the target.**  The attention K/V is 5.9 GiB at 256 K and a 32 K-cell pool of 0.75 GiB serves it, with the reader already walking a block list.  Note the *indexer* keys (3.0 GiB at 256 K) are scored for **every** cell and so stay `O(n_ctx)` — that is O4, and it is the second-biggest term |
+| **qwen4exp QSA** (Flash-Next) | `indexer.top_k` is in **CELLS** (`qwen4exp.cpp`: `width = indexer_top_k + r - 1`, and the block budget is `top_k/r`), so `2048 + 4 - 1` = **2051 cells = 0.78 % of 262144** (3.98 % at 51 475) | **the target.**  Measured cache sizes at `-c 65536`: attention **816 MiB**, indexer **102 MiB** (keys-only, `A2 §3.7.11.2`), i.e. 12.75 / 1.6 KiB per cell at q8_0 — so at 262144 the attention K/V is ~3.3 GiB and a 4-8 k-cell pool (~51-102 MiB) serves it.  The *indexer* keys are scored for **every** cell, so they stay `O(n_ctx)` (~410 MiB at 262144) and must
+  stay RESIDENT — streaming them is B0's mistake (`A2 §4`).  **And the sparse reader is PREFILL-only on
+  gfx1201**: single-token decode is dense by arch policy (`qwen4exp.cpp:2506`), so a streamed KV on this
+  arch decodes *dense* unless the arm is forced — the measured matrix that decides this feature is
+  `B1-STRATA-PLAN.md` §3.1/§3.2 (`+32…49 %` for sparse under a STREAMED KV, dense still wins a resident one) |
 | deepseek4 / glm-dsa (`llama_kv_cache_dsa`) | bounded light-indexer selection | same shape, same design; no glm5-next GGUF on this fleet (`TODO` #108) |
 | gemma4 iSWA | the SWA half is *already* bounded (its own smaller cache); the full half is not | the SWA cache could become a ring with no behavioural change; the full half does not stream |
 | the **drafter** (MTP / DFlash) | bounded by construction — it only proposes | a ring (Strata's `--mtp-window`) is an *acceptance* trade, zero correctness risk (the target verifies) |
@@ -332,6 +338,10 @@ HIP_VISIBLE_DEVICES=0 /tmp/bw-probe 512 5
   bookkeeping is this campaign, T3/T4/T5-outside-the-KV-cache are the deferred later areas**), scaling laws
   with file:line, and the commands.
 * [`STRATA-KV-STREAMING.md`](STRATA-KV-STREAMING.md) — the reference design read, and the 1:1 mapping.
+* [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) — **Goal B's plan of record** (B0's measured baseline, the three
+  candidate mechanisms, the B1-B4 stages and their gates, the eligibility rule and the risks).
+* [`A6-TENSOR-SPLIT-WINDOW.md`](A6-TENSOR-SPLIT-WINDOW.md) — a window across a `-sm tensor` split: design
+  only, parked until the multi-GPU host is available.
 * [`bw-probe.cc`](bw-probe.cc) — the link/kernel-read probe (28.8 GB/s here; the card is x16 but its host
   uplink is x8 behind its switch, so read the **root port's** `max_link_width`).
 * `AGENTS.md` — the slab invariants (§"The movable-boundary slab is MoE-only"), the cross-device peer copy
