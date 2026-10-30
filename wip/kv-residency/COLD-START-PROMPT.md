@@ -1,7 +1,7 @@
 # Cold-session prompt — `wip/kv-residency` (TODO #118)
 
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from the previous
-session's context).  Rewritten 2026-10-30 (after r181) at the end of session A7, the r181 intake.
+session's context).  Rewritten 2026-10-30 at the end of session A8 (the gate fix + the split-window design).
 
 ---
 
@@ -31,29 +31,34 @@ without the knob is byte-identical to r177 including its OOM).  The shipped tree
   silent); and the `LLAMA_KV_SPILL_RAM_PCT` clamp could be taken past the VRAM budget (invariant 14 — an
   intermediate form planned a **235 GiB** pinned spill and OOM-killed the box, so **bound the spill PLAN**).
 
-**THIS SESSION'S JOB — the campaign's remainder, in order:**
+**WHAT SESSION A8 (2026-10-30) DID — do not redo it:**
 
-1. **A `-sm tensor` window** (the only technical gap left in Goal A).  Today a split declines the window by
-   design.  Doing it needs per-device region bufts wrapped in a Meta split buft plus a fit that sizes the
-   devices together.  **This box has ONE card**, so it cannot be validated here — start with a design note and a
-   cross-check against `common/fit.cpp`'s split accounting, and say plainly that the arms need a 2/3-device
-   host.  Do not implement it blind.
-2. **The `auto` policy questions** (the maintainer's call; unchanged by r181).  `auto` sizes the window to
+1. **The `-sm tensor` design note exists**: `wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md` (+
+   `A2-MIXED-BACKING.md` §3.7.13 §2).  Design only, nothing built.  It lists the five changes, the two code
+   facts that make it smaller than it looks (the cell axis is never split; the Meta buft already fans allocation
+   and init per child) and **four `common/fit.cpp` findings a blind implementation would get wrong** — read §4
+   of it before touching the block: `margins[0]` is device 0's margin not the sum; `kv_bytes/cell_bytes` are
+   already aggregate; the pinned-spill **plan** under-counts `n_devices×` for a MIRRORED cache; the split
+   `estimate()` counts the KV `ntd×`.  Implementing it is the maintainer's call and needs a 2/3-device host.
+2. **The parking-gate test gap is fixed** (`scripts/gate-park-idle-slots.sh`): it now counts park MOVES (not the
+   region refusal warning logged under the same `seq_park` prefix) and grades the save-and-clear fallback as a
+   PASS with `park == lazyoff` still required.  Verified on a windowed Flash-Next arm and the no-window control.
+   **It is UNCOMMITTED, waiting for the maintainer's go-ahead.**
+
+**WHAT IS LEFT — in order:**
+
+1. **`auto` policy** (the maintainer's call; unchanged by r181).  `auto` sizes the window to
    `free − margin − everything-but-the-KV`, where the margin includes the **arena/slab reserve** — so on a
    `-ncmoe` config the arena wins the VRAM and the window comes out small *by design* — and it only spills a
    `-c` the user pinned.  The deciding measurements are `A2-MIXED-BACKING.md` §3.7.11.4 A–C.  `W` stays a cell
    count; a percentage-of-slab form is deferred — do not re-propose it.
-3. **One owed TEST-gap fix in the delivery** (needs the maintainer's go-ahead): `scripts/gate-park-idle-slots.sh`
-   HARD-fails a legitimate outcome — when the park arm's server logs *"cannot park the idle slot: saving it to
-   the prompt cache and clearing it"* (what a windowed KV triggers, and what already happens for a slot whose
-   cells are not one run), it should require `park == lazyoff` and report the fallback instead of failing on
-   *"parking moved nothing"*.  With no window the gate passes today (verified).
-4. **Goal C decisions** (`O3-DRAFTER-RING.md` §7): the MTP drafter ring (`LLAMA_SPEC_DRAFT_WINDOW`) is
+2. **Goal C decisions** (`O3-DRAFTER-RING.md` §7): the MTP drafter ring (`LLAMA_SPEC_DRAFT_WINDOW`) is
    measured, not promoted — free at a usable window (46k context, `W=32768`: acceptance −2.3 % relative,
    generation flat), 7-9 % lost far below the working context; the prize is one draft layer (~1 GiB at
    `-c 262144`) and it does not reach the arena.  Open: default-on or not, one size or per-model, MTP-only or
    DFlash2 too.
-5. **Goal B** (a sparse attended set streamed cheaply — `STRATA-KV-STREAMING.md`) is **not started**: a different
+3. **The split window** — implement A6 only on the maintainer's go-ahead and only with a 2/3-device host.
+4. **Goal B** (a sparse attended set streamed cheaply — `STRATA-KV-STREAMING.md`) is **not started**: a different
    mechanism, needs its own plan before any code, independent of Goal A.
 
 START BY READING, in this order: `wip/kv-residency/HANDOVER.md` (**§11 = this work list**, §1 the state, §3 the

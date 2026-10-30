@@ -795,3 +795,61 @@ the arena wins the VRAM and the KV window comes out small by design; and it only
 therefore usually the arena reservation showing up in `margins[0]`, not a sizing bug: the arithmetic is
 `free − margin − everything-but-the-KV`, and it reproduces to the MiB on both boxes (27B Q8_0
 `-c 262144 -ctk/-ctv q8_0`: 123265 of 262144 cells, 4092.8 MiB resident, 4611.2 MiB spilled).
+
+---
+
+# §3.7.13 A6 (2026-10-30, tenth session) — the parking gate's fallback blindness, and the split-window design
+
+Session scope: the campaign's remainder in HANDOVER §11.  Two items were actionable on this box; the rest are
+decisions.  Box: **one R9700 (gfx1201, 32 624 MiB), `HIP_VISIBLE_DEVICES=0`**; every run 1 GPU.
+
+## 1. The owed TEST gap is CLOSED (awaiting the maintainer's commit approval)
+
+`scripts/gate-park-idle-slots.sh` now recognises the server's save-and-clear fallback.  Two things were wrong,
+not one:
+
+* the move counter was `grep -c "seq_park:"` — which also counts the **refusal warning**, logged under the
+  `seq_park` logger prefix, so a region-backed arm read `seq_park=1 seq_unpark=0` and the gate failed on
+  *"parking moved nothing"* while `park == lazyoff` on all four requests.  It now counts actual **moves**
+  (`seq_park: seq N [lo, hi) -> [dst, bound)`).
+* when no move happened **and** the park arm logged *"cannot park the idle slot: saving it to the prompt cache
+  and clearing it"*, that is the legitimate decline (a region-backed/windowed KV, or a slot whose cells are not
+  one run): the gate reports the fallback and still requires `park == lazyoff` — the same arm parking falls
+  back to.  A mixed arm (some parks, some fallbacks) passes with a note.
+
+Measured (Flash-Next GSQ-IQ3_XXS, MTP draft, `NGPU=1 SM=layer NCMOE=48 CTX=40960`, prose prompt, 96 tokens):
+
+| arm | before the fix | after the fix |
+|---|---|---|
+| `LLAMA_KV_RESIDENT_CELLS=1024` (2 windows, 3 fallbacks) | **FAIL** `parking moved nothing (seq_park=1 seq_unpark=0)`; `park == lazyoff` on A-D | **PASS** `parking declined -> save-and-clear fallback (3 idle transitions)`, `park == lazyoff` A-D, `parkoff != lazyoff` on B/C/D (the workload still reproduces #210) |
+| no window (control) | (had passed) | **PASS** `6 park move(s), 2 unpark move(s) traced`, unchanged oracle |
+
+`check-gpu-faults.sh` clean on every arm's log and the kernel journal; no aborts.  Nothing in the delivery's
+patch set changed (the fix is `scripts/`-only, so `release.json`'s artifact hashes are untouched).
+
+## 2. A `-sm tensor` window: [`A6-TENSOR-SPLIT-WINDOW.md`](A6-TENSOR-SPLIT-WINDOW.md) (design only)
+
+Not implemented (one card, nothing to validate against).  The note's cross-check against `common/fit.cpp`
+found four things a blind implementation would get wrong:
+
+1. `margins[0]` in the window block is **simple device 0's** `--fit-target`, not the sum, while `free_dev` is
+   the Meta device's **summed** free — so on a split the budget silently omits `(ntd-1) × target`.
+2. the probe's `kv_bytes_full[0]` is the **whole logical** KV (the probe is `no_alloc`), so `cell_bytes` and
+   `W × cell_bytes` are already **aggregate** figures — correct for the aggregate budget, but they cannot tell
+   whether one device can hold *its* share, so per-device feasibility must be checked separately.
+3. the pinned-spill **plan** (`llama-kv-cache.cpp`, logical `cell_all`) under-counts by `n_devices×` for a
+   **MIRRORED** cache (`cache_idx_*`, the dsv4/glm5-next KV) — invariant 14 says bound the plan, so it must be
+   built from the per-device geometry.
+4. the split branch's `estimate()` is `model + ntd*(ctx+comp)` and its KV component is the whole logical KV, so
+   the KV is counted `ntd×` there — pre-existing, independent of the window, and it is why the window decision
+   (which changes `ttarget`) has to move into that branch rather than follow it.
+
+Two code facts make the split window smaller than it looks: the **cell axis is never split** (axis-0 KV-head
+split ⇒ `W` is shared), and the Meta buft's `alloc_buffer_n` / `init_tensor` / `get`/`set` already fan out per
+child, so the window commit and the lazy host growth need no new per-device logic.  The gaps are the Meta
+buft variant, a grow **fan-out** (the CUDA grow proc currently returns success for any non-CUDA buffer — a
+silent no-op that would fault the GPU), a Meta-aware `is_kv_buft` for the fit, `region_capable`, and C5 above.
+
+## 3. Not started / decisions (unchanged)
+
+The `auto` policy and Goal C's three questions are the maintainer's (HANDOVER §11); Goal B is not started.

@@ -24,7 +24,8 @@ build — **§3.7.11 is this session**) and [`MIXED-BACKING.md`](MIXED-BACKING.m
 > `GGML_ABORT`s on a slab-armed MoE config where the plain arm completes), and the **provider is on by
 > default** (`LLAMA_KV_REGION=0` is the kill switch).  What is left in the campaign is **Goal B (not
 > started)**, **Goal C** (the drafter ring: measured, not promoted, three questions in `O3-DRAFTER-RING.md`
-> §7) and one owed *test* fix (the parking gate cannot grade the save-and-clear fallback).
+> §7), the split-window design (A6, not implementable on this one-card box), and the parking gate's
+> save-and-clear fallback (fixed in A6, awaiting the maintainer's commit approval; §3.7.13).
 >
 > **The box.**  One R9700 (gfx1201), 32 624 MiB; the PCIe rework (2026-10-30) makes the link **55.7 GB/s**
 > H2D / 56.8 D2H.  Every pre-swap t/s number in this campaign is at 28.8 GB/s and **must not be compared**
@@ -370,6 +371,9 @@ read/restore paths.
    arena's sake*, so the arena half needs a numeric `W` or a policy change.
 5. **The promotion conversation** (a block, `ENVIRONMENT.md`, and the default-on call for the window itself) --
    the maintainer's.  It now needs the §3.7.11.3 decision too.
+6. **The split window** -- designed in A6 ([`A6-TENSOR-SPLIT-WINDOW.md`](A6-TENSOR-SPLIT-WINDOW.md));
+   implementing it is the maintainer's call, and its arms need a 2/3-device host.  The §3.7.13 findings
+   (`margins[0]`, the mirrored-cache spill plan, the split `estimate()`'s `ntd×` KV) are owed by any change here.
 
 ### 7.3 The re-measurement (owed since the 2026-10-30 re-cable) -- **DONE in A5** (`A2-MIXED-BACKING.md` §3.7.11.4)
 
@@ -503,6 +507,7 @@ passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 |---|---|
 | [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) | **the state of the build**: what is implemented, every gate, §3.5 the arena numbers, §3.6 the deep arm + the break-even, §3.7 the re-baseline at the new link, and **§3.7.11 = the A5 session** (the spilling-arm gates, the Flash-Next arm, the two bugs it found and their fixes, the arena re-measurement) |
 | [`MIXED-BACKING.md`](MIXED-BACKING.md) | the design + the driver probe (one VA range can be backed partly by pinned host memory; host chunks; the real shape at scale) |
+| [`A6-TENSOR-SPLIT-WINDOW.md`](A6-TENSOR-SPLIT-WINDOW.md) | **A6**: a windowed KV across a `-sm tensor` split — design only (five changes, the `fit.cpp` split-accounting cross-check, the invariants, the arms a multi-device host owes) |
 | [`A1-TWO-BASE-KV.md`](A1-TWO-BASE-KV.md) | A1 (two-base read in the FA kernels): built, gated, **superseded**, kept as the fallback |
 | [`O2-PLAN.md`](O2-PLAN.md) | the plan of record as written (its §6.3 mechanism is now historical — mixed backing won) |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | O1 (the growable KV region) — **parked**; A2 reuses its buffer-type skeleton |
@@ -523,9 +528,9 @@ in the campaign:
 | item | state |
 |---|---|
 | **Goal A, single device** | **SHIPPED**: opt-in (`LLAMA_KV_RESIDENT_CELLS=<cells>|auto`), unset = the plain device buffer and the same OOM; purity proven on spilling arms; r181 fixed the multi-device crash and three `auto` wiring defects |
-| **Goal A across a `-sm tensor` split** | **NOT IMPLEMENTED, hardware-blocked here.**  A Meta device has no backend reg, so the block declines the window on a split (one message) — by design since r181.  Doing it needs per-device region bufts wrapped in a split buft plus a fit that sizes them together, and a 2/3-device host to validate on (this box has **one card**).  Invariant 13 |
+| **Goal A across a `-sm tensor` split** | **DESIGNED, not implemented** — [`A6-TENSOR-SPLIT-WINDOW.md`](A6-TENSOR-SPLIT-WINDOW.md): the five changes (Meta buft variant, grow fan-out, fit recognition, `region_capable`, fit sizing inside the split branch), the `common/fit.cpp` cross-check (four findings, `margins[0]` first) and the arms a 2/3-device host must run.  Still hardware-blocked here (one card) |
 | **`auto` policy** (the arena half) | **the maintainer's call, unchanged by r181.**  `auto` sizes the window to `free − margin − everything-but-the-KV`, where the margin includes the **arena/slab reserve**, so on a `-ncmoe` config the arena wins the VRAM and the window comes out small *by design*; and it only spills a pinned `-c`.  The measurement that decides it is `A2-MIXED-BACKING.md` §3.7.11.4 A–C.  `W` stays a cell count; a percentage-of-slab form is deferred — do not re-propose it |
-| **owed: a TEST gap in the delivery** | `scripts/gate-park-idle-slots.sh` HARD-fails a legitimate outcome — when the park arm's server logs *"cannot park the idle slot: saving it to the prompt cache and clearing it"* (what a windowed KV triggers, and what already happens for a slot whose cells are not one run), it should require `park == lazyoff` and report the fallback instead of failing on *"parking moved nothing"*.  With no window the gate passes today |
+| **owed: a TEST gap in the delivery** | **FIXED (A6, awaiting the maintainer's commit approval)**: `scripts/gate-park-idle-slots.sh` now counts actual park MOVES (it used to count the region refusal warning, logged under the same `seq_park` prefix) and, when the park arm logs *"cannot park the idle slot: saving it to the prompt cache and clearing it"*, reports *"parking declined -> save-and-clear fallback"* and still requires `park == lazyoff`, instead of failing on *"parking moved nothing"*.  Verified on a windowed Flash-Next arm (3 fallbacks -> PASS) and on the no-window control (6 park / 2 unpark moves -> PASS).  `A2-MIXED-BACKING.md` §3.7.13 |
 | **Goal B** — a sparse attended set (QSA/DSA) streamed instead of a full KV | **NOT STARTED**; a different mechanism (`STRATA-KV-STREAMING.md`) that needs its own plan, independent of Goal A |
 | **Goal C** — the drafter ring (`LLAMA_SPEC_DRAFT_WINDOW`) | **measured, NOT promoted** (`O3-DRAFTER-RING.md`): free at a usable window (46k context, `W=32768`: acceptance −2.3 % rel, generation flat), 7-9 % lost far below the working context; the VRAM prize is one draft layer (~1 GiB at `-c 262144`) and it does not reach the arena (the draft KV lives in the slab's `aux_reserve`).  Three open questions in §7 |
 
