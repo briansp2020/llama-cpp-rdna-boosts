@@ -1,7 +1,7 @@
-From 32a91da12a11b9595d6a47cb5e8e3b680e5e21dc Mon Sep 17 00:00:00 2001
+From cfdcbb7bd7eb763cc96668465fd623ebb909afb1 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 22 Oct 2026 23:30:11 +0000
-Subject: [PATCH 02/17] port fix: moe-expert-cache keeps <thread> (r113 dropped
+Subject: [PATCH 02/15] port fix: moe-expert-cache keeps <thread> (r113 dropped
  it with its background worker; the sparse registration uses std::thread)
 
 (cherry picked from commit 13483e8f57d77eeb233597708903ab9de9ede568)

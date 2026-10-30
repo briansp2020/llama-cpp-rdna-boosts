@@ -1,7 +1,7 @@
-From b76a429e5d5b5d0c690fa680b87414e5310ed27a Mon Sep 17 00:00:00 2001
+From 0bd7c42001d147f7bbae83aa8635012f8cc4f503 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 12:41:15 +0000
-Subject: [PATCH 15/17] ours fixes after review: restore the GLU -> Q8_1 mark
+Subject: [PATCH 14/15] ours fixes after review: restore the GLU -> Q8_1 mark
  call that the r176 rebase dropped from ggml_cuda_try_fuse (the publish was
  dead: Qwen3.6-35B-A3B tg128 +8.3 % vs r176 with it, R9700); the shared-expert
  gate fold admits only BF16 / F32 weights (F16 would take the half-accumulator
@@ -9,8 +9,7 @@ Subject: [PATCH 15/17] ours fixes after review: restore the GLU -> Q8_1 mark
 
 ---
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 6 ++++++
- ggml/src/ggml-cuda/mmvf.cu               | 2 +-
- 2 files changed, 7 insertions(+), 1 deletion(-)
+ 1 file changed, 6 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 index c3bdb8f7f..8150b0673 100644
@@ -29,19 +28,6 @@ index c3bdb8f7f..8150b0673 100644
      // Upstream fused shared-expert MMVQ (owned by mmvq.cu).
      if (const int n_shared_expert = ggml_cuda_match_shared_expert_try_fuse(*cuda_ctx, cgraph, i)) {
          return n_shared_expert;
-diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index 654914058..35cf2a653 100644
---- a/ggml/src/ggml-cuda/mmvf.cu
-+++ b/ggml/src/ggml-cuda/mmvf.cu
-@@ -1391,7 +1391,7 @@ int ggml_cuda_shexp_gate_sigmoid_try_fuse(ggml_backend_cuda_context & ctx, const
-     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-     const int64_t nt    = y->ne[1];
-     if (w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1 || w->view_src || !ggml_is_contiguous(w) ||
--            (w->type != GGML_TYPE_BF16 && w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) ||
-+            (w->type != GGML_TYPE_BF16 && w->type != GGML_TYPE_F32) ||   // F16 would take the half-accumulator mmvf path, which has no fusion (abort)
-             y->type != GGML_TYPE_F32 || y->ne[2] != 1 || y->ne[3] != 1 || nt < 1 || nt > MMVF_MAX_BATCH_SIZE ||
-             gate->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate) || gate->ne[0] != 1 || gate->ne[1] != nt ||
-             mul->ne[1] != nt || add->ne[0] > INT_MAX ||
 -- 
 2.53.0
 

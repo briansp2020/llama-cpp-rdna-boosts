@@ -1,7 +1,7 @@
-From d96e4ae68ada8867478dce46e095122925e3e431 Mon Sep 17 00:00:00 2001
+From 06ce4990a3cd596d4ede13642388180dbace2d8c Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 21:37:18 +0000
-Subject: [PATCH 17/17] ours: the pinned snapshot ring and lazy split events by
+Subject: [PATCH 15/15] ours: the pinned snapshot ring and lazy split events by
  default only with more than one device
 
 On a single GPU both measured about -1 % decode each (FINDINGS 639); on 1x R9700 the gate gives tg128 +1.8 % on
