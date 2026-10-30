@@ -1,86 +1,93 @@
 # Cold-session prompt — `wip/kv-residency` (TODO #118)
 
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from the previous
-session's context).  Rewritten 2026-10-30 at the end of session A6, the promotion.
+session's context).  Rewritten 2026-10-30 (after r181) at the end of session A7, the r181 intake.
 
 ---
 
 Continue the windowed-KV campaign (TODO **#118**) in `~/llama-cpp-rdna-boosts` and `~/llama.cpp`.
 
-**Goal A is SHIPPED — do not re-measure it and do not re-promote it.**  Release **`v16-6050b467c-r179`** (r178 shipped the same block with a fit/probe regression that made it unusable with `--fit on`; r179 fixed it)
+**Goal A is SHIPPED — do not re-measure it and do not re-promote it.**  Release **`v16-6050b467c-r181`**
 (16 blocks) carries the windowed KV as **block 15**: an **opt-in** fixed-VRAM resident window with the KV's
 tail in pinned system RAM (`LLAMA_KV_RESIDENT_CELLS=<cells>|auto`; unset = the plain device buffer, so a run
-without the knob is byte-identical to r177 including its OOM).  The fork's `rdna-boosts` is the re-cut tip
-`898103305` (tree `9d2e5c28`), `validate-set.sh` is green, the shipped tree's gates are green (coherence
-`5ba44647188f`, spilling-arm prefill-logit −0.000000 / 100.000 %, VMM selftest PASS and FAIL with the hold
-disabled, no GPU faults), and the container images are built off-host by the tag watcher.  The shipped
-description is `patches/README.md` "Block 15", `ENVIRONMENT.md` §17 and `WORKLOG.md` **261030.002**.
+without the knob is byte-identical to r177 including its OOM).  The shipped tree is
+`~/llama.cpp`'s `rdna-boosts` at **`83d2c391a`** (= `release.json.tip`); the campaign/measurement tree is
+`wip-kv-residency` at `7c7769e50` and does **not** carry r181's fixes.  Shipped description:
+`patches/README.md` "Block 15", `ENVIRONMENT.md` §17, `WORKLOG.md` **261030.002/.003/.005**, and
+`A2-MIXED-BACKING.md` **§3.7.11** (measurements) + **§3.7.12** (r181's analysis).
 
-**This session's job is the campaign's remainder, not Goal A.**  In order:
+**What r181 fixed (know this before touching the block):**
 
-1. **One owed fix in the DELIVERY (small, needs the maintainer's go-ahead):**
-   `scripts/gate-park-idle-slots.sh` HARD-fails a *legitimate* outcome.  When the park arm's server logs
-   *"cannot park the idle slot: saving it to the prompt cache and clearing it"* — what a windowed/region-backed
-   KV now triggers, and what already happens for any slot whose cells are not one run (a prefix shared through
-   `seq_cp`) — the gate should require `park == lazyoff` and report *"parking declined → save-and-clear
-   fallback"* instead of failing on *"parking moved nothing"*.  With no window the gate passes today (verified).
-   Rationale and shape: `wip/kv-residency/A2-MIXED-BACKING.md` §3.7.11.3.
-2. **Goal C decisions** (`O3-DRAFTER-RING.md` §7): the MTP drafter ring (`LLAMA_SPEC_DRAFT_WINDOW`) is
-   **implemented and measured but not promoted** — it is free at a usable window (46k context, `W=32768`:
-   acceptance −2.3 % relative, generation flat) and costs 7-9 % at a window far below the working context; the
-   VRAM prize is one draft layer (~1 GiB at `-c 262144`), and it does not currently reach the arena because the
-   draft KV lives in the slab's `aux_reserve`.  The three open questions are default-on-or-not, one window size
-   or per-model guidance, and MTP-only or DFlash2 too.
-3. **Goal B** (a sparse attended set streamed cheaply — `STRATA-KV-STREAMING.md`) is **not started**.  It is a
-   *different mechanism* and needs its own plan before any code; it does not depend on Goal A.
+* **Multi-device `--fit` aborted at model load.**  The block reaches its backend entry points through
+  `ggml_backend_dev_backend_reg(dev)`; a **Meta** (tensor-split) device has no reg (`device->reg == NULL`) and
+  the proc-address helper ASSERTS on a null reg — three paths (the fit's KV probes on any run, the runtime buft
+  lookup with a numeric `W`, the spill budget/link lookups).  Both selectors now resolve the reg through a
+  reg-less-tolerant helper (`llama_kv_region_dev_reg`, `fit_dev_reg` — the latter walks a Meta device's simple
+  child), and a reg-less device means "the backend does not answer": **the window is declined on a `-sm tensor`
+  split with one message** (HANDOVER invariant 13).  The campaign's box is single-GPU, which is why nothing
+  caught it.
+* **Three `auto` wiring defects**, all reproducible on one device: a decided "no window needed" was reported as
+  "the fit did not run" (a decided-0 flag now exists); every run *without* the knob logged a KV warning (now
+  silent); and the `LLAMA_KV_SPILL_RAM_PCT` clamp could be taken past the VRAM budget (invariant 14 — an
+  intermediate form planned a **235 GiB** pinned spill and OOM-killed the box, so **bound the spill PLAN**).
 
-START BY READING, in this order:
-  1. `wip/kv-residency/HANDOVER.md` — self-contained.  **§11 is this work list**, §1 the state, §3 the
-     invariants (each cost a session), §5 the measurement rules, §6 the gates, §8.1 the absolute references
-     for this box.
-  2. `wip/kv-residency/A2-MIXED-BACKING.md` **§3.7.11** — the measurements block 15's claims rest on (the
-     spilling-arm gates, the Flash-Next arm, the two bugs and their fixes, the arena re-measurement).
-  3. `WORKLOG.md` **261030.002** (what shipped in r178 and how the shipped form differs from the campaign
-     tree) and `patches/README.md` "Block 15" (the user-facing description).
+**THIS SESSION'S JOB — the campaign's remainder, in order:**
+
+1. **A `-sm tensor` window** (the only technical gap left in Goal A).  Today a split declines the window by
+   design.  Doing it needs per-device region bufts wrapped in a Meta split buft plus a fit that sizes the
+   devices together.  **This box has ONE card**, so it cannot be validated here — start with a design note and a
+   cross-check against `common/fit.cpp`'s split accounting, and say plainly that the arms need a 2/3-device
+   host.  Do not implement it blind.
+2. **The `auto` policy questions** (the maintainer's call; unchanged by r181).  `auto` sizes the window to
+   `free − margin − everything-but-the-KV`, where the margin includes the **arena/slab reserve** — so on a
+   `-ncmoe` config the arena wins the VRAM and the window comes out small *by design* — and it only spills a
+   `-c` the user pinned.  The deciding measurements are `A2-MIXED-BACKING.md` §3.7.11.4 A–C.  `W` stays a cell
+   count; a percentage-of-slab form is deferred — do not re-propose it.
+3. **One owed TEST-gap fix in the delivery** (needs the maintainer's go-ahead): `scripts/gate-park-idle-slots.sh`
+   HARD-fails a legitimate outcome — when the park arm's server logs *"cannot park the idle slot: saving it to
+   the prompt cache and clearing it"* (what a windowed KV triggers, and what already happens for a slot whose
+   cells are not one run), it should require `park == lazyoff` and report the fallback instead of failing on
+   *"parking moved nothing"*.  With no window the gate passes today (verified).
+4. **Goal C decisions** (`O3-DRAFTER-RING.md` §7): the MTP drafter ring (`LLAMA_SPEC_DRAFT_WINDOW`) is
+   measured, not promoted — free at a usable window (46k context, `W=32768`: acceptance −2.3 % relative,
+   generation flat), 7-9 % lost far below the working context; the prize is one draft layer (~1 GiB at
+   `-c 262144`) and it does not reach the arena.  Open: default-on or not, one size or per-model, MTP-only or
+   DFlash2 too.
+5. **Goal B** (a sparse attended set streamed cheaply — `STRATA-KV-STREAMING.md`) is **not started**: a different
+   mechanism, needs its own plan before any code, independent of Goal A.
+
+START BY READING, in this order: `wip/kv-residency/HANDOVER.md` (**§11 = this work list**, §1 the state, §3 the
+invariants — **13** reg-less Meta devices, **14** bound the planned spill — §5 the measurement rules, §6 the
+gates, §8.1 the absolute references); then `A2-MIXED-BACKING.md` §3.7.11 + §3.7.12; then `WORKLOG.md` 261030.005.
 
 STATE (verify, don't assume):
-  - `~/llama.cpp`: **`rdna-boosts`** at **`38ef3a767`** is the shipped tree; **`wip-kv-residency`** at
-    **`7c7769e50`** is the *campaign/measurement* tree.  They differ deliberately: the shipped one has **A1
-    stripped** (the superseded two-base FA read), **no O1 fallback** (the region buffer is only taken when a
-    window is active — O1 `GGML_ABORT`s on a slab-armed MoE config where the plain arm completes), and the
-    **provider on by default** (`LLAMA_KV_REGION=0` kills it).  Never commit campaign code to `rdna-boosts`.
-  - `~/llama-cpp-rdna-boosts` `main` = the record (delivery r178).  Campaign code snapshot:
-    `wip/kv-residency/patches/0001`…`0014`, cut against `5bdec04ab`.
-  - ONE R9700 (gfx1201), 32 624 MiB.  Pin `HIP_VISIBLE_DEVICES=0`; never claim a multi-GPU result.
+  - `rdna-boosts` `83d2c391a` = shipped; `wip-kv-residency` `7c7769e50` = campaign/measurement (no r181 fixes).
+    Never commit campaign code to `rdna-boosts`.
+  - ONE R9700 (gfx1201), 32 624 MiB.  **Check `rocm-smi --showmeminfo vram` first** — the maintainer runs a
+    Flash-Next server here that holds ~34 GB, and every fit/gate then reads garbage (`free = 2 MiB`) or OOMs.
+    Never run a second GPU job; if the card is in use, say so and stop.
   - Link 55.7 GB/s H2D (re-cabled 2026-10-30).  No pre-swap t/s number may be compared with a new one.
-
-WHAT IS DONE — do not rebuild, do not re-gate, do not re-derive:
-  - The window slides, `--fit` sizes and reports it, the pinned-RAM ceiling holds, the window apparatus is
-    free, the spill's cost is a straight line, purity is proven on spilling arms (27B and Flash-Next), the
-    state/checkpoint/MTP gates pass on spilling arms, and the arena half is measured (+2.2…+2.9 GiB when `W`
-    is at or above the run depth; 11-26 % lost when it is 35 k cells below it).
-  - `W` stays a **cell count** (numeric or `auto`); a percentage-of-slab form is deferred by the maintainer —
-    do not re-propose it.  `auto`'s ordering (weights → arena reserve → `W` from the residue, capped at `-c`)
-    is settled policy.
 
 CONSTRAINTS:
   - Build `~/bin/build-llama-rocm` (never pass `-DCMAKE_HIP_FLAGS`); `LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib`.
   - Hash text from a run WITHOUT `-v` via `scripts/extract-generated.py`; timings from a separate `-v` run.
     Always `--single-turn --no-display-prompt`, always `timeout`, never two GPU jobs at once.
-  - **`ROCBLAS_USE_HIPBLASLT=0` for every fresh-process numeric comparison** (two identical commands otherwise
-    differ; this cost a false alarm in A6).
-  - Never judge on a greedy text hash alone; the prefill-logit gate on a spilling arm is the sensitive one.
+  - **`ROCBLAS_USE_HIPBLASLT=0` for EVERY fresh-process numeric comparison** (unset, two identical commands
+    differ — that nearly derailed the promotion).
+  - Never judge on a greedy text hash alone; the prefill-logit gate on a **spilling** arm is the sensitive one.
     Never quote a timing from a `LLAMA_KV_REGION_DEBUG` arm.
   - Prove a spill before believing an arm: `LLAMA_KV_REGION_DUMP=/dev/null` → `KVREGION_FREE … host=` > 0 (or
-    `FLIP > 0` with `LLAMA_KV_REGION_DEBUG=1`).  A spill needs `used > W + unit/nb1` cells — the shipped prose
-    prompt is not enough on the 4B (use prose twice) — and the floor is one 4 MiB map unit per tensor.
-  - `/tmp` is a 47 GB tmpfs: a prefill-logit base is ~7 GB, so clean old `.kld` files before a gate run
-    (a full tmpfs truncates the base and the next compare fails on a read).
-  - `-n 2000` for anything about the expert arena, and `-ncmoe` must be the model's full layer count.
+    `FLIP > 0`).  A spill needs `used > W + unit/nb1` cells (the shipped prose prompt is not enough on the 4B —
+    use it twice); the floor is one 4 MiB map unit per tensor.
+  - `/tmp` is a 47 GB tmpfs and a prefill-logit base is ~7 GB — clean old `.kld` files before a gate run.
+  - `-n 2000` for anything about the expert arena, with `-ncmoe` = the model's full layer count.
   - Do not pick scope.  If something cannot be measured, say so and stop.
 
-GATES if you touch the window's code: `GGML_CUDA_VMM_REGION_SELFTEST=1` (**PASS**, and **FAIL** with
-`LLAMA_KV_REGION_QUARANTINE=0`), the coherence trio (`5ba44647188f`, `ROCBLAS_USE_HIPBLASLT=0`), the
+GATES if you touch the block: `GGML_CUDA_VMM_REGION_SELFTEST=1` (**PASS**, and **FAIL** with
+`LLAMA_KV_REGION_QUARANTINE=0`), the coherence trio (`5ba44647188f`, with `ROCBLAS_USE_HIPBLASLT=0`), the
 prefill-logit gate on a **spilling** arm (−0.000000 / 100.000 %), `check-gpu-faults.sh` over every log, and the
-OOM baseline with the knob unset.  Touch the VMM primitive and you also owe
-`wip/kv-residency/hostmap-hazard-probe.cc` (default FAIL, `--grab 4` PASS).  Exact commands: HANDOVER §6.
+OOM baseline with the knob unset.  Plus, for this block specifically: no un-checked
+`ggml_backend_dev_backend_reg` (invariant 13), the planned-spill bound (invariant 14: `llama-fit-params` with a
+big `-c` and `LLAMA_KV_SPILL_RAM_PCT=1` must REPORT and drop the window), and the three `auto` wiring arms in
+HANDOVER §6.  Touch the VMM primitive and you also owe `wip/kv-residency/hostmap-hazard-probe.cc` (default
+FAIL, `--grab 4` PASS).
