@@ -1,5 +1,59 @@
 # WORKLOG - dated delivery records
 
+## 261030.001 (r177) -- PR #252: its Q/K/V projection reorder and its RDNA4 row concat shipped (block 10); its GDN projection gather held off (TODO #119)
+
+**Released as `v15-6050b467c-r177` (15 blocks, 00-14; block 10 amended).**  Contributor PR
+[#252](https://github.com/stew675/llama-cpp-rdna-boosts/pull/252) (`@briansp2020`) is three graph-ordering
+patches cut against r176, applying with `git am` unchanged.  Two are folded into **block 10** (it owns
+`ggml_backend_cuda_graph_optimize`'s passes and `mmvq.cu`); blocks 00-09 are byte-unchanged, 0010-0014 were
+re-cut.  `benchmarks/2026-10-30-graph-order-r176.md` holds every number; the submission is preserved in
+`archive/work/graph-order-r176/`.
+
+**Taken (block 10, default-on, `=0` switch each):**
+
+* **`GGML_CUDA_QK_ROTATE` — the V / K projections of a Q-norm attention layer move in front of the Q
+  projection.**  The model graph runs Q `MUL_MAT`, `RESHAPE`, `RMS_NORM`, `MUL`, `ROPE` and *then* V and K,
+  so the row concat's scan from the Q matmul stopped at the Q norm (only V+K fused) and the allocator handed
+  V/K the Q chain's freed buffers, which made `ggml_cuda_qk_pair_k_at`'s overlap test refuse the Q/K
+  norm+rope pair.  A structural pass (`std::rotate` of the V/K block, the r175 shared-expert pattern) fixes
+  both.  Same nodes, one stream, bit-identical; every ubatch size; idempotent.
+* **`GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4` — the dense 1-token row concat also runs on RDNA4.**  At `ncols_dst == 1`
+  a row's dot product is row-count independent there (one warp, no `small_m`; `two_rows` / the decode row
+  loop / `grid_stall_pad` only move rows between blocks), so the only new condition is that every segment has
+  an **even** row count (a 2-row block must not straddle a segment boundary).  RDNA3_0 keeps its own rule.
+
+**Held off: the GDN small-projection gather (`GGML_CUDA_MMVQ_CONCAT_REORDER`).**  It needs a **quantized**
+`<= 256`-row weight and skips `Q8_0`; in every Qwen3.6-35B quant we hold the GDN `ssm_alpha`/`ssm_beta` are
+**F32** (UD-Q3_K_M/Q4_K_M/Q5_K_M, Q6_K, Q8_K_XL) or **Q8_0**, and `attn_gate` is Q8_0 in the UD quants — so
+the pass cannot fire.  Measured on the 35B, on vs off: gfx1201 **104.4 vs 105.1 t/s**, gfx1100 **141.1 vs
+141.1** (neutral to −0.7 %).  Their +3.0 / +3.5 % needs a quant whose GDN small projections stay quantized; we
+asked for the exact GGUF + command line and parked it as `TODO` #119.  It is also the only one of the three
+with a positional constraint (`ssm_conv_in` skips nodes up to its `CONCAT`; the GDN prescan matches by
+position), which is why the submitted guard list exists.
+
+**Measured** (1 GPU, alternating rounds, `-sm layer -t 8`, `ROCBLAS_USE_HIPBLASLT=0`; stock = the r176 release
+tree, kept as `build-r176/bin`): gfx1100 Qwen3-30B-A3B Q4_K_M tg128 **194.3 -> 205.8 (+5.9 %)**, d4096
+170.0 -> 180.2 (+6.0 %); gfx1201 the same model **152.0 -> 160.9 (+5.9 %)**, d4096 131.2 -> 137.2 (+4.5 %) —
+`QK_ROTATE=0` returns both to base, and `ROW_CONCAT_RDNA4=0` leaves 156.9 (so the reorder alone is +3.2 % and
+the RDNA4 concat is +2.6 %).  2-GPU `-sm tensor` 30B: 141.2 -> 147.9 (+4.7 %).  Qwen3.6-35B-A3B +1.8 %
+(gfx1201) / +0.7 % (gfx1100, noise); dense 27B flat (32.62 -> 32.72).  The submitter's +5.9 % (RDNA4 d0) and
++7.5 % (RDNA3) reproduce in shape; their 35B absolute figures are ~25 % faster than either box reads here, a
+box difference rather than a patch one.
+
+**Gates:** greedy text byte-identical to r176 on 30B-A3B (1 GPU and 2-GPU `-sm tensor`), 35B-A3B, dense 27B,
+Gemma4-31B and Flash-Next (`-sm tensor -ncmoe 48`); prefill-logit KLD **0.000000 / 100.000 %** at the default
+ubatch and at `-ub 1` (the rotate runs at every ubatch size); MTP Protocol A on the dense 27B at 3 devices
+unchanged — layer 25.0 -> **51.7 t/s** acceptance **0.621**, tensor 50.8 -> **101.2** acceptance **0.608**,
+`plain == draft-mtp` text identical in both split modes; rule-5 band gate flat (31.91/102.11/156.90 ->
+31.94/102.20/157.18); `gate-per-block-build.sh --changed-from 19dec99a0 --fast` 2/2; `validate-set.sh` green
+(tree `b7adbd1259…`); no GPU faults.
+
+**Invariants for a future edit** (`patches/README.md`, block 10): the rotate runs in the **alloc-deps** half
+of the pass, so the meta `marks_only` forward sees the unrotated order — no new mark may depend on adjacency
+the rotate changes; the pass is deliberately **not** arch-gated because every fusion it enables is gated
+itself; and the RDNA4 concat's even-row-count rule rests on `calc_nwarps_weight` being row-independent at
+`ncols_dst == 1`, so re-check that before widening the predicate.
+
 ## 261029.008 (r176) -- TODO #117 closed: the expert-cache band is answered only for a model with HOST-RESIDENT experts (a dense single-GPU / `-sm layer` run no longer n-gram-clamps or bounds multi-slot draft widths)
 
 **Released as `v15-6050b467c-r176` (15 blocks, 00-14; blocks 09 and 12 amended).**  `TODO.md` item

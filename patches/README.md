@@ -1592,6 +1592,58 @@ unchanged (27B 3 GPU layer 51.6, tensor 100.5 -> 100.8); rule-5 `llama-batched-b
 per-patch switch-off deltas above; `test-backend-ops -o ROPE,MUL_MAT_ID` OK; no GPU faults.  Numbers:
 `benchmarks/2026-10-29-rdna3-decode-fusions.md`.
 
+#### r177 — the Q/K/V projection reorder and the dense row concat on RDNA4 (PR #252)
+
+**What it is.**  Two of that PR's three graph-ordering patches, from `@briansp2020`, folded here for the
+same reason (block 10 owns `ggml_backend_cuda_graph_optimize`'s fusion passes and `mmvq.cu`).
+
+| patch | what | knob | worth (30B-A3B, gfx1100/gfx1201) |
+|---|---|---|---|
+| V/K projections move in front of the Q projection | Q can join the row concat and the Q/K norm+rope pair fires | `GGML_CUDA_QK_ROTATE` | 5.9 / 3.2 % |
+| the dense row concat also runs on RDNA4 | one ksplit launch instead of 2-3 on RDNA4 too | `GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4` | inert / 2.6 % |
+
+**Why the reorder is needed.**  The model graph runs Q MUL_MAT, RESHAPE, RMS_NORM, MUL, ROPE and *then* the
+V and K projections, so (a) the row concat's scan from the Q matmul stops at the Q norm (only V+K fuse) and
+(b) the allocator hands the Q chain's freed buffers to V/K, so `ggml_cuda_qk_pair_k_at`'s overlap test
+refuses the Q/K pair.  The pass matches the Q chain structurally, requires the nodes in between to be only
+`MUL_MAT`/`RESHAPE`/`VIEW` and to read none of the Q nodes (resolving `view_src`), matches the K chain's
+`RMS_NORM`/`MUL`/`ROPE` by identical rope parameters **and** position tensors, and then `std::rotate`s the
+V/K block in front of the Q matmul — the same trick as the r175 shared-expert rotate, same nodes, one
+stream, so it is bit-identical.  It is structural only (no data pointers), runs at every ubatch size, and is
+idempotent (`j == i + 5` is the rotated shape, so a second pass declines).
+
+**Facts a future edit must keep.**
+
+* **The rotate sits in the alloc-deps half of the pass, i.e. it runs for the meta backend's `allocs_only`
+  forward and NOT for `marks_only`.**  That is deliberate — the marks are per tensor and the fusion deps must
+  be registered before allocation — but it means the two halves of a `-sm tensor` optimize see different
+  node **orders**, so no matcher added to the marking half may depend on adjacency that this rotate changes.
+  Verified byte-identical on 2-GPU `-sm tensor` (30B-A3B, text and prefill logits), which is the arm that
+  exercises both forwards.
+* **The pass is not arch-gated, and must not be**: it only re-enables fusions that are themselves gated
+  (the row concat's own table-id gate, the Q/K pair's own matcher).  On both RDNA generations the reorder
+  alone carries the whole win; the RDNA4 row concat is the increment on top.
+* **The RDNA4 row concat needs every segment to have an even row count.**  RDNA4's single-token launch may
+  take two rows per block and a 2-row block must not straddle a segment boundary; the check is `ne[0] % 2`
+  on *every* segment including the main one.  RDNA3_0 keeps its own `small_m` + rows-per-block agreement
+  rule.  **Do not widen the RDNA4 gate further**: the argument is that `ncols_dst == 1` makes
+  `calc_nwarps_weight` row-independent, and that `two_rows` / `GGML_MMVQ_RDNA4_DECODE_GRID` / the
+  `grid_stall_pad` block only change *which* block computes a row — a future row-count-dependent nwarps or
+  VDR would break it silently, so re-check that predicate before touching it.
+* **The submitter's third patch is NOT taken** (`GGML_CUDA_MMVQ_CONCAT_REORDER`, `wip/graph-order-r176`
+  0003): it gathers small GDN projections into the row concat, but it needs a **quantized** `<= 256`-row
+  weight and skips `Q8_0`, and in every GGUF we hold the GDN `ssm_alpha`/`ssm_beta` are **F32** (the UD
+  quants) or `Q8_0` (the Q8_0 quant), so it cannot fire — measured neutral to −0.7 % on the 35B on both
+  arches.  Held as `TODO` #119 pending the submitter's model/quant and configuration.
+
+**Gates.**  Greedy text byte-identical to r176 on 30B-A3B (1 GPU and 2-GPU `-sm tensor`), 35B-A3B, dense
+27B, Gemma4-31B and Flash-Next (`-ncmoe 48`, 2 GPU tensor); prefill-logit KLD **0.000000 / 100.000 %** at the
+default ubatch and at `-ub 1`; MTP Protocol A on the dense 27B at 3 devices unchanged (layer 25.0 -> 51.7
+t/s, acceptance 0.621; tensor 50.8 -> 101.2, acceptance 0.608; `plain == draft-mtp` text identical in both
+split modes); rule-5 `llama-batched-bench -npl 1,4,8` flat (31.91/102.11/156.90 -> 31.94/102.20/157.18);
+2-GPU `-sm tensor` 30B-A3B +4.7 % (d0) / +3.9 % (d4096); per-block build 2/2; `validate-set.sh` green;
+no GPU faults.  Numbers: `benchmarks/2026-10-30-graph-order-r176.md`.
+
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 
 **What it is.**  The qwen4exp (Qwen3.8-Flash-Next) architecture support, split out of block 10 in r109 so
