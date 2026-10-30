@@ -1,0 +1,109 @@
+From 8788b952a73ad2449c2f68e48676549f8f930653 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Fri, 30 Oct 2026 10:00:28 -0500
+Subject: [PATCH 13/13] wip/kv-residency: A5 (i) -- a windowed region's tensors
+ must start on the map grid
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Found while running the owed §7.2 item 2 (a Flash-Next/QSA spilling arm): the
+first spilling arm this campaign has run on a model whose KV tensors are not
+unit-sized, and it ABORTED at the first slide.
+
+    llama-kv-cache.cpp:1903: grow_regions: the KV region cannot be grown to 32000 cells ...
+    ggml_cuda_vmm_region_ensure_span: refusing to flip [8.50, 12.50) MiB: the mapping
+      [8.50, 12.50) MiB covers it only in part
+
+The cause is tensor PLACEMENT, not the flip.  A slide step is a whole-mapping
+kind flip (ensure_span: the driver refuses a sub-range unmap, and re-attaching
+one mapping as head/mid/tail loses the middle piece's bytes -- A2 (ii)), so a
+flip request must coincide EXACTLY with a mapping.  The window quantises its
+boundary in whole map units, so a flip is [tensor_off + k*unit, + (k+1)*unit)
+and that only matches a mapping while every tensor STARTS on the driver's map
+granularity.  The plain CUDA alloc size pads a quantized tensor's rows
+(MATRIX_ROW_PADDING), which is NOT gran-aligned: the qwen4exp QSA indexer
+cache's q8_0 rows pad by +512 B per tensor, so tensor k started 512*k B off the
+grid, init_tensor's window commit floored to a 4 KiB-aligned start and left a
+4 KiB tail mapping, and the second tensor's first flip straddled it -> refused
+-> grow_regions aborts (by design: a batch above the mapped extent faults the
+GPU).  The 27B and the 4B happened to have unit-sized rows, which is why every
+gate this campaign ran before this one was green.
+
+Fix: the WINDOWED buffer type rounds each tensor's place up to
+ggml_cuda_vmm_region_granularity().  At most gran-1 unused VA bytes per tensor,
+no mapped byte changes (the resident window is committed per tensor at its own
+rounded-up size either way), and it makes "every mapping in a windowed region is
+on the map grid" true by construction rather than by luck.  The plain (O1) buft
+is untouched.
+
+Gates (1 GPU, gfx1201, dc122f338 + this):
+  Flash-Next GSQ-IQ3_XXS -ncmoe 48 -c 65536 q8_0 KV, W=1024, 51 475-token prompt
+      before: abort at 32000 cells, 0 flips of the second tensor
+      after : 156 flips, 156/156 VERIFY ok (exhaustive), 0 refusals,
+              attention 576 of 672 MiB host, indexer 48 of 96 MiB host,
+              prefill 683.9 t/s, decode 26.5 t/s
+      text (ROCBLAS_USE_HIPBLASLT=0, no -v): plain == windowed, 701 chars 6c0561298cf1
+      prefill-logit KLD on that arm: -0.000000 / 99.994 % (base PPL 4.0810)
+      test-backend-ops -o FLASH_ATTN_QSA: 26/26
+  VMM selftest PASS (and FAIL with LLAMA_KV_REGION_QUARANTINE=0)
+  §6 identity trio 5ba44647188f x3 (W = -, 2048, 4096)
+  27B Q4_K_XL spilling arm, prefill-logit: -0.000000 / 100.000 %
+  gate-ckpt-reuse.sh (4B, ctx 16384, 10503-token prompt) PASS, 128 MiB host spilled
+  gate-state-pipe.sh (35B-A3B, 5 arms) PASS, 80 MiB host spilled in every arm
+  MTP verify widths on a spilling 27B: 4/4 arms 305 chars e2cea6fa6670
+  the OOM baseline still OOMs with the feature off
+  check-gpu-faults.sh clean over every log
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 729ce6670..4b3ee7bfc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3112,6 +3112,35 @@ static ggml_backend_buffer_t ggml_backend_cuda_kv_region_buffer_type_alloc_buffe
+     return ggml_backend_buffer_init(buft, ggml_backend_cuda_kv_region_buffer_interface, ctx, size);
+ }
+ 
++// wip/kv-residency (TODO #118): the alloc size of a tensor in a WINDOWED region.
++//
++// A windowed region's mappings can only start on the driver's MINIMUM map granularity (`gran`), and a slide
++// step is a WHOLE-mapping kind flip (`ensure_span`: the driver refuses a sub-range unmap, and re-attaching one
++// mapping as head/mid/tail loses the middle piece's bytes).  So every flip request must coincide exactly with
++// a mapping, which is only true while each tensor STARTS on that grid -- the window quantises its boundary in
++// whole map units, so a flip is `[tensor_off + k*unit, tensor_off + (k+1)*unit)`.
++//
++// The plain CUDA alloc size pads a quantized tensor's rows (`MATRIX_ROW_PADDING`), which is NOT a multiple of
++// the granularity: the qwen4exp QSA indexer cache's rows pad to +512 B per tensor, so every tensor after the
++// first started 512 B off the grid, `init_tensor`'s window commit floored to a 4 KiB-aligned start and left a
++// 4 KiB tail mapping, and the first slide of the second tensor was refused -- which aborts the process by
++// design (`grow_regions`: a batch above the mapped extent faults the GPU).  Measured 2026-10-30 on Flash-Next
++// at `-c 65536`, the first spilling arm this campaign ran on a model whose KV tensors are not unit-sized.
++//
++// Rounding each tensor's place up to `gran` is what makes "every mapping in a windowed region is on the map
++// grid" true BY CONSTRUCTION rather than by luck (the 27B and the 4B happen to have unit-sized rows).  It
++// costs at most `gran - 1` unused VA bytes per tensor and does not change any mapped byte: the resident
++// window is committed per tensor at its own rounded-up size either way.
++static size_t ggml_backend_cuda_kv_region_windowed_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
++    size_t size = ggml_backend_cuda_buffer_type_get_alloc_size(buft, tensor);
++    const ggml_backend_cuda_buffer_type_context * buft_ctx = (const ggml_backend_cuda_buffer_type_context *) buft->context;
++    const size_t g = ggml_cuda_vmm_region_granularity(buft_ctx->device);
++    if (size != 0 && g > 1) {
++        size = ((size + g - 1) / g) * g;
++    }
++    return size;
++}
++
+ // `cells` > 0 = A2 the windowed KV: the newest `cells` cells of the USED extent are backed by VRAM and
+ // everything older by pinned system RAM (see ggml_cuda_vmm_region_ensure_span).  0 = the whole tensor in VRAM
+ // (O1).  One buft instance per (device, cells).
+@@ -3174,7 +3203,7 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buffer_type_split(
+                 /* .alloc_buffer_n      = */ NULL,
+                 /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
+                 /* .get_max_size        = */ NULL,
+-                /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
++                /* .get_alloc_size      = */ ggml_backend_cuda_kv_region_windowed_alloc_size,
+                 /* .get_alloc_size_n    = */ NULL,
+                 /* .is_host             = */ NULL,
+             },

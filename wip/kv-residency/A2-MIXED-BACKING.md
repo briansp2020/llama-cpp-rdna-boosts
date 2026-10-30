@@ -555,3 +555,173 @@ Owed before promotion, in order:
    count, interleaved), the deep arm, and the moved `--fit` break-even.  §3.7.9 covers the cost side.
 5. The promotion conversation (a block, `ENVIRONMENT.md`, the default-on call) — the maintainer's, and it needs
    1-2 first.  Goal B is still not started; multi-device is still not measurable here (one card).
+
+---
+
+# §3.7.11 A5 (2026-10-30, ninth session) — the corners on spilling arms, the Flash-Next arm, and the two bugs it found
+
+Session scope: **§7.2 items 1 → 2 → 4** (the state/MTP gates on arms that provably spill; a Flash-Next qwen4exp
+spilling arm; the re-measurement at the 55.7 GB/s link).  All three are done.  Item 2 found **two** real bugs:
+one is fixed (`0013`, A5 (i)), the other is measured, isolated and **left for the maintainer** (§3.7.11.4).  Box:
+**one R9700 (gfx1201, 32 624 MiB), `HIP_VISIBLE_DEVICES=0` on every arm**; every number here is 1 GPU.
+
+## 3.7.11.1 Item 1 — the three gates, on arms that PROVABLY spill
+
+Every arm below was first proved to spill (`LLAMA_KV_REGION_DEBUG=1` → `FLIP > 0`, and/or `KVREGION_DUMP=/dev/null`
+→ `KVREGION_FREE … host=` > 0); the *timed* runs never carry `LLAMA_KV_REGION_DEBUG` (§5 rule 6).
+
+| gate | arm (all q8_0 KV, W=1024) | spill proof | result |
+|---|---|---|---|
+| MTP verify widths | 27B Q4_K_XL, `-c 8192`, prose (5246 tok), `-n 64`, `n_max 7` | `FLIP=32`, 32/32 VERIFY ok (same shape) | **plain-decode / plain-mtp / win-decode / win-mtp = one hash**, 305 chars `e2cea6fa6670` |
+| `gate-ckpt-reuse.sh` | 4B Q8_0 (hybrid), `CTX=16384`, prompt = prose×2 (**10 502 tok**) | `KVREGION_FREE … mapped=192.00 host=128.00` on both arms | **PASS** (keep 5 vs eager 8 checkpoints, 3 kept, every request byte-identical, 0 GPU faults) |
+| `gate-state-pipe.sh` | 35B-A3B UD-Q4_K_M, `NGPU=1 SM=layer NCMOE=0`, `CTX=16384` | `mapped=160.00 host=80.00` in **all five** arms | **PASS** (5/5 cycles byte-identical to `sync`; pipe −7.0 %, copy0 −7.4 %); the mid-run `map-new` of a restore (`grow_for`) is clean |
+
+Notes that matter for the next session:
+
+* **The default `PROMPT` never spills on the 4B.**  A spill needs `used > W + unit/nb1`; the 4B has `nb1 = 1088`,
+  i.e. `unit/nb1 = 3855` cells, so `W=1024` starts spilling at **4879** used cells and `W=2048` at **5903** — and
+  the prose prompt is ~5250.  A3's `W=2048` pass was therefore a no-flip arm.  The doubled prompt is what makes the
+  arm decisive; `-c` alone does not (A3 already used `-c 16384`).
+* The MTP arm has **two** windowed caches (the target's KV and the MTP draft's own), one warning line each — the
+  verify widths are therefore covered with the draft's KV windowed too.
+
+## 3.7.11.2 Item 2 — the Flash-Next spilling arm, and bug 1 (FIXED, `0013`)
+
+`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS`, `-ncmoe 48`, `-c 65536`, q8_0 KV, `W=1024`, 51 475-token prompt.  Two KV
+caches take the window (attention 816 MiB, QSA indexer 102 MiB), two warning lines.
+
+**It aborted at the first slide** — the first spilling arm this campaign has run on a model whose KV tensors are
+not unit-sized:
+
+```
+llama-kv-cache.cpp:1903: grow_regions: the KV region cannot be grown to 32000 cells ...
+ggml_cuda_vmm_region_ensure_span: device 0: refusing to flip [8.50, 12.50) MiB: the mapping
+  [8.50, 12.50) MiB covers it only in part
+```
+
+**The cause is tensor PLACEMENT, not the flip.**  A slide step is a whole-mapping kind flip (§3, invariant 7), so
+a flip request must coincide *exactly* with a mapping; the window quantises its boundary in whole map units, so a
+flip is `[tensor_off + k·unit, tensor_off + (k+1)·unit)` and that only matches a mapping while every tensor
+**starts** on the driver's map granularity.  The plain CUDA alloc size pads a quantized tensor's rows
+(`MATRIX_ROW_PADDING`), which is **not** gran-aligned: the QSA indexer's q8_0 rows pad by **+512 B per tensor**, so
+tensor *k* started `512·k` B off the grid (`TRACE` showed `off=8.500 MiB mod=512`, `17.001 mod=1024`, …),
+`init_tensor`'s window commit floored to a 4 KiB-aligned start and left a 4 KiB tail mapping, and the second
+tensor's first flip straddled it → refused → `grow_regions` aborts (by design: a batch above the mapped extent
+would fault the GPU).  **The 27B and the 4B have unit-sized rows, which is why every earlier gate was green.**
+
+### The fix (`0013`)
+
+The **windowed** buffer type rounds each tensor's place up to `ggml_cuda_vmm_region_granularity()`.  At most
+`gran − 1` unused VA bytes per tensor, **no mapped byte changes** (the resident window is committed per tensor at
+its own rounded-up size either way), and it makes invariant 7 true *by construction*.  The plain (O1) buft is
+untouched, and the reporting cost is 48 KiB on the Flash-Next indexer cache (102.00 → 102.05 MiB).
+
+### After the fix
+
+| measurement | value |
+|---|---|
+| slide steps | 156 flips, **156/156 `VERIFY … ok (exhaustive)`**, 0 refusals, 0 aborts (`LLAMA_KV_REGION_DEBUG=1` run of this exact config; the timed run below reads the same spill totals) |
+| spill (at 51 475 depth) | attention **576 of 672 MiB** host, indexer **48 of 96 MiB** host |
+| prefill / decode (`-v`, no DEBUG) | **683.9 t/s** / **26.48 t/s** (37.8 ms/token, of which ~11 ms is the 624 MiB/token of spill) |
+| text, `ROCBLAS_USE_HIPBLASLT=0`, no `-v` | plain == windowed, **701 chars `6c0561298cf1`** |
+| prefill-logit KLD (`--ctx 32768 --chunks 2 --kv q8_0`, base PPL 4.0810) | **−0.000000 / 99.994 %**, reproduced on the final tip after the fix commit — and the gate arm itself spills (`mapped=408.00 host=384.00` at `--chunks 1`) |
+| `test-backend-ops -o FLASH_ATTN_QSA` | **26/26** |
+| GPU faults | `check-gpu-faults.sh` clean |
+
+Recovery record: the fix was found with two throw-away diagnostics (an exact-bytes print in the refusal, and the
+raw offsets in the `LLAMA_KV_REGION_TRACE` line).  Both were reverted before the gates above; the trace line is
+still worth adding permanently if this class recurs.
+
+## 3.7.11.3 Item 2 — bug 2 (OPEN): a park on a region-backed KV faults the GPU
+
+`gate-park-idle-slots.sh` (the r136/r146 parking path, the model's own gating gate) **kills the server** on a
+region-backed KV.  Same config throughout: Flash-Next, `-ncmoe 48`, 1 GPU, MTP draft, prose×2 / 51 475-token
+request A.
+
+| arm | result |
+|---|---|
+| window `W=1024`, `-c 65536`, deep prompt | request A completes, **request B faults**: `HSA_STATUS_ERROR_MEMORY_FAULT` in `__amd_rocclr_copyBuffer`, *"Page not present"*, GPU hang analysis, coredump |
+| window `W=1024`, `-c 16384`, **shallow** prompt (5 404 used of 16 384 — **nothing spills**) | **identical fault** ⇒ the spill is not the trigger |
+| `LLAMA_KV_REGION=1` with **no window** (the O1 grow-on-demand region) | **identical fault** ⇒ the window is not the trigger either |
+| **window OFF** (plain CUDA KV), same config | **PASS** — and the gate reports *"every park moved the attention cache and the indexer cache together"* |
+
+So the fault belongs to the **region provider**, not to the window: the region maps only the cell **watermark**
+(`grow_cells`, and the window's own `init_tensor` commit), while a park relocates an idle slot's cells **near the
+top of the cache**, i.e. above the mapped extent — unmapped VA, and the park's move is a copy-engine transfer,
+which *faults* instead of returning an error.  (The same copy-engine-vs-host-mapping limitation as §3.7.7 #2,
+with the opposite symptom.)
+
+**Not fixed — it is a product decision, and the options pull apart:**
+
+1. `llama_kv_cache::seq_park` grows the region to the destination cell range before moving cells.  Correct, and it
+   removes the fault; but with a window the parked cells then land *inside the resident window* (which keeps the
+   **newest** cells) while the running slot sits in the spilled tail — large VRAM cost, and a decode that reads
+   every attended cell from host.
+2. Refuse parking on a region-backed cache (warn once, fall back to the save-and-clear idle-slot path).  Keeps both
+   features honest, and `LLAMA_SERVER_PARK_IDLE_SLOTS=0`/`--lazy-idle-slots`-off already give a working server.
+3. Refuse the *window* when the server parks idle slots.
+
+Whatever ships, the failure must not be a GPU fault, and `gate-park-idle-slots.sh` (with a region/window arm) is
+the gate that sees it.
+
+## 3.7.11.4 Item 4 — the re-measurement at the 55.7 GB/s link
+
+`-n 2000`, `-ncmoe` = the model's full layer count, `-c 262144`, q8_0 KV, 51 433-token prompt, **arms interleaved
+back-to-back with two reps each** (the first arm of a batch is a cold-page-cache artefact: 35B plain reads 652 t/s
+cold and 1195 t/s warm, which is why the rule exists).
+
+### A. A window at/above the run depth — no spill, and the arena still gains
+
+The KV's VRAM is committed **lazily** (`init_tensor` commits W cells, `grow_cells` the rest), so a `W` above the
+run's depth costs the arena nothing *and* spills nothing.  This is the Goal-A-2 shape:
+
+| model (`-ncmoe 48`, `-c 262144`) | arm | arena | residency | prefill t/s | decode t/s |
+|---|---|---|---|---|---|
+| 35B-A3B **Q8_0** | plain | 25 245.0 MiB | 77.3 % | 1197.1 / 1192.2 | 67.81 / 67.76 |
+|  | `W=53248` (nothing spills) | **27 412.5** | **84.0 %** | 1230.7 / 1242.4 | 66.85 / 67.28 (≈ −0.9 %) |
+| 122B-A10B **Q4_K_XL** | plain | 19 661.1 MiB | 29.3 % | 365.1 / 366.0 | 28.74 / 28.75 |
+|  | `W=49152` (nothing spills) | **22 282.6** | **33.2 %** | 382.7 / 382.6 (+4.7 %) | **29.84 / 29.84 (+3.8 %)** |
+
+### B. A window far below the depth — the spill dominates
+
+| model | arm | arena | residency | prefill t/s | decode t/s |
+|---|---|---|---|---|---|
+| 35B-A3B Q8_0 | plain | 25 245.0 | 77.3 % | 1195.7 | 67.53 |
+|  | `W=16384` (**320 MiB/token** of spill) | 27 667.5 | 84.8 % | 1172.4 | **49.69 (−26 %)** |
+| 122B-A10B Q4_K_XL | plain | 19 661.1 | 29.3 % | 366.6 | 28.81 |
+|  | `W=16384` (**384 MiB/token**) | 22 544.8 | 33.6 % | 372.4 | **25.57 (−11 %)** |
+
+Read together with §3.7.9: the arena's whole prize here is **+2.2 to +2.9 GiB** (residency +3.9 to +6.7 points),
+worth **+3.8 %** decode at the 122B's 29 % residency and ≈0 at the 35B's 77 % — while a `W` 35 k cells below the
+depth costs 11-26 %.  **The window's arena half only pays when `W` is at or above the depth the user actually
+runs**, i.e. it is a *capacity* trade (the VRAM the KV does not need *yet*), not a hot/cold one.  This supersedes
+the pre-swap §8 rows for this box; do not mix the two.
+
+### C. `--fit` still refuses to spill for the arena's sake — a policy gap, not a bug
+
+`LLAMA_KV_RESIDENT_CELLS=auto` sizes a window only when the KV does **not** fit at the pinned `-c`:
+
+```
+35B-A3B Q8_0 -ncmoe 48 -c 262144:  "auto: no window is needed -- the 262144-cell KV (2720.0 MiB) fits fully
+                                   resident (21899.2 MiB of VRAM left over the 6899 MiB target)"
+27B Q8_0        -c 262144:          "WINDOWED: 112190 of 262144 cells resident (3725.1 MiB of 8704.0 MiB),
+                                   4978.9 MiB spilled ... about 95.2 ms at that rate, and nothing spills below
+                                   depth 112190"
+```
+
+So the arena half of Goal A needs a **numeric** `W` (or a new fit policy: "spill to grow the arena, up to N MiB of
+spill per token"), and the number to hand it is table A above.  The moved break-even at this link is the cost side
+of §3.7.9 (16.3 µs/MiB pre-swap → **≈8-11 µs/MiB** here): 128 MiB/token ≈ +1.1 ms (−4 % of a 28 ms token),
+256 ≈ −7 %, 512 ≈ −15 %, 640 ≈ −18 %.  `--fit` no longer hard-codes 28.8 GB/s (it calibrates from the backend and
+reports 54-55 GB/s here), so its own arithmetic already reflects this.
+
+## 3.7.11.5 What is left
+
+1. ~~The corners on spilling arms~~ — **DONE** (§3.7.11.1).
+2. ~~The Flash-Next spilling arm~~ — **DONE** (§3.7.11.2), including the QSA op test; bug 1 fixed, **bug 2 open**
+   (§3.7.11.3) and it needs a decision.
+3. ~~The re-measurement~~ — **DONE** (§3.7.11.4 A-C).
+4. The promotion conversation (a block, `ENVIRONMENT.md`, the default-on call for the window) — the maintainer's.
+   It now needs a decision on §3.7.11.3 (park) and, if the arena half is wanted, on the `auto`-policy gap
+   (§3.7.11.4 C).
+5. Goal B is still not started; multi-device is still not measurable here (one card).
