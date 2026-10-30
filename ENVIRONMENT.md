@@ -484,8 +484,9 @@ any single fusion.)
 ### 7.1 `GGML_CUDA_FUSE_*` — presence of the variable with a value, `0` disables
 
 `GGML_CUDA_FUSE_ADD_RMS_Q8`, `GGML_CUDA_FUSE_CPY_BATCH`, `GGML_CUDA_FUSE_GATE_BETA_VERIFY`,
-`GGML_CUDA_FUSE_GDN_BETA_SIGMOID`, `GGML_CUDA_FUSE_GDN_CONV_VERIFY`, `GGML_CUDA_FUSE_GDN_GATE`,
-`GGML_CUDA_FUSE_GLU_Q8_1`, `GGML_CUDA_FUSE_HC_COMBINE_MIX`, `GGML_CUDA_FUSE_Q8_1_VERIFY`,
+`GGML_CUDA_FUSE_GDN_BETA_SIGMOID`, `GGML_CUDA_FUSE_GDN_CONV_VERIFY`, `GGML_CUDA_FUSE_GDN_CONV_DECODE`,
+`GGML_CUDA_FUSE_GDN_CONV_GATHER`, `GGML_CUDA_FUSE_GDN_GATE`, `GGML_CUDA_FUSE_GLU_Q8_1`,
+`GGML_CUDA_FUSE_HC_COMBINE_MIX`, `GGML_CUDA_FUSE_Q8_1_VERIFY`, `GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID`,
 `GGML_CUDA_FUSE_SIGMOID_MUL_ADD`, `GGML_CUDA_FUSE_SWIGLU_MMQ`.
 These use `getenv(...) == nullptr || atoi(...) != 0`, so unset = **on** and `0` = off.
 (Git history note: these were originally *opt-in* `=1` switches; they are now default-on kill-switches.)
@@ -508,7 +509,8 @@ kill-switch, and `tests/test-fusion-gate-beta-multiseq.cpp` is the gate that cov
 run it after touching any fusion that consumes a reshaped chain (`GREEDY-PURITY.md` §49).
 
 The same idiom — and therefore also default-on despite the name — covers
-`GGML_CUDA_DISABLE_IDX_RELU_SUM`, `GGML_CUDA_CONCAT_VERIFY` and (r46, block 15) `GGML_CUDA_FUSE_GDN_STATE_GATHER`.
+`GGML_CUDA_DISABLE_IDX_RELU_SUM`, `GGML_CUDA_CONCAT_VERIFY`, (r46, block 15) `GGML_CUDA_FUSE_GDN_STATE_GATHER` and
+(r183, block 10) `GGML_CUDA_DISABLE_GDN_CONV_SNAP`.
 
 `GGML_CUDA_DISABLE_NORM_PAIR` is value-gated (listed with §7.2): `0` keeps the paired GDN q/k norm.
 
@@ -533,6 +535,13 @@ pre-existing single-device restriction, the batched CPY does not, and RDNA3_0 mu
 (`-sm tensor` / `-sm layer`) is a recorded open gap — the batched CPY fires ~450 times (`-sm layer`) /
 ~1350 times (`-sm tensor`) per 60-token MTP run on 3x gfx1201, so that arm is exercised on RDNA4 but
 not measured on RDNA3_0.
+
+**r183 (block 10) extends that same gate to one token.**  `GGML_CUDA_FUSE_GDN_CONV_DECODE` widens
+`GGML_CUDA_FUSE_GDN_CONV_VERIFY`'s band to `T = 1` (only where the q/k norm pair folds too and the decode-only
+`ssm_prescan` would not take the conv first), and `GGML_CUDA_DISABLE_GDN_CONV_SNAP` /
+`GGML_CUDA_FUSE_GDN_CONV_GATHER` ride the direct conv on whatever width it runs (prefill, the verify band and,
+with `..._DECODE`, decode).  All three keep the pre-existing single-device restriction, so on `-sm tensor` /
+`-sm layer` with two or more devices they are inert unless `GGML_CUDA_CONV_FUSION_MULTI=1` is set.
 
 ### 7.2 `GGML_CUDA_DISABLE_*` — value-gated (`=1` disables, `0` keeps it on)
 
@@ -694,6 +703,10 @@ The QSA op has a CPU oracle: `test-backend-ops -o FLASH_ATTN_QSA` (18/18 minimum
 | `GGML_CUDA_GDN_TAIL` | on (r91, block 10) | kill-switch | inside that chunked path, a single-sequence batch above the threshold runs the chunked kernel on its first `n_tokens - D` tokens and the **sequential** kernel on the last `D = max(K>16?K:16, n_rs_batch)` in the same launch, so the rollback snapshots `0..D-1` exist for every batch.  `=0` restores whole-batch chunking (the r90 behaviour, and the A/B base for the prefill-logit gate).  Prefill-only (decode / verify batches ≤ the threshold never take it); no extra memory or graph; measured pp2048 −0.58 %, decode flat. |
 | `GGML_CUDA_GDN_CHUNKED_BF16` | on | kill-switch | BF16/WMMA chunked GDN variant, **default-on since r30** (RDNA3/RDNA4, `S_v == 128` prefill). Near-lossless, not bit-exact (bf16 operands, fp32 accumulation; ~1e-5 op NMSE; prefill mean KLD 0.0007 / 0.00005 / 0.00015 on gfx1201 / gfx1100 / gfx1151, same-top-p >= 98.7 %). `=0` runs the fp32 chunked kernel. r29 had defaulted it off as a workaround for the n_seqs > 1 `A_sc` stride aliasing bug (issue #113), fixed in r30. |
 | `GGML_CUDA_FUSE_GDN_STATE_GATHER` | on (r46, block 15) | kill-switch | in the one-sequence `<= 16`-token decode/verify band the graph skips the per-GDN-layer recurrent-state `GET_ROWS` and the sequential kernel reads `s0` from the cache row directly (`GET_ROWS` is a plain copy, so bit-identical).  Uses the §7.1 presence idiom (unset = on, `0` = gather as before). |
+| `GGML_CUDA_DISABLE_GDN_CONV_SNAP` | on (r183, block 10) | kill-switch | where the direct GDN conv runs, its kernel also writes the 3-column recurrent snapshot tails, so the `CONCAT` and the snapshot `CPY`s launch nothing.  Only taken when a runtime byte-span check shows nothing between the CONCAT and the conv writes over `state`/`x` or touches a snapshot destination and the destinations are disjoint; the batched-copy run stops at a folded snapshot `CPY`.  `1` restores the r182 path (a plain `CONCAT` + `cpy_batch` run).  Bit-identical: the values the CPYs would write are the ones the kernel writes, and the conv matcher already requires the CONCAT to have no reader other than the conv and the snapshot views. |
+| `GGML_CUDA_FUSE_GDN_CONV_GATHER` | on (r183, block 10) | kill-switch | in the one-sequence, `<= 16`-token band, `build_rs`'s `GET_ROWS` of the conv cache (the `CONCAT`'s state operand) is deferred into the direct conv kernel, which reads the cache row itself (`row id = the gather's src[1]`) and writes it back; the three state values are loaded into registers first.  Requires the snapshot fold above, the CONCAT to be the gather's only reader and only folded snapshot `CPY`s writing the cache before the conv.  `0` (or `GGML_CUDA_FUSE_GDN_STATE_GATHER=0`, which turns both off) restores the gather.  A `CONCAT` over a deferred gather the direct conv does not take **aborts** by design. |
+| `GGML_CUDA_FUSE_GDN_CONV_DECODE` | on (r183, block 10) | kill-switch | the 1-token direct GDN conv on RDNA4 / RDNA3_0, and only where it also elides the q/k l2 norm pair (`gdn_conv_norm_match() > 0`) and the decode-only `ssm_prescan` would not take the conv first.  It is the enabler for the two folds above at one token and is worth +0.3 % on its own; the dense Q8_0 case that cost −1.1 % in PR #249 stays neutral because the norm-match gate keeps the `ssm_conv_in` epilogue (and its free `CONCAT` write) there.  `0` turns off only the 1-token path; `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0` still turns off the whole band. |
+| `GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID` | on (r183, block 10) | kill-switch | the shared-expert gate `MUL_MAT` (one row) + `SIGMOID` + `MUL` + `ADD` of qwen4exp in one `mul_mat_vec_f` launch: every block recomputes the one gate row and applies `sigmoid_mul_add_f32`'s own `op_sigmoid` and `contract(off)` expression to its slice, so the gate, the sigmoid and the product are never stored.  BF16/F32 gate weights only (F16 can take a half accumulator), decode/verify band.  Inert on every quantized model we hold and **+0.6 %** on Flash-Next GSQ-IQ3_XXS tg128. |
 | `LLAMA_RS_ROLLBACK_DEBUG` | unset | **diagnostic** | r91 (block 03).  `1` logs one `RSPREP` line per prepared ubatch and one `RSROLL` line per partial recurrent rollback (rollback distance, the sequence's own last-batch shape, `n_rs_seq`, `n_rs_batch`).  This is the instrument that proved the issue-#131 warning was a stale per-sequence tracker entry.  Verbose; diagnosing only. |
 | `GGML_CUDA_GDN_GATHER_INDEX` | unset = on (r68) | **kill-switch / diagnostic** | replaces the `O(gathers × nodes)` `ggml_cuda_gdn_state_gather_deferrable` forward walk with one index per graph evaluation, built **lazily on the first candidate** so a non-GDN graph pays only one pointer check per `GET_ROWS`.  `0` = the per-gather walk; `2` = both, `GGML_ABORT` on a different answer.  Conservative relative to the walk (a disagreement can only drop a deferral, never add one), so the kernel path is unchanged.  Issue #151: 0.63 ms/graph less host work on gfx1201 (13 %), ~+0.3 % decode on a slow host. |
 | `GDN_DBG_SKIP_KKT`, `GDN_DBG_SKIP_SCAN` | off | diagnostic | skip stages (debug). |

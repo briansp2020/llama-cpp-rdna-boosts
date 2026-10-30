@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249) | +12718 / −4970 | 78 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard) | +14341 / −5057 | 81 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -1736,6 +1736,74 @@ canonical 27B Q8_0 gate **0.000000 / 100.000 %**; `test-backend-ops -o TOPK_MOE`
 unchanged (51.53 t/s, acceptance 0.62134); rule-5 batched bench inert at npl>1; per-block build 2/2;
 `validate-set.sh` green; no GPU faults.  Numbers: `benchmarks/2026-10-30-router-topk-fold.md`, record
 `archive/work/router-topk-fold/PROMOTED.md`.
+
+#### r183 — the GDN decode folds (PR #256) and the 2-D copy guard
+
+**What it is.**  PR #256's four patches, all of them the follow-up the #249 review asked for, plus a load-abort
+fix found while setting up its Flash-Next arm.
+
+* **The direct conv also writes the recurrent snapshot tails** (`GGML_CUDA_DISABLE_GDN_CONV_SNAP=1` off), so
+  where the direct conv runs the `CONCAT` and the snapshot `CPY`s launch nothing.  Taken only when a runtime
+  byte-span check shows nothing between the CONCAT and the conv writes over `state`/`x` or touches a snapshot
+  destination and the destinations are disjoint; the batched-copy run stops at a folded snapshot `CPY` so
+  `cpy_batch` cannot swallow one.
+* **The conv-state gather fold** (`GGML_CUDA_FUSE_GDN_CONV_GATHER=0` off): `build_rs`'s `GET_ROWS` of the conv
+  cache, feeding a CONCAT the direct conv takes, is deferred like the GDN state gather, and the direct kernel
+  reads the cache row itself (row id = the gather's `src[1]`) with each channel's three state values held in
+  registers before the snapshot writes, one of which is the write-back to that row.  One sequence, at most 16
+  tokens, the CONCAT the gather's only reader, only folded snapshot `CPY`s writing the cache before the conv.
+  A CONCAT over a deferred gather the direct conv does not take **aborts** rather than reading an unwritten
+  `GET_ROWS` (the tripwire is asserted in `write_tail` and at the CONCAT).
+* **The 1-token direct conv** (`GGML_CUDA_FUSE_GDN_CONV_DECODE=0` off): the #249 re-submission, now gated on
+  `gdn_conv_norm_match() > 0` **and** on the decode-only `ssm_prescan` not taking the conv first, with the
+  `ssm_conv_in` stand-down using `continue` instead of `return 0`.  The gate is data-pointer dependent, so it
+  lives in the compute-time matchers (`match_at_concat` / `match_at_conv`, which every compute-time site calls);
+  `graph_optimize` uses the structural `ggml_cuda_gdn_conv_pattern_at_concat`, a superset, so its alloc deps
+  cover every case the compute-time matchers take.
+* **The shared-expert gate fold** (`GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0` off): `MUL_MAT`(one gate row) ->
+  `SIGMOID` -> `MUL` -> `ADD` runs in the `mul_mat_vec_f` launch the gate would take anyway; every block
+  recomputes the one gate row and applies `sigmoid_mul_add_f32`'s own `op_sigmoid` and its
+  `#pragma clang fp contract(off)` expression to its slice.  BF16/F32 gate weights only, decode/verify band,
+  and the gate, the sigmoid and the product may have no other reader.
+* **The 2-D copy guard**: `ggml_cuda_cpy_as_memcpy_2d` keeps upstream's `cudaMemcpy2DAsync` fast path only
+  while the padded span (`height*pitch`) fits the tensor's own allocation.  A 2-D copy of a view of a
+  *mirrored model weight* is refused with `invalid argument` when the weight sits in the slab region, which
+  made `Flash-Next GSQ-IQ3_XXS -sm tensor -ncmoe 48` abort at load on r182 and earlier (device 1,
+  `blk.1.ple_conv1d.weight`'s column view, qwen4exp's PLE conv; `GGML_CUDA_SLAB=0` and `-sm layer` both
+  loaded).  The scalar kernels are the bit-identical fallback, and no other model we hold reaches the path
+  (0 2-D copies in an instrumented decode+prefill run of 35B-A3B, 4B Q8_0, 27B and gpt-oss).
+
+**Worth (1 GPU, `llama-bench -r 5`, two interleaved rounds, all four on vs all four off).**  gfx1100
+Qwen3.6-35B-A3B Q4_K_M tg128 **142.3 -> 150.6 (+5.9 %)**, d4096 **139.0 -> 146.9 (+5.6 %)**; gfx1201 the
+same model **105.0 -> 108.4 (+3.3 %)**, d4096 **+3.4 %**; dense 27B UD-Q4_K_XL **+1.7 %**; Qwen3.5-4B Q8_0
+neutral.  Decomposed on gfx1201: `0003` alone **+0.3 %** (it is the enabler, not the win — exactly what #249
+measured), the snapshot fold **+2.2 %**, the gather fold **+1.0 %**.  The shared-expert gate fold is inert on
+every quantized model we hold (its gate weight must be BF16/F32) and measures **+0.6 %** on Flash-Next
+GSQ-IQ3_XXS tg128.  The submitter's +7.2 % (7900 XTX) / +5.6 % (R9700) against r176 reproduce in direction;
+against r182 they measure +5.9 % / +3.3 % here.
+
+**Facts a future edit must keep.**
+
+* **The folds are inert on a multi-device graph** (the pre-existing `gdn_conv_enabled()`: one device unless
+  `GGML_CUDA_CONV_FUSION_MULTI=1`), so the recommended `-sm tensor -ncmoe` server shape gets none of them.
+  Stated in the release note; do not present these as multi-GPU wins.
+* **`0003` must keep the `gdn_conv_norm_match() > 0` gate.**  Relaxing it re-opens the #249 loss: where the
+  norm fold is refused the `ssm_conv_in` epilogue's free CONCAT write is replaced by a separate launch.
+* **The compute-time matchers and `graph_optimize` must keep deciding the same way** — the decode gate reads
+  data pointers, so a new compute-time caller goes through `ggml_cuda_gdn_conv_match_at_concat` /
+  `_at_conv`; only `graph_optimize` may use the structural `_pattern_at_concat` (a superset).
+* **The gather fold's tripwire is deliberate** (an abort, not a wrong read), and the direct kernel's
+  "read the state row, then write it back" order (preload into registers first) is load-bearing.
+* **`0004` elides stores, never tensor identities**: it needs BF16/F32 gate weights and needs the gate,
+  sigmoid and product to have no other reader.
+
+**Gates.**  Greedy text byte-identical on/off (35B-A3B 1 GPU, 4B Q8_0, 2-GPU `-sm tensor -ncmoe 40`, Flash-Next
+`-sm layer`); `gate-prefill-logits.sh --ab "<all four off>" --ub 1` **0.000000 / 100.000 %** on 27B Q8_0;
+canonical 27B Q8_0 gate **0.000000 / 100.000 %** against the r182 base; MTP on 35B-A3B `n_max 7` identical
+(362/203); `--parallel 2 --kv-unified` server clean; Flash-Next `-sm tensor -ncmoe 48` now loads (and matches
+the `GGML_CUDA_SLAB=0` arm's text); per-block build 3/3 `--fast`; `validate-set.sh` green; no GPU faults.
+Numbers: `benchmarks/2026-10-30-gdn-decode-folds.md`; records `archive/work/gdn-decode-folds/PROMOTED.md`
+and `archive/work/cpy-2d-memcpy-guard/README.md`.
 
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 
