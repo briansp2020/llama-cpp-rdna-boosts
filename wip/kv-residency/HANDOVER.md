@@ -456,11 +456,28 @@ A5 handover did, and it confused the maintainer):
 | **C** — the **drafter ring** (windowed MTP draft KV) | `LLAMA_SPEC_DRAFT_WINDOW`, implemented + measured on the campaign branch (`a93dee7a9`), **not in `patches/`** | **done as an EXPERIMENT, not promoted**: target text byte-identical; at a usable window it is free (46k context, `W=32768`: acceptance −2.3 % rel, generation flat); a window far below the working context costs 7-9 %; the VRAM prize is one draft layer (~1 GiB at `-c 262144`) and the freed VRAM does **not** reach the arena (it lives in the slab's `aux_reserve`).  Three questions for the maintainer are open in `O3-DRAFTER-RING.md` §7 |
 
 So: **"promote" means Goal A only.**  A promotion session's work is: re-cut `patches/0013`-era code against the
-then-current release (now r177) into a delivery block, add the `ENVIRONMENT.md` rows for the five campaign env
-vars (`LLAMA_KV_REGION`, `LLAMA_KV_RESIDENT_CELLS`, `LLAMA_KV_SPILL_RAM_PCT`, `LLAMA_KV_REGION_QUARANTINE`,
-`LLAMA_KV_REGION_DEBUG`/`TRACE`/`CANARY`/`DUMP` + `GGML_CUDA_VMM_REGION_SELFTEST`), decide the default-on call
-(the default-on policy applies: beneficial + gated ⇒ on, with a kill switch), and run the release gates.  It is
-**not** measurement and it is **not** Goal B.
+then-current release (now r177) into a delivery block, **first make the two shape changes below**, add the
+`ENVIRONMENT.md` rows for the five campaign env vars (`LLAMA_KV_REGION`, `LLAMA_KV_RESIDENT_CELLS`,
+`LLAMA_KV_SPILL_RAM_PCT`, `LLAMA_KV_REGION_QUARANTINE`, `LLAMA_KV_REGION_DEBUG`/`TRACE`/`CANARY`/`DUMP` +
+`GGML_CUDA_VMM_REGION_SELFTEST`), decide the default-on call, and run the release gates.  It is **not**
+measurement and it is **not** Goal B.
+
+**The two shape changes a promoted build needs (do not ship the campaign's gating as-is):**
+
+1. **Take the region buffer ONLY when a window is actually active** (`kv_resident_cells != 0`), else the plain
+   CUDA KV.  Today's `cells == 0` fallback goes to the **O1** region buft, and O1 is *not* inert —
+   `IMPLEMENTATION.md` → *KNOWN LIMIT*: 35B-A3B `-ncmoe 24 -c 262144` on a 253k-token prompt **completes** plain
+   (1201 t/s prefill, 51.2 t/s decode) and **`GGML_ABORT`s** with the region on, because the slab/arena took the
+   VRAM the KV had not committed up front.  O1 is parked; nothing is lost by dropping it from the default path.
+2. **Then** `LLAMA_KV_RESIDENT_CELLS=auto` can be default-on: it spills only when the KV does **not** fit at the
+   user's pinned `-c` (OOM → a working run, with the WARN line and the `--fit` cost report), and it sets the
+   window to 0 when the KV fits — which, with (1), keeps the plain buffer, so a config that fits stays
+   byte-identical.  A **numeric** `W` stays explicit (a window below the run depth costs 11-26 %), and the env
+   var becomes the kill switch (`=0`).
+
+**What the current gating really is:** the *window* needs **both** `LLAMA_KV_REGION=1` **and**
+`LLAMA_KV_RESIDENT_CELLS=W|auto` (+ a pinned `-c` for `auto`).  `LLAMA_KV_RESIDENT_CELLS` alone is **inert**
+(both buft helpers check the region flag); the provider alone takes the **O1** path, which is what (1) removes.
 
 1. `cd ~/llama-cpp-rdna-boosts && git pull` (and `cd ~/llama.cpp && git fetch origin`); read this file, then
    `A2-MIXED-BACKING.md` **§3.7.11** (A5: the spilling-arm gates, the Flash-Next arm, **both bugs and their
