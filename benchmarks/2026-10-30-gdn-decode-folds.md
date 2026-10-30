@@ -54,6 +54,10 @@ Decomposition (gfx1201, 35B-A3B, one round per arm, all `llama-bench -r 5`):
   **0.000000 KLD / 100.000 % same-top-p**.  Canonical gate at the default ubatch against the r182-recorded
   base: **0.000000 / 100.000 %**.
 * MTP, 35B-A3B, `n_max 7`: draft/accept **362 / 203** on both arms, identical.
+* MTP Protocol A (dense 27B UD-Q4_K_XL, 3 devices, `-sm layer`, `-c 102400 -fa 1`, `-n 3000`): plain **25.9**
+  -> draft-mtp **66.1 t/s**, acceptance **0.85057**, and `plain == draft-mtp` **byte-identical** (1806 chars
+  each).  The plain rate matches the r181/r182 reference (24.98), so the MTP path is unchanged while the
+  snapshot fold runs on the verify band (`T = 2..8`).
 * server `--parallel 2 --kv-unified`: clean (no assert from the gather fold's tripwire; a multi-sequence
   batch declines the deferral).
 
