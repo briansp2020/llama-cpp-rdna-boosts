@@ -12,7 +12,7 @@ release history here — this file is the policy layer, not the log.
 ## What this repo is
 
 A **delivery repo**. It packages the RDNA/ROCm work of the [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp)
-fork (`rdna-boosts` branch) as a **15-block set (V2.1)** (block 00 + blocks 01-14) that applies to a clean
+fork (`rdna-boosts` branch) as a **16-block set (V2.1)** (block 00 + blocks 01-15) that applies to a clean
 llama.cpp checkout at the fork point named in `release.json`. This repo is NOT the fork: the fork
 lives at `~/llama.cpp`; its `rdna-boosts` branch is re-cut from `patches/` on every release and
 force-pushed to the personal fork so it never goes stale (see the Pushing policy). `patches/` is the
@@ -97,7 +97,7 @@ amendment, or a note in the relevant record).
 | `BASELINE.md` | fork point, what the patches are, how they are cut, drift policy. Its dated baseline/re-base records are in `archive/docs/baseline-history.md` |
 | `TODO.md` | **forward-looking only**: open items, items waiting on someone else, accepted limitations, parked ideas. A closed item is one `WORKLOG.md` entry — never a TODO entry. `#NN` numbers are permanent handles and are never reused |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims); dated narratives/evidence are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
-| `patches/` | **the delivery set** (0000-0014: block 00 + blocks 01-14) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
+| `patches/` | **the delivery set** (0000-0015: block 00 + blocks 01-15) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 15 is the windowed KV** (the promoted Goal A of `TODO` #118: an opt-in fixed-VRAM resident window with a pinned-host tail, `LLAMA_KV_RESIDENT_CELLS`). **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
 | `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback, **deterministic commit ids**), `fork-refresh.sh` (the release-time fork refresh: re-cut, tree/tip check, optional build/gates/push — the `.tip` rule below), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-park-idle-slots.sh` (the server idle-slot parking gate: park == lazy-off text + the indexer cache moves with the attention cache, issue #227), `gate-hc-fusions.sh` (the qwen4exp hyper-connection fusion-equivalence gate: all four mix/combine arms must reproduce the unfused chain, once per hc-down weight class, issue #228), `gate-ckpt-reuse.sh` (the context-checkpoint reuse gate: a kept restored checkpoint changes no token, and only a hybrid/recurrent target reaches the keep path), `gate-state-pipe.sh` (the batched state save/restore gate: the pipelined / plain-memcpy-copy / pipelining-off / save-only / synchronous arms must restore byte-identical text, and it is the only gate that reaches that code), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out), `check-windows-portability.sh` (fails on a POSIX-only call outside a Windows-excluding region in a file the delivery adds, issue #231; run by `validate-set.sh`). **Index: `scripts/README.md`** |
 | `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
 |  `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
@@ -179,20 +179,38 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
 
 - **`llama-cli` MUST be run with `--single-turn`** (plus `--no-display-prompt` for scripted output).
   Without it, the interactive chat loop blocks forever. Wrap potentially blocking commands in `timeout`.
-- **Apply method:** all 15 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
+- **Apply method:** all 16 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
   `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
-- **Naming (V2.1):** the current set is **15 blocks, 00-14** (block 14 is the temporary `-sm relaxed-tensor`
+- **Naming (V2.1):** the current set is **16 blocks, 00-15** (block 15 is the windowed KV, the promoted
+  Goal A of `TODO` #118; block 14 is the temporary `-sm relaxed-tensor`
   block, see `patches/README.md`; the release tag lives in `release.json` — read `.release` there, it is
-  never restated here).  Every `block NN`
+  never restated here).  **15** (r178) the windowed KV: an opt-in fixed-VRAM resident window
+  (`LLAMA_KV_RESIDENT_CELLS`) with the tail in pinned system RAM — one VA range, no kernel change; a run
+  without the knob keeps the plain device buffer and its OOM.  Every `block NN`
   reference elsewhere in this file that is not one of the V2.1 numbers below is the **pre-V2.1 16-block
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,
   **03** chunked GDN, **04** BF16 KV, **05** FA band/native/derived, **06** MMB, **07** k-quant,
   **08** fused kernels (fused MoE), **09** host-resident MoE (slab/cache), **10** slab + fusion dispatcher
-  + async input ring (infrastructure), **11** qwen4exp (model/QSA/HC/lazy reader), **12** campaign
+  + async input ring + the rope/row-concat reorders + the 1-token router fold (infrastructure), **11**
+  qwen4exp (model/QSA/HC/lazy reader), **12** campaign
   remainder, **13** MTP draft vocabulary subset (opt-in).  V2.1 split r109's old block 10 in two: the
   **infrastructure stays 10**, the **qwen4exp architecture is 11** (QSA went with it by decision), so
   every pre-r109 "block 10" note about slab / dispatcher / async-input is still block 10 while a note
   about qwen4exp / QSA / HC / the lazy reader is now block 11.
+- **A 1-token router fold is a width-1 fusion (r182, block 10).**  `ggml_cuda_router_topk_moe_ok` folds the
+  MoE router `MUL_MAT` into the fused `topk_moe` launch only where the dispatcher would run
+  `mul_mat_vec_f<float,float,1,256>` and the logits have **one row**, and the merged kernel reproduces that
+  kernel's arithmetic exactly (same thread map, `float2` loads, `ggml_cuda_mad`, warp + cross-warp
+  butterfly) with the last block -- threadfence + one atomic on the last `moe_red_counters()` slot -- running
+  the unchanged selection.  The **prefill-logit gate at the default ubatch cannot see it** (the fold never
+  fires with more than one token): judge it with `gate-prefill-logits.sh --ab "GGML_CUDA_ROUTER_TOPK=0" --ub 1`
+  plus a `rocprofv3` census in the same build, and `test-backend-ops -o TOPK_MOE`.  The fold is **inert
+  under any speculator** (a verify batch is wider than one token), so it is a plain-decode win
+  (+1.2..+3.1 % on a 128/256-expert MoE, RDNA3/RDNA4), and it **steps aside on RDNA4 above 128 experts**
+  (measured slower as one launch on both our box and the submitter's).  `GGML_CUDA_ROUTER_TOPK=0` is the
+  kill switch; do not drop the logits store (the fold elides the *launch*, never the tensor, so another
+  consumer of the logits keeps working).  `GREEDY-PURITY.md` §72,
+  `archive/work/router-topk-fold/PROMOTED.md`.
 - **Throughput is NOT a correctness signal.** Verify coherence (same-seed `llama-cli` diff, or
   `archive/work/tools/ar_kernel_unit.cpp`). Decode perf work is validated at **depth-16384**, not
   shallow `llama-bench`. **Never run parallel/background benches.**

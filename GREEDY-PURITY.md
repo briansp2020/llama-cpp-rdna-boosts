@@ -11,7 +11,7 @@ which false trails were ruled out) are in
 numbers.  The delivery-side record of each amendment is in `patches/README.md` and `WORKLOG.md`.  Section
 numbers are **stable** — dozens of docs cite them — so they are never renumbered; new findings append.
 
-> **Numbering.**  This document uses the **V2.1 block** numbering for new text (14 blocks, `00`-`13`; r109
+> **Numbering.**  This document uses the **V2.1 block** numbering for new text (16 blocks, `00`-`15`; r109
 > split the old block 10 into block 10 = infrastructure and block 11 = qwen4exp, and moved the campaign
 > remainder to block 12 and the MTP-vocab trim to block 13).  Entries written
 > before 2026-10-13 use the **pre-V2.0 16-block** numbering ("block 10" = the k-quant/VDR umbrella, now
@@ -132,6 +132,8 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§68** | a re-base that inherits an upstream **association-order** change is a *re-baseline*, not a purity break: classify a cross-release text move by *what* moved (a VDR/nwarps/norm-grouping carrier is a re-baseline; a scale or tensor-identity carrier is a defect), judge it by width purity and a distribution check, and answer a consumer's output-identity gate with a build-time escape — never a runtime arm | doctrine (r170, issue #228 follow-up; `prompts/` payload, gfx1151) |
 | **§69** | a fusion that stands down for MMB must ask the **dispatch** predicate (the exact shape claim), never a weight-type test: a type-only answer stands down for shapes MMB does not take and, worse, disagrees with the graph optimizer's BF16-only activation marking, so the marking pass must also refuse to elide an activation whose reader a fusion may consume; a matcher that probes arbitrary node pairs owes null-safe predicates | fix + doctrine (r171, `TODO` #115; `benchmarks/2026-10-29-mmb-pair-ownership.md`) |
 | **§70** | a second sequence in a batch is a **stride** in the mask predicate, not a new mask: sequence `k`'s cells and tokens shift by `k * 2^23`, so `tok_lo <= cell_pos <= tok_hi` stays exact with no kernel change — but only with one KV stream, one sequence per token, **no cell carrying two of the batch's sequences** (the shared-cell counter is a fast path, never the semantics), positions below the stride, and > 32 tokens; the reserve latch is a reserve optimization only, because `kq_mask_derivable()` re-runs per ubatch | doctrine + measured (r172, PR #247; `benchmarks/2026-10-29-derived-kq-multiseq.md`) |
+| **§71** | a graph-reorder pass is pure only while it moves nodes alone: enumerate the positional consumers (a matcher that anchors at a fixed index and returns a skip count) and exclude every input they depend on, judge it at three ubatch widths, and quote the GGUF with any claim because a reorder's reach is a model property | doctrine + measured (r180, PR #252; `benchmarks/2026-10-30-graph-order-0003-r180.md`) |
+| **§72** | a fold that merges two launches with an in-kernel barrier is pure only where it reproduces the first launch's arithmetic **and** keeps writing its output: the predicate must re-check the dispatcher's route in its own order, the width is the gate (one logits row), the elided launch's store stays, and the cross-block counter is a dedicated slot | doctrine + fix (r182, PR #253; `benchmarks/2026-10-30-router-topk-fold.md`) |
 
 ---
 
@@ -2309,3 +2311,88 @@ then keeps the packed mask for the rest of the run: the memory is given back, th
 
 **Record:** `WORKLOG.md` 261029.003, `archive/work/kq-derived-multiseq/`, `patches/README.md` (block 05),
 `benchmarks/2026-10-29-derived-kq-multiseq.md`, `ENVIRONMENT.md` (`LLAMA_KQ_MASK_DERIVED_MULTISEQ`).
+
+## 71. A graph-reorder pass is pure only while it moves nodes alone and the positional matchers are excluded (r180, PR #252)
+
+**The claim.**  Two structural passes in `ggml_backend_cuda_graph_optimize` move `MUL_MAT` nodes earlier in
+the graph (`GGML_CUDA_QK_ROTATE`, r177; `GGML_CUDA_MMVQ_CONCAT_REORDER`, r180).  A reorder cannot change a
+result: the moved node's sources (its activation and its own leaf weight) are already earlier in the graph,
+and the nodes it crosses are guaranteed by topological order not to read it, so no reader is skipped and no
+buffer lifetime shortens.  What a reorder *can* break is a **positional consumer** — a matcher that reads
+`cgraph->nodes[i + k]` and, having declared the region fused, returns a skip count so those nodes are never
+executed.
+
+**The rule.**  Before a reorder is allowed, enumerate the try-fuse entries that (a) anchor at a fixed index
+and (b) skip nodes without validating each one, and exclude every input they depend on:
+
+* `ggml_cuda_ssm_conv_in_try_fuse` returns `j - i` having validated only its `MUL_MAT` and the `CONCAT` —
+  so **never move a node whose output feeds a `CONCAT` within 8 nodes**: it would land inside the skipped
+  window and silently never run;
+* `ggml_cuda_ssm_prescan_try_fuse` matches a 16-node chain **by position** (`alpha_w` at `i + 7`,
+  `beta_w` at `i + 13`) and only fires when both GDN small weights are `Q8_0` — so **never move a `Q8_0`
+  weight**; doing so drops the whole conv + l2-norm + gate/beta fusion (a perf loss, not a wrong answer, but
+  it silently disables a shipped win).
+
+Both guards live in the r180 pass and are load-bearing, not tuning.  A pass that gathers *other* families'
+small projections owes the same enumeration.
+
+**How to judge a change here.**  A reorder runs at every ubatch size, so the prefill-logit gate must be run
+at **three** widths, not one: the default ubatch (prefill shape), `-ub 1` (the decode-width graph) and
+`-ub 8` (the captured-graph band).  All three read **0.000000 / 100.000 %** for r180
+(`--ab GGML_CUDA_MMVQ_CONCAT_REORDER=0`, on the only GGUF the pass fires on).  Text is the second instrument
+and it must be run **within** one device count: 1 / 2 / 3 devices, both MTP split modes, and the DFlash2
+draft arm (whose `selector_hidden` is the only other `<= 256`-row quantized weight we hold and which the
+pass deliberately does not match) are all byte-identical for r180.
+
+**A reorder's *reach* is a model property, not a kernel property.**  The r180 pass fires only where a
+**quantized `<= 256`-row** projection exists: llama.cpp-quantized GGUFs (lmstudio-community's Qwen3.6 range)
+keep the GDN `ssm_alpha`/`ssm_beta` at Q4_K, while the unsloth UD quants keep them `F32` and the Q8_0 quant
+is excluded — so the same build measures +2.8 % on one file and is inert on another.  Quote the GGUF's
+sha256 with any claim about this pass; "inert on our models" is not "does not work".
+
+**Record:** `WORKLOG.md` 261030.004, `patches/README.md` (block 10, "r180"),
+`benchmarks/2026-10-30-graph-order-0003-r180.md`, `ENVIRONMENT.md` (`GGML_CUDA_MMVQ_CONCAT_REORDER`).
+
+## 72. A fold that merges two launches with an in-kernel barrier is pure only where it reproduces the first launch's arithmetic *and* keeps writing its output (r182, PR #253)
+
+**The claim.**  The r182 router fold merges a 1-token MoE router `MUL_MAT` with the fused `topk_moe` launch.
+The router's logits are recomputed inside `topk_moe_cuda` by block `b` (one block per expert row) with the
+**same** thread-to-column map, `float2` loads, unroll, `ggml_cuda_mad` calls and warp + cross-warp butterfly
+as `mul_mat_vec_f<float,float,1,256>`, and the *last* block to finish — a `__threadfence()`, then one atomic
+on a self-resetting counter — runs the unchanged selection.  The two launches become one with no float
+reassociated, so a decode step is bit-identical to the two-launch path.
+
+**The rule.**  Three conditions, each of which can fail on its own:
+
+1. **The arithmetic must be the fused launch's, not "equivalent".**  The fold is only admissible where the
+   dispatcher would pick the very kernel whose loop it inlines, so the predicate re-checks the route
+   (`ggml_cuda_mmb_supported_mm` first, then `ggml_cuda_should_use_mmvf`, then the *same* block-size choice
+   `launch_mul_mat_vec_f_cuda` makes) and refuses every shape where another path would run: a bias, a
+   delayed softmax, a Hadamard-hinted `src0` (FWHT), a padded compute-buffer `src0` (cuBLAS), non-F32, a
+   non-contiguous operand, an expert count outside 64/128/256, wave64.  Keep it in sync with
+   `ggml_cuda_mul_mat` the way `ggml_cuda_mul_mat_takes_mmq` is kept in sync.
+2. **The width is the gate, not a heuristic.**  `n_tokens == 1` is required (one logits row): at `ncols_dst
+   > 1` `mul_mat_vec_f` accumulates in a different order and the selection's row map is per-row blocks.  A
+   verify batch must never fold, which is why the fold is inert under any speculator.
+3. **The elided launch's output must still be written, and the tensor still allocated.**  The fold elides
+   the *kernel*, never the logits tensor or its store, so any other consumer of `logits` (always later in
+   node order) keeps working and the allocator keeps the buffer live.  Turning the logits write into a
+   private scratch buffer would silently drop such a consumer.
+
+The in-kernel election is the r182 instance of the delivery's existing cross-block counter idiom (the MoE
+down fold): a per (device, stream) counter, zeroed at allocation and reset before the kernel returns, here
+taken from the **last** slot (`GGML_CUDA_MOE_RED_CNT - 1`) so it cannot collide with the down fold's
+`red_cnt + blockIdx.x` range.  A launch aborted mid-kernel leaves it non-zero — the caveat both folds
+carry.
+
+**How to judge a change here.**  The prefill-logit gate at the **default ubatch cannot see this change**:
+the fold never fires with more than one token, so the interesting probe is
+`gate-prefill-logits.sh --ab "GGML_CUDA_ROUTER_TOPK=0" --ub 1`, which makes every token its own graph and
+forces the fold on (confirm it with a `rocprofv3` census in the same build).  r182 reads **0.000000 KLD /
+100.000 % same-top-p** there on Qwen3-30B-A3B (gfx1201, 128 experts) and Qwen3.6-35B-A3B (gfx1100, 256
+experts), with greedy text byte-identical on/off.  `test-backend-ops -o TOPK_MOE` (608/608) is the op
+oracle for the kernel refactor.
+
+**Record:** `WORKLOG.md` 261030.006, `patches/README.md` (block 10, "r182"),
+`benchmarks/2026-10-30-router-topk-fold.md`, `archive/work/router-topk-fold/PROMOTED.md`,
+`ENVIRONMENT.md` (`GGML_CUDA_ROUTER_TOPK`).

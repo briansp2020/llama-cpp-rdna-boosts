@@ -70,6 +70,12 @@ what that turns into.
 
 ### D. The link constant, and the cost of a non-resident KV byte
 
+> **RE-BASELINED 2026-10-30: the box was re-cabled and the link DOUBLED.**  The values immediately below are the
+> historical 28.8 GB/s calibration that every number in this campaign was measured at; the current box measures
+> **55.7 GB/s H2D / 56.8 D2H / 55.7 GB/s kernel read of pinned host memory**, i.e. `bytes / 55.7 GB/s` is the
+> present cost model and every earlier t/s figure in this campaign must be re-measured before it is compared.
+> See `A2-MIXED-BACKING.md` §3.7 for the new numbers and the re-run probe output.
+
 `wip/kv-residency/bw-probe.cc` (`hipcc -O3 --offload-arch=gfx1201`), 512 MiB per arm, 5 reps, best of:
 
 ```

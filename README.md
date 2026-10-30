@@ -10,12 +10,12 @@ support, and an attention-memory campaign that frees several GiB of VRAM.
 [`ENVIRONMENT.md`](ENVIRONMENT.md) documents every variable the set adds or repoints: its default, and
 whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
 
-It ships as **15 patches** (block 00 + blocks 01-14) for a clean llama.cpp checkout at the fork point
+It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork point
 **`6050b467c`** (upstream master).  Each block is one `git am` commit, and the series is linear (a block
 assumes its predecessors), so the set is applied whole.  **Block 14 is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
 [block 14](patches/README.md#block-14--sm-relaxed-tensor-for-the-moe-amax-arches-temporary-expect-removal)
-and treat it as a stop-gap, not a feature.  The current release is **`v15-6050b467c-r176`**: the release
+and treat it as a stop-gap, not a feature.  The current release is **`v15-6050b467c-r177`**: the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
 [`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,
@@ -27,10 +27,10 @@ git checkout 6050b467c
 bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (15 commits)
 
 # OPTIONAL: a beta candidate on top (NOT the release tree -- for beta testing only)
-bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 15 blocks + beta/*/*.patch
+bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 16 blocks + beta/*/*.patch
 ```
 
-- One-line summary of each block: [The 15 blocks](#the-15-blocks-v21)
+- One-line summary of each block: [The 16 blocks](#the-16-blocks-v21)
 - What each block contains, its knobs and its purity notes: [`patches/README.md`](patches/README.md)
 - The folded `mmb`/QSA campaign: [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery)
 - Every environment variable, with its default and class: [`ENVIRONMENT.md`](ENVIRONMENT.md)
@@ -42,8 +42,9 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 15 blocks + b
 ## Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v15-6050b467c-r176`**; the
-`v16-*` tags are the historical 16-block set.  `r1` is the
+(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-6050b467c-r180`**; the block
+count in the tag follows the set, so `v15-*` tags are the 15-block releases up to r177 and `v16-*` the
+16-block releases from r178 on.  `r1` is the
 re-base of the set onto that fork point and every later `rN` is a dated change recorded in
 [`WORKLOG.md`](WORKLOG.md), newest first).
 
@@ -150,7 +151,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The 15 blocks (V2.1)
+## The 16 blocks (V2.1)
 
 `release.json` (V2.1; the current release).  Each row is one `git am` commit.
 
@@ -170,6 +171,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 | `0011` | **qwen4exp** (model, hyper-connections, lazy reader, QSA/indexer) | old-14 + old-15 HC16/policy/QSA; the model graph, the QSA/indexer/HC ops and kernels, the managed lazy reader and the keys-only indexer cache, the qwen4exp tensor-split arch gate, and the qwen4exp fusion arms; split out of `0010` in r109 (tree-identical) |
 | `0012` | **campaign remainder** (CPU wins, DFlash, FA build grouping, mmap reclaim, batched state copy) | old-15 W1-W3 + old-06/15 mmap reclaim + old-16; + the expected `--fit` `ctx_other` probe failure logs as a warning, and the draft-context creation is gated on an enabled type that uses it (r101); + the batched state save/restore, the pipelined copy over it, and the threaded streaming host copy (r152, PR #235); + the DFlash draft's compute reserve split over its injection and noise-block graphs (r162, issue #239); + the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they stop being graph outputs and the host rows are reserved only when the host path runs (r163, issue #240) |
 | `0013` | **MTP draft vocabulary subset** (`--spec-draft-mtp-vocab N`, **opt-in**, default off) | the MTP draft scores only the LM-head rows for token ids < N (+ control/user ids) and scatters them into a full-vocab row of `-inf` — the target's verification is untouched, so the draft can only lose proposals; the `ggml-backend-meta` row-range read that makes it work under `-sm tensor` (r107) |
+| `0015` | **windowed KV** (**opt-in**, `LLAMA_KV_RESIDENT_CELLS`) | the KV's VRAM cost becomes a resident **window** of the newest `W` cells instead of `-c` cells: one VA reservation holds the cache, the window is VRAM and everything older is pinned system RAM, so a context that OOMed now runs (27B Q8_0 `-c 262144` = 128 MiB VRAM + 8576 MiB pinned host) and the VRAM the KV does not need *yet* goes to the expert-cache arena (+2.2…+2.9 GiB at `-c 262144`, `-n 2000`). A spilled KV is numerically transparent (prefill-logit KLD −0.000000 / 100.000 % on a spilling arm); unset = byte-identical to a build without it, including the OOM (r178, promoted from `wip/kv-residency`) |
 | `0014` | **`-sm relaxed-tensor`** (**TEMPORARY**, `flint`/`mellum`/`mistral4` only) | tensor split that also admits a replicated tensor whose values differ per GPU (the MoE amax row max, which no device can complete). Exact on RDNA/HIP, zero VRAM, and **not a supported feature**: it relaxes upstream #31081 and is expected to be dropped when upstream fixes the amax under a tensor split. Delete this patch to get back to the r136 tree |
 
 Phase-2 additionally moved each concern into a self-contained file: the `ggml_cuda_try_fuse` arms, the

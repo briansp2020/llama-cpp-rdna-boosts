@@ -1,0 +1,30 @@
+From 1f02d981d36412a40055ecb4534a61d6d4c5ad8a Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 30 Oct 2026 05:39:38 +0000
+Subject: [PATCH 2/2] router-topk: step aside on RDNA4 with more than 128
+ experts, where the one launch is slower than the two (Qwen3.6-35B-A3B tg128
+ 133.2 -> 134.7 on R9700; Qwen3-30B-A3B keeps its gain). Bit-identical either
+ way
+
+---
+ ggml/src/ggml-cuda/topk-moe.cu | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
+index 4991e6e82..a14c15b04 100644
+--- a/ggml/src/ggml-cuda/topk-moe.cu
++++ b/ggml/src/ggml-cuda/topk-moe.cu
+@@ -758,6 +758,10 @@ bool ggml_cuda_router_topk_moe_ok(const ggml_backend_cuda_context & ctx, const g
+             !ggml_cuda_should_use_mmvf(x->type, dev.cc, dev.warp_size, x->ne, x->nb, 1)) {
+         return false;
+     }
++    // RDNA4, 256 experts: the one launch is slower than the two (Qwen3.6-35B-A3B tg128 about -1 % on R9700)
++    if (GGML_CUDA_CC_IS_RDNA4(dev.cc) && x->ne[1] > 128) {
++        return false;
++    }
+     // mul_mat_vec_f's block size choice (mmvf.cu): the fewest K iterations, the smallest block on a tie
+     const int64_t max_block_size = dev.cc > GGML_CUDA_CC_OFFSET_AMD && dev.cc < GGML_CUDA_CC_RDNA1 ? 128 : 256;
+     int64_t block_size_best = dev.warp_size;
+-- 
+2.53.0
+

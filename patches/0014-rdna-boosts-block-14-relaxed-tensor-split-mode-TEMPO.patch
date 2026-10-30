@@ -1,7 +1,7 @@
-From 0cc6f408df82943e2d21255518a54782b5a696a6 Mon Sep 17 00:00:00 2001
+From d17a4796d9962f755feca067c0c9c238dfef5252 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
-Subject: [PATCH 14/14] rdna-boosts: block 14: relaxed-tensor split mode
+Subject: [PATCH 14/15] rdna-boosts: block 14: relaxed-tensor split mode
  (TEMPORARY: MoE amax per-device scalar)
 
 This block is a LOCAL, TEMPORARY relaxation of upstream behaviour, not a

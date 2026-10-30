@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
-**15 blocks** (block 00 + blocks 01-14) against `release.json.base` (**`6050b467c`** as of
-`v15-6050b467c-r171`; the base is the 2026-10-25 re-base), one
+**16 blocks** (block 00 + blocks 01-15) against `release.json.base` (**`6050b467c`** as of
+`v16-6050b467c-r178`; the base is the 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -21,12 +21,12 @@ and every environment variable is catalogued in [`../ENVIRONMENT.md`](../ENVIRON
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout "$(jq -r .base /path/to/rdna-boosts/release.json)"
-bash /path/to/rdna-boosts/scripts/apply-all.sh .          # creates branch rdna-boosts, 15 commits
+bash /path/to/rdna-boosts/scripts/apply-all.sh .          # creates branch rdna-boosts, 16 commits
 bash /path/to/rdna-boosts/scripts/apply-all.sh --include-beta .   # + beta/*/*.patch (NOT the release tree)
 ```
 
 All blocks with **`git am`**, in order.  `git apply` on the concatenated series silently drops hunks; the
-manual equivalent is `git am patches/000[0-9]-*.patch patches/001[0-4]-*.patch`.  `apply-all.sh` asserts
+manual equivalent is `git am patches/000[0-9]-*.patch patches/001[0-5]-*.patch`.  `apply-all.sh` asserts
 the applied tree equals `release.json.tree` on the strict path.
 
 ## Block index
@@ -51,6 +51,7 @@ only as a rough shape.
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
+| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`): the KV's VRAM cost is a **resident window** of the newest `W` cells, the rest in pinned system RAM, in **one VA reservation** — so `set_rows`, the rope shift, `state_write/read`, the kq mask and the FA kernels keep addressing one contiguous range (**no kernel or op change**).  The window slides in whole map units.  Payoffs: a context that OOMs now runs, and the VRAM the KV does not need *yet* goes to the expert-cache arena.  Unset = plain device buffer, byte-identical including the OOM.  Two driver hazards are held (a kind flip zeroes a neighbouring live host mapping without the `LLAMA_KV_REGION_QUARANTINE` hold; every tensor must start on the map granularity), and an idle-slot park is refused on a region-backed cache.  See below and `../wip/kv-residency/A2-MIXED-BACKING.md` §3.7.9/§3.7.11 |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
 infrastructure split out of `ggml-cuda.cu` (slab/arena/try-fuse TUs) and block 11 is the qwen4exp
@@ -1592,6 +1593,150 @@ unchanged (27B 3 GPU layer 51.6, tensor 100.5 -> 100.8); rule-5 `llama-batched-b
 per-patch switch-off deltas above; `test-backend-ops -o ROPE,MUL_MAT_ID` OK; no GPU faults.  Numbers:
 `benchmarks/2026-10-29-rdna3-decode-fusions.md`.
 
+#### r177 — the Q/K/V projection reorder and the dense row concat on RDNA4 (PR #252)
+
+**What it is.**  Two of that PR's three graph-ordering patches, from `@briansp2020`, folded here for the
+same reason (block 10 owns `ggml_backend_cuda_graph_optimize`'s fusion passes and `mmvq.cu`).
+
+| patch | what | knob | worth (30B-A3B, gfx1100/gfx1201) |
+|---|---|---|---|
+| V/K projections move in front of the Q projection | Q can join the row concat and the Q/K norm+rope pair fires | `GGML_CUDA_QK_ROTATE` | 5.9 / 3.2 % |
+| the dense row concat also runs on RDNA4 | one ksplit launch instead of 2-3 on RDNA4 too | `GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4` | inert / 2.6 % |
+
+**Why the reorder is needed.**  The model graph runs Q MUL_MAT, RESHAPE, RMS_NORM, MUL, ROPE and *then* the
+V and K projections, so (a) the row concat's scan from the Q matmul stops at the Q norm (only V+K fuse) and
+(b) the allocator hands the Q chain's freed buffers to V/K, so `ggml_cuda_qk_pair_k_at`'s overlap test
+refuses the Q/K pair.  The pass matches the Q chain structurally, requires the nodes in between to be only
+`MUL_MAT`/`RESHAPE`/`VIEW` and to read none of the Q nodes (resolving `view_src`), matches the K chain's
+`RMS_NORM`/`MUL`/`ROPE` by identical rope parameters **and** position tensors, and then `std::rotate`s the
+V/K block in front of the Q matmul — the same trick as the r175 shared-expert rotate, same nodes, one
+stream, so it is bit-identical.  It is structural only (no data pointers), runs at every ubatch size, and is
+idempotent (`j == i + 5` is the rotated shape, so a second pass declines).
+
+**Facts a future edit must keep.**
+
+* **The rotate sits in the alloc-deps half of the pass, i.e. it runs for the meta backend's `allocs_only`
+  forward and NOT for `marks_only`.**  That is deliberate — the marks are per tensor and the fusion deps must
+  be registered before allocation — but it means the two halves of a `-sm tensor` optimize see different
+  node **orders**, so no matcher added to the marking half may depend on adjacency that this rotate changes.
+  Verified byte-identical on 2-GPU `-sm tensor` (30B-A3B, text and prefill logits), which is the arm that
+  exercises both forwards.
+* **The pass is not arch-gated, and must not be**: it only re-enables fusions that are themselves gated
+  (the row concat's own table-id gate, the Q/K pair's own matcher).  On both RDNA generations the reorder
+  alone carries the whole win; the RDNA4 row concat is the increment on top.
+* **The RDNA4 row concat needs every segment to have an even row count.**  RDNA4's single-token launch may
+  take two rows per block and a 2-row block must not straddle a segment boundary; the check is `ne[0] % 2`
+  on *every* segment including the main one.  RDNA3_0 keeps its own `small_m` + rows-per-block agreement
+  rule.  **Do not widen the RDNA4 gate further**: the argument is that `ncols_dst == 1` makes
+  `calc_nwarps_weight` row-independent, and that `two_rows` / `GGML_MMVQ_RDNA4_DECODE_GRID` / the
+  `grid_stall_pad` block only change *which* block computes a row — a future row-count-dependent nwarps or
+  VDR would break it silently, so re-check that predicate before touching it.
+* **The submitter's third patch ships since r180** (`GGML_CUDA_MMVQ_CONCAT_REORDER`, PR #252 0003; see the
+  r180 subsection below).  It needs a **quantized** `<= 256`-row weight and skips `Q8_0`, so it cannot fire
+  in the UD quants (F32 `ssm_alpha`/`ssm_beta`) or in the Q8_0 quant; the measurement that took it is on the
+  submitter's llama.cpp-quantized Qwen3.6-35B-A3B Q4_K_M (whose GDN small projections are Q4_K), and it is
+  inert on every other GGUF we hold.
+
+**Gates.**  Greedy text byte-identical to r176 on 30B-A3B (1 GPU and 2-GPU `-sm tensor`), 35B-A3B, dense
+27B, Gemma4-31B and Flash-Next (`-ncmoe 48`, 2 GPU tensor); prefill-logit KLD **0.000000 / 100.000 %** at the
+default ubatch and at `-ub 1`; MTP Protocol A on the dense 27B at 3 devices unchanged (layer 25.0 -> 51.7
+t/s, acceptance 0.621; tensor 50.8 -> 101.2, acceptance 0.608; `plain == draft-mtp` text identical in both
+split modes); rule-5 `llama-batched-bench -npl 1,4,8` flat (31.91/102.11/156.90 -> 31.94/102.20/157.18);
+2-GPU `-sm tensor` 30B-A3B +4.7 % (d0) / +3.9 % (d4096); per-block build 2/2; `validate-set.sh` green;
+no GPU faults.  Numbers: `benchmarks/2026-10-30-graph-order-r176.md`.
+
+#### r180 — the GDN small-projection gather (PR #252's third patch)
+
+**What it is.**  A second structural pass in `ggml_backend_cuda_graph_optimize`, placed right after the V/K
+rotate and gated on RDNA3_0/RDNA4.  The Qwen3.5/3.6 GDN layers read the same normed input with
+`ssm_beta` (32 rows), `ssm_alpha` (32 rows) and the `attn_gate` z projection (4096 rows), but sigmoid /
+softplus / reshape nodes sit between them, so each ran as its own GEMV launch.  From the first
+**quantized** `MUL_MAT` of `<= 256` rows (`a`), the pass scans up to 24 nodes ahead for `MUL_MAT`s with the
+same `src1`, the same weight type, the same `K` and the same row stride (at most one of them larger than
+256 rows), and `std::rotate`s up to 2 of them directly after `a`, so a group is at most 3 `MUL_MAT`s (the row
+concat's cap) and `ggml_cuda_mul_mat_row_concat_try_fuse` runs them as one launch.
+
+**Worth (gfx1201, 1 GPU, 3 interleaved rounds, `-fa 1 -p 0 -n 128 -d 0,4096 -r 10`).**  On the submitter's
+file (lmstudio-community `Qwen3.6-35B-A3B-Q4_K_M`, sha256 `4ac6a06b…a410d`, 40 blocks with
+`full_attention_interval = 4` → 30 GDN layers): tg128 **129.35 -> 132.93 (+2.8 %)**, d4096 **126.16 ->
+129.65 (+2.8 %)**; `=0` returns 129.45 (≡ base).  With `GGML_CUDA_MMVQ_ROW_CONCAT=0` (gather on, concat off)
+it is 130.7, i.e. the gain is the concat the gather enables.  Kernel census (`rocprofv3`, 44 decode steps):
+44 808 -> 42 231 dispatches = **60 fewer launches per token** (30 layers x 2).  The submitter's +3.0 / +2.9 %
+reproduce; their gfx1100 +3.5 % is their box.
+
+**Facts a future edit must keep.**
+
+* **Both skip guards are load-bearing, and neither is a tuning choice.**  A `MUL_MAT` whose output feeds a
+  `CONCAT` within 8 nodes is never moved, because `ggml_cuda_ssm_conv_in_try_fuse` returns `j - i` and the
+  nodes in between are never executed — so a node moved into that window would silently never run.  A
+  `Q8_0` weight is never moved, because `ggml_cuda_ssm_prescan_try_fuse` matches the 16-node SSM chain **by
+  position** (`alpha_w` at `i + 7`, `beta_w` at `i + 13`) and only fires when both small weights are `Q8_0`;
+  moving one out of the window would silently drop the whole conv + l2-norm + gate/beta fusion.
+* **The pass only reorders; it never fuses or elides.**  It moves a node earlier across nodes that a valid
+  topological order guarantees cannot read it (its sources are the anchor's activation and its own leaf
+  weight), so no reader is skipped and no buffer lifetime shortens.  Anything it enables is enabled by a
+  fusion's own predicate at compute time.
+* **It is arch-gated (unlike the V/K rotate) because it is a tuning pass, not a correctness enabler** — the
+  fusion it feeds carries its own RDNA3_0/RDNA4 gate.  A new arch that wants it needs its own row-concat
+  proof, not a wider arch list.
+* **Purity is a decode-width property and was measured as one**: prefill-logit KLD **0.000000 / 100.000 %**
+  at the default ubatch, at `-ub 1` and at `-ub 8` (the gather runs at every ubatch size; the row concat is
+  `ne[1] == 1` only), greedy text byte-identical on 1 / 2 / 3 devices, in both MTP split modes (layer and
+  tensor) and on the DFlash2 draft arm, whose `selector_hidden` is the only other `<= 256`-row quantized
+  weight we hold (Q4_K, 256 rows) and which the gather does not match.
+
+**Gates.**  The above plus MTP Protocol A unchanged (layer acceptance 0.62134 = 1951/3140, 51.6 t/s; tensor
+0.60816 = 1937/3185, 101.5 t/s; `plain == draft-mtp` byte-identical in both split modes), rule-5
+`llama-batched-bench -npl 1,4,8` flat (124.3 -> 127.2 / 322.5 -> 319.5 / 414.7 -> 417.3), the canonical
+27B Q8_0 prefill-logit gate **0.000000 / 100.000 %**, per-block build 2/2, `validate-set.sh` green, no GPU
+faults.  Numbers: `benchmarks/2026-10-30-graph-order-0003-r180.md`.
+
+#### r182 — the 1-token router fold (PR #253)
+
+**What it is.**  A 1-token MoE decode runs the router (`ffn_gate_inp`) as `mul_mat_vec_f<float,float,1,256>`
+and then the fused topk-moe as a second launch.  `topk_moe_cuda` gains a `router` mode: block `b` computes
+logit `b` with the same thread map, `float2` loads, `#pragma unroll 4`, `ggml_cuda_mad` calls and warp +
+cross-warp butterfly as `mul_mat_vec_f`, writes it to the (still written, still allocated) logits tensor, and
+the block that finishes last — a `__threadfence()`, then one atomic on a self-resetting counter in the last
+`moe_red_counters()` slot — runs the **unchanged** selection.  One launch replaces two; the dispatcher arm
+lives in `ggml_cuda_topk_moe_match_at` + `ggml_cuda_router_topk_moe_ok` (r176's topk-moe matcher refactored
+out so the router path can reuse it).
+
+**Worth (1 GPU, `llama-bench -r 5`, two interleaved rounds, on vs off).**  gfx1100 Qwen3-30B-A3B Q4_K_M
+(128 experts) tg128 **205.1 -> 212.0 (+3.1 %)**, d4096 **180.2 -> 183.1 (+1.7 %)**; Qwen3.6-35B-A3B
+(256 experts) tg128 **141.1 -> 142.8 (+1.2 %)**, d4096 **+1.1 %**; gfx1201 the 128-expert model **+1.7 %**
+(noisy) and the 256-expert model flat, because it **steps aside on RDNA4 above 128 experts** (`0002`), where
+the one launch measured -0.3..-0.5 % on our R9700 and -0.8..-1.0 % on the submitter's.  Kernel census: the
+per-layer router GEMV is gone; the `mul_mat_vec_f<...,1,256>` that remains is the **shared-expert** gate.
+
+**Facts a future edit must keep.**
+
+* **It is a 1-token shape; the width is the gate.**  `ggml_nrows(logits) == 1` in the dispatcher and
+  `n_rows = 1` in the launch.  A verify batch (`n_tokens > 1`) must not fold: `mul_mat_vec_f` accumulates in
+  a different order at `ncols_dst > 1` and the selection's row map is per-row blocks.  With a speculator the
+  fold is therefore inert (a verify batch is wider than one token); it is a plain-decode win.
+* **The election is a device-wide barrier inside one launch, and it needs the logits write.**  The fold
+  elides the *launch*, never the tensor or its write, so another consumer of `logits` still works (any
+  consumer is later in node order).  Do not replace the write with a private scratch buffer.
+* **The counter is the last `moe_red_counters()` slot** (`GGML_CUDA_MOE_RED_CNT - 1`), which the MoE down fold
+  cannot reach (`mmvq-moe.cu` indexes `red_cnt + blockIdx.x` under `dst->ne[0] <= 2*CNT - 2`).  Per (device,
+  stream), zeroed at allocation, reset before return; a launch aborted mid-kernel leaves it non-zero (the same
+  caveat the down fold carries).
+* **The predicate mirrors the dispatcher's chain, in its own order** — F32 weight/activation/output,
+  contiguous, `x->ne[1]` in 64/128/256, wave32, `!mmb_supported_mm`, `should_use_mmvf`, the same block-size
+  choice, plus a refusal of a bias, a delayed softmax, a Hadamard-hinted router and a padded compute-buffer
+  `src0`.  Keep it in sync with `ggml_cuda_mul_mat` (the `ggml_cuda_mul_mat_takes_mmq` discipline).
+* **`0002` is a per-device tuning step-aside, not a correctness rule**; a new arch needs its own measurement.
+  `GGML_CUDA_ROUTER_TOPK=0` is the A/B arm and the kill switch.
+
+**Gates.**  Greedy text byte-identical on/off (30B-A3B on gfx1201 + gfx1100, 35B-A3B on gfx1100); the
+**decode-band** prefill-logit probe `gate-prefill-logits.sh --ab "GGML_CUDA_ROUTER_TOPK=0" --ub 1` (every
+token a 1-token graph, the fold firing) **0.000000 / 100.000 %** on 30B-A3B (gfx1201) and 35B-A3B (gfx1100);
+canonical 27B Q8_0 gate **0.000000 / 100.000 %**; `test-backend-ops -o TOPK_MOE` **608/608**; MTP Protocol A
+unchanged (51.53 t/s, acceptance 0.62134); rule-5 batched bench inert at npl>1; per-block build 2/2;
+`validate-set.sh` green; no GPU faults.  Numbers: `benchmarks/2026-10-30-router-topk-fold.md`, record
+`archive/work/router-topk-fold/PROMOTED.md`.
+
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 
 **What it is.**  The qwen4exp (Qwen3.8-Flash-Next) architecture support, split out of block 10 in r109 so
@@ -2394,6 +2539,47 @@ kernel confirms each device pools its own 256-wide slice and the per-device maxi
 byte-identical under `tensor` and `relaxed-tensor`, so the mode is a no-op without the amax node;
 `ggml_pool_1d` has exactly one producer in the graph, so the state is unreachable from any other arch.
 Purity notes: `GREEDY-PURITY.md` §58.
+
+## Block 15 — the windowed KV (`LLAMA_KV_RESIDENT_CELLS`, **opt-in**)
+
+Promoted from the `wip/kv-residency` campaign (Goal A of `TODO` #118) in **r178**.  Opt-in: with
+`LLAMA_KV_RESIDENT_CELLS` unset (or `0`) the KV takes the **plain device buffer** and the run is
+byte-identical to a build without this block, including its OOM.
+
+* `LLAMA_KV_RESIDENT_CELLS=<cells>` — keep the newest `<cells>` cells of the KV in VRAM; everything older
+  goes to pinned system RAM.  `=auto` lets `--fit` size it, and only for a context the user pinned with `-c`
+  (the fit then reports the resident/spill split, the per-token read cost and the depth below which nothing
+  spills).  `LLAMA_KV_SPILL_RAM_PCT` (default 85 % of `MemAvailable`) caps the pinned spill and **widens the
+  window** rather than letting the run be OOM-killed.
+* **`--fit` interaction:** the fit identifies the KV by the region buffer type, and its measurement context is
+  a `no_alloc` probe that declines a window — so the probe takes the region buffer explicitly
+  (`llama_kv_region_set_probe`, internal).  Without that (r178) the fit could not see the KV, reported an
+  over-budget config and aborted instead of sizing the window (fixed in r179).
+* **One device only (r181).**  The window is one VMM region per device, and a tensor split (`-sm tensor`) has
+  no per-device region buffer type to hand out: its KV lives on the Meta wrapper, which has no backend reg, so
+  the region proc addresses cannot be reached through it.  A tensor split therefore **declines** the window
+  (one message from the fit and one from the cache, naming the split) and keeps the KV fully resident;
+  `-sm layer` and one device are unaffected.  Before r181 the reg lookup was an assert, so default `--fit`
+  aborted on **every** multi-device `-sm tensor` run (see the block-15 note in `WORKLOG.md` 261030.005).
+* **`auto` is a decision, not a guess (r181).**  The fit hands down three distinct states — a window, "the KV
+  fits fully resident, keep it" (silent), and "nobody decided" (which still warns) — and it only takes the
+  pinned-RAM clamp while the widened window still meets the VRAM target.  If the `MemAvailable` ceiling would
+  need a window wider than VRAM allows, the fit says so and drops the window (then fits the context by
+  shrinking `-c`), instead of planning a pinned spill larger than the machine.
+* `LLAMA_KV_REGION=0` disables the provider; `LLAMA_KV_REGION_QUARANTINE=0` is the diagnosis switch that
+  reproduces the driver hazard (never ship it), and `LLAMA_KV_REGION_DEBUG/TRACE/CANARY/DUMP` are the
+  instruments.  `GGML_CUDA_VMM_REGION_SELFTEST=1` runs the provider's own selftest (it must PASS, and must
+  FAIL with the hold disabled).
+* **Cost:** the spill is read over the link on every step — `(used − W) × cell_bytes / 55.7 GB/s` on the
+  validation box — so `W` belongs at or above the depth you actually run.  Measured at `-c 262144`, a `W` at
+  the run's depth is free (+2.2…+2.9 GiB of arena, 122B-A10B +3.8 % decode / +4.7 % prefill); a `W` 35 k
+  cells below it costs 11-26 %.
+* **Purity:** a spilled KV is numerically transparent — prefill-logit KLD −0.000000 / 100.000 % on a spilling
+  27B, −0.000000 / 99.994 % on a spilling Flash-Next (two KV caches), and every text arm byte-identical to
+  its plain reference.  The state, context-checkpoint and MTP verify-width gates all pass on arms that
+  provably spill (`FLIP > 0`).
+* **Not in this block:** Goal B (a sparse attended set) and Goal C (the MTP drafter ring,
+  `LLAMA_SPEC_DRAFT_WINDOW`), and the superseded A1 two-base FA read.
 
 ## Dated history
 
