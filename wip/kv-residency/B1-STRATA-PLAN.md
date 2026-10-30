@@ -130,6 +130,11 @@ proved by `KVREGION_FREE … host=` > 0).  Three depths, four arms each:
 | 180 035 (`196608`) | **37.0** | 25.3 (−32 %) | 14.7 | **21.9** | **+49 %** |
 | arena (MiB) / residency | 23 580 / 57.6 % → 22 701 / 55.5 % | same | 25 338 / 61.9 % | same | +1.8…2.6 GiB for the arena |
 
+*(Caveat, added with §3.3: this table predates the PLE flags, so its **51 475** row and the absolute levels are
+pre-flag data — the direction was reproduced under the flags at 103k and 180k (§3.3), and only those numbers should
+be quoted.  The 51k row is kept because it is the only 51k arm set measured, and its text hashes were re-checked
+under the flags unchanged.)*
+
 **Read it as three rules, and they are not the same feature:**
 
 1. **Resident KV → dense decode, always, on this hardware.**  Dense's read is `O(depth)` but VRAM reads are ~10×
