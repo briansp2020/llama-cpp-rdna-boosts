@@ -18,5 +18,16 @@ An independent review of the logic found one issue, now fixed. The router phase 
 
 This 0001 on top of graph-order 0001: +2.0 % / +1.1 %. Prefill flat.
 
+**0002: step aside on RDNA4 with more than 128 experts** (`topk-moe.cu`, 4 lines in `ggml_cuda_router_topk_moe_ok`). On an R9700 with 256 experts (Qwen3.6-35B-A3B), the one launch measured slower than the router GEMV and topk-moe run separately. So on RDNA4 the fold now applies only up to 128 experts; Qwen3-30B-A3B keeps it. Nothing changes on RDNA3.
 
-File: `0001-Router-MUL_MAT-1-token-F32-mul_mat_vec_f-256-thread-.patch` (`git format-patch` against the r176 tree, applies on its own, `git am`).
+**R9700 (gfx1201)**, stock r176 + graph-order 0001, `-fa 1 -p 0 -n 128 -d 0,4096 -r 10`, the last of 3 interleaved rounds (the earlier rounds were disturbed on some arms). The baseline is the same build with `GGML_CUDA_ROUTER_TOPK=0`. tg t/s:
+
+| | Qwen3-30B tg128 | @4096 | Qwen3.6 tg128 | @4096 |
+|---|---|---|---|---|
+| without this PR | 163.1 | 145.3 | 130.3 | 127.6 |
+| + 0001 | 166.4 (+2.0 %) | 148.1 (+1.9 %) | 129.3 (-0.8 %) | 126.2 (-1.0 %) |
+| + 0001 + 0002 | 166.3 (+2.0 %) | 148.1 (+1.9 %) | 130.3 (=) | 127.5 (=) |
+
+Greedy server replies were byte-identical to stock r176 on both models for all three arms, with 0 faults. The 7900 XTX numbers above are unchanged by 0002.
+
+Files: `0001-Router-MUL_MAT-1-token-F32-mul_mat_vec_f-256-thread-.patch`, `0002-router-topk-step-aside-on-RDNA4-with-more-than-128-e.patch` (`git format-patch` against the r176 tree, apply in order with `git am`; 0001 applies on its own).

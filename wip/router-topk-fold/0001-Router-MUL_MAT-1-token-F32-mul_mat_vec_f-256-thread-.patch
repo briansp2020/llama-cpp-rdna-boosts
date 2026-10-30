@@ -1,11 +1,11 @@
 From d82472b10ba7785d7c87cb3b146950973ad7831f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 29 Oct 2026 17:36:00 +0000
-Subject: [PATCH] Router MUL_MAT (1 token, F32, mul_mat_vec_f 256-thread shape)
- + topk-moe in one launch: each topk_moe_cuda block computes one logit as
- mul_mat_vec_f does, the last one (self-resetting counter) runs the unchanged
- selection. Bit-identical; on r176 + graph-order 0001, Qwen3-30B-A3B tg128
- +2.0 %, Qwen3.6-35B-A3B +1.1 % on 7900 XTX. GGML_CUDA_ROUTER_TOPK=0 off
+Subject: [PATCH 1/2] Router MUL_MAT (1 token, F32, mul_mat_vec_f 256-thread
+ shape) + topk-moe in one launch: each topk_moe_cuda block computes one logit
+ as mul_mat_vec_f does, the last one (self-resetting counter) runs the
+ unchanged selection. Bit-identical; on r176 + graph-order 0001, Qwen3-30B-A3B
+ tg128 +2.0 %, Qwen3.6-35B-A3B +1.1 % on 7900 XTX. GGML_CUDA_ROUTER_TOPK=0 off
 
 ---
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 186 +++++++++++---------
