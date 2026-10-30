@@ -1,0 +1,619 @@
+From 9190fde16c4d5c34667f87c80b15959d32400d6d Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Thu, 29 Oct 2026 21:47:01 -0500
+Subject: [PATCH 6/8] wip-kv-residency: A2 (ii) -- the SLIDING window (the
+ boundary follows the watermark)
+
+The static window anchored at the end of `-c` only helps once the run reaches it: at 51k tokens in a
+-c 262144 cache the whole used extent is still in the tail (measured 8.9 t/s where a depth-anchored
+window gave 18.6).  So the resident window is now the newest `W` cells of the USED extent and the
+host/VRAM boundary slides forward as the watermark advances.
+
+  ggml-cuda-vmm-region: `ensure_span(off, bytes, host)` maps OR FLIPS: a piece whose backing kind is
+    wrong is remapped through a pinned scratch (stage out -> hipMemUnmap -> map the other kind -> stage
+    in), with a device synchronise around the unmap.  The table stays one entry per mapping and the VA
+    never changes, so captured graphs and every existing data path stay valid.  `vmm_at`/`vmm_next` are
+    binary searches now (the slide calls them per cell per batch).
+  ggml-cuda.cu: the buft carries the window in CELLS and keeps the slide position (kv_lead_cells,
+    monotone) + the VRAM watermark, so a batch only maps the DELTAS -- one cell normally, and one
+    unit-sized remap every `unit/nb1` cells (~1900 cells on the 27B, ~3900 on the 35B).  The boundary
+    is quantised down to whole map units so a remap is a whole-mapping unmap (the driver refuses
+    sub-ranges), and cells between quantised boundaries are simply kept resident a little longer.
+  llama-kv-cache.cpp: W cells (not a fixed tail in bytes); DEFAULT W = -c = no spill, i.e. today's
+    cache, with the opt-in being what spills.
+
+Measured (1 GPU, gfx1201):
+  * text byte-identical to the fully resident arm on 4B (W=1024) and 27B q8_0 -- and byte-identical to
+    the pre-slide hash, which is the proof that a remap preserves every staged chunk;
+  * 27B Q8_0 -c 262144 at 51 475 tokens (the OOM config): W=49152 -> 18.6 t/s vs 8.9 static and 18.7
+    fully resident -- the big context now runs at the small one's speed; W=16384 -> 10.3 (1.19 GiB of
+    spill per token, as modelled);
+  * 35B-A3B Q8_0 -ncmoe 24 -c 262144 at 5256 tokens: arena 12393 -> 15070 MiB, host-expert residency
+    63.3 % -> 77.0 %, slab mapped 13.19 -> 15.81 GiB, prefill 602 -> 615 t/s, decode 64.5 -> 64.9 t/s
+    with ZERO spill.  That is Goal A's second half with no cost.
+
+Not for patches/: nothing here is in the delivery set.
+---
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 147 +++++++++++++++---
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |   6 +
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 165 +++++++++++++--------
+ src/llama-kv-cache.cpp                     |  57 ++++---
+ 4 files changed, 263 insertions(+), 112 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
+index f268337b8..2776688e1 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
+@@ -37,6 +37,9 @@ struct ggml_cuda_vmm_region {
+     size_t   mapped_host = 0;
+     void *   base    = nullptr;
+     std::vector<vmm_mapping> maps;
++    // pinned staging for a remap (grow-only, one unit's worth is enough for the sliding window)
++    void *   stage       = nullptr;
++    size_t   stage_bytes = 0;
+ };
+ 
+ namespace {
+@@ -197,21 +200,33 @@ namespace {
+ 
+ // Is [off, off + bytes) covered by one mapping, and is that mapping host-backed?  (Mappings never overlap,
+ // so "covered" means exactly one entry contains the whole range.)
++// The mapping whose range contains (or starts at) `off`, or nullptr.  `maps` is sorted by `off` and
++// non-overlapping, so this is a binary search: the sliding window calls it once per cell per batch.
++const vmm_mapping * vmm_at(const ggml_cuda_vmm_region * r, size_t off) {
++    auto it = std::upper_bound(r->maps.begin(), r->maps.end(), off,
++            [](size_t v, const vmm_mapping & m) { return v < m.off; });
++    if (it == r->maps.begin()) {
++        return nullptr;
++    }
++    --it;
++    return off - it->off < it->bytes ? &*it : nullptr;
++}
++
++// The first mapping that starts strictly after `off`, or nullptr.
++const vmm_mapping * vmm_next(const ggml_cuda_vmm_region * r, size_t off) {
++    auto it = std::upper_bound(r->maps.begin(), r->maps.end(), off,
++            [](size_t v, const vmm_mapping & m) { return v < m.off; });
++    return it == r->maps.end() ? nullptr : &*it;
++}
++
+ bool vmm_find(const ggml_cuda_vmm_region * r, size_t off, size_t bytes, size_t * end, bool * host) {
+-    for (const vmm_mapping & m : r->maps) {
+-        if (m.off > off) {
+-            return false;   // sorted: nothing later can cover it
+-        }
+-        if (off - m.off < m.bytes) {
+-            if (bytes > m.bytes - (off - m.off)) {
+-                return false;   // starts inside a mapping but runs past its end
+-            }
+-            if (end  != nullptr) { *end  = m.off + m.bytes; }
+-            if (host != nullptr) { *host = m.host; }
+-            return true;
+-        }
++    const vmm_mapping * m = vmm_at(r, off);
++    if (m == nullptr || bytes > m->bytes - (off - m->off)) {
++        return false;
+     }
+-    return false;
++    if (end  != nullptr) { *end  = m->off + m->bytes; }
++    if (host != nullptr) { *host = m->host; }
++    return true;
+ }
+ 
+ // Insert a mapping and keep the table sorted and coalesced.
+@@ -254,15 +269,13 @@ bool ggml_cuda_vmm_region_map_span(ggml_cuda_vmm_region * r, size_t off, size_t
+     if (b > r->size) { b = r->size; }
+ 
+     while (a < b) {
+-        size_t next = 0;
+-        if (vmm_find(r, a, 1, &next, nullptr)) {
+-            a = next;                 // already mapped: skip it (the driver refuses a re-map)
++        if (const vmm_mapping * cur = vmm_at(r, a)) {
++            a = cur->off + cur->bytes;   // already mapped: skip it (the driver refuses a re-map)
+             continue;
+         }
+         size_t n = r->unit;
+-        // do not step over an existing mapping
+-        for (const vmm_mapping & m : r->maps) {
+-            if (m.off > a && m.off - a < n) { n = m.off - a; }
++        if (const vmm_mapping * nxt = vmm_next(r, a)) {
++            if (nxt->off - a < n) { n = nxt->off - a; }   // do not step over an existing mapping
+         }
+         if (b - a < n) { n = b - a; }
+         if (!vmm_map(r, a, n, host)) {
+@@ -279,6 +292,97 @@ bool ggml_cuda_vmm_region_map_span(ggml_cuda_vmm_region * r, size_t off, size_t
+     return true;
+ }
+ 
++// Preserve a mapping's bytes across a kind change.  A remap is unmap + map, and the driver hands back fresh
++// physical with no relation to what was there (measured: stale on device chunks, zero on host ones), so the
++// bytes are staged through a pinned scratch.  Only the sliding window takes this path, once per unit per
++// few thousand tokens, so a blocking round trip is the right trade for simplicity here.
++bool vmm_remap(ggml_cuda_vmm_region * r, const vmm_mapping & m, bool host) {
++    if (m.bytes > r->stage_bytes) {
++        if (r->stage != nullptr) { (void) cudaFreeHost(r->stage); r->stage = nullptr; r->stage_bytes = 0; }
++        void * st = nullptr;
++        if (cudaMallocHost(&st, m.bytes) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
++        }
++        r->stage = st;
++        r->stage_bytes = m.bytes;
++    }
++    // nothing may be in flight while the VA is unmapped (the VA stays valid for graphs, the *physical* does not)
++    if (cudaDeviceSynchronize() != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    if (cudaMemcpy(r->stage, (const char *) r->base + m.off, m.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    vmm_unmap(r, m.off, m.bytes);
++    // drop the table entry by hand (we are holding a reference into the vector)
++    const size_t off = m.off, bytes = m.bytes;
++    const bool was_host = m.host;
++    r->maps.erase(std::find_if(r->maps.begin(), r->maps.end(),
++            [off](const vmm_mapping & e) { return e.off == off; }));
++    r->mapped      -= bytes;
++    r->mapped_host -= was_host ? bytes : 0;
++
++    if (!vmm_map(r, off, bytes, host)) {
++        return false;   // left unmapped: the caller's next batch will refuse loudly rather than read garbage
++    }
++    if (cudaMemcpy((char *) r->base + off, r->stage, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    vmm_insert(r, off, bytes, host);   // re-insert (and coalesce with its new neighbours of the same kind)
++    return true;
++}
++
++bool ggml_cuda_vmm_region_ensure_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host) {
++    if (r == nullptr) {
++        return false;
++    }
++    if (bytes == 0) {
++        return true;
++    }
++    if (off > r->size || bytes > r->size - off) {
++        return false;
++    }
++    const size_t g = r->gran != 0 ? r->gran : (size_t) 4096;
++    size_t a = (off / g) * g;
++    size_t b = vmm_up(off + bytes, g);
++    if (b > r->size) { b = r->size; }
++
++    while (a < b) {
++        if (const vmm_mapping * cur = vmm_at(r, a)) {
++            if (cur->host == host) {
++                a = cur->off + cur->bytes;    // this piece is already the KIND we need
++                continue;
++            }
++            // The kind is wrong for the whole mapping: flip it, preserving its bytes.  Flipping the whole
++            // mapping (not just this range) keeps the table one-entry-per-mapping and avoids a sub-range
++            // unmap, which the driver refuses.
++            if (!vmm_remap(r, *cur, host)) {
++                return false;
++            }
++            continue;                          // `a` is unchanged; the entry is gone/rewritten
++        }
++        size_t n = r->unit;
++        if (const vmm_mapping * nxt = vmm_next(r, a)) {
++            if (nxt->off - a < n) { n = nxt->off - a; }
++        }
++        if (b - a < n) { n = b - a; }
++        if (!vmm_map(r, a, n, host)) {
++            return false;
++        }
++        vmm_insert(r, a, n, host);
++        if (cudaMemset((char *) r->base + a, 0, n) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
++        }
++        a += n;
++    }
++    return true;
++}
++
+ bool ggml_cuda_vmm_region_grow_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes) {
+     if (r == nullptr) {
+         return false;
+@@ -353,6 +457,11 @@ void ggml_cuda_vmm_region_free(ggml_cuda_vmm_region * r) {
+     r->maps.clear();
+     r->mapped = 0;
+     r->mapped_host = 0;
++    if (r->stage != nullptr) {
++        (void) cudaFreeHost(r->stage);
++        r->stage = nullptr;
++        r->stage_bytes = 0;
++    }
+     if (r->base != nullptr) {
+         if (cuMemAddressFree((CUdeviceptr) (uintptr_t) r->base, r->size) != cudaSuccess) {
+             (void) cudaGetLastError();
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
+index a2d770250..812a0018d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
+@@ -66,6 +66,12 @@ bool ggml_cuda_vmm_region_grow(ggml_cuda_vmm_region * r, size_t used_bytes);
+ // Same fail-soft contract as the rest of this file (false = the driver refused, nothing half-created).
+ bool ggml_cuda_vmm_region_map_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host);
+ 
++// Like `map_span`, but also flips a piece whose backing KIND is wrong: it stages the bytes out, unmaps, maps
++// the other kind and stages them back (a remap loses the physical contents -- measured).  This is the sliding
++// window's primitive; the caller keeps the VA, so captured graphs and every existing data path stay valid.
++// One blocking round trip per flipped mapping, so a caller should call it with DELTAS, not the whole range.
++bool ggml_cuda_vmm_region_ensure_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host);
++
+ // Bytes of the mapped extent that are host-backed (the spill), for reporting.
+ size_t ggml_cuda_vmm_region_mapped_host(const ggml_cuda_vmm_region * r);
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 340bb5332..c058f7ad6 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1471,9 +1471,14 @@ struct ggml_backend_cuda_buffer_context {
+     // only the mapped units hold physical.  The region owns the VA *and* the physical, so freeing the buffer
+     // frees it here instead of a cudaFree.
+     ggml_cuda_vmm_region * vmm_region = nullptr;
+-    // wip/kv-residency (TODO #118) A2: the host-backed prefix of every KV tensor (0 = no split)
+-    size_t kv_tail_bytes  = 0;
+-    bool   kv_tail_logged = false;
++    // wip/kv-residency (TODO #118) A2: the windowed KV -- W cells resident, the rest of the used extent in
++    // pinned system RAM.  0 = no window.  `kv_lead_cells` is how many leading cells are already host-backed
++    // (the slide's monotone position) and `kv_dev_cells` how far the VRAM part has been mapped; both keep the
++    // per-batch work to the DELTAS (one cell per token, one unit every few thousand tokens).
++    size_t kv_resident_cells = 0;
++    size_t kv_lead_cells     = 0;
++    size_t kv_dev_cells      = 0;
++    bool   kv_tail_logged    = false;
+     // The layout of every tensor placed in the region, so a cell-count grow can compute each tensor's
+     // [off + s*nb2, off + s*nb2 + n_cells*nb1) extent without knowing anything about the KV cache.
+     struct vmm_tens { size_t off; size_t nb1; size_t nb2; int64_t ne2; };
+@@ -2271,10 +2276,11 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
+ struct ggml_backend_cuda_buffer_type_context {
+     int device;
+     std::string name;
+-    // wip/kv-residency (TODO #118) A2: for the KV region buffer type, the byte length of each tensor's TAIL
+-    // segment (the part backed by pinned system RAM).  0 = no split, i.e. the O1 behaviour (whole tensor in
+-    // VRAM, mapped lazily).  Set when the buffer type is instantiated, so one buft instance per split.
+-    size_t kv_tail_bytes = 0;
++    // wip/kv-residency (TODO #118) A2: the windowed KV's resident window, in CELLS.  0 = no window (the O1
++    // behaviour: the whole tensor in VRAM, mapped lazily).  The window is the newest W cells of the USED
++    // extent, so the host/VRAM boundary slides forward as the watermark advances (see the buffer context's
++    // kv_lead_cells).  Set when the buffer type is instantiated, so one buft instance per window size.
++    size_t kv_resident_cells = 0;
+ };
+ 
+ // See ggml-cuda-arena.cuh: the compute-buffer chunk decision needs this buffer type's device, because
+@@ -2547,43 +2553,79 @@ static int ggml_backend_cuda_kv_region_grow_cells(ggml_backend_buffer_t buffer,
+ 
+     const size_t cap = ggml_cuda_kv_region_map_cap();
+     const size_t mapped_before = ggml_cuda_vmm_region_mapped(ctx->vmm_region);
+-    // A2 mixed backing: cells below the split are backed by PINNED SYSTEM RAM, the rest by VRAM.  Both grow
+-    // with the same cell watermark, so a run commits host pages only for the tail it actually reaches and
+-    // VRAM only for the resident cells it actually uses -- the whole point of the window.
+-    const size_t tail_bytes = ctx->kv_tail_bytes;
+-    for (const auto & t : ctx->vmm_tensors) {
+-        const size_t bytes = (size_t) n_cells * t.nb1;
+-        if (bytes == 0) {
+-            continue;
+-        }
+-        const size_t host = tail_bytes < bytes ? tail_bytes : bytes;   // the tail of THIS extent
+-        for (int64_t s = 0; s < t.ne2; ++s) {
+-            const size_t off = t.off + (size_t) s * t.nb2;
+-            if (cap != 0 && off + bytes > cap) {
+-                ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off, bytes);
+-                return -1;
++
++    // A2 the windowed KV: the newest `W` cells of the USED extent stay in VRAM, everything older is in pinned
++    // system RAM.  The boundary therefore SLIDES with the watermark, and it moves in whole map units so a
++    // remap (which must stage a unit's bytes out and back) happens once per few thousand tokens, not per
++    // token.  `kv_lead_cells` only ever grows: a cell that has been handed to system RAM is not taken back.
++    if (ctx->kv_resident_cells != 0) {
++        const uint64_t w = ctx->kv_resident_cells;
++        size_t lead = n_cells > w ? (size_t) (n_cells - w) : 0;
++        // cells per map unit, from this cache's cell geometry (uniform across its tensors -- checked above)
++        size_t cells_per_unit = 1;
++        if (!ctx->vmm_tensors.empty() && ctx->vmm_tensors[0].nb1 != 0) {
++            cells_per_unit = ggml_cuda_vmm_region_unit(ctx->vmm_region) / ctx->vmm_tensors[0].nb1;
++            if (cells_per_unit == 0) { cells_per_unit = 1; }
++        }
++        lead -= lead % cells_per_unit;
++        if (lead < ctx->kv_lead_cells) { lead = ctx->kv_lead_cells; }
++
++        size_t lead_bytes_done = ctx->kv_lead_cells * (ctx->vmm_tensors.empty() ? 0 : ctx->vmm_tensors[0].nb1);
++        size_t dev_cells_done  = ctx->kv_dev_cells;
++        const size_t lead_bytes = lead * (ctx->vmm_tensors.empty() ? 0 : ctx->vmm_tensors[0].nb1);
++
++        for (const auto & t : ctx->vmm_tensors) {
++            const size_t used_bytes = (size_t) n_cells * t.nb1;
++            if (used_bytes == 0) {
++                continue;
++            }
++            const size_t lead_t = lead * t.nb1;                 // this tensor's spill boundary
++            const size_t done_t = ctx->kv_lead_cells * t.nb1;   // what is already host-backed
++            for (int64_t st = 0; st < t.ne2; ++st) {
++                const size_t off = t.off + (size_t) st * t.nb2;
++                if (cap != 0 && off + used_bytes > cap) {
++                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off, used_bytes);
++                    return -1;
++                }
++                // 1. hand the newly-spilled leading cells to system RAM (the slide's forward step)
++                if (lead_t > done_t &&
++                        !ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off + done_t, lead_t - done_t, true)) {
++                    ggml_backend_cuda_kv_region_log("host growth", ctx, ctx->vmm_region, off + done_t, lead_t - done_t);
++                    return -1;
++                }
++                // 2. map the newly-used resident cells in VRAM
++                const size_t from = std::max(ctx->kv_dev_cells * t.nb1, lead_t);
++                if (used_bytes > from &&
++                        !ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off + from, used_bytes - from, false)) {
++                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off + from, used_bytes - from);
++                    return -1;
++                }
+             }
+-            if (host != 0 && !ggml_cuda_vmm_region_map_span(ctx->vmm_region, off, host, /*host=*/ true)) {
+-                ggml_backend_cuda_kv_region_log("host growth", ctx, ctx->vmm_region, off, host);
+-                return -1;
++        }
++        GGML_UNUSED(lead_bytes_done);
++        GGML_UNUSED(dev_cells_done);
++        GGML_UNUSED(lead_bytes);
++        ctx->kv_lead_cells = lead;
++        ctx->kv_dev_cells  = n_cells;
++    } else {
++        for (const auto & t : ctx->vmm_tensors) {
++            const size_t bytes = (size_t) n_cells * t.nb1;
++            if (bytes == 0) {
++                continue;
+             }
+-            if (bytes > host &&
+-                    !ggml_cuda_vmm_region_map_span(ctx->vmm_region, off + host, bytes - host, /*host=*/ false)) {
+-                ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off + host, bytes - host);
+-                return -1;
++            for (int64_t s = 0; s < t.ne2; ++s) {
++                const size_t off = t.off + (size_t) s * t.nb2;
++                if (cap != 0 && off + bytes > cap) {
++                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off, bytes);
++                    return -1;
++                }
++                if (!ggml_cuda_vmm_region_grow_span(ctx->vmm_region, off, bytes)) {
++                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off, bytes);
++                    return -1;
++                }
+             }
+         }
+     }
+-    if (ctx->kv_tail_bytes != 0 && !ctx->kv_tail_logged) {
+-        // The one line that says the window is real: how much of the KV is in system RAM and how much in VRAM.
+-        ctx->kv_tail_logged = true;
+-        const size_t host_b = ggml_cuda_vmm_region_mapped_host(ctx->vmm_region);
+-        const size_t all_b  = ggml_cuda_vmm_region_mapped(ctx->vmm_region);
+-        GGML_LOG_INFO("%s: device %d: windowed KV -- %.2f MiB of KV mapped: %.2f MiB in system RAM (pinned, "
+-                      "non-swappable) + %.2f MiB in VRAM, of a %.2f MiB reservation\n", __func__, ctx->device,
+-                      all_b / 1048576.0, host_b / 1048576.0, (all_b - host_b) / 1048576.0,
+-                      ggml_cuda_vmm_region_size(ctx->vmm_region) / 1048576.0);
+-    }
+     if (ggml_cuda_kv_region_debug()) {
+         const size_t mapped_after = ggml_cuda_vmm_region_mapped(ctx->vmm_region);
+         if (mapped_after != mapped_before) {
+@@ -2672,25 +2714,26 @@ static void ggml_backend_cuda_kv_region_grow_for(ggml_backend_cuda_buffer_contex
+         ggml_backend_cuda_kv_region_log("a write", ctx, ctx->vmm_region, off, size);
+         return;
+     }
+-    if (ctx->kv_tail_bytes == 0 || tensor->nb[2] == 0) {
++    if (ctx->kv_resident_cells == 0 || tensor->nb[2] == 0) {
+         if (!ggml_cuda_vmm_region_grow_span(ctx->vmm_region, off, size)) {
+             ggml_backend_cuda_kv_region_log("a write", ctx, ctx->vmm_region, off, size);
+         }
+         return;
+     }
+-    // mixed backing: the kind is decided by where the bytes sit inside their stream's cell extent.  A restore
+-    // can write ANY cell index, so this must map into the right memory, not just into *some* memory.
++    // windowed KV: the kind is decided by where the bytes sit relative to the CURRENT spill boundary inside
++    // their stream's cell extent.  A restore can write ANY cell index, so this must map into the right memory,
++    // not just into *some* memory.
+     const size_t tensor_off = (size_t) ((const char *) tensor->data - (const char *) ctx->dev_ptr);
+     const size_t nb2        = (size_t) tensor->nb[2];
+-    const size_t rel        = (off - tensor_off) % nb2;          // byte offset inside the stream extent
+-    const size_t tail       = ctx->kv_tail_bytes < nb2 ? ctx->kv_tail_bytes : nb2;
+-    const size_t host_end   = rel < tail ? (tail - rel < size ? tail - rel : size) : 0;
++    const size_t rel        = (off - tensor_off) % nb2;                       // byte offset inside the extent
++    const size_t lead       = ctx->kv_lead_cells * (size_t) tensor->nb[1];    // the current boundary
++    const size_t host_end   = rel < lead ? (lead - rel < size ? lead - rel : size) : 0;
+     if (host_end != 0 &&
+-            !ggml_cuda_vmm_region_map_span(ctx->vmm_region, off, host_end, /*host=*/ true)) {
++            !ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off, host_end, /*host=*/ true)) {
+         ggml_backend_cuda_kv_region_log("a host write", ctx, ctx->vmm_region, off, host_end);
+     }
+     if (size > host_end &&
+-            !ggml_cuda_vmm_region_map_span(ctx->vmm_region, off + host_end, size - host_end, /*host=*/ false)) {
++            !ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off + host_end, size - host_end, /*host=*/ false)) {
+         ggml_backend_cuda_kv_region_log("a write", ctx, ctx->vmm_region, off + host_end, size - host_end);
+     }
+ }
+@@ -2803,7 +2846,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_kv_region_buffer_type_alloc_buffe
+     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device,
+             ggml_cuda_vmm_region_base(region));
+     ctx->vmm_region = region;
+-    ctx->kv_tail_bytes = buft_ctx->kv_tail_bytes;
++    ctx->kv_resident_cells = buft_ctx->kv_resident_cells;
+     ctx->vmm_tensors.reserve(64);
+ 
+     GGML_LOG_INFO("%s: device %d: KV region reserved %.2f MiB (VA only, nothing mapped; %zu MiB map unit%s)\n",
+@@ -2816,10 +2859,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_kv_region_buffer_type_alloc_buffe
+     return ggml_backend_buffer_init(buft, ggml_backend_cuda_kv_region_buffer_interface, ctx, size);
+ }
+ 
+-// `tail_bytes` > 0 = A2 mixed backing: that many bytes of EVERY tensor's cell extent are backed by pinned
+-// system RAM, the rest by VRAM (see ggml_cuda_vmm_region_map_span).  0 = the whole tensor in VRAM (O1).
+-// One buft instance per (device, tail_bytes); the split is fixed for a context's lifetime.
+-static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buffer_type_split(int device, size_t tail_bytes) {
++// `cells` > 0 = A2 the windowed KV: the newest `cells` cells of the USED extent are backed by VRAM and
++// everything older by pinned system RAM (see ggml_cuda_vmm_region_ensure_span).  0 = the whole tensor in VRAM
++// (O1).  One buft instance per (device, cells).
++static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buffer_type_split(int device, size_t cells) {
+     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+         return nullptr;
+     }
+@@ -2835,7 +2878,7 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buffer_type_split(
+     static std::mutex extra_mutex;
+     for (const auto & e : extra) {
+         const auto * c = (const ggml_backend_cuda_buffer_type_context *) e->context;
+-        if (c->device == device && c->kv_tail_bytes == tail_bytes) {
++        if (c->device == device && c->kv_resident_cells == cells) {
+             return e.get();
+         }
+     }
+@@ -2843,7 +2886,7 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buffer_type_split(
+     static ggml_backend_buffer_type bufts[GGML_CUDA_MAX_DEVICES];
+     static bool init[GGML_CUDA_MAX_DEVICES] = {};
+ 
+-    if (tail_bytes == 0 && !init[device]) {
++    if (cells == 0 && !init[device]) {
+         bufts[device] = {
+             /* .iface    = */ {
+                 // The plain CUDA name function, so `ggml_backend_buft_is_cuda()` (a function-pointer identity)
+@@ -2862,15 +2905,15 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buffer_type_split(
+         };
+         init[device] = true;
+     }
+-    if (tail_bytes == 0) {
++    if (cells == 0) {
+         return &bufts[device];
+     }
+ 
+     {
+         std::lock_guard<std::mutex> lock_extra(extra_mutex);
+         auto bt = std::make_unique<ggml_backend_buffer_type>();
+-        const std::string nm = std::string(GGML_CUDA_NAME) + "KVRegion" + std::to_string(device) + "+tail" +
+-            std::to_string(tail_bytes >> 20) + "MiB";
++        const std::string nm = std::string(GGML_CUDA_NAME) + "KVRegion" + std::to_string(device) + "+win" +
++            std::to_string(cells) + "c";
+         *bt = {
+             /* .iface    = */ {
+                 /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
+@@ -2883,7 +2926,7 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buffer_type_split(
+                 /* .is_host             = */ NULL,
+             },
+             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+-            /* .context  = */ new ggml_backend_cuda_buffer_type_context{device, nm, tail_bytes},
++            /* .context  = */ new ggml_backend_cuda_buffer_type_context{device, nm, cells},
+         };
+         extra.push_back(std::move(bt));
+         return extra.back().get();
+@@ -8729,11 +8772,11 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_for_dev(ggml_
+     return nullptr;
+ }
+ 
+-// A2: the same, with the mixed-backing split.  `tail_bytes` is the host-backed prefix of every KV tensor.
+-static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_split_for_dev(ggml_backend_dev_t dev, size_t tail_bytes) {
++// A2: the same, with the windowed KV's resident window (`cells`).
++static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_split_for_dev(ggml_backend_dev_t dev, size_t cells) {
+     for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+         if (ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i) == dev) {
+-            return ggml_backend_cuda_kv_region_buffer_type_split(i, tail_bytes);
++            return ggml_backend_cuda_kv_region_buffer_type_split(i, cells);
+         }
+     }
+     return nullptr;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index d509a248b..4d27d02c6 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -54,17 +54,17 @@ static ggml_backend_buffer_type_t llama_kv_region_buft(ggml_backend_dev_t dev) {
+     return fn != nullptr ? fn(dev) : nullptr;
+ }
+ 
+-// wip/kv-residency (TODO #118) A2: the same buffer type with mixed backing -- `tail_bytes` of every tensor is
+-// backed by pinned system RAM (the window's spill), the rest by VRAM.
+-typedef ggml_backend_buffer_type_t (*llama_kv_region_buft_split_fn)(ggml_backend_dev_t dev, size_t tail_bytes);
++// wip/kv-residency (TODO #118) A2: the same buffer type with the windowed KV -- the newest `cells` cells of
++// the used extent are in VRAM, everything older in pinned system RAM.
++typedef ggml_backend_buffer_type_t (*llama_kv_region_buft_split_fn)(ggml_backend_dev_t dev, size_t cells);
+ 
+-static ggml_backend_buffer_type_t llama_kv_region_buft_split(ggml_backend_dev_t dev, size_t tail_bytes) {
+-    if (!llama_kv_region_enabled() || dev == nullptr || tail_bytes == 0) {
++static ggml_backend_buffer_type_t llama_kv_region_buft_split(ggml_backend_dev_t dev, size_t cells) {
++    if (!llama_kv_region_enabled() || dev == nullptr || cells == 0) {
+         return nullptr;
+     }
+     auto fn = (llama_kv_region_buft_split_fn) ggml_backend_reg_get_proc_address(
+             ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_buft_split");
+-    return fn != nullptr ? fn(dev, tail_bytes) : nullptr;
++    return fn != nullptr ? fn(dev, cells) : nullptr;
+ }
+ 
+ // wip/kv-residency (TODO #118): the windowed KV's resident window, in CELLS.  0/unset = off.
+@@ -268,14 +268,14 @@ llama_kv_cache::llama_kv_cache(
+ 
+     const bool is_mla = hparams.is_mla();
+ 
+-    // wip/kv-residency (TODO #118) A2: the mixed-backing window.  The resident window is the LAST `W` cells
+-    // of the context (`LLAMA_KV_RESIDENT_CELLS`, the same knob A1 used), so the spill is cells [0, W_tail) --
+-    // a STATIC split, decided here, before the slab is armed, so the arena gets the VRAM the KV never commits.
+-    // `tail_bytes` is that prefix in BYTES of one tensor's cell extent, which is what the buffer type maps
+-    // from pinned system RAM; it is one number for every tensor, so the geometry has to be uniform across the
+-    // layers this cache holds (K and V included).  Anything else DECLINES the split -- no spill, today's
+-    // fit-or-fail -- rather than guess.
+-    size_t kv_tail_bytes = 0;
++    // wip/kv-residency (TODO #118) A2: the windowed KV.  The RESIDENT WINDOW is the newest `W` cells of the
++    // USED extent (`LLAMA_KV_RESIDENT_CELLS`), so the host/VRAM boundary slides forward as the context fills
++    // and a token always attends the newest cells from VRAM.  The spill grows with the used extent up to
++    // (kv_size - W) cells, i.e. the VRAM the cache never commits is what the expert arena gets.
++    //   Default W = kv_size -> no spill, i.e. today's fully resident cache (the opt-in is what spills).
++    //   One W covers every tensor, so the cell geometry has to be uniform across the layers this cache holds
++    //   (K and V included).  Anything else DECLINES the window -- no spill, today's fit-or-fail -- not a guess.
++    size_t kv_resident_cells = 0;
+     if (llama_kv_region_enabled() && other == nullptr && !v_trans && !hparams.no_alloc) {
+         const uint32_t w = kv_split_resident_cells();
+         const uint32_t n_tail = (w != 0 && kv_size > w) ? kv_size - w : 0;
+@@ -293,25 +293,18 @@ llama_kv_cache::llama_kv_cache(
+             uniform = ck == cell && cv == cell;
+         }
+         if (!uniform) {
+-            LLAMA_LOG_WARN("%s: the mixed-backing KV window is unavailable for this cache (%s); the KV stays "
+-                           "fully resident\n", __func__,
++            LLAMA_LOG_WARN("%s: the windowed KV is unavailable for this cache (%s); the KV stays fully "
++                           "resident\n", __func__,
+                            n_tail == 0 ? "no spilled cells" : "non-uniform K/V cell geometry across layers");
+         } else {
+-            // a boundary must be a multiple of the driver's minimum map granularity (4 KiB)
+-            const size_t gran = 4096;
+-            kv_tail_bytes = ((size_t) n_tail * cell / gran) * gran;
+-            if (kv_tail_bytes == 0) {
+-                LLAMA_LOG_WARN("%s: the KV window of %u cells is below one map granule; the KV stays fully resident\n",
+-                               __func__, n_tail);
+-            } else {
+-                LLAMA_LOG_WARN("%s: WINDOWED KV ENABLED: %u of %u cells spilling to pinned system RAM (%.2f MiB "
+-                               "per tensor%s), %u cells resident in VRAM.  The spilled cells are read over the "
+-                               "PCIe link every step (~28.8 GB/s), so a token at depth costs about "
+-                               "(cells beyond the window) x %.1f KiB / 28.8 GB/s.  Unset LLAMA_KV_RESIDENT_CELLS "
+-                               "or LLAMA_KV_REGION to keep the KV fully resident.\n",
+-                               __func__, n_tail, kv_size, kv_tail_bytes / 1024.0 / 1024.0,
+-                               n_stream > 1 ? " per stream" : "", w, cell / 1024.0);
+-            }
++            kv_resident_cells = w;
++            LLAMA_LOG_WARN("%s: WINDOWED KV ENABLED: the newest %u of up to %u cells stay in VRAM, everything "
++                           "older spills to pinned system RAM (%.1f KiB per cell%s).  The spill grows with the "
++                           "used extent, up to %.2f MiB per tensor at full context, and every spilled cell is "
++                           "read over the PCIe link per step (~28.8 GB/s).  Unset LLAMA_KV_RESIDENT_CELLS or "
++                           "LLAMA_KV_REGION to keep the KV fully resident.\n",
++                           __func__, w, kv_size, cell / 1024.0, n_stream > 1 ? ", per stream" : "",
++                           (double) n_tail * cell / 1048576.0);
+         }
+     }
+ 
+@@ -376,7 +369,7 @@ llama_kv_cache::llama_kv_cache(
+             // device buffer type with the plain type's vtable contract (same device, same name predicate), so
+             // everything downstream -- the scheduler's placement, `memory_breakdown()`, `--fit` -- sees a KV
+             // buffer of the same size; only WHEN its physical is committed changes.
+-            ggml_backend_buffer_type_t buft_region = kv_tail_bytes != 0 ? llama_kv_region_buft_split(dev, kv_tail_bytes) : nullptr;
++            ggml_backend_buffer_type_t buft_region = kv_resident_cells != 0 ? llama_kv_region_buft_split(dev, kv_resident_cells) : nullptr;
+             if (buft_region == nullptr) {
+                 buft_region = llama_kv_region_buft(dev);
+             }
+-- 
+2.55.0
+

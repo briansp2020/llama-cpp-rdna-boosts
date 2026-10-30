@@ -1,16 +1,17 @@
- ggml/include/ggml.h                        |  19 ++
- ggml/src/ggml-cuda/fattn-common.cuh        |  91 +++++-
- ggml/src/ggml-cuda/fattn-mma-f16.cuh       |  90 ++++--
- ggml/src/ggml-cuda/fattn-tile.cuh          |  54 +++-
+ ggml/include/ggml.h                        |  19 +
+ ggml/src/ggml-cuda/fattn-common.cuh        |  91 +++-
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh       |  90 ++--
+ ggml/src/ggml-cuda/fattn-tile.cuh          |  54 ++-
  ggml/src/ggml-cuda/fattn-vec.cuh           |   4 +-
  ggml/src/ggml-cuda/fattn.cu                |  29 +-
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 437 +++++++++++++++++++++++++++++
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  84 ++++++
- ggml/src/ggml-cuda/ggml-cuda.cu            | 389 +++++++++++++++++++++++++
- ggml/src/ggml.c                            |  51 ++++
- src/llama-graph.cpp                        |  57 +++-
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 664 +++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  | 112 +++++
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 564 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/vendors/hip.h           |   4 +
+ ggml/src/ggml.c                            |  51 +++
+ src/llama-graph.cpp                        |  57 ++-
  src/llama-graph.h                          |   9 +-
- src/llama-kv-cache.cpp                     | 169 ++++++++++-
- src/llama-kv-cache.h                       |  40 +++
- src/llama-model.cpp                        |  69 ++++-
- 15 files changed, 1534 insertions(+), 58 deletions(-)
+ src/llama-kv-cache.cpp                     | 225 +++++++++-
+ src/llama-kv-cache.h                       |  40 ++
+ src/llama-model.cpp                        |  69 ++-
+ 16 files changed, 2024 insertions(+), 58 deletions(-)
