@@ -1,6 +1,6 @@
-From d3bf9ac6fac6558d7dc813a65464fb4db740e18b Mon Sep 17 00:00:00 2001
+From 59b1bf1a8208e1ee3d5c92a7016e3e8948c919d6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
-Date: Fri, 30 Oct 2026 06:06:09 -0500
+Date: Fri, 30 Oct 2026 06:07:21 -0500
 Subject: [PATCH 10/10] wip/kv-residency: A3 diagnostic --
  LLAMA_KV_REGION_SPILL_SKIP (bisect one tensor's spill)
 MIME-Version: 1.0
@@ -22,11 +22,28 @@ while the flip's byte round-trip verifies.  That points the next session at the 
 verify compares stage vs restore, which is blind to a stage filled with the wrong data) or at a lost kernel
 store into host-backed memory -- see §3.7.6.
 
+Also: the VMM selftest's PASS line now describes what it checks (partial flips are REFUSED).
+
 Not delivery work.
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu | 54 +++++++++++++++++++++++++++++----
- 1 file changed, 48 insertions(+), 6 deletions(-)
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu |  3 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 54 +++++++++++++++++++---
+ 2 files changed, 50 insertions(+), 7 deletions(-)
 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
+index 8b48a76d0..5101164c9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
+@@ -860,7 +860,8 @@ bool ggml_cuda_vmm_region_selftest(int device) {
+     (void) cudaFree(d_bad);
+ 
+     GGML_LOG_INFO("%s: device %d: %s (reserved %zu MiB in %zu x %zu MiB units, prefix + span growth, "
+-                  "a HOST-backed span, a partial (window-boundary) flip, the watermark contract and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
++                  "a HOST-backed span, aligned window flips (a partial one is REFUSED), the watermark contract "
++                  "and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
+                   (n_units * unit) >> 20, n_units, unit >> 20);
+     return ok;
+ }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index c7ed56b69..26d0b2c39 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu

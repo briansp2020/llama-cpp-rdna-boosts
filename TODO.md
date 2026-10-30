@@ -291,7 +291,7 @@ perf claim, or stop.
   Blocked for *measurement* while only one 32 GiB card is attached: its target family is qwen4exp/QSA
   (Flash-Next, 75 GB).  Correctness work can proceed on a small model with a forced small window.
 
-**PROGRESS 2026-10-30 (A3; fork `wip-kv-residency` tip `bbd69cda2`, records in
+**PROGRESS 2026-10-30 (A3; fork `wip-kv-residency` tip `59b1bf1a8`, records in
 `wip/kv-residency/A2-MIXED-BACKING.md` §3.7).**  Done: `--fit` **sizes and reports** the window
 (`LLAMA_KV_RESIDENT_CELLS=auto`: bytes-per-cell from the region buffer type, `W` from the VRAM left after the
 arena/slab reserve, the split + modelled cost printed at the calibrated link rate, the user's `-c` kept rather

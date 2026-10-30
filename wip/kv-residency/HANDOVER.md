@@ -27,10 +27,10 @@ build) and [`MIXED-BACKING.md`](MIXED-BACKING.md) (the design + the driver probe
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, **pushed** (`origin` = `git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
 | delivery release | **r176** (`release.json`) — the campaign is cut against **r174** (`v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`); a promotion re-cuts against the then-current release |
 | the campaign's TODO handle | **#118** (`TODO.md` §118 + the table row; the older text says `#117`, which was a dangling reference — see the number note there) |
-| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`d3bf9ac6f`** (A3 + the spill-bisect diagnostic) |
+| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`59b1bf1a8`** (A3 + the spill-bisect diagnostic) |
 | the A1 fallback | fork branch `wip-kv-residency-a1-two-base` (`e49e1cef4`), also pushed (superseded; unchanged this session) |
 | `rdna-boosts` | **never touched by this campaign.**  Locally `5bdec04ab`; the fork's branch is at r176's tip (moved by the r176 release) |
-| patch snapshot | `patches/0001`…`0010` + `patches/README.md` + `patches/diffstat.txt` (2807 insertions, 18 files) — apply **in order** to `5bdec04ab` |
+| patch snapshot | `patches/0001`…`0010` + `patches/README.md` + `patches/diffstat.txt` (2808 insertions, 18 files) — apply **in order** to `5bdec04ab` |
 | box | **one R9700 (gfx1201), 32 624 MiB.**  Pin `HIP_VISIBLE_DEVICES=0` on every arm.  Every number here is 1-GPU; say so, never claim multi-GPU |
 
 ## 2. What Goal A asked for (the maintainer's words, unchanged)
@@ -308,7 +308,7 @@ passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 
 1. `cd ~/llama-cpp-rdna-boosts && git pull`; read this file, then `A2-MIXED-BACKING.md` **§3.7.6** (the block,
    the bisect table, the plan) and §3.7.7 (the three bugs already fixed — do not reintroduce them).
-2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** at **`d3bf9ac6f`** or later
+2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** at **`59b1bf1a8`** or later
    (`git log --oneline -3` shows the A3 commit).  Never commit campaign code to `rdna-boosts`.
 3. `~/bin/build-llama-rocm` (~5 s warm); then gate 0 (VMM selftest, must print PASS) and the §6 identity trio
    (27B Q4_K_XL `-c 8192` q8_0 must hash `5ba44647188f` with the feature off).
