@@ -7,11 +7,11 @@ session's context).  Rewritten 2026-10-30 at the end of session A6, the promotio
 
 Continue the windowed-KV campaign (TODO **#118**) in `~/llama-cpp-rdna-boosts` and `~/llama.cpp`.
 
-**Goal A is SHIPPED — do not re-measure it and do not re-promote it.**  Release **`v16-6050b467c-r178`**
+**Goal A is SHIPPED — do not re-measure it and do not re-promote it.**  Release **`v16-6050b467c-r179`** (r178 shipped the same block with a fit/probe regression that made it unusable with `--fit on`; r179 fixed it)
 (16 blocks) carries the windowed KV as **block 15**: an **opt-in** fixed-VRAM resident window with the KV's
 tail in pinned system RAM (`LLAMA_KV_RESIDENT_CELLS=<cells>|auto`; unset = the plain device buffer, so a run
 without the knob is byte-identical to r177 including its OOM).  The fork's `rdna-boosts` is the re-cut tip
-`38ef3a767` (tree `92d087ef`), `validate-set.sh` is green, the shipped tree's gates are green (coherence
+`898103305` (tree `9d2e5c28`), `validate-set.sh` is green, the shipped tree's gates are green (coherence
 `5ba44647188f`, spilling-arm prefill-logit −0.000000 / 100.000 %, VMM selftest PASS and FAIL with the hold
 disabled, no GPU faults), and the container images are built off-host by the tag watcher.  The shipped
 description is `patches/README.md` "Block 15", `ENVIRONMENT.md` §17 and `WORKLOG.md` **261030.002**.

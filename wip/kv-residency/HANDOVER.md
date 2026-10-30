@@ -4,7 +4,14 @@
 before touching anything; it is self-contained.  Then read [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) (the measured state of the
 build — **§3.7.11 is this session**) and [`MIXED-BACKING.md`](MIXED-BACKING.md) (the design + the driver probe).
 
-> **State in one line: GOAL A IS SHIPPED (r178, block 15).**  The windowed KV is in the delivery as an
+> **State in one line: GOAL A IS SHIPPED (block 15; current release r179).**  r178 shipped it with a
+> regression that made the block unusable with the default `--fit on` — the fit identifies the KV by the region
+> buffer *type*, and the fit's `no_alloc` measurement context declined a window, got the plain buffer, so the
+> fit could not see the KV and aborted with "does NOT fit in device memory" before the window existed.  **r179
+> fixes it** (`llama_kv_region_set_probe`: the probe takes the region buffer explicitly; the runtime path is
+> untouched).  Lesson for any future change here: the fit's probe is a *context* too, and it declines a
+> window — check `llama-fit-params` on a config that needs the window, not only `llama-cli` on one that
+> fits.  The windowed KV is in the delivery as an
 > **opt-in** block (`LLAMA_KV_RESIDENT_CELLS=<cells>|auto`; unset = the plain device buffer, byte-identical
 > including the OOM), with `ENVIRONMENT.md` §17, `patches/README.md` "Block 15", and the release record in
 > `WORKLOG.md` 261030.002.  Both bugs the Flash-Next arm found are fixed in it (`0013` the tensor placement on
@@ -27,7 +34,7 @@ build — **§3.7.11 is this session**) and [`MIXED-BACKING.md`](MIXED-BACKING.m
 | what | where |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, **pushed** (`origin` = `git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
-| delivery release | **r178** (`v16-6050b467c-r178`, `release.json`) — 16 blocks; **block 15 is this campaign's Goal A**, cut against r177's tip.  The campaign's own patch series is still cut against **r174** (`5bdec04ab`) and is the *measurement* tree, not the shipped one |
+| delivery release | **r179** (`v16-6050b467c-r179`, `release.json`; r178 was the same block with a fit/probe regression) — 16 blocks; **block 15 is this campaign's Goal A**, cut against r177's tip.  The campaign's own patch series is still cut against **r174** (`5bdec04ab`) and is the *measurement* tree, not the shipped one |
 | the campaign's TODO handle | **#118** (`TODO.md` §118 + the table row; the older text says `#117`, which was a dangling reference — see the number note there) |
 | campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`7c7769e50`** (A5 (ii): the tensor-placement fix `0013` and the park decline `0014`, on top of the A4 tip) |
 | the A1 fallback | fork branch `wip-kv-residency-a1-two-base` (`e49e1cef4`), also pushed (superseded; unchanged this session) |
@@ -448,10 +455,10 @@ passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 
 ## 11. First 30 minutes of the next session
 
-**Goal A is shipped — do not re-measure it, and do not re-promote it.**  `v16-6050b467c-r178` carries it as
+**Goal A is shipped — do not re-measure it, and do not re-promote it.**  `v16-6050b467c-r179` carries it as
 block 15 (opt-in, `LLAMA_KV_RESIDENT_CELLS`); the delivery's `patches/0015`, `ENVIRONMENT.md` §17,
 `patches/README.md` "Block 15" and `WORKLOG.md` 261030.002 are the shipped description, and the fork's
-`rdna-boosts` carries the re-cut tip `38ef3a767` (tree `92d087ef`).  What is left is **Goal B**, **Goal C**'s
+`rdna-boosts` carries the re-cut tip `898103305` (tree `9d2e5c28`).  What is left is **Goal B**, **Goal C**'s
 decisions, and one *test* fix:
 
 | item | state |
