@@ -52,6 +52,48 @@ RDNA4 at 256 experts.
 Record: `archive/work/router-topk-fold/` (the submission verbatim + `PROMOTED.md`, the assessment),
 `benchmarks/2026-10-30-router-topk-fold.md`, `patches/README.md` (block 10, "r182"), `GREEDY-PURITY.md`
 §72, `ENVIRONMENT.md` (`GGML_CUDA_ROUTER_TOPK`).
+## 261030.007 -- `gate-park-idle-slots.sh` grades the save-and-clear fallback (a gate fix, no block change)
+
+**Not a release: `patches/` and `release.json` are untouched by this commit and the block set is unchanged
+(r182 is the release current at the time of writing); no re-cut and no tag.**  A scripts-only fix to the server
+parking gate, plus the campaign's decisions.
+
+**The gate HARD-failed a legitimate outcome, for two reasons.**  (1) It counted parks with
+`grep -c "seq_park:"`, which also matches the **region-backed refusal warning** — logged under the `seq_park`
+logger prefix — so a windowed cache read `seq_park=1 seq_unpark=0` and looked like "a park that never came
+back".  (2) When the cache declines the park, the server says *"cannot park the idle slot: saving it to the
+prompt cache and clearing it"* (`server-context.cpp`, `park_idle_slots_for_launch`), which is exactly the arm
+the gate compares against (`lazyoff`); the gate should require `park == lazyoff` and report the fallback, not
+fail on *"parking moved nothing"*.  That path already existed for any slot whose cells are not one run
+(a prefix shared through `seq_cp`); the windowed KV (block 15) made it reachable.
+
+**The fix.**  Count actual **moves** (`seq_park: seq N [lo, hi) -> [dst, bound)`), and when no move happened
+but the park arm logged the fallback line, report *"parking declined -> save-and-clear fallback (N idle
+transitions)"* and keep the `park == lazyoff` oracle.  A mixed arm (some parks, some fallbacks) passes with a
+note; a run that neither parks nor falls back still fails.
+
+**Verified** (Flash-Next GSQ-IQ3_XXS + MTP draft, 1 GPU, `SM=layer NCMOE=48 CTX=40960`, prose prompt, 96
+tokens/request, 1 R9700/gfx1201):
+
+| arm | before | after |
+|---|---|---|
+| `LLAMA_KV_RESIDENT_CELLS=1024` (2 windows) | **FAIL** `parking moved nothing (seq_park=1 seq_unpark=0)`; text `park == lazyoff` on A-D | **PASS** `parking declined -> save-and-clear fallback (3 idle transitions)`, `park == lazyoff` A-D, `parkoff != lazyoff` on B/C/D (the workload still reproduces #210) |
+| no knob (control) | passed | **PASS** `6 park move(s), 2 unpark move(s) traced`, same oracle |
+
+`check-gpu-faults.sh` clean on every arm's log and the kernel journal; no aborts.
+
+**Decisions taken (the campaign's, recorded here so they do not get re-litigated):**
+
+* **`auto` stays capacity-only** — `--fit` sizes a window only when a pinned `-c` does not fit, against
+  `free - margin - everything-but-the-KV` with the arena/slab reserve in the margin.  The arena half
+  (`A2-MIXED-BACKING.md` §3.7.11.4 A: +2.2..2.9 GiB, worth +3.8 % decode at the 122B's residency and ~0 at the
+  35B's) needs a **numeric** `W` at or above the run depth; a policy that spills to grow the arena is not
+  adopted (a percentage-of-slab form of `W` stays deferred).
+* **A window across a `-sm tensor` split stays parked** — designed in
+  `wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md` (design only; its `common/fit.cpp` cross-check lists four things
+  an implementation must honour, `margins[0]` first).  It is picked up on the multi-GPU development host.
+* **Goal B (a sparse attended set streamed cheaply) is next**, developed **inside `wip/` only** until it is
+  promoted; `patches/` is left alone while the other delivery work is in flight.
 
 ## 261030.005 (r181) -- block 15: `--fit` + `-sm tensor` fixed properly (three asserts), plus three `auto` wiring defects
 
