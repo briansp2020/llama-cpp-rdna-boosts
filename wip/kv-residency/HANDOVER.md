@@ -4,13 +4,14 @@
 anything; it is self-contained.  Then read [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) (the measured state of the
 build — **§3.7.11 is this session**) and [`MIXED-BACKING.md`](MIXED-BACKING.md) (the design + the driver probe).
 
-> **State in one line: Goal A's mechanism, purity and cost are all measured on provably spilling arms — and
-two bugs came out of the Flash-Next arm (A5).**  Bug 1 is **fixed** (`0013`): a windowed region's tensors were
-not placed on the map grid, so the *second* tensor's first slide was refused and the process aborted — the
-first spilling arm this campaign ran on a model whose KV rows are not unit-sized (Flash-Next's QSA indexer pads
-+512 B/tensor).  Bug 2 is **OPEN and needs a decision**: an idle-slot **park** on a region-backed KV faults the
-GPU (§7.2 item 2 / `A2-MIXED-BACKING.md` §3.7.11.3) — reproduced with the window off too, so it is the region
-provider, not the window.  Everything §7.2 owed (items 1, 2, 4) is done.
+> **State in one line: Goal A's mechanism, purity and cost are all measured on provably spilling arms, and both
+bugs the Flash-Next arm found are FIXED.**  Bug 1 (`0013`): a windowed region's tensors were not placed on the map
+grid, so the *second* tensor's first slide was refused and the process aborted (Flash-Next's QSA indexer pads
++512 B/tensor; the 27B/4B are unit-sized by luck).  Bug 2 (`0014`): an idle-slot **park** on a region-backed KV
+faults the GPU (a park writes cells above the region's watermark through the copy engine) — **a region-backed KV
+now declines parking** and the server uses its existing save-and-clear fallback, which is byte-identical to the
+parking gate's oracle and costs one state copy per idle transition (timings inside the noise).  Everything §7.2
+owed (items 1, 2, 4) is done; the one follow-up is the parking gate not recognising that fallback.
 >
 > **The box changed (2026-10-30).**  The PCIe rework happened: the link is now **55.7 GB/s H2D / 56.8 D2H**
 > (root port x16 @ 32 GT/s, was x8) and the probes were re-run (`A2-MIXED-BACKING.md` §3.7.1).  Every
@@ -104,12 +105,16 @@ kernels — was built, gated byte-identical, and **superseded**; kept on its bra
     the second tensor's first flip is refused and `grow_regions` **aborts the process** (measured 2026-10-30).
     The 27B/4B are unit-sized by luck; never re-derive a gate on those two alone.
 
-12. **A cell move that the region has not mapped is a GPU fault, not an error — a park is one (A5, OPEN).**  The
-    region maps only the cell **watermark**; `llama_kv_cache::seq_park` relocates an idle slot's cells near the
-    **top of the cache**, above that watermark, and the park's move is a **copy-engine** transfer: the GPU faults
-    (`__amd_rocclr_copyBuffer`, *Page not present*).  Measured with **and without** the window (§3.7.11.3), so it
-    is the region provider.  Anything that writes above the watermark must grow the region first (a host-driven
-    write does it through `grow_for`; a device/copy-engine move does not).
+12. **A cell move that the region has not mapped is a GPU fault, not an error — a park is one (A5, FIXED).**  The
+    region maps only the cell **watermark**; `llama_kv_cache::seq_park` relocates an idle slot's cells at
+    `park_bound()` = the **top of the cache**, above that watermark, and the park's move is a **copy-engine**
+    transfer: the GPU faults (`__amd_rocclr_copyBuffer`, *Page not present*).  Measured with **and without** the
+    window (§3.7.11.3), so it is the region provider.  `0014` makes a region-backed cache **decline** the park
+    (`seq_park` false, warn once) so the server save-and-clears the slot — do **not** move that refusal into
+    `can_park()` (a false there means "idle slots stay resident", i.e. #210) and do **not** "fix" it by growing
+    the region on a windowed cache (the parked cold cells would take the resident window and the active cells
+    would fall into the spilled tail).  Anything that writes above the watermark must grow the region first (a
+    host-driven write does it through `grow_for`; a device/copy-engine move does not).
 
 Knobs (all campaign-only): `LLAMA_KV_REGION=1` (enables the provider), `LLAMA_KV_RESIDENT_CELLS=W` (the window)
 or `=auto` (**`--fit` sizes it** -- the product shape; unset = no window, i.e. today's cache),
@@ -282,9 +287,10 @@ read/restore paths.
    a windowed region's tensors were not placed on the map grid, so the second tensor's first slide was
    refused and the process **aborted** (`0013`, now 156 flips / 156 VERIFY ok, both caches spilling).
    Text, prefill-logit KLD (`-0.000000 / 99.994 %`) and `test-backend-ops -o FLASH_ATTN_QSA` (26/26) all
-   green on that arm.  **The park coupling is a NEW OPEN BUG**: `gate-park-idle-slots.sh` faults the GPU
-   on a region-backed KV, with the window off as well (§3.7.11.3) -- a park writes cells above the
-   region's watermark.  Needs the maintainer's decision (grow on park / refuse parking / refuse the window).
+   green on that arm.  **The park coupling is fixed too** (`0014`): a region-backed KV declines the park
+   and the server save-and-clears the slot (byte-identical to the gate's oracle, no fault, cost in the
+   noise).  Owed: `gate-park-idle-slots.sh` should recognise that fallback instead of failing on "parking
+   moved nothing" (§3.7.11.3).
 3. ~~The hazard as a self-test~~ -- **DONE (A4 (ii))**, `GGML_CUDA_VMM_REGION_SELFTEST=1` now includes it and is
    **sensitive** (`LLAMA_KV_REGION_QUARANTINE=0` makes it FAIL).  It only runs under that env var, so keep asking
    for it in every release gate.

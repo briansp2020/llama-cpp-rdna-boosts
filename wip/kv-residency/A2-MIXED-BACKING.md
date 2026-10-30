@@ -632,7 +632,7 @@ Recovery record: the fix was found with two throw-away diagnostics (an exact-byt
 raw offsets in the `LLAMA_KV_REGION_TRACE` line).  Both were reverted before the gates above; the trace line is
 still worth adding permanently if this class recurs.
 
-## 3.7.11.3 Item 2 — bug 2 (OPEN): a park on a region-backed KV faults the GPU
+## 3.7.11.3 Item 2 — bug 2 (FIXED, `0014`): a park on a region-backed KV faults the GPU
 
 `gate-park-idle-slots.sh` (the r136/r146 parking path, the model's own gating gate) **kills the server** on a
 region-backed KV.  Same config throughout: Flash-Next, `-ncmoe 48`, 1 GPU, MTP draft, prose×2 / 51 475-token
@@ -651,18 +651,43 @@ top of the cache**, i.e. above the mapped extent — unmapped VA, and the park's
 which *faults* instead of returning an error.  (The same copy-engine-vs-host-mapping limitation as §3.7.7 #2,
 with the opposite symptom.)
 
-**Not fixed — it is a product decision, and the options pull apart:**
+**The two candidates** (option 3, refusing the window, is out):
 
-1. `llama_kv_cache::seq_park` grows the region to the destination cell range before moving cells.  Correct, and it
-   removes the fault; but with a window the parked cells then land *inside the resident window* (which keeps the
-   **newest** cells) while the running slot sits in the spilled tail — large VRAM cost, and a decode that reads
-   every attended cell from host.
-2. Refuse parking on a region-backed cache (warn once, fall back to the save-and-clear idle-slot path).  Keeps both
-   features honest, and `LLAMA_SERVER_PARK_IDLE_SLOTS=0`/`--lazy-idle-slots`-off already give a working server.
-3. Refuse the *window* when the server parks idle slots.
+1. `llama_kv_cache::seq_park` grows the region to the destination cell range before moving cells.  Cheap and right
+   on an **unwindowed** region (VRAM→VRAM, native D2D, no PCIe), but on a **windowed** cache the parked (cold)
+   cells then take the resident window while the ACTIVE cells fall below the spill boundary — every decode step
+   reads the running context over the link: a *per-token* cost (10 k active cells at Flash-Next geometry =
+   109 MiB/token ≈ 2 ms/token ≈ 10 % of a 20 ms token) against save-and-clear's *one state copy* per transition.
+   It also needs the copy leg to be kernel-based for any spilled range (invariant 8) or it silently does not land.
+2. Decline the park on a region-backed cache and let the server use the fallback it **already has**
+   (`park_idle_slots_for_launch`: *"cannot park the idle slot: saving it to the prompt cache and clearing it"*) —
+   i.e. exactly the arm this gate compares against.  No new code in the copy/staging path.
 
-Whatever ships, the failure must not be a GPU fault, and `gate-park-idle-slots.sh` (with a region/window arm) is
-the gate that sees it.
+**Chosen: (2), implemented in `0014`** (`seq_park` returns false, warn once; `LLAMA_KV_REGION`-only, so the
+default path is untouched).  `can_park()` is deliberately **not** the place: a false there makes the server log
+*"not supported … the idle slots stay where they are"*, which is the **#210** behaviour (idle slots resident), not
+the fallback.
+
+Measured (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, `-c 65536`, `W=1024`, MTP draft, 51 475-token request A then three
+short ones, 96 tokens each, 1 GPU, windowed arm — `KVREGION_FREE … host=1152` so the state path ran over a spill):
+
+| arm | A (51 k tok) | B | C | D | tokens B/C/D |
+|---|---|---|---|---|---|
+| `park` = decline + save-and-clear | 85 521 ms | 1 992 | 2 129 | 2 074 | 155 / 159 / 162 |
+| `parkoff` (no parking, #210) | 85 432 ms | 2 369 | 1 846 | 2 169 | 113 / 117 / 162 |
+| `lazyoff` (the reference) | 85 458 ms | 1 934 | 2 150 | 2 096 | 155 / 159 / 162 |
+
+⇒ **byte-identical to the reference on A–D** (the #210 placement dependence is still removed — `parkoff` differs),
+the fallback's cost is **inside the arm-to-arm noise** (one state copy per idle transition), and there is no GPU
+fault and no abort.  The three *"cannot park the idle slot: saving it to the prompt cache and clearing it"* lines
+are the fallback firing once per idle transition.  **Control, no region: the park gate PASSES unchanged** ("every
+park moved the attention cache and the indexer cache together"), so the default path is untouched.
+
+**Owed (a gate gap, not a code gap):** `scripts/gate-park-idle-slots.sh` still HARD-fails this arm on *"parking
+moved nothing"* — the gate does not recognise the server's save-and-clear fallback, which it should, because that
+path exists for **any** slot whose cells are not one run (a prefix shared through `seq_cp`, for instance).  The
+proposed change: when the park arm logged the fallback line, require `park == lazyoff` (it is) and report
+*"parking declined → save-and-clear fallback"* instead of failing.
 
 ## 3.7.11.4 Item 4 — the re-measurement at the 55.7 GB/s link
 
@@ -718,8 +743,9 @@ reports 54-55 GB/s here), so its own arithmetic already reflects this.
 ## 3.7.11.5 What is left
 
 1. ~~The corners on spilling arms~~ — **DONE** (§3.7.11.1).
-2. ~~The Flash-Next spilling arm~~ — **DONE** (§3.7.11.2), including the QSA op test; bug 1 fixed, **bug 2 open**
-   (§3.7.11.3) and it needs a decision.
+2. ~~The Flash-Next spilling arm~~ — **DONE** (§3.7.11.2), including the QSA op test; **both bugs fixed**
+   (bug 1 §3.7.11.2 `0013`, bug 2 §3.7.11.3 `0014`; the parking gate's own fallback blindness is the one owed
+   follow-up).
 3. ~~The re-measurement~~ — **DONE** (§3.7.11.4 A-C).
 4. The promotion conversation (a block, `ENVIRONMENT.md`, the default-on call for the window) — the maintainer's.
    It now needs a decision on §3.7.11.3 (park) and, if the arena half is wanted, on the `auto`-policy gap

@@ -1,0 +1,99 @@
+From 7c7769e504d44c2a40364185913f9240308df0c0 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Fri, 30 Oct 2026 11:04:48 -0500
+Subject: [PATCH 14/14] wip/kv-residency: A5 (ii) -- a region-backed KV
+ declines parking, and the server saves-and-clears
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the GPU fault A5 (i) found (§7.2 item 2).  An idle-slot park moves
+cells to `park_bound()` = the top of the CACHE, above the cell watermark a
+growable/windowed region has mapped; the move is `ggml_backend_tensor_copy`
+(the copy engine), so the write into unmapped VA is a PAGE FAULT, not an error
+(`__amd_rocclr_copyBuffer`, "Page not present").  Reproduced with the window
+OFF (`LLAMA_KV_REGION=1` alone) and at a depth where nothing spills, so it is
+the region provider, not the window.
+
+Two options were weighed (the maintainer's criterion: least disruptive to
+performance while remaining correct at all times):
+
+  1. grow the region to cover the park range -- cheap on an unwindowed region
+     (VRAM->VRAM, native D2D), but on a WINDOWED cache the parked (cold) cells
+     then take the resident window while the ACTIVE cells fall below the spill
+     boundary: every decode step reads the running context over the link, a
+     per-token cost against save-and-clear's one state copy per transition.
+  2. decline the park and let the server use the fallback it already has
+     (`park_idle_slots_for_launch`: "cannot park the idle slot: saving it to
+     the prompt cache and clearing it"), i.e. exactly the arm the parking gate
+     compares against.
+
+Took (2).  It adds no code to the copy/staging path (the risky part), it is
+correct by construction -- the output is the save-and-clear output, which is
+the gate's oracle -- and its cost is one state copy per idle transition.
+
+Measured (Flash-Next GSQ-IQ3_XXS, -ncmoe 48, -c 65536, W=1024, MTP draft,
+51 475-token request A then three short ones, 96 tokens each, 1 GPU):
+  park (decline + save/clear)  A 85521 ms  B 1992  C 2129  D 2074
+  parkoff (no parking, #210)   A 85432 ms  B 2369  C 1846  D 2169
+  lazyoff (the reference)      A 85458 ms  B 1934  C 2150  D 2096
+  -> the fallback is byte-identical to lazyoff on A-D (155/159/162 tokens, vs
+     parkoff's 113/117: the #210 placement dependence is still removed) and its
+     timing is inside the arm-to-arm noise; no GPU fault, no abort.
+  The window arm still spills 1152 MiB (KVREGION_FREE), so the state save/clear
+  ran through the spilling state path.
+  CONTROL, no region: the park gate PASSES unchanged ("every park moved the
+  attention cache and the indexer cache together") -- the default path is
+  untouched, the decline is `LLAMA_KV_REGION`-only.
+
+NOTE: `can_park()` is deliberately NOT the place for this -- a false there makes
+the server log "not supported ... the idle slots stay where they are", which is
+the #210 behaviour (idle slots resident), not the fallback.  The decline has to
+be `seq_park()` returning false, which the server handles per slot.
+
+Owed: `scripts/gate-park-idle-slots.sh` still HARD-fails this arm on "parking
+moved nothing" -- the gate does not recognise the server's save-and-clear
+fallback, which it should (that path exists for any slot whose cells are not
+one run, a shared prefix for instance).  Reported, not patched here.
+---
+ src/llama-kv-cache.cpp | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 68b72ab23..06e066274 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1058,6 +1058,33 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+     if (!can_park()) {
+         return false;
+     }
++
++    // wip/kv-residency (TODO #118): a park MOVES cells, and park_bound() is the top of the CACHE -- above the cell
++    // watermark a growable/windowed region has mapped.  The move is `ggml_backend_tensor_copy` (the copy engine),
++    // so a write into unmapped VA is a GPU PAGE FAULT, not an error: measured on Flash-Next (both KV caches
++    // windowed, `-c 65536 -ncmoe 48`) and reproduced with the window OFF (`LLAMA_KV_REGION=1` alone) and at a
++    // depth where nothing spills, so it belongs to the region provider, not to the window
++    // (`../llama-cpp-rdna-boosts/wip/kv-residency/A2-MIXED-BACKING.md` §3.7.11.3).
++    //
++    // Growing the region to cover the park instead is not free either: on a windowed cache the parked (cold)
++    // cells would take the resident window while the ACTIVE cells fall below the spill boundary, so every decode
++    // step would read the running context over the link -- a per-token cost against save-and-clear's one state
++    // copy per idle transition.  So this DECLINES, which leaves every cell where it is and lets the caller use its
++    // fallback: the server saves the slot to the prompt cache and clears it (server-context.cpp,
++    // `park_idle_slots_for_launch`: "cannot park the idle slot: saving it to the prompt cache and clearing it"),
++    // i.e. exactly the behaviour the parking gate compares against.  A region-backed cache is opt-in
++    // (`LLAMA_KV_REGION=1`), so the default path is unchanged.
++    if (kv_region) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            LLAMA_LOG_WARN("%s: the KV is a growable/windowed REGION (LLAMA_KV_REGION): a park moves cells above "
++                    "the region's mapped watermark and a copy-engine move there faults the GPU, so idle slots are "
++                    "saved to the prompt cache and cleared instead of parked (one state copy per idle transition)\n",
++                    __func__);
++        }
++        return false;
++    }
+     if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
+         return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
+     }
