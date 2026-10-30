@@ -164,6 +164,32 @@ its 40 host layers.
 So the 262 144-cell context runs at the small one's speed, and the spill hides behind the 27B Q8_0's 1.29 GiB
 of CPU-mapped weights (which is what actually bounds this arm: ~1.29 GiB/token over the link).
 
+### 3.6 The deep arm (the caches actually spill) — and the window's break-even
+
+Flash-Next, `-c 65536` (so `-c` is ~1.4× the 46k-token prompt), `-ncmoe 48`, q8_0 KV, `-n 2000`; at depth
+~15k cells of BOTH caches are host-backed (attention KV 0.5 KiB/cell + QSA indexer 0.1 KiB/cell):
+
+| arm | `SLAB_INIT` free | arena | residency | prefill | decode |
+|---|---|---|---|---|---|
+| plain (both caches fully resident) | 27.06 GiB | 24 539 MiB | 60.0 % | 465.7 t/s | **45.2 t/s** |
+| window `W=32768` (both spill at depth) | 27.46 GiB | 24 939 MiB | 60.9 % | 477.2 t/s | **38.6 t/s (−14.6 %)** |
+
+**The window is a bet that `-c` is much larger than the depth you run at**, and this arm is the other side of
+it: at `-c 65536` the whole KV is 918 MiB, so the window frees only **0.39 GiB** of arena and costs **14.6 %**
+of decode (213 MiB/token of spill at depth).  Compare §3.5 at `-c 262144`, where the same model frees 3.63 GiB
+and spills nothing at a 5256-token depth (+13.1 % prefill, +2.0 % decode).  Break-even is therefore a **`--fit`
+decision**: size `W` from the depth (and leave `W = -c`, i.e. no spill, when `-c` is close to it) — exactly the
+`--fit` half already on the owed list.
+
+### A bug this measurement found (and fixed): the resident window must be committed BEFORE SLAB_INIT
+
+The deep arm first **aborted** at depth: `growth refused (region 816 MiB, wanted 500..503 MiB)`, with
+`SLAB_STATS ... free=0.0 MiB`.  The resident window's VRAM was being mapped lazily, so `SLAB_INIT` mapped
+`free VRAM − reserve` first and the arena owned all of it by the time the watermark advanced — the ordering
+rule `O2-PLAN.md` §6.2 already states, which A2 was violating for the **device** half (the host half is
+supposed to be lazy; the resident half is not).  `init_tensor` now commits `min(W, n_cells)·nb1` of VRAM per
+tensor at buffer creation and keeps the spill lazy (`ba5c7205e`).
+
 ### A bug this measurement found (and fixed): the boundary must be quantised in BYTES
 
 The slide first quantised its boundary in *cells* (`unit/nb1`, integer division), which is not map-unit
