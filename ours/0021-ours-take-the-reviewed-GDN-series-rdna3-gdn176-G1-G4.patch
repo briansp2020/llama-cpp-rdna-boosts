@@ -1,0 +1,225 @@
+From 469def42e5951f55f75b166c015866659feef34a Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 30 Oct 2026 14:09:48 +0000
+Subject: [PATCH 21/21] ours: take the reviewed GDN series (rdna3 gdn176 G1-G4,
+ Fable-reviewed): snapshot fold with the cpy_batch run guard, conv-state
+ gather fold with the deferred-gather tripwire, the 1-token direct conv only
+ where gdn_conv_norm_match() > 0 and the prescan would not match
+ (GGML_CUDA_FUSE_GDN_CONV_DECODE=0: off; the ssm_conv_in stand-down continues
+ instead of returning), graph_optimize on the structural matcher, shexp gate
+ fold with the MMB check. Replaces the older forms from the squashed stack and
+ the ungated 1-token conv
+
+---
+ ggml/src/ggml-cuda/cpy-batch.cu |  2 ++
+ ggml/src/ggml-cuda/gdn-conv.cu  | 38 +++++++++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/gdn-conv.cuh |  1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu |  2 +-
+ ggml/src/ggml-cuda/mmvf.cu      |  4 +++-
+ ggml/src/ggml-cuda/mmvq.cu      | 21 +++++++++++++++---
+ ggml/src/ggml-cuda/mmvq.cuh     |  1 +
+ 7 files changed, 62 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/cpy-batch.cu b/ggml/src/ggml-cuda/cpy-batch.cu
+index a2575b4c1..8fff42579 100644
+--- a/ggml/src/ggml-cuda/cpy-batch.cu
++++ b/ggml/src/ggml-cuda/cpy-batch.cu
+@@ -1,3 +1,4 @@
++#include "gdn-conv.cuh"
+ #include "cpy-batch.cuh"
+ 
+ namespace {
+@@ -73,6 +74,7 @@ int ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, c
+         const ggml_tensor * b = cgraph->nodes[j];
+         if (cb_noop(b)) continue;
+         if (!cb_member(b) || !cb_same(b->src[0], first->src[0]) || !cb_same(b->src[1], first->src[1])) break;
++        if (ggml_cuda_gdn_conv_snap_try_fuse(cgraph, j)) break;   // written by the GDN direct conv (snapshot fold)
+         idx[n++] = j; last = j;
+     }
+     if (n < 2) return 0;
+diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
+index 6d48f6551..97b6ce57f 100644
+--- a/ggml/src/ggml-cuda/gdn-conv.cu
++++ b/ggml/src/ggml-cuda/gdn-conv.cu
+@@ -1,5 +1,6 @@
+ #include "gdn-conv.cuh"
+ #include "unary.cuh"
++#include "mmvq.cuh"
+ #include <cstdlib>
+ #include <algorithm>
+ 
+@@ -244,12 +245,20 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+     return true;
+ }
+ 
+-bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m) { return gdn_conv_check(cgraph, i, m); }
++static bool gdn_conv_decode_ok(const ggml_cgraph * cgraph, const ggml_cuda_gdn_conv_match & m);
++
++bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m) {
++    return gdn_conv_check(cgraph, i, m) && gdn_conv_decode_ok(cgraph, m);
++}
++
++// The structural match alone (graph_optimize, before allocation: no data pointers yet).  A superset of match_at_concat, so
++// its alloc deps cover every case the compute-time matchers take.
++bool ggml_cuda_gdn_conv_pattern_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m) { return gdn_conv_check(cgraph, i, m); }
+ 
+ bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cuda_gdn_conv_match & m) {
+     if (!gdn_conv_enabled() || j < 1 || cgraph->nodes[j]->op != GGML_OP_SSM_CONV) return false;
+     const ggml_tensor * cc = cgraph->nodes[j]->src[0];
+-    for (int i = j - 1; i >= 0 && i >= j - 64; --i) if (cgraph->nodes[i] == cc) return gdn_conv_check(cgraph, i, m) && m.conv_idx == j;
++    for (int i = j - 1; i >= 0 && i >= j - 64; --i) if (cgraph->nodes[i] == cc) return gdn_conv_check(cgraph, i, m) && m.conv_idx == j && gdn_conv_decode_ok(cgraph, m);
+     return false;
+ }
+ 
+@@ -374,6 +383,22 @@ static int gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_gdn_c
+     return j2 + 1;
+ }
+ 
++// One token (decode; GGML_CUDA_FUSE_GDN_CONV_DECODE=0: off): the direct conv only where it also takes the q / k l2 norm pair (otherwise the ssm_conv_in epilogue,
++// which writes the CONCAT inside the in-proj GEMV, is cheaper) and only where the decode-only ssm_prescan fusion would not
++// take the conv.  Uses data pointers: compute time only.  Every compute-time caller (CONCAT, SSM_CONV, the ssm_conv_in
++// stand-down, the snapshot and gather folds) goes through the two matchers above, so they all decide the same way.
++static bool gdn_conv_decode_ok(const ggml_cgraph * cgraph, const ggml_cuda_gdn_conv_match & m) {
++    if (m.T > 1) {
++        return true;
++    }
++    static const bool decode = getenv("GGML_CUDA_FUSE_GDN_CONV_DECODE") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_CONV_DECODE")) != 0;
++    if (!decode) {
++        return false;
++    }
++    gdn_conv_norm_args na;
++    return gdn_conv_norm_match(cgraph, m, na) > 0 && !ggml_cuda_ssm_prescan_match_at(cgraph, m.conv_idx);
++}
++
+ // Depthwise causal conv1d fusion entry point (GDN).  Returns the number of graph nodes to skip
+ // when fused, 0 otherwise.  A/B / bisect kill switch: GGML_CUDA_DISABLE_CONV_FUSION=1.
+ int ggml_cuda_gdn_conv_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+@@ -386,6 +411,15 @@ int ggml_cuda_gdn_conv_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgra
+         return 0;
+     }
+     ggml_cuda_gdn_conv_match gm;
++    if (node->op == GGML_OP_CONCAT && !ctx.gdn_deferred_gathers.empty() && !ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
++        const ggml_tensor * root = node->src[0];
++        while (root != nullptr && root->view_src != nullptr) {
++            root = root->view_src;
++        }
++        GGML_ASSERT(std::find(ctx.gdn_deferred_gathers.begin(), ctx.gdn_deferred_gathers.end(), root) == ctx.gdn_deferred_gathers.end() &&
++                    "a CONCAT over a deferred conv-state gather must be taken by the direct conv");
++        return 0;
++    }
+     if (node->op == GGML_OP_CONCAT && ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
+         if (!gm.snap) {
+             ggml_cuda_gdn_conv_write_tail(ctx, gm);
+diff --git a/ggml/src/ggml-cuda/gdn-conv.cuh b/ggml/src/ggml-cuda/gdn-conv.cuh
+index 1a7148d21..dcfad68c6 100644
+--- a/ggml/src/ggml-cuda/gdn-conv.cuh
++++ b/ggml/src/ggml-cuda/gdn-conv.cuh
+@@ -18,6 +18,7 @@ struct ggml_cuda_gdn_conv_match {
+     ggml_tensor * snap_dst[SNAP_MAX] = {};
+ };
+ bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m);
++bool ggml_cuda_gdn_conv_pattern_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m);
+ bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cuda_gdn_conv_match & m);
+ void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
+ struct gdn_conv_norm_args;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7fdd5833d..3ab99d5b9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6955,7 +6955,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                     continue;
+                 }
+                 ggml_cuda_gdn_conv_match gm;
+-                if (ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
++                if (ggml_cuda_gdn_conv_pattern_at_concat(cgraph, i, gm)) {
+                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.x), cgraph->nodes[gm.conv_idx]);
+                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.state), cgraph->nodes[gm.conv_idx]);
+                 }
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 35cf2a653..da5319343 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -2,6 +2,7 @@
+ #include "common.cuh"
+ #include "unary.cuh"
+ #include "mmvf.cuh"
++#include "mmb.cuh"
+ #include "mmf.cuh"
+ #include "convert.cuh"
+ #include "fwht.cuh"
+@@ -1391,7 +1392,8 @@ int ggml_cuda_shexp_gate_sigmoid_try_fuse(ggml_backend_cuda_context & ctx, const
+     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+     const int64_t nt    = y->ne[1];
+     if (w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1 || w->view_src || !ggml_is_contiguous(w) ||
+-            (w->type != GGML_TYPE_BF16 && w->type != GGML_TYPE_F32) ||   // F16 would take the half-accumulator mmvf path, which has no fusion (abort)
++            (w->type != GGML_TYPE_BF16 && w->type != GGML_TYPE_F32) ||   // F16 may take a half accumulator here (not fused)
++            ggml_cuda_mmb_supported_mm(w, y, gate) ||
+             y->type != GGML_TYPE_F32 || y->ne[2] != 1 || y->ne[3] != 1 || nt < 1 || nt > MMVF_MAX_BATCH_SIZE ||
+             gate->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate) || gate->ne[0] != 1 || gate->ne[1] != nt ||
+             mul->ne[1] != nt || add->ne[0] > INT_MAX ||
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 6e842049f..2701a522b 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -3127,10 +3127,10 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
+             continue;
+         }
+         // the GDN direct conv takes this concat (decode included on RDNA4 / RDNA3_0): it reads the plain matmul output
+-        // and the conv-state row itself, so this epilogue must not consume the concat
++        // and the conv state itself, so this epilogue must not consume the concat (it would skip the plain store)
+         ggml_cuda_gdn_conv_match gdn_m;
+         if (ggml_cuda_gdn_conv_match_at_concat(cgraph, j, gdn_m)) {
+-            return 0;
++            continue;
+         }
+         // conv_input [cs, C] = states [(cs-1)*C] + qkv [C], dim 0
+         const int64_t C = n->ne[1] * n->ne[2] * n->ne[3];
+@@ -3172,7 +3172,19 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
+ // Fuse the SSM pre-scan chain: conv+silu, l2_norm(q,k) and the gate/beta projections (decode only).
+ // One kernel instead of ssm_conv, l2_norm_pair and ssm_gate_beta.  Returns 15 when fused.
+ // GGML_CUDA_DISABLE_SSM_PRESCAN=1 turns it off.
++// The decode-only conv + l2 norm + gate / beta prescan fusion at SSM_CONV node i: whether it would take the node
++// (ggml_cuda_ssm_prescan_try_fuse with launch = false).  Also consulted by the GDN direct conv, which steps aside for it.
++static int ggml_cuda_ssm_prescan_impl(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i);
++
++bool ggml_cuda_ssm_prescan_match_at(const ggml_cgraph * cgraph, int i) {
++    return ggml_cuda_ssm_prescan_impl(nullptr, cgraph, i) != 0;
++}
++
+ int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    return ggml_cuda_ssm_prescan_impl(&ctx, cgraph, i);
++}
++
++static int ggml_cuda_ssm_prescan_impl(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i) {
+     static const bool disable_ssm_prescan = getenv("GGML_CUDA_DISABLE_SSM_PRESCAN") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_SSM_PRESCAN"));
+     ggml_tensor * node = cgraph->nodes[i];
+     if (disable_ssm_prescan || node->op != GGML_OP_SSM_CONV || node->type != GGML_TYPE_F32 || node->ne[1] != 1 ||
+@@ -3251,9 +3263,12 @@ int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
+     if (wiring_ok && type_ok) {
+         const int out_nodes[] = { i + 1, i + 3, i + 5, i + 11, i + 15 };
+         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 16, out_nodes, 5)) {
++            if (ctx == nullptr) {
++                return 15;
++            }
+             float eps;
+             memcpy(&eps, q_norm->op_params, sizeof(float));
+-            ggml_cuda_op_ssm_conv_l2_gatebeta(ctx,
++            ggml_cuda_op_ssm_conv_l2_gatebeta(*ctx,
+                 node->src[0], node->src[1],
+                 alpha_w->src[0], beta_w->src[0], alpha_w->src[1], dt, ssm_a,
+                 (ggml_tensor *) q_norm, (ggml_tensor *) k_norm, (ggml_tensor *) silu,
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 84dd93992..ea7ce5ad9 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -58,6 +58,7 @@ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool
+ int ggml_cuda_mul_mat_id_weighted_down_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ 
+ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++bool ggml_cuda_ssm_prescan_match_at(const struct ggml_cgraph * cgraph, int i);
+ int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ 
+ int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+-- 
+2.53.0
+

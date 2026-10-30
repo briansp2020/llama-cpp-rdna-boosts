@@ -1,7 +1,7 @@
-From e5f46773b6cab83159761eb6f98f18216b27e108 Mon Sep 17 00:00:00 2001
+From c40d6bd83958eea7b1164ae7795ee5f0f4bd3839 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 02:45:29 +0000
-Subject: [PATCH 05/20] Router + topk-moe fusion steps aside on RDNA4 with 256
+Subject: [PATCH 05/21] Router + topk-moe fusion steps aside on RDNA4 with 256
  experts: the one launch is slower there (Qwen3.6 tg128 133.2 -> 134.7 on
  R9700; Qwen3-30B keeps +2.1 %). Bit-identical either way
 
@@ -10,14 +10,14 @@ Subject: [PATCH 05/20] Router + topk-moe fusion steps aside on RDNA4 with 256
  1 file changed, 4 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
-index 4991e6e82..13e2cd159 100644
+index 4991e6e82..a14c15b04 100644
 --- a/ggml/src/ggml-cuda/topk-moe.cu
 +++ b/ggml/src/ggml-cuda/topk-moe.cu
 @@ -758,6 +758,10 @@ bool ggml_cuda_router_topk_moe_ok(const ggml_backend_cuda_context & ctx, const g
              !ggml_cuda_should_use_mmvf(x->type, dev.cc, dev.warp_size, x->ne, x->nb, 1)) {
          return false;
      }
-+    // RDNA4, 256 experts: the one launch is slower than the two (Qwen3.6 tg128 -1.0 % on R9700, FINDINGS 620)
++    // RDNA4, 256 experts: the one launch is slower than the two (Qwen3.6-35B-A3B tg128 about -1 % on R9700)
 +    if (GGML_CUDA_CC_IS_RDNA4(dev.cc) && x->ne[1] > 128) {
 +        return false;
 +    }
