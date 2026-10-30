@@ -41,8 +41,16 @@ If `5bdec04ab` is not available (an old checkout), re-cut it first from this rep
 
 `diffstat.txt` is the net diff of the series against `5bdec04ab`.
 
-The A1 slice is also a **named branch** in `~/llama.cpp`: `wip-kv-residency-a1-two-base` (`e49e1cef4`), so the
-fallback can be checked out without replaying any patch.
+The A1 slice is also a **named branch**, so the fallback can be checked out without replaying any patch, and
+**both campaign branches are pushed to the maintainer's personal fork** (`git@github.com:stew675/llama.cpp.git`,
+the only remote `~/llama.cpp` has) — that is the backup:
+
+| branch on the fork | tip | what |
+|---|---|---|
+| `wip-kv-residency` | `0e5b0d59d` | A2 (mixed backing, the design of record) on top of A1 |
+| `wip-kv-residency-a1-two-base` | `e49e1cef4` | A1 alone (the two-base K/V read, superseded, kept as the fallback) |
+
+`rdna-boosts` on the fork stays at the release tip and is **not** touched by this campaign.
 
 As slice 2 (the KV buffer type) lands, it is appended as `0002-…`: re-cut with
 `git format-patch 5bdec04ab..wip-kv-residency`, replacing the series rather than adding a patch on top of an
