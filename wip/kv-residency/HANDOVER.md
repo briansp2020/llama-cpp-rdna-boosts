@@ -1,7 +1,7 @@
 # HANDOVER — `wip/kv-residency` (TODO **#118**), cold-session start
 
-**Rewritten 2026-10-29 at the end of the sixth session.**  Read this top to bottom before touching anything;
-it is self-contained.  Then read [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) (the measured state of the
+**Rewritten 2026-10-30 at the end of the seventh session (A3).**  Read this top to bottom before touching
+anything; it is self-contained.  Then read [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) (the measured state of the
 build) and [`MIXED-BACKING.md`](MIXED-BACKING.md) (the design + the driver probe).
 
 > **The one thing to know (maintainer's decision, 2026-10-30): the campaign is BLOCKED on one bug, and that
