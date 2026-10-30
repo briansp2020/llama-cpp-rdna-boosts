@@ -1,5 +1,61 @@
 # WORKLOG - dated delivery records
 
+## 261030.009 (r184) -- PR #254 ships the target's speculative checkpoint in device memory (block 12): +2.1 % dense / +4.3 % MoE on n-gram rewrite requests, bit-identical, plus a `-nkvo` correction and the state-copy invariant
+
+**Released as `v16-6050b467c-r184` (16 blocks; block 12 amended).**  Contributor `@overdoingism`'s
+[PR #254](https://github.com/stew675/llama-cpp-rdna-boosts/pull/254), filed as `wip/spec-ckpt-device/` against
+r176 and applying with `git am` unchanged to r183 (one patch, `tools/server/server-context.cpp`).  Record:
+`archive/work/spec-ckpt-device/`, numbers: `benchmarks/2026-10-30-spec-ckpt-device.md`.
+
+**What shipped.**  On a recurrent or hybrid target the server saves a checkpoint of the target's recurrent state
+before a verify whose draft is longer than `n_rs_seq` (`use_ckpt_tgt`) and restores it when only part of the draft
+is accepted.  It went to host memory (149.6 MiB for Qwen3.8-27B).  It now carries
+`LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`, so a save and a restore are device copies into one staging buffer per slot that
+the context keeps and reuses.  Decided once per slot at its first checkpoint and logged: device memory when the
+target is on exactly one GPU, its state is offloaded and that GPU has the state's size plus 512 MiB free (the
+buffer is allocated lazily, after the expert-cache arena sized itself); host memory otherwise, and always under
+`-sm tensor` / a layer split.  `LLAMA_SERVER_SPEC_CKPT_DEVICE=0` keeps host memory always.  Context checkpoints
+(the prompt cache) are untouched, and no arithmetic, kernel or KV cell moves.
+
+**Measured (1 GPU, one binary, kill switch vs default, greedy, `ROCBLAS_USE_HIPBLASLT=0`).**  27B UD-Q4_K_XL +
+DFlash2 + `ngram-mod` rewrite request 310.2 -> **316.8 t/s (+2.1 %)**; 27B with `ngram-mod` alone 202.1 ->
+**205.4 (+1.6 %)**; 35B-A3B UD-Q4_K_M `-ncmoe 40` (arena on, 850 MiB free) + DFlash2 422.1 -> **440.4 (+4.3 %,
+63 MiB state)**; the zh story and continuation requests 0 %; 2 slots `--kv-unified` +2.6 %.  Text, drafted and
+accepted tokens identical in every arm; +150 MiB VRAM per used slot on the 27B, -150 MiB RSS.
+**The PR's +10.0 %/+15.8 % does not reproduce because the win is (host save cost) x (checkpoints taken)**: a
+3039-token rewrite takes 47 checkpoints (8 restores), ~6 % of steps rather than "most", and this box's host save
+is 4.5 ms against the submitter's 16 ms (the r96/r151/r152 state-copy folds took the rest).  The feature is worth
+as much as the host CPU is slow, which is the direction that helps weaker machines.
+
+**Fixed on top of the submission** (both found in review, neither filed as a TODO):
+* **`-nkvo` / `-ngl 0` claimed device memory for a host-resident state** (`device memory ... 13502.5 MiB free on
+  ROCm0`, io class staging on the CPU buft).  The decision now requires `!no_kv_offload && n_gpu_layers != 0` and
+  says so in its own log line; the `-nkvo` arm of the new gate asserts it.
+* **The device arm is not a byte image** and that is now documented as an invariant (code comment,
+  `patches/README.md`, `AGENTS.md`): `data_tgt` carries only the metadata, the payload is the context's per-seq
+  `mem_storage` staging buffer, so a save must be restored before the next save for that sequence (the spec path
+  does exactly that) and one of these must never be written to anything persistent.  A host-flagged save does not
+  touch the stage.
+
+**Gates.**  `scripts/gate-spec-ckpt-device.sh` is new and is the only gate that reaches this code: three arms
+(host `=0`, device, `-nkvo`), requiring the device arm's decision and checkpoint counts, the kill switch on the
+host path, `-nkvo` on the host path with its own reason, and byte-identical greedy text plus identical
+drafted/accepted counts between the host and device arms - PASS (18 created / 5 restored per arm).  Also
+`tests/test-llama-context` `baseline|cp_h|cp_d|cp_h_s|cp_d_s` **5/5** on the 27B (the io class the server now
+uses), `gate-ckpt-reuse.sh` PASS (27B + DFlash2), `check-gpu-faults.sh` clean, coherence + prefill-logit as in
+every release.  MTP Protocol A was not re-run: the change copies the same bytes from another location, MTP drafts
+never take this checkpoint (`draft.size() <= n_rs_seq`), and the multi-GPU spec path is inert.
+
+**Not covered / accepted.**  Single GPU only (multi-GPU would need a change and a run - under a split the state is
+spread over devices and the r157 device io class bounces through the host anyway); +150 MiB per used slot is not
+in the `--fit` estimate.
+
+**Unrelated, observed while building** (not touched, for the maintainer): every build warns
+`ggml-backend-meta.cpp:344: missing field 'moe_host_master_buft' initializer` - the meta device's positional
+`ggml_backend_device_i` initializer omits the last field, so `ggml_backend_dev_moe_host_master_buft()` answers
+NULL for a tensor-split (`-sm tensor`) device and `--host-experts pool` there falls back to the pinned master.
+Pre-existing (the file is unchanged by this release); it needs its own assessment.
+
 ## 261030.008 (r183) -- PR #256's GDN decode folds ship (block 10): +5.9 % gfx1100 / +3.3 % gfx1201 decode, bit-identical, plus the 2-D copy guard that fixes a Flash-Next `-sm tensor` load abort
 
 **Released as `v16-6050b467c-r183` (16 blocks; block 10 amended).**  Contributor `@briansp2020`'s
