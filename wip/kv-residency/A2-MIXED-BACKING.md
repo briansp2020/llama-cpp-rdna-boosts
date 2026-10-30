@@ -364,14 +364,47 @@ Found while re-baselining, and **not** resolved:
 * The flip itself is byte-exact: a debug verify (`LLAMA_KV_REGION_DEBUG=1`) reads every flipped mapping back
   and compares it with the stage — 32/32 flips ok on the 27B arm that produces the divergent text.
 
-So the data path we control is correct and something else about having a spilled KV changes the result.  Two
-hypotheses worth trying first, in order: (a) a **`cudaMemcpy` vs kernel asymmetry on a host-location mapping**
-is gone (both legs now go through a kernel, §3.7.7) but a *stale-L2 / non-coherent load* in the FA kernel for
-system-memory operands would look exactly like this — test by forcing the tile path (`GGML_CUDA_FA_BAND`-family
-knobs) or by copying the spilled cells back to VRAM before the attention of one layer; (b) a **mask/padding**
-interaction: the spilled cells sit under a unit-rounded mapping whose end is clamped to the tensor's unpadded
-extent, so the *last* row's quantized padding may be unmapped where the resident arm has it zeroed — check
-`nb1` vs the padded row size per tensor.
+So the data path we control is correct and something else about having a spilled KV changes the result.
+
+### The bisect is already narrowed (2026-10-30, last measurement of the session)
+
+`LLAMA_KV_REGION_SPILL_SKIP=<tensor indices>` (added for this, DIAGNOSTIC ONLY) keeps the listed tensors of a
+windowed buffer fully resident.  Same 27B arm, 64 tokens, `W=1024`:
+
+| arm | text | note |
+|---|---|---|
+| plain (no window) | 305 chars `e2cea6fa6670` | the reference |
+| window, **every** tensor skipped (no spill at all) | 305 chars `e2cea6fa6670` | **the control: the windowed apparatus is inert when nothing spills** |
+| window, only tensor 0 spills (4 MiB, one tensor) | 310 chars `ccdb98b7b254` | **one tensor is enough** |
+| window, tensors 0..15 spill (8 layers) | 317 chars `df3128cb54d5` | |
+| window, all 32 tensors spill | 325 chars `fb65430049e9` | |
+
+So it is **not** scale-dependent (a single spilled 4 MiB tensor moves the text) and not a stress/race effect
+(two `W` values with the same boundary give the same text).  The spilled cells are the *oldest* cells of the
+tensor, they were written before the flip, and the flip's byte round-trip verifies.
+
+Two hypotheses worth trying first, in order:
+
+(a) **The stage-OUT may be capturing the wrong bytes, and the verify is blind to it.**  The debug verify
+    compares the *stage* with the *restore* (`stage == readback`), which holds even if the stage itself was
+    filled with zeros/wrong data.  Take a snapshot of the mapping *before* the flip and compare it with the
+    stage after the detach (a `debug`-only `GGML_CUDA_D2H` of the same range immediately before
+    `vmm_remap`).  If the stage already differs, the bug is on the read side of the flip; if it matches, the
+    spilled cells really do hold the right bytes and the fault is in the *consumer*.
+(b) **A lost kernel write into host-backed memory.**  `cudaMemcpy` into a host-location mapping silently does
+    nothing (§3.7.7) — it is entirely possible that a *store* to it from certain kernels (the q8_0
+    `set_rows`/`cpy` path, or any kernel using non-temporal / L2-bypass stores) behaves the same, which would
+    leave a re-written spilled cell holding the *previous* chunk's bytes: exactly the "deterministic, small
+    KLD, only when spilled" signature.  The discriminating test is `--chunks 2` vs `--chunks 1` on the KLD
+    gate (chunk 2+ REWRITES cells that are already spilled, whereas a single-chunk run only ever writes them
+    before the flip), plus `LLAMA_STATE_TIMING`-style instrumentation is not needed — the gate's per-chunk
+    logits already isolate it.  Note that the failing 27B *text* arm is single-chunk, so (b) can only be part
+    of the story; check (a) first.
+
+Also worth one run: the same bisect on the **4B** (which is byte-identical for a full spill).  If the 4B is
+identical even when *one* tensor spills, the difference between the two models is the thing to chase
+(`nb1` 1088 B vs 2048 B, 16 vs 8 KV layers, 32 vs 16 tensors) — and `nb1 = 1088` is **not** a multiple of 128,
+which is worth checking against every vectorized access (16 B is fine: 1088 = 68 x 16).
 
 ## 3.7.7 The three bugs the re-baseline found in the slide (fixed)
 
@@ -394,7 +427,11 @@ extent, so the *last* row's quantized padding may be unmapped where the resident
 The VMM selftest (`GGML_CUDA_VMM_REGION_SELFTEST=1`) now covers all of it: an aligned window flip moves
 exactly one mapping and preserves every byte, and a straddling request is refused and moves nothing.
 
-## 3.7.8 What is left
+## 3.7.8 What is left (maintainer's decision, 2026-10-30)
+
+**§3.7.6 is THE block and is the next session's whole job.**  Items 2-4 of the campaign's owed list are
+verified and closed; the 28.8 GB/s tables in §3.3-§3.6 will be re-measured at the new link **after** §3.7.6 is
+closed (maintainer).  Until then:
 
 1. **§3.7.6**, which blocks calling the window pure.  Until it is closed: quote text/KLD purity only for
    **non-spilling** windowed arms; the 4B's spilling arms are the only byte-identity evidence.

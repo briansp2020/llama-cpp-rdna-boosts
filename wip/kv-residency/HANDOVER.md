@@ -4,13 +4,14 @@
 it is self-contained.  Then read [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) (the measured state of the
 build) and [`MIXED-BACKING.md`](MIXED-BACKING.md) (the design + the driver probe).
 
-> **The one thing to know:** the ask is a **windowed KV** — Goal A, fittability on one 32 GiB card — and the
-> *feature set* is now complete: the window slides, **`--fit` sizes and reports it** (`LLAMA_KV_RESIDENT_CELLS=auto`),
-> the spill is gated on `MemAvailable` (`LLAMA_KV_SPILL_RAM_PCT`), and both state gates and the MTP verify
-> widths pass on a windowed arm.  **But the window is NOT yet pure at a spilling depth**: a 1-unit (4 MiB) spill
-> on a 27B changes the greedy text and shifts the prefill logits by KLD 0.004973, deterministically, while the
-> flip itself is byte-exact (verified) and a 4B arm with the same spill shape is byte-identical.  **That is the
-> next thing to work on** — `A2-MIXED-BACKING.md` §3.7.6 has the repro and the two hypotheses.  See §7.
+> **The one thing to know (maintainer's decision, 2026-10-30): the campaign is BLOCKED on one bug, and that
+> bug is next session's whole job.**  The feature set is complete — the window slides, **`--fit` sizes and
+> reports it** (`LLAMA_KV_RESIDENT_CELLS=auto`), the spill is gated on `MemAvailable`
+> (`LLAMA_KV_SPILL_RAM_PCT`), and both state gates and the MTP verify widths pass on a windowed arm — **but a
+> spilled KV is not numerically transparent yet on a 27B**: a **single** 4 MiB tensor spill changes the greedy
+> text and shifts the prefill logits by KLD 0.004973, deterministically, while the flip's byte round-trip
+> verifies and a 4B arm with the same spill shape is byte-identical.  Repro, the bisect already done, and the
+> two remaining hypotheses: `A2-MIXED-BACKING.md` **§3.7.6**.  §7 is the plan.
 >
 > **The box changed (2026-10-30).**  The PCIe rework happened: the link is now **55.7 GB/s H2D / 56.8 D2H**
 > (root port x16 @ 32 GT/s, was x8) and the probes were re-run (`A2-MIXED-BACKING.md` §3.7.1).  Every
@@ -26,10 +27,10 @@ build) and [`MIXED-BACKING.md`](MIXED-BACKING.md) (the design + the driver probe
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, **pushed** (`origin` = `git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
 | delivery release | **r176** (`release.json`) — the campaign is cut against **r174** (`v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`); a promotion re-cuts against the then-current release |
 | the campaign's TODO handle | **#118** (`TODO.md` §118 + the table row; the older text says `#117`, which was a dangling reference — see the number note there) |
-| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`bbd69cda2`** (A3) |
+| campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`d3bf9ac6f`** (A3 + the spill-bisect diagnostic) |
 | the A1 fallback | fork branch `wip-kv-residency-a1-two-base` (`e49e1cef4`), also pushed (superseded; unchanged this session) |
 | `rdna-boosts` | **never touched by this campaign.**  Locally `5bdec04ab`; the fork's branch is at r176's tip (moved by the r176 release) |
-| patch snapshot | `patches/0001`…`0009` + `patches/README.md` + `patches/diffstat.txt` (2765 insertions, 18 files) — apply **in order** to `5bdec04ab` |
+| patch snapshot | `patches/0001`…`0010` + `patches/README.md` + `patches/diffstat.txt` (2807 insertions, 18 files) — apply **in order** to `5bdec04ab` |
 | box | **one R9700 (gfx1201), 32 624 MiB.**  Pin `HIP_VISIBLE_DEVICES=0` on every arm.  Every number here is 1-GPU; say so, never claim multi-GPU |
 
 ## 2. What Goal A asked for (the maintainer's words, unchanged)
@@ -93,6 +94,8 @@ Knobs (all campaign-only, default off except where noted): `LLAMA_KV_REGION=1` (
 `LLAMA_KV_RESIDENT_CELLS=W` (the window) or `=auto` (**`--fit` sizes it** — the product shape; unset = no
 window, i.e. today's cache), `LLAMA_KV_SPILL_RAM_PCT` (85, the pinned-RAM ceiling), `LLAMA_KV_REGION_DEBUG=1`
 (per-growth lines + a verify of every flip), `GGML_CUDA_VMM_REGION_SELFTEST=1`, `GGML_CUDA_SLAB_STATS=1`.
+**DIAGNOSTIC ONLY:** `LLAMA_KV_REGION_SPILL_SKIP=<tensor indices>` keeps the listed tensors of a windowed
+buffer fully resident — it exists to bisect §7.1 and is not part of the shipped behaviour.
 
 ## 4. Environment and build
 
@@ -171,31 +174,83 @@ LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=2048 NGPU=1 SM=layer NCMOE=0 ./scripts
 **Owed: §7 item 1 only** — the spilled-KV numeric difference.  Do not claim purity for a *spilling* windowed
 arm until it is closed.
 
-## 7. What remains, in priority order
+## 7. What remains — one thing: the block
 
-1. **CLOSE §3.7.6 — the spilled-KV numeric difference (BLOCKER).**  Repro, both arms at 55.7 GB/s:
-   ```bash
-   # 27B Q4_K_XL, q8_0 KV, a ONE-UNIT (4 MiB/tensor) spill; deterministic, `--fit off` included
-   LLAMA_ARG_FIT=0 LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=1024 ./build-rocm/bin/llama-cli \
-     -m /llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 99 -c 8192 -ctk q8_0 -ctv q8_0 \
-     -f ~/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt -n 64 --seed 42 --temp 0 \
-     --no-display-prompt --single-turn        # 325 chars fb65430049e9 vs plain 305 chars e2cea6fa6670
-   # and the same point on the logit gate: 0.004973 KLD / 98.761 % (W=8192, nothing spilled: 0.000000)
-   ```
-   What is already excluded: the quantized KV type (4B q8_0 is identical), a race (two different `W` values
-   that give the same boundary give the same text), the flip losing bytes (the debug verify reads every
-   flipped mapping back and it matches the stage, 32/32), and the buffer type (window enabled, no spill:
-   0.000000).  Start with the two hypotheses in `A2-MIXED-BACKING.md` §3.7.6: a non-coherent/`__ldg` read of
-   system memory in the FA kernel, or the last row's quantized **padding** being unmapped where the resident
-   arm has it zeroed.  Until it is closed, purity may only be claimed for **non-spilling** windowed arms.
-2. **Re-measure the delivered tables at the new link** (§3.3-§3.6 of `A2-MIXED-BACKING.md`: the arena's value
-   and the deep arm + break-even) with the standing rules (`-n 2000`, `-ncmoe` = the model's full layer count,
-   interleaved arms).  The spill cost halves at 55.7 GB/s, so the `--fit` break-even moves.
-3. Then the promotion conversation (a block, an env kill-switch, `ENVIRONMENT.md`), which is the maintainer's
-   call and needs (1) closed first.
-4. Multi-device: still not measurable (one card).  Goal B: not started, not next.
+### 7.1 THE BLOCK: a spilled KV changes the numbers on a 27B (`A2-MIXED-BACKING.md` §3.7.6)
 
-## 8. The numbers (1 GPU; all at **28.8 GB/s** H2D — see §9)
+Repro (deterministic, `--fit off` included, 1 GPU):
+
+```bash
+cd ~/llama.cpp && export LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib HIP_VISIBLE_DEVICES=0
+P=~/llama-cpp-rdna-boosts
+M=/llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf
+
+# plain:                 305 chars sha=e2cea6fa6670
+./build-rocm/bin/llama-cli -m $M -ngl 99 -c 8192 -ctk q8_0 -ctv q8_0 -f $P/prompts/prose-rdna-boosts.txt \
+  -n 64 --seed 42 --temp 0 --no-display-prompt --single-turn > /tmp/plain.log 2>&1
+python3 $P/scripts/extract-generated.py /tmp/plain.log
+
+# windowed (spills 4 MiB/tensor):  325 chars sha=fb65430049e9
+LLAMA_ARG_FIT=0 LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=1024 ./build-rocm/bin/llama-cli -m $M ... > /tmp/win.log 2>&1
+
+# the logit point: 0.004973 KLD / 98.761 %  (limit 0.005); W=8192 (window on, nothing spilled) = 0.000000
+ROCBLAS_USE_HIPBLASLT=0 $P/scripts/gate-prefill-logits.sh --ctx 8192 --chunks 4 --kv q8_0 \
+  --base /tmp/k.kld --ab "LLAMA_KV_REGION=1 LLAMA_KV_RESIDENT_CELLS=1024"
+```
+
+**Already excluded — do not re-derive:** the quantized KV type (4B q8_0 is identical), a race (two `W` values
+with the same boundary give the same text), the flip losing bytes (the debug verify matches the stage), the
+buffer type (window on, nothing spilled = 0.000000), and `--fit` (reproduces with fit off).
+
+**Already bisected — the tool exists.**  `LLAMA_KV_REGION_SPILL_SKIP=<tensor indices>` (DIAGNOSTIC, in
+`ggml-cuda.cu`; unset = shipped behaviour) keeps the listed tensors fully resident.  Measured on the arm above:
+
+| arm | text |
+|---|---|
+| plain / every tensor skipped (no spill) | 305 `e2cea6fa6670` — the control: the windowed apparatus is inert when nothing spills |
+| **only tensor 0 spills (4 MiB)** | **310 `ccdb98b7b254`** — one tensor is enough |
+| tensors 0..15 spill | 317 `df3128cb54d5` |
+| all 32 spill | 325 `fb65430049e9` |
+
+So it is not scale-dependent and not a stress effect: **one spilled tensor moves the text**.
+
+**The plan, in order (cheap and decisive first):**
+
+1. **Is the stage-out capturing the right bytes?**  The existing verify compares stage vs restore, which is
+   blind to a stage that was filled with the wrong data.  Add a debug-only snapshot: read the mapping to host
+   *immediately before* `vmm_remap`, then compare it with the stage after `vmm_detach`.  Mismatch → the flip's
+   read side; match → the spilled cells hold the right bytes and the fault is in the consumer.
+2. **A lost kernel write into host-backed memory.**  `cudaMemcpy` into a host-location mapping silently does
+   nothing (§3.7.7); a kernel *store* using non-temporal / L2-bypass stores may behave the same, which would
+   leave a re-written spilled cell holding the previous chunk's bytes.  Discriminator: the KLD gate at
+   `--chunks 1` vs `--chunks 2` (chunk 2+ rewrites already-spilled cells; a single chunk only writes them
+   before the flip).  Also grep the q8_0 `set_rows`/`cpy` path for `__stwt`/`st.global` variants.
+3. **Why is the 4B immune?**  Run the same single-tensor bisect on the 4B.  If the 4B stays identical even
+   when one tensor spills, the model difference is the thing to chase (`nb1` 1088 B vs 2048 B; 16 vs 8 KV
+   layers; 32 vs 16 tensors).  `nb1 = 1088` is not a multiple of 128 (it is of 16) — check every vectorized
+   access against that.
+4. Only then look at the FA kernel's read of a host-mapped operand (a stale/non-coherent load would look like
+   this, though the FA kernels contain no `__ldg`).
+
+**Very fast falsification test if 1-3 stall:** copy the spilled cells back to VRAM just before the attention of
+one layer (debug-only) — if the text returns to the plain hash, the values are right and the *read* is wrong;
+if it stays wrong, the values in host memory are wrong.
+
+### 7.2 After the block is closed (agreed order)
+
+1. Re-measure the delivered tables at the new link (`A2-MIXED-BACKING.md` §3.3-§3.6): the arena's value
+   (`-n 2000`, `-ncmoe` = the model's full layer count, interleaved arms) and the deep arm + break-even.  The
+   spill cost halved (28.8 → 55.7 GB/s), so the `--fit` break-even moved.
+2. Then the promotion conversation (a block, an env kill-switch, `ENVIRONMENT.md`) — the maintainer's call, and
+   it needs §7.1 closed first.
+3. Multi-device: still not measurable (one card).  Goal B: not started, not next.
+
+## 8. The numbers (1 GPU; all at **28.8 GB/s** H2D — STALE, see §9)
+
+> **Do not quote anything in this section as a current number.**  The link doubled (55.7 GB/s) and the
+> maintainer's decision is that these tables are re-measured **after** §7.1 is closed.  The only post-swap
+> numbers are the ones in `A2-MIXED-BACKING.md` §3.7 (fit sizing/reporting, the RAM ceiling, the state gates,
+> the MTP arm) and they are correctness/behaviour, not throughput.
 
 **Fittability** (27B **Q8_0**, 51 475-token prompt → 53 475 used, `-n 2000`):
 
@@ -251,12 +306,12 @@ passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 
 ## 11. First 30 minutes of the next session
 
-1. `cd ~/llama-cpp-rdna-boosts && git pull`; read this file, then `A2-MIXED-BACKING.md` **§3.7** (this
-   session's record: the re-baseline, the three fixed bugs, and the open one).
-2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** (the A3 commits on top of the
-   A2 ones).  `git log --oneline -8` should show `A3` subjects.  Never commit campaign code to `rdna-boosts`.
-3. `~/bin/build-llama-rocm` (~5 s warm), then gate 0 + the §6 identity trio — the hashes must match §6.
-4. **Then §7 item 1** (the spilled-KV numeric difference).  It is a real, deterministic, well-scoped bug and it
-   is the only thing between this campaign and its purity claim.
-5. Do **not** quote the arena / deep-arm / break-even numbers in §8 without re-measuring: they are 28.8 GB/s
-   numbers.
+1. `cd ~/llama-cpp-rdna-boosts && git pull`; read this file, then `A2-MIXED-BACKING.md` **§3.7.6** (the block,
+   the bisect table, the plan) and §3.7.7 (the three bugs already fixed — do not reintroduce them).
+2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** at **`d3bf9ac6f`** or later
+   (`git log --oneline -3` shows the A3 commit).  Never commit campaign code to `rdna-boosts`.
+3. `~/bin/build-llama-rocm` (~5 s warm); then gate 0 (VMM selftest, must print PASS) and the §6 identity trio
+   (27B Q4_K_XL `-c 8192` q8_0 must hash `5ba44647188f` with the feature off).
+4. Reproduce the block with the §7.1 commands, then work the plan in §7.1 order.  The `SPILL_SKIP` bisect
+   ladder in §7.1 is the starting point — do not re-derive it.
+5. Report findings to the maintainer before committing; §7.2 (the re-measurement) waits for the block.

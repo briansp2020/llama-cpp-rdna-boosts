@@ -1,7 +1,7 @@
 From bbd69cda2cf65b0356aeaea5a0b3082593199da8 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Fri, 30 Oct 2026 05:54:26 -0500
-Subject: [PATCH] wip/kv-residency: A3 -- --fit sizing + reporting of the
+Subject: [PATCH 09/10] wip/kv-residency: A3 -- --fit sizing + reporting of the
  window, the pinned-RAM gate, and three slide bugs
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
