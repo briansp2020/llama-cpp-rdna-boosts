@@ -853,3 +853,29 @@ silent no-op that would fault the GPU), a Meta-aware `is_kv_buft` for the fit, `
 ## 3. Not started / decisions (unchanged)
 
 The `auto` policy and Goal C's three questions are the maintainer's (HANDOVER §11); Goal B is not started.
+
+## 4. Goal B's baseline (B0) — naive streaming is a 14 % loss
+
+Goal B's plan is [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md).  Its first job was to measure what a *streamed
+attended set* costs today, with no mechanism at all: block 15 at `W=1` puts both KV caches' tails in pinned host
+RAM, and the QSA reader (already sparse and exact, `fattn-qsa.cuh`) then reads its attended set from host.  So
+`W=1` **is** the naive streaming arm.
+
+Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, `-c 65536`, q8_0 KV, 51 475-token prompt, `-n 2000`,
+`ROCBLAS_USE_HIPBLASLT=0`, 1 GPU, interleaved, 1 rep each:
+
+| arm | prefill t/s | decode t/s | ms/token | arena MiB | residency | hit |
+|---|---|---|---|---|---|---|
+| plain | 584.13 | **39.19** | 25.52 | 24 539.0 | 60.0 % | 0.9686 |
+| `W=1` (spilled; `KVREGION_FREE … host=` > 0) | **604.49 (+3.5 %)** | **33.67 (−14.1 %)** | 29.70 | **25 338.3 (+799)** | **61.9 %** | 0.9727 |
+
+* The attended set is `top_k + r - 1 = 2051` cells/query/layer (GGUF: `indexer.top_k 2048`,
+  `compress_ratios 4`) = 3.98 % of a 51 475-token context → ~26 MiB/token of attention read; the indexer scores
+  every block, ~82 MiB/token at this depth.  Together ~108 MiB/token ≈ 2 ms at the peak link rate, but the
+  measured cost is **4.18 ms** ⇒ either scattered host reads run at ~26 GB/s or part of the traffic is
+  unattributed.  **That attribution is B1's job before any policy is designed**, and it is why the plan does
+  not start with a page table.
+* A 799 MiB arena gain for a 14 % decode loss is the wrong trade *as it stands*: Goal B has to earn those ~12
+  points back.  Prefill moves the other way (+3.5 %, capacity-bound), so the loss is a decode-side read.
+* Purity is not in question for a mechanism of this class (residency changes *where* the bytes live): the oracle
+  is the prefill-logit gate at **100.000 %**, not the drafter ring's acceptance trade.
