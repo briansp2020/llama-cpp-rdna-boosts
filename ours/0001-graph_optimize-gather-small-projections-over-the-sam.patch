@@ -1,7 +1,7 @@
-From 3ce1063feb82967b1bcb9342a89b1e88e1c2441a Mon Sep 17 00:00:00 2001
+From f9c817e45b1e70326b37b719c53fea30e4e733f5 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 03:17:20 +0000
-Subject: [PATCH 03/21] graph_optimize: gather small projections over the same
+Subject: [PATCH 01/19] graph_optimize: gather small projections over the same
  input for the row concat (bit-identical)
 
 Qwen3.5 / 3.6 GDN layers read the normed input with ssm_beta and ssm_alpha (32 rows each) and attn_gate z (4096 rows), but
