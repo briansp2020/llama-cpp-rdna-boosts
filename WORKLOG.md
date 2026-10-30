@@ -1,5 +1,58 @@
 # WORKLOG - dated delivery records
 
+## 261030.006 (r182) -- PR #253's 1-token router fold ships (block 10): +1.2..+3.1 % MoE decode, bit-identical
+
+**Released as `v16-6050b467c-r182` (16 blocks; block 10 amended).**  Contributor `@briansp2020`'s
+[PR #253](https://github.com/stew675/llama-cpp-rdna-boosts/pull/253), filed as `wip/router-topk-fold/`
+against r176 and applying with `git am` unchanged to r181.  A 1-token MoE decode ran the router
+(`ffn_gate_inp`, an F32 `MUL_MAT` with one column) as `mul_mat_vec_f<float,float,1,256>` and then the fused
+`topk_moe` as a second launch.  `topk_moe_cuda` now has a `router` mode: block `b` computes logit `b` with the
+same thread map, `float2` loads, `#pragma unroll 4`, `ggml_cuda_mad` calls and warp + cross-warp butterfly as
+`mul_mat_vec_f`, writes it to the logits tensor (still written, still allocated), and the block that finishes
+last -- `__threadfence()`, then one atomic on a self-resetting counter in the last `moe_red_counters()` slot
+-- runs the **unchanged** selection.  One launch replaces two.  The dispatcher arm reuses the topk-moe
+matcher (refactored out of `ggml_cuda_try_fuse` into `ggml_cuda_topk_moe_match_at`), and
+`ggml_cuda_router_topk_moe_ok` re-checks the dispatcher's route rather than trusting it: F32
+weight/activation/output, contiguous, 64/128/256 experts, wave32, not MMB, `should_use_mmvf`, the same
+block-size choice, one logits row, no bias, no delayed softmax, no Hadamard hint, no padded compute-buffer
+`src0`.  `GGML_CUDA_ROUTER_TOPK=0` is the kill switch.
+
+**Both patches taken, plus a 5-line hardening.**  The contributor's `0002` steps the fold aside on **RDNA4
+above 128 experts**, where the one launch measured slower than the two; we reproduced the direction on our
+R9700 (**-0.3 % d0 / -0.5 % d4096** with `0001` only at 256 experts; they measured -0.8/-1.0 %), so it ships
+as-is.  Our amendment adds the Hadamard-hint and padded-compute-buffer refusals above (both unreachable for
+a router -- the hint is only emitted by `llama_mul_mat_hadamard` and a router weight is never a
+compute-buffer view -- but the predicate now mirrors `ggml_cuda_mul_mat` in its own order, the
+`ggml_cuda_mul_mat_takes_mmq` discipline).
+
+**Worth (1 GPU, `llama-bench -r 5`, two interleaved rounds, on vs off).**  gfx1100 Qwen3-30B-A3B Q4_K_M
+(128 experts) tg128 **205.1 -> 212.0 (+3.1 %)**, d4096 **180.2 -> 183.1 (+1.7 %)**; Qwen3.6-35B-A3B
+(256 experts) tg128 **141.1 -> 142.8 (+1.2 %)**, d4096 **+1.1 %**; gfx1201 the 128-expert model **+1.7 %**
+(noisy, per-run sd +-4.4 %), the 256-expert model flat through the step-aside.  Kernel census: the per-layer
+router GEMV is gone (`topk_moe_cuda<128,false,true>` / `<256,false,true>`); the `mul_mat_vec_f<...,1,256>`
+that remains is the **shared-expert** gate.  The contributor's +2.0 % / +1.1 % reproduce.
+
+**Purity.**  The interesting probe is the **decode-width** one, because the fold never fires with more than
+one token: `gate-prefill-logits.sh --ab "GGML_CUDA_ROUTER_TOPK=0" --ub 1` (every token its own graph, the
+fold firing, confirmed by the census in the same build) reads **0.000000 KLD / 100.000 % same-top-p** on
+Qwen3-30B-A3B (gfx1201) and Qwen3.6-35B-A3B (gfx1100).  Canonical 27B Q8_0 prefill-logit gate **0.000000 /
+100.000 %**; greedy text byte-identical on/off (30B-A3B both devices, 35B-A3B gfx1100); `test-backend-ops -o
+TOPK_MOE` **608/608** on three R9700s; MTP Protocol A unchanged (plain 24.98 -> draft-mtp **51.53 t/s**,
+acceptance **0.62134**, the r181 reference 51.7 / 0.62); rule-5 `llama-batched-bench -npl 1,4,8`
+144.5/341.0/425.4 -> 139.6/344.3/420.9 (single-token only, so npl>1 is inert); 35B-A3B with `ngram-mod` flat
+(a verify batch is wider than one token).  Per-block build `--changed-from <r181 tip> --fast` 2/2 (16 s),
+`validate-set.sh` green (tree `bdbcb1964...`), no GPU faults.
+
+**Scope, stated plainly.**  The fold is unreachable in the delivery's recommended speculative configs (any
+speculator's verify batch is more than one token wide), and no MoE GGUF we hold carries an MTP head, so the
+fold's 1-token draft-context path is unmeasured here (same graph shape as plain decode).  It is a
+**plain-decode** MoE win of +1.2..+3.1 % depending on arch and expert count, plus a small loss avoided on
+RDNA4 at 256 experts.
+
+Record: `archive/work/router-topk-fold/` (the submission verbatim + `PROMOTED.md`, the assessment),
+`benchmarks/2026-10-30-router-topk-fold.md`, `patches/README.md` (block 10, "r182"), `GREEDY-PURITY.md`
+§72, `ENVIRONMENT.md` (`GGML_CUDA_ROUTER_TOPK`).
+
 ## 261030.005 (r181) -- block 15: `--fit` + `-sm tensor` fixed properly (three asserts), plus three `auto` wiring defects
 
 **Released as `v16-6050b467c-r181` (16 blocks; block 15 amended).**  Found while gating r180's multi-GPU arms

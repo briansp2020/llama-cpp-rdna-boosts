@@ -1691,6 +1691,52 @@ reproduce; their gfx1100 +3.5 % is their box.
 27B Q8_0 prefill-logit gate **0.000000 / 100.000 %**, per-block build 2/2, `validate-set.sh` green, no GPU
 faults.  Numbers: `benchmarks/2026-10-30-graph-order-0003-r180.md`.
 
+#### r182 — the 1-token router fold (PR #253)
+
+**What it is.**  A 1-token MoE decode runs the router (`ffn_gate_inp`) as `mul_mat_vec_f<float,float,1,256>`
+and then the fused topk-moe as a second launch.  `topk_moe_cuda` gains a `router` mode: block `b` computes
+logit `b` with the same thread map, `float2` loads, `#pragma unroll 4`, `ggml_cuda_mad` calls and warp +
+cross-warp butterfly as `mul_mat_vec_f`, writes it to the (still written, still allocated) logits tensor, and
+the block that finishes last — a `__threadfence()`, then one atomic on a self-resetting counter in the last
+`moe_red_counters()` slot — runs the **unchanged** selection.  One launch replaces two; the dispatcher arm
+lives in `ggml_cuda_topk_moe_match_at` + `ggml_cuda_router_topk_moe_ok` (r176's topk-moe matcher refactored
+out so the router path can reuse it).
+
+**Worth (1 GPU, `llama-bench -r 5`, two interleaved rounds, on vs off).**  gfx1100 Qwen3-30B-A3B Q4_K_M
+(128 experts) tg128 **205.1 -> 212.0 (+3.1 %)**, d4096 **180.2 -> 183.1 (+1.7 %)**; Qwen3.6-35B-A3B
+(256 experts) tg128 **141.1 -> 142.8 (+1.2 %)**, d4096 **+1.1 %**; gfx1201 the 128-expert model **+1.7 %**
+(noisy) and the 256-expert model flat, because it **steps aside on RDNA4 above 128 experts** (`0002`), where
+the one launch measured -0.3..-0.5 % on our R9700 and -0.8..-1.0 % on the submitter's.  Kernel census: the
+per-layer router GEMV is gone; the `mul_mat_vec_f<...,1,256>` that remains is the **shared-expert** gate.
+
+**Facts a future edit must keep.**
+
+* **It is a 1-token shape; the width is the gate.**  `ggml_nrows(logits) == 1` in the dispatcher and
+  `n_rows = 1` in the launch.  A verify batch (`n_tokens > 1`) must not fold: `mul_mat_vec_f` accumulates in
+  a different order at `ncols_dst > 1` and the selection's row map is per-row blocks.  With a speculator the
+  fold is therefore inert (a verify batch is wider than one token); it is a plain-decode win.
+* **The election is a device-wide barrier inside one launch, and it needs the logits write.**  The fold
+  elides the *launch*, never the tensor or its write, so another consumer of `logits` still works (any
+  consumer is later in node order).  Do not replace the write with a private scratch buffer.
+* **The counter is the last `moe_red_counters()` slot** (`GGML_CUDA_MOE_RED_CNT - 1`), which the MoE down fold
+  cannot reach (`mmvq-moe.cu` indexes `red_cnt + blockIdx.x` under `dst->ne[0] <= 2*CNT - 2`).  Per (device,
+  stream), zeroed at allocation, reset before return; a launch aborted mid-kernel leaves it non-zero (the same
+  caveat the down fold carries).
+* **The predicate mirrors the dispatcher's chain, in its own order** — F32 weight/activation/output,
+  contiguous, `x->ne[1]` in 64/128/256, wave32, `!mmb_supported_mm`, `should_use_mmvf`, the same block-size
+  choice, plus a refusal of a bias, a delayed softmax, a Hadamard-hinted router and a padded compute-buffer
+  `src0`.  Keep it in sync with `ggml_cuda_mul_mat` (the `ggml_cuda_mul_mat_takes_mmq` discipline).
+* **`0002` is a per-device tuning step-aside, not a correctness rule**; a new arch needs its own measurement.
+  `GGML_CUDA_ROUTER_TOPK=0` is the A/B arm and the kill switch.
+
+**Gates.**  Greedy text byte-identical on/off (30B-A3B on gfx1201 + gfx1100, 35B-A3B on gfx1100); the
+**decode-band** prefill-logit probe `gate-prefill-logits.sh --ab "GGML_CUDA_ROUTER_TOPK=0" --ub 1` (every
+token a 1-token graph, the fold firing) **0.000000 / 100.000 %** on 30B-A3B (gfx1201) and 35B-A3B (gfx1100);
+canonical 27B Q8_0 gate **0.000000 / 100.000 %**; `test-backend-ops -o TOPK_MOE` **608/608**; MTP Protocol A
+unchanged (51.53 t/s, acceptance 0.62134); rule-5 batched bench inert at npl>1; per-block build 2/2;
+`validate-set.sh` green; no GPU faults.  Numbers: `benchmarks/2026-10-30-router-topk-fold.md`, record
+`archive/work/router-topk-fold/PROMOTED.md`.
+
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 
 **What it is.**  The qwen4exp (Qwen3.8-Flash-Next) architecture support, split out of block 10 in r109 so

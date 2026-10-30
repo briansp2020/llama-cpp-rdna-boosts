@@ -191,11 +191,26 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,
   **03** chunked GDN, **04** BF16 KV, **05** FA band/native/derived, **06** MMB, **07** k-quant,
   **08** fused kernels (fused MoE), **09** host-resident MoE (slab/cache), **10** slab + fusion dispatcher
-  + async input ring (infrastructure), **11** qwen4exp (model/QSA/HC/lazy reader), **12** campaign
+  + async input ring + the rope/row-concat reorders + the 1-token router fold (infrastructure), **11**
+  qwen4exp (model/QSA/HC/lazy reader), **12** campaign
   remainder, **13** MTP draft vocabulary subset (opt-in).  V2.1 split r109's old block 10 in two: the
   **infrastructure stays 10**, the **qwen4exp architecture is 11** (QSA went with it by decision), so
   every pre-r109 "block 10" note about slab / dispatcher / async-input is still block 10 while a note
   about qwen4exp / QSA / HC / the lazy reader is now block 11.
+- **A 1-token router fold is a width-1 fusion (r182, block 10).**  `ggml_cuda_router_topk_moe_ok` folds the
+  MoE router `MUL_MAT` into the fused `topk_moe` launch only where the dispatcher would run
+  `mul_mat_vec_f<float,float,1,256>` and the logits have **one row**, and the merged kernel reproduces that
+  kernel's arithmetic exactly (same thread map, `float2` loads, `ggml_cuda_mad`, warp + cross-warp
+  butterfly) with the last block -- threadfence + one atomic on the last `moe_red_counters()` slot -- running
+  the unchanged selection.  The **prefill-logit gate at the default ubatch cannot see it** (the fold never
+  fires with more than one token): judge it with `gate-prefill-logits.sh --ab "GGML_CUDA_ROUTER_TOPK=0" --ub 1`
+  plus a `rocprofv3` census in the same build, and `test-backend-ops -o TOPK_MOE`.  The fold is **inert
+  under any speculator** (a verify batch is wider than one token), so it is a plain-decode win
+  (+1.2..+3.1 % on a 128/256-expert MoE, RDNA3/RDNA4), and it **steps aside on RDNA4 above 128 experts**
+  (measured slower as one launch on both our box and the submitter's).  `GGML_CUDA_ROUTER_TOPK=0` is the
+  kill switch; do not drop the logits store (the fold elides the *launch*, never the tensor, so another
+  consumer of the logits keeps working).  `GREEDY-PURITY.md` §72,
+  `archive/work/router-topk-fold/PROMOTED.md`.
 - **Throughput is NOT a correctness signal.** Verify coherence (same-seed `llama-cli` diff, or
   `archive/work/tools/ar_kernel_unit.cpp`). Decode perf work is validated at **depth-16384**, not
   shallow `llama-bench`. **Never run parallel/background benches.**
