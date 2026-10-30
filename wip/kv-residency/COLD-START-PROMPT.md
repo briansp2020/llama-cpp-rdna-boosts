@@ -7,7 +7,12 @@ session's context).  Rewritten 2026-10-30 at the end of session A5.
 
 Continue the windowed-KV campaign (TODO **#118**) in `~/llama-cpp-rdna-boosts` and `~/llama.cpp`.
 
-**The measurement work is finished; what is left is a promotion decision plus one owed gate change.**  Goal A's
+**The measurement work for GOAL A is finished; what is left is a promotion decision plus one optional gate
+change.**  The campaign has three goals and only A is promotable: **A** = the fixed VRAM window (complete, no
+blockers), **B** = a sparse attended set streamed cheaply (**not started**; independent of A and it must not gate
+A's promotion), **C** = the drafter ring (implemented and measured on the campaign branch as an *experiment*,
+`LLAMA_SPEC_DRAFT_WINDOW`, **not** in `patches/`; its three default-on/scope questions are open in
+`O3-DRAFTER-RING.md` §7).  Do not read "Goal B/C not started" as a Goal-A blocker — HANDOVER §11 spells this out.  Goal A's
 mechanism, its purity and its cost are all measured on arms that **provably spill**: a spilled KV is numerically
 transparent (prefill-logit KLD −0.000000 on a spilling 27B *and* on a spilling Flash-Next, text byte-identical),
 the spill is a straight line (~8-11 µs per MiB per token at the 55.7 GB/s link), the state/checkpoint/MTP gates
@@ -55,16 +60,20 @@ WHAT IS DONE — do not rebuild, do not re-gate:
     user's `-c`.  **`W` as a percentage of the slab is deferred by the maintainer — do not re-propose it.**
 
 WHAT IS LEFT (all of it is a decision, not a measurement):
-  1. **The promotion conversation** — a delivery block, `ENVIRONMENT.md`, and the default-on call for the window.
-     The campaign's evidence is complete; the maintainer decides whether it ships, and a promotion re-cuts the
-     patch series against the then-current release (now r177).
-  2. **One owed DELIVERY change (needs the maintainer's go-ahead):**
+  1. **GOAL A's promotion** — re-cut the campaign code against the then-current release (now r177) into a delivery
+     block, add the `ENVIRONMENT.md` rows for the campaign env vars, make the default-on call (the default-on
+     policy applies: beneficial + gated => on, with a kill switch), run the release gates.  Goal A's evidence is
+     complete; nothing else in the campaign is a Goal-A blocker.
+  2. **Optional DELIVERY change (needs the maintainer's go-ahead; a TEST gap, not a product bug):**
      `scripts/gate-park-idle-slots.sh` HARD-fails a legitimate outcome.  When the park arm's server logs *"cannot
      park the idle slot: saving it to the prompt cache and clearing it"* — the fallback a region-backed KV now
      triggers, and which also exists for a slot whose cells are not one run (a `seq_cp` shared prefix) — the gate
      should require `park == lazyoff` and report *"parking declined → save-and-clear fallback"* instead of failing
-     on *"parking moved nothing"*.  Shape: `A2-MIXED-BACKING.md` §3.7.11.3.
-  3. Goal B (a sparse attended set streamed cheaply) is not started; multi-device is not measurable here.
+     on *"parking moved nothing"*.  With no region the gate passes today (verified); the GPU fault itself was
+     campaign-only.  Shape: `A2-MIXED-BACKING.md` §3.7.11.3.
+  3. **Goal B** (a sparse attended set streamed cheaply, `STRATA-KV-STREAMING.md`) is **not started** — a different
+     mechanism with its own plan, independent of Goal A.  **Goal C** (the drafter ring) is an experiment awaiting
+     the maintainer's three answers (`O3-DRAFTER-RING.md` §7).  Multi-device is not measurable here.
 
 CONSTRAINTS:
   - Build `~/bin/build-llama-rocm` (never pass `-DCMAKE_HIP_FLAGS`); `LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib`.

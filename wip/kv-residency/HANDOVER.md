@@ -446,6 +446,22 @@ passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 
 ## 11. First 30 minutes of the next session
 
+**Read this first: the campaign has three goals and only ONE of them is promotable.**  Do not mix them up (the
+A5 handover did, and it confused the maintainer):
+
+| goal | what | state |
+|---|---|---|
+| **A** — a fixed VRAM **window** instead of `O(n_ctx)` (the KV's tail spills to pinned RAM) | payoff (a) a big context on one 32 GB card instead of OOM, (b) the slab/arena gets the freed VRAM | **COMPLETE and promotable**: mechanism, purity, cost, every §7.2 gate, and the arena half are measured (`A2-MIXED-BACKING.md` §3.7.9 + §3.7.11).  **No blockers.** |
+| **B** — a **sparse attended set** (QSA/DSA) streamed cheaply instead of a full KV | a different mechanism (`STRATA-KV-STREAMING.md`), its own plan | **NOT STARTED.**  Independent of A: it does not touch A's code and must not gate A's promotion.  (The delivery already *ships* qwen4exp/QSA model support — block 11 — that is not this.) |
+| **C** — the **drafter ring** (windowed MTP draft KV) | `LLAMA_SPEC_DRAFT_WINDOW`, implemented + measured on the campaign branch (`a93dee7a9`), **not in `patches/`** | **done as an EXPERIMENT, not promoted**: target text byte-identical; at a usable window it is free (46k context, `W=32768`: acceptance −2.3 % rel, generation flat); a window far below the working context costs 7-9 %; the VRAM prize is one draft layer (~1 GiB at `-c 262144`) and the freed VRAM does **not** reach the arena (it lives in the slab's `aux_reserve`).  Three questions for the maintainer are open in `O3-DRAFTER-RING.md` §7 |
+
+So: **"promote" means Goal A only.**  A promotion session's work is: re-cut `patches/0013`-era code against the
+then-current release (now r177) into a delivery block, add the `ENVIRONMENT.md` rows for the five campaign env
+vars (`LLAMA_KV_REGION`, `LLAMA_KV_RESIDENT_CELLS`, `LLAMA_KV_SPILL_RAM_PCT`, `LLAMA_KV_REGION_QUARANTINE`,
+`LLAMA_KV_REGION_DEBUG`/`TRACE`/`CANARY`/`DUMP` + `GGML_CUDA_VMM_REGION_SELFTEST`), decide the default-on call
+(the default-on policy applies: beneficial + gated ⇒ on, with a kill switch), and run the release gates.  It is
+**not** measurement and it is **not** Goal B.
+
 1. `cd ~/llama-cpp-rdna-boosts && git pull` (and `cd ~/llama.cpp && git fetch origin`); read this file, then
    `A2-MIXED-BACKING.md` **§3.7.11** (A5: the spilling-arm gates, the Flash-Next arm, **both bugs and their
    fixes**, the arena re-measurement), **§3.7.8** (the hazard hold), **§3.7.9** (the spill's cost) and §8.1 above
@@ -453,16 +469,17 @@ passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 2. `cd ~/llama.cpp && git branch --show-current` — expect **`wip-kv-residency`** at **`7c7769e50`** or later
    (`git log --oneline -3`: A5 (ii) on A5 (i) on A4 (ii)).  Never commit campaign code to `rdna-boosts`.
    `~/bin/build-llama-rocm` (~5 s warm).
-3. **There is no measurement left in §7.2** — items 1, 2 and 4 are done and their evidence is recorded.  The
-   session's work is the **promotion conversation** (the maintainer's) plus the two items below.
-4. **Owed, and it needs the maintainer's go-ahead because it is a DELIVERY change:** `scripts/gate-park-idle-slots.sh`
-   HARD-fails a legitimate outcome — when the park arm's server logs *"cannot park the idle slot: saving it to the
-   prompt cache and clearing it"* (the fallback a region-backed KV now triggers, and which also exists for a slot
-   whose cells are not one run, e.g. a shared prefix), the gate should require `park == lazyoff` and report
-   *"parking declined → save-and-clear fallback"* instead of failing on *"parking moved nothing"*.  Shape and
-   rationale: `A2-MIXED-BACKING.md` §3.7.11.3.
+3. **Nothing in §7.2 is left to measure** and no Goal-A work is outstanding.  The next session is the promotion
+   decision/conversation (Goal A), optionally followed by the two items below.
+4. **Optional, and it needs the maintainer's go-ahead because it is a DELIVERY change:**
+   `scripts/gate-park-idle-slots.sh` HARD-fails a *legitimate* outcome — when the park arm's server logs *"cannot
+   park the idle slot: saving it to the prompt cache and clearing it"* (the fallback a region-backed KV now
+   triggers, and which also exists for a slot whose cells are not one run, e.g. a shared prefix), the gate should
+   require `park == lazyoff` and report *"parking declined → save-and-clear fallback"* instead of failing on
+   *"parking moved nothing"*.  This is a **test-gap, not a product bug**: with no region the gate passes today
+   (verified), and the fault itself was campaign-only.  Shape: `A2-MIXED-BACKING.md` §3.7.11.3.
 5. **Deferred by the maintainer (do not re-propose):** expressing `W` as a percentage of the slab.  `W` stays a
    cell count (numeric or `auto`), and `auto`'s ordering (weights → arena reserve → `W` from the residue, capped
    at the user's `-c`) is the agreed policy — verified on the 35B-A3B, the 122B-A10B and the 27B Q8_0.
-6. Goal B (a sparse attended set streamed cheaply) is still not started; multi-device is still not measurable
-   here (one card).  Report findings to the maintainer before committing any delivery-affecting change.
+6. Multi-device is still not measurable here (one card).  Report findings to the maintainer before committing any
+   delivery-affecting change.
