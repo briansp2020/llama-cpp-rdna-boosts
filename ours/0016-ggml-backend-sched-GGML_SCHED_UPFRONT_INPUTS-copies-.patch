@@ -1,0 +1,141 @@
+From 6aa9c1983b2cfabfdc806680b5da1fafe40f450b Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 26 Oct 2026 08:17:21 +0000
+Subject: [PATCH 16/19] ggml-backend sched: GGML_SCHED_UPFRONT_INPUTS copies
+ user inputs once per graph (no per-split host wait)
+
+(cherry picked from commit ec358ad37c878d91518d5a88498977b8ef52ca5b)
+---
+ ggml/src/ggml-backend.cpp | 81 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index be3596f7e..c76f7cf91 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -23,6 +23,7 @@
+ #include <unordered_map>
+ #include <string>
+ #include <vector>
++#include <unordered_set>
+ 
+ // getenv() is cheap on Linux but takes a lock and rescans the environment block on Windows.  These
+ // debug / A-B gates sit on per-graph and per-split paths, so resolve each one once per call site:
+@@ -1495,6 +1496,27 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
+ 
+ // the graph input a tensor ultimately refers to, following view chains, or NULL if it is not (a
+ // view of) a graph input.  The recurrent-state copy, for one, is only ever read through views.
++static bool sched_sync_graph_inputs(void);
++static struct ggml_tensor * ggml_backend_sched_graph_input(struct ggml_tensor * t);
++
++// `GGML_SCHED_UPFRONT_INPUTS=1` (n_copies == 1 only): copy every user input of the graph once, before
++// the first split, instead of a host wait + synchronous copy in front of every split that reads one
++// (the per-split waits stop the host from queuing ahead of the GPU: FINDINGS 571).  The input copies
++// become leafs flagged OUTPUT so ggml-alloc never places a split intermediate over them.  Assumes no
++// node writes into a graph input (or a view of one) that a later split consumes.
++static bool sched_upfront_inputs(void) {
++    static const bool on = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_UPFRONT_INPUTS");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on;
++}
++
++static bool sched_is_user_input(struct ggml_tensor * t) {
++    return (t->flags & GGML_TENSOR_FLAG_INPUT) ||
++           (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(t) != nullptr);
++}
++
+ static struct ggml_tensor * ggml_backend_sched_graph_input(struct ggml_tensor * t) {
+     while (t != NULL) {
+         if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+@@ -2036,6 +2058,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                             } else if (src->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                                 ggml_set_output(tensor_copy); // the source must stay alive for the whole graph: so must its copy
+                             }
++                            if (sched->n_copies == 1 && sched_upfront_inputs() && sched_is_user_input(src)) {
++                                ggml_set_input(tensor_copy);
++                                ggml_set_output(tensor_copy); // copied before the first split: must not be reused
++                            }
+                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
+                             SET_CAUSE(tensor_copy, "4.cpy");
+                         }
+@@ -2270,6 +2296,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         }
+     }
+ 
++    if (sched->n_copies == 1 && sched_upfront_inputs()) {
++        // the up-front user-input copies are allocated first, like the n_copies > 1 copies above
++        std::unordered_set<ggml_tensor *> added;
++        for (int i = 0; i < sched->n_splits; i++) {
++            struct ggml_backend_sched_split * split = &sched->splits[i];
++            for (int j = 0; j < split->n_inputs; j++) {
++                struct ggml_tensor * input = split->inputs[j];
++                if (!sched_is_user_input(input)) {
++                    continue;
++                }
++                struct ggml_tensor * input_cpy = tensor_id_copy(hash_id(input), split->backend_id, 0);
++                if (input_cpy == NULL || !added.insert(input_cpy).second) {
++                    continue;
++                }
++                sched->leaf_backend_ids[graph_copy->n_leafs] = split->backend_id;
++                assert(graph_copy->size > graph_copy->n_leafs);
++                graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
++            }
++        }
++    }
++
+     // add leafs from the original graph
+     for (int i = 0; i < graph->n_leafs; i++) {
+         struct ggml_tensor * leaf = graph->leafs[i];
+@@ -2777,7 +2824,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     auto & used_ids        = st.used_ids;
+ 
+ 
+-    if ((input->flags & GGML_TENSOR_FLAG_INPUT) ||
++    if (sched->n_copies == 1 && sched_upfront_inputs() && sched_is_user_input(input)) {
++        // already copied before the first split (ggml_backend_sched_compute_splits)
++    } else if ((input->flags & GGML_TENSOR_FLAG_INPUT) ||
+         (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(input) != nullptr)) {
+         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+@@ -3090,6 +3139,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     int prev_backend_id = -1;
+     ggml_backend_sched_copy_state st;
+ 
++    if (sched->n_copies == 1 && sched_upfront_inputs()) {
++        // one wait per backend (llama does not synchronize between ubatches without pipeline parallelism),
++        // then every distinct user-input copy once
++        bool waited[GGML_SCHED_MAX_BACKENDS] = { false };
++        std::unordered_set<ggml_tensor *> copied;
++        for (int split_id = 0; split_id < sched->n_splits; split_id++) {
++            struct ggml_backend_sched_split * split = &splits[split_id];
++            const int b = split->backend_id;
++            for (int j = 0; j < split->n_inputs; j++) {
++                struct ggml_tensor * input = split->inputs[j];
++                if (!sched_is_user_input(input)) {
++                    continue;
++                }
++                struct ggml_tensor * input_cpy = tensor_copy(input, b, sched->cur_copy);
++                if (!copied.insert(input_cpy).second) {
++                    continue;
++                }
++                if (!waited[b]) {
++                    waited[b] = true;
++                    if (sched->events[b][sched->cur_copy] != NULL) {
++                        ggml_backend_event_synchronize(sched_event_get(sched, b));
++                    } else {
++                        ggml_backend_synchronize(sched->backends[b]);
++                    }
++                }
++                ggml_backend_tensor_copy(input, input_cpy);
++            }
++        }
++    }
++
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+-- 
+2.53.0
+

@@ -1,0 +1,102 @@
+From e0052abd6f8f493f12f34856820154d6b9d31fb3 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 25 Oct 2026 18:04:11 +0000
+Subject: [PATCH 15/19] qwen4exp: gather prompt ubatches from a device copy of
+ the token embedding
+
+The token embedding lives in host memory, so every graph starts with a
+CPU split, and without pipeline parallelism the scheduler synchronizes
+the devices before copying that split's output in: before every prompt
+ubatch the GPUs wait for the host (-sm tensor, 2 x R9700).
+LLAMA_DEVICE_INPUT=1 removes the split (prefill +3.6 %) but also moves
+decode / MTP gathers to the device, which costs decode 0.76 %.
+
+LLAMA_TOK_EMBD_DEV_MIN=N (> 0) keeps the host table and adds a copy on
+the output layer's device (TENSOR_DUPLICATED, MIRRORED under the Meta
+policy); a ubatch of N or more tokens gathers from the copy, smaller
+ones (decode, verify, the MTP head) from the host table.  Not taken with
+LoRA adapters (they resolve token_embd.weight to the host table) or a
+rotated (Hadamard) table.  Same dequantized values.
+
+(cherry picked from commit 03dd775b408a1b1cdf64640194dc75269bdd2587)
+---
+ src/llama-model.h       |  1 +
+ src/models/models.h     |  3 +++
+ src/models/qwen4exp.cpp | 21 ++++++++++++++++++++-
+ 3 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 78f231057..df56fc32e 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -754,6 +754,7 @@ struct llama_model {
+     std::vector<std::string> decision_labels;
+ 
+     struct ggml_tensor * tok_embd   = nullptr;
++    struct ggml_tensor * tok_embd_dev = nullptr; // LLAMA_TOK_EMBD_DEV_MIN: device copy of tok_embd for prompt ubatches (qwen4exp)
+     struct ggml_tensor * type_embd  = nullptr;
+     struct ggml_tensor * pos_embd   = nullptr;
+     struct ggml_tensor * tok_norm   = nullptr;
+diff --git a/src/models/models.h b/src/models/models.h
+index 9bbd1f4c4..1bcf14a86 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2724,6 +2724,9 @@ struct llama_model_clef : public llama_model_qwen35 {
+ struct llama_model_qwen4exp : public llama_model_base {
+     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+ 
++    // LLAMA_TOK_EMBD_DEV_MIN: min ubatch tokens gathered from tok_embd_dev (0 = no device copy)
++    static int64_t tok_embd_dev_min();
++
+     // env: LLAMA_LAZY_READER_STATS
+     ~llama_model_qwen4exp() override {
+         if (lazy_reader) {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 47ff49f75..6065f7702 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -511,6 +511,14 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+     }
+ }
+ 
++int64_t llama_model_qwen4exp::tok_embd_dev_min() {
++    static const int64_t v = [] {
++        const char * e = getenv("LLAMA_TOK_EMBD_DEV_MIN");
++        return e != nullptr ? std::max<int64_t>(0, atoll(e)) : (int64_t) 0;
++    }();
++    return v;
++}
++
+ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+     LLAMA_LOAD_LOCALS;
+ 
+@@ -523,6 +531,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+     const int  mtp_flags   = nf.mtp;
+ 
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
++    // LLAMA_TOK_EMBD_DEV_MIN=N (> 0): also keep a copy of the token embedding on the output layer's device and gather a
++    // ubatch of N or more tokens from it, so a prompt ubatch has no CPU split (whose input copy makes the scheduler
++    // synchronize the devices before every prompt ubatch).  Smaller ubatches (decode, verify, short turns) keep the
++    // host table: the device gather is slower there (LLAMA_DEVICE_INPUT=1, which moves the only copy, costs decode).
++    if (tok_embd_dev_min() > 0 && getenv("LLAMA_DEVICE_INPUT") == nullptr) {
++        tok_embd_dev = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED | trunk_flags);
++    }
+ 
+     // there is no output_norm: the final hyper-connection mixer carries it
+     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
+@@ -987,7 +1002,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+         ggml_build_forward_expand(gf, ple_emb);
+     }
+ 
+-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
++    const bool embd_dev = model.tok_embd_dev != nullptr && model.tok_embd_dev != model.tok_embd &&
++        (int64_t) ubatch.n_tokens >= llama_model_qwen4exp::tok_embd_dev_min() &&
++        (loras == nullptr || loras->empty()) &&   // an adapter resolves token_embd.weight to the host table only
++        (hdmd == nullptr || hdmd->inv.find(model.tok_embd) == hdmd->inv.end());   // a rotated table: the map is keyed on tok_embd
++    ggml_tensor * inpL = build_inp_embd(embd_dev ? model.tok_embd_dev : model.tok_embd);
+     cb(inpL, "model.input_embed", -1);
+     ggml_build_forward_expand(gf, inpL);
+ 
+-- 
+2.53.0
+

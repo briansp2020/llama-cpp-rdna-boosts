@@ -1,0 +1,33 @@
+From e475456e05e6bd6a5c6e52e6a685bf7dd785029e Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 23 Oct 2026 03:52:11 +0000
+Subject: [PATCH 10/19] llama-context: LLAMA_UB_SMALL_SPLIT only for causal
+ prompt chunks (<= 1 output) and when K > the recurrent rollback tail (review:
+ split_equal assert with n-max >= K-1; non-causal; multi-stream verify
+ batches)
+
+(cherry picked from commit 3d74fe1e1f2e300ade47dcbd3904ef3b0539aaca)
+---
+ src/llama-context.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d0bdde513..6959bc360 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3233,8 +3233,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         // prefill path (whole-table expert staging).  Off when unset.  Changes numerics like any ubatch size change.
+         static const uint32_t ub_small_k   = [] { const char * e = getenv("LLAMA_UB_SMALL_SPLIT"); return e ? (uint32_t) std::max(0, atoi(e)) : 0u; }();
+         static const uint32_t ub_small_max = [] { const char * e = getenv("LLAMA_UB_SMALL_MAX");   return e ? (uint32_t) std::max(0, atoi(e)) : 31u; }();
++        // Only a causal prompt chunk (at most one output row; a verify batch outputs every row), and only when K-token
++        // ubatches can hold a recurrent rollback tail (split_equal asserts n_ubatch > n_rs_seq + 1 with MTP drafting).
+         const uint32_t n_ubatch_eff = ub_small_k > 0 && n_tokens_all > ub_small_k && n_tokens_all <= ub_small_max &&
+-                                      cparams.n_ubatch > ub_small_k ? ub_small_k : cparams.n_ubatch;
++                                      cparams.n_ubatch > ub_small_k && cparams.causal_attn && n_outputs_all <= 1 &&
++                                      (cparams.n_rs_seq == 0 || ub_small_k > cparams.n_rs_seq + 1) ? ub_small_k : cparams.n_ubatch;
+         mctx = memory->init_batch(*balloc, n_ubatch_eff, embd_all);
+         if (!mctx) {
+             return -2;
+-- 
+2.53.0
+

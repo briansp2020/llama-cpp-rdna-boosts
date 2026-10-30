@@ -1,0 +1,35 @@
+From 528963cea18d1f849d049eaf9d007a7b84e52800 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 23 Oct 2026 03:17:02 +0000
+Subject: [PATCH 09/19] llama-context: LLAMA_UB_SMALL_SPLIT=K splits
+ K+1..31-token batches into K-token ubatches (short-turn chunks stay in the
+ MoE decode band)
+
+(cherry picked from commit b1bf0fce0325212085afa634f6651bcb7bb945c4)
+---
+ src/llama-context.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 057a81775..d0bdde513 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3228,7 +3228,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     llama_memory_context_ptr mctx;
+ 
+     while (true) {
+-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
++        // local: LLAMA_UB_SMALL_SPLIT=K splits a batch of K+1..LLAMA_UB_SMALL_MAX (default 31) tokens into K-token
++        // ubatches, so a short chat-turn chunk stays in the MoE decode band (K = the band, 8 here) instead of taking the
++        // prefill path (whole-table expert staging).  Off when unset.  Changes numerics like any ubatch size change.
++        static const uint32_t ub_small_k   = [] { const char * e = getenv("LLAMA_UB_SMALL_SPLIT"); return e ? (uint32_t) std::max(0, atoi(e)) : 0u; }();
++        static const uint32_t ub_small_max = [] { const char * e = getenv("LLAMA_UB_SMALL_MAX");   return e ? (uint32_t) std::max(0, atoi(e)) : 31u; }();
++        const uint32_t n_ubatch_eff = ub_small_k > 0 && n_tokens_all > ub_small_k && n_tokens_all <= ub_small_max &&
++                                      cparams.n_ubatch > ub_small_k ? ub_small_k : cparams.n_ubatch;
++        mctx = memory->init_batch(*balloc, n_ubatch_eff, embd_all);
+         if (!mctx) {
+             return -2;
+         }
+-- 
+2.53.0
+

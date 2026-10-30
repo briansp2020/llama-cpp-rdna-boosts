@@ -1,0 +1,74 @@
+From 72570783df3b7d2b75670c2b28b381e3941cf151 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 22 Oct 2026 22:26:23 +0000
+Subject: [PATCH 08/19] port fix: r111 pool-backed staging/upload paths apply
+ only in --host-experts pool (table_pool_backed); a sparse mmap table declines
+ the 10-arg staging as in r109
+
+(cherry picked from commit 563d6e6fc6d27e4cc8e3787e6e99da5ebbcdc869)
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index cf9623eb6..92ef86246 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1383,6 +1383,12 @@ static inline bool table_master_pageable(const table_t & t) {
+     return t.host != nullptr && !t.host_pinned && !t.host_sparse;
+ }
+ 
++// local: the r111 pool-backed staging / upload paths apply only in --host-experts pool.  Under --host-experts mmap a
++// master that is not pinned is either sparse-registered or declined by the cache, exactly as in r109.
++static inline bool table_pool_backed(const table_t & t) {
++    return g_pool_requested && table_master_pageable(t);
++}
++
+ // Human-readable cache budget for the log lines: "auto" when MOE_EXPERT_CACHE_MIB was unset (each
+ // device is sized from its free VRAM at `alloc_all_locked`), otherwise the requested MiB/device.
+ static const char * budget_desc() {
+@@ -6590,7 +6596,7 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
+     std::lock_guard<std::mutex> lock(g_mutex);
+     const char * s = (const char *) src_host;
+     for (table_t & t : g_tables) {
+-        if (t.device != device || t.host == nullptr || t.host_pinned || t.n_experts <= 0 || t.host_bytes == 0) {
++        if (t.device != device || t.host == nullptr || !table_pool_backed(t) || t.n_experts <= 0 || t.host_bytes == 0) {
+             continue;
+         }
+         const char * base = (const char *) t.host;
+@@ -6673,7 +6679,7 @@ bool moe_cache_source_pageable(const void * p) {
+     std::lock_guard<std::mutex> lock(g_mutex);
+     const char * c = (const char *) p;
+     for (const table_t & t : g_tables) {
+-        if (t.host == nullptr || t.host_pinned || t.host_bytes == 0 || t.n_experts <= 0) {
++        if (t.host == nullptr || !table_pool_backed(t) || t.host_bytes == 0 || t.n_experts <= 0) {
+             continue;
+         }
+         const char * b = (const char *) t.host;
+@@ -6833,11 +6839,12 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+         // master.  A POOL-BACKED master needs neither: it is filled expert by expert from the pinned pool
+         // (or the per-table bounce), so it also serves the pre-sizing prefill (the whole point -- a
+         // pageable master must never reach the ring through the pageable upload).
+-        if (t.host_pinned && (t.arena == nullptr || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe)) {
++        if (!table_pool_backed(t) && (t.arena == nullptr || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe ||
++                                        !t.host_pinned)) {   // local: a sparse mmap table declines (as in r109)
+             g_stage_decline_usable++;
+             return false;
+         }
+-        if (t.host_pinned && !g_sized) {
++        if (!table_pool_backed(t) && !g_sized) {
+             return false;
+         }
+         const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
+@@ -6875,7 +6882,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+         // `<= -2` pool slot `-v-2`, `-1` in neither), so the kernel needs no extra bookkeeping; the experts
+         // in NEITHER tier are still copied here, one at a time, because each of those is a distinct read
+         // from the mapping/disk.
+-        if (!t.host_pinned) {
++        if (table_pool_backed(t)) {   // local: not a sparse mmap table
+             host_pool_t * pool = table_pool_locked(t);
+             cudaError_t   err  = cudaSuccess;
+             {
+-- 
+2.53.0
+

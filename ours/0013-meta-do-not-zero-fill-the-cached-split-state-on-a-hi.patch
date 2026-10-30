@@ -1,0 +1,34 @@
+From 15489a9e1d21d39161860439e33e76bf43e51127 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 25 Oct 2026 13:31:34 +0000
+Subject: [PATCH 13/19] meta: do not zero-fill the cached split state on a hit
+
+Only the max(n_segments, 1) x n_bufs prefix of ne is meaningful; the
+2128-byte zero fill in split_state_entry::get() was ~1/3 of
+ggml_backend_meta_get_split_state's self time on short server turns
+(-sm tensor, 2 GPUs, GCC 13.3 host build).
+
+(cherry picked from commit d2b85f9192ca041897c4645c8a7bdf96cf6c5582)
+---
+ ggml/src/ggml-backend-meta.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 879b10596..1170a72e4 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -756,7 +756,10 @@ struct ggml_backend_meta_buffer_context {
+             ne.assign(ss.ne, ss.ne + std::max<size_t>(n_segments, 1)*n_bufs);
+         }
+         ggml_backend_meta_split_state get() const {
+-            ggml_backend_meta_split_state ss = {};
++            // Only the first max(n_segments, 1) x n_bufs entries of `ne` are meaningful (see `set`), so the ~2 KiB
++            // state is not zero-filled first: on the hit path (every lookup of every graph allocation under
++            // -sm tensor) the fill was a third of this function's own time (GCC 13 emits a 2128-byte rep stos).
++            ggml_backend_meta_split_state ss;
+             ss.axis       = axis;
+             ss.n_segments = n_segments;
+             memcpy(ss.nr, nr, sizeof(nr));
+-- 
+2.53.0
+

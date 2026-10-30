@@ -1,0 +1,26 @@
+From 926f04846654d2238873d57d978eb709e8fd535b Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 27 Oct 2026 05:31:54 +0000
+Subject: [PATCH 18/19] port fix: devremap_free_locked forces a graph recapture
+ (r149 per-layer keys replay; the device-remap buffers are local and not
+ covered by stew's free-site bumps)
+
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 322a35762..f73649be5 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -7612,6 +7612,7 @@ static void devremap_free_locked(table_t & t) {
+     (void) cudaGetLastError();
+     t.dr_map_dev = t.dr_lag_dev = t.dr_map_host = t.dr_map_hdev = t.dr_lag_host = nullptr;
+     t.dr_map_ev = t.dr_lag_ev = nullptr;
++    ggml_cuda_graph_mem_freed(t.dr_device);   // the remap / lag buffers are kernel arguments of captured graphs
+     t.dr_cap = 0; t.dr_device = -1; t.dr_lag_n = 0; t.dr_map_ok = false;
+ }
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,36 @@
+From f09853b5dbff24e25772ab44700d3e2e08d51634 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 23 Oct 2026 17:30:24 +0000
+Subject: [PATCH 11/19] server: LLAMA_CKPT_USER_MERGE=K, no checkpoint break at
+ a user message followed by <= K prompt tokens (local, default off)
+
+(cherry picked from commit b78b01c965c642090e6d91098cde2dca1639f097)
+---
+ tools/server/server-context.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c72db05ea..8594a9b21 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4646,7 +4646,16 @@ private:
+                         slot.prompt.tokens.push_back(cur_tok);
+ 
+                         // break at the last user message, or at user messages at least min step past the last checkpoint
+-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
++                        // LLAMA_CKPT_USER_MERGE=K (local, default 0 = off): no break when at most K prompt tokens follow,
++                        // so a short follow-up is one chunk (plus the end-of-prompt tail below) instead of two.  It drops
++                        // that user-start checkpoint (an edited last message restores from an earlier one) and changes the
++                        // ubatch split, so the outputs change like any ubatch change.
++                        static const int ckpt_user_merge = [] {
++                            const char * e = getenv("LLAMA_CKPT_USER_MERGE");
++                            return e != nullptr ? std::max(0, atoi(e)) : 0;
++                        }();
++                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens()) &&
++                                slot.task->n_tokens() - slot.prompt.n_tokens() > ckpt_user_merge) {
+                             const auto pos = slot.prompt.n_tokens();
+                             const auto & checkpoints = slot.prompt.checkpoints;
+ 
+-- 
+2.53.0
+

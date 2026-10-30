@@ -1,0 +1,36 @@
+From cff9d6f0c9bb1d2d143e5b026956493f3352b530 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 25 Oct 2026 12:56:10 +0000
+Subject: [PATCH 12/19] moe-expert-cache: stamp the heat-map debounce even when
+ the save writes nothing
+
+With no map path (--host-experts mmap never opens one) or a frozen map,
+heat_map_save_locked() returns without touching g_heat_last_save, so the
+debounced flush in moe_cache_get_stats ran on every server turn: 2 x 282
+synchronous D2H copies + memsets, ~15 ms of host time per request end.
+Output-neutral: the pulled tally only feeds placement ranking, and the
+consumers that need a fresh tally (pool_rank_from_prefill_locked, the
+exit report) pull it themselves.
+
+(cherry picked from commit f26a37f3859305f7d867ffb8cd2e9c782360a7c7)
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 92ef86246..322a35762 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -5167,6 +5167,9 @@ bool moe_cache_get_stats(int64_t * hits, int64_t * misses, int64_t * arena_bytes
+             g_heat_debounce_s) {
+             heat_pull_locked();
+             heat_map_save_locked();
++            // Stamp the debounce even when the save wrote nothing (no map path, e.g. `--host-experts mmap`, or
++            // a frozen map): otherwise every turn repeats the ~15 ms pull of 2 x 282 synchronous D2H copies.
++            g_heat_last_save = now;
+             g_heat_dirty = false;
+         }
+     }
+-- 
+2.53.0
+

@@ -1,0 +1,75 @@
+From b0008685ec8f4c168b3d794515892335321bb1de Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 30 Oct 2026 03:06:04 +0000
+Subject: [PATCH 01/19] graph_optimize: move the V / K projections of a Q-norm
+ attention layer in front of the Q projection (bit-identical)
+
+The model graph runs the Q projection and its RMS_NORM, MUL, ROPE before the V and K projections, so the Q GEMV cannot join
+the V / K row concat, and the allocator hands the Q chain's freed buffers to V / K, which stops the Q / K norm+rope pair.
+Rotating the V / K MUL_MAT + RESHAPE nodes ahead of the Q MUL_MAT gives the order both fusions expect, with no model-file
+change.  Structural match only, every ubatch size.  Qwen3-30B-A3B Q4_K_M on 7900 XTX: 653 -> 558 launches per token,
+tg128 189.2 -> 203.2 (+7.4 %), greedy text and prefill logits identical.  GGML_CUDA_QK_ROTATE=0: off.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 46 +++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f4089f81a..be2e59c7e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6678,6 +6678,52 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     };
+ 
+     if (!disable_fusion) {
++        // Q-norm attention (Qwen3, Qwen3-MoE): the model graph runs the Q projection and its RMS_NORM, MUL, ROPE before
++        // the V and K projections, so the Q GEMV cannot join the V / K row concat and the allocator hands the Q chain's
++        // freed buffers to V / K, which stops the Q / K norm+rope pair (ggml_cuda_qk_pair_k_at).  Move the V / K
++        // projections (MUL_MAT + RESHAPE / VIEW, which read none of the Q nodes) in front of the Q projection: the same
++        // nodes, one stream, so the results are bit-identical.  Structural only (no data pointers yet), every ubatch
++        // size.  GGML_CUDA_QK_ROTATE=0: off.
++        static const bool qk_rotate = getenv("GGML_CUDA_QK_ROTATE") == nullptr || atoi(getenv("GGML_CUDA_QK_ROTATE")) != 0;
++        for (int i = 0; qk_rotate && i + 8 < cgraph->n_nodes; ++i) {
++            ggml_tensor ** n = cgraph->nodes;
++            if (n[i]->op != GGML_OP_MUL_MAT || n[i + 1]->op != GGML_OP_RESHAPE || n[i + 1]->src[0] != n[i] ||
++                    n[i + 2]->op != GGML_OP_RMS_NORM || n[i + 2]->src[0] != n[i + 1] ||
++                    n[i + 3]->op != GGML_OP_MUL      || n[i + 3]->src[0] != n[i + 2] ||
++                    n[i + 4]->op != GGML_OP_ROPE     || n[i + 4]->src[0] != n[i + 3]) {
++                continue;
++            }
++            // the K chain RMS_NORM, MUL, ROPE with the same rope parameters and positions; between them only V / K
++            // projections and views that read none of the Q nodes (the Q nodes come first, so they read none of them)
++            int j = -1;
++            bool ok = true;
++            for (int k = i + 5; k < std::min(cgraph->n_nodes - 2, i + 16) && ok; ++k) {
++                const ggml_tensor * t = n[k];
++                if (t->op == GGML_OP_RMS_NORM) {
++                    j = k;
++                    break;
++                }
++                ok = t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW;
++                for (int s = 0; s < GGML_MAX_SRC && t->src[s] && ok; ++s) {
++                    const ggml_tensor * r = t->src[s];
++                    while (r->view_src) {
++                        r = r->view_src;
++                    }
++                    for (int q = i; q <= i + 4; ++q) {
++                        ok = ok && r != n[q];
++                    }
++                }
++            }
++            if (!ok || j < 0 || j == i + 5 || n[j + 1]->op != GGML_OP_MUL || n[j + 1]->src[0] != n[j] ||
++                    n[j + 2]->op != GGML_OP_ROPE || n[j + 2]->src[0] != n[j + 1] ||
++                    n[j + 2]->src[1] != n[i + 4]->src[1] || n[j + 2]->src[2] != n[i + 4]->src[2] ||
++                    memcmp(n[j + 2]->op_params, n[i + 4]->op_params, sizeof(n[i + 4]->op_params)) != 0) {
++                continue;
++            }
++            std::rotate(n + i, n + i + 5, n + j);
++            i = j + 2;
++        }
++
+         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
+         // TODO: consolidate fusion paths in graph_optimize and graph_compute
+         ggml_cuda_set_device(cuda_ctx->device);
+-- 
+2.53.0
+

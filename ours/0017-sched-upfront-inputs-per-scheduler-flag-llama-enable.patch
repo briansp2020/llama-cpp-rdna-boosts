@@ -1,0 +1,124 @@
+From 22acb90493873383de6b11dbf9596b447784ab99 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 26 Oct 2026 09:00:06 +0000
+Subject: [PATCH 17/19] sched upfront inputs: per-scheduler flag; llama enables
+ it for ubatches <= LLAMA_SCHED_UPFRONT_MAX_TOKENS (16)
+
+(cherry picked from commit f201937387f6822278a5f1baa74b126dfa114ca7)
+---
+ ggml/include/ggml-backend.h |  2 ++
+ ggml/src/ggml-backend.cpp   | 14 ++++++++++----
+ src/llama-context.cpp       | 10 ++++++++++
+ 3 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 48e3e1067..209e6d105 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -479,6 +479,8 @@ extern "C" {
+     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
+ 
+     // Set a callback to be called for each resulting node during graph compute
++    // GGML_SCHED_UPFRONT_INPUTS: whether the graphs allocated from now on copy their user inputs once up front (default true)
++    GGML_API void                 ggml_backend_sched_set_upfront_inputs(ggml_backend_sched_t sched, bool on);
+     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+ 
+     // Set a callback to be called when the inputs weights of a split are being copied
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index c76f7cf91..d9c687bb4 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1171,6 +1171,7 @@ struct ggml_backend_sched_split {
+ #define GGML_SCHED_STAGE_SLOTS_DEFAULT 8
+ 
+ struct ggml_backend_sched {
++    bool upfront_on; // GGML_SCHED_UPFRONT_INPUTS for the graphs allocated from now on (ggml_backend_sched_set_upfront_inputs)
+     bool is_reset; // true if the scheduler has been reset since the last graph split
+     bool is_alloc;
+ 
+@@ -2058,7 +2059,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                             } else if (src->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                                 ggml_set_output(tensor_copy); // the source must stay alive for the whole graph: so must its copy
+                             }
+-                            if (sched->n_copies == 1 && sched_upfront_inputs() && sched_is_user_input(src)) {
++                            if (sched->n_copies == 1 && sched_upfront_inputs() && sched->upfront_on && sched_is_user_input(src)) {
+                                 ggml_set_input(tensor_copy);
+                                 ggml_set_output(tensor_copy); // copied before the first split: must not be reused
+                             }
+@@ -2296,7 +2297,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         }
+     }
+ 
+-    if (sched->n_copies == 1 && sched_upfront_inputs()) {
++    if (sched->n_copies == 1 && sched_upfront_inputs() && sched->upfront_on) {
+         // the up-front user-input copies are allocated first, like the n_copies > 1 copies above
+         std::unordered_set<ggml_tensor *> added;
+         for (int i = 0; i < sched->n_splits; i++) {
+@@ -2824,7 +2825,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     auto & used_ids        = st.used_ids;
+ 
+ 
+-    if (sched->n_copies == 1 && sched_upfront_inputs() && sched_is_user_input(input)) {
++    if (sched->n_copies == 1 && sched_upfront_inputs() && sched->upfront_on && sched_is_user_input(input)) {
+         // already copied before the first split (ggml_backend_sched_compute_splits)
+     } else if ((input->flags & GGML_TENSOR_FLAG_INPUT) ||
+         (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(input) != nullptr)) {
+@@ -3139,7 +3140,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     int prev_backend_id = -1;
+     ggml_backend_sched_copy_state st;
+ 
+-    if (sched->n_copies == 1 && sched_upfront_inputs()) {
++    if (sched->n_copies == 1 && sched_upfront_inputs() && sched->upfront_on) {
+         // one wait per backend (llama does not synchronize between ubatches without pipeline parallelism),
+         // then every distinct user-input copy once
+         bool waited[GGML_SCHED_MAX_BACKENDS] = { false };
+@@ -3273,6 +3274,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
+     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
+ 
+     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
++    sched->upfront_on = true;
+ 
+     const char * GGML_SCHED_DEBUG = GGML_ENV_STR("GGML_SCHED_DEBUG");
+     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
+@@ -3541,6 +3543,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+     }
+ }
+ 
++void ggml_backend_sched_set_upfront_inputs(ggml_backend_sched_t sched, bool on) {
++    sched->upfront_on = on;
++}
++
+ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
+     GGML_ASSERT(sched);
+     sched->callback_eval = callback;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6959bc360..bf9a4f79c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2764,6 +2764,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         ggml_backend_sched_reset(sched.get());
+         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++        {
++            // up-front user-input copies (GGML_SCHED_UPFRONT_INPUTS) help decode / verify ubatches but cost
++            // large prefill ubatches ~2 % (FINDINGS 572): only small ubatches use them
++            static const uint32_t upfront_max = [] {
++                const char * e = getenv("LLAMA_SCHED_UPFRONT_MAX_TOKENS");
++                return e != nullptr ? (uint32_t) atoi(e) : 16u;
++            }();
++            ggml_backend_sched_set_upfront_inputs(sched.get(), ubatch.n_tokens <= upfront_max);
++        }
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
+@@ -4380,6 +4389,7 @@ ggml_cgraph * llama_context::graph_reserve(
+     }
+ 
+     ggml_backend_sched_reset(sched.get());
++    ggml_backend_sched_set_upfront_inputs(sched.get(), true);   // reserve with the up-front copies' (larger) footprint
+ 
+     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+     for (auto & res : gf_res_prev) {
+-- 
+2.53.0
+
