@@ -1168,7 +1168,7 @@ index 000000000..8e65564b6
 +                                                   ggml_type type_k,
 +                                                   ggml_type type_v);
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 7a0300829..509c0195a 100644
+index 7a0300829..ca06dc053 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -27,6 +27,116 @@ class common_params_fit_exception : public std::runtime_error {
@@ -1440,7 +1440,22 @@ index 7a0300829..509c0195a 100644
                  return;
              }
  
-@@ -261,7 +463,11 @@ static void common_params_fit_impl(
+@@ -258,10 +460,26 @@ static void common_params_fit_impl(
+         }
+     };
+ 
++    // wip/kv-residency: the fit identifies the KV's share of the device tier by the KV buffer's TYPE
++    // (`ggml_backend_cuda_kv_region_is_kv_buft`), and the region buffer type is only taken when a window is
++    // actually asked for.  So a probe context created while the window is 'auto' (or a number) would get the
++    // PLAIN buffer, the KV could not be identified, and the walk below would report an over-budget config and
++    // abort instead of sizing the window.  Ask for a 1-cell window across the probe -- the buffer's SIZE and
++    // the reported KV bytes are unchanged by the window's width, only its type is -- and drop the override
++    // again straight after, so the real decision (and the real W) is still made below.
++    const bool kv_probe_on = llama_kv_region_resident_cells_requested() != 0;
++    if (kv_probe_on) {
++        llama_kv_region_set_probe(true);
++    }
++
      // step 1: get data for default parameters and check whether any changes are necessary in the first place
  
      LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
@@ -1453,7 +1468,7 @@ index 7a0300829..509c0195a 100644
  
      // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
      const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
-@@ -273,7 +479,7 @@ static void common_params_fit_impl(
+@@ -273,9 +491,13 @@ static void common_params_fit_impl(
          if (n_streams > 1) {
              LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                  __func__, n_ctx_max, n_streams);
@@ -1461,8 +1476,14 @@ index 7a0300829..509c0195a 100644
 +            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, nullptr, nullptr, &kv_bytes_full);
          }
      }
++    if (kv_probe_on) {
++        llama_kv_region_set_probe(false);
++    }
++
      add_extra_memory(dmds_full);
-@@ -290,6 +496,401 @@ static void common_params_fit_impl(
+ 
+     const size_t nd = devs.size(); // number of devices
+@@ -290,6 +512,401 @@ static void common_params_fit_impl(
          }
      }
  
@@ -1864,7 +1885,7 @@ index 7a0300829..509c0195a 100644
      std::vector<std::string> dev_names;
      {
          dev_names.reserve(nd);
-@@ -453,6 +1054,49 @@ static void common_params_fit_impl(
+@@ -453,6 +1070,49 @@ static void common_params_fit_impl(
                  }
              } else {
                  LOG_TRC("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
@@ -78546,7 +78567,7 @@ index 0c260f7b6..1f472330f 100644
      enum llama_rope_scaling_type rope_scaling_type;
      enum llama_pooling_type pooling_type;
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 933cb8013..aaf646c67 100644
+index 933cb8013..9258dd0b3 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
 @@ -89,11 +89,36 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
@@ -78639,7 +78660,7 @@ index 933cb8013..aaf646c67 100644
  // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
  // returns total number of elements or 0 on error
  // if out is nullptr, returns the number of tokens without writing to out
-@@ -164,3 +216,23 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
+@@ -164,3 +216,27 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
  
  // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
  LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
@@ -78659,6 +78680,10 @@ index 933cb8013..aaf646c67 100644
 +// The window the cache would use: 0 = none, UINT32_MAX = `auto` (fit decides), else the cell count.
 +// Reads the fit decision first, then the environment.
 +LLAMA_API uint32_t llama_kv_region_resident_cells_requested(void);
++
++// For `--fit`'s measurement context only: take a region buffer even with no window, so the fit can identify
++// the KV's bytes.  No batch ever runs on such a context.
++LLAMA_API void llama_kv_region_set_probe(bool on);
 +
 +// Hand a window (in cells) down to every context created afterwards; 0 clears it.  `common_params_fit` calls
 +// this before the real contexts exist.  One W covers every cache in the process (the A2 rule).
@@ -80182,10 +80207,10 @@ index c18d913da..b3bca8be1 100644
          for (const auto & layer : layers) {
              ggml_backend_tensor_copy(layer.kv_stream[ssrc], layer.kv_stream[sdst]);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 4ab280a61..1b1280407 100644
+index 4ab280a61..8ad3335c1 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -18,6 +18,148 @@ static bool ggml_is_power_of_2(int n) {
+@@ -18,6 +18,173 @@ static bool ggml_is_power_of_2(int n) {
      return (n & (n - 1)) == 0;
  }
  
@@ -80216,6 +80241,25 @@ index 4ab280a61..1b1280407 100644
 +    }();
 +    return on;
 +}
++
++// The backend's region buffer type WITHOUT a window (`cells = 0`, the O1 shape).  Only the `--fit` probe uses
++// it: the fit identifies the KV's share of the device tier by this buffer TYPE, and the probe context is a
++// `no_alloc` one (so it declines a window), which would otherwise leave the fit unable to see the KV at all --
++// and then it reports an over-budget config and aborts instead of sizing the window.  No batch ever runs on a
++// probe context, so O1's KNOWN LIMIT (the slab takes the uncommitted VRAM) cannot bite.
++typedef ggml_backend_buffer_type_t (*llama_kv_region_buft_fn)(ggml_backend_dev_t dev);
++
++static bool g_kv_region_probe = false;
++
++static ggml_backend_buffer_type_t llama_kv_region_buft(ggml_backend_dev_t dev) {
++    if (!llama_kv_region_enabled() || dev == nullptr) {
++        return nullptr;
++    }
++    auto fn = (llama_kv_region_buft_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
++            "ggml_backend_cuda_kv_region_buft");
++    return fn != nullptr ? fn(dev) : nullptr;
++}
++
 +
 +// wip/kv-residency (TODO #118) A2: the same buffer type with the windowed KV -- the newest `cells` cells of
 +// the used extent are in VRAM, everything older in pinned system RAM.
@@ -80264,6 +80308,12 @@ index 4ab280a61..1b1280407 100644
 +}
 +
 +// UINT32_MAX = `auto`: fit sizes it (see above).
++// `--fit`'s measurement context: take a region buffer even with no window, purely so the fit can identify
++// the KV.  Never set by the runtime; a probe context allocates no window and runs no batch.
++void llama_kv_region_set_probe(bool on) {
++    g_kv_region_probe = on;
++}
++
 +uint32_t llama_kv_region_resident_cells_requested(void) {
 +    if (g_kv_resident_cells_override != 0) {
 +        return g_kv_resident_cells_override;
@@ -80334,7 +80384,7 @@ index 4ab280a61..1b1280407 100644
  // orthonormal Walsh-Hadamard rotation matrix
  // note: res^2 == I
  static void ggml_gen_hadamard(ggml_tensor * tensor) {
-@@ -62,6 +204,29 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
+@@ -62,6 +229,29 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
  // llama_kv_cache
  //
  
@@ -80364,7 +80414,7 @@ index 4ab280a61..1b1280407 100644
  llama_kv_cache::llama_kv_cache(
          const llama_model & model,
          const llama_hparams & hparams,
-@@ -79,9 +244,11 @@ llama_kv_cache::llama_kv_cache(
+@@ -79,9 +269,11 @@ llama_kv_cache::llama_kv_cache(
      const layer_filter_cb & filter,
      const  layer_reuse_cb & reuse,
      const  layer_share_cb & share,
@@ -80378,7 +80428,7 @@ index 4ab280a61..1b1280407 100644
      other(static_cast<llama_kv_cache *>(mem_other)),
      v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
      v_cells(*v_cells_impl) {
-@@ -162,6 +329,93 @@ llama_kv_cache::llama_kv_cache(
+@@ -162,6 +354,93 @@ llama_kv_cache::llama_kv_cache(
  
      const bool is_mla = hparams.is_mla();
  
@@ -80472,7 +80522,7 @@ index 4ab280a61..1b1280407 100644
      for (uint32_t il = 0; il < n_layer; il++) {
          if (!hparams.has_kv(il)) {
              LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
-@@ -218,6 +472,33 @@ llama_kv_cache::llama_kv_cache(
+@@ -218,6 +497,40 @@ llama_kv_cache::llama_kv_cache(
              buft = ggml_backend_dev_buffer_type(dev);
  
              dev_name = ggml_backend_dev_name(dev);
@@ -80502,11 +80552,18 @@ index 4ab280a61..1b1280407 100644
 +                    buft = buft_region;
 +                    kv_region = true;
 +                }
++            } else if (g_kv_region_probe) {
++                // the fit's measurement context (see llama_kv_region_set_probe)
++                ggml_backend_buffer_type_t buft_probe = llama_kv_region_buft(dev);
++                if (buft_probe != nullptr) {
++                    buft = buft_probe;
++                    kv_region = true;
++                }
 +            }
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-@@ -228,7 +509,7 @@ llama_kv_cache::llama_kv_cache(
+@@ -228,7 +541,7 @@ llama_kv_cache::llama_kv_cache(
          }
  
          const bool has_k = true;
@@ -80515,7 +80572,7 @@ index 4ab280a61..1b1280407 100644
  
          ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
          ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
-@@ -394,6 +675,8 @@ void llama_kv_cache::clear(bool data) {
+@@ -394,6 +707,8 @@ void llama_kv_cache::clear(bool data) {
          v_heads[s] = 0;
      }
  
@@ -80524,7 +80581,7 @@ index 4ab280a61..1b1280407 100644
      if (data) {
          for (auto & [_, buf] : ctxs_bufs) {
              ggml_backend_buffer_clear(buf.get(), 0);
-@@ -424,7 +707,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -424,7 +739,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
  
          uint32_t new_head = cells.size();
  
@@ -80535,7 +80592,7 @@ index 4ab280a61..1b1280407 100644
              if (!cells.pos_in(i, p0, p1)) {
                  continue;
              }
-@@ -440,6 +725,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -440,6 +757,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
          if (new_head != cells.size() && new_head < head) {
              head = new_head;
          }
@@ -80546,7 +80603,7 @@ index 4ab280a61..1b1280407 100644
      } else {
          // match any sequence
          for (uint32_t s = 0; s < n_stream; ++s) {
-@@ -448,7 +737,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -448,7 +769,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
  
              uint32_t new_head = cells.size();
  
@@ -80556,7 +80613,7 @@ index 4ab280a61..1b1280407 100644
                  if (!cells.pos_in(i, p0, p1)) {
                      continue;
                  }
-@@ -465,6 +755,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -465,6 +787,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                  head = new_head;
              }
          }
@@ -80567,7 +80624,7 @@ index 4ab280a61..1b1280407 100644
      }
  
      return true;
-@@ -479,6 +773,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+@@ -479,6 +805,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
      GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
      GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
  
@@ -80578,7 +80635,7 @@ index 4ab280a61..1b1280407 100644
      const auto s0 = seq_to_stream[seq_id_src];
      const auto s1 = seq_to_stream[seq_id_dst];
  
-@@ -583,12 +881,311 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+@@ -583,12 +913,311 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
          }
      }
  
@@ -80890,7 +80947,7 @@ index 4ab280a61..1b1280407 100644
  void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
      // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
      if (other) {
-@@ -712,6 +1309,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -712,6 +1341,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
          if (hparams.no_alloc) {
              GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
              ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
@@ -80910,7 +80967,7 @@ index 4ab280a61..1b1280407 100644
          } else {
              // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
              ret[buft] += ggml_backend_buffer_get_size(buf.get());
-@@ -771,6 +1381,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
+@@ -771,6 +1413,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
  llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
      llama_kv_cache::slot_info_vec_t res;
  
@@ -80930,7 +80987,7 @@ index 4ab280a61..1b1280407 100644
      struct state_t {
          slot_info sinfo; // slot info for the ubatch
  
-@@ -834,7 +1457,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+@@ -834,7 +1489,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
      return res;
  }
  
@@ -80939,7 +80996,7 @@ index 4ab280a61..1b1280407 100644
      // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
      if (other) {
          return true;
-@@ -844,16 +1467,16 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
+@@ -844,16 +1499,16 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
  
      auto * sched = lctx->get_sched();
  
@@ -80960,7 +81017,7 @@ index 4ab280a61..1b1280407 100644
  
              assert(ssrc < n_stream);
              assert(sdst < n_stream);
-@@ -976,12 +1599,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -976,12 +1631,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                  LLAMA_LOG_DEBUG("\n%s\n", ss.c_str());
              }
  
@@ -80976,7 +81033,7 @@ index 4ab280a61..1b1280407 100644
              }
          }
      }
-@@ -1023,14 +1646,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1023,14 +1678,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
  
          uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
  
@@ -80999,7 +81056,7 @@ index 4ab280a61..1b1280407 100644
              return { };
          }
  
-@@ -1041,8 +1669,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1041,8 +1701,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
          const uint32_t n_test = cont ? n_tokens : 1;
  
          while (true) {
@@ -81010,7 +81067,7 @@ index 4ab280a61..1b1280407 100644
                  head_cur = 0;
                  continue;
              }
-@@ -1100,7 +1728,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1100,7 +1760,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                  res.idxs[s].clear();
              }
  
@@ -81019,7 +81076,7 @@ index 4ab280a61..1b1280407 100644
                  //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                  return { };
              }
-@@ -1174,8 +1802,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+@@ -1174,8 +1834,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
                  cells.ext_set(idx, ext);
              }
  
@@ -81030,7 +81087,7 @@ index 4ab280a61..1b1280407 100644
              }
          }
      }
-@@ -1280,17 +1908,54 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1280,17 +1940,54 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -81088,7 +81145,7 @@ index 4ab280a61..1b1280407 100644
      }
  
      return result;
-@@ -1367,16 +2032,16 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
+@@ -1367,16 +2064,16 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
  
      k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
  
@@ -81108,7 +81165,7 @@ index 4ab280a61..1b1280407 100644
      }
  
      // store the current K values into the cache
-@@ -1399,20 +2064,20 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
+@@ -1399,20 +2096,20 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
      // we can merge dims 0 and 1
      GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_head) == v_cur->nb[1]);
  
@@ -81132,7 +81189,7 @@ index 4ab280a61..1b1280407 100644
          }
  
          return ggml_set_rows(ctx, v, v_cur, v_idxs);
-@@ -1765,12 +2430,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1765,12 +2462,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      const int64_t n_kv     = dst->ne[0];
@@ -81148,7 +81205,7 @@ index 4ab280a61..1b1280407 100644
  
      // see llama_non_causal_type
      // only the SWA cache (or the SWA layers of a single cache) become non-causal
-@@ -1788,7 +2453,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1788,7 +2485,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
          /*.n_swa            =*/ n_swa,
          /*.swa_type         =*/ swa_type,
          /*.n_kv             =*/ n_kv,
@@ -81157,7 +81214,7 @@ index 4ab280a61..1b1280407 100644
          /*.n_tps            =*/ n_tps,
      };
  
-@@ -1803,6 +2468,271 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1803,6 +2500,271 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
      //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
  }
  
@@ -81429,7 +81486,7 @@ index 4ab280a61..1b1280407 100644
  void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
      const int64_t n_tokens = ubatch->n_tokens;
  
-@@ -2247,8 +3177,8 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
+@@ -2247,8 +3209,8 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
                  io.write(&ext, sizeof(ext));
              }
  
@@ -81440,7 +81497,7 @@ index 4ab280a61..1b1280407 100644
              }
          }
      }
-@@ -2257,10 +3187,10 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
+@@ -2257,10 +3219,10 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
  void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
      const auto & cells = v_cells[cr.strm];
  
@@ -81453,7 +81510,7 @@ index 4ab280a61..1b1280407 100644
      io.write(&n_layer, sizeof(n_layer));
      io.write(&n_rot_k, sizeof(n_rot_k));
      io.write(&n_rot_v, sizeof(n_rot_v));
-@@ -2290,7 +3220,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
+@@ -2290,7 +3252,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
          }
      }
  
@@ -81462,7 +81519,7 @@ index 4ab280a61..1b1280407 100644
          for (const auto & layer : layers) {
              const uint32_t il = layer.il;
  
-@@ -2554,12 +3484,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -2554,12 +3516,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -81477,7 +81534,7 @@ index 4ab280a61..1b1280407 100644
      io.read(&n_layer, sizeof(n_layer));
      io.read(&n_rot_k_ref, sizeof(n_rot_k_ref));
      io.read(&n_rot_v_ref, sizeof(n_rot_v_ref));
-@@ -2574,7 +3504,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -2574,7 +3536,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          return false;
      }
  
@@ -81486,7 +81543,7 @@ index 4ab280a61..1b1280407 100644
          LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
          return false;
      }
-@@ -2871,7 +3801,12 @@ bool llama_kv_cache_context::apply() {
+@@ -2871,7 +3833,12 @@ bool llama_kv_cache_context::apply() {
      }
  
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
@@ -81500,7 +81557,7 @@ index 4ab280a61..1b1280407 100644
  
      return true;
  }
-@@ -2946,6 +3881,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
+@@ -2946,6 +3913,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
      kv->set_input_kq_mask(dst, ubatch, causal_attn);
  }
  

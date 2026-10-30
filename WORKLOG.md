@@ -1,5 +1,30 @@
 # WORKLOG - dated delivery records
 
+## 261030.003 (r179) -- hotfix: `--fit` could not size the window (a probe-context bug in r178's block 15)
+
+**Released as `v16-6050b467c-r179` (16 blocks; block 15 amended).**  r178 shipped a regression that made block
+15 unusable with the default `--fit on`: the fit identifies the KV's share of the device tier by the **region
+buffer type**, and the r178 promotion rule "take the region buffer only when a window is active" meant the
+fit's `no_alloc` **measurement context** declined a window, got the plain buffer, and so could not see the KV at
+all — the fit then reported *"the requested configuration does NOT fit in device memory"* and aborted the run
+**before** the window was ever created.  `LLAMA_KV_RESIDENT_CELLS=auto` and a numeric `W` were both affected, on
+any `-c` that needs a window (i.e. exactly the OOM configs the block exists for).
+
+**Fix:** the probe context takes a region buffer explicitly (`llama_kv_region_set_probe`, internal; no batch
+ever runs on a probe), so the fit sees the KV and sizes/reports the window as designed.  The runtime path is
+untouched: the region buffer is still taken **only** when a window is asked for, so a run without the knob is
+byte-identical and keeps OOMing.
+
+**Verified on the reported config** (27B Q8_0, `-c 262144`, q8_0 KV, `--fit on`): `auto` sizes **W = 119108 of
+262144** cells (3954.8 MiB VRAM + 4749.2 MiB pinned host) and the server comes up in 4 s; a numeric
+`W = 32768` reports 1088.0 MiB resident / 7616.0 MiB spilled; with no knob the fit still reports the
+over-budget configuration (r177 behaviour).  Gates re-run on the amended block: default path `5ba44647188f`,
+windowed `W=2048` `5ba44647188f`, spilling-arm prefill-logit **−0.000000 / 100.000 %**.
+
+**User-facing correction for r178 users:** `LLAMA_KV_REGION=1` is **not** the window knob (the provider is on
+by default and the O1 path is not shipped); the knob is `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`.  On r178 the
+workaround was `--fit off` + a numeric `W` (verified); r179 does not need it.
+
 ## 261030.002 (r178) -- the windowed KV ships as block 15 (Goal A of #118): an opt-in fixed-VRAM resident window with a pinned-host tail
 
 **Released as `v16-6050b467c-r178` (16 blocks, 00-15; block 15 is new).**  Promoted from the

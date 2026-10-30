@@ -1,13 +1,13 @@
 {
-  "release": "v16-6050b467c-r178",
+  "release": "v16-6050b467c-r179",
   "base": "6050b467c",
   "base_tree": "cb3251e17731887f7d17dade0676ddef50bc27e7",
   "n_blocks": 16,
-  "tip": "38ef3a767",
-  "tree": "92d087ef990593a87e652eb51b8e877ef252ae8b",
+  "tip": "1c30ec0cb",
+  "tree": "9d2e5c28afec5f5d2d5569c43528115bd4d0f1cc",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "d2f2d9ccefc25800e2cec49dc278bb3f5958e07e976e3e114b47f7afe6a0d7b9"
+    "sha256": "3db1d237510be727c5a307a45b46501f9be527b10edbfbc912c6734df9b77155"
   },
   "patches": {
     "0000-rdna-boosts-block-00-foundation-band-uniformity-Meta.patch": "3ae6e2acfd1b0533a6a837b9d4a4863646e0c1a8681f87c85852c4d8f399ee85",
@@ -25,6 +25,6 @@
     "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "dcd1069974427dd027b15c83dcb8d53a97d830cc37a920612d74a6405012b79c",
     "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "2d48f436bb4f859072b37f2160b89170f69dbfe32922539b97355a1107a39461",
     "0014-rdna-boosts-block-14-relaxed-tensor-split-mode-TEMPO.patch": "8bb88f254fc824f66b48733363b017fa9bc897959f1f2b70ce990c72130f15b7",
-    "0015-rdna-boosts-block-15-windowed-KV-a-fixed-VRAM-reside.patch": "9ad1b13a1b88c2dd3284a6e953c9a590597bd1a6f3a4ba4223d7a74053947e18"
+    "0015-rdna-boosts-block-15-windowed-KV-a-fixed-VRAM-reside.patch": "dbbecf04bd3c287711f574fe32e1b3cbedecbd1b1fc1e2c418dabf38d5746640"
   }
 }

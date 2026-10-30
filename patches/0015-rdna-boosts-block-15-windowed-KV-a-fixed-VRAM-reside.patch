@@ -1,4 +1,4 @@
-From 38ef3a767d9938e694632cbe13e4a303b9049cea Mon Sep 17 00:00:00 2001
+From b35a3354e80af42514d9caeb0796becf0d2b7784 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Fri, 30 Oct 2026 11:56:35 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: windowed KV (a fixed-VRAM
@@ -41,30 +41,37 @@ idle-slot park is REFUSED on a region-backed cache (the server then saves the sl
 clears it, which is byte-identical to the parking gate's reference) because a park moves cells above the
 region's mapped watermark through the copy engine, which faults the GPU.
 
+FIT.  `--fit` sizes and reports the window (`auto`), or honours and reports a numeric `W`: the resident/spill
+split, the VRAM saved, and the per-token read cost at the model's full context from the backend's calibrated
+link rate.  The fit identifies the KV's bytes by the region buffer TYPE, and its measurement context is a
+`no_alloc` probe that declines a window -- so the probe takes the region buffer explicitly
+(`llama_kv_region_set_probe`); without that the fit cannot see the KV, reports an over-budget config and
+aborts instead of sizing the window (the r178 regression).
+
 GATES (1 GPU, gfx1201): default path byte-identical (`5ba44647188f`) and still OOMs; VMM selftest PASS and
 FAIL with the hold disabled; windowed arms 305 `e2cea6fa6670` = plain at W=1024/2048/4096 (spilling at 1024:
-128 MiB host), `QUARANTINE=0` -> 325 `fb65430049e9` (the hazard); `--fit` report;
-`gate-ckpt-reuse.sh` / `gate-state-pipe.sh` / MTP verify widths on spilling arms; `test-backend-ops -o
-FLASH_ATTN_QSA` 26/26; `check-gpu-faults.sh` clean.
+128 MiB host), `QUARANTINE=0` -> 325 `fb65430049e9` (the hazard); `--fit` sizes `auto` (96680 of 262144
+cells, 3210 MiB resident) and reports a numeric W; `gate-ckpt-reuse.sh` / `gate-state-pipe.sh` / MTP verify
+widths on spilling arms; `test-backend-ops -o FLASH_ATTN_QSA` 26/26; `check-gpu-faults.sh` clean.
 
 Not in this block: the campaign's Goal B (a sparse attended set) and Goal C (the MTP drafter ring,
 `LLAMA_SPEC_DRAFT_WINDOW`) -- both remain campaign work -- and A1 (the superseded two-base FA read).
 Records: `wip/kv-residency/A2-MIXED-BACKING.md` (§3.7.9, §3.7.11), `HANDOVER.md`.
 ---
- common/fit.cpp                             |  165 ++-
+ common/fit.cpp                             |  181 ++-
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1208 ++++++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  122 ++
  ggml/src/ggml-cuda/ggml-cuda.cu            |  861 +++++++++++++-
  ggml/src/ggml-cuda/vendors/hip.h           |    4 +
- src/llama-ext.h                            |   20 +
- src/llama-kv-cache.cpp                     |  321 ++++++
+ src/llama-ext.h                            |   24 +
+ src/llama-kv-cache.cpp                     |  353 ++++++
  src/llama-kv-cache.h                       |   16 +
- 8 files changed, 2710 insertions(+), 7 deletions(-)
+ 8 files changed, 2762 insertions(+), 7 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
 
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 29d9dbbd0..509c0195a 100644
+index 29d9dbbd0..ca06dc053 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -105,6 +105,38 @@ struct common_fit_cache_reserve {
@@ -141,7 +148,24 @@ index 29d9dbbd0..509c0195a 100644
                  break;
              }
          }
-@@ -421,7 +465,9 @@ static void common_params_fit_impl(
+@@ -416,12 +460,26 @@ static void common_params_fit_impl(
+         }
+     };
+ 
++    // wip/kv-residency: the fit identifies the KV's share of the device tier by the KV buffer's TYPE
++    // (`ggml_backend_cuda_kv_region_is_kv_buft`), and the region buffer type is only taken when a window is
++    // actually asked for.  So a probe context created while the window is 'auto' (or a number) would get the
++    // PLAIN buffer, the KV could not be identified, and the walk below would report an over-budget config and
++    // abort instead of sizing the window.  Ask for a 1-cell window across the probe -- the buffer's SIZE and
++    // the reported KV bytes are unchanged by the window's width, only its type is -- and drop the override
++    // again straight after, so the real decision (and the real W) is still made below.
++    const bool kv_probe_on = llama_kv_region_resident_cells_requested() != 0;
++    if (kv_probe_on) {
++        llama_kv_region_set_probe(true);
++    }
++
+     // step 1: get data for default parameters and check whether any changes are necessary in the first place
+ 
      LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
      std::vector<size_t> host_expert_bytes;
      std::vector<std::pair<ggml_backend_dev_t, size_t>> host_experts;
@@ -152,7 +176,7 @@ index 29d9dbbd0..509c0195a 100644
  
      // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
      const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
-@@ -433,7 +479,7 @@ static void common_params_fit_impl(
+@@ -433,9 +491,13 @@ static void common_params_fit_impl(
          if (n_streams > 1) {
              LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                  __func__, n_ctx_max, n_streams);
@@ -160,8 +184,14 @@ index 29d9dbbd0..509c0195a 100644
 +            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, nullptr, nullptr, &kv_bytes_full);
          }
      }
++    if (kv_probe_on) {
++        llama_kv_region_set_probe(false);
++    }
++
      add_extra_memory(dmds_full);
-@@ -732,6 +778,119 @@ static void common_params_fit_impl(
+ 
+     const size_t nd = devs.size(); // number of devices
+@@ -732,6 +794,119 @@ static void common_params_fit_impl(
          return;
      }
  
@@ -2583,10 +2613,10 @@ index 7343e230d..b3b113388 100644
  #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
  #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 0079595f5..aaf646c67 100644
+index 0079595f5..9258dd0b3 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
-@@ -216,3 +216,23 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
+@@ -216,3 +216,27 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
  
  // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
  LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
@@ -2607,14 +2637,18 @@ index 0079595f5..aaf646c67 100644
 +// Reads the fit decision first, then the environment.
 +LLAMA_API uint32_t llama_kv_region_resident_cells_requested(void);
 +
++// For `--fit`'s measurement context only: take a region buffer even with no window, so the fit can identify
++// the KV's bytes.  No batch ever runs on such a context.
++LLAMA_API void llama_kv_region_set_probe(bool on);
++
 +// Hand a window (in cells) down to every context created afterwards; 0 clears it.  `common_params_fit` calls
 +// this before the real contexts exist.  One W covers every cache in the process (the A2 rule).
 +LLAMA_API void llama_kv_region_set_resident_cells(uint32_t cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index b3f3a9c87..1b1280407 100644
+index b3f3a9c87..8ad3335c1 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -18,6 +18,148 @@ static bool ggml_is_power_of_2(int n) {
+@@ -18,6 +18,173 @@ static bool ggml_is_power_of_2(int n) {
      return (n & (n - 1)) == 0;
  }
  
@@ -2645,6 +2679,25 @@ index b3f3a9c87..1b1280407 100644
 +    }();
 +    return on;
 +}
++
++// The backend's region buffer type WITHOUT a window (`cells = 0`, the O1 shape).  Only the `--fit` probe uses
++// it: the fit identifies the KV's share of the device tier by this buffer TYPE, and the probe context is a
++// `no_alloc` one (so it declines a window), which would otherwise leave the fit unable to see the KV at all --
++// and then it reports an over-budget config and aborts instead of sizing the window.  No batch ever runs on a
++// probe context, so O1's KNOWN LIMIT (the slab takes the uncommitted VRAM) cannot bite.
++typedef ggml_backend_buffer_type_t (*llama_kv_region_buft_fn)(ggml_backend_dev_t dev);
++
++static bool g_kv_region_probe = false;
++
++static ggml_backend_buffer_type_t llama_kv_region_buft(ggml_backend_dev_t dev) {
++    if (!llama_kv_region_enabled() || dev == nullptr) {
++        return nullptr;
++    }
++    auto fn = (llama_kv_region_buft_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
++            "ggml_backend_cuda_kv_region_buft");
++    return fn != nullptr ? fn(dev) : nullptr;
++}
++
 +
 +// wip/kv-residency (TODO #118) A2: the same buffer type with the windowed KV -- the newest `cells` cells of
 +// the used extent are in VRAM, everything older in pinned system RAM.
@@ -2693,6 +2746,12 @@ index b3f3a9c87..1b1280407 100644
 +}
 +
 +// UINT32_MAX = `auto`: fit sizes it (see above).
++// `--fit`'s measurement context: take a region buffer even with no window, purely so the fit can identify
++// the KV.  Never set by the runtime; a probe context allocates no window and runs no batch.
++void llama_kv_region_set_probe(bool on) {
++    g_kv_region_probe = on;
++}
++
 +uint32_t llama_kv_region_resident_cells_requested(void) {
 +    if (g_kv_resident_cells_override != 0) {
 +        return g_kv_resident_cells_override;
@@ -2763,7 +2822,7 @@ index b3f3a9c87..1b1280407 100644
  // orthonormal Walsh-Hadamard rotation matrix
  // note: res^2 == I
  static void ggml_gen_hadamard(ggml_tensor * tensor) {
-@@ -187,6 +329,93 @@ llama_kv_cache::llama_kv_cache(
+@@ -187,6 +354,93 @@ llama_kv_cache::llama_kv_cache(
  
      const bool is_mla = hparams.is_mla();
  
@@ -2857,7 +2916,7 @@ index b3f3a9c87..1b1280407 100644
      for (uint32_t il = 0; il < n_layer; il++) {
          if (!hparams.has_kv(il)) {
              LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
-@@ -243,6 +472,33 @@ llama_kv_cache::llama_kv_cache(
+@@ -243,6 +497,40 @@ llama_kv_cache::llama_kv_cache(
              buft = ggml_backend_dev_buffer_type(dev);
  
              dev_name = ggml_backend_dev_name(dev);
@@ -2887,11 +2946,18 @@ index b3f3a9c87..1b1280407 100644
 +                    buft = buft_region;
 +                    kv_region = true;
 +                }
++            } else if (g_kv_region_probe) {
++                // the fit's measurement context (see llama_kv_region_set_probe)
++                ggml_backend_buffer_type_t buft_probe = llama_kv_region_buft(dev);
++                if (buft_probe != nullptr) {
++                    buft = buft_probe;
++                    kv_region = true;
++                }
 +            }
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-@@ -798,6 +1054,33 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+@@ -798,6 +1086,33 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
      if (!can_park()) {
          return false;
      }
@@ -2925,7 +2991,7 @@ index b3f3a9c87..1b1280407 100644
      if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
          return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
      }
-@@ -1026,6 +1309,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1026,6 +1341,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
          if (hparams.no_alloc) {
              GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
              ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
@@ -2945,7 +3011,7 @@ index b3f3a9c87..1b1280407 100644
          } else {
              // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
              ret[buft] += ggml_backend_buffer_get_size(buf.get());
-@@ -1612,6 +1908,26 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1612,6 +1940,26 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -2972,7 +3038,7 @@ index b3f3a9c87..1b1280407 100644
  uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
      uint32_t result = 0;
  
-@@ -3487,6 +3803,11 @@ bool llama_kv_cache_context::apply() {
+@@ -3487,6 +3835,11 @@ bool llama_kv_cache_context::apply() {
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
      n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
  

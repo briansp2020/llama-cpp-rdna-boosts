@@ -2459,6 +2459,10 @@ byte-identical to a build without this block, including its OOM.
   (the fit then reports the resident/spill split, the per-token read cost and the depth below which nothing
   spills).  `LLAMA_KV_SPILL_RAM_PCT` (default 85 % of `MemAvailable`) caps the pinned spill and **widens the
   window** rather than letting the run be OOM-killed.
+* **`--fit` interaction:** the fit identifies the KV by the region buffer type, and its measurement context is
+  a `no_alloc` probe that declines a window — so the probe takes the region buffer explicitly
+  (`llama_kv_region_set_probe`, internal).  Without that (r178) the fit could not see the KV, reported an
+  over-budget config and aborted instead of sizing the window (fixed in r179).
 * `LLAMA_KV_REGION=0` disables the provider; `LLAMA_KV_REGION_QUARANTINE=0` is the diagnosis switch that
   reproduces the driver hazard (never ship it), and `LLAMA_KV_REGION_DEBUG/TRACE/CANARY/DUMP` are the
   instruments.  `GGML_CUDA_VMM_REGION_SELFTEST=1` runs the provider's own selftest (it must PASS, and must
