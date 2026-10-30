@@ -31,7 +31,7 @@ file, then [`README.md`](README.md) §4.0 (the goal) and §4.1 (the speed rule).
 | what | where |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, pushed to `origin` (`git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
-| release the campaign is cut against | **r174**, `v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`, 15 blocks.  **r175 is now the delivery's current release** (`tip cc1def018`) — the campaign's fork branch is based on r174 and its patches apply to r174; a promotion re-cuts against r175 |
+| release the campaign is cut against | **r174**, `v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`, 15 blocks.  **r176 is now the delivery's current release** (`release.json`) — the campaign's fork branch is based on r174 and its patches apply to r174; a promotion re-cuts against the then-current release |
 | the campaign's TODO handle | **#118** (cited as `#117` until 2026-10-29, when that number was allocated to the MoE band-predicate item — see `TODO.md` §118) |
 | campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, local only: `973e166e1` (O1 slice 1) → `6bf445b34` (O1 slice 2) → `a93dee7a9` (O3) → `e49e1cef4` (A1, superseded; also branch `wip-kv-residency-a1-two-base`) → `0e5b0d59d` (A2, mixed backing, measured) |
 | the release chain | `rdna-boosts` in `~/llama.cpp` — **still `5bdec04ab`, untouched.** Nothing in this campaign is in `patches/`, `release.json` or any block |

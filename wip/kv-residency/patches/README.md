@@ -12,8 +12,8 @@ work is backed up with the record that explains it.
 ## How to reproduce the tree
 
 The patches apply to the **r174** release tip, `5bdec04ab` (`v15-6050b467c-r174`, base `6050b467c`).
-**r175 is now the delivery's current release** (`release.json`, tip `cc1def018`); these patches are *not*
-re-cut against it, because the campaign is not promoted.  A promotion re-cuts the series from `r175`'s tip.
+**r176 is now the delivery's current release** (`release.json`); these patches are *not* re-cut against it,
+because the campaign is not promoted.  A promotion re-cuts the series from the then-current release's tip.
 
 ```bash
 cd ~/llama.cpp
@@ -32,6 +32,8 @@ If `5bdec04ab` is not available (an old checkout), re-cut it first from this rep
 |---|---|---|
 | `0001-ggml-cuda-grow-only-VMM-region-primitive.patch` | `ggml/src/ggml-cuda/ggml-cuda-vmm-region.{h,cu}`: one VA reservation, physical mapped per `unit` chunk, grown monotonically, clear-on-map, fail-soft.  The mapped extent is a **set of spans** (`grow_span`/`is_mapped`/`clear` over a per-unit bitmap), because a KV buffer lays its tensors out consecutively and a single prefix watermark would map ~the whole region even for a 4-token run.  Plus a one-shot `GGML_CUDA_VMM_REGION_SELFTEST=1` hook in `ggml_backend_cuda_init`.  Purely additive — no existing path changes. | **applied, building, selftest PASS**; gates green (see `../IMPLEMENTATION.md`) |
 | `0002-ggml-cuda-KV-region-buffer-type.patch` | `ggml_backend_cuda_kv_region_buffer_type` (ggml-cuda.cu) + the `llama_kv_cache` selection and the `apply()` grow (src/llama-kv-cache.{h,cpp}).  Env-gated OFF (`LLAMA_KV_REGION=1`), plain device buffer type as the mandatory fallback. | **applied, building**, all gates green — but see the KNOWN LIMIT in `../IMPLEMENTATION.md`: on a slab-armed MoE config the arena keeps the VRAM the KV no longer takes up front, so a run that uses most of `-c` refuses where the plain arm completes |
+
+| (A2, no patch file yet — it is on the fork branch, not re-cut) | **A2, the mixed-backing windowed KV**: one VA reservation, the KV's leading cells backed by pinned system RAM, the rest by VRAM; the mapping-table primitive, the split buffer type, the split point + loud warning.  Measured: the 27B Q8_0 `-c 262144` OOM config runs; `(used − resident) × cell_bytes / ~28 GB/s` matches to ~3 %; slab mode's arena gains 2.69 GiB and the 35B-A3B **Q8_0** expert residency goes 63.3 % → 77.0 %.  See `../A2-MIXED-BACKING.md` | **applied, building, gates green** (the design of record) |
 
 | `0004-ggml-fa-A1-two-base-KV-read-SUPERSEDED.patch` | **A1, the two-base K/V read** — the op carries `k_tail`/`v_tail` + `n_tail`, and the tile and MMA-f16 kernels select the segment where a KV tile's base is formed (the cell index space stays global).  Gated byte-identical at several window widths on both families, MTP verify widths, and a negative control.  **SUPERSEDED 2026-10-29** by mixed backing (`../MIXED-BACKING.md`: one VA range backed partly by pinned host memory, measured at 28.4 GB/s) — kept as the record and the fallback, see `../A1-TWO-BASE-KV.md` | **applied, building, all gates green** (not the A2 path) |
 
