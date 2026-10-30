@@ -1,6 +1,7 @@
 # `wip/kv-residency/patches` — the campaign's code, self-contained
 
-**Not delivery work.**  These patches belong to the `wip/kv-residency` campaign (`TODO` #117).  They are not
+**Not delivery work.**  These patches belong to the `wip/kv-residency` campaign (`TODO` **#118**; the commit messages inside say
+`#117`, which is the handle the campaign used before that number was allocated to another item).  They are not
 in `patches/`, not in `release.json`, and no block in the delivery reads them.  Nothing here may be applied to
 `~/llama.cpp`'s `rdna-boosts` branch, and folding any of it into the delivery is the promotion rule's job
 (`AGENTS.md`, WIP and promotion rules), not a hand-edit.
@@ -10,8 +11,9 @@ work is backed up with the record that explains it.
 
 ## How to reproduce the tree
 
-The patches apply to the **r174** release tip, `5bdec04ab` (`release.json`: `v15-6050b467c-r174`,
-base `6050b467c`).
+The patches apply to the **r174** release tip, `5bdec04ab` (`v15-6050b467c-r174`, base `6050b467c`).
+**r175 is now the delivery's current release** (`release.json`, tip `cc1def018`); these patches are *not*
+re-cut against it, because the campaign is not promoted.  A promotion re-cuts the series from `r175`'s tip.
 
 ```bash
 cd ~/llama.cpp

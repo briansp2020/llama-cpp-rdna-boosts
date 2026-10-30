@@ -6,7 +6,8 @@ first 30 minutes.
 **Status: OPEN — scoping complete, implementation started (2026-10-29).  Nothing here is in `patches/`, and
 nothing is scheduled.  The campaign's code lives on fork branch `wip-kv-residency` (cut from the r174 tip
 `5bdec04ab`); what exists is [`IMPLEMENTATION.md`](IMPLEMENTATION.md).**
-**`TODO` #117 is the permanent handle** for the subject (old and future records that cite `#117` mean this
+**`TODO` #118 is the permanent handle** for the subject (it was cited as `#117` before that number went to the
+MoE band-predicate item; see `TODO.md` §118) (old and future records that cite `#117` mean this
 document).  `wip/` is never applied to the fork (`AGENTS.md`, WIP rules).
 
 **Scope decision (maintainer, 2026-10-29): the subject is the KV cache.**  "Reduce the GPU-resident

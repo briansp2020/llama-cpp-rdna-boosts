@@ -1,4 +1,4 @@
-# HANDOVER — `wip/kv-residency` (TODO #117), cold-session start
+# HANDOVER — `wip/kv-residency` (TODO **#118**), cold-session start
 
 **Rewritten 2026-10-29 at the end of the fourth session.**  Read this top to bottom before touching anything;
 it is self-contained.  **The plan of record is [`O2-PLAN.md`](O2-PLAN.md)** — read it immediately after this
@@ -15,7 +15,8 @@ file, then [`README.md`](README.md) §4.0 (the goal) and §4.1 (the speed rule).
 | what | where |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, pushed to `origin` (`git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
-| release the campaign is cut against | **r174**, `v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`, 15 blocks |
+| release the campaign is cut against | **r174**, `v15-6050b467c-r174`, base `6050b467c`, tip `5bdec04ab`, 15 blocks.  **r175 is now the delivery's current release** (`tip cc1def018`) — the campaign's fork branch is based on r174 and its patches apply to r174; a promotion re-cuts against r175 |
+| the campaign's TODO handle | **#118** (cited as `#117` until 2026-10-29, when that number was allocated to the MoE band-predicate item — see `TODO.md` §118) |
 | campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, local only: `973e166e1` (O1 slice 1) → `6bf445b34` (O1 slice 2) → `a93dee7a9` (O3) |
 | the release chain | `rdna-boosts` in `~/llama.cpp` — **still `5bdec04ab`, untouched.** Nothing in this campaign is in `patches/`, `release.json` or any block |
 | patch snapshot (the backup) | `patches/0001`…`0003` + `patches/README.md` + `patches/diffstat.txt` (1076 insertions, 6 files) |
@@ -162,6 +163,10 @@ arena (the draft KV sits inside the slab's `aux_reserve`).
   reachable only through the server; `scripts/gate-ckpt-reuse.sh` drives it).
 * Streaming a `-v` run into `grep` floods: the whole generation arrives as JSON chunks.  Capture to a file and
   extract the **last** `"draft_n"/"predicted_per_second"` pair (see the O3 session's python snippet pattern).
+* **Read a delta only from within one interleaved batch** — this box's clocks drift between batches (r175's
+  docs record a 4-point disagreement on identical binaries).  The A/Bs recorded in this campaign were
+  interleaved arm-to-arm inside one session, so their deltas stand; do not compare an absolute t/s from one
+  session with one from another.
 * `scripts/check-gpu-faults.sh --since "HH:MM" --log FILE` is the fault check (defaults to "today"; the journal
   still holds 10 gfxhub faults from 2026-10-29 15:33:40 that predate this campaign's sessions).
 * Models: `/llm/models/Qwen3.8/27B/Q8_0/…` (27.1 GiB, the Goal-A target), `Qwen3.8/27B/Q4_K_XL/…` (**use this one

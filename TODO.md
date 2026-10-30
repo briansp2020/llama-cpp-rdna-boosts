@@ -20,7 +20,7 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | **117** | `llama_model_moe_cache_band()` reports a device band with no host experts on single-device / `-sm layer` configs, so the n-gram clamp and every band-bounded multi-slot alignment fire without an arena | correctness of a predicate / perf | **OPEN** (2026-10-29, found in the PR #244 v5 assessment on r175).  The API contract is "0 when the cache is not active", but the CUDA iface returns the device band whenever `moe_cache_enabled()` (true by default via AUTO, with no registered table) and `llama_model_moe_cache_band()` falls back to `model->devices` when `moe_host_expert_bytes` is empty.  Measured on the dense 27B, 1 GPU: `ngram-mod --spec-ngram-mod-n-max 64` logs `draft length 64 -> 15` with no routed experts at all (`MOE_EXPERT_CACHE_MIB=0` does not), and a DFlash2 3-slot arm was band-bounded to width 4 and lost 7.5 % wall.  Detail in §117 |
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
 
-| **117** | windowed KV cache ("Strata-style"): a **fixed VRAM window** instead of `O(-c)`, so (A) a 27B Q8_0 or 35B-A3B Q6_K can run a large context on one 32 GiB card instead of OOM, and slab mode gets the freed VRAM for the decode arena; (B) a sparse attended set (QSA/DSA) streams cheaply; (C) the drafter ring (campaign `wip/kv-residency/`) | performance / memory | **OPEN — the ask is Goal A, order A -> B/C. `O2-PLAN.md` is the plan of record.**  **O1 (`--kv-grow`) is PARKED** (built, measured, not on the path).  **O3 is built and is goal C (last).**  Goal A's failure is measured on this box (`cudaMalloc failed: out of memory` at `-c 262144`, 27B Q8_0) and it is NOT Flash-Next-only |
+| **118** | windowed KV cache ("Strata-style"): a **fixed VRAM window** instead of `O(-c)`, so (A) a 27B Q8_0 or 35B-A3B Q6_K can run a large context on one 32 GiB card instead of OOM, and slab mode gets the freed VRAM for the decode arena; (B) a sparse attended set (QSA/DSA) streams cheaply; (C) the drafter ring (campaign `wip/kv-residency/`) | performance / memory | **OPEN — the ask is Goal A, order A -> B/C. `O2-PLAN.md` is the plan of record.**  **O1 (`--kv-grow`) is PARKED** (built, measured, not on the path).  **O3 is built and is goal C (last).**  Goal A's failure is measured on this box (`cudaMalloc failed: out of memory` at `-c 262144`, 27B Q8_0) and it is NOT Flash-Next-only.  `#117` is the MoE band predicate (§117) — see §118 on the number |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -289,7 +289,12 @@ so the usual coherence + arch sweeps plus a `-ncmoe` n-gram arm.  Record: `WORKL
 
 ---
 
-## 117. Windowed / streamed KV cache — scope decision 2026-10-29 (campaign `wip/kv-residency/`)
+## 118. Windowed / streamed KV cache — scope decision 2026-10-29 (campaign `wip/kv-residency/`)
+
+**Number note (2026-10-29).**  The campaign's records cited "TODO #117" for three sessions, but `TODO.md`
+never had a `#117` row — the reference was dangling.  Item **117** was then allocated to the separate MoE
+band-predicate finding (§117) in a concurrent session, so the campaign takes the next free handle, **#118**.
+Old `wip/kv-residency/` text (and the patches' commit messages) still say #117; they mean this item.
 
 **The ask was, and is, a Strata-style windowed KV cache: the KV's VRAM footprint is a *fixed window*
 (host master + residency page table + in-graph resolve), so a large `-c` no longer costs VRAM that the
