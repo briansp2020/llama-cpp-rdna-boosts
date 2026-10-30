@@ -121,12 +121,20 @@ here is a 2000-token decode after a 5256-token prompt.
 | 35B-A3B Q8_0 `-ncmoe 40` window `W=32768` | 27 922 (**+2.62**) | 85.5 % | 382 t/s | 67.4 (**+1.7 %**) |
 | 35B-A3B Q8_0 `-ncmoe 40` **bf16 KV** plain | 22 822 MiB | 69.9 % | 375 t/s | 65.4 t/s |
 | 35B-A3B Q8_0 `-ncmoe 40` **bf16 KV** window | 27 922 (**+5.10**) | 85.5 % | 373 t/s | 66.2 (**+1.2 %**) |
-| **122B-A10B Q4_K_XL** `-ncmoe 40` plain | 8 746 MiB | **15.6 %** | 220 t/s | 21.8 t/s |
-| **122B-A10B Q4_K_XL** `-ncmoe 40` window `W=16384` | 12 026 (**+3.18**) | **21.5 %** | 233 t/s | 24.0 (**+10.1 %**) |
+| 122B-A10B Q4_K_XL `-ncmoe 40` plain | 8 746 MiB | **15.6 %** | 220 t/s | 21.8 t/s |
+| 122B-A10B Q4_K_XL `-ncmoe 40` window `W=16384` | 12 026 (**+3.18**) | **21.5 %** | 233 t/s | 24.0 (**+10.1 %**) |
+| **122B-A10B Q4_K_XL `-ncmoe 48` (ALL 48 layers) plain** | 19 661 MiB | 29.3 % | 202.8 t/s | 22.9 t/s |
+| **122B-A10B Q4_K_XL `-ncmoe 48` window `W=16384`** | 22 807 (**+3.15**) | **34.0 %** | **220.3 t/s** | **24.7 t/s (+7.9 %)** |
 
-**The arena's value is largest where the arena is smallest**: the 122B (56 GiB of host experts, 15.6 % of it
-cached) gains **+10.1 %** decode from +3.18 GiB, while the 35B-A3B — already at 70-77 % — gains 1-2 %.  Prefill
-moves in the same direction (+2 to +6 %) because the prefill staging hits the arena too.  122B numbers:
+`-ncmoe` **must** be the model's full layer count when the point is the arena: at `-ncmoe 40` eight layers of
+experts (218.6 MiB per expert across the host layers) still sit on the device, so the arena is only 8.7 GiB of
+the 65.5 GiB host set (15.6 %); at `-ncmoe 48` it is 19.7 GiB (29.3 %).  That is the config that matters for
+this model, and it is also its fastest: **24.7 t/s** with the window vs 22.9 plain.
+
+**The arena's value is largest where the arena is smallest**: the 122B gains **+7.9 to +10.1 %** decode from
+~3.2 GiB (15.6-34 % of its host set cached), while the 35B-A3B — already at 70-77 % — gains 1-2 %.  Prefill
+moves the same way and further on the 122B (**+8.6 %** at `-ncmoe 48`), because the prefill staging is what
+hits the arena hardest.  122B numbers:
 48 layers, 256 experts, 8 used, `n_embd_k_gqa` 512, 55 974 MiB of host experts, 218.6 MiB per expert across
 its 40 host layers.
 
