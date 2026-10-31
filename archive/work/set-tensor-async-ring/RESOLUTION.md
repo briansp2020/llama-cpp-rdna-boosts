@@ -1,7 +1,8 @@
-# RESOLUTION — `set-tensor-async-ring` (PR #194) — DECLINED at r98
+# RESOLUTION — `set-tensor-async-ring` (PR #194) — DECLINED at r98, CLOSED 2026-10-31
 
-**Status: reviewed 2026-10-20 and NOT promoted.**  The submitted patch plus README are kept here because
-the diagnosis is worth keeping; the change is being revised by the submitter.
+**Status: reviewed 2026-10-20 and NOT promoted; re-assessed on r186 (2026-10-31) and the PR is CLOSED as
+not planned** — see "Final assessment" at the bottom, which supersedes the r98 attribution below.  The
+submitted patch plus README are kept here because the diagnosis is worth keeping.
 
 ## What was proposed
 
@@ -40,7 +41,58 @@ Two further notes given to the submitter: the per-context ring takes no lock (th
 replaces takes `d.mtx`), and `cudaEventSynchronize` on a half switch is a host-blocking wait inside the
 upload path that r90's ring does not have.
 
-## Re-entry conditions
+## Re-entry conditions (r98)
 
 Scope the drain to the destination-overlap case only (`ggml_cuda_async_input_set` already does exactly
 that) and re-run this table plus the self-KLD control.  Nothing else in the patch needs to change.
+
+---
+
+## Final assessment — r186, 2026-10-31 (PR CLOSED)
+
+The submitter never replied (no comment, no new commit; the branch stayed at `325224590`).  One last pass
+re-cut the patch on the current tree (it applies cleanly to `8f9dad0be`, offsets only) and also built the
+r98 re-entry condition, i.e. the drain scoped to a destination overlap with the copy **fenced** on the
+event that issue recorded (issuing only the overlapping origins, so the rest of the queue keeps batching).
+Both arms were measured against the same baseline, from the same build directory (bin dirs kept per arm).
+
+**Set-up.**  gfx1201, ROCm 10.1.0, one job at a time, `ROCBLAS_USE_HIPBLASLT=0` on every fresh process,
+3 interleaved pairs, seed 42, temp 0, `prompts/prose-rdna-boosts.txt`, `-n 400`, `llama-cli -lv 3`.
+
+| config | base | PR as submitted | PR + scoped drain |
+|---|---:|---:|---:|
+| Flash-Next GSQ-RCO-IQ3_XXS + shared Q8_0 MTP, 2 GPU `-sm tensor -ncmoe 10`, MTP n3, q8_0 K/V | **101.12** | 99.65 (**-1.5 %**) | 99.27 (**-1.8 %**) |
+| 35B-A3B UD-Q4_K_M, 2 GPU `-sm tensor -ncmoe 10`, MTP n3, q8_0 K/V | **199.66** | 199.15 (-0.3 %) | 196.95 (-1.4 %) |
+| dense 27B UD-Q4_K_XL, 1 GPU, plain, 8K | 30.69 | 30.66 | 30.72 |
+
+**Correctness holds** in every arm: greedy text byte-identical across all three arms on the Flash-Next
+cell (1775 chars `52ccd3394a63`), the 35B-A3B cell (1401 chars `aaef5122fe19`) and a dense 4B cell (889
+chars `fbb8c4ac4d98`); no GPU faults.  The r90 snapshot guarantee is not at risk, exactly as the
+submitter measured.
+
+**The r98 attribution was wrong, and this pass corrects it.**  The drain is the *trigger*, not the cost:
+scoping it does not recover the loss (it is slightly worse on the 35B-A3B cell, where the extra
+compute-stream fence and a queue that no longer drains early are both paid).  The cost is that these
+uploads leave the graph-input ring's **batched** path (r89 / PR #182) and become one `cudaMemcpyAsync`
+per upload.  Isolated with the same build and only `GGML_CUDA_ASYNC_INPUT_BATCH=0` on the Flash-Next cell:
+`base` 101.12 · `PR` 99.65 · `base + BATCH=0` (the per-copy path the PR replaces) **96.96** ·
+`PR + BATCH=0` 98.91.  So the submitter's `+2.7 %` is real — it is measured against a tree whose other
+host-side work drains that queue — but it lands *between* the per-copy and the batch path, and the batch
+path is what this delivery ships.
+
+**Two defects in the patch itself** (found while building the scoped arm):
+
+1. **The pinned ring can be freed under an in-flight copy.**  `snap_half_ev[h]` is recorded when the ring
+   *leaves* half `h`, so the half currently being filled has copies that no event covers; the destructor
+   synchronises the two stored events and then `cudaFreeHost(snap_ring)`s a buffer an H2D copy may still
+   be reading.  Fix (used in the scoped arm): record `snap_half_ev[snap_half]` on `stream()` before the
+   syncs, or synchronise the stream first.
+2. **No lock on the per-context ring**, where the per-device ring it replaces takes `d.mtx`; and
+   `cudaEventSynchronize` on a half switch is a host-blocking wait inside the upload path (r98 noted
+   both).
+
+**Outcome.**  CLOSED as not planned (2026-10-31) with the table above on the PR.  What would reopen it is
+a measurement showing the queue is actually drained between upload and graph **on a delivery config**
+(`GGML_CUDA_ASYNC_INPUT_DEBUG=1` / `rocprofv3` counting per-token drains that issued queued uploads) — and
+the fix for that is to stop whatever drains it, not to bypass the ring, because both forms of this change
+land below the batch path.

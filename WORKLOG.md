@@ -1,5 +1,59 @@
 # WORKLOG - dated delivery records
 
+## 261031.004 (r186) -- PR #194 (`set-tensor-async-ring`) re-assessed on the r186 tree and CLOSED; no delivery change
+
+**No patch, no release, no `release.json` change** -- the delivery set stays at `v16-6050b467c-r186` (16
+blocks, tip `8f9dad0be`, tree `0bd26dbe`).  Record: `archive/work/set-tensor-async-ring/`
+(`RESOLUTION.md`, "Final assessment").
+
+**Why re-open a declined PR.**  r98 declined it (-1.2 % / -2.3 % on two MoE tensor-split MTP cells) and
+asked the submitter to scope the queue drain.  Nine days later the PR was still a draft with **no reply
+and no new commit** (branch `325224590`), so it got one last look before closing: the patch was re-cut on
+the current tree (applies cleanly to `8f9dad0be`, offsets only) and **the r98 re-entry condition was
+implemented here** -- drain only where a queued upload's destination overlaps the copy, issuing only the
+overlapping origins and fencing the copy on the event that issue recorded (so the rest of the queue keeps
+batching), plus a fix for the ring teardown (below).
+
+**Measured** (gfx1201, ROCm 10.1.0, one job at a time, `ROCBLAS_USE_HIPBLASLT=0`, 3 interleaved pairs per
+arm, seed 42, temp 0, `prompts/prose-rdna-boosts.txt`, `-n 400`, all arms from the same build directory
+with the `bin/` of each kept):
+
+| config | base (r186) | PR as submitted | PR + scoped drain |
+|---|---:|---:|---:|
+| Flash-Next GSQ-RCO-IQ3_XXS + shared Q8_0 MTP, 2 GPU `-sm tensor -ncmoe 10`, MTP n3, q8_0 K/V | **101.12** | 99.65 (**-1.5 %**) | 99.27 (**-1.8 %**) |
+| 35B-A3B UD-Q4_K_M, 2 GPU `-sm tensor -ncmoe 10`, MTP n3, q8_0 K/V | **199.66** | 199.15 (-0.3 %) | 196.95 (-1.4 %) |
+| dense 27B UD-Q4_K_XL, 1 GPU, plain, 8K ctx | 30.69 | 30.66 | 30.72 |
+
+Correctness is intact in every arm -- greedy text byte-identical on the Flash-Next cell (1775 chars
+`52ccd3394a63`), the 35B-A3B cell (1401 chars `aaef5122fe19`) and a dense 4B cell (889 chars
+`fbb8c4ac4d98`), no GPU faults -- so the change is numerics-neutral and r90's `set_tensor_async` snapshot
+guarantee is kept, exactly as the submitter measured (and as r98 verified with the FINDINGS-2026-10-19b
+self-KLD control, 100.000 % at `-ub 8` and `-ub 1`).
+
+**The r98 attribution was wrong and is corrected here.**  The drain is the *trigger*, not the cost:
+scoping it does not recover the loss, and on the 35B-A3B cell it is worse than the unconditional drain.
+The cost is that these uploads leave the graph-input ring's **batched** path (r89 / PR #182) and become
+one `cudaMemcpyAsync` per upload.  Isolated with the same build and only `GGML_CUDA_ASYNC_INPUT_BATCH=0` on
+the Flash-Next cell: `base` 101.12 · `PR` 99.65 · `base + BATCH=0` (the per-copy path the PR replaces)
+**96.96** · `PR + BATCH=0` 98.91.  The submitter's `+2.7 %` therefore reproduces -- against a tree whose
+other host-side work drains that queue -- and it still lands *between* the per-copy and the batch path.
+No delivery config drains the queue between upload and graph, so the premise of the change does not arise
+here.
+
+**Two defects in the patch itself** (found building the scoped arm; both are in the submitter's file, none
+reachable in the delivery): (1) the pinned ring can be freed under an in-flight copy -- `snap_half_ev[h]`
+is recorded when the ring *leaves* half `h`, so the half being filled has copies no event covers, and the
+destructor synchronises the two stored events and then `cudaFreeHost`s the ring (fix: record
+`snap_half_ev[snap_half]` on `stream()` before the syncs, or synchronise the stream first); (2) the
+per-context ring takes no lock where the per-device ring takes `d.mtx`, and `cudaEventSynchronize` on a
+half switch is a host-blocking wait inside the upload path.
+
+**Outcome.**  PR **CLOSED as not planned** with the table above posted to the submitter, stating what
+would reopen it: a measurement showing the queue is actually drained between upload and graph **on a
+delivery config** (`GGML_CUDA_ASYNC_INPUT_DEBUG=1` / `rocprofv3` counting per-token drains that issued
+queued uploads) -- and the correct fix for that is to stop whatever drains it, not to bypass the ring.
+`wip/CAMPAIGNS.md` records the closure; nothing is added to `TODO.md` (a closed item is a WORKLOG entry).
+
 ## 261031.003 (r186) -- the conv fusion's single-device gate is gone (block 10): +5.7 % dense / +3.0 % MoE decode on 3 GPU `-sm tensor`, bit-identical
 
 **Released as `v16-6050b467c-r186` (16 blocks; block 10 amended).**  Canonical tip

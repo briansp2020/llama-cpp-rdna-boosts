@@ -297,6 +297,21 @@ under its own `wip/rdna4-band-fetch-ahead/`, and that branch is now merged onto 
 `RESOLUTION.md` records the promotion), so nothing was ever listed here and no stub was created or
 removed.  See `WORKLOG.md` 261020.010.
 
+**Closed as not planned (2026-10-31, r186 re-assessment).**  PR #194 (`@briansp2020`,
+`set-tensor-async-ring`) was **not** promoted, and the submitter never replied to the r98 review (no
+comment, no new commit).  Re-cut on the r186 tree it is still **-1.5 %** (Flash-Next 2 GPU tensor
+`-ncmoe 10`, MTP n3, 101.12 -> 99.65 t/s) and -0.3 % (35B-A3B `-ncmoe 10`, MTP n3), neutral on dense 27B;
+correctness is intact (greedy text byte-identical on all three cells).  **The r98 attribution is corrected
+here: the drain is the trigger, not the cost.**  The r98 re-entry condition was implemented (drain scoped to
+a destination overlap, with the copy fenced on the issued batch) and does **not** recover it (99.27, and
+196.95 on the 35B-A3B cell, i.e. worse than the unconditional drain): the cost is that these uploads leave
+the graph-input ring's batched path (r89 / PR #182) and become one `cudaMemcpyAsync` per upload.  Isolated
+with `GGML_CUDA_ASYNC_INPUT_BATCH=0` on the Flash-Next cell: base 101.12, PR 99.65, **base per-copy path
+96.96**, PR + `BATCH=0` 98.91 — so the submitter's +2.7 % is real against a *drained* queue, which no
+delivery config has.  Also found in the patch: the pinned ring can be freed under an in-flight copy (the
+current half's event is only recorded when the ring *leaves* it), and the per-context ring takes no lock.
+Record: `archive/work/set-tensor-async-ring/` (`RESOLUTION.md`, "Final assessment").
+
 **Declined (r98, 2026-10-20).**  PR #194 (`@briansp2020`, `set-tensor-async-ring`) was reviewed and **not**
 promoted.  It keeps r90's `set_tensor_async` snapshot guarantee (verified: 100.000 % on the FINDINGS-2026-10-
 19b self-KLD control at `-ub 8` and `-ub 1`), but its per-context ring drains the graph-input upload queue
