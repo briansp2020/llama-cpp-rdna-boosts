@@ -27,8 +27,11 @@ Shipped description: `patches/README.md` "Block 15", `ENVIRONMENT.md` §17, `WOR
   headline numbers at 103k depth with MTP depth 4: resident-dense **60.2**, sparse+resident **47.9**, **pool
   48.3** (4104 pages = 16 416 cells/layer, **204 MiB**), hit rate **89.7 %**, fill cost ~0.05 ms/step.  **So the
   pool lands ON the sparse ceiling and the remaining -20 % is the SPARSE ARM, not the KV's placement** -- a
-  better page policy can recover ~0.05 ms/step, no more.  Next: step 3 (policy, expected to be a no-op), B3
-  (the arena half at `-n 2000`), then the maintainer's promotion decision.
+  better page policy can recover ~0.05 ms/step, no more.  **B3 (the arena half) is measured as well** (`-n 2000`,
+  `-c 131072`, `-ncmoe 48`): arena 23 579.8 -> 25 018.6 MiB (**+1.44 GiB**, +18 slots/table, expert hit 96.26 ->
+  97.02 %, cold reads 42.0 -> 31.6 GiB), plain decode 43.1 -> 33.0 t/s (the sparse arm's cost; `identity fast path
+  ON` = 0 in both arms).  What is left: step 3 (the policy, expected to be a no-op) and the maintainer's
+  promotion decision.
 
 
 * **B1 — the placement matrix.**  A **resident** KV wants the **dense** decode arm (VRAM is ~10x the link, and the
