@@ -1,5 +1,73 @@
 # WORKLOG - dated delivery records
 
+## 261031.002 (docs/gates) -- PR #177 closed as superseded (it is already in r183), and the width gate it was held by is now a release gate
+
+**No delivery change, no release, no patch re-cut** (`release.json` untouched, still `v16-6050b467c-r185`).  Docs
+and CI-gate only.  Closes a four-release-old open question with a measurement instead of an assumption.
+
+### PR #177 (`gdn-conv-snapshot-fold`, `@briansp2020`) -- CLOSED, superseded
+
+Assessed for a last integration attempt and found **fully superseded**, three ways:
+
+1. **It carries no code.**  Its single commit (2026-10-17, never updated) adds two files under
+   `wip/gdn-conv-snapshot-fold/` — one `format-patch` + a `README.md` — i.e. a `wip/` proposal, not a fork
+   patch.  Both are **byte-identical** to what is already committed at
+   `archive/work/gdn-conv-snapshot-fold/` (sha256 `21b2337048e5…` and `65ceb2463119…`), where they went when the
+   campaign closed (the no-stub rule).
+2. **The change itself shipped in r183**, as block 10, through the submitter's *own* PR #256 patch `0001` —
+   which is a strict **superset**: same `gdn_conv_snap_safe` byte-span check, same `gdn_conv_snap_args`, same
+   `GGML_CUDA_DISABLE_GDN_CONV_SNAP`, plus the batched-copy run stop at a folded snapshot `CPY`
+   (`cpy-batch.cu`) that #177 lacked, without which `cpy_batch` swallows one.  All 98 substantive added lines
+   of #177 are present in the tree (3 in extended form, carrying the later `norm`/`state_ids`/`state_row`
+   args), and `patches/0010-…-block-10-….patch` carries all of it.
+3. **The blocker that held it is gone.**  #177 was declined at r81 and r100 for 35B-A3B run-to-run
+   nondeterminism at P=3584, traced then to that model's prefill being sensitive to the launch sequence
+   itself (TODO #75) rather than to the fold — the fold's write was proven byte-exact.  Re-run on the shipped
+   r185 build (gfx1201, 1 GPU, HIP graphs on, `test-logits-width-probe`, the fold firing per
+   `GDN_CONV_DIRECT … snap=1 n_snap=1`):
+
+   | model | depth | folds on (`W8` / row-0) | vs kill switch | runs |
+   |---|---|---|---|---|
+   | 35B-A3B UD-Q4_K_M | P=256 | `efb1ac6b4a863719` / `aa6057acd67bd109` | identical | 3/3 |
+   | 35B-A3B UD-Q4_K_M | P=3584 | `36026b682d8aa1fc` / `23f86e866c6e5804` | identical | 3/3 |
+   | 35B-A3B UD-Q4_K_M | P=4096 | `493a0a43ad3927cd` / `bbbfff452c95a46a` | identical | 2/2 |
+   | 27B UD-Q4_K_M (dense) | P=256 / P=3584 | `b43fb4ee01d6b7ab` / `cb7acb2f9013340d` | identical | 3/3 |
+
+   `width_purity=PASS` (worst maxdiff 0) in every arm; `check-gpu-faults.sh` clean.  So #177's re-entry
+   condition is met — by a build that already contains it.  Closed with that evidence on the PR, credited to
+   the submitter and noting the one thing never used from it (the `GGML_CUDA_CONV_FUSION_MULTI=1` 2x R9700
+   bit-identity data point; the direct conv's multi-device gate still stands, blocked on the 3x R9700
+   `-sm tensor` divergence).  Detail appended to `archive/work/gdn-conv-snapshot-fold/RESOLUTION.md`.
+
+### The gap this exposed, and the gates that now close it
+
+**r183 shipped these four folds with only two arms: greedy text and `gate-prefill-logits.sh --ub 1`.**  Both are
+*value* instruments, and a fold is a **launch-order** change: it splits or elides launches on multi-token steps
+and touches no arithmetic.  The instrument that held #177 out for four releases — `test-logits-width-probe` at
+the verify widths, read **across runs** — was never run on the shipped folds.  That is the same
+"that the probe ran is not that it reached the code" class as r126/r134 (`GREEDY-PURITY.md` §51), one level up:
+the probe was the right instrument and simply was not pointed at the fold.
+
+* **`MANIFESTS.md` release gate 14** (new): the width probe at `P=3584` and `P>=4096` on a dense *and* a MoE
+  GDN model, default vs each of the four kill switches, run-to-run stable across `>= 3` runs, bit-identical to
+  every kill switch, and with `GGML_CUDA_CONV_DEBUG=1` proving the fold **fired** — a run that never logs
+  `snap=1` is a vacuous pass and **fails**, not skips (the `n_snap=1` field also appears with `snap=0`, so the
+  match is on the `snap=` field).
+* **`MANIFESTS.md` block 10 per-block row** gained the same arm, so a block-level review sees it too.
+* **`scripts/validate-gpu.sh` step 4c** runs it automatically on tier-2 CI when the applied tree touches
+  `gdn-conv`/`cpy-batch`/`ggml-cuda-try-fuse`, so it is no longer a promise in a document.  Arms: `folds on`
+  vs `GGML_CUDA_DISABLE_GDN_CONV_SNAP=1` + `GGML_CUDA_FUSE_GDN_CONV_GATHER=0` +
+  `GGML_CUDA_FUSE_GDN_CONV_DECODE=0` + `GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0`; `GDN_WIDTH_MODELS` /
+  `GDN_WIDTH_P` / `GDN_WIDTH_RUNS` / `SKIP_GDN_WIDTH` are the knobs.  Cheap: **9 s** for `P=4096`, 3 s for
+  `P=256` on gfx1201 (8 widths x the prefill, so ~30 s per model for both depths and 3 runs).  Exercised here
+  on all four paths — pass, fold-off mismatch detection, non-GDN model (fails as vacuous), missing path (skips).
+* **`AGENTS.md`** (the r183 critical-facts bullet) and **`GREEDY-PURITY.md` §73** (new rule 6 + the judgement
+  paragraph + the index row) now say the fold is judged by the width probe, and why text/KLD cannot do it.
+
+**What this does *not* change:** no kernel, no default, no env var, no block, no `release.json` value — so there
+is nothing to re-gate and no new tag.  `scripts/validate-set.sh` still validates the same 16 patches (the
+`release.json` hashes are byte-identical), and `bash -n scripts/validate-gpu.sh` is clean.
+
 ## 261031.001 (r185) -- the multi-slot verify WIDTH bound (block 02): +14.2 to +31.8 % on the default recommended speculator, and PR #169 closed on the measurement
 
 **Released as `v16-6050b467c-r185` (16 blocks; block 02 amended).**  Canonical tip

@@ -110,3 +110,49 @@ runs each at P=256 and P=3584 with graphs on, on 35B-A3B **and** the dense 27B. 
 itself needs to change: the kill switch, the byte-span check and the `n_snap`/`snap_ok` guards all behaved
 as specified, the dense result is bit-identical, and the 27B +1.0-1.2 % MTP decode win is real.  Record:
 `WORKLOG.md` 261020.014 (r100), comment on the PR.
+
+# Third review (2026-10-31, r185 tree) -- CLOSED: superseded, and the blocker is gone
+
+Re-opened for one last integration attempt and closed the same session, because there is nothing left to
+integrate.  Three independent reasons, any one of which would be enough:
+
+1. **This PR carries no code.**  Its single commit (2026-10-17, never updated) adds two files under
+   `wip/gdn-conv-snapshot-fold/` -- one `format-patch` plus a `README.md` -- i.e. a `wip/` proposal, not a
+   fork patch.  Both files are **byte-identical** to the copies already committed in this directory
+   (sha256 `21b2337048e53151b3300da73514c8e97ecb7792e3d7063e05b1c1c8c7d7858d` for the patch,
+   `65ceb24631190f22a0e145495152414487856239be42a37d91156c46aa3d6510` for the README).  They are here, and
+   not in `wip/`, because the campaign closed and the no-stub rule moved them.
+2. **The change shipped in r183** as block 10, via the submitter's own PR #256 patch `0001`, which is a
+   strict **superset**: same `gdn_conv_snap_safe` byte-span check, same `gdn_conv_snap_args`, same
+   `GGML_CUDA_DISABLE_GDN_CONV_SNAP`, *plus* the batched-copy run stop at a folded snapshot `CPY`
+   (`cpy-batch.cu: if (ggml_cuda_gdn_conv_snap_try_fuse(cgraph, j)) break;`) that this PR lacked -- without
+   it `cpy_batch` can swallow a folded snapshot `CPY`.  All 98 substantive added lines of the PR's patch are
+   present in the tree (three of them in extended form, carrying the r183 `norm` / `state_ids` /
+   `state_row` arguments), and `patches/0010-...-block-10-....patch` carries the lot.
+3. **The blocker recorded above is gone.**  Re-measured on the shipped r185 build (gfx1201, 1 GPU, HIP
+   graphs on) with `test-logits-width-probe`, the fold firing per `GGML_CUDA_CONV_DEBUG=1`
+   (`GDN_CONV_DIRECT C=8192 T=256 tail_from=256 silu=1 snap=1 n_snap=1`, and `snap=0` with the kill
+   switch):
+
+   | model | depth | folds on `W8` / row-0 | vs `GGML_CUDA_DISABLE_GDN_CONV_SNAP=1` | runs |
+   |---|---|---|---|---|
+   | 35B-A3B UD-Q4_K_M | P=256 | `efb1ac6b4a863719` / `aa6057acd67bd109` | identical | 3/3 |
+   | 35B-A3B UD-Q4_K_M | P=3584 | `36026b682d8aa1fc` / `23f86e866c6e5804` | identical | 3/3 |
+   | 35B-A3B UD-Q4_K_M | P=4096 | `493a0a43ad3927cd` / `bbbfff452c95a46a` | identical | 2/2 |
+   | 27B UD-Q4_K_M (dense) | P=256 | `b43fb4ee01d6b7ab` / `44fd7c8f3b062cfd` | identical | 3/3 |
+   | 27B UD-Q4_K_M (dense) | P=3584 | `cb7acb2f9013340d` / `0acd13d1c5084da2` | identical | 3/3 |
+
+   `width_purity=PASS` (worst maxdiff 0) in every arm, both models, all three depths;
+   `scripts/check-gpu-faults.sh` clean.  The r100 failure mode (`2b1caf3bd5cfe4e3` x3 /
+   `c2336484ebf6dab2` x2 at P=3584) does not reproduce: that was the TODO #75 launch-sequence sensitivity
+   of this model's prefill, not this fold, exactly as the node-by-node hash above said.
+
+**What was never used.**  The multi-device data point: `GGML_CUDA_CONV_FUSION_MULTI=1` was bit-identical on
+2 x R9700 for 27B tensor/layer, 35B-A3B tensor and the hybrid model.  The direct conv's single-device gate
+still stands, because of the 3 x R9700 `-sm tensor` divergence that has never been root-caused; that
+divergence, not this PR, is what keeps the r183 folds off the recommended multi-GPU server shape.
+
+**Outcome: CLOSED as superseded** (comment on the PR, credited).  The gate gap it exposed -- r183 shipped
+these folds with only text + the `-ub 1` prefill-logit arm, both blind to a launch-order change -- is closed
+by `MANIFESTS.md` release gate 14, the block-10 per-block row, `scripts/validate-gpu.sh` step 4c,
+`GREEDY-PURITY.md` §73 rule 6 and the `AGENTS.md` r183 bullet.  Record: `WORKLOG.md` 261031.002.

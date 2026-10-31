@@ -134,7 +134,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§70** | a second sequence in a batch is a **stride** in the mask predicate, not a new mask: sequence `k`'s cells and tokens shift by `k * 2^23`, so `tok_lo <= cell_pos <= tok_hi` stays exact with no kernel change — but only with one KV stream, one sequence per token, **no cell carrying two of the batch's sequences** (the shared-cell counter is a fast path, never the semantics), positions below the stride, and > 32 tokens; the reserve latch is a reserve optimization only, because `kq_mask_derivable()` re-runs per ubatch | doctrine + measured (r172, PR #247; `benchmarks/2026-10-29-derived-kq-multiseq.md`) |
 | **§71** | a graph-reorder pass is pure only while it moves nodes alone: enumerate the positional consumers (a matcher that anchors at a fixed index and returns a skip count) and exclude every input they depend on, judge it at three ubatch widths, and quote the GGUF with any claim because a reorder's reach is a model property | doctrine + measured (r180, PR #252; `benchmarks/2026-10-30-graph-order-0003-r180.md`) |
 | **§72** | a fold that merges two launches with an in-kernel barrier is pure only where it reproduces the first launch's arithmetic **and** keeps writing its output: the predicate must re-check the dispatcher's route in its own order, the width is the gate (one logits row), the elided launch's store stays, and the cross-block counter is a dedicated slot | doctrine + fix (r182, PR #253; `benchmarks/2026-10-30-router-topk-fold.md`) |
-| **§73** | a fold that elides graph nodes is pure only while every reader it could serve is accounted for: an elided store's destination must be span-checked and reproduced exactly, an elided copy's reader must be the kernel (preload the row before writing it back), a compute-time disjunctive predicate must stay a **superset** of the structural one `graph_optimize` uses, a fold that stores no intermediate needs a whole-graph reader count, and reach is a model property (single-device only, BF16/F32 gate weights) | doctrine + fix (r183, PR #256; `benchmarks/2026-10-30-gdn-decode-folds.md`) |
+| **§73** | a fold that elides graph nodes is pure only while every reader it could serve is accounted for: an elided store's destination must be span-checked and reproduced exactly, an elided copy's reader must be the kernel (preload the row before writing it back), a compute-time disjunctive predicate must stay a **superset** of the structural one `graph_optimize` uses, a fold that stores no intermediate needs a whole-graph reader count, reach is a model property (single-device only, BF16/F32 gate weights), and a launch-order-only fold is judged by the **width probe across runs**, never by text or the single-token KLD | doctrine + fix (r183, PR #256; `benchmarks/2026-10-30-gdn-decode-folds.md`) |
 
 ---
 
@@ -2438,6 +2438,17 @@ kinds, and each has its own failure mode.
    every node's `src[]` and `view_src`), and it refuses F16 weights (whose `mul_mat_vec_f` can take a *half*
    accumulator, which the fused path does not reproduce).  It reproduces `op_sigmoid` verbatim and keeps
    `#pragma clang fp contract(off)` on `y + x*s`, the directive `sigmoid_mul_add_f32` carries.
+6. **A launch-order-only change is judged by the width probe, never by text or the single-token KLD.**  The
+   folds move work between launches on multi-token steps; they do not change any value.  So text identity,
+   the canonical prefill-logit gate and even `gate-prefill-logits.sh --ub 1` can all read clean while the
+   arm is **not reproducible between runs** — that is precisely how PR #177 was held out from r81 to r185
+   (35B-A3B at P=3584: `2b1caf3bd5cfe4e3` x3 / `c2336484ebf6dab2` x2 against a stable stock arm, with clean
+   text and clean KLD, and with the probe's own **within-run** `width_purity` reporting `PASS` — the whole
+   signal was the between-runs difference).  `test-logits-width-probe` at `P=3584` and `P>=4096` is the
+   instrument: the default arm's `W8` and row-0 hashes must be identical across `>= 3` runs and identical to
+   each kill switch, with `GGML_CUDA_CONV_DEBUG=1` proving the fold fired (`GDN_CONV_DIRECT ... snap=1`).  A
+   run that never reaches the fold is a **vacuous pass** and must be treated as a failure.  This is the
+   project's general "that the probe ran is not that it reached the code" rule (§51) applied to a fold.
 
 **Reach is a model property.**  The GDN folds ride the direct conv's pre-existing **single-device** gate, so a
 `-sm tensor` / `-sm layer` run with two or more devices is inert (`GGML_CUDA_CONV_FUSION_MULTI=1` excepted);
@@ -2445,14 +2456,18 @@ the shared-expert gate fold needs a **BF16/F32** gate weight, which no quantized
 inert on 35B-A3B / 4B / 27B / gpt-oss and fires on qwen4exp/Flash-Next).  A bench arm that says "no change"
 on a quantized model says nothing about the fold.
 
-**How to judge a change here.**  The prefill-logit gate is the instrument for the *values* and text identity
-is the instrument for the *graph*: `gate-prefill-logits.sh --ab "<all four off>" --ub 1` (the decode width,
+**How to judge a change here.**  The prefill-logit gate is the instrument for the *values*, text identity
+is the instrument for the *graph*, and `test-logits-width-probe` at `P=3584`/`P>=4096` is the instrument for
+*reproducibility* (rule 6 — the only one of the three that saw this fold's defect class):
+`gate-prefill-logits.sh --ab "<all four off>" --ub 1` (the decode width,
 which is the only width the 1-token conv fires at) reads **0.000000 KLD / 100.000 % same-top-p**, and the
 canonical gate at the default ubatch reads the same against the previous release's base.  Same-seed text must
 be byte-identical on/off on a single device *and* on a 2-GPU `-sm tensor -ncmoe` arm (inert there, so it
 proves the elision did not leak into the multi-device path).  MTP is the third: on 35B-A3B `n_max 7` the
 draft/accept counts are identical (362/203), because a verify batch is the band where the snapshot fold runs
-on `T >= 2`.
+on `T >= 2`.  **All three of those passed on r183 while the width probe was not run at all** — run it
+(`MANIFESTS.md` release gate 14, `scripts/validate-gpu.sh` step 4c), because a fold is a launch-order change
+and only a cross-run instrument can see a launch-order change.
 
 **Record:** `WORKLOG.md` 261030.008, `patches/README.md` (block 10, "r183"),
 `benchmarks/2026-10-30-gdn-decode-folds.md`, `archive/work/gdn-decode-folds/PROMOTED.md`,
