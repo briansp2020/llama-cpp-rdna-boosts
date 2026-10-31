@@ -1,6 +1,7 @@
 # B-A — the attendance pool for the attention KV (design + acceptance numbers)
 
-**Status: DESIGN, with every number measured on this box (1 R9700). No pool code yet.**  Plan context:
+**Status: STEPS 1 AND 2 ARE BUILT AND GATED (session A10, §7); step 3 (the policy) is not.**  Every number is
+measured on this box (1 R9700).  Plan context:
 [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) §3.2-§3.5; instrument and trace: [`qsa-census.py`](qsa-census.py) over a
 48-step decode trace (Flash-Next IQ3, `-c 131072`, 102 912 cells, sparse arm, `GGML_CUDA_DISABLE_GRAPHS=1`).
 
@@ -86,3 +87,109 @@ test: the four-arm gate in `B1-STRATA-PLAN.md` §3.3, with the pool arm added, a
 |---|---|
 | block 15's region with the resident set chosen by attendance (no page table) | **refuted by measurement**: the region's 4 MiB unit = 3855 contiguous cells, the attended set is scattered → 6.4 % hit and 601 unit flips/step (90 ms/step) |
 | a pre-calculated static ordering (Strata's static arena) | **refuted by measurement on the KV**: 63-68 % hit vs 84-90 % for an adaptive policy at the same capacity, the same verdict the expert-cache campaign reached for the arena |
+
+## 7. Built and measured (A10) — steps 1 and 2 of §4
+
+Branch **`wip-kv-residency-b`**, tip **`b5d895c59`** (pushed).  Two commits: the pool itself, then the mirror's
+host-copy handling in the delivery's async state paths.
+
+### 7.1 What was built
+
+* **`LLAMA_KV_REGION_POOL=<cells>`** (unset/`0` = off, byte-identical): a KV cache mode.  The attention cache's
+  cell-indexed tensors become the **pinned host MIRROR** -- authoritative, so every existing path (the
+  `set_rows` writers, `state_read`/`state_write`, the K-shift, `seq_park`, `defrag`, `get_k`/`get_v`) works on it
+  **unchanged**, which is the whole point of Strata's writer rule -- and a compact **DEVICE POOL** of pages of one
+  indexer block (`compress_ratio` = 4 cells) per layer, plus a page table `tbl[block] -> slot`, its inverse, a
+  per-slot epoch mark and a counter block.
+* **`GGML_OP_KV_POOL`** (CUDA only): mark / claim / map+fill, three launches per layer per step.
+  * MARK sets `use[slot] = epoch` for every page this launch reads **and** every page the batch just wrote
+    (`wids` = the graph's `k_idxs`), and queues the written ones for re-fill.
+  * CLAIM takes a slot for each **distinct missing block** (the table CAS is the dedupe) and never takes a slot
+    MARK protected.
+  * MAP+FILL writes each selected cell's pool position into the reader's K/V index list and copies the claimed
+    and dirty pages from the mirror, K and V (they share slots).
+  * The epoch is a device counter incremented once per launch -- the graph bakes pointers, never counters, and
+    nothing is allocated per launch (a transient device-pool scratch inside a captured graph is a
+    use-after-free; see §7.3).
+* **The reader is unchanged in shape**: `ggml_flash_attn_qsa_set_kv_idx()` gives the QSA kernel a second id list,
+  so the K/V gather follows the page table while the mask / visibility keys stay indexed by the **cell** number.
+* Eligibility is narrow on purpose: one stream, non-MLA, K and V both present, `!v_trans`, a uniform
+  `compress_ratio` and cell geometry, no window active, and only the **trunk** context of a qwen4exp model
+  (`llama_memory_params.kv_pool`, false for the MTP draft's cache -- its attention is dense).  The indexer cache
+  stays fully resident by construction.  Anything else declines with one message.
+* The pool is **floored at one decode band's worth of blocks** (`8 x ceil(width/page)` pages) so a verify batch
+  cannot exhaust the slot budget, and the graph re-checks the real width (`kv_pool_serves`): a batch too wide
+  for the pool takes the cell-indexed path instead.
+* A pooled cache reports `is_streaming()` -- the pool exists to serve the sparse arm, so the dense arm must not
+  read the mirror over the link.
+
+### 7.2 Gates (Flash-Next GSQ-IQ3_XXS, 1 GPU, `-ncmoe 48`, q8_0, PLE flags, `ROCBLAS_USE_HIPBLASLT=0`)
+
+| gate | result |
+|---|---|
+| text, pool **off** vs **on** (`-c 65536`, 51 475 depth, `-n 64`, sparse arm both) | **854 chars `43b30de151b9` — identical** |
+| text, pool on, **dense** arm forced (`STREAM=0`) | 853 `77a40bf40be1` — identical to the pool-off dense arm (the mirror write path is exact) |
+| the pool's own verify kernel (`LLAMA_KV_POOL_VERIFY=1`: every selected page compared byte-for-byte with the mirror at read time) | **0 mismatches** |
+| `scripts/gate-prefill-logits.sh --ab "LLAMA_KV_REGION_POOL=8192"` (ctx 8192, chunks 2, q8_0) | **0.000000 KLD / 100.000 % top-p — PASS** |
+| `scripts/gate-park-idle-slots.sh` (1 GPU, layer, `-ncmoe 48`, ctx 32768) | **PASS** — 6 park + 2 unpark moves traced (not the save-and-clear fallback), `park == lazyoff` on all four requests |
+| `scripts/gate-ckpt-reuse.sh` (same shape) | **PASS** — keep 3 / eager 3, identical text and RSS |
+| `scripts/gate-state-pipe.sh` (ctx 16384) | **PASS** — all five arms |
+| `test-backend-ops -o FLASH_ATTN_QSA` | **27/27 OK** (`HIP_VISIBLE_DEVICES=0`; the iGPU abort at the end of an unpinned run is the documented gfx trap) |
+| `check-gpu-faults.sh` over every log | clean |
+| hit rate / fills | **89.66 %** of ids at 4104 pages, 27 762 fills over 768 resolves (~36 pages/resolve) |
+
+Two earlier text discrepancies were **not** defects: the pool's stats line was printed between the generated text
+and llama-cli's perf line, and `scripts/extract-generated.py` slices exactly that range.  `LLAMA_KV_POOL_STATS`
+now takes a **path** and appends there.
+
+### 7.3 Three defects the text caught (each is now an invariant)
+
+1. **A claim must never evict a page the same launch reads.**  The first cut marked nothing, so the round-robin
+   victim could be a page another row still needed: the text diverged ~400 chars in (and a pool larger than the
+   whole cache hid it completely).  MARK-then-CLAIM is what makes it exact.
+2. **Claim attempts are not distinct blocks.**  A slot was consumed per *id* attempt, so a 4-row batch (4 x 2051
+   ids against a 4104-page pool) wrapped the cursor **within one launch**: two blocks ended up in one slot and a
+   just-resolved block went unresident.  The table CAS now dedupes first, so only distinct blocks consume a slot,
+   and `kv_pool_serves` bounds the distinct count.
+3. **No transient scratch in a captured graph.**  The fill list lived in a `ggml_cuda_pool_alloc`, which is freed
+   at the end of the op -- and a captured graph bakes the pointer, so a replay wrote into whatever op had been
+   handed that block.  The symptom was exactly "values verify clean, text differs run to run".  The list lives in
+   the counters tensor now.
+
+### 7.4 What it is worth at 103k depth (the acceptance test)
+
+Flash-Next, 1 GPU, `-ncmoe 48`, q8_0, `-c 131072`, 102 948-token prompt, **MTP depth 4**, `-n 128`:
+
+| arm | gen t/s | accepted | prefill t/s |
+|---|---|---|---|
+| resident KV, dense arm (the default) | **60.2** | 87 | 519.1 |
+| resident KV, **sparse** arm forced (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) | 47.9 | 79 | 518.9 |
+| **pool, 4104 pages = 16 416 cells/layer, 204 MiB** | **48.3** | 79 | 488.1 |
+
+**The pool lands ON the sparse ceiling (+0.8 %, i.e. within noise) — the fills are essentially free (2.7
+MiB/token at 90 % hits = 0.05 ms of a 21 ms step).**  Against B2's fully spilled arm (31.4 t/s at this depth)
+that is **+54 %**, and it costs 204 MiB instead of the resident KV's 816 MiB.
+
+So the residual **-20 % against resident is entirely the SPARSE ARM's own cost** (the indexer scores every block
+and the top-k runs over it -- `B1-STRATA-PLAN.md` §3.2's 47.9 vs 60.2 pair proves it with no pool involved), not
+the KV's placement.  That reframes step 3: a better pool policy can only recover the *remaining* ~10 % of fills
+(≈0.05 ms), so **the next lever is the sparse decode arm's indexer cost, not the page policy.**  The pool's own
+job -- "204 MiB of VRAM instead of 816 MiB, with the streaming tax gone" -- is done.
+
+Pre-split note: prefill reads the mirror over the link (488 vs 519 t/s, -6 % at 103k), the same shape block 15's
+windowed arm showed (`W=1` prefill was *faster* there because the freed VRAM went to the expert arena; here the
+pool's 204 MiB is small and the mirror is a second copy of the KV, so prefill pays the link).
+
+### 7.5 Not done (the work list)
+
+* **Step 3, the policy.**  Eviction is round-robin + "skip what this launch marked" (§2's lag-1 LRU, F-LRU and
+  the heat prior are NOT implemented).  Predicted ceiling: the remaining ~10 % of fills (`qsa-census.py` says an
+  LRU at this capacity is 90.2 % vs 90.05 % measured -- already at the plateau, §1's "churn-bound").
+* **Step 4 / B3**: the arena half (`-n 2000`, `-ncmoe` = the full layer count), recording arena MiB / residency %
+  / the `identity fast path ON` count.
+* `--fit` accounting: the pool's 204 MiB is inside the KV buffer's size but the mirror is *pinned host*, invisible
+  to a VRAM arithmetic.  A `-c 262144` Flash-Next run pins 3.4 GiB (bounded by `LLAMA_KV_SPILL_RAM_PCT`).
+* The mirror is allocated **in full at creation** (a short run pins the whole `-c`): a grow-on-demand mirror is
+  the obvious next step if the RAM cost matters.
+* The pool declines a `-sm tensor` split (like the window): one page table per device would need a per-device
+  pool and a split-aware resolve.

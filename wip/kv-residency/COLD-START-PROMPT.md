@@ -1,13 +1,14 @@
 # Cold-session prompt — `wip/kv-residency` (TODO #118)
 
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from the previous
-session's context).  Rewritten 2026-10-30 at the end of session A9 (Goal B: B1 measured, B2 implemented, the
-attendance census done, B-A designed).
+session's context).  Rewritten 2026-10-31 at the end of session A10 (B-A steps 1+2 built and gated; the policy and
+B3 are what is left).
 
 ---
 
 Continue the windowed-KV campaign (TODO **#118**) in `~/llama-cpp-rdna-boosts` and `~/llama.cpp`.
-**This phase is Goal B: build B-A, the attendance pool for the attention KV.**
+**This phase is Goal B: B-A, the attendance pool for the attention KV — steps 1 and 2 are BUILT and GATED; the
+policy (step 3) and B3 (the arena half) are what is left.**
 
 **Goal A is SHIPPED — do not re-measure it and do not re-promote it.**  Release `v16-6050b467c-r181` (the set is
 now at r184) carries the windowed KV as **block 15**: an **opt-in** fixed-VRAM resident window with the KV's tail
@@ -17,6 +18,18 @@ Shipped description: `patches/README.md` "Block 15", `ENVIRONMENT.md` §17, `WOR
 (`wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`) — the maintainer picks it up on the multi-GPU host.
 
 **Goal B so far (all measured on this one card; do not redo):**
+
+* **B-A steps 1 and 2 — BUILT AND GATED (A10, 2026-10-31).**  Branch `wip-kv-residency-b`, tip **`b5d895c59`**
+  (pushed).  `LLAMA_KV_REGION_POOL=<cells>`: the attention KV becomes a pinned host MIRROR (authoritative,
+  cell-indexed -- every existing path works on it unchanged) + a compact DEVICE POOL of indexer-block pages +
+  a page table + an in-graph resolve (`GGML_OP_KV_POOL`: mark / claim / map+fill) and a second id list for the
+  QSA reader's K/V gather.  Full detail and every gate: [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md) **§7**.  The
+  headline numbers at 103k depth with MTP depth 4: resident-dense **60.2**, sparse+resident **47.9**, **pool
+  48.3** (4104 pages = 16 416 cells/layer, **204 MiB**), hit rate **89.7 %**, fill cost ~0.05 ms/step.  **So the
+  pool lands ON the sparse ceiling and the remaining -20 % is the SPARSE ARM, not the KV's placement** -- a
+  better page policy can recover ~0.05 ms/step, no more.  Next: step 3 (policy, expected to be a no-op), B3
+  (the arena half at `-n 2000`), then the maintainer's promotion decision.
+
 
 * **B1 — the placement matrix.**  A **resident** KV wants the **dense** decode arm (VRAM is ~10x the link, and the
   sparse arm adds the `O(depth)` indexer score + top-k); a **streamed** KV wants the **sparse** arm (+34 % at
@@ -32,21 +45,27 @@ Shipped description: `patches/README.md` "Block 15", `ENVIRONMENT.md` §17, `WOR
   15's region with attendance-chosen units (its 4 MiB unit = 3855 contiguous cells vs a scattered attended set →
   **6 % hit, 601 flips/step ≈ 90 ms/step**) and any static ordering.
 
-**THIS SESSION'S JOB — `wip/kv-residency/BA-POOL-DESIGN.md`, in its own build order:**
+**THIS SESSION'S JOB (was: build B-A; steps 1 and 2 are now DONE — see above and `BA-POOL-DESIGN.md` §7) — what
+is left of `wip/kv-residency/BA-POOL-DESIGN.md`:**
 
-1. **The mirror + the pool + the page table as a KV cache mode** (`LLAMA_KV_REGION_POOL=<cells>`, 0 = off and
+1. ~~**The mirror + the pool + the page table as a KV cache mode**~~ — **DONE (A10)**, gated: text, state, park. (`LLAMA_KV_REGION_POOL=<cells>`, 0 = off and
    byte-identical to today): a host-mirror tensor pair per layer (pinned, authoritative), a device pool of
    `N` pages (page = **4 cells = one indexer block**), a page table `table_l[block] -> slot`, and a write path that
    lands in the mirror **always** and in the slot only when the page is resident (Strata's writer rule: no
    invalidation, ever — `seq_rm`/`seq_cp`/`defrag`/state become trivial, and an eviction costs nothing).
    **Gate:** text byte-identical with the pool on vs off on a **resident** arm, plus `gate-state-pipe.sh`,
    `gate-ckpt-reuse.sh` and `gate-park-idle-slots.sh`.
-2. **The resolve kernel + the id rewrite**, QSA decode path only (prefill's union is not sparse — leave it on the
+2. ~~**The resolve kernel + the id rewrite**, QSA decode path only~~ — **DONE (A10)**: `GGML_OP_KV_POOL` +
+   `ggml_flash_attn_qsa_set_kv_idx`; the pool's verify kernel reports 0 mismatches, prefill-logit 0.000000.
+   Original spec, QSA decode path only (prefill's union is not sparse — leave it on the
    current window or resident).  **Gate:** `test-backend-ops -o FLASH_ATTN_QSA`, then the pool arm's text equal to
    the resident **sparse** hash (`e6080aaf2318` at 51 475 depth).
 3. **The policy** (lag-1 LRU first, then F-LRU + heat), gated on `qsa-census.py`'s predicted hit rate
    (>= 84 % at 4096 cells/layer) and on the four-arm timing gate (`B1-STRATA-PLAN.md` §3.3) with the pool arm
-   added at 5.3k / 103k / 180k.
+   added at 5.3k / 103k / 180k.  **Current eviction is round-robin + "skip what this launch marked", and it
+   already measures 89.7 % -- the census's LRU plateau is 90.2 %, so a policy is expected to buy ~1 point of
+   hits (0.05 ms/step).  Judge it against that, and note the 103k timing gate is already measured (48.3 vs
+   the sparse ceiling 47.9).**
 4. **B3** — the arena half at `-n 2000` with `-ncmoe` = the full layer count, recording arena MiB, residency % and
    the `identity fast path ON` count (the r117 cliff).  Then the promotion decision (the maintainer's).
 
@@ -60,6 +79,14 @@ work list**, §3 the invariants, §5 the measurement rules, §6 the gates), then
 the pool is the only form left), then `A2-MIXED-BACKING.md` §4.
 
 STATE (verify, don't assume):
+  - **Machine note: `git push` over the `git@` remote FAILS on this box** (no ssh-agent, no working key).
+    `git push https://github.com/stew675/llama.cpp.git <branch>` works (gh's credential helper) and is the same
+    personal fork.  Never push to upstream.
+  - `LLAMA_KV_POOL_STATS=<path>` appends the pool's accounting to a file; do **not** print it to stderr on a
+    text-hash arm (`scripts/extract-generated.py` slices from the generated text to llama-cli's perf line and
+    would include it -- that cost most of A10's "nondeterminism" hunt).
+  - `LLAMA_KV_POOL_VERIFY=1` is the pool's own oracle: every selected page is compared byte-for-byte with the
+    mirror at read time (mismatches land in the stats' `bad` field).  Ground truth before any hash.
   - **Campaign branch `wip-kv-residency-b`** (pushed), based on the shipped tip, tip **`c045bf866`** = B2 + the
     census diagnostic.  `wip-kv-residency` (`7c7769e50`) is Goal A's measurement tree — do not develop on it.
     Never commit campaign code to `rdna-boosts`; **never touch `patches/` or `release.json`**.
