@@ -1,0 +1,310 @@
+From 2a5203aa180dd7751d90f47904ef8b72dcd30aaa Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 31 Oct 2026 15:26:48 +0000
+Subject: [PATCH 17/21] MoE GEMV: expert dedup at verify widths (cold experts;
+ GGML_CUDA_MOE_DEDUP)
+
+At 2-4 tokens the (slot, token) pairs routed to the same cold expert are computed by one warp, the first pair in
+token-major order: it loads each weight item once (the IQ2_S / IQ3_XXS / IQ3_S fused gate/up and IQ4_NL down raw-load
+paths) and runs every pair's unchanged per-item arithmetic on it with that pair's activation, in the same item order,
+so each output is bit-identical; the other pairs' warps return.  A duplicate cold expert is then read over PCIe once per
+verify instead of once per token.  Resident groups keep the per-pair path (GGML_CUDA_MOE_DEDUP=2 dedups them too, for
+A/B; =0 off).  Not with the 1-token folds (down + weighted reduction, GLU -> Q8_1 publish).
+---
+ ggml/src/ggml-cuda/common.cuh  |   2 +
+ ggml/src/ggml-cuda/mmvq-moe.cu | 193 +++++++++++++++++++++++++++++++--
+ 2 files changed, 188 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 5f40b930d..0ec10b4c4 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2815,6 +2815,8 @@ struct ggml_cuda_mm_fusion_args_device {
+     const void * gate = nullptr;
+     const int32_t * gate_ids = nullptr;
+     uint32_t gate_ids_stride = 0;
++    // MoE expert dedup (mul_mat_vec_q_moe c_dd): 0 = only the groups of a cold expert, 1 = every group (GGML_CUDA_MOE_DEDUP=2)
++    int moe_dd_all = 0;
+     const void * gate_bias = nullptr;
+     const void * x_scale = nullptr;
+     const void * gate_scale = nullptr;
+diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
+index a1f284e25..653d28b25 100644
+--- a/ggml/src/ggml-cuda/mmvq-moe.cu
++++ b/ggml/src/ggml-cuda/mmvq-moe.cu
+@@ -32,6 +32,16 @@ static __device__ __forceinline__ void moe_iq4nl_load(moe_iq4nl_raw & r, const v
+     r.d  = bq4->d;
+     r.ds = bq8_1->ds;
+ }
++// the activation words of another (slot, token) pair, for the expert dedup path (same words moe_iq4nl_load reads)
++static __device__ __forceinline__ void moe_iq4nl_set_y(moe_iq4nl_raw & r, const block_q8_1 * bq8_1, const int iqs) {
++    const int * q8 = (const int *) bq8_1->qs + iqs;
++#pragma unroll
++    for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
++        r.q8[2*l + 0] = q8[l + 0];
++        r.q8[2*l + 1] = q8[l + 4];
++    }
++    r.ds = bq8_1->ds;
++}
+ static __device__ __forceinline__ float moe_iq4nl_dot(const moe_iq4nl_raw & r) {
+     int sumi = 0;
+ #pragma unroll
+@@ -173,7 +183,7 @@ template <ggml_type type> struct moe_pfiq_ok { static constexpr bool v = type ==
+ // kernel is the one that keeps the band on a single accumulation order (see the has_ids branch in
+ // mul_mat_vec_q_switch_ncols_dst), so its launch bound must cover the band rather than the per-type
+ // cap -- otherwise a launch with ncols_dst > cap fails outright.
+-template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool c_pf = false, int c_pfu = 0>
++template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool c_pf = false, int c_pfu = 0, bool c_dd = false>
+ __launch_bounds__(MMVQ_MOE_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_moe(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+@@ -234,14 +244,14 @@ static __global__ void mul_mat_vec_q_moe(
+         }
+     }
+ 
+-    const uint32_t token_idx   = threadIdx.y;
++    uint32_t       token_idx   = threadIdx.y;   // per (slot, token) pair in the dedup epilogue
+     const int      row0        = c_rows_per_block*blockIdx.x;
+     if (row0 >= (int) nrows_x) {
+         return;   // the padding block of ggml_cuda_grid_stall_pad (never block 0)
+     }
+     const int      blocks_per_row_x = ncols_x / qk;
+ 
+-    const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
++    uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
+ 
+     if (token_idx >= ncols_dst) {
+         return;
+@@ -287,6 +297,61 @@ static __global__ void mul_mat_vec_q_moe(
+     const uint32_t gate_row_x_st     = (gate_cold_host && cold_gate_row_stride != 0) ? cold_gate_row_stride : stride_row_x;
+     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+ 
++    // Expert dedup (verify widths, c_dd; GGML_CUDA_MOE_DEDUP): the (slot, token) pairs routed to the same expert -- same up
++    // id and, for a separately remapped gate table, the same gate id -- are computed by one warp, the pair that comes first
++    // in token-major order.  It loads each weight item once and runs every pair's unchanged per-item arithmetic on it with
++    // that pair's activation, in the same item order, so each output is bit-identical; the other pairs' warps return.  A
++    // duplicate cold expert is then read over PCIe once per verify instead of once per token.  A token lists an expert at
++    // most once, so a group has at most ncols_dst <= 4 pairs.
++    constexpr int DDK = c_dd ? 4 : 1;
++    int      dd_n = 1;
++    uint32_t dd_s[DDK];
++    uint32_t dd_t[DDK];
++    dd_s[0] = channel_dst;
++    dd_t[0] = token_idx;
++    if constexpr (c_dd) {
++        // Only a cold expert's group by default: a resident duplicate is served by the caches anyway, and the owner's
++        // longer warp costs more than the second read saves (gfx1100, all resident).  The condition is the same for every
++        // pair of a group (same up id, same gate id).
++        if (!shared_expert && (cold || gate_cold || fusion.moe_dd_all)) {
++            const uint32_t np  = nchannels_dst*ncols_dst;   // <= 64 (host)
++            const uint32_t myp = token_idx*nchannels_dst + channel_dst;
++            uint64_t m[2];
++#pragma unroll
++            for (int c = 0; c < 2; ++c) {
++                const uint32_t p = threadIdx.x + 32*c;
++                bool match = false;
++                if (p < np) {
++                    const uint32_t s = p % nchannels_dst;
++                    const uint32_t t = p / nchannels_dst;
++                    match = (uint32_t) ids[s + t*ids_stride] == channel_x_raw;
++                    if constexpr (has_fusion) {
++                        if (fusion.gate_ids != nullptr) {
++                            match = match && (uint32_t) fusion.gate_ids[s + t*fusion.gate_ids_stride] == gate_channel_raw;
++                        }
++                    }
++                }
++                m[c] = (uint64_t) __ballot_sync(0xFFFFFFFFULL, match) & 0xFFFFFFFFULL;
++            }
++            const uint64_t mm = m[0] | (m[1] << 32);   // contains myp
++            if ((uint32_t) __builtin_ctzll(mm) != myp) {
++                return;
++            }
++            dd_n = 0;
++            uint64_t b = mm;
++#pragma unroll
++            for (int k = 0; k < DDK; ++k) {
++                if (b != 0) {
++                    const uint32_t p = (uint32_t) __builtin_ctzll(b);
++                    dd_s[k] = p % nchannels_dst;
++                    dd_t[k] = p / nchannels_dst;
++                    dd_n = k + 1;
++                    b &= b - 1;
++                }
++            }
++        }
++    }
++
+     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+     const int kbx_offset      = channel_x*stride_channel_x_use + row0*stride_row_x_use;
+     const int kbx_offset_gate = gate_channel_x*gate_channel_x_st + row0*gate_row_x_st;
+@@ -294,6 +359,9 @@ static __global__ void mul_mat_vec_q_moe(
+     // partial sum for each thread
+     float tmp[c_rows_per_block] = {0.0f};
+     float tmp_gate[c_rows_per_block] = {0.0f};
++    // the dedup path's per-pair partial sums (copied into tmp / tmp_gate for each pair's epilogue)
++    [[maybe_unused]] float tmpd[DDK][c_rows_per_block] = {};
++    [[maybe_unused]] float tmpgd[DDK][c_rows_per_block] = {};
+ 
+     // split (row, kblock) items across the 8 thread groups: the K-split loop
+     // leaves most groups idle on short-K MoE GEMMs (down K=512 -> 2 K-blocks)
+@@ -311,6 +379,86 @@ static __global__ void mul_mat_vec_q_moe(
+     // Two items in flight per thread for IQ2_XS / IQ2_XXS (ALU/latency bound here); gfx1201, Flash-Next MUL_MAT_ID shapes:
+     // IQ2_XS -3 .. -7 %, IQ2_XXS -6 .. -8 % at K 1280 (+1 .. +5 % at K 2560, m 1280); the other types gain nothing.
+     constexpr int n_unroll = (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS) ? 2 : 1;
++    if constexpr (c_dd && c_pfu > 0 && moe_pfiq_ok<type>::v && has_fusion) {
++        for (int it0 = threadIdx.x / (qi/vdr); it0 < n_items; it0 += c_pfu*n_groups) {
++            moe_iq_raw<type> ru[c_pfu];
++            moe_iq_raw<type> rg[c_pfu];
++            moe_q8_raw       ry[c_pfu][DDK];
++#pragma unroll
++            for (int u = 0; u < c_pfu; ++u) {
++                const int it = it0 + u*n_groups;
++                if (it < n_items) {
++                    const int i   = it / blocks_per_row_x;
++                    const int kbx = it % blocks_per_row_x;
++                    const int kby = kbx * (qk/QK8_1);
++                    moe_iq_load<type>(ru[u], vx_use, kbx_offset + i*stride_row_x_use + kbx, kqs);
++                    if (use_gate) {
++                        moe_iq_load<type>(rg[u], vgate_use, kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++                    }
++#pragma unroll
++                    for (int k = 0; k < DDK; ++k) {
++                        if (k < dd_n) {
++                            const block_q8_1 * yk = ((const block_q8_1 *) vy) + fastmodulo(dd_s[k], nchannels_y)*stride_channel_y + dd_t[k]*stride_col_y;
++                            moe_q8_load(ry[u][k], &yk[kby], kqs);
++                        }
++                    }
++                }
++            }
++#pragma unroll
++            for (int u = 0; u < c_pfu; ++u) {
++                const int it = it0 + u*n_groups;
++                if (it < n_items) {
++                    const int i = it / blocks_per_row_x;
++#pragma unroll
++                    for (int k = 0; k < DDK; ++k) {
++                        if (k < dd_n) {
++                            tmpd[k][i] += moe_iq_dot<type>(ru[u], ry[u][k], kqs);
++                            if (use_gate) {
++                                tmpgd[k][i] += moe_iq_dot<type>(rg[u], ry[u][k], kqs);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    } else
++    if constexpr (c_dd && c_pf && type == GGML_TYPE_IQ4_NL && !has_fusion) {
++        constexpr int PU0 = c_rows_per_block > MOE_PF_U ? c_rows_per_block : MOE_PF_U;
++        for (int it0 = threadIdx.x / (qi/vdr); it0 < n_items; it0 += PU0*n_groups) {
++            constexpr int PU = c_rows_per_block > MOE_PF_U ? c_rows_per_block : MOE_PF_U;
++            moe_iq4nl_raw r[PU][DDK];
++#pragma unroll
++            for (int u = 0; u < PU; ++u) {
++                const int it = it0 + u*n_groups;
++                if (it < n_items) {
++                    const int i   = it / blocks_per_row_x;
++                    const int kbx = it % blocks_per_row_x;
++                    const int kby = kbx * (qk/QK8_1);
++                    moe_iq4nl_load(r[u][0], vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
++#pragma unroll
++                    for (int k = 1; k < DDK; ++k) {
++                        if (k < dd_n) {
++                            const block_q8_1 * yk = ((const block_q8_1 *) vy) + fastmodulo(dd_s[k], nchannels_y)*stride_channel_y + dd_t[k]*stride_col_y;
++                            r[u][k] = r[u][0];
++                            moe_iq4nl_set_y(r[u][k], &yk[kby], kqs);
++                        }
++                    }
++                }
++            }
++#pragma unroll
++            for (int u = 0; u < PU; ++u) {
++                const int it = it0 + u*n_groups;
++                if (it < n_items) {
++#pragma unroll
++                    for (int k = 0; k < DDK; ++k) {
++                        if (k < dd_n) {
++                            tmpd[k][it / blocks_per_row_x] += moe_iq4nl_dot(r[u][k]);
++                        }
++                    }
++                }
++            }
++        }
++    } else
+     if constexpr (c_pfu > 0 && moe_pfiq_ok<type>::v && has_fusion) {
+         for (int it0 = threadIdx.x / (qi/vdr); it0 < n_items; it0 += c_pfu*n_groups) {
+             moe_iq_raw<type> ru[c_pfu];
+@@ -385,6 +533,20 @@ static __global__ void mul_mat_vec_q_moe(
+ 
+     ggml_cuda_pdl_lc();
+ 
++    // one epilogue per pair (a single pass outside the dedup path)
++#pragma unroll
++    for (int k = 0; k < DDK; ++k) {
++    if (k < dd_n) {
++    if constexpr (c_dd) {
++        channel_dst = dd_s[k];
++        token_idx   = dd_t[k];
++#pragma unroll
++        for (int i = 0; i < c_rows_per_block; ++i) {
++            tmp[i]      = tmpd[k][i];
++            tmp_gate[i] = tmpgd[k][i];
++        }
++    }
++
+     // Warp-level reduction only - no shared memory needed
+ #pragma unroll
+     for (int i = 0; i < c_rows_per_block; ++i) {
+@@ -444,6 +606,8 @@ static __global__ void mul_mat_vec_q_moe(
+         }
+         dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
+     }
++    }
++    }
+ 
+     // MoE down + weighted reduction (fusion.red_dst, 1 token, no shared lane): each expert lane of a row block counts in; the
+     // last one sums the block's rows over the experts as moe_weighted_reduction does (same order, same expression).
+@@ -653,6 +817,16 @@ void mul_mat_vec_q_moe_launch(
+                             fusion.red_dst != nullptr;
+ 
+     static const bool pf4nl = getenv("GGML_CUDA_MOE_PF4NL") == nullptr || atoi(getenv("GGML_CUDA_MOE_PF4NL")) != 0;
++    // Expert dedup at verify widths (2-4 tokens): only on the raw-load paths (IQ2_S / IQ3_XXS / IQ3_S gate/up, IQ4_NL down)
++    // and not with the 1-token folds (down + weighted reduction, GLU -> Q8_1 publish), whose epilogues assume one pair per
++    // warp.  GGML_CUDA_MOE_DEDUP=0: off.
++    // GGML_CUDA_MOE_DEDUP=2: dedup the resident experts' groups too (A/B and the all-resident identity tests).
++    static const int  dedup_mode = getenv("GGML_CUDA_MOE_DEDUP") ? atoi(getenv("GGML_CUDA_MOE_DEDUP")) : 1;
++    static const bool dedup_on   = dedup_mode != 0;
++    ggml_cuda_mm_fusion_args_device fusion_dd = fusion;
++    fusion_dd.moe_dd_all = dedup_mode == 2;
++    const bool dedup = dedup_on && ncols_dst >= 2 && ncols_dst <= 4 && (int64_t) nchannels_dst*ncols_dst <= 64 &&
++                       warp_size == 32 && fusion.red_dst == nullptr && fusion.glu_q8 == nullptr && fusion.shared_glu_q8 == nullptr;
+     const auto launch = [&](auto rpb_c, auto fusion_c) {
+         constexpr int  RPB   = decltype(rpb_c)::value;
+         constexpr bool CFUSE = decltype(fusion_c)::value;
+@@ -662,14 +836,19 @@ void mul_mat_vec_q_moe_launch(
+                 kern = mul_mat_vec_q_moe<type, RPB, CFUSE, true>;
+             }
+         }
++        if constexpr (type == GGML_TYPE_IQ4_NL && !CFUSE) {
++            if (pf4nl && dedup) {
++                kern = mul_mat_vec_q_moe<type, RPB, CFUSE, true, 0, true>;
++            }
++        }
+         if constexpr (moe_pfiq_ok<type>::v && RPB == 2 && CFUSE) {
+             static const int pfiq_u = getenv("GGML_CUDA_MOE_PFIQ_U") ? atoi(getenv("GGML_CUDA_MOE_PFIQ_U")) : 2;
+-            if (pfiq_u == 2) { kern = mul_mat_vec_q_moe<type, RPB, CFUSE, false, 2>; }
+-            if (pfiq_u == 4) { kern = mul_mat_vec_q_moe<type, RPB, CFUSE, false, 4>; }
+-            if (pfiq_u == 5) { kern = mul_mat_vec_q_moe<type, RPB, CFUSE, false, 5>; }
++            if (pfiq_u == 2) { kern = dedup ? mul_mat_vec_q_moe<type, RPB, CFUSE, false, 2, true> : mul_mat_vec_q_moe<type, RPB, CFUSE, false, 2>; }
++            if (pfiq_u == 4) { kern = dedup ? mul_mat_vec_q_moe<type, RPB, CFUSE, false, 4, true> : mul_mat_vec_q_moe<type, RPB, CFUSE, false, 4>; }
++            if (pfiq_u == 5) { kern = dedup ? mul_mat_vec_q_moe<type, RPB, CFUSE, false, 5, true> : mul_mat_vec_q_moe<type, RPB, CFUSE, false, 5>; }
+         }
+         ggml_cuda_kernel_launch(kern, launch_params,
+-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
++            vx, vy, ids, fusion_dd, dst, ncols_x, nchannels_y, nrows_x,
+             stride_row_x, stride_col_y, stride_col_dst,
+             stride_channel_x, stride_channel_y, stride_channel_dst,
+             ncols_dst, ids_stride, nchannels_dst,
+-- 
+2.53.0
+

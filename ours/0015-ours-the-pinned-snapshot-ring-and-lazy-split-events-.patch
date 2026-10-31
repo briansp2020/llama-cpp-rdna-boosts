@@ -1,7 +1,7 @@
-From d6e8fe587b1553d2955b4d0d4af959c217d39d6e Mon Sep 17 00:00:00 2001
+From 07d4731b20a67b68ccd1b58ef5e26efed63f53d6 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 21:37:18 +0000
-Subject: [PATCH 15/22] ours: the pinned snapshot ring and lazy split events by
+Subject: [PATCH 15/21] ours: the pinned snapshot ring and lazy split events by
  default only with more than one device
 
 On a single GPU both measured about -1 % decode each (FINDINGS 639); on 1x R9700 the gate gives tg128 +1.8 % on
@@ -72,7 +72,7 @@ index d9c687bb4..0731b3acd 100644
      // initialize hash table
      // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 265a89ca1..99e3801da 100644
+index 35f8b75dd..526c7058b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -5846,14 +5846,18 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens

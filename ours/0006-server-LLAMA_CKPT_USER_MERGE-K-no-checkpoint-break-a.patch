@@ -1,7 +1,7 @@
-From 6282a7637d27f9f005947a6cd613ceb67b985de9 Mon Sep 17 00:00:00 2001
+From a6d2ba338704702ed3e5d0833eebcab4d67d700b Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 23 Oct 2026 17:30:24 +0000
-Subject: [PATCH 06/22] server: LLAMA_CKPT_USER_MERGE=K, no checkpoint break at
+Subject: [PATCH 06/21] server: LLAMA_CKPT_USER_MERGE=K, no checkpoint break at
  a user message followed by <= K prompt tokens (local, default off)
 
 (cherry picked from commit b78b01c965c642090e6d91098cde2dca1639f097)

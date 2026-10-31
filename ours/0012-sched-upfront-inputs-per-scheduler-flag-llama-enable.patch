@@ -1,7 +1,7 @@
-From 2f21a3e48ff9c8ada2c73e89007d3df1306682cb Mon Sep 17 00:00:00 2001
+From 9c7beb664fc20018a758c78f56c010eca69c4998 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 26 Oct 2026 09:00:06 +0000
-Subject: [PATCH 12/22] sched upfront inputs: per-scheduler flag; llama enables
+Subject: [PATCH 12/21] sched upfront inputs: per-scheduler flag; llama enables
  it for ubatches <= LLAMA_SCHED_UPFRONT_MAX_TOKENS (16)
 
 (cherry picked from commit f201937387f6822278a5f1baa74b126dfa114ca7)

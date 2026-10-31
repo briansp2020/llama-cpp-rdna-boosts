@@ -1,7 +1,7 @@
-From 7044e16eb377b5cbb771818c8a41da6b108fb115 Mon Sep 17 00:00:00 2001
+From f6bcccaa6d7253109f7f1bfdf05f82c7733cf2fb Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 08:02:31 +0000
-Subject: [PATCH 22/22] RDNA4 dense row concat across a K-quant / Q6_K pair
+Subject: [PATCH 16/21] RDNA4 dense row concat across a K-quant / Q6_K pair
  (attn_v of the K-quant M mixes)
 
 The RDNA4 1-token dense row concat runs the Q / K / V projections over the same input in one ksplit launch, but only
