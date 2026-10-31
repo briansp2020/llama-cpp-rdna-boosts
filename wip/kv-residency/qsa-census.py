@@ -118,6 +118,81 @@ def static_hits(seq_per_step, capacity, warmup):
     return hits, misses
 
 
+def unit_policy_hits(seq_per_step, capacity_cells, unit_cells, lag=1):
+    """The CHEAP form of an attendance pool: block 15's region, with WHICH units are device decided by the
+    attended set instead of by recency.
+
+    Constraints it models, because they are what the region can actually do:
+      * residency moves in whole map units (`unit_cells` cells/layer at the region's 4 MiB map unit);
+      * the decision lags one step (`lag`), because the top-k is device data and a per-step readback would
+        serialise the decode pipeline (block 15's invariant 6: a capture holds the VA, so a *lagged* host-side
+        remap is legal, a synchronous one is not);
+      * at most `capacity_cells` cells are resident, as a whole number of units.
+
+    Returns (hits, misses, swaps) over every step, where a swap is one unit evicted + one admitted (the
+    region flip: stage out + flip + stage in, ~8 MiB of copies at 55.7 GB/s).
+    """
+    assert unit_cells > 0
+    cap_units = max(capacity_cells // unit_cells, 1)
+    hits = misses = swaps = 0
+    prev = None                   # lagged admitted set (cells of the previous step)
+    resident = OrderedDict()      # unit -> None, LRU order
+    for step in seq_per_step:
+        cells = set(step)
+        if prev is not None:
+            want = []
+            for c in prev:        # admit the units the previous step attended, in its order
+                u = c // unit_cells
+                if u not in want:
+                    want.append(u)
+            for u in want:
+                if u in resident:
+                    resident.move_to_end(u)
+                    continue
+                while len(resident) >= cap_units:
+                    resident.popitem(last=False)
+                    swaps += 1
+                resident[u] = None
+                swaps += 1
+        for c in cells:
+            if (c // unit_cells) in resident:
+                hits += 1
+            else:
+                misses += 1
+        prev = cells
+    return hits, misses, swaps
+
+
+def block_policy_hits(seq_per_step, capacity_cells, page_cells, lag=1):
+    """A compact POOL with a page table: residency is per PAGE of `page_cells` cells (the QSA selection is
+    block-granular, `compress_ratio` = 4 cells, so that is the natural page), and the pool holds
+    `capacity_cells // page_cells` pages.  Unlike the region-unit case this is a *compact* pool: a logical
+    page can sit anywhere in it, which is what a scattered attended set needs.
+    """
+    cap_pages = max(capacity_cells // page_cells, 1)
+    hits = misses = fills = 0
+    resident = OrderedDict()
+    prev = None
+    for step in seq_per_step:
+        pages = set(c // page_cells for c in step)
+        if prev is not None:
+            for p in sorted(prev):
+                if p in resident:
+                    resident.move_to_end(p)
+                    continue
+                while len(resident) >= cap_pages:
+                    resident.popitem(last=False)
+                resident[p] = None
+                fills += 1
+        for p in pages:
+            if p in resident:
+                hits += 1
+            else:
+                misses += 1
+        prev = pages
+    return hits, misses, fills
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path")
@@ -229,6 +304,41 @@ def main():
               100.0 * hit / tot if tot else 0.0,
               100.0 * hit_f / (hit_f + miss_f) if (hit_f + miss_f) else 0.0,
               100.0 * hs / (hs + ms) if (hs + ms) else 0.0))
+
+    # the cheap form: unit-granular, lagged (the region's map unit is 4 MiB -> unit_cells cells/layer)
+    unit_cells = int(4 * 1024 * 1024 // args.cell_bytes)
+    print("\nattendance pool in REGION UNITS (4 MiB = %d cells/layer), lag-1 admission:" % unit_cells)
+    print("%18s %10s %12s %10s %14s" % ("pool cells/layer", "hit rate", "read MiB/tok", "swaps/step", "swap ms/step"))
+    for cap in (8192, 16384, 32768, 65536):
+        hit = mis = sw = 0
+        for li, seq in steps.items():
+            h, m, s2 = unit_policy_hits(seq, cap, unit_cells, lag=1)
+            hit += h
+            mis += m
+            sw += s2
+        tot = hit + mis
+        per_step_sw = sw / max(n_steps, 1)
+        # a swap = 4 MiB staged out + 4 MiB staged in, at the measured 55.7 GB/s link
+        print("%18d %9.2f%% %11.2f %10.1f %13.2f" % (cap, 100.0 * hit / tot if tot else 0.0,
+              mis * args.cell_bytes / (1024.0 * 1024.0) / max(n_steps, 1), per_step_sw,
+              per_step_sw * 2 * 4 * 1024.0 * 1024.0 / (55.7e9) * 1e3))
+
+    # the POOL with a page table, page = 4 cells (one indexer block: the selection is block-granular)
+    print("\nattendance POOL with a page table, page = 4 cells (indexer block), lag-1 admission:")
+    print("%18s %10s %12s %12s %14s" % ("pool cells/layer", "hit rate", "read MiB/tok", "fills/step", "fill ms/step"))
+    for cap in (4096, 8192, 16384, 32768):
+        hit = mis = fills = 0
+        for li, seq in steps.items():
+            h, m, fl = block_policy_hits(seq, cap, 4, lag=1)
+            hit += h
+            mis += m
+            fills += fl
+        tot = hit + mis
+        per_step = fills / max(n_steps, 1)
+        # a fill = one 4-cell page copied host->device = 4 x cell_bytes
+        print("%18d %9.2f%% %11.2f %12.1f %13.2f" % (cap, 100.0 * hit / tot if tot else 0.0,
+              mis * args.cell_bytes / (1024.0 * 1024.0) / max(n_steps, 1), per_step,
+              per_step * 4 * args.cell_bytes / (55.7e9) * 1e3))
 
     print("\nall-miss (zero-hit) read for the same selection: %.2f MiB/token"
           % (sum(len(s) for v in steps.values() for s in v) * args.cell_bytes

@@ -303,6 +303,25 @@ Their 80+ t/s is therefore not contradicted by our engine at a *working* depth (
 §3.4); at 103k the difference between 49.6 (a recency window of the same size) and their figure is exactly the
 pool's ~90 % hit rate that §3.5 measures.
 
+## 3.6 B1(c) continued — the pool must be a *compact* pool with a page table (the region cannot do it)
+
+Two more simulations on the same trace, and they decide B-A's *form* ([`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md)):
+
+1. **Block 15's region, with the resident units chosen by attendance** (the cheap form: no page table, no reader
+   change, the reader already reads by cell index through one VA).  The region's map unit is a **4 MiB mapping =
+   3855 contiguous cells/layer**, and the attended set is *scattered* over the prefix, so a residency policy at
+   that granularity hits **6.4 % at 8192 cells/layer** and churns **601 unit flips/step ≈ 90 ms/step** (each flip
+   is a staged unmap/map).  **Refuted by measurement** — the region's granularity cannot express an attendance
+   pool, whatever the policy.
+2. **A compact pool with a page table, page = 4 cells** (one indexer block — the granularity the QSA selection
+   already speaks), lag-1 admission, adaptive LRU: **85.1 % at 4096 cells/layer, 90.2 % at 8192**, 90.3 %
+   plateau, **0.05 ms/step** of fills (2.6 MiB), and *no* eviction cost because the host mirror is authoritative
+   (an eviction is a dropped slot, not a copy).  Pool VRAM at 8192 cells/layer = **107 MiB** for 12 layers.
+
+So B-A is confirmed as **Strata's form minus its static ordering**: a compact pool + a page table + an in-graph
+resolve, with the delivery's adaptive policy (LRU/F-LRU/heat) instead of a frozen ordering — which the census
+also says wins at equal capacity (84-90 % vs 63-68 %).
+
 ## 4. The three candidate mechanisms
 
 **B-A — page table + resolve inside the graph (Strata's form).**  The KV becomes a bounded pool of `n_slot`
