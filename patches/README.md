@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too) | +14341 / −5057 | 81 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too; + r187: PR #258's five quantized-KV decode folds; + r188: PR #259's shared-expert lane Q8_1 publish) | +14913 / −5064 | 83 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -1360,6 +1360,43 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
 * **The fusion dispatcher** (`ggml-cuda-try-fuse.cu`): the matcher arms moved out of `ggml-cuda.cu`.
 * **Rope/FWHT fusions** (M-RoPE and NEOX, with the q8_0 K/V cache `SET_ROWS` folded in), the paired GDN
   q/k norms, and the `ADD + rms_norm_q8_1` one-token fusion (`GREEDY-PURITY.md` §42).
+* **The quantized-KV decode fusions (r187, PR #258, `GREEDY-PURITY.md` §74).**  With `-ctk/-ctv q8_0`
+  `build_attn` rotates Q/K after their ROPE and V before the cache write, and for V the attention output
+  before the projection — which turned every fusion above off on that arm: 726 kernel launches per token
+  against 510 with an f16 cache (Qwen3-30B-A3B).  Five default-on terms put them back, all bit-identical and
+  each with its own kill switch:
+  * `GGML_CUDA_QK_ROTATE_HADAMARD` — the `GGML_CUDA_QK_ROTATE` pass also takes Q's rotation
+    (`RESHAPE`, Hadamard `MUL_MAT`, `RESHAPE`, so `q_end = i + 7`) and **defers V's rotation** (the Hadamards
+    between the chains, the `RESHAPE`/`VIEW`s they read and everything downstream of them) behind the Q chain,
+    leaving the projections in front.  1-token graphs only (prefill keeps the stock order), and the whole
+    rotate is skipped if a node left in front would read a deferred one.
+  * `GGML_CUDA_FUSE_V_FWHT` — the fused K kernel (norm+rope+FWHT+q8_0 K/V `SET_ROWS`) rotates the V row
+    itself with `ggml_cuda_fwht_warp<64, 32>` and the same lane->element quantize map, so the V FWHT launch
+    goes away.  Single-use rotated V, not a graph output, 32-lane wave, source disjoint from the cache rows.
+  * `GGML_CUDA_FA_COMBINE_FWHT` — at a 1-token FA whose **combine kernel** runs (`parallel_blocks > 1`) and
+    whose output feeds the 64-wide rotation + an mmvq projection, `flash_attn_combine_results<D, true>` stages
+    each row in shared memory, applies the same FWHT, stores it and publishes the projection's Q8_1 (the
+    `GGML_CUDA_FA_COMBINE_Q8` mechanism, so `GGML_CUDA_FA_Q8_1`-style cache accounting is unchanged).  If the
+    combine does not run the rotation runs as before and **no** cache entry is created; the plain `<D>`
+    instantiation is untouched.  This is the one term whose kernel lives in block 05's TU — it is an
+    extension of the combine-q8 code block 10 already owns (`fattn-common.cuh`), not a change to block 05's
+    arithmetic.
+  * `GGML_CUDA_QK_PAIR_FWHT` — `GGML_CUDA_ROPE_QK_PAIR`'s quantized form: Q's norm+rope+rotation is deferred
+    to the V-rotation + K site seven nodes later and both run as one `rms_norm_mul_rope_f32_qk_pair<..,
+    fwht_n, true>` launch (each block runs the single launch's body).  Q's rotation output is checked against
+    everything the K half reads and the K/V cache rows against everything the Q half reads; an orphaned Q
+    falls back to the single launch (with the FWHT when that is what was deferred).
+  * `GGML_CUDA_FUSE_ROPE_FWHT` — a ROPE with **no** norm in front (Llama-style) runs as one
+    `rms_norm_mul_rope_f32<.., no_norm = true>` launch, taking the K `RESHAPE`/`VIEW`/q8_0 `SET_ROWS` (and the
+    V row when allowed).  **Any token count, so prefill takes it too** — it is the only term of the five that
+    does, so it carries the prefill-logit obligation (`gate-prefill-logits.sh --ab
+    "GGML_CUDA_FUSE_ROPE_FWHT=0"`, plus the `--ub 1` arm).  Fires on gpt-oss on our models, not on
+    qwen/gemma (their ROPE follows a norm).
+  All five key on the cache `SET_ROWS` being **`GGML_TYPE_Q8_0`** (`TODO` #190 covers the other KV types).
+  Measured on gfx1201 1 GPU, Qwen3-30B-A3B Q4_K_M q8_0 KV: tg128 **141.2 -> 160.1 t/s (+13.4 %)**,
+  @4096 **127.3 -> 140.1 (+10.1 %)**, launches/token **726 -> 510**; F16 KV unchanged (162.7 vs 163.1);
+  gpt-oss-20b q8_0 **+4.0 % / +6.1 %**.  Records: `WORKLOG.md` 261031.005,
+  `benchmarks/2026-10-31-kv-rotation-decode.md`, `archive/work/kv-rotation-decode/`.
 * **bf16 RoPE destinations (r103, `TODO` #83, filed and closed in r103)**: `rope.cu` instantiated float/f16 destinations for the NORMAL
   and NEOX modes but not bf16, and since r101 the iSWA `k_cur`/`v_cur` reorder lets the ROPE → VIEW →
   SET_ROWS fusion fire for Gemma's K — so `-ctk bf16 -ctv bf16` prefill aborted at `rope.cu:672`.  The four
@@ -1868,6 +1905,43 @@ unfused one.  `test-backend-ops` SSM_CONV 60/60, CONCAT 183/183, CPY 251/251, 3/
   the *config* that shows it with a witness, not on a device count that also disables the bit-identical
   `-sm layer` arms.
 
+#### r188 — the shared-expert lane's Q8_1 publish (PR #259)
+
+**What it is.**  The r175 GLU Q8_1 publish covers the **routed** lanes only: the 1-token fused MoE gate/up+GLU
+kernel (`mul_mat_vec_q_moe`) writes each routed expert's GLU row into the quantize cache, so the routed down
+`MUL_MAT_ID` skips its `quantize_q8_1`.  A model with a **shared expert** writes one more lane (the last
+`blockIdx.y`, into `fusion.shared_dst`) and the shared down `MUL_MAT` then ran its own quantize.  The shared
+lane now publishes too, into its own cache entry keyed on the **shared GLU node** (`fusion.shared_dst`, the
+key that down looks up), with its counters in the lane **after** the routed ones
+(`lane = gridDim.y - 1 = nchannels_dst`) and the same 32-lane `warp_reduce_max/sum` + `roundf` arithmetic and
+zeroed padding blocks as `quantize_q8_1`.  `GGML_CUDA_MOE_SHARED_GLU_Q8=0` is the kill switch; it is nested
+inside the routed arming block, so `GGML_CUDA_MOE_GLU_Q8=0` (and every condition that stands the routed
+publish down: not a 32-lane wave, not one token, `n_ff % QK8_1 != 0`, non-contiguous `dst`, the counter
+budget) stands both down.  That nesting is the invariant, not an accident — it is what guarantees the host
+arms exactly the predicate the kernel implements, so a cache entry cannot exist that nothing filled.
+
+**Reach is a quant property (the one fact that decides whether a claim about this is meaningful).**  Block
+08's `shexp_down_gate` fusion (`shexp_down_gated_q8_0`) already consumes the shared GLU + shared down when
+`ffn_down_shexp` is **Q8_0**, and every Unsloth **UD** quant keeps that tensor at Q8_0.  On those files the
+shared down node does not exist, so this publish is inert — measured **839 launches/token before and after**
+(`UD-Q4_K_M`), with `shexp_down_gated_q8_0` in the census.  It fires where the shared down is its own node
+(conventional quants: the LMStudio `Q4_K_M` with Q6_K shared tensors, `UD-IQ3_S`), which is the file class
+the submitter measured.  **Quote the GGUF with any number.**
+
+**Worth.**  One launch per layer: Qwen3.6-35B-A3B launches/token **748 -> 708** (gfx1201) and **688 -> 648**
+(gfx1100).  LMStudio `Q4_K_M`, 1 GPU, three interleaved rounds: gfx1201 tg128 **139.54 -> 141.10 (+1.1 %)**,
+@4096 **136.47 -> 137.53 (+0.8 %)**; gfx1100 (7900 XTX) tg128 **177.90 -> 182.56 (+2.6 %)**, @4096
+**178.16 -> 182.28 (+2.3 %)**.  Rule-5 `llama-batched-bench -npl 1,4,8`: +1.1 % at 1 slot, flat at 4/8 (a
+multi-token batch never publishes).
+
+**Gates.**  `gate-prefill-logits.sh --ab "GGML_CUDA_MOE_SHARED_GLU_Q8=0" --ub 1` **0.000000 / 100.000 %** (the
+published blocks are `quantize_q8_1`'s, bit for bit); default-ub prefill logits unchanged; greedy text
+byte-identical at 1 GPU, 2 GPU `-sm tensor` (both x8 pairs), 3 GPU `-sm tensor`, 3 GPU `-sm layer`, a
+`-ncmoe 20` arm and on gfx1100; MTP identical text **and** acceptance on a dense 27B in both split modes
+(inert) and on a firing MoE arm (35B-A3B `UD-Q4_K_M` with `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`);
+`test-backend-ops -o MUL_MAT_ID` 931/931; no GPU faults.  Rule: `GREEDY-PURITY.md` §75.  Numbers:
+`benchmarks/2026-10-31-shared-glu-q8.md`; record `archive/work/shared-glu-q8/README.md`.
+
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 
 **What it is.**  The qwen4exp (Qwen3.8-Flash-Next) architecture support, split out of block 10 in r109 so
@@ -1878,10 +1952,13 @@ slab/dispatcher/ring code of its own beyond the arms implemented in its own TUs.
 
 **Contents.**
 
-* **The QSA combine launch passes the FA combine's new `q8` argument as `nullptr` (r175).**  Block 10's
-  FA-combine Q8_1 publish added a `block_q8_1 * q8` parameter to `flash_attn_combine_results`; QSA's own
-  combine (`fattn-qsa.cu`, created by this block) publishes nothing because its output is not fed to a
-  quantized matmul.  A new combine call site owes that decision explicitly.
+* **The QSA combine launch passes the FA combine's new `q8` argument as `nullptr` (r175), and its `had_dst`
+  as `nullptr` (r187).**  Block 10's FA-combine Q8_1 publish added a `block_q8_1 * q8` parameter to
+  `flash_attn_combine_results`; QSA's own combine (`fattn-qsa.cu`, created by this block) publishes nothing
+  because its output is not fed to a quantized matmul.  r187's rotation fold (block 10,
+  `GGML_CUDA_FA_COMBINE_FWHT`) added a trailing `float * had_dst` for the same reason — the apply has no
+  quantized-KV output rotation either — so this block's call site carries `(float *) nullptr` for it.  A new
+  combine call site owes both decisions explicitly.
 
 * **The HC down/inject pairs are one tensor (r138, upstream #31028).**  `create_merged(
   LLM_TENSOR_HC_{ATTN,FFN}_DOWN_INJECT, …)` accepts the converter's merged weight and `build_hc_mix(…,

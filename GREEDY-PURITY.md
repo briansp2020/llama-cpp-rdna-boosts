@@ -135,6 +135,8 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§71** | a graph-reorder pass is pure only while it moves nodes alone: enumerate the positional consumers (a matcher that anchors at a fixed index and returns a skip count) and exclude every input they depend on, judge it at three ubatch widths, and quote the GGUF with any claim because a reorder's reach is a model property | doctrine + measured (r180, PR #252; `benchmarks/2026-10-30-graph-order-0003-r180.md`) |
 | **§72** | a fold that merges two launches with an in-kernel barrier is pure only where it reproduces the first launch's arithmetic **and** keeps writing its output: the predicate must re-check the dispatcher's route in its own order, the width is the gate (one logits row), the elided launch's store stays, and the cross-block counter is a dedicated slot | doctrine + fix (r182, PR #253; `benchmarks/2026-10-30-router-topk-fold.md`) |
 | **§73** | a fold that elides graph nodes is pure only while every reader it could serve is accounted for: an elided store's destination must be span-checked and reproduced exactly, an elided copy's reader must be the kernel (preload the row before writing it back), a compute-time disjunctive predicate must stay a **superset** of the structural one `graph_optimize` uses, a fold that stores no intermediate needs a whole-graph reader count, reach is a model **and device-count** property (r186 removed the single-device gate — multi-device reach is empirical, gate it with a multi-device width-probe arm), and a launch-order-only fold is judged by the **width probe across runs**, never by text or the single-token KLD | doctrine + fix (r183 PR #256 + r186; `benchmarks/2026-10-30-gdn-decode-folds.md`, `benchmarks/2026-10-31-conv-fusion-multi-device.md`) |
+| **§75** | a Q8_1 publish that extends an existing one into a **second** consumer must be armed by the very predicate the kernel implements (here it is nested inside the routed term, so no entry can exist that nothing filled), must key the entry on the tensor the consumer looks up (the shared GLU node, never the routed `dst`) with counters in a **disjoint lane**, and must reproduce `quantize_q8_1` exactly; its **reach is a quant property**, because the delivery's own `shexp_down_gate` fusion (Q8_0 `ffn_down_shexp`) consumes the shared down and leaves the publish inert — so reach is measured with a launch census and quoted with the GGUF | doctrine + fix (r188, PR #259; `benchmarks/2026-10-31-shared-glu-q8.md`) |
+| **§74** | a fusion that exists for one cache-*quantizer* path is sound only while it reproduces that quantizer's write exactly: the V/rotation folds re-run the standalone kernel's in-warp FWHT and lane->element quantize map on the same row, an F32 intermediate whose only reader is the fold is a single-use (not-a-output) tensor whose source must not overlap the rows the fold writes, the FA-combine fold publishes the projection's Q8_1 **only** where the combine kernel actually runs (never on the fallback path, which would leave a cache entry nobody filled), and a reorder that defers nodes owes the "no remaining node reads a deferred one" check — the oracle is the `--ub 1` A/B plus the width probe, because every one of these is a 1-token-shape fusion except the rope-only form, which is prefill and owes the prefill-logit gate | doctrine + fix (r187, PR #258; `benchmarks/2026-10-31-kv-rotation-decode.md`) |
 
 ---
 
@@ -2479,3 +2481,114 @@ and only a cross-run instrument can see a launch-order change.
 **Record:** `WORKLOG.md` 261030.008, `patches/README.md` (block 10, "r183"),
 `benchmarks/2026-10-30-gdn-decode-folds.md`, `archive/work/gdn-decode-folds/PROMOTED.md`,
 `archive/work/cpy-2d-memcpy-guard/README.md`, `ENVIRONMENT.md` (§7.1/§7.2).
+
+## 74. A fusion that exists for one cache-quantizer path is sound only while it reproduces that quantizer's write exactly (r187, PR #258)
+
+**The claim.**  With a **quantized** KV cache (`-ctk/-ctv q8_0`) `build_attn` inserts a Hadamard rotation:
+Q and K after their ROPE, V before the cache write, and the attention output before the output projection.  Those
+rotations broke every decode fusion the delivery had for an f16 cache, so a q8_0-KV Qwen3-30B-A3B ran **726 kernel
+launches per token against 510** for the same model with an f16 cache: the V/K/Q row concat, the Q/K norm+rope
+pair, the combine's Q8_1 publish and both `fwht_cuda` launches were all gone.  r187 adds five default-on terms
+(block 10) that recover them — `GGML_CUDA_QK_ROTATE_HADAMARD`, `GGML_CUDA_FUSE_V_FWHT`,
+`GGML_CUDA_FA_COMBINE_FWHT`, `GGML_CUDA_QK_PAIR_FWHT`, `GGML_CUDA_FUSE_ROPE_FWHT` — and the census is back to 510.
+
+**The rule.**
+
+1. **A folded write reproduces the kernel it replaces, not an equivalent one.**  The V row the fused K kernel
+   rotates uses `ggml_cuda_fwht_warp<64, 32>` and `ggml_cuda_quantize_q8_0_group` with the *standalone* kernel's
+   lane->element map (`col = e*warp_size + lane`), and the FA-combine fold reproduces `fwht_cuda<64, float, true>`'s
+   reduction and rounding (`warp_reduce_max/sum<QK8_1>`, `d = amax/127`, `ds = make_half2(d, sum)`).  A
+   re-associated FWHT or a rounding change here moves every q8_0-KV logit; the gate that sees it is the `--ub 1`
+   prefill-logit A/B (`0.000000` KLD against the all-off arm) plus the width probe, not text.
+2. **The elided tensor is single-use and must not alias what the fold writes.**  Both rotation folds require
+   `use_count == 1`, not-a-graph-output, and (V) a source that does not overlap the K/V cache rows; the QK pair
+   additionally checks Q's rotation output against *every* read of the K half and the K/V cache rows against
+   *every* read of the Q half.  When the deferred Q has no K partner, the fallback must launch the form that was
+   deferred (the FWHT one), not the plain norm+rope.
+3. **The Q8_1 publish happens only on the path that fills it.**  The FA-combine fold creates the projection's
+   quantize-cache entry **and** writes it in the same launch, so it may only be requested where the combine kernel
+   runs (`parallel_blocks > 1`): on any other path the rotation runs as before and no entry is created.  This is
+   the same invariant `GGML_CUDA_FA_COMBINE_Q8` already had (`GREEDY-PURITY.md` §55's range check applies too).
+4. **A pass that defers nodes owes the reverse hazard check.**  The rotate moves V's rotation (the Hadamards, the
+   views they read, everything downstream) behind the Q chain; a node left *in front* that reads a deferred one
+   would reorder a read, so the pass verifies it.  It is 1-token only, which keeps prefill's order stock.
+5. **Except the rope-only form, these are 1-token-shape fusions — and that is what the instruments must respect.**
+   `GGML_CUDA_FUSE_ROPE_FWHT` takes **any** token count, so it is a prefill path and owes the prefill-logit gate
+   (`--ab "GGML_CUDA_FUSE_ROPE_FWHT=0"`, plus `--ub 1`); the other four are invisible to a default-window gate and
+   are judged by the `--ub 1` A/B and the `test-logits-width-probe` at `P=3584`/`P>=4096` (r187: 3-run stable,
+   bit-identical to the all-off reference, single device and 3-GPU tensor/layer, on the one model that reaches the
+   rope-only form).
+
+**Scope.**  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` — that is the quantizer they reproduce.
+`q4_0`/`q5_0`/`iq4_nl`/`bf16` KV keep their separate launches (correct, unfused): `TODO.md` #190.
+
+**Numbers** (gfx1201, 3x R9700, ROCm 10.1.0, 1 GPU, `llama-bench -r 3`, 3 interleaved rounds, same build dir):
+Qwen3-30B-A3B Q4_K_M `-ctk/-ctv q8_0` tg128 **141.2 -> 160.1 t/s (+13.4 %)**, @4096 **127.3 -> 140.1 (+10.1 %)**;
+f16 KV **162.7 vs 163.1 / 138.7 vs 138.8** (unchanged); gpt-oss-20b MXFP4 q8_0 **149.0 -> 155.0 (+4.0 %)** and
+@4096 **143.2 -> 151.9 (+6.1 %)**.  Purity: greedy text byte-identical on six arches (1 GPU), 3-GPU `-sm tensor`
+and `-sm layer`, a `-ncmoe 16` host-expert arm, MTP four axes at `-n 3000` (**text and acceptance identical to the
+last digit**, 0.61351 / 0.83360 / 0.89815 / 0.99200), prefill-logit `0.000000 / 100.000 %` against the recorded
+bases for both f16 and q8_0 KV, `test-backend-ops -o ROPE,SET_ROWS,FLASH_ATTN_EXT` 7059/7059.  The submitter's own
+gaps (multi-GPU/`-sm tensor`, and the rope-only prefill arm) are covered here.
+
+**Record:** `WORKLOG.md` 261031.005, `patches/README.md` (block 10 / block 11), `ENVIRONMENT.md` §7.4,
+`benchmarks/2026-10-31-kv-rotation-decode.md`, `archive/work/kv-rotation-decode/`.
+
+## 75. A Q8_1 publish that extends an existing one must be armed by the predicate the kernel implements, and its reach is a quant property (r188, PR #259)
+
+**Claim.**  The 1-token fused MoE gate/up+GLU kernel (`mul_mat_vec_q_moe`, block 10) published the **routed**
+lanes' GLU output as Q8_1 for the routed down `MUL_MAT_ID` but not the **shared-expert** lane (the last
+`blockIdx.y`, writing `fusion.shared_dst`), so on a model with a shared expert the shared down `MUL_MAT` still
+ran its own `quantize_q8_1`.  Since r188 that lane publishes too, into its own cache entry keyed on the
+**shared GLU node** with its counters in the lane after the routed ones.  Worth one launch per layer: 40 on
+Qwen3.6-35B-A3B, **+1.1 % tg128 / +0.8 % @4096** on gfx1201 and **+2.6 % / +2.3 %** on gfx1100, bit-identical.
+
+**Rule.**
+
+1. **The arming predicate must be the one the kernel implements.**  The shared term is nested inside the
+   routed arming block (`glu_q8_on && ids && fusion->gate && warp_size == 32 && dst->ne[2] == dst->ne[3] == 1
+   && dst->ne[0] % QK8_1 == 0 && ggml_is_contiguous(dst) && the counter budget`), so it inherits every gate the
+   kernel's own `if constexpr (has_fusion)` branch checks — a 32-lane wave, one token, `use_gate`, the shared
+   lane present.  That nesting is the invariant: a host-side arming that could be true while the kernel
+   declines would leave a cache entry **nobody filled**, and the consumer (which finds entries, never re-checks
+   them) would read stale arena and produce silent garbage.  Any future condition added to either side must be
+   added to both, or the shared term must move inside it.
+2. **The entry is keyed on the tensor the *consumer* looks up.**  The routed publish keys on `dst` (the packed
+   routed GLU output); the shared publish keys on `fusion.shared_dst`, which is exactly the src1 of the shared
+   down `MUL_MAT`, so the plain dense `ggml_cuda_mul_mat_vec_q` finds it with the same canonical row layout and
+   skips its quantize.  The counters must be a **disjoint lane** (`lane = gridDim.y - 1 = nchannels_dst`; the
+   routed lanes use `0..nchannels_dst-1`) and the budget must cover `n_used + 1` lanes, or two rows of two
+   different lanes share a counter and the group either never completes or completes early.
+3. **The write is `quantize_q8_1`'s, to the bit.**  Same 32-lane `warp_reduce_max/sum`, same `d = amax/127`
+   and `roundf`, same `ds = make_half2(d, sum)`, and the block that completes a row's **last** group zeroes the
+   row's padding blocks up to `MATRIX_ROW_PADDING` (the arena is reused across graphs, so a padded-row reader
+   must not find stale blocks) — the shared row is `n_ff` wide and generally not `MATRIX_ROW_PADDING`-aligned.
+   The oracle is the `--ub 1` A/B (`gate-prefill-logits.sh --ab "GGML_CUDA_MOE_SHARED_GLU_Q8=0" --ub 1`):
+   r188 reads **0.000000 / 100.000 %**.  A default-window gate cannot see it at all (a verify batch is wider
+   than one token, so nothing publishes), and neither can text.
+4. **Reach is a *quant* property, not only a model one — measure it, do not infer it.**  Block 08's
+   `shexp_down_gate` epilogue (`shexp_down_gated_q8_0`, `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE`) already consumes
+   the shared GLU + shared down when `ffn_down_shexp` is **Q8_0**, which is what every Unsloth **UD** quant
+   keeps for its shared tensors: there the shared down node does not exist and this publish is **inert**
+   (measured 839 launches/token before and after on `UD-Q4_K_M`, `shexp_down_gated_q8_0` in the census).  It
+   fires on a conventional quant (Q6_K/Q4_K shared tensors: LMStudio `Q4_K_M`, `UD-IQ3_S`).  So a launch census
+   decides whether a claim about it means anything, and any number is quoted **with the GGUF**.  The same
+   question recurs for the *upstream* fused shared pair: on `UD-IQ3_S` at gfx1100 the matcher declines the
+   shared lane entirely (`sup=0`), so even a non-Q8_0 shared down can be unreachable there.
+5. **The one-token scope keeps prefill and every verify step stock.**  The publish needs
+   `dst->ne[2] == dst->ne[3] == 1`, so an MTP/DFlash verify batch runs the unchanged launches; the only firing
+   case inside a speculative run is a 1-token step (every draft rejected), and that step's Q8_1 is
+   bit-identical, so text **and acceptance** are unchanged (measured on a dense 27B in both split modes and on
+   a firing MoE arm: 7061 chars, acceptance 0.72137 on both builds).
+
+**Numbers** (gfx1201 3x R9700 + gfx1100 1x 7900 XTX, ROCm 10.1.0, 1 GPU, same build dir, 3 interleaved
+rounds, `ROCBLAS_USE_HIPBLASLT=0`): Qwen3.6-35B-A3B LMStudio `Q4_K_M` launches/token **748 -> 708**
+(gfx1201) / **688 -> 648** (gfx1100); tg128 **139.54 -> 141.10 (+1.1 %)** and @4096 **136.47 -> 137.53
+(+0.8 %)** on gfx1201; tg128 **177.90 -> 182.56 (+2.6 %)** and @4096 **178.16 -> 182.28 (+2.3 %)** on gfx1100.
+Purity: `--ub 1` KLD **0.000000 / 100.000 %**; default-ub prefill logits unchanged; greedy text byte-identical
+at 1 GPU, 2 GPU `-sm tensor` (both x8 pairs), 3 GPU `-sm tensor`, 3 GPU `-sm layer`, a `-ncmoe 20` arm and on
+gfx1100; `test-backend-ops -o MUL_MAT_ID` 931/931; `llama-batched-bench -npl 1,4,8` +1.1 % at one slot and
+flat at 4/8.
+
+**Record:** `WORKLOG.md` 261031.006, `patches/README.md` (block 10), `ENVIRONMENT.md` §7.4,
+`benchmarks/2026-10-31-shared-glu-q8.md`, `archive/work/shared-glu-q8/`.

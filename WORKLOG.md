@@ -1,5 +1,175 @@
 # WORKLOG - dated delivery records
 
+## 261031.006 (r188) -- PR #259 accepted: the shared-expert lane publishes its GLU output's Q8_1 (block 10 amended) -- one launch/layer, +1.1 % gfx1201 / +2.6 % gfx1100, bit-identical
+
+**Released as `v16-6050b467c-r188` (16 blocks; block 10 amended, blocks 11-15 re-cut unchanged).**  Canonical
+tip `0e42c6bc2`, tree `61a89235716a899753c74cacb427f49d31f25b39` (r187 was `9ee1862a6` / `7cd527bde`).
+`release.json` refreshed; `scripts/validate-set.sh` OK (16/16, 284 Windows-scanned files).
+
+**What shipped.**  `briansp2020`'s PR #259, one patch (+33/-6) cut against r184 and applied to the r187 tree
+with offsets only.  The r175 GLU Q8_1 publish covers the **routed** lanes of the 1-token fused MoE
+gate/up+GLU kernel; a model with a shared expert writes one more lane (`blockIdx.y == gridDim.y - 1`, into
+`fusion.shared_dst`) and that down `MUL_MAT` still ran its own `quantize_q8_1`.  The shared lane now publishes
+too: into its own cache entry keyed on the **shared GLU node** (the key the shared down looks up), counters in
+the lane after the routed ones (`lane = gridDim.y - 1 = nchannels_dst`, budget `(n_used+1) * n_ff/QK8_1 <=
+4096`), the same 32-lane reduction/rounding and the same zeroed padding blocks.  `GGML_CUDA_MOE_SHARED_GLU_Q8=0`
+is the kill switch and the term is **nested inside** `GGML_CUDA_MOE_GLU_Q8`'s arming block, which is the
+invariant that matters: the host can never arm an entry the kernel does not fill.
+
+**Fold.**  Block 10 owns all three files (`common.cuh`, `mmvq.cu`, `mmvq-moe.cu`), so the patch went in there
+(squashed into the commit with its author/date preserved), blocks 11-15 replayed on top; their trees and patch
+bodies are unchanged (only the `From <sha>` line differs, as every re-cut does).  The fold's tree is
+byte-identical to the measured arm (`61a8923…`), so no re-measurement was needed.  No code change was required.
+
+**Claims reproduced** (gfx1201 3x R9700 + gfx1100 1x 7900 XTX, ROCm 10.1.0, 1 GPU, both arms from the same
+build dir, `ROCBLAS_USE_HIPBLASLT=0`, 3 interleaved rounds, `llama-bench -fa 1 -p 0 -n 128 -d 0,4096 -r 10`;
+model Qwen3.6-35B-A3B LMStudio `Q4_K_M`, whose shared tensors are Q4_K/Q6_K):
+
+| | PR says | measured |
+|---|---|---|
+| launches/token (gfx1201) | 761 -> 721 | **748 -> 708** (exactly one per layer, 40) |
+| launches/token (gfx1100) | — | **688 -> 648** |
+| tg128, R9700 | 141.61 -> 143.42 (+1.3 %) | 139.54 -> **141.10 (+1.1 %)** |
+| @4096, R9700 | — | 136.47 -> **137.53 (+0.8 %)** |
+| tg128, 7900 XTX | 175.45 -> 179.93 (+2.6 %) | 177.90 -> **182.56 (+2.6 %)** |
+| @4096, 7900 XTX | 172.55 -> 175.96 (+2.0 %) | 178.16 -> **182.28 (+2.3 %)** |
+
+**The finding the submission could not see -- reach is a quant property.**  Block 08's `shexp_down_gate`
+epilogue (`shexp_down_gated_q8_0`) already consumes the shared GLU + shared down when `ffn_down_shexp` is
+**Q8_0**, and every Unsloth **UD** quant keeps its shared tensors at Q8_0: on `UD-Q4_K_M` the patch is
+**inert** (839 launches/token before *and* after, no perf delta, `shexp_down_gated_q8_0` in the census).  It
+fires on conventional quants (LMStudio `Q4_K_M`, `UD-IQ3_S`) -- the file class the submitter measured, which
+is why their numbers reproduce here and the UD files show nothing.  On gfx1100 the `UD-IQ3_S` arm cannot even
+reach it (the upstream shared-pair matcher declines the lane there, `sup=0`), so the gfx1100 arm was measured
+on the copied LMStudio file.
+
+**Purity (all bit-identical).**  `gate-prefill-logits.sh --ab "GGML_CUDA_MOE_SHARED_GLU_Q8=0" --ub 1`
+**0.000000 / 100.000 %** (base PPL 6.2078) -- the published blocks are `quantize_q8_1`'s, bit for bit; the
+default-ub gate **-0.000000 / 99.967 %** against a base recorded from the r187 build (the stored-logit floor);
+greedy text identical at 1 GPU (`782/92d0837f148d`), 2 GPU `-sm tensor` on (0,1) and (0,2)
+(`793/adf5c8f08334`), 3 GPU `-sm tensor` (`794/f03cb34fd6ad`), 3 GPU `-sm layer` (`782/92d0837f148d`), a
+`-ncmoe 20` arm (`786/d4e150984a25`) and gfx1100 (`831/56fb588a388f`); MTP identical text **and** acceptance on
+a dense 27B in both split modes (inert -- a verify batch is wider than one token: 0.60816 / 0.62134) and on a
+**firing** MoE arm (35B-A3B `UD-Q4_K_M` with `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`, `-n 2000`: `7061
+f80eab6cf390`, acceptance 0.72137 on both builds); `test-backend-ops -o MUL_MAT_ID` **931/931**; rule-5
+`llama-batched-bench -npl 1,4,8` +1.1 % at 1 slot and flat at 4/8; per-block build gate `--changed-from
+9ee1862a6 --fast` **2/2**; `check-gpu-faults.sh` clean.
+
+**Also recorded.**  `GREEDY-PURITY.md` §75 (a Q8_1 publish that extends an existing one must be armed by the
+predicate the kernel implements, keyed on the tensor the consumer looks up, in a disjoint counter lane, exactly
+`quantize_q8_1`'s write -- and its reach is a **quant** property, measured with a launch census and quoted with
+the GGUF); `ENVIRONMENT.md` §7.4 (`GGML_CUDA_MOE_SHARED_GLU_Q8`); `patches/README.md` block 10 (index row +
+"The shared-expert lane's Q8_1 publish (r188)"); `MANIFESTS.md` block-10 index + verification row;
+`AGENTS.md` critical facts; `benchmarks/2026-10-31-shared-glu-q8.md`; `archive/work/shared-glu-q8/` (the
+submitter's patch and README, with the gfx1100 round-3 caveat: that host was running a foreign CPU benchmark,
+so only the two clean rounds are quoted).
+
+## 261031.005 (r187) -- PR #258 accepted: the quantized-KV decode rotations (block 10 amended, block 11 one line) -- +13.4 % / +10.1 % q8_0-KV decode, bit-identical
+
+**Released as `v16-6050b467c-r187` (16 blocks; block 10 amended).**  Canonical tip
+`9ee1862a646f7cc9186566a0bb49f15424003d40`, tree `7cd527bde82bb0df5c2abd618f725c3e17c6b394` (r186 was
+`8f9dad0be` / `0bd26dbe`).  `release.json` refreshed; `scripts/validate-set.sh` OK.
+
+**What shipped.**  `bsp2020`'s PR #258, five patches (+1238) cut against r184 and applied to the r186 tree with
+offsets only.  With `-ctk/-ctv q8_0` `build_attn` rotates Q/K (after their ROPE), V (before the cache write) and
+the attention output (before its projection), which had turned off every decode fusion the delivery has for an
+f16 cache: **726 kernel launches per token against 510** on Qwen3-30B-A3B.  Five default-on terms restore them,
+each with its own kill switch -- `GGML_CUDA_QK_ROTATE_HADAMARD` (the `QK_ROTATE` pass takes Q's rotation and
+defers V's behind the Q chain, projections in front, 1-token graphs only), `GGML_CUDA_FUSE_V_FWHT` (the fused K
+kernel rotates the V row), `GGML_CUDA_FA_COMBINE_FWHT` (the combine kernel does the output rotation and publishes
+the projection's Q8_1), `GGML_CUDA_QK_PAIR_FWHT` (the pair, quantized form) and `GGML_CUDA_FUSE_ROPE_FWHT` (rope
++ rotation for models without Q/K norm -- **the one that runs in prefill too**).
+
+**Fold.**  Block **10** owns every changed file, so the five went in there (block 11 takes the one-line
+`flash_attn_combine_results<D>` call-site update in `fattn-qsa.cu`, the file block 11 creates).  Folded by
+applying the combined diff into block 10's commit (author/date preserved), replaying blocks 11-15, then amending
+block 11 -- the tree is byte-identical to the validated arm.  No block renumbering, no new block.
+
+**Claims reproduced** (gfx1201, 3x R9700, ROCm 10.1.0, 1 GPU, `ROCBLAS_USE_HIPBLASLT=0`, 3 interleaved rounds,
+both arms from the same build dir): launches/token **726 -> 510** (exactly the submitter's number);
+Qwen3-Coder-30B-A3B Q4_K_M q8_0 KV tg128 **141.24 -> 160.06 (+13.3 %)** and @4096 **127.33 -> 140.18
+(+10.1 %)** (the PR's R9700 table said +10.8 / +10.7); gpt-oss-20b MXFP4 q8_0 (its only no-Q/K-norm arm here)
+**148.99 -> 155.01 (+4.0 %)** / **143.20 -> 151.88 (+6.1 %)**; **F16 KV unchanged** (162.67 -> 163.10, 138.72 ->
+138.82), i.e. the submitter's -0.8 % F16 "code layout" observation does not reproduce.
+
+**Purity (all bit-identical).**  Greedy text stock-vs-fold on six arches (Qwen3-Coder-30B-A3B, gpt-oss-20b,
+Gemma4-12B, Ling-3.0-tiny, LFM2.5-8B-A1B, Qwen3.6-35B-A3B) at 1 GPU q8_0 KV, on **3-GPU `-sm tensor` and
+`-sm layer`** (two models) and on a `-ncmoe 16` host-expert arm; MTP four axes at `-n 3000` identical text
+**and acceptance to the last digit** (0.61351 / 0.83360 / 0.89815 / 0.99200); `gate-prefill-logits.sh`
+**0.000000 / 100.000 %** against the recorded bases for both f16 and q8_0 KV, the five-switch `--ab` at `--ub 1`
+reading the harness floor (99.990 %, which the off-vs-off control also reads) and the rope-only form's
+`--ab "GGML_CUDA_FUSE_ROPE_FWHT=0"` at the default ub **0.000000 / 99.990 %**; `test-logits-width-probe KV=q8_0`
+at `P=3584`/`P>=4096` 3-run stable and identical to the all-off reference, single device and 3-GPU tensor/layer
+(`width_purity=PASS`, worst maxdiff 0); `test-backend-ops -o ROPE,SET_ROWS,FLASH_ATTN_EXT` **7059/7059** both
+builds; `llama-batched-bench -npl 1,4,8` flat or better; per-block build gate `--changed-from 8f9dad0be --fast`
+**3/3**; no GPU faults.  The submission's own gaps -- multi-GPU/`-sm tensor`, the prefill-logit gate and the
+rope-only form's prefill arm -- are covered above.
+
+**Two nits, neither a defect** (left as submitted): 0002's V offset is computed by subtracting `data` pointers
+and 0003 replaces it with `view_offs` + an assert (the fold lands the final form); and the FA request is a
+file-scope `thread_local` where the context already carries `qk_pend_*`.
+
+**Also recorded.**  `GREEDY-PURITY.md` §74 (the rule: a fusion that exists for one cache-quantizer path must
+reproduce that quantizer's write exactly, the elided tensor must be single-use and non-overlapping, the Q8_1
+publish only on the path that fills it, and a deferring pass owes the reverse hazard check);
+`ENVIRONMENT.md` §7.4 (five variables + the q8_0-only scope); `patches/README.md` block 10 / block 11;
+`MANIFESTS.md` release gate 1 and the block-10 verification row; `benchmarks/2026-10-31-kv-rotation-decode.md`;
+`archive/work/kv-rotation-decode/README.md`; `TODO.md` #190 (the other KV quant types are not fused).
+
+## 261031.004 (r186) -- PR #194 (`set-tensor-async-ring`) re-assessed on the r186 tree and CLOSED; no delivery change
+
+**No patch, no release, no `release.json` change** -- the delivery set stays at `v16-6050b467c-r186` (16
+blocks, tip `8f9dad0be`, tree `0bd26dbe`).  Record: `archive/work/set-tensor-async-ring/`
+(`RESOLUTION.md`, "Final assessment").
+
+**Why re-open a declined PR.**  r98 declined it (-1.2 % / -2.3 % on two MoE tensor-split MTP cells) and
+asked the submitter to scope the queue drain.  Nine days later the PR was still a draft with **no reply
+and no new commit** (branch `325224590`), so it got one last look before closing: the patch was re-cut on
+the current tree (applies cleanly to `8f9dad0be`, offsets only) and **the r98 re-entry condition was
+implemented here** -- drain only where a queued upload's destination overlaps the copy, issuing only the
+overlapping origins and fencing the copy on the event that issue recorded (so the rest of the queue keeps
+batching), plus a fix for the ring teardown (below).
+
+**Measured** (gfx1201, ROCm 10.1.0, one job at a time, `ROCBLAS_USE_HIPBLASLT=0`, 3 interleaved pairs per
+arm, seed 42, temp 0, `prompts/prose-rdna-boosts.txt`, `-n 400`, all arms from the same build directory
+with the `bin/` of each kept):
+
+| config | base (r186) | PR as submitted | PR + scoped drain |
+|---|---:|---:|---:|
+| Flash-Next GSQ-RCO-IQ3_XXS + shared Q8_0 MTP, 2 GPU `-sm tensor -ncmoe 10`, MTP n3, q8_0 K/V | **101.12** | 99.65 (**-1.5 %**) | 99.27 (**-1.8 %**) |
+| 35B-A3B UD-Q4_K_M, 2 GPU `-sm tensor -ncmoe 10`, MTP n3, q8_0 K/V | **199.66** | 199.15 (-0.3 %) | 196.95 (-1.4 %) |
+| dense 27B UD-Q4_K_XL, 1 GPU, plain, 8K ctx | 30.69 | 30.66 | 30.72 |
+
+Correctness is intact in every arm -- greedy text byte-identical on the Flash-Next cell (1775 chars
+`52ccd3394a63`), the 35B-A3B cell (1401 chars `aaef5122fe19`) and a dense 4B cell (889 chars
+`fbb8c4ac4d98`), no GPU faults -- so the change is numerics-neutral and r90's `set_tensor_async` snapshot
+guarantee is kept, exactly as the submitter measured (and as r98 verified with the FINDINGS-2026-10-19b
+self-KLD control, 100.000 % at `-ub 8` and `-ub 1`).
+
+**The r98 attribution was wrong and is corrected here.**  The drain is the *trigger*, not the cost:
+scoping it does not recover the loss, and on the 35B-A3B cell it is worse than the unconditional drain.
+The cost is that these uploads leave the graph-input ring's **batched** path (r89 / PR #182) and become
+one `cudaMemcpyAsync` per upload.  Isolated with the same build and only `GGML_CUDA_ASYNC_INPUT_BATCH=0` on
+the Flash-Next cell: `base` 101.12 · `PR` 99.65 · `base + BATCH=0` (the per-copy path the PR replaces)
+**96.96** · `PR + BATCH=0` 98.91.  The submitter's `+2.7 %` therefore reproduces -- against a tree whose
+other host-side work drains that queue -- and it still lands *between* the per-copy and the batch path.
+No delivery config drains the queue between upload and graph, so the premise of the change does not arise
+here.
+
+**Two defects in the patch itself** (found building the scoped arm; both are in the submitter's file, none
+reachable in the delivery): (1) the pinned ring can be freed under an in-flight copy -- `snap_half_ev[h]`
+is recorded when the ring *leaves* half `h`, so the half being filled has copies no event covers, and the
+destructor synchronises the two stored events and then `cudaFreeHost`s the ring (fix: record
+`snap_half_ev[snap_half]` on `stream()` before the syncs, or synchronise the stream first); (2) the
+per-context ring takes no lock where the per-device ring takes `d.mtx`, and `cudaEventSynchronize` on a
+half switch is a host-blocking wait inside the upload path.
+
+**Outcome.**  PR **CLOSED as not planned** with the table above posted to the submitter, stating what
+would reopen it: a measurement showing the queue is actually drained between upload and graph **on a
+delivery config** (`GGML_CUDA_ASYNC_INPUT_DEBUG=1` / `rocprofv3` counting per-token drains that issued
+queued uploads) -- and the correct fix for that is to stop whatever drains it, not to bypass the ring.
+`wip/CAMPAIGNS.md` records the closure; nothing is added to `TODO.md` (a closed item is a WORKLOG entry).
+
 ## 261031.003 (r186) -- the conv fusion's single-device gate is gone (block 10): +5.7 % dense / +3.0 % MoE decode on 3 GPU `-sm tensor`, bit-identical
 
 **Released as `v16-6050b467c-r186` (16 blocks; block 10 amended).**  Canonical tip
