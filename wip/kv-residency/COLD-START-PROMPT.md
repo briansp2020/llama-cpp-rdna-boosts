@@ -89,6 +89,11 @@ STATE (verify, don't assume):
   - **Campaign branch `wip-kv-residency-b`**, tip **`b5d895c59`** (pushed).  `wip-kv-residency` (`7c7769e50`) is
     Goal A's measurement tree — do not develop on it.  Never commit campaign code to `rdna-boosts`; **never
     touch `patches/` or `release.json`**.
+  - **The campaign tree is behind the delivery**: `b5d895c59` sits on the r182-era tip, the set is now at r186.
+    A11's numbers were all measured on that one build (so the arm comparisons are like-for-like), and r183-r186
+    are 1-GPU-neutral for these arms (r183's GDN folds already fire at one device, r185's verify-width bound is
+    inert at one sequence, r186 only removes a multi-device-only conv gate) — but **re-base the campaign branch
+    onto `release.json.tip` before promotion**, and re-measure rather than carrying a number across a base.
   - ONE R9700 (gfx1201), 32 624 MiB.  **Check `rocm-smi --showmeminfo vram` first** — the maintainer runs a
     Flash-Next server here that holds ~34 GB, and every fit/gate then reads garbage (`free = 2 MiB`) or OOMs.
     Never run a second GPU job; if the card is in use, say so and stop.
