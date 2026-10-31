@@ -1,7 +1,9 @@
 # B-A — the attendance pool for the attention KV (design + acceptance numbers)
 
-**Status: STEPS 1 AND 2 ARE BUILT AND GATED (session A10, §7); step 3 (the policy) is not.**  Every number is
-measured on this box (1 R9700).  Plan context:
+**Status: STEPS 1 AND 2 ARE BUILT AND GATED (session A10, §7), the ACCEPTANCE TABLE IS COMPLETE AT THREE DEPTHS
+and the sparse arm is attributed (session A11, §8), and the page policy (step 3 of §4) is measured dead (§8.4).**
+What is left is the indexer score chain and the promotion decision (§8.6).  Every number is measured on this box
+(1 R9700).  Plan context:
 [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) §3.2-§3.5; instrument and trace: [`qsa-census.py`](qsa-census.py) over a
 48-step decode trace (Flash-Next IQ3, `-c 131072`, 102 912 cells, sparse arm, `GGML_CUDA_DISABLE_GRAPHS=1`).
 
@@ -10,6 +12,7 @@ measured on this box (1 R9700).  Plan context:
 | fact | value |
 |---|---|
 | attended set | **2051 cells per layer per step** (`top_k + r − 1`, r = 4), spread over the whole prefix |
+| what the pool itself costs (A11, §8.4) | **0.10-0.11 ms/token** of resolve + 0.03-0.05 ms of fills — i.e. the fills a policy can win are <1 % of a step |
 | step-to-step Jaccard (same layer) | median **0.586** |
 | recency window of 17-25 % of the KV | **≈ 0 gain** (+3 % over ~0 at 180k) — position says nothing about attendance |
 | region's map unit (block 15) at 4 MiB | **3855 cells/layer** → an attendance policy at that granularity hits **6 %** and churns 601 units/step (**90 ms/step**): the region's granularity cannot express a scattered attended set |
@@ -216,3 +219,180 @@ is that the pool keeps 90 % of the attention's KV *hot* rather than a positional
   the obvious next step if the RAM cost matters.
 * The pool declines a `-sm tensor` split (like the window): one page table per device would need a per-device
   pool and a split-aware resolve.
+
+## 8. The acceptance table at three depths, and what the sparse arm actually costs (A11, 2026-10-31)
+
+**Status: the A10 work list's steps 1, 2 and 3 are DONE.  The page policy (step 3 of §4) is measured dead, and
+the next lever is named.**  Same box, same build (`wip-kv-residency-b` `b5d895c59`, 1 GPU, gfx1201, `-ncmoe 48`,
+q8_0 KV, PLE flags, `ROCBLAS_USE_HIPBLASLT=0`, static MTP depth 4).
+
+### 8.1 The harness (so an arm is repeatable)
+
+One `llama-cli` process per arm (its internal server prints the timings as JSON, which is what the numbers below
+are read from), one GPU job at a time, arms back-to-back inside one batch:
+
+```bash
+HIP_VISIBLE_DEVICES=0 ROCBLAS_USE_HIPBLASLT=0 ./build-rocm/bin/llama-cli \
+  -m …/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf -md …/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  -ngl 99 -ncmoe 48 -ot 'per_layer_token_embd.*=CPU' -lm none -lzm off -ctk q8_0 -ctv q8_0 \
+  --seed 42 --temp 0 --no-display-prompt --single-turn --spec-type draft-mtp --spec-draft-n-max 4 \
+  -c <ctx> -f <prompt> -n 512 -v
+```
+
+| arm | env |
+|---|---|
+| resident, dense decode (the default on gfx1201) | — |
+| resident, **sparse** decode forced | `LLAMA_QSA_DENSE_DECODE_UNTIL=0` |
+| **pool** | `LLAMA_KV_REGION_POOL=16416` (= 4104 pages × 4 cells = 16 416 cells/layer = **204.4 MiB**), `LLAMA_KV_POOL_STATS=<file>` |
+
+Prompts: `prompts/prose-rdna-boosts.txt` (5 298 tok) at `-c 16384`; `kld-corpus-35b-in-domain.txt` ×4
+(102 899 tok) at `-c 131072`; ×7 (180 035 tok) at `-c 196608`.  Pinned mirror: **204 MiB / 1 632 MiB /
+2 448 MiB** at those `-c`.  Text from a separate run **without** `-v` (`scripts/extract-generated.py`).
+
+The two instruments are committed next to this file, so the next session can re-run the table rather than
+re-derive it: **`acceptance-arms.sh {5k|103k|180k} [reps]`** (the arms above, interleaved, one row per arm via
+`arm-row.py` — which prints tokens/step because two MTP arms may only be compared where that matches) and
+**`kv-kernel-census.py short.csv long.csv <n_short> <n_long> [--vs …]`** (8.4's subtraction, per kernel and per
+bucket, with the call-count filter).
+
+### 8.2 The table (`-n 512`, MTP depth 4)
+
+| depth | arm | gen t/s | tokens/step | draft / accepted | prefill t/s |
+|---|---|---|---|---|---|
+| **5 298** (`16384`) | resident dense | **70.94** (71.11 / 70.77) | 2.65 | 766 / 319 (41.6 %) | 523-526 |
+| | resident sparse | **70.65** (70.67 / 70.63) | 2.78 | 728 / 328 (45.1 %) | 523-525 |
+| | pool (204 MiB) | **70.30** (70.31 / 70.29) | 2.78 | 728 / 328 | 520-522 |
+| **102 899** (`131072`) | resident dense | **58.27** | 2.83 | 715 / 331 (46.3 %) | 518.3 |
+| | resident sparse | **53.92** (−7.5 %) | 2.84 | 715 / 332 (46.4 %) | 518.0 |
+| | pool (204 MiB, mirror 1.6 GiB) | **54.20** (−7.0 %) | 2.84 | 715 / 332 | 491.4 (−5.1 %) |
+| **180 035** (`196608`) | resident dense | **48.73** (48.72 / 48.74) | 2.75 | 739 / 326 (44.1 %) | 482.3 |
+| | resident sparse | **42.93** (−11.9 %) | 2.71 | 745 / 323 (43.4 %) | 482.0 |
+| | pool (204 MiB, mirror 2.4 GiB) | **43.09** (−11.6 %) | 2.71 | 745 / 323 | 443.8 (−8.0 %) |
+
+* **The pool lands on the sparse ceiling at every depth** (+0.5 % / +0.6 % / +0.35 % vs the forced-sparse arm —
+  i.e. all noise), so the pool's *placement* is free and the remaining gap to a resident KV is the sparse decode
+  arm's own cost (8.5).
+* **5.3k is the first depth where the pool is free** (the brief expected a −3.5 % streaming tax there; it is not
+  there): a 16 416-cell pool is *the whole cache* at `-c 16384` (the KV is 204 MiB there, i.e. the same 204 MiB
+  as the pool), so 99.25 % of ids hit and only the misses and the indexer touch the mirror; prefill is neutral
+  (520-525 vs 523-526 t/s).  At a longer window the three arms are within 1 % of each other, and a fixed
+  one-time cost fit over the `-n` 128/512 pairs gives a steady state of 74.3 (dense) / 75.4 (sparse) / 75.2
+  (pool) t/s — all equal.
+* **The deep end is where it costs**: −7.5 % at 103k, −11.9 % at 180k, all of it the sparse arm (8.5), against a
+  **204 MiB pool instead of the resident attention KV's 1 632 MiB (103k) / 2 448 MiB (180k)** — plus the arena
+  gain of §7.5.  (§7.4's "816 MiB resident KV" was the `-c 65536` arm's KV at a 103k-deep prompt, not the 103k
+  arm's; a q8_0 cell is 1 088 B × 12 layers, so `-c × 13 056 B`.)
+* Pool hit rate: **99.25 %** (5.3k), **92.5 %** (103k), **93.4 %** (180k) of ids; 2 160-2 268 resolves.
+* Text: pool **==** sparse at every depth measured (5.3k `332 chars dd1981213373`, 51 475
+  `854 chars 43b30de151b9`); dense differs from both (the documented regime change, `GREEDY-PURITY.md`
+  §45/§63) — e.g. 5.3k dense `296 chars 91ef8940d66e`.
+
+### 8.3 The A10 "−20 %" was the measurement window, not placement
+
+§7.4 read dense **60.2** / sparse 47.9 / pool 48.3 with a **`-n 128`** window.  At `-n 512`, everything else
+identical, the same arms read **58.3 / 53.9 / 54.2** — the sparse penalty is **−7.5 %**, not −20 %.  The cause is
+not a warm-up artefact and not the KV: **a speculative arm's t/s is (tokens/step) × (step rate)**, and inside the
+first 128 tokens the two arms accept differently (at 180k: dense 87 of 158 drafts = **55.1 %**, sparse 76 of
+203 = **37.4 %**) because the two arms generate *different text* (different attention regime).  Over 512 tokens
+the arms converge
+(331/715 = 46.3 % vs 332/715 = 46.4 %, 181 vs 180 steps) and the per-step cost is what is left.
+
+This is reproducible, not noise: at 180k, back-to-back, the dense arm reads **53.53** in a `-n 128` window and
+**48.72** over `-n 512` (its own acceptance decays 55.1 % → 44.1 % as the text leaves the prompt's domain), while
+the sparse arm reads 38.41 and 42.92.  So the `-n 128` set (−28 % at 180k, −20 % at 103k) measures *acceptance*,
+and the `-n 512` set measures the arm.  **Rule: compare MTP arms only where their tokens/step match; check the
+draft/accepted counters before reading a t/s delta** (`HANDOVER.md` §5 rule 9).
+
+### 8.4 The sparse arm's attribution (rocprofv3, A10's step 2)
+
+**Method.**  Two `rocprofv3 --kernel-trace --stats` runs of the *same* arm at two `-n` lengths: the prefill is
+identical and the one-time lazy code-object loads happen in both, so `(t_long − t_short)/(n_long − n_short)` is
+the steady-state **decode** cost per token, kernel by kernel.  Filtering to kernels whose *call count* scales with
+tokens drops the prefill noise (a stray prefill kernel drifting between runs otherwise contributes ±2 ms/token).
+
+**A. MTP-4 at 103k** (`n = 2 → 130`), decode GPU kernel time per token and per verify step (2.83 tokens/step).
+The bucket sums are what `kv-kernel-census.py` prints for the two arms; `--vs` reproduces the Δ column exactly:
+
+| bucket | dense | pool | Δ/token | Δ/step |
+|---|---|---|---|---|
+| indexer score chain | −0.02 | **2.34** | +2.36 | **+6.7** |
+| radix top-k (6 kernels) | — | 0.31 | +0.31 | +0.9 |
+| FA | 3.14 | 1.09 (QSA 0.27 + draft 0.82) | **−2.05** | −5.8 |
+| pool resolve (mark / claim / map+fill) | — | 0.09 | +0.09 | +0.3 |
+| copies | 0.25 | 1.24 | +0.98 | +2.8 |
+| everything else (MoE, hc_mix, norms …) | 9.06 | 10.26 | +1.20 | +3.4 |
+| **total** | **12.42** | **15.32** | **+2.90 (+23 %)** | **+8.3** |
+
+The indexer score chain at decode width is not one kernel: `k_get_rows<…dequantize_q8_0>` **0.81**
+(the indexer key cache read), `mul_mat_vec_f<float,float,20,64>` **0.54** (the actual query·key score),
+`rope_multi` **0.44**, `rms_rows_f32` **0.29**, `k_bin_bcast<op_add>` **0.44** (the block bias).  The "everything
+else" drift is *text*, not attention: a different accepted set routes different experts.
+
+**B. Plain decode at 103k** (no MTP, so 1 token = 1 step and there is no acceptance confound), per token:
+
+| bucket | dense | pool | Δ |
+|---|---|---|---|
+| indexer score chain | 0.19 | **5.38** | +5.19 |
+| radix top-k | — | 2.17 | +2.17 |
+| FA | 4.38 | 0.30 | **−4.08** |
+| pool resolve | — | 0.11 | +0.11 |
+| copies | 0.88 | 2.62 | +1.74 |
+| everything else | 12.66 | 13.21 | +0.55 |
+| **total** | **18.10** | **23.78** | **+5.68 (+31 %)** |
+
+The plain-decode chain is dominated by the *preparation* of the indexer keys, not by the score: key read/dequantize
+**2.17**, bias add **1.18**, rope **1.08**, `rms_rows_f32` **0.40**, and the score matvec itself only **0.28** —
+and +1.74 of the copies bucket is a whole-cache `copyBufferRect` (**1.83** ms, 89 calls/token, 0 calls in the
+dense arm) that belongs to the same key path, which puts the whole preparation at **~6.6 ms/token** against
+**0.28 ms** of actual scoring.  (Plain decode takes the non-derived indexer path — the derived bias is gated on
+`ubatch.n_tokens > 1` — and a different top-k family, which is why its per-step indexer cost is larger than
+1/2.83 of the MTP arm's.  *Not chased this session.*)
+
+**Answer to the brief's question.**
+
+* **The pool's own machinery is 0.10-0.11 ms/token (≈0.3 ms/step, <1 % of a step).**  Its fill traffic is
+  `(1 − hit) × 2.55 MiB/token` = **0.03-0.05 ms/step** at 92-99 % hits.  **A page policy can recover no more
+  than that: step 3 of §4 (LRU / F-LRU / a heat prior) is dead at this shape**, exactly as the design predicted.
+* **The lever is the indexer score chain: ~6.7 ms per verify step (MTP) / ~5.2-6.6 ms per token (plain).**  Most
+  of it is the *per-step re-preparation of the indexer keys* (gather/dequantize + a whole-cache copy, rope, rms,
+  bias) rather than the score itself (0.28-0.54 ms) — i.e. a derived key form's worth of work is being redone
+  every step.  The radix top-k is the second item (0.9 ms/step under MTP, 2.2 ms/token plain).  Neither is a
+  placement question and neither is touched by block 15 or by this pool.
+* **The sparse arm's structural trade, stated plainly:** it replaces a dense FA read of the whole extent
+  (4.38 ms/token at 103k plain) with an indexer pass over the same extent (~7.5 ms) plus the top-k (2.2) plus a
+  small FA (0.3).  On a *resident* KV that trade loses (the dense read is from VRAM); it only wins when the KV
+  is streamed (`B1-STRATA-PLAN.md` §3.2).  So the pool's 204 MiB buys VRAM at a **7-12 %** decode cost at depth
+  — not the 20 % A10 recorded.
+
+**Read the census for its buckets, never for a timing.**  Its kernel delta (+2.90 ms/token at MTP-4) is *larger*
+than the unprofiled wall delta (+1.29 ms/token = −7.5 %), because profiling inflates the pool arm more than the
+dense one (the two profiled runs' own banners read 17.7 vs 22.2 ms/token, i.e. 56.4 vs 45.1 t/s).  The buckets
+are internally consistent (they sum to the measured kernel delta) and that is what they are for.
+
+### 8.5 Step 3 (the work list's item 3) — the MTP draft's sparse decode under a pooled target
+
+`qwen4exp_mtp_sparse_arm`'s decode half was default-OFF on measurements taken with a **resident** draft KV; under
+a pooled target the argument could have inverted.  It does not:
+
+| arm (pool, 103k, `-n 512`, MTP-4) | gen t/s | draft / accepted | text (51 475 depth) |
+|---|---|---|---|
+| `LLAMA_MTP_SPARSE_DECODE=0` (the default) | **54.25** | 715 / 332 | 854 `43b30de151b9` |
+| `LLAMA_MTP_SPARSE_DECODE=1` | 50.00 (**−7.8 %**) | 715 / 332 | 854 `43b30de151b9` |
+
+Identical acceptance and identical text, so the whole 7.8 % is the draft arm's per-step cost on this geometry
+(a resident draft KV, and the pool does not cover the draft's cache).  **The default-OFF decision stands**;
+`LLAMA_MTP_SPARSE_DECODE` stays an A/B knob.  (Reminder, `qwen4exp.cpp`: the *prefill* half of that feature is
+default-ON and is not involved here.)
+
+### 8.6 What is left
+
+1. **The indexer score chain** (8.4) — the only item with real mass left: ~7 ms of a ~35-43 ms verify step.
+   Candidate direction (not started, and the maintainer's call): keep a *derived* indexer key form (roped,
+   normed, biased once at write time) so a decode step only runs the score matvec + the top-k, and check why
+   the derived-cache path is not already doing that at `n_tokens == 1`.
+2. **The radix top-k** (0.9-2.2 ms) — second item, same shape of question.
+3. **Step 3's page policy — do not spend time on it** (8.4's first bullet).
+4. **Promotion is the maintainer's decision** and its prerequisites are unchanged (§7.6 plus
+   `COLD-START-PROMPT.md`): a block in `patches/`, `ENVIRONMENT.md` + `patches/README.md` entries, the pool's
+   VRAM in `--fit`'s arithmetic, a grow-on-demand mirror, the gates in the release flow, and a default-off
+   call (it forces the sparse arm, so it is a fittability feature like block 15, not a speed one).
