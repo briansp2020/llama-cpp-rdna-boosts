@@ -1,4 +1,4 @@
-From 09969cf0b1fbb530fcdf6566f46c590d0a4aabab Mon Sep 17 00:00:00 2001
+From f3d144a402f78d3bccf7ff893b18ab90e535afac Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -293,7 +293,7 @@ device 1) and its text matches the GGML_CUDA_SLAB=0 arm.
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu |   11 +-
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu |    5 +-
  .../gated_delta_net_chunked_bf16_gfx11.cu     |    5 +-
- ggml/src/ggml-cuda/gdn-conv.cu                |  351 +-
+ ggml/src/ggml-cuda/gdn-conv.cu                |  379 +-
  ggml/src/ggml-cuda/gdn-conv.cuh               |   13 +-
  ggml/src/ggml-cuda/ggml-cuda-arena.cu         |   70 +
  ggml/src/ggml-cuda/ggml-cuda-arena.cuh        |   15 +
@@ -324,7 +324,7 @@ device 1) and its text matches the GGML_CUDA_SLAB=0 arm.
  ggml/src/ggml-cuda/norm-gated.cuh             |    1 +
  ggml/src/ggml-cuda/norm.cu                    |  156 +-
  ggml/src/ggml-cuda/norm.cuh                   |    7 +
- ggml/src/ggml-cuda/ple-conv.cu                |   27 +-
+ ggml/src/ggml-cuda/ple-conv.cu                |   36 +-
  ggml/src/ggml-cuda/ple-conv.cuh               |    1 +
  ggml/src/ggml-cuda/quantize.cuh               |   13 +-
  ggml/src/ggml-cuda/rope.cu                    |  371 +-
@@ -349,7 +349,7 @@ device 1) and its text matches the GGML_CUDA_SLAB=0 arm.
  tests/test-fusion-gate-beta-multiseq.cpp      |  278 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 81 files changed, 14341 insertions(+), 5057 deletions(-)
+ 81 files changed, 14364 insertions(+), 5071 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
@@ -3867,30 +3867,53 @@ index 44dbf85c2..cd9b1d3b4 100644
          const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * n_seqs * H * GDN_BF16_BT * GDN_BF16_BT;
          std::vector<unsigned short> dump(m);
 diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
-index 07380a061..97b6ce57f 100644
+index 07380a061..06c85a380 100644
 --- a/ggml/src/ggml-cuda/gdn-conv.cu
 +++ b/ggml/src/ggml-cuda/gdn-conv.cu
-@@ -1,6 +1,8 @@
+@@ -1,19 +1,31 @@
  #include "gdn-conv.cuh"
  #include "unary.cuh"
 +#include "mmvq.cuh"
  #include <cstdlib>
 +#include <algorithm>
  
- // The direct kernel is bit-identical to the CONCAT+SSM_CONV+SILU reference on a single-device graph
- // (same 4-tap reduction order, same silu, `gdn_concat_tail` still materializes the snapshot tail).
-@@ -11,7 +13,9 @@
- // single-device graphs only.  GGML_CUDA_CONV_FUSION_MULTI=1 forces it back on (A/B / fix validation)
- // and GGML_CUDA_DISABLE_CONV_FUSION=1 is the explicit off switch.
+-// The direct kernel is bit-identical to the CONCAT+SSM_CONV+SILU reference on a single-device graph
+-// (same 4-tap reduction order, same silu, `gdn_concat_tail` still materializes the snapshot tail).
+-// Under a multi-device tensor split it is NOT: with the fusion off, the raw ops and the upstream
+-// SSM_CONV+SILU fusion agree byte for byte, while the direct kernel produces a different greedy
+-// continuation (27B/35B, 3x R9700, -sm tensor; gfx1201 2026-09-23).  The sharded inputs themselves
+-// are consistent, so the divergence is still open; until it is root-caused keep the fusion on
+-// single-device graphs only.  GGML_CUDA_CONV_FUSION_MULTI=1 forces it back on (A/B / fix validation)
+-// and GGML_CUDA_DISABLE_CONV_FUSION=1 is the explicit off switch.
++// The direct kernel is bit-identical to the CONCAT+SSM_CONV+SILU reference: same 4-tap reduction
++// order, same silu, and `gdn_concat_tail` still materializes the snapshot tail.
++//
++// It was gated to single-device graphs from 2026-09-23 (r13) because under a multi-device tensor split
++// it produced a different greedy continuation on 3x R9700 (27B/35B), while the raw ops and the
++// upstream SSM_CONV+SILU fusion agreed byte for byte.  That divergence was never root-caused and
++// **no longer reproduces** on the r186 tree: the post-prefill logits are bit-identical with the
++// fusion on and off at P=4096 on 1/2/3 devices, `-sm tensor` and `-sm layer`, dense (27B) and MoE
++// (35B-A3B, including the `-ncmoe` server shape), and so is greedy text; the prefill-logit gate
++// reads KLD 0.000000 / same-top-p 99.990 % for the fused arm against the unfused one on 3 GPU
++// `-sm tensor`.  The likely fix is the r183 rework of exactly the suspect area (the snapshot write
++// moved into the conv kernel and the conv-state gather was deferred into it), but that is unproven.
++// Relative throughput of the fused arm on 3 GPU `-sm tensor`: 27B IQ3_S tg128 +5.7 % / pp2048
++// +1.1 %, 35B-A3B Q4_K_M tg128 +3.0 % (prefill flat).
++//
++// So the device gate is gone and the fusion runs on every split.  GGML_CUDA_DISABLE_CONV_FUSION=1 is
++// the off switch and the A/B arm; the old GGML_CUDA_CONV_FUSION_MULTI force-on knob is retired (it
++// only ever countermanded the gate, and forcing it on is now the default).
  static bool gdn_conv_enabled() {
 -    if (getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr) return false;
-+    // Cache the switches: this runs once per conv launch, and getenv() is expensive on Windows.
+-    static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
+-    return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
++    // Cache the switch: this runs once per conv launch, and getenv() is expensive on Windows.
 +    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr;
-+    if (disabled) return false;
-     static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
-     return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
++    return !disabled;
  }
-@@ -26,18 +30,56 @@ static __global__ void gdn_concat_tail(const float * __restrict__ state, const f
+ 
+ // tail-only materialization of the concat: columns [tail_from, T+3) of every channel row
+@@ -26,18 +38,56 @@ static __global__ void gdn_concat_tail(const float * __restrict__ state, const f
      out[(size_t) c * row_stride + j] = (j < 3) ? state[c * 3 + j] : x[(size_t) (j - 3) * C + c];
  }
  
@@ -3950,7 +3973,7 @@ index 07380a061..97b6ce57f 100644
      const float b = 0.0f;
      const int tend = min(T, t0 + TT);
      for (int t = t0; t < tend; ++t) {
-@@ -45,12 +87,93 @@ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float
+@@ -45,12 +95,93 @@ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float
  #pragma unroll
          for (int j = 0; j < 4; ++j) sumf += xw[j] * wr[j];
          sumf += b;
@@ -4046,7 +4069,7 @@ index 07380a061..97b6ce57f 100644
  static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m) {
      if (!gdn_conv_enabled() || i < 0 || i + 2 >= cgraph->n_nodes) return false;
      const ggml_tensor * cc = cgraph->nodes[i];
-@@ -64,7 +187,14 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+@@ -64,7 +195,14 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
      if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) return false;
      if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
      if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) return false;
@@ -4062,7 +4085,7 @@ index 07380a061..97b6ce57f 100644
      if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) return false;
      int64_t tail_from = T + 3; int conv = -1;
      for (int n = i + 1; n < cgraph->n_nodes && n < i + 64; ++n) {
-@@ -78,7 +208,7 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+@@ -78,7 +216,7 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
              const int64_t col = (int64_t) (t->view_offs / sizeof(float)); if (col < 0 || col + 3 > T + 3) return false;
              tail_from = std::min(tail_from, col); continue;
          }
@@ -4071,7 +4094,7 @@ index 07380a061..97b6ce57f 100644
          // the shared build_conv_state (qwen35moe/qwen35/qwen3next) writes the snapshot with a raw
          // view of the concat, while qwen4exp wraps it in a cont.  Accept the snapshot cpy when its
          // source is a 3-column view of the concat (already accounted for by tail_from above); reject
-@@ -87,6 +217,13 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+@@ -87,6 +225,13 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
              const ggml_tensor * s0 = t->src[0];
              if (s0 == nullptr || s0->op != GGML_OP_VIEW || s0->view_src != cc ||
                      s0->ne[0] != 3 || s0->ne[1] != C || s0->ne[2] != 1) return false;
@@ -4085,7 +4108,7 @@ index 07380a061..97b6ce57f 100644
              continue;
          }
          return false;
-@@ -103,19 +240,37 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+@@ -103,19 +248,37 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
          for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == cv || t->src[s]->view_src == cv) return false; }
      m.concat_idx = i; m.conv_idx = conv; m.x = x; m.state = st; m.concat = cc; m.w = w; m.conv_out = cgraph->nodes[conv + 1];
      m.C = C; m.T = T; m.tail_from = tail_from; m.silu = true;
@@ -4125,7 +4148,7 @@ index 07380a061..97b6ce57f 100644
      const int ncols = (int) (m.T + 3 - m.tail_from);
      if (ncols <= 0) return;
      const int64_t n = m.C * ncols;
-@@ -124,12 +279,180 @@ void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_c
+@@ -124,12 +287,180 @@ void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_c
      CUDA_CHECK(cudaGetLastError());
  }
  
@@ -20839,21 +20862,31 @@ index 5b41d8bce..9fb6a3921 100644
 +
  int  ggml_cuda_l2_norm_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/ple-conv.cu b/ggml/src/ggml-cuda/ple-conv.cu
-index 65f7ba070..0dab786de 100644
+index 65f7ba070..3ccc9e63b 100644
 --- a/ggml/src/ggml-cuda/ple-conv.cu
 +++ b/ggml/src/ggml-cuda/ple-conv.cu
-@@ -7,7 +7,9 @@
- // See gdn-conv.cu: the direct conv kernel diverges from the reference under a multi-device tensor
- // split, so keep the fusion on single-device graphs only until that is root-caused.
+@@ -4,12 +4,15 @@
+ #include <vector>
+ #include <algorithm>
+ #include <cstdlib>
+-// See gdn-conv.cu: the direct conv kernel diverges from the reference under a multi-device tensor
+-// split, so keep the fusion on single-device graphs only until that is root-caused.
++// See gdn-conv.cu: the direct conv kernel used to diverge from the reference under a multi-device
++// tensor split, which is why this fusion was gated to single-device graphs.  That divergence no
++// longer reproduces (r186: bit-identical post-prefill logits and greedy text on 1/2/3 devices,
++// dense and MoE), so the fusion runs on every split.  GGML_CUDA_DISABLE_CONV_FUSION=1 is the off
++// switch; GGML_CUDA_CONV_FUSION_MULTI is retired.
  static bool ple_conv_enabled() {
 -    if (getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr) return false;
-+    // Cache the switches: this runs once per conv launch, and getenv() is expensive on Windows.
+-    static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
+-    return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
++    // Cache the switch: this runs once per conv launch, and getenv() is expensive on Windows.
 +    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr;
-+    if (disabled) return false;
-     static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
-     return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
++    return !disabled;
  }
-@@ -193,3 +195,26 @@ void ggml_cuda_ple_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_
+ #if defined(__HIP_PLATFORM_AMD__)
+ static __device__ __forceinline__ float ple_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
+@@ -193,3 +196,26 @@ void ggml_cuda_ple_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_
      }
      CUDA_CHECK(cudaGetLastError());
  }

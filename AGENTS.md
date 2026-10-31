@@ -1196,7 +1196,14 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `ggml_cuda_gdn_conv_pattern_at_concat`, which must stay a **superset** (its alloc deps then cover every case);
   and a `CONCAT` over a deferred gather the direct conv does not take **aborts** by design.  All three ride the
   direct conv's single-device gate, so a 2+ device `-sm tensor` / `-sm layer` run (the recommended MoE server
-  shape) is **inert** unless `GGML_CUDA_CONV_FUSION_MULTI=1` — do not quote them as multi-GPU wins.  The
+  shape) is **inert** unless `GGML_CUDA_CONV_FUSION_MULTI=1` — do not quote them as multi-GPU wins.  **(r186
+  removed that restriction:** the 3x R9700 `-sm tensor` divergence that motivated it no longer reproduces —
+  bit-identical post-prefill logits (P=4096) and greedy text on 1/2/3 devices, `-sm tensor` and `-sm layer`,
+  dense and MoE including the `-ncmoe` server shape, and the prefill-logit gate reads 0.000000 / 99.990 % —
+  so the fusion and all four folds now run on every split, worth **+5.7 % tg128 / +1.1 % pp2048** on 3 GPU
+  `-sm tensor` 27B IQ3_S and **+3.0 % tg128** on 35B-A3B Q4_K_M.  `GGML_CUDA_DISABLE_CONV_FUSION=1` is the
+  A/B arm and `GGML_CUDA_CONV_FUSION_MULTI` is retired; the 3-device divergence is not root-caused, so
+  re-gate with release gate 14's **multi-device** arm before touching the gate.  The
   shared-expert gate fold (`GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0`) is the fourth patch: it needs a BF16/F32 gate
   weight, is inert on every quantized model we hold and is +0.6 % on Flash-Next.  Gate: the prefill-logit `--ab`
   at `--ub 1` (0.000000 / 100.000 %), text identity on a single device *and* a 2-GPU `-sm tensor -ncmoe` arm,

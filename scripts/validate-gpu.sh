@@ -31,8 +31,11 @@
 #      greedy text and the `-ub 1` prefill-logit arm are both blind to them (r80 + PR #177 was
 #      run-to-run unstable at P=3584 with clean text and KLD 0.000000).  Fails unless the default
 #      arm is run-to-run stable, bit-identical to its all-folds-off arm, and really reaches the
-#      fold (`GGML_CUDA_CONV_DEBUG=1` -> `snap=1`).  Skipped when no GDN GGUF is present or the
-#      applied tree touched no conv-fold source;
+#      fold (`GGML_CUDA_CONV_DEBUG=1` -> `snap=1`) and the reference arm must really have taken
+#      CONCAT+SSM_CONV+CPY.  Runs one single-device arm and, on a 2+ GPU box, `-sm tensor` and
+#      `-sm layer` arms (r186 made the fusion device-count independent, so those are the ones that
+#      can catch a regression).  Skipped when no GDN GGUF is present or the tree touched no
+#      conv-fold source;
 #   5. writes a one-screen summary to $STATE_DIR/runs/<rev>/summary.txt and, on success,
 #      records $STATE_DIR/last-ok.
 #
@@ -126,6 +129,10 @@ GDN_WIDTH_TEXT="${GDN_WIDTH_TEXT:-$REPO/prompts/prose-rdna-boosts.txt}"
 GDN_WIDTH_P="${GDN_WIDTH_P:-3584 4096}"
 GDN_WIDTH_RUNS="${GDN_WIDTH_RUNS:-3}"
 GDN_WIDTH_ALWAYS="${GDN_WIDTH_ALWAYS:-0}"
+# The arm list is "<HIP_VISIBLE_DEVICES>:<split>".  r186 made the conv fusion device-count independent, so the
+# MULTI-device arms are the ones that can catch a regression; they are clamped to the GPUs actually present.
+GW_SINGLE_ARM="0:layer"
+GDN_WIDTH_ARMS="${GDN_WIDTH_ARMS:-}"
 
 # Paths whose change makes the prefill-logit gate relevant (AGENTS: "any change to a prefill
 # kernel ... or a default-on approximate path").
@@ -376,6 +383,15 @@ fi
 # widths is the instrument that saw it, so it is the arm a change to these folds owes.  r183 shipped
 # the folds without it; r185 re-checked them with it (see the WORKLOG entry).
 
+# How many GPUs this box exposes.  rocm-smi is not required: if the count cannot be read we report 1 and only
+# the single-device arm runs (never a multi-device claim we did not actually exercise).
+gdn_gpu_count() {
+    local n
+    n=$("$ROCM_DIR/bin/rocm-smi" -i 2>/dev/null || rocm-smi -i 2>/dev/null) || n=""
+    n=$(printf '%s\n' "$n" | grep -oE '^GPU\[[0-9]+\]' | sort -u | wc -l)
+    [ "${n:-0}" -ge 1 ] && printf '%s' "$n" || printf '1'
+}
+
 # "<W8 hash> <row-0 hash>" from a probe log -- the two values a determinism/purity claim is made of.
 # Prints NOTHING when either half is missing (a bare `printf '%s %s'` of two empty strings is a space,
 # which would make the "no hash" guard below unreachable).
@@ -389,10 +405,11 @@ gw_hashes() {
 
 gdn_width_step() {
     local probe="$BUILD/bin/test-logits-width-probe"
-    local gw_ran=0 gw_fired=0 gw_model gw_p gw_r gw_ref gw_on gw_off gw_log gw_tag
+    local gw_ran=0 gw_fired=0 gw_model gw_arm gw_devs gw_split gw_p gw_r gw_ref gw_on gw_off gw_log gw_tag gw_ngpu arms
     if ! cmake --build "$BUILD" --target test-logits-width-probe -j "$JOBS" >"$RUN/gdn-width-build.log" 2>&1; then
         fail "building test-logits-width-probe (log: $RUN/gdn-width-build.log)"
     fi
+    gw_ngpu="$(gdn_gpu_count)"
     for gw_model in $GDN_WIDTH_MODELS; do
         gw_tag="$(basename "$gw_model" .gguf)"
         if [ ! -f "$gw_model" ]; then
@@ -400,42 +417,65 @@ gdn_width_step() {
             continue
         fi
         gw_ran=1
-        for gw_p in $GDN_WIDTH_P; do
-            gw_ref=""
-            for gw_r in $(seq 1 "$GDN_WIDTH_RUNS"); do
-                gw_log="$RUN/gdn-width-$gw_tag-P$gw_p-r$gw_r"
-                # default arm: every fold on
-                if ! HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" GGML_CUDA_CONV_DEBUG=1 \
-                        timeout 3600 "$probe" "$gw_model" "$GDN_WIDTH_TEXT" "$gw_p" 512 >"$gw_log.on" 2>&1; then
-                    fail "width probe, folds on ($gw_tag P=$gw_p; log: $gw_log.on)"
-                fi
-                # kill-switch arm: every fold off (`GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0` too: it is the
-                # fourth fold and a BF16/F32-gate model is the only one it fires on)
-                if ! HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" GGML_CUDA_CONV_DEBUG=1 \
-                        GGML_CUDA_DISABLE_GDN_CONV_SNAP=1 GGML_CUDA_FUSE_GDN_CONV_GATHER=0 \
-                        GGML_CUDA_FUSE_GDN_CONV_DECODE=0 GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0 \
-                        timeout 3600 "$probe" "$gw_model" "$GDN_WIDTH_TEXT" "$gw_p" 512 >"$gw_log.off" 2>&1; then
-                    fail "width probe, folds off ($gw_tag P=$gw_p; log: $gw_log.off)"
-                fi
-                gw_on="$(gw_hashes "$gw_log.on")"
-                gw_off="$(gw_hashes "$gw_log.off")"
-                # both halves present, else the log did not carry a probe result at all
-                case "$gw_on" in "") fail "width probe produced no W8/row-0 hash ($gw_tag P=$gw_p; log: $gw_log.on)";; esac
-                case "$gw_off" in "") fail "width probe produced no W8/row-0 hash ($gw_tag P=$gw_p; log: $gw_log.off)";; esac
-                grep -q 'GDN_CONV_DIRECT ' "$gw_log.on"  || fail "the GDN direct conv never ran ($gw_tag P=$gw_p), so this arm cannot judge the folds -- check GDN_WIDTH_MODELS (log: $gw_log.on)"
-                # `(^|[[:space:]])snap=1` and not a bare `snap=1`: the same line also carries `n_snap=1`,
-                # which would make the stand-down check below pass on the OFF arm by accident.
-                grep -qE '(^|[[:space:]])snap=1([[:space:]]|$)' "$gw_log.on" && gw_fired=1
-                grep -qE '(^|[[:space:]])snap=0([[:space:]]|$)' "$gw_log.off" \
-                    || fail "GGML_CUDA_DISABLE_GDN_CONV_SNAP=1 did not stand the snapshot fold down ($gw_tag P=$gw_p; log: $gw_log.off)"
-                if [ -z "$gw_ref" ]; then
-                    gw_ref="$gw_on"
-                elif [ "$gw_on" != "$gw_ref" ]; then
-                    fail "width probe is NOT run-to-run stable: $gw_tag P=$gw_p run $gw_r gave '$gw_on', run 1 gave '$gw_ref' (logs: $gw_log.*)"
-                fi
-                [ "$gw_on" = "$gw_off" ] || fail "the GDN conv folds are NOT bit-identical: $gw_tag P=$gw_p folds-on '$gw_on' vs folds-off '$gw_off' (logs: $gw_log.*)"
+        if [ -n "$GDN_WIDTH_ARMS" ]; then
+            arms="$GW_SINGLE_ARM $GDN_WIDTH_ARMS"
+        elif [ "$gw_ngpu" -ge 3 ]; then
+            arms="$GW_SINGLE_ARM 0,1,2:tensor 0,1,2:layer"
+        elif [ "$gw_ngpu" -eq 2 ]; then
+            arms="$GW_SINGLE_ARM 0,1:tensor 0,1:layer"
+        else
+            arms="$GW_SINGLE_ARM"
+            say "gdn width: single-GPU box, the multi-device arms are skipped (r186 made the fusion device-count independent, so they are the ones that matter -- run this on a 2+ GPU box before a release)"
+        fi
+        for gw_arm in $arms; do
+            gw_devs="${gw_arm%%:*}"
+            gw_split="${gw_arm##*:}"
+            for gw_p in $GDN_WIDTH_P; do
+                gw_ref=""
+                for gw_r in $(seq 1 "$GDN_WIDTH_RUNS"); do
+                    gw_log="$RUN/gdn-width-$gw_tag-$gw_devs-$gw_split-P$gw_p-r$gw_r"
+                    # default arm: every fold on
+                    if ! HIP_VISIBLE_DEVICES="$gw_devs" SPLIT="$gw_split" LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" \
+                            GGML_CUDA_CONV_DEBUG=1 \
+                            timeout 3600 "$probe" "$gw_model" "$GDN_WIDTH_TEXT" "$gw_p" 512 >"$gw_log.on" 2>&1; then
+                        fail "width probe, folds on ($gw_tag $gw_devs $gw_split P=$gw_p; log: $gw_log.on)"
+                    fi
+                    # kill-switch arm: every fold off (`GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0` too: it is the
+                    # fourth fold and a BF16/F32-gate model is the only one it fires on).  r186: every fusion
+                    # rides GGML_CUDA_DISABLE_CONV_FUSION, so the conv itself is stood down here as well --
+                    # that is the reference path the fused arm must reproduce.
+                    if ! HIP_VISIBLE_DEVICES="$gw_devs" SPLIT="$gw_split" LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" \
+                            GGML_CUDA_CONV_DEBUG=1 GGML_CUDA_DISABLE_CONV_FUSION=1 \
+                            GGML_CUDA_DISABLE_GDN_CONV_SNAP=1 GGML_CUDA_FUSE_GDN_CONV_GATHER=0 \
+                            GGML_CUDA_FUSE_GDN_CONV_DECODE=0 GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0 \
+                            timeout 3600 "$probe" "$gw_model" "$GDN_WIDTH_TEXT" "$gw_p" 512 >"$gw_log.off" 2>&1; then
+                        fail "width probe, folds off ($gw_tag $gw_devs $gw_split P=$gw_p; log: $gw_log.off)"
+                    fi
+                    gw_on="$(gw_hashes "$gw_log.on")"
+                    gw_off="$(gw_hashes "$gw_log.off")"
+                    # both halves present, else the log did not carry a probe result at all
+                    case "$gw_on" in "") fail "width probe produced no W8/row-0 hash ($gw_tag $gw_devs $gw_split P=$gw_p; log: $gw_log.on)";; esac
+                    case "$gw_off" in "") fail "width probe produced no W8/row-0 hash ($gw_tag $gw_devs $gw_split P=$gw_p; log: $gw_log.off)";; esac
+                    grep -q 'GDN_CONV_DIRECT ' "$gw_log.on" \
+                        || fail "the GDN direct conv never ran ($gw_tag $gw_devs $gw_split P=$gw_p) -- a multi-device arm needs 2+ visible devices (GDN_WIDTH_ARMS) and a GDN model (GDN_WIDTH_MODELS); log: $gw_log.on"
+                    # `(^|[[:space:]])snap=1` and not a bare `snap=1`: the same line also carries `n_snap=1`,
+                    # which would make the stand-down check below pass on the OFF arm by accident.
+                    grep -qE '(^|[[:space:]])snap=1([[:space:]]|$)' "$gw_log.on" && gw_fired=1
+                    # The comparison is only meaningful if the two arms really ran different paths: the
+                    # reference arm must have taken CONCAT + SSM_CONV + CPY, with no direct conv at all.
+                    if grep -q 'GDN_CONV_DIRECT ' "$gw_log.off"; then
+                        fail "GGML_CUDA_DISABLE_CONV_FUSION=1 did not stand the conv down, so both arms ran the fused path and this arm is VACUOUS ($gw_tag $gw_devs $gw_split P=$gw_p; log: $gw_log.off)"
+                    fi
+                    if [ -z "$gw_ref" ]; then
+                        gw_ref="$gw_on"
+                    elif [ "$gw_on" != "$gw_ref" ]; then
+                        fail "width probe is NOT run-to-run stable: $gw_tag $gw_devs $gw_split P=$gw_p run $gw_r gave '$gw_on', run 1 gave '$gw_ref' (logs: $gw_log.*)"
+                    fi
+                    [ "$gw_on" = "$gw_off" ] \
+                        || fail "the conv fusion is NOT bit-identical to its reference path: $gw_tag $gw_devs $gw_split P=$gw_p fused '$gw_on' vs reference '$gw_off' (logs: $gw_log.*)"
+                done
+                say "gdn width: $gw_tag $gw_devs $gw_split P=$gw_p  W8/row0 $gw_ref  (== reference path, $GDN_WIDTH_RUNS runs)"
             done
-            say "gdn width: $gw_tag P=$gw_p  W8/row0 $gw_ref  (== kill switch, $GDN_WIDTH_RUNS runs)"
         done
     done
     if [ "$gw_ran" = 1 ] && [ "$gw_fired" != 1 ]; then

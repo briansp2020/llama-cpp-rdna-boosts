@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard) | +14341 / −5057 | 81 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too) | +14341 / −5057 | 81 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -1804,9 +1804,10 @@ against r182 they measure +5.9 % / +3.3 % here.
 
 **Facts a future edit must keep.**
 
-* **The folds are inert on a multi-device graph** (the pre-existing `gdn_conv_enabled()`: one device unless
-  `GGML_CUDA_CONV_FUSION_MULTI=1`), so the recommended `-sm tensor -ncmoe` server shape gets none of them.
-  Stated in the release note; do not present these as multi-GPU wins.
+* **The folds were inert on a multi-device graph until r186** (the pre-existing `gdn_conv_enabled()` required
+  one device unless `GGML_CUDA_CONV_FUSION_MULTI=1`).  **r186 removed that gate** — see the section below — so
+  the recommended `-sm tensor -ncmoe` server shape now gets all of them.  The sentence in the r183 release note
+  that said otherwise is historical.
 * **`0003` must keep the `gdn_conv_norm_match() > 0` gate.**  Relaxing it re-opens the #249 loss: where the
   norm fold is refused the `ssm_conv_in` epilogue's free CONCAT write is replaced by a separate launch.
 * **The compute-time matchers and `graph_optimize` must keep deciding the same way** — the decode gate reads
@@ -1824,6 +1825,48 @@ canonical 27B Q8_0 gate **0.000000 / 100.000 %** against the r182 base; MTP on 3
 the `GGML_CUDA_SLAB=0` arm's text); per-block build 3/3 `--fast`; `validate-set.sh` green; no GPU faults.
 Numbers: `benchmarks/2026-10-30-gdn-decode-folds.md`; records `archive/work/gdn-decode-folds/PROMOTED.md`
 and `archive/work/cpy-2d-memcpy-guard/README.md`.
+
+#### r186 — the conv fusion (and all four r183 folds) run on every device count
+
+**What it is.**  `gdn_conv_enabled()` / `ple_conv_enabled()` no longer test
+`ggml_backend_cuda_get_device_count() <= 1`.  On 2026-09-23 (r13) the depthwise conv1d fusion was found to
+produce a different greedy continuation under a 3x R9700 `-sm tensor` split while the raw ops and the upstream
+`SSM_CONV+SILU` fusion agreed byte for byte, and it was gated to single-device graphs until root-caused
+(`archive/work/closing-the-gap/2026-09-23-gfx1201-conv-fusion-tensor-split.md`).  **That divergence no longer
+reproduces**, so the gate is gone: the fusion (and the r183 snapshot / gather / 1-token folds that ride it)
+now run on `-sm tensor` and `-sm layer` as well, which is the recommended multi-GPU server shape.
+
+**Evidence (gfx1201, r186 tree).**  `test-logits-width-probe` at `P=4096`, fused default vs
+`GGML_CUDA_DISABLE_CONV_FUSION=1` — bit-identical `W8` and row-0 hashes on eight arms: 27B IQ3_S on 1 GPU,
+2 GPU (`0,2`) tensor, 3 GPU tensor and 3 GPU layer; 35B-A3B Q3_K_M 3 GPU tensor and 3 GPU layer; 35B-A3B
+Q4_K_M 3 GPU tensor with `-ncmoe 40`, with and without the expert-cache arena — with the direct conv
+confirmed running on the shard (`C=2560` for 3 devices, `C=5120` for 2) and the snapshot fold active
+(`snap=1`).  Greedy text identical on 4B Q8_0 (1 GPU, 3 GPU tensor), 27B Q4_K_XL (3 GPU tensor + layer) and
+35B-A3B Q4_K_M (3 GPU tensor, and `-ncmoe 40`).  MTP Protocol A identical text **and** acceptance on both
+split modes (3 GPU tensor: acc 0.63244 = 2445/3866; 3 GPU layer: 0.58861 = 1850/3143).  A DFlash2 draft arm
+(35B-A3B + `draft-dflash n_max 5`) identical text and acceptance (0.52806 = 1449/2744).  The prefill-logit
+gate on 3 GPU tensor reads mean KLD **0.000000** / same-top-p **99.990 %** for the fused arm against the
+unfused one.  `test-backend-ops` SSM_CONV 60/60, CONCAT 183/183, CPY 251/251, 3/3 backends; per-block build
+2/2 `--fast`; no GPU faults.
+
+**Worth (3 GPU `-sm tensor`, `llama-bench -r 5`, three interleaved rounds, fused vs disabled).**
+27B IQ3_S tg128 **58.52/58.54/58.72 -> 61.85/61.90/62.01 (+5.7 %)** and pp2048 **1938.9 -> 1965**ish
+(+1.1 %); 35B-A3B Q4_K_M tg128 **118.7 -> 122.1 (+3.0 %)** with prefill flat.  Rule-5
+`llama-batched-bench -npl 1,4,8` total t/s flat (+0.4 / -0.2 / -0.1 %).  Numbers:
+`benchmarks/2026-10-31-conv-fusion-multi-device.md`.
+
+**Facts a future edit must keep.**
+
+* **The divergence was never root-caused** — the reach is *empirical*, not proven.  The likely fix is r183's
+  rework of exactly the suspect area (the snapshot write moved into the conv kernel and the conv-state gather
+  was deferred into it), but nothing establishes that.  A config outside the matrix above is unproven, which
+  is why release gate 14 carries a multi-device arm.
+* **`GGML_CUDA_CONV_FUSION_MULTI` is retired, not renamed.**  It only ever countermanded the gate; forcing the
+  fusion on is now the default.  `GGML_CUDA_DISABLE_CONV_FUSION` (§7.3, presence-only) is the off switch and
+  the A/B arm everywhere.
+* **Do not re-add a device-count test to "restore purity".**  If a divergence is ever found again, gate it on
+  the *config* that shows it with a witness, not on a device count that also disables the bit-identical
+  `-sm layer` arms.
 
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 

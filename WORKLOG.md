@@ -1,5 +1,49 @@
 # WORKLOG - dated delivery records
 
+## 261031.003 (r186) -- the conv fusion's single-device gate is gone (block 10): +5.7 % dense / +3.0 % MoE decode on 3 GPU `-sm tensor`, bit-identical
+
+**Released as `v16-6050b467c-r186` (16 blocks; block 10 amended).**  Canonical tip
+`8f9dad0be9625542f4f1d7891dd25cbb40aa7257`, tree `0bd26dbe195185072019fe99926177d4daa7718b`,
+`validate-set.sh` strict 16/16.
+
+**What changed.**  `gdn_conv_enabled()` / `ple_conv_enabled()` no longer require
+`ggml_backend_cuda_get_device_count() <= 1`.  The depthwise conv1d fusion was gated to single-device graphs
+on 2026-09-23 (r13) because the direct kernel produced a different greedy continuation under a 3x R9700
+`-sm tensor` split while its reference path agreed byte for byte; that divergence was never root-caused
+(`archive/work/closing-the-gap/2026-09-23-gfx1201-conv-fusion-tensor-split.md`).  **It no longer
+reproduces**, so the gate is gone and the fusion — plus the three r183 GDN decode folds that ride it —
+now runs on every split.  `GGML_CUDA_CONV_FUSION_MULTI` is **retired** (it only ever countermanded the
+gate; forcing the fusion on is now the default) and `GGML_CUDA_DISABLE_CONV_FUSION=1` is the A/B arm.
+
+**Why it is safe (gfx1201).**  `test-logits-width-probe` at `P=4096`, fused vs `GGML_CUDA_DISABLE_CONV_FUSION=1`,
+bit-identical `W8`/row-0 on 8 arms — 27B IQ3_S 1 GPU / 2 GPU (`0,2`) tensor / 3 GPU tensor / 3 GPU layer,
+35B-A3B Q3_K_M 3 GPU tensor + layer, 35B-A3B Q4_K_M 3 GPU tensor `-ncmoe 40` with and without the arena —
+with the direct conv confirmed running on the shard (`C=2560` for 3 devices, `C=5120` for 2) and `snap=1`.
+Greedy text identical on 4B Q8_0, 27B Q4_K_XL (tensor + layer) and 35B-A3B Q4_K_M (tensor, and `-ncmoe 40`);
+MTP Protocol A identical text **and** acceptance on both split modes (tensor 0.63244 = 2445/3866, layer
+0.58861 = 1850/3143); a DFlash2 draft arm identical (0.52806 = 1449/2744); prefill-logit gate on 3 GPU
+tensor **0.000000 / 99.990 %**; `test-backend-ops` SSM_CONV 60/60, CONCAT 183/183, CPY 251/251 (3/3
+backends); per-block build 2/2 `--fast`; no GPU faults.
+
+**Worth (3 GPU `-sm tensor`, `llama-bench -r 5`, three interleaved rounds).**  27B IQ3_S tg128
+**58.59 -> 61.92 (+5.7 %)** and pp2048 **+1.1 %**; 35B-A3B Q4_K_M tg128 **118.52 -> 122.13 (+3.0 %)**
+with prefill flat; rule-5 `llama-batched-bench -npl 1,4,8` flat (+0.4 / -0.2 / -0.1 %).  Full matrix:
+`benchmarks/2026-10-31-conv-fusion-multi-device.md`.
+
+**Caveat, stated plainly.**  The 2026-09-23 divergence was never root-caused, so this is an **empirical**
+result.  The likely fix is r183's rework of exactly the suspect area (the snapshot write moved into the conv
+kernel, the conv-state gather deferred into it), but nothing establishes that.  Configs outside the matrix
+are unproven, which is why **release gate 14 now runs a multi-device arm on every release** and
+`scripts/validate-gpu.sh` step 4c runs the single-device *and* multi-device arms automatically.  A future
+divergence must be gated on the config that shows it, never on a device count (that also disabled the
+bit-identical `-sm layer` arms).
+
+**Re-cut.**  Block 10 amended (`5f8b82aab` -> `f3d144a40`), blocks 11-15 re-cut on top; blocks 00-09
+byte-unchanged.  Docs: `AGENTS.md` (r183 bullet), `GREEDY-PURITY.md` §73 (rule 6 + reach paragraph + index),
+`ENVIRONMENT.md` (§7.1/§7.3), `MANIFESTS.md` (release gate 14 + the block-10 row), `patches/README.md`
+(block 10 "r186"), `scripts/README.md`, `scripts/validate-gpu.sh` (step 4c).  Resolution appended to
+`archive/work/closing-the-gap/2026-09-23-gfx1201-conv-fusion-tensor-split.md`.
+
 ## 261031.002 (docs/gates) -- PR #177 closed as superseded (it is already in r183), and the width gate it was held by is now a release gate
 
 **No delivery change, no release, no patch re-cut** (`release.json` untouched, still `v16-6050b467c-r185`).  Docs

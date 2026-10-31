@@ -134,7 +134,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§70** | a second sequence in a batch is a **stride** in the mask predicate, not a new mask: sequence `k`'s cells and tokens shift by `k * 2^23`, so `tok_lo <= cell_pos <= tok_hi` stays exact with no kernel change — but only with one KV stream, one sequence per token, **no cell carrying two of the batch's sequences** (the shared-cell counter is a fast path, never the semantics), positions below the stride, and > 32 tokens; the reserve latch is a reserve optimization only, because `kq_mask_derivable()` re-runs per ubatch | doctrine + measured (r172, PR #247; `benchmarks/2026-10-29-derived-kq-multiseq.md`) |
 | **§71** | a graph-reorder pass is pure only while it moves nodes alone: enumerate the positional consumers (a matcher that anchors at a fixed index and returns a skip count) and exclude every input they depend on, judge it at three ubatch widths, and quote the GGUF with any claim because a reorder's reach is a model property | doctrine + measured (r180, PR #252; `benchmarks/2026-10-30-graph-order-0003-r180.md`) |
 | **§72** | a fold that merges two launches with an in-kernel barrier is pure only where it reproduces the first launch's arithmetic **and** keeps writing its output: the predicate must re-check the dispatcher's route in its own order, the width is the gate (one logits row), the elided launch's store stays, and the cross-block counter is a dedicated slot | doctrine + fix (r182, PR #253; `benchmarks/2026-10-30-router-topk-fold.md`) |
-| **§73** | a fold that elides graph nodes is pure only while every reader it could serve is accounted for: an elided store's destination must be span-checked and reproduced exactly, an elided copy's reader must be the kernel (preload the row before writing it back), a compute-time disjunctive predicate must stay a **superset** of the structural one `graph_optimize` uses, a fold that stores no intermediate needs a whole-graph reader count, reach is a model property (single-device only, BF16/F32 gate weights), and a launch-order-only fold is judged by the **width probe across runs**, never by text or the single-token KLD | doctrine + fix (r183, PR #256; `benchmarks/2026-10-30-gdn-decode-folds.md`) |
+| **§73** | a fold that elides graph nodes is pure only while every reader it could serve is accounted for: an elided store's destination must be span-checked and reproduced exactly, an elided copy's reader must be the kernel (preload the row before writing it back), a compute-time disjunctive predicate must stay a **superset** of the structural one `graph_optimize` uses, a fold that stores no intermediate needs a whole-graph reader count, reach is a model **and device-count** property (r186 removed the single-device gate — multi-device reach is empirical, gate it with a multi-device width-probe arm), and a launch-order-only fold is judged by the **width probe across runs**, never by text or the single-token KLD | doctrine + fix (r183 PR #256 + r186; `benchmarks/2026-10-30-gdn-decode-folds.md`, `benchmarks/2026-10-31-conv-fusion-multi-device.md`) |
 
 ---
 
@@ -2450,8 +2450,15 @@ kinds, and each has its own failure mode.
    run that never reaches the fold is a **vacuous pass** and must be treated as a failure.  This is the
    project's general "that the probe ran is not that it reached the code" rule (§51) applied to a fold.
 
-**Reach is a model property.**  The GDN folds ride the direct conv's pre-existing **single-device** gate, so a
-`-sm tensor` / `-sm layer` run with two or more devices is inert (`GGML_CUDA_CONV_FUSION_MULTI=1` excepted);
+**Reach is a model property *and* a device-count property.**  Until r186 the GDN folds (and the direct conv
+itself) rode a **single-device** gate: the kernel diverged from the reference under a 3x R9700 `-sm tensor`
+split from 2026-09-23 and the fusion was kept off multi-device graphs until it was root-caused.  **r186 removed
+that gate** because the divergence no longer reproduces (bit-identical post-prefill logits at P=4096 and
+greedy text on 1/2/3 devices, `-sm tensor` and `-sm layer`, dense and MoE including `-ncmoe`, prefill-logit KLD
+0.000000 / 99.990 %), so the folds now reach the recommended multi-GPU server shape — which is why every
+earlier "this is inert on 2+ devices" statement in the records is now historical.  The divergence was never
+root-caused, so **the reach is empirical**: a config that was not in the r186 matrix is unproven until the
+width probe hashes it, and release gate 14 carries a multi-device arm for that reason.
 the shared-expert gate fold needs a **BF16/F32** gate weight, which no quantized model we hold has (it is
 inert on 35B-A3B / 4B / 27B / gpt-oss and fires on qwen4exp/Flash-Next).  A bench arm that says "no change"
 on a quantized model says nothing about the fold.

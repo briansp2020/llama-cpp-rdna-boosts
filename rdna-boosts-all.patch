@@ -25660,30 +25660,38 @@ index 000000000..cd9b1d3b4
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
 new file mode 100644
-index 000000000..97b6ce57f
+index 000000000..06c85a380
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gdn-conv.cu
-@@ -0,0 +1,458 @@
+@@ -0,0 +1,466 @@
 +#include "gdn-conv.cuh"
 +#include "unary.cuh"
 +#include "mmvq.cuh"
 +#include <cstdlib>
 +#include <algorithm>
 +
-+// The direct kernel is bit-identical to the CONCAT+SSM_CONV+SILU reference on a single-device graph
-+// (same 4-tap reduction order, same silu, `gdn_concat_tail` still materializes the snapshot tail).
-+// Under a multi-device tensor split it is NOT: with the fusion off, the raw ops and the upstream
-+// SSM_CONV+SILU fusion agree byte for byte, while the direct kernel produces a different greedy
-+// continuation (27B/35B, 3x R9700, -sm tensor; gfx1201 2026-09-23).  The sharded inputs themselves
-+// are consistent, so the divergence is still open; until it is root-caused keep the fusion on
-+// single-device graphs only.  GGML_CUDA_CONV_FUSION_MULTI=1 forces it back on (A/B / fix validation)
-+// and GGML_CUDA_DISABLE_CONV_FUSION=1 is the explicit off switch.
++// The direct kernel is bit-identical to the CONCAT+SSM_CONV+SILU reference: same 4-tap reduction
++// order, same silu, and `gdn_concat_tail` still materializes the snapshot tail.
++//
++// It was gated to single-device graphs from 2026-09-23 (r13) because under a multi-device tensor split
++// it produced a different greedy continuation on 3x R9700 (27B/35B), while the raw ops and the
++// upstream SSM_CONV+SILU fusion agreed byte for byte.  That divergence was never root-caused and
++// **no longer reproduces** on the r186 tree: the post-prefill logits are bit-identical with the
++// fusion on and off at P=4096 on 1/2/3 devices, `-sm tensor` and `-sm layer`, dense (27B) and MoE
++// (35B-A3B, including the `-ncmoe` server shape), and so is greedy text; the prefill-logit gate
++// reads KLD 0.000000 / same-top-p 99.990 % for the fused arm against the unfused one on 3 GPU
++// `-sm tensor`.  The likely fix is the r183 rework of exactly the suspect area (the snapshot write
++// moved into the conv kernel and the conv-state gather was deferred into it), but that is unproven.
++// Relative throughput of the fused arm on 3 GPU `-sm tensor`: 27B IQ3_S tg128 +5.7 % / pp2048
++// +1.1 %, 35B-A3B Q4_K_M tg128 +3.0 % (prefill flat).
++//
++// So the device gate is gone and the fusion runs on every split.  GGML_CUDA_DISABLE_CONV_FUSION=1 is
++// the off switch and the A/B arm; the old GGML_CUDA_CONV_FUSION_MULTI force-on knob is retired (it
++// only ever countermanded the gate, and forcing it on is now the default).
 +static bool gdn_conv_enabled() {
-+    // Cache the switches: this runs once per conv launch, and getenv() is expensive on Windows.
++    // Cache the switch: this runs once per conv launch, and getenv() is expensive on Windows.
 +    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr;
-+    if (disabled) return false;
-+    static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
-+    return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
++    return !disabled;
 +}
 +
 +// tail-only materialization of the concat: columns [tail_from, T+3) of every channel row
@@ -67037,24 +67045,25 @@ index 95618df5f..9fb6a3921 100644
 +int  ggml_cuda_l2_norm_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/ple-conv.cu b/ggml/src/ggml-cuda/ple-conv.cu
 new file mode 100644
-index 000000000..0dab786de
+index 000000000..3ccc9e63b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ple-conv.cu
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,221 @@
 +#include "ple-conv.cuh"
 +#include "unary.cuh"
 +#include "convert.cuh"
 +#include <vector>
 +#include <algorithm>
 +#include <cstdlib>
-+// See gdn-conv.cu: the direct conv kernel diverges from the reference under a multi-device tensor
-+// split, so keep the fusion on single-device graphs only until that is root-caused.
++// See gdn-conv.cu: the direct conv kernel used to diverge from the reference under a multi-device
++// tensor split, which is why this fusion was gated to single-device graphs.  That divergence no
++// longer reproduces (r186: bit-identical post-prefill logits and greedy text on 1/2/3 devices,
++// dense and MoE), so the fusion runs on every split.  GGML_CUDA_DISABLE_CONV_FUSION=1 is the off
++// switch; GGML_CUDA_CONV_FUSION_MULTI is retired.
 +static bool ple_conv_enabled() {
-+    // Cache the switches: this runs once per conv launch, and getenv() is expensive on Windows.
++    // Cache the switch: this runs once per conv launch, and getenv() is expensive on Windows.
 +    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr;
-+    if (disabled) return false;
-+    static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
-+    return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
++    return !disabled;
 +}
 +#if defined(__HIP_PLATFORM_AMD__)
 +static __device__ __forceinline__ float ple_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
