@@ -226,8 +226,10 @@ sparse arm, grow the *positional* window until it holds a Strata-like share of t
 attention reads, so block 15's window cannot be rescued by making `W` larger.  Strata's residency is
 **attendance-driven** — a page table plus a pool of `n_slots` pages whose admission is "the blocks attention
 selected" — so their per-token host traffic is the *churn* of the attended set, not the attended set itself, and
-their per-cell KV is ~4x smaller (int8, 4-cell blocks holding all K/V heads: 4 224 B per block).  That is the
-structural advantage, and it is exactly `STRATA-KV-STREAMING.md` §1's `kv_stream_resolve`.
+their per-cell KV is the SAME size as ours (int8, 4-cell blocks *per layer*: 4 224 B/block = 1 056 B/cell/layer
+vs our q8_0 1 088 B — the "~4x smaller" originally written here was a units error, corrected in §3.5).  The
+structural advantage is the residency rule alone, and it is exactly `STRATA-KV-STREAMING.md` §1's
+`kv_stream_resolve`.
 
 **What this changes in the plan.**  B2 stands (it is the right arm on a streamed cache, and it is free at a working
 context: −3.5 % there, +34…47 % at depth).  But **B-A is back on the table for the deep end** and its ceiling is a
