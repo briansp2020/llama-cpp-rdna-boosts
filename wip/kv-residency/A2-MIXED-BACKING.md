@@ -922,3 +922,15 @@ Flash-Next IQ3, `-ncmoe 48`, 1 GPU, PLE flags: resident plain 42.2 / 37.1 t/s at
 (`W=32768` 25.03 vs `W=1` 24.32 at 180k, sparse arm) — recency is not attendance, which is why Strata's
 attendance-driven pool + page table (`STRATA-KV-STREAMING.md` §1) beats a recency window at the deep end.  The
 deciding unmeasured number is the attended set's churn / pool hit rate: plan §3.4, B1(c).
+
+### B1(c): the attended set's stability (the number a KV pool's design hangs on)
+
+`qsa-census.py` over a 48-step decode trace (Flash-Next IQ3, `-c 131072`, 102 912 cells, sparse arm,
+`GGML_CUDA_DISABLE_GRAPHS=1`): **2051 attended cells/layer/step**, consecutive-step Jaccard median **0.586**;
+an LRU pool hits **84.5 % at 4096 cells/layer** and **90.2 % at 8192** (90.3 % plateau = churn-bound), i.e.
+**2.5 MiB/token** of host read instead of 25.5.  At equal capacity an **adaptive** policy beats a
+**pre-calculated static ordering** (84-90 % vs 63-68 % at 4096-8192) — the same verdict the expert-cache
+campaign reached for the arena, so a KV pool should reuse the delivery's policy machinery, not Strata's static
+ordering.  A 8192-cell/layer pool costs 107 MiB of VRAM.  Strata's cell is 1056 B/cell/layer (int8, 4-cell
+per-layer blocks) vs our 1088 (q8_0) — **no 4x size/accuracy difference**; their sparsity is the model's own
+`indexer.top_k = 2048`.  Plan §3.5.

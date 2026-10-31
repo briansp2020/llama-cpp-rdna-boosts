@@ -237,6 +237,70 @@ reproducible here; if they churn fast, no pool helps and the deep-context story 
 tax".  That is **B1(c)** (a diagnostic readback of `top_k` in a non-captured arm), and it is now the next
 measurement, before any pool code.
 
+## 3.5 B1(c) — the attended set's stability, and the policy the campaign already chose
+
+Instrument: campaign branch `wip-kv-residency-b` (`LLAMA_QSA_STREAM_CENSUS=<path>` in
+`ggml/src/ggml-cuda/indexer-topk.cu` — one record per decode-band top-k call) + `qsa-census.py` (the replayer,
+the KV analogue of `scripts/moe-trace-replay.py`).  Arm: Flash-Next IQ3, `-c 131072`, 102 912 cells used,
+q8_0, `-ncmoe 48`, `GGML_CUDA_DISABLE_GRAPHS=1` (a readback cannot be captured), sparse arm forced, 48 decode
+steps x 12 QSA layers.  Timings from that arm are meaningless; the selection statistics are its product.
+
+| quantity | value |
+|---|---|
+| attended cells per layer per step | **2051** (2048 at the start) — exactly `top_k + r - 1` |
+| step-to-step Jaccard (same layer) | median **0.586** (p10 0.288, p90 0.754) |
+| LRU pool, 2048 cells/layer | 36.5 % hit → 16.2 MiB/token |
+| LRU pool, 4096 | **84.5 %** → 3.96 MiB/token |
+| LRU pool, 8192 | **90.2 %** → **2.50 MiB/token** |
+| LRU pool, 16384 / 32768 / 65536 | 90.3 % → 2.47 MiB/token (**plateau = churn-bound**) |
+| zero-hit (a `W`-recency window over the attended set) | 25.54 MiB/token |
+
+Policy at equal capacity (**the campaign's own question, asked again for the KV**):
+
+| cells/layer | LRU | F-LRU | pre-calculated static ordering |
+|---|---|---|---|
+| 2048 | 36.5 % | 37.3 % | 43.8 % (small pool: pre-loading wins) |
+| 4096 | **84.5 %** | 77.5 % | 63.3 % |
+| 8192 | **90.2 %** | 89.8 % | 67.8 % |
+| 16384 | **90.3 %** | 89.9 % | 67.8 % |
+
+**So an adaptive policy beats a pre-calculated static ordering once the pool is big enough to work** — the same
+verdict the expert-cache campaign reached (`AGENTS.md`: the host pool is a LAYOUT; the arena is adaptive
+F-LRU + a persisted heat prior, and a frozen ordering loses) — and it is reproduced here on the KV's attended
+set.  A KV pool should therefore reuse the delivery's policy machinery (LRU/F-LRU + heat prior, with the trace
+replayer as the instrument), not Strata's static arena ordering.
+
+**What that means quantitatively.**  A pool of 8192 cells/layer costs 8192 x 1088 B x 12 layers = **107 MiB**
+of VRAM and reduces the attention KV's host read to **2.5 MiB/token ≈ 0.045 ms** — i.e. the streaming cost
+essentially disappears, leaving only the indexer cache (`O(depth)`, must stay resident) and the sparse arm's
+own compute.  That is how a Strata-shaped run stays near resident speed with 25 % of the KV resident, and it is
+the number B-A has to reproduce.
+
+**Strata's invocation, for the record** (`~/Strata/run-iq3_xxs.sh` → `strata-iq3_xxs.json`):
+`--max-context 131072 --kv int8 --kv-resident 32768 --spec 4 --spec-min-p 0.5 --expert-cache auto`.  Two
+corrections to earlier readings here:
+
+* **Their cell is NOT 4x smaller than ours.**  Their page is 4 cells *of one layer* (all K/V heads) = 4 224 B
+  in int8 → **1 056 B/cell/layer**; our q8_0 Flash-Next cell is **1 088 B/cell/layer**.  Comparable, so their
+  KV buys no size advantage and pays no extra accuracy cost relative to q8_0.  (The "4x" in §3.4's first draft
+  compared their *per-layer block* with our *all-layer cell* — a units error; corrected here.)
+* **Their sparsity is the model's own spec**, not an approximation: the GGUF says `indexer.top_k = 2048` cells,
+  and the reference implementations select exactly that.  Our *dense* decode arm is the deviation (measured
+  faster on gfx1201, hence the arch policy) — so a sparse arm is not "less accurate" than the architecture.
+
+**Matched arms** (same shape as their config, our engine): `-c 131072`, 102 899-token prompt, MTP
+`--spec-draft-n-max 4`, PLE flags, 1 GPU:
+
+| arm | decode t/s | acceptance | arena |
+|---|---|---|---|
+| KV resident | **58.24** | 0.468 | 19 663.2 MiB / 48.0 % |
+| `W=32768` (25 %, recency) | 49.58 | 0.483 | 20 942.1 / 51.2 % |
+| `W=1` (all spilled, B2 sparse) | 47.26 | 0.483 | 21 341.7 / 52.1 % |
+
+Their 80+ t/s is therefore not contradicted by our engine at a *working* depth (75.4 resident + MTP at 5.3k,
+§3.4); at 103k the difference between 49.6 (a recency window of the same size) and their figure is exactly the
+pool's ~90 % hit rate that §3.5 measures.
+
 ## 4. The three candidate mechanisms
 
 **B-A — page table + resolve inside the graph (Strata's form).**  The KV becomes a bounded pool of `n_slot`
