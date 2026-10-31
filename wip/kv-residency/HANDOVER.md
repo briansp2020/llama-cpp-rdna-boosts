@@ -204,6 +204,8 @@ fully resident (it bisected A2 §3.7.6; not shipped behaviour).
 4. **Never judge run-to-run determinism on a greedy text hash** (hipBLASLt per-process solving, `AGENTS.md`).
 5. Two `llama-cli` runs of the same command differ in text only if something is wrong; the identity gates below
    are the oracle.
+8. **Static MTP: never `--spec-draft-n-max` > 4** (maintainer, 2026-10-30: almost always worse above 4; the
+   adaptive controller is the tuned path, and a static depth of 4 is also what the Strata comparison uses).
 7. **Every Flash-Next arm must carry `-ot per_layer_token_embd.*=CPU -lm none -lzm off`.**  The PLE table is
    **27 465 MiB** and is otherwise lazy-mapped + prefetched, so its reads depend on page-cache residency
    beside 41 GiB of host experts: identical runs moved **±20 %** without the flags and **±0.2 %** with them
@@ -513,6 +515,8 @@ passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 | [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) | **the state of the build**: what is implemented, every gate, §3.5 the arena numbers, §3.6 the deep arm + the break-even, §3.7 the re-baseline at the new link, and **§3.7.11 = the A5 session** (the spilling-arm gates, the Flash-Next arm, the two bugs it found and their fixes, the arena re-measurement) |
 | [`MIXED-BACKING.md`](MIXED-BACKING.md) | the design + the driver probe (one VA range can be backed partly by pinned host memory; host chunks; the real shape at scale) |
 | [`A6-TENSOR-SPLIT-WINDOW.md`](A6-TENSOR-SPLIT-WINDOW.md) | **A6**: a windowed KV across a `-sm tensor` split — design only (five changes, the `fit.cpp` split-accounting cross-check, the invariants, the arms a multi-device host owes) |
+| [`qsa-census.py`](qsa-census.py) | the attended-set census replayer (LRU / F-LRU / static / region-unit / page-table pool) |
+| [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md) | **B-A**: the attendance pool for the attention KV — design, the measured hit rates it stands on, what it is worth, the four gated build steps, and the two refuted alternatives |
 | [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) | **Goal B**: stream a sparse attended set — the plan of record (B0's measured baseline, the three candidate mechanisms, the staged plan B1-B4 with each stage's gates, the eligibility rule and the risks) |
 | [`A1-TWO-BASE-KV.md`](A1-TWO-BASE-KV.md) | A1 (two-base read in the FA kernels): built, gated, **superseded**, kept as the fallback |
 | [`O2-PLAN.md`](O2-PLAN.md) | the plan of record as written (its §6.3 mechanism is now historical — mixed backing won) |
@@ -526,7 +530,7 @@ passes every check (T8: 768 host chunks, 53.4 GB/s).  Consequences:
 
 ## 11. First 30 minutes of the next session
 
-**Goal A is shipped (block 15; current release **r181**) — do not re-measure it and do not re-promote it.**  The
+**Goal A is shipped (block 15; r178-r181, set now at r184) — do not re-measure it and do not re-promote it.**  The
 shipped description is `patches/README.md` "Block 15", `ENVIRONMENT.md` §17, `WORKLOG.md` 261030.002 / .003 /
 .005, and `A2-MIXED-BACKING.md` §3.7.11 + §3.7.12 (the latter is the maintainer's r181 analysis).  What is left
 in the campaign:
@@ -537,18 +541,34 @@ in the campaign:
 | **Goal A across a `-sm tensor` split** | **DESIGNED, not implemented** — [`A6-TENSOR-SPLIT-WINDOW.md`](A6-TENSOR-SPLIT-WINDOW.md): the five changes (Meta buft variant, grow fan-out, fit recognition, `region_capable`, fit sizing inside the split branch), the `common/fit.cpp` cross-check (four findings, `margins[0]` first) and the arms a 2/3-device host must run.  Still hardware-blocked here (one card) |
 | **`auto` policy** (the arena half) | **the maintainer's call, unchanged by r181.**  `auto` sizes the window to `free − margin − everything-but-the-KV`, where the margin includes the **arena/slab reserve**, so on a `-ncmoe` config the arena wins the VRAM and the window comes out small *by design*; and it only spills a pinned `-c`.  The measurement that decides it is `A2-MIXED-BACKING.md` §3.7.11.4 A–C.  `W` stays a cell count; a percentage-of-slab form is deferred — do not re-propose it |
 | **owed: a TEST gap in the delivery** | **FIXED (A6, awaiting the maintainer's commit approval)**: `scripts/gate-park-idle-slots.sh` now counts actual park MOVES (it used to count the region refusal warning, logged under the same `seq_park` prefix) and, when the park arm logs *"cannot park the idle slot: saving it to the prompt cache and clearing it"*, reports *"parking declined -> save-and-clear fallback"* and still requires `park == lazyoff`, instead of failing on *"parking moved nothing"*.  Verified on a windowed Flash-Next arm (3 fallbacks -> PASS) and on the no-window control (6 park / 2 unpark moves -> PASS).  `A2-MIXED-BACKING.md` §3.7.13 |
-| **Goal B** — a sparse attended set (QSA/DSA) streamed instead of a full KV | **B1 + B2 DONE (A6).**  Plan of record [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) (§3.1-§3.3); branch `wip-kv-residency-b` `f33a9d8fe` based on the **shipped** r182 tip.  B1: a resident KV wants DENSE decode, a streamed KV wants SPARSE (+32…49 %, growing with depth) — so Goal B is a fittability feature, not a speed one, and **no page table is needed**.  **B2 shipped as the policy slice**: `is_streaming(n_kv)` + `qwen4exp_kv_streams()` make a windowed KV take the sparse decode arm — **+34.3 % at 103k and +47.3 % at 180k** (23.4→31.4 / 16.5→24.3 t/s), text inert on a resident cache and equal to the forced-sparse arm when streaming.  `LLAMA_QSA_DENSE_DECODE_STREAM=0` is the A/B arm.  **Open:** B3 (the arena half at `-n 2000`), the promotion decision, and a streamed-arm re-measure of the MTP draft's sparse-decode default (it was declined on resident-cache numbers) |
+| **Goal B** — a sparse attended set (QSA/DSA) streamed instead of a full KV | **B1, B2, B1(c) DONE (A9); B-A STEPS 1+2 BUILT AND GATED (A10)** on branch `wip-kv-residency-b` (tip `b5d895c59`): `LLAMA_KV_REGION_POOL=<cells>` = pinned host mirror (authoritative) + compact device pool of indexer-block pages + page table + an in-graph resolve (`GGML_OP_KV_POOL`) with a second id list for the reader's K/V gather. Gates: text identical with the pool on vs off (854 `43b30de151b9` at 51 475 depth), the pool's verify kernel 0/0 mismatches, prefill-logit 0.000000/100.000 %, park/ckpt/state gates PASS, `FLASH_ATTN_QSA` 27/27, no GPU faults, **89.7 % hit rate at 4104 pages**.  And the headline: at 103k with MTP-4 the pool is **48.3 t/s = the sparse ceiling (sparse+resident 47.9)**, +54 % over B2's spilled arm, at **204 MiB instead of 816 MiB** — the residual -20 % against resident-dense is the SPARSE ARM's own cost, not placement.  **B3 is measured too**: at `-n 2000`, `-c 131072`, `-ncmoe 48`, the arena goes 23 579.8 -> 25 018.6 MiB (**+1.44 GiB**, +18 slots/table, expert hit 96.26 -> 97.02 %, cold reads 42.0 -> 31.6 GiB) for a 204 MiB pool instead of an 816 MiB KV; plain decode pays the sparse arm's -23 % (43.1 -> 33.0 t/s), and `identity fast path ON` is 0 in both arms (313/512 slots/table, so the r117 cliff is not in play).  `BA-POOL-DESIGN.md` §7.4-§7.5.  Previous:  Plan: [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) (§3.1-§3.6); pool spec: [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md); census tool: [`qsa-census.py`](qsa-census.py).  **B1**: a *resident* KV wants DENSE decode, a *streamed* KV wants SPARSE (+34/47 % at 103k/180k).  **B2 (implemented, branch `wip-kv-residency-b`)**: `is_streaming(n_kv)` + `qwen4exp_kv_streams()` → +34.3 % at 103k, +47.3 % at 180k; `LLAMA_QSA_DENSE_DECODE_STREAM=0` is the A/B arm; text inert on a resident cache.  **B1(c)**: 2051 attended cells/layer/step, Jaccard 0.586; LRU pool 84.5 % @4096 cells/layer, 90.2 % @8192 (2.5 MiB/token vs 25.5 zero-hit); **adaptive beats a static ordering** (84-90 % vs 63-68 %); and block 15's region cannot express it (its 4 MiB unit = 3855 contiguous cells → **6 % hit, 90 ms/step** of flips).  **B-A = a compact pool + page table (page = 4 cells = one indexer block) + a host-authoritative mirror + an in-graph resolve, lag-1 admission, adaptive policy: 85-90 % hit, 0.05 ms/step of fills, 107 MiB for 12 layers.**  **Next = B-A step 1** (mirror + pool + page table as a KV cache mode; the design's build order).  Then B3 (arena half at `-n 2000`), the MTP draft's sparse-decode re-measure under a streamed cache, and the promotion decision |
 | **Goal C** — the drafter ring (`LLAMA_SPEC_DRAFT_WINDOW`) | **measured, NOT promoted** (`O3-DRAFTER-RING.md`): free at a usable window (46k context, `W=32768`: acceptance −2.3 % rel, generation flat), 7-9 % lost far below the working context; the VRAM prize is one draft layer (~1 GiB at `-c 262144`) and it does not reach the arena (the draft KV lives in the slab's `aux_reserve`).  Three open questions in §7 |
 
+**A10 (2026-10-31) added, so do not redo it:** B-A steps 1 and 2 (`BA-POOL-DESIGN.md` §7): the mirror + pool +
+page table + resolve are built and gated, and the measured answer to the design's acceptance question is that
+**the pool reaches the sparse arm's ceiling and the sparse-vs-dense gap is what remains** — so a page POLICY
+(step 3) can only recover ~0.05 ms/step, and the next lever is the sparse decode arm's indexer cost.  Three
+invariants came out of it (§7.3): mark-then-claim, distinct-block claims, and no per-launch scratch in a captured
+graph.  Machine note: `git push` over the `git@` remote fails on this box (no ssh-agent, no working key) —
+`git push https://github.com/stew675/llama.cpp.git <branch>` works and is the same personal fork.
+
+**A9 (2026-10-30) added, so do not redo it:** B1's placement matrix (resident→dense, streamed→sparse at 5.3k /
+103k / 180k), the **MTP x depth** framing (resident + MTP 75.4 / 58.2 / 53.6 t/s), the **PLE rule** (§5 rule 7) and
+the **static-MTP depth <= 4** rule (§5 rule 8), B2 on `wip-kv-residency-b`, the census instrument +
+`qsa-census.py`, and [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md).  Twice corrected by measurement: a recency window
+cannot stand in for attendance, and neither can the region's unit granularity.
+
 1. `cd ~/llama-cpp-rdna-boosts && git pull` (and `cd ~/llama.cpp && git fetch origin`); read this file, then
-   the row above that you are picking up, then `A2-MIXED-BACKING.md` **§3.7.11** (the measurements) and
-   **§3.7.12** (r181's analysis), and `WORKLOG.md` 261030.005 (what changed and what it cost to get wrong).
-2. Branch state: the **shipped** tree is `rdna-boosts` at **`83d2c391a`** (= `release.json.tip`); the
-   **campaign/measurement** tree is `wip-kv-residency` at `7c7769e50` (it does **not** have r181's fixes).
-   Never commit campaign code to `rdna-boosts`.
+   [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md) (the spec you are building), then [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md)
+   §3.4-§3.6 (why the pool is the only form left), then `A2-MIXED-BACKING.md` §4.
+2. Branch state: the **shipped** tree is `rdna-boosts` at `release.json.tip` (r184 at the time of writing); the
+   **Goal B campaign** branch is **`wip-kv-residency-b`**, based on that tip, tip **`c045bf866`** (B2 + the census
+   diagnostic; pushed).  `wip-kv-residency` (`7c7769e50`) is Goal A's measurement tree — do not develop on it.
+   Never commit campaign code to `rdna-boosts`, and never touch `patches/` or `release.json`.
 3. **This box is one card and may be busy.**  Check `rocm-smi --showmeminfo vram` before any gate — a live
    server (the maintainer runs Flash-Next here) holds ~34 GB and makes every fit/gate read nonsense
    (`free = 2 MiB`).  Never run a second GPU job; if the card is in use, say so and stop.
-4. Anything you change in this block owes the gates in §6, including **invariant 13** (no un-checked
-   `ggml_backend_dev_backend_reg`) and **invariant 14** (bound the planned spill).  Report findings to the
-   maintainer before committing any delivery-affecting change.
+4. Anything you change owes the gates in §6, plus this feature's own: text byte-identical on a **resident** arm
+   (pool off vs on), the pool arm's text equal to the resident **sparse** hash, `test-backend-ops -o
+   FLASH_ATTN_QSA`, and `check-gpu-faults.sh` over every log.  Report findings to the maintainer before committing
+   any delivery-affecting change, and **push the campaign branch after every step** (these arms can OOM this box).

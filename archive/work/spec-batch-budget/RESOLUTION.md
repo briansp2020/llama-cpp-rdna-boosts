@@ -161,3 +161,35 @@ starts one `llama-server` per arm, primes it, runs N concurrent `/completion` ca
 aggregate t/s, per-slot t/s, per-step ms, accepted/step, mean accepted length and per-slot text sha256
 (parsed from the server's own `draft acceptance` and `eval time` lines).  It is a record, not a delivery
 script.
+
+## Re-assessment on r184 (2026-10-31) -- CLOSED, superseded by the delivery-side width bound
+
+The PR was re-opened a third time and re-measured on **r184** (one binary = r184 + the patch, the env var
+selecting the arm; the contributor's shape is 2x R9700 `-sm tensor` with the PLE table resident via
+`--lazy-mode off`; 4 concurrent 300-token greedy requests, fresh server per arm, 2-4 reps, this kit's probe as
+the harness).  Two things had changed since r79: 148 releases of kernel/graph work, and `LLAMA_SPEC_ALIGN`
+(r153) turning multi-slot drafting into a per-sequence-depth problem.  Full tables:
+`benchmarks/2026-10-31-multislot-verify-width.md`; release: `WORKLOG.md` 261031.001 (r185).
+
+**The premise is refuted.**  Fixed depth 3, 4 slots, width 16 (uncapped) vs width 8 (`=8`): **35B-A3B 3 GPU
+432.7 vs 389.8 t/s, 2 GPU 387.2 vs 359.6, dense 27B 3 GPU 240.1 vs 211.2** -- the cap LOSES 7-12 % on the shapes
+this delivery recommends -- while the contributor's shape wins (qwen4exp Flash-Next GSQ-IQ3_XXS 2 GPU + PLE
+204.6 vs **220.8**, IQ3_S 196.7 vs **205.8**).  At 2 slots on that shape the same knob is **-22 %**.  Width 16
+beats width 8 on 3 of 4 fixed-depth shapes, so "above ~8 rows each extra draft token costs more than it gains"
+does not hold as a rule.  The structural point (the controller is fed `n_accepted` against its own `n_cur`, not
+the capped depth) was never addressed, and since r153 a per-call cap also has to interact with the alignment.
+
+**The r79 "cliff" is gone, and the real defect is elsewhere.**  The qwen4exp + host-expert + 2-GPU arm that
+measured 11.5-13.0 ms per accepted token at width 16 on r79 now reads 5.46 at 16 and 5.03 at 8 (i.e. the
+workaround's 80-90 % is gone with it).  What is left is a *different* and larger defect that this PR pointed at:
+on a band-0 config the **adaptive** depth is unbounded (r176 made the arena band answer only for host-resident
+experts), so 4 slots at `--spec-draft-n-max 7` present ~28-32 rows and the default recommended speculator loses
+**9.5-31.8 %** against the same arm bounded at 16 rows (35B-A3B 3 GPU 317.1 -> 418.0, qwen4exp 2 GPU 166.6 ->
+212.4, dense 27B 3 GPU 205.7 -> 225.3).  That is fixed in the delivery (block 02, r185,
+`LLAMA_SPEC_ALIGN_WIDTH_BAND`, default 16) -- not by a user-facing budget, and **not** by a model/shape whitelist:
+the sign flips on the same model across quant, device count, slot count and speculator, so the rule is expressed
+on the verify width `n_slots x (1 + depth)` and evaluated per draft call.
+
+**Status: CLOSED (2026-10-31), not merged.**  The PR's files are a `wip/` copy of what this directory already
+holds (byte-identical), so there was nothing to take; its finding is credited in the r185 block-02 amendment and
+`benchmarks/2026-10-31-multislot-verify-width.md`.

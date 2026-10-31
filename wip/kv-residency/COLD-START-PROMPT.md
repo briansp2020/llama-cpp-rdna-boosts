@@ -1,108 +1,133 @@
 # Cold-session prompt — `wip/kv-residency` (TODO #118)
 
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from the previous
-session's context).  Rewritten 2026-10-30 at the end of session A9 (Goal B: B1 measured, B2 implemented and pushed).
+session's context).  **Rewritten 2026-10-31 at the end of session A10**: Goal B's B-A is **built and gated**
+(steps 1, 2 and B3), so the next session finishes the acceptance table, attributes the one remaining loss, and
+prepares the promotion decision.
 
 ---
 
 Continue the windowed-KV campaign (TODO **#118**) in `~/llama-cpp-rdna-boosts` and `~/llama.cpp`.
 
-**Goal A is SHIPPED — do not re-measure it and do not re-promote it.**  Release **`v16-6050b467c-r181`**
-(16 blocks) carries the windowed KV as **block 15**: an **opt-in** fixed-VRAM resident window with the KV's
-tail in pinned system RAM (`LLAMA_KV_RESIDENT_CELLS=<cells>|auto`; unset = the plain device buffer, so a run
-without the knob is byte-identical to r177 including its OOM).  The shipped tree is
-`~/llama.cpp`'s `rdna-boosts` at **`83d2c391a`** (= `release.json.tip`); the campaign/measurement tree is
-`wip-kv-residency` at `7c7769e50` and does **not** carry r181's fixes.  Shipped description:
-`patches/README.md` "Block 15", `ENVIRONMENT.md` §17, `WORKLOG.md` **261030.002/.003/.005**, and
-`A2-MIXED-BACKING.md` **§3.7.11** (measurements) + **§3.7.12** (r181's analysis).
+**Goal A is SHIPPED — do not re-measure it and do not re-promote it.**  Release `v16-6050b467c-r181` (the set is
+now at r184) carries the windowed KV as **block 15**: an **opt-in** fixed-VRAM resident window with the KV's tail
+in pinned system RAM (`LLAMA_KV_RESIDENT_CELLS=<cells>|auto`; unset = byte-identical to r177 including its OOM).
+Shipped description: `patches/README.md` "Block 15", `ENVIRONMENT.md` §17, `WORKLOG.md` 261030.002/.003/.005,
+`A2-MIXED-BACKING.md` §3.7.11 + §3.7.12.  **A window across a `-sm tensor` split is designed only and parked**
+(`wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`) — the maintainer picks it up on the multi-GPU host.
 
-**What r181 fixed (know this before touching the block):**
+**Goal B's B-A (the attendance pool for the attention KV) is BUILT AND GATED — do not rebuild it, do not
+re-derive its design, and do not re-run its gates.**  Read
+[`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md) **§7** (what was built, every gate, the three defects, the 103k table,
+B3) before touching anything.
 
-* **Multi-device `--fit` aborted at model load.**  The block reaches its backend entry points through
-  `ggml_backend_dev_backend_reg(dev)`; a **Meta** (tensor-split) device has no reg (`device->reg == NULL`) and
-  the proc-address helper ASSERTS on a null reg — three paths (the fit's KV probes on any run, the runtime buft
-  lookup with a numeric `W`, the spill budget/link lookups).  Both selectors now resolve the reg through a
-  reg-less-tolerant helper (`llama_kv_region_dev_reg`, `fit_dev_reg` — the latter walks a Meta device's simple
-  child), and a reg-less device means "the backend does not answer": **the window is declined on a `-sm tensor`
-  split with one message** (HANDOVER invariant 13).  The campaign's box is single-GPU, which is why nothing
-  caught it.
-* **Three `auto` wiring defects**, all reproducible on one device: a decided "no window needed" was reported as
-  "the fit did not run" (a decided-0 flag now exists); every run *without* the knob logged a KV warning (now
-  silent); and the `LLAMA_KV_SPILL_RAM_PCT` clamp could be taken past the VRAM budget (invariant 14 — an
-  intermediate form planned a **235 GiB** pinned spill and OOM-killed the box, so **bound the spill PLAN**).
+* Branch **`wip-kv-residency-b`**, tip **`b5d895c59`** (pushed).
+* **`LLAMA_KV_REGION_POOL=<cells>`** (unset/`0` = off, byte-identical): the attention KV becomes a pinned host
+  **MIRROR** (authoritative; every existing path — writers, `state_*`, the K-shift, `seq_park`, `defrag`,
+  `get_k/get_v` — runs on it unchanged) plus a compact **DEVICE POOL** of pages of one indexer block (4 cells),
+  a page table `tbl[block] -> slot`, and **`GGML_OP_KV_POOL`** (mark / claim / map+fill, 3 launches per layer per
+  step).  `ggml_flash_attn_qsa_set_kv_idx()` gives the QSA reader a second id list, so the K/V gather follows the
+  table while the mask / visibility keys stay **cell**-indexed.
+* Trunk-only (the MTP draft's cache is deliberately not pooled: its attention is dense), one stream, non-MLA,
+  no window active, uniform `compress_ratio`/cell geometry; otherwise it declines with one message.  The pool is
+  floored at one decode band's worth of blocks and the graph re-checks the real width (`kv_pool_serves`).
+* **Three invariants** (each cost a session — keep them): a claim may never take a slot this launch marked
+  (mark-then-claim); claims are per **distinct block** (the table CAS dedupes — per-id attempts wrapped the
+  round-robin cursor on a 4-row batch); and **no transient scratch in a captured graph** (the fill list lives in
+  the counters tensor).
+* Gates already green, all on the pool arm: text identical pool on/off (854 `43b30de151b9`, 51 475 depth),
+  the pool's own verify kernel 0 mismatches (`LLAMA_KV_POOL_VERIFY=1`), prefill-logit 0.000000 / 100.000 %,
+  `gate-park-idle-slots.sh` / `gate-ckpt-reuse.sh` / `gate-state-pipe.sh` PASS, `FLASH_ATTN_QSA` 27/27,
+  `check-gpu-faults.sh` clean.
 
-**WHAT SESSIONS A8/A9 (2026-10-30) DID — do not redo it:**
+**The measured state (use these; they are the current numbers):**
 
-1. **The parking-gate test gap is FIXED and COMMITTED** (`scripts/gate-park-idle-slots.sh`, commit
-   `5a3d4535`; `WORKLOG.md` 261030.006): it counts park MOVES (it used to count the region refusal warning,
-   logged under the same `seq_park` prefix) and grades the save-and-clear fallback as a PASS with
-   `park == lazyoff` still required.  Verified on a windowed Flash-Next arm and the no-window control.
-2. **A `-sm tensor` window is DESIGNED ONLY and PARKED** — `wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`
-   (+ `A2-MIXED-BACKING.md` §3.7.13 §2), picked up later on the multi-GPU development host.  Read its §4
-   before touching that block: `margins[0]`, the aggregate `cell_bytes`, the mirrored-cache spill plan and the
-   split `estimate()`'s `ntd×` KV are the four findings a blind implementation would get wrong.
-3. **The `auto` policy is settled: capacity-only** (it spills only a pinned `-c`; the arena half needs a
-   numeric `W` at or above the run depth).  Do not re-open it without the maintainer.
-4. **Goal B is IN FLIGHT**: the plan of record is `wip/kv-residency/B1-STRATA-PLAN.md` and B0 is measured
-   (`A2-MIXED-BACKING.md` §4).  **All Goal B work stays inside `wip/`** (campaign branch `wip-kv-residency`
-   for code) — `patches/` and `release.json` are untouched while the delivery is in flight on other features.
+| at 103k depth, MTP depth 4, `-n 128` | gen t/s | accepted |
+|---|---|---|
+| resident KV, dense arm (the default) | **60.2** | 87 |
+| resident KV, sparse arm forced | 47.9 | 79 |
+| **pool, 4104 pages = 16 416 cells/layer, 204 MiB** | **48.3** | 79 |
 
-**WHAT IS LEFT — B2 IS DONE (branch `wip-kv-residency-b` `f33a9d8fe`), so start at B3:**
+**So the pool lands exactly ON the sparse arm's ceiling (+0.8 %, noise) and the remaining -20 % against
+resident-dense is the SPARSE ARM's own cost — the indexer scoring every block plus the radix top-k — NOT the KV's
+placement.**  B3 (`-n 2000`, `-c 131072`, `-ncmoe 48`, plain decode): arena 23 579.8 -> 25 018.6 MiB
+(**+1.44 GiB**, +18 slots/table, expert hit 96.26 -> 97.02 %, cold reads 42.0 -> 31.6 GiB), plain decode
+43.1 -> 33.0 t/s.  Hit rate 89.7-90.05 %, fills ~0.05 ms/step (`qsa-census.py`'s LRU plateau is 90.2 %, so the
+selection's ~10 % per-step novelty is the floor — an entropy bound, not a policy weakness).
 
-0. **Read the measurement rule you will trip over:** every Flash-Next arm needs
-   `-ot per_layer_token_embd.*=CPU -lm none -lzm off`.  The PLE table is 27 465 MiB and is otherwise lazy-mapped;
-   identical runs moved ±20 % without the flags, ±0.2 % with them (HANDOVER §5 rule 7).
-1. **B3 — the arena half at `-n 2000`** (`-ncmoe` = the full layer count): the streamed+B2 arms above carry
-   +1.7…2.6 GiB of arena (57.6 -> 61.9 % residency), which the `-n 400` arms cannot score.  Also re-read the r117
-   identity cliff: record arena MiB, residency % and the count of `identity fast path ON` lines.
-2. **The MTP draft's sparse decode deserves a streamed re-measure** (`qwen4exp_mtp_sparse_arm`): it is default-OFF
-   on resident-cache numbers, and under a *streamed* draft KV the B2 argument applies (`LLAMA_MTP_SPARSE_DECODE=1`).
-3. **Then the promotion decision** (the maintainer's): B2 is a ~15-line policy + an accessor; if it is promoted it
-   is a block amendment, `ENVIRONMENT.md` (`LLAMA_QSA_DENSE_DECODE_STREAM`) and a `GREEDY-PURITY.md` row for the
-   regime change.  **Nothing leaves `wip/` until that call.**
-4. **B-A/B-B (page table / compact gather) are NOT needed for the B2 win** — they come back only if a gate arm
-   shows the policy is insufficient.
-2. **Goal C decisions** (`O3-DRAFTER-RING.md` §7): the MTP drafter ring is measured, not promoted — free at a
-   usable window (46k context, `W=32768`: acceptance −2.3 % relative, generation flat), 7-9 % lost far below
-   the working context; the prize is one draft layer (~1 GiB at `-c 262144`) and it does not reach the arena.
-   Open: default-on or not, one size or per-model, MTP-only or DFlash2 too (the ring is arch-agnostic but the
-   code gates on `LLAMA_CONTEXT_TYPE_MTP`, and there is no DFlash context type).
-3. **The `-sm tensor` window** — implement A6 only on the maintainer's go-ahead and only with a 2/3-device host.
-4. **Goal B's later stages** (B2 residency policy, B3 arena half, B4 promotion) are in the plan; do not start
-   B2 before B1 closes.
+**THIS SESSION'S JOB, in this order (the maintainer has agreed with all of the above):**
 
-START BY READING, in this order: `wip/kv-residency/HANDOVER.md` (**§11 = this work list**, §1 the state, §3 the
-invariants — **13** reg-less Meta devices, **14** bound the planned spill — §5 the measurement rules, §6 the
-gates, §8.1 the absolute references); then `A2-MIXED-BACKING.md` §3.7.11 + §3.7.12; then `WORKLOG.md` 261030.005.
+1. **Finish the acceptance table at the other two depths** (`B1-STRATA-PLAN.md` §3.3/§3.4 shape, pool arm added),
+   one batch, arms interleaved, `ROCBLAS_USE_HIPBLASLT=0`, MTP depth 4:
+   * **5.3k depth**: `-c 16384`, prompt `prompts/prose-rdna-boosts.txt` (5 256 tokens), arms
+     resident / sparse-forced / pool.  Expect the pool ~equal to resident here (streaming cost 3.5 % at this
+     depth) — if it is not, say so.
+   * **180k depth**: a ~180k-token prompt (`cat prompts/kld-corpus-35b-in-domain.txt` **seven** times, ~180k
+     tokens) with `-c 196608`; the mirror is 2.45 GiB of pinned RAM.  Arms resident / pool (+ `W=32768` as the
+     recency control if time allows).  This is where the pool's ratio is best (204 MiB of pool against 2.45 GiB
+     of KV) and where the sparse arm's cost is largest.
+2. **Attribute the sparse arm's -20 %.**  At 103k, dump a `rocprofv3` kernel census for the pool arm and for the
+   resident-dense arm; split the difference into (a) the indexer score (the `INDEXER_SCORE`/pool chain, every
+   block), (b) the radix top-k (`indexer-topk.cu`), (c) the FA kernel.  **This decides the next engineering
+   item and it lifts every streamed arm, including block 15's** — a page policy cannot recover more than
+   ~0.05 ms/step, so do not spend the session there.  Report the split before changing anything.
+3. **The MTP draft's sparse-decode re-measure** (`B1-STRATA-PLAN.md` §3.3's follow-up): `qwen4exp_mtp_sparse_arm`
+   is default-OFF on measurements taken with a **resident** draft KV; under a pooled/streamed target the argument
+   may invert (`LLAMA_MTP_SPARSE_DECODE=1`).  Two arms, acceptance + text identity.
+4. **Then the promotion DECISION is the maintainer's** (do not build the package unasked).  What it would need:
+   a block in `patches/` (the code is ~1 200 lines over 19 files), `ENVIRONMENT.md` §, `patches/README.md`
+   block entry, the pool's VRAM in `--fit`'s arithmetic (the mirror is host, the pool must be *sized* by the fit
+   like block 15's `auto`), a **grow-on-demand mirror** (today the whole `-c` is pinned at creation), the gates
+   in the release flow, and a default-off call (it forces the sparse arm, so it is a fittability feature like
+   block 15, not a speed one).
+
+**Do not redo:** Goal A; B1/B2/B1(c); B-A's design, implementation or gates; the "is the pool exact?" question
+(verify kernel + the sparse hash answer it); step 3's LRU policy **unless the maintainer asks** (expected ~1 point
+of hits for ~0.05 ms/step — it is the entropy floor, not a policy gap).
+
+START BY READING, in this order: [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md) **§7** (the state), then
+`HANDOVER.md` (**§11 = the work list**, §3 the invariants, §5 the measurement rules, §6 the gates), then
+`B1-STRATA-PLAN.md` §3.2-§3.6 (the placement matrix and why the pool was the only form left), then
+`A2-MIXED-BACKING.md` §4.
 
 STATE (verify, don't assume):
-  - `rdna-boosts` `83d2c391a` = shipped; `wip-kv-residency` `7c7769e50` = campaign/measurement (no r181 fixes).
-    Never commit campaign code to `rdna-boosts`.
+  - **Campaign branch `wip-kv-residency-b`**, tip **`b5d895c59`** (pushed; `git@` works again — `ssh -T
+    git@github.com` says hi).  `wip-kv-residency` (`7c7769e50`) is Goal A's measurement tree — do not develop on
+    it.  Never commit campaign code to `rdna-boosts`; **never touch `patches/` or `release.json`**.
   - ONE R9700 (gfx1201), 32 624 MiB.  **Check `rocm-smi --showmeminfo vram` first** — the maintainer runs a
     Flash-Next server here that holds ~34 GB, and every fit/gate then reads garbage (`free = 2 MiB`) or OOMs.
     Never run a second GPU job; if the card is in use, say so and stop.
   - Link 55.7 GB/s H2D (re-cabled 2026-10-30).  No pre-swap t/s number may be compared with a new one.
+  - **Push the campaign branch after every step** — these arms can OOM this box (the maintainer lost a session
+    to a 235 GiB pinned-spill plan), so the work must be durable at every point.
+  - `LLAMA_KV_POOL_STATS=<path>` appends the pool's accounting to a **file**; never print it to stderr on a
+    text-hash arm (`scripts/extract-generated.py` slices from the generated text to llama-cli's perf line and
+    would include it — that cost most of A10's "nondeterminism" hunt).  `LLAMA_KV_POOL_VERIFY=1` is the pool's
+    oracle (0 mismatches expected).
 
 CONSTRAINTS:
   - Build `~/bin/build-llama-rocm` (never pass `-DCMAKE_HIP_FLAGS`); `LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib`.
+  - **Every Flash-Next arm must carry `-ot per_layer_token_embd.*=CPU -lm none -lzm off`** (HANDOVER §5 rule 7):
+    the PLE table is 27 465 MiB and is otherwise lazy-mapped, which moved identical runs by **±20 %** (with the
+    flags: ±0.2 %).
+  - **Flash-Next's MTP head is a SEPARATE file**: `-md /llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`
+    (without it the draft context fails to load: "model doesn't contain MTP layers").
+  - **Static MTP: never `--spec-draft-n-max` > 4** (§5 rule 8; above 4 is almost always worse).
   - Hash text from a run WITHOUT `-v` via `scripts/extract-generated.py`; timings from a separate `-v` run.
     Always `--single-turn --no-display-prompt`, always `timeout`, never two GPU jobs at once.
-  - **`ROCBLAS_USE_HIPBLASLT=0` for EVERY fresh-process numeric comparison** (unset, two identical commands
-    differ — that nearly derailed the promotion).
-  - Never judge on a greedy text hash alone; the prefill-logit gate on a **spilling** arm is the sensitive one.
-    Never quote a timing from a `LLAMA_KV_REGION_DEBUG` arm.
-  - Prove a spill before believing an arm: `LLAMA_KV_REGION_DUMP=/dev/null` → `KVREGION_FREE … host=` > 0 (or
-    `FLIP > 0`).  A spill needs `used > W + unit/nb1` cells (the shipped prose prompt is not enough on the 4B —
-    use it twice); the floor is one 4 MiB map unit per tensor.
+  - **`ROCBLAS_USE_HIPBLASLT=0` for EVERY fresh-process numeric comparison.**
+  - Never quote a timing from a `LLAMA_KV_REGION_DEBUG` arm, nor from a `GGML_CUDA_DISABLE_GRAPHS=1` census arm
+    (the census *needs* graphs disabled — a readback cannot be captured — and its timings are meaningless).
+  - Prove a spill / a pool before believing an arm (`LLAMA_KV_REGION_DUMP=/dev/null` → `KVREGION_FREE … host=`
+    > 0), and a pool arm must show its own accounting (hits / fills per step / VRAM).
   - `/tmp` is a 47 GB tmpfs and a prefill-logit base is ~7 GB — clean old `.kld` files before a gate run.
   - `-n 2000` for anything about the expert arena, with `-ncmoe` = the model's full layer count.
   - Do not pick scope.  If something cannot be measured, say so and stop.
 
-GATES if you touch the block: `GGML_CUDA_VMM_REGION_SELFTEST=1` (**PASS**, and **FAIL** with
-`LLAMA_KV_REGION_QUARANTINE=0`), the coherence trio (`5ba44647188f`, with `ROCBLAS_USE_HIPBLASLT=0`), the
-prefill-logit gate on a **spilling** arm (−0.000000 / 100.000 %), `check-gpu-faults.sh` over every log, and the
-OOM baseline with the knob unset.  Plus, for this block specifically: no un-checked
-`ggml_backend_dev_backend_reg` (invariant 13), the planned-spill bound (invariant 14: `llama-fit-params` with a
-big `-c` and `LLAMA_KV_SPILL_RAM_PCT=1` must REPORT and drop the window), and the three `auto` wiring arms in
-HANDOVER §6.  Touch the VMM primitive and you also owe `wip/kv-residency/hostmap-hazard-probe.cc` (default
-FAIL, `--grab 4` PASS).
+GATES: `GGML_CUDA_VMM_REGION_SELFTEST=1` (PASS, and FAIL with `LLAMA_KV_REGION_QUARANTINE=0`) if you touch the
+VMM primitive (then `hostmap-hazard-probe.cc` too: default FAIL, `--grab 4` PASS); the coherence trio
+(`5ba44647188f`, `ROCBLAS_USE_HIPBLASLT=0`); the prefill-logit gate on a **spilling** arm (−0.000000 / 100.000 %);
+`check-gpu-faults.sh` over every log; the OOM baseline with the knob unset.  For anything that touches the pool:
+the resident-arm text identity, the pool arm == the resident **sparse** hash, `test-backend-ops -o
+FLASH_ATTN_QSA`, and the three state/park gates (the mirror must make them trivial — that is the point of the
+writer rule).  A change to the sparse decode arm or the indexer owes the same prefill-logit gate.
