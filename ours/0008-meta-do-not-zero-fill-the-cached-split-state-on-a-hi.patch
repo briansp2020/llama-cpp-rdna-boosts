@@ -1,4 +1,4 @@
-From a5b396bf1f6896f9a3e5046f9ebc714ac0e33ab5 Mon Sep 17 00:00:00 2001
+From 933b6c6f85894c32e3e747dc3e5e34bb3439af17 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 13:31:34 +0000
 Subject: [PATCH 08/15] meta: do not zero-fill the cached split state on a hit

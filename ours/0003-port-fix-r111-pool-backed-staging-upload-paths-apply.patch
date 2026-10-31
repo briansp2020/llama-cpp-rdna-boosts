@@ -1,4 +1,4 @@
-From f0558a189c3111e49e710c2d158910e8d2242602 Mon Sep 17 00:00:00 2001
+From acb954a2f5171359dfc883e4adf129f0121bca95 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 22 Oct 2026 22:26:23 +0000
 Subject: [PATCH 03/15] port fix: r111 pool-backed staging/upload paths apply

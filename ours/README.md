@@ -3,8 +3,8 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-6050b467c-r183` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
-`3eb776204336`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
+**Base:** `v16-6050b467c-r184` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
+`f2141780f11a`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
 GDN small-projection gather), r182 took #253 (the 1-token router fold and its RDNA4 gate) and r183 took #256 (the GDN
 decode folds), so they are no longer in this series.
 
@@ -12,11 +12,11 @@ decode folds), so they are no longer in this series.
 
 ```
 git checkout 6050b467c
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r183 release, branch rdna-boosts
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r184 release, branch rdna-boosts
 git am <path-to-this-repo>/ours/*.patch              # 15 patches
 ```
 
-Result: tree `2694667cf9cc`.
+Result: tree `f948c8efa9b8`.
 
 ## Patches
 
@@ -37,9 +37,17 @@ The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`
 
 ## Validation (2026-10-30, Radeon AI PRO R9700, 1 GPU)
 
-The r183 tree is the r182-based tree measured below plus r183's 2-D copy guard in `cpy.cu` (a three-way merge of the two
-gives exactly `2694667cf9cc`). The guard is not reached by these models, and on r183 the server replies on
-Llama-3.2-1B, Qwen3.6-35B-A3B and Qwen3.5-4B are unchanged, byte for byte, from the r182 run.
+The r184 tree is the r182-based tree measured below plus r183's 2-D copy guard in `cpy.cu` and r184's device-resident
+speculative checkpoint (#254) in `server-context.cpp` (three-way merges give exactly `2694667cf9cc` on r183 and
+`f948c8efa9b8` on r184). Neither changes code from this series. Checked on r183 / r184 on top of the run below:
+
+- Server replies on Llama-3.2-1B, Qwen3.6-35B-A3B and Qwen3.5-4B (r183), and Llama-3.2-1B and Qwen3.8-27B NVFP4-MTP
+  (r184; plain, MTP `--spec-draft-n-max 3` and `7`), are byte-identical to stock and, where the r182 run had
+  them (all but `7`), to that run.
+- #254's path: Qwen3.8-27B with `--spec-type ngram-mod --spec-ngram-mod-n-max 16 --spec-ngram-mod-n-match 4` keeps the
+  speculative checkpoint in device memory (149.6 MiB) on both r184 and this series; replies are identical between them
+  and with `LLAMA_SERVER_SPEC_CKPT_DEVICE=0`.
+- test-backend-ops CPY 251 / 251, CONCAT 183 / 183, SSM_CONV 60 / 60 (r183).
 
 r182 vs r182 + the r182-based series, no env on either side, `ROCBLAS_USE_HIPBLASLT=0`. llama-bench `-fa 1 -p 512 -n 128 -r 5`,
 2 alternating rounds, means; KLD on wikitext-2 `-c 512`, 24 chunks, against r182's logits.

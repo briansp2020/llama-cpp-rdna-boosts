@@ -1,4 +1,4 @@
-From 846f5d39f62853cb4008541de76a22bc233c3af5 Mon Sep 17 00:00:00 2001
+From 94c72aeb3c5fd3f6bb330a8c63723bbc255ab549 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 22 Oct 2026 22:14:57 +0000
 Subject: [PATCH 01/15] our stack on r118 (squashed port of cand1 = try109 +
@@ -5245,7 +5245,7 @@ index 5e3469510..2dd689d1f 100644
                          invalid_param = true;
                          break;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index d8e83c73f..c72db05ea 100644
+index d6aa3c909..19c39cbd8 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1,3 +1,4 @@
@@ -5253,7 +5253,7 @@ index d8e83c73f..c72db05ea 100644
  #include "server-context.h"
  #include <atomic>
  #include <thread>
-@@ -3953,6 +3954,25 @@ private:
+@@ -4046,6 +4047,25 @@ private:
          std::vector<server_slot *> generating;
          std::vector<server_slot *> drafting;
  
@@ -5279,7 +5279,7 @@ index d8e83c73f..c72db05ea 100644
          // determine which slots are generating and drafting
          iterate(slots, [&](server_slot & slot) {
              if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS) {
-@@ -3978,7 +3998,7 @@ private:
+@@ -4071,7 +4091,7 @@ private:
                  const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                  const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
  

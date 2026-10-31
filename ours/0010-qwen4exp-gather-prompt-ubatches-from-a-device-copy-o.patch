@@ -1,4 +1,4 @@
-From c3a422cffefb9dde0e4fecda5c35b1a5773434bb Mon Sep 17 00:00:00 2001
+From 1bbcb5fefa7a222092c89d193c5538bb6821a56d Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 18:04:11 +0000
 Subject: [PATCH 10/15] qwen4exp: gather prompt ubatches from a device copy of
