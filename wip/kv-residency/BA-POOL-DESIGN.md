@@ -180,7 +180,30 @@ Pre-split note: prefill reads the mirror over the link (488 vs 519 t/s, -6 % at 
 windowed arm showed (`W=1` prefill was *faster* there because the freed VRAM went to the expert arena; here the
 pool's 204 MiB is small and the mirror is a second copy of the KV, so prefill pays the link).
 
-### 7.5 Not done (the work list)
+### 7.5 B3 — the arena half (what the pool's VRAM is worth)
+
+Flash-Next, 1 GPU, `-ncmoe 48` (the model's full layer count), q8_0, `-c 131072`, 102 948-token prompt,
+`-n 2000`, **plain** decode (no MTP), arms back to back in one batch:
+
+| arm | arena | slots/table | expert hit / cold | prefill t/s | decode t/s |
+|---|---|---|---|---|---|
+| resident KV (816 MiB) | 23 579.8 MiB | 295 | 96.26 % / 2.68 % | 562.2 | **43.1** |
+| **pool (204 MiB, mirror in host)** | **25 018.6 MiB (+1 438.8)** | **313** | **97.02 % / 2.00 %** | 568.2 | **33.0** |
+
+* **The VRAM is real: +1.44 GiB of arena (+18 slots/table), +0.76 points of expert hit rate, cold reads 42.0 ->
+  31.6 GiB.**  `identity fast path ON` count is **0 in both arms** — at 313 of 512 slots per table the r117
+  cliff is not in play at this shape, so the per-token traffic figure the report prints (a stale per-token
+  divisor) is not usable here.
+* **Plain decode is the pool's worst case (-23 %)**: it must take the sparse arm while a resident KV takes the
+  dense one on gfx1201 (`B1-STRATA-PLAN.md` §3.2).  With MTP depth 4 -- the product shape -- the same comparison
+  is 60.2 (resident-dense) vs **48.3 (pool)**, and the sparse ceiling with a *resident* KV is 47.9, so the pool
+  itself costs ~0 (see §7.4).
+
+So B3's answer: **+1.44 GiB of arena for a 612 MiB smaller KV, at the sparse arm's cost, which is only paid
+because the pool cannot express the dense arm.**  That is the same trade block 15's window makes; the difference
+is that the pool keeps 90 % of the attention's KV *hot* rather than a positional tail.
+
+### 7.6 Not done (the work list)
 
 * **Step 3, the policy.**  Eviction is round-robin + "skip what this launch marked" (§2's lag-1 LRU, F-LRU and
   the heat prior are NOT implemented).  Predicted ceiling: the remaining ~10 % of fills (`qsa-census.py` says an
