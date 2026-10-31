@@ -1,4 +1,4 @@
-From e3baa3b170fda518ea57ad3fbb105dc0a66be5b9 Mon Sep 17 00:00:00 2001
+From ddadf3e4f80980ba21772d741b4c3d0f13d6faf7 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 05/15] rdna-boosts: block 05: flash-attention band, native
@@ -828,10 +828,10 @@ index 7c2c9b11a..42d708e5b 100644
      cparams.type_v = params.cache_type_v;
  
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index ec4be29a3..555224c47 100644
+index 7c0f2b9b9..3dc85b18c 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -2943,6 +2943,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
+@@ -2968,6 +2968,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
      result.embedding    = false;
      result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
  

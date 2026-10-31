@@ -197,7 +197,9 @@ reserves its compute buffers (r94 moved it here, the block that calls it).
 **Knobs.**  `--spec-draft-n-max`, `--spec-draft-n-start`, `--spec-draft-p-min`,
 `LLAMA_SPEC_DRAFT_N_MAX_CLAMP`, `LLAMA_MTP_INGEST_TAIL`, `LLAMA_MTP_TAIL_READBACK` (r118: kill-switch
 for the readback skip, on by default; `0` restores the pre-r118 behaviour with the tail still set),
-`LLAMA_MTP_DRAFT_OP_OFFLOAD`, `LLAMA_SPEC_ALIGN` (r153: verify-batch alignment, on).
+`LLAMA_MTP_DRAFT_OP_OFFLOAD`, `LLAMA_SPEC_ALIGN` (r153: verify-batch alignment, on),
+`LLAMA_SPEC_ALIGN_WIDTH_BAND` (r185: the verify width the aligned depth is bounded by on a band-0 config,
+default 16, `0` = off).
 
 **The verify batch is aligned across the sequences of one step (r153, issue #234).**
 `llama_memory_hybrid::init_batch()` splits a decode with `llama_batch_allocr::split_equal()`, which takes one
@@ -222,6 +224,24 @@ just as `--spec-draft-n-max 4` vs `5` do.  **A slot that cannot draft at all** (
 context) still splits that one step, deliberately: that ubatch carries the neighbour's genuine draft rows, and
 both alternatives measured neutral (`TODO.md` #111, analysed and declined).  Record:
 `archive/work/spec-align-234/`.
+
+**The aligned depth is bounded by a verify WIDTH where there is no arena (r185, `LLAMA_SPEC_ALIGN_WIDTH_BAND`).**
+r153's bound was the expert-cache band (`band / n_drafting - 1` rows per sequence), and r176 made `band` answer
+only for a config with host-resident experts -- so on a band-0 config (all-in-VRAM, `-sm layer`, a model with no
+routed expert) a multi-slot draft was **unbounded**: four slots at `--spec-draft-n-max 7` present ~28-32 rows and
+the batch leaves the decode kernels' small-batch families (MMVQ/MMVF -> MMQ, an FA family switch above 8 rows).
+The bound is now `width / n_drafting - 1`, `width` being the arena band when one is active (unchanged) and
+`LLAMA_SPEC_ALIGN_WIDTH_BAND` (default **16**, `0`/`1` = off) otherwise.  **16 and not 8:** at the two widths the
+fixed-depth arms measure 16 rows AHEAD on 3 of 4 shapes (35B-A3B 3 GPU 432.7 vs 389.8 t/s, 2 GPU 387.2 vs
+359.6; dense 27B 3 GPU 240.1 vs 211.2; qwen4exp Flash-Next GSQ-IQ3_XXS 2 GPU + a resident PLE table is the
+exception, 204.6 vs 220.8), which is why PR #169's "above ~8 rows each extra draft token costs more than it
+gains" is not the rule: the *unbounded* width was the defect.  Measured with 4 concurrent 300-token greedy
+requests on one binary, band on vs off: **35B-A3B 3 GPU 330.8 -> 434.7 t/s (+31.4 %)**, qwen4exp 2 GPU + PLE
+**175.5 -> 208.9 (+19.0 %)**, dense 27B 3 GPU **218.5 -> 249.6 (+14.2 %)**, a fixed `draft-mtp n_max 7` arm
+310.9 -> 362.8 (+16.7 %); 3 slots +16.9 %; **1 and 2 slots inert** (16 / 2 - 1 = 7 = the default `n_max`, and the
+2-slot text stays byte-identical), so every single-sequence gate is untouched.  A host-expert config keeps the
+arena band (`width band 16` is what the log prints there too, so the path is unchanged).  Gate:
+`scripts/gate-spec-width-band.sh`; record: `benchmarks/2026-10-31-multislot-verify-width.md`.
 
 **The draft's KV cache type follows the main `-ctk` / `-ctv` (r125, issue #216).**  Upstream gives the
 speculative draft context its own KV type pair (`--spec-draft-type-k` / `-ctvd`, defaulting to **f16**)

@@ -1,4 +1,4 @@
-From 10de73fca259a46d151fdb708c57e9f2cde62a27 Mon Sep 17 00:00:00 2001
+From ba637f0fd6b2c9d0597133974f51d0d01857897b Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/15] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -700,10 +700,10 @@ index 564fa9c4d..da77044b7 100644
      // Check if a backend sampler has already sampled a token in which case we
      // return that token id directly.
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 5c3cf9501..26e76cec2 100644
+index 32bc28f58..48b1c9379 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -1031,6 +1031,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1051,6 +1051,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
  
      std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
  
@@ -718,7 +718,7 @@ index 5c3cf9501..26e76cec2 100644
      std::vector<common_sampler_ptr> smpls;
  
      // backend sampler chain per seq, attached to ctx_dft
-@@ -1066,6 +1074,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1086,6 +1094,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
      // block-internal attention
      bool causal_attn = false;
  
@@ -733,7 +733,7 @@ index 5c3cf9501..26e76cec2 100644
      const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
      uint32_t        target_layer_ids_n = 0;
  
-@@ -1121,6 +1137,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1141,6 +1157,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
          }
          mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
  
@@ -749,7 +749,7 @@ index 5c3cf9501..26e76cec2 100644
          if (is_dspark && this->params.p_min > 0.0f) {
              char buf[16] = {};
              const bool has_conf =
-@@ -1135,6 +1160,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1155,6 +1180,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
          LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
          LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                  block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
@@ -760,7 +760,7 @@ index 5c3cf9501..26e76cec2 100644
  
          // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
          // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
-@@ -1183,6 +1212,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1203,6 +1232,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
          }
  
@@ -790,7 +790,7 @@ index 5c3cf9501..26e76cec2 100644
          // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
          llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
          llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
-@@ -1200,6 +1252,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1220,6 +1272,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              llama_sampler_free(backend_chains[seq_id]);
          }
          backend_chains.clear();
@@ -801,7 +801,7 @@ index 5c3cf9501..26e76cec2 100644
      }
  
      void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-@@ -1223,6 +1279,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1243,6 +1299,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
          }
      }
  
@@ -814,7 +814,7 @@ index 5c3cf9501..26e76cec2 100644
      bool process(const common_batch & batch_in) override {
          if (batch_in.size() <= 0) {
              return true;
-@@ -1254,17 +1316,84 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1274,17 +1336,84 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              }
          }
  
@@ -899,7 +899,7 @@ index 5c3cf9501..26e76cec2 100644
              // an M-RoPE image pins all its rows to one position, so a windowed draft
              // cache cannot free cells for it - skip it, the draft can jump over the gap
              const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
-@@ -1323,6 +1452,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1343,6 +1472,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              }
          }
  
@@ -910,7 +910,7 @@ index 5c3cf9501..26e76cec2 100644
          return true;
      }
  
-@@ -3041,7 +3174,10 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -3066,7 +3199,10 @@ common_speculative_init_result::common_speculative_init_result(
      llama_context * ctx_tgt,
      llama_model * model_dft_pre) :
      pimpl(new impl{}) {
@@ -922,7 +922,7 @@ index 5c3cf9501..26e76cec2 100644
      const bool spec_mtp = params.speculative.has_mtp();
  
      auto mparams = common_model_params_to_llama(params);
-@@ -3067,6 +3203,20 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -3092,6 +3228,20 @@ common_speculative_init_result::common_speculative_init_result(
      // the draft context holds as many tokens per sequence as the target context
      cparams.n_ctx = llama_n_ctx(ctx_tgt);
  

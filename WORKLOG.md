@@ -1,5 +1,67 @@
 # WORKLOG - dated delivery records
 
+## 261031.001 (r185) -- the multi-slot verify WIDTH bound (block 02): +14.2 to +31.8 % on the default recommended speculator, and PR #169 closed on the measurement
+
+**Released as `v16-6050b467c-r185` (16 blocks; block 02 amended).**  Canonical tip
+`5639690d2e64d4a9c9538c5c3d32a949b39a6e98`, tree `f8eaf8f005b44a11bad1a619f0c9b07b0559f64b`, `validate-set.sh`
+strict 16/16.  Numbers: `benchmarks/2026-10-31-multislot-verify-width.md`; record: this entry (no `archive/work/`
+campaign: the work was PR #169's assessment plus the promotion, and PR #169 is closed).
+
+**PR #169 (`wip/spec-batch-budget`, `@briansp2020`) is CLOSED, not merged.**  Its head is byte-identical to the
+copy the repo has kept at `archive/work/spec-batch-budget/` since r77, so there was nothing new to take; the third
+and final assessment re-measured it on **r184** (one binary = r184 + the patch, the env var selecting the arm,
+`--lazy-mode off`, 4 concurrent 300-token greedy requests, fresh server per arm, 2-4 reps, the archived probe as
+the harness) and the reply on the PR carries the tables.  Two findings, and the second one is the release:
+
+1. **The premise is not the rule.**  At a 4-slot verify width, "above ~8 rows each extra draft token costs more
+   than it gains" holds only on the contributor's own shape: fixed depth 3, width 16 vs width 8, **35B-A3B 3 GPU
+   432.7 vs 389.8 t/s, 2 GPU 387.2 vs 359.6, dense 27B 3 GPU 240.1 vs 211.2** (all *worse* with the cap), while
+   qwen4exp Flash-Next GSQ-IQ3_XXS 2 GPU + a resident PLE table is 204.6 vs **220.8** and IQ3_S 196.7 vs **205.8**
+   (better with it).  A 2-slot arm on that shape is **-22 %** at width 4 vs 8, so the knob was a per-shape gamble
+   with no safe value, its structural controller defect (fed `n_accepted` against its own `n_cur`, not the capped
+   depth) was never addressed, and the r79 record's "2-slot byte-identical text" no longer holds on r184 (`a59941368946`
+   uncapped vs `7f8f820b9789` capped).
+2. **The defect it was reaching for is real and much larger, and it is a delivery bug in the DEFAULT config.**
+   `align_draft_caps()` bounded the aligned depth by the expert-cache band, and r176 made `band` answer only for a
+   config with **host-resident experts** -- so on a band-0 config (all-in-VRAM, `-sm layer`, a model with no
+   routed expert) a multi-slot draft was **unbounded**.  Four slots at the shipped `--spec-draft-n-max 7` present
+   ~28-32 rows, past the MMVQ/MMVF -> MMQ and FA family switch, and with `draft-mtp-adaptive` (the recommended
+   speculator) the *default* measured **317.1 vs 418.0 t/s on 35B-A3B 3 GPU (-31.8 %), 166.6 vs 212.4 on
+   qwen4exp 2 GPU (-27.5 %), 205.7 vs 225.3 on dense 27B 3 GPU (-9.5 %)** against the same arm bounded at 16
+   rows.  Per step on the 35B: 51.5 ms for 16.1 accepted (3.18 ms/accepted) vs 31.5 ms for 13.2 (2.39) -- the wide
+   arm buys no acceptance for its time.  Nothing could see it: coherence, prefill-logit, the four-axis MTP
+   protocol and `gate-spec-align.sh` all run one or two sequences, where `width / n_drafting - 1` is 15 or 7 and
+   the bound is inert by construction.
+
+**Delivery change (`common/speculative.cpp`, block 02, 32 lines).**  The aligned depth is bounded by
+`width / n_drafting - 1`, where `width` is the arena band when one is active (unchanged) and the new
+`LLAMA_SPEC_ALIGN_WIDTH_BAND` (default **16**, `0`/`1` = off) otherwise.  **16 and not 8**, because at the two
+widths the fixed-depth arms measure 16 rows ahead on 3 of 4 shapes (the table above); a model or shape whitelist
+was rejected on purpose -- the sign flips on the same model across quant, device count, slot count and speculator,
+and the variable that governs it is the verify width `n_slots x (1 + depth)`, so the rule is expressed on that and
+evaluated per draft call.  A/B, one binary, band on vs off: **35B-A3B 3 GPU 4 slots adaptive 330.8 -> 434.7 t/s
+(+31.4 %)**, **qwen4exp IQ3_XXS 2 GPU + PLE 175.5 -> 208.9 (+19.0 %)**, **dense 27B 3 GPU 218.5 -> 249.6
+(+14.2 %)**, a fixed `draft-mtp n_max 7` arm 310.9 -> 362.8 (+16.7 %); 3 slots +16.9 %; **1 and 2 slots inert**
+(16 / 2 - 1 = 7 = the default `n_max`, 2-slot text byte-identical, an `n_max 9` 2-slot arm neutral within noise),
+and a host-expert config takes the arena band and runs the same code path (191.9 vs 184.5 t/s = the ±7 % noise
+floor at 4 slots, measured deliberately as a control).
+
+**Gates.**  New `scripts/gate-spec-width-band.sh` (band-0, 3 GPU, `--parallel` 1/2/4, one binary) **PASS**: the
+bound fires as `aligned draft depth ... 4 -> 3 (width band 16)` and never on the knob-off arm, 4 slots 363-366 ->
+425-432 t/s, 1 and 2 slots inert and text-identical (`fa36ef316479`, `e846c29f763b`/`b02d535e449d`), full token
+budgets, no abort, GPU journal clean.  `gate-spec-align.sh` **PASS** with the r176 numbers unchanged (2 GPU
+113.8 -> 146.7, 3 GPU 139.4 -> 178.3, host-expert 124.5 -> 151.1, splits 58+1 -> 0+1, mixed chain inert, single-slot
+text `b8775233a93a`).  Coherence against a kept r184 build **byte-identical** on 5 arms (4B 3 GPU and 1 GPU
+`8d89080db673`, dense 27B 3 GPU and `draft-mtp n3` `bda6ce08c7e1`, 35B-A3B `-ncmoe 40` `265c381dbc11`).  MTP
+Protocol A (27B, 3 devices, `-n 3000`, bf16 KV): layer plain 25.0 -> **61.7** t/s, tensor 50.8 -> **121.0**
+(r176 at `-n 2000`: 25.0/50.9 -> 62.1/120.9); adaptive R axis at `-n 3000` 67.0 t/s and `893b1d5a3322` on **both**
+builds.  Prefill-logit **0.000000 / 100.000 %**.  Per-block build `--fast` **16/16** (896 s).  `validate-set.sh`
+green.
+
+**Docs.**  `ENVIRONMENT.md` §3 (the knob + the band note), `patches/README.md` (block 02), `MANIFESTS.md` (release
+gate 13 + the block 02 verification row), `AGENTS.md` (critical fact + the `scripts/` index), `scripts/README.md`
+(index + detail row).
+
 ## 261030.009 (r184) -- PR #254 ships the target's speculative checkpoint in device memory (block 12): +2.1 % dense / +4.3 % MoE on n-gram rewrite requests, bit-identical, plus a `-nkvo` correction and the state-copy invariant
 
 **Released as `v16-6050b467c-r184` (16 blocks; block 12 amended).**  Contributor `@overdoingism`'s
