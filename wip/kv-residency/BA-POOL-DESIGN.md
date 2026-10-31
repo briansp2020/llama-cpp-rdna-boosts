@@ -386,7 +386,7 @@ default-ON and is not involved here.)
 
 ### 8.6 What is left
 
-1. **The indexer score chain** (8.4) — the only item with real mass left: ~7 ms of a ~35-43 ms verify step.
+1. **The indexer score chain** (8.4) — the only item with real mass left: ~6.7 ms of a ~35-44 ms verify step.
    Candidate direction (not started, and the maintainer's call): keep a *derived* indexer key form (roped,
    normed, biased once at write time) so a decode step only runs the score matvec + the top-k, and check why
    the derived-cache path is not already doing that at `n_tokens == 1`.
