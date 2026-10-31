@@ -1,7 +1,7 @@
-From 94c72aeb3c5fd3f6bb330a8c63723bbc255ab549 Mon Sep 17 00:00:00 2001
+From 6a730ff5c648566af6932a4fc2c60bfc516dfd8f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 22 Oct 2026 22:14:57 +0000
-Subject: [PATCH 01/15] our stack on r118 (squashed port of cand1 = try109 +
+Subject: [PATCH 01/22] our stack on r118 (squashed port of cand1 = try109 +
  evclock + ckpool; PR #206 dropped, folded in r118)
 
 (cherry picked from commit d981d8cbc27611fcd39798542ef64d5a129c969f)

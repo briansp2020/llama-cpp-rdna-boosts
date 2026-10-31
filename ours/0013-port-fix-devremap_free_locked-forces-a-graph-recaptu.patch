@@ -1,7 +1,7 @@
-From a83ed5b13168e3db2de31716d876a2d0da8a0458 Mon Sep 17 00:00:00 2001
+From feff4fe764389be031eecba8161ea5e5be9f7371 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 27 Oct 2026 05:31:54 +0000
-Subject: [PATCH 13/15] port fix: devremap_free_locked forces a graph recapture
+Subject: [PATCH 13/22] port fix: devremap_free_locked forces a graph recapture
  (r149 per-layer keys replay; the device-remap buffers are local and not
  covered by stew's free-site bumps)
 
