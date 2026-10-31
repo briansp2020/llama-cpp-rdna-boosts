@@ -912,3 +912,13 @@ none -lzm off` — 27 465 MiB of PLE is otherwise lazy-mapped and made identical
 Text: resident default == `STREAM=0` (853 `77a40bf40be1`, inert on a resident cache); streamed default ==
 forced-sparse (1159 `e6080aaf2318`); streamed dense 1158 `0f1ad14496c9` (a documented regime change).  Prefill
 untouched.  Plan §3.3.
+
+### B2's context: MTP x depth settles the "Strata is fast with little resident" question
+
+Flash-Next IQ3, `-ncmoe 48`, 1 GPU, PLE flags: resident plain 42.2 / 37.1 t/s at 103k / 180k; **resident + MTP
+53.6** at 180k and **75.4** at 5.3k depth; streamed `W=1` + B2 + MTP **36.4** at 180k and **72.8** at 5.3k.  So the
+80+ t/s figure is a working-context MTP number (reproduced), and streaming's cost is **−3.5 % at 5.3k, −25 % at
+103k, −32 % at 180k**.  At depth, a positional window holding **17 %** of the KV gains **+3 %** over ~0 %
+(`W=32768` 25.03 vs `W=1` 24.32 at 180k, sparse arm) — recency is not attendance, which is why Strata's
+attendance-driven pool + page table (`STRATA-KV-STREAMING.md` §1) beats a recency window at the deep end.  The
+deciding unmeasured number is the attended set's churn / pool hit rate: plan §3.4, B1(c).

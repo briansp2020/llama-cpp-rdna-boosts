@@ -195,6 +195,48 @@ the strength of measurements taken with a **res**ident draft KV ("every measured
 draft cache the same argument as B2 applies, so that default deserves a streamed-arm re-measure before it is
 believed (`LLAMA_MTP_SPARSE_DECODE=1`, `O3-DRAFTER-RING.md` territory).
 
+## 3.4 Why Strata is fast with little resident, and why our arms looked catastrophic (2026-10-30, same session)
+
+The maintainer's check: *"when I run Strata with MTP it sustains 80+ t/s on one card with the same model"*.  That
+reproduces here, and the discrepancy was **MTP x depth**, not a contradiction:
+
+| Flash-Next IQ3_XXS, 1 GPU, `-ncmoe 48`, q8_0, PLE flags, `-n 400…512` | depth ~5 300 (`-c 16384`) | depth 102 899 | depth 180 035 |
+|---|---|---|---|
+| KV resident, plain decode | — | 42.16 | 37.10 |
+| KV resident, **+ MTP** | **75.42** (acceptance 0.486) | — | **53.55** (0.475) |
+| KV streamed `W=1`, plain + B2 | — | 31.43 | 24.31 |
+| KV streamed `W=1`, **+ MTP** + B2 | **72.80** (0.517) | — | **36.42** (0.506) |
+| streaming's cost | **−3.5 %** | −25 % | −32 % |
+
+So "80+ on one card" is a *working-context* number (75.4 at 5.3k; a shallower or warmed arm is 80+) and it is
+**MTP** that lifts it there (37.1 → 53.6 at 180k, +44 %).  Every B1/B2 arm above was *plain* decode at 103k-180k —
+the least favourable combination — which is why streaming looked uniformly catastrophic.
+
+**The part that does point at Strata's design** is the deep end, and one measurement settles it.  At 180k, with B2's
+sparse arm, grow the *positional* window until it holds a Strata-like share of the KV:
+
+| arm at 180 035, sparse decode | resident KV | decode t/s |
+|---|---|---|
+| `W=1` (96 MiB, ~4 %) | 96 MiB | 24.32 |
+| `W=32768` (427 MiB, **17 %**) + indexer resident | 427 MiB | **25.03 (+3 %)** |
+| `W=32768`, indexer also windowed | 427 MiB | 24.53 |
+| everything resident (2.45 GiB) | 2 448 MiB | 37.10 plain / 53.55 MTP |
+
+**A positional window holding 17 % of the KV buys 3 % over holding ~0 %**: recency says nothing about what
+attention reads, so block 15's window cannot be rescued by making `W` larger.  Strata's residency is
+**attendance-driven** — a page table plus a pool of `n_slots` pages whose admission is "the blocks attention
+selected" — so their per-token host traffic is the *churn* of the attended set, not the attended set itself, and
+their per-cell KV is ~4x smaller (int8, 4-cell blocks holding all K/V heads: 4 224 B per block).  That is the
+structural advantage, and it is exactly `STRATA-KV-STREAMING.md` §1's `kv_stream_resolve`.
+
+**What this changes in the plan.**  B2 stands (it is the right arm on a streamed cache, and it is free at a working
+context: −3.5 % there, +34…47 % at depth).  But **B-A is back on the table for the deep end** and its ceiling is a
+number nobody has measured: the attended set's *stability* across steps — i.e. the hit rate a pool of `N` pages
+would get.  If the top-k blocks churn slowly, a 4-8 k-page pool lands near the resident speed and Strata's result is
+reproducible here; if they churn fast, no pool helps and the deep-context story stays "streaming is a fittability
+tax".  That is **B1(c)** (a diagnostic readback of `top_k` in a non-captured arm), and it is now the next
+measurement, before any pool code.
+
 ## 4. The three candidate mechanisms
 
 **B-A — page table + resolve inside the graph (Strata's form).**  The KV becomes a bounded pool of `n_slot`
