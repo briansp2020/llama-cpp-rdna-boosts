@@ -532,18 +532,22 @@ until r95 (PR #192 + PR #193); gfx1101-gfx1102 are inside the arch predicate but
 validated**, and **RDNA3_5 is excluded** (`GGML_CUDA_CC_IS_RDNA3_0` is `0x1100 <= cc < 0x1150`).
 Every one of them is a default-on kill-switch: `=0` restores the pre-r95 RDNA3_0 path.  The three are
 bit-identical to the paths they replace (gfx1100 `W = 1..8` width-probe maxdiff 0, greedy text identical
-for `none` and `draft-mtp n3`, prefill-logit KLD 0.000000 / 100.000 %); the GDN conv keeps its
-pre-existing single-device restriction, the batched CPY does not, and RDNA3_0 multi-device
-(`-sm tensor` / `-sm layer`) is a recorded open gap — the batched CPY fires ~450 times (`-sm layer`) /
-~1350 times (`-sm tensor`) per 60-token MTP run on 3x gfx1201, so that arm is exercised on RDNA4 but
-not measured on RDNA3_0.
+for `none` and `draft-mtp n3`, prefill-logit KLD 0.000000 / 100.000 %); the batched CPY and the GDN conv both
+run on every device count (**r186 removed the GDN/PLE conv's single-device restriction** — see the r183 note
+below), and RDNA3_0 multi-device (`-sm tensor` / `-sm layer`) is a recorded open gap — the batched CPY fires
+~450 times (`-sm layer`) / ~1350 times (`-sm tensor`) per 60-token MTP run on 3x gfx1201, so that arm is
+exercised on RDNA4 but not measured on RDNA3_0.
 
 **r183 (block 10) extends that same gate to one token.**  `GGML_CUDA_FUSE_GDN_CONV_DECODE` widens
 `GGML_CUDA_FUSE_GDN_CONV_VERIFY`'s band to `T = 1` (only where the q/k norm pair folds too and the decode-only
 `ssm_prescan` would not take the conv first), and `GGML_CUDA_DISABLE_GDN_CONV_SNAP` /
 `GGML_CUDA_FUSE_GDN_CONV_GATHER` ride the direct conv on whatever width it runs (prefill, the verify band and,
-with `..._DECODE`, decode).  All three keep the pre-existing single-device restriction, so on `-sm tensor` /
-`-sm layer` with two or more devices they are inert unless `GGML_CUDA_CONV_FUSION_MULTI=1` is set.
+with `..._DECODE`, decode).  **r186:** all of them (and the direct conv itself) now run on **every device
+count**.  The single-device restriction existed because the 3x R9700 `-sm tensor` split diverged from the
+reference (2026-09-23, never root-caused); that no longer reproduces, so `ggml_cuda_get_device_count()` is no
+longer consulted and `GGML_CUDA_CONV_FUSION_MULTI` — the old force-on knob — is **retired** (forcing the fusion
+on is now the default, so the knob has nothing left to do and is not read).  `GGML_CUDA_DISABLE_CONV_FUSION`
+(§7.3) is the off switch and the A/B arm for every multi-device measurement.
 
 ### 7.2 `GGML_CUDA_DISABLE_*` — value-gated (`=1` disables, `0` keeps it on)
 
@@ -765,7 +769,7 @@ None of these change the computed result on the default path.
 | `GGML_CUDA_GCDBG` | CUDA-graph debug. |
 | `GGML_STREAMDBG` | stream debug. |
 | `GGML_ALLOCATOR_DEBUG` | build-flag companion for allocator tracing. |
-| `GGML_CUDA_MWR_DEBUG`, `GGML_CUDA_HC_BLK16_DEBUG`, `GGML_CUDA_IDX_RELU_SUM_LOG`, `GGML_CUDA_FUSE_CPY_BATCH_DEBUG`, `GGML_CUDA_CONV_DEBUG`, `GGML_CUDA_CONV_FUSION_MULTI`, `LLAMA_HC_CN_DEBUG`, `LLAMA_HC_GATEMIX_DEBUG`, `LLAMA_QSA_SCORE_STRIP_DEBUG`, `GGML_CUDA_QSA_DEBUG` | feature-specific debug output. |
+| `GGML_CUDA_MWR_DEBUG`, `GGML_CUDA_HC_BLK16_DEBUG`, `GGML_CUDA_IDX_RELU_SUM_LOG`, `GGML_CUDA_FUSE_CPY_BATCH_DEBUG`, `GGML_CUDA_CONV_DEBUG`, `LLAMA_HC_CN_DEBUG`, `LLAMA_HC_GATEMIX_DEBUG`, `LLAMA_QSA_SCORE_STRIP_DEBUG`, `GGML_CUDA_QSA_DEBUG` | feature-specific debug output.  (`GGML_CUDA_CONV_FUSION_MULTI` was the conv fusion's old force-on knob; **retired in r186** — the fusion is on for every device count and `GGML_CUDA_DISABLE_CONV_FUSION` is the off switch, so it is no longer read.) |
 | `FA`, `KV`, `RS`, `GDN_DBG_A`, `GDN_DBG_P`, `GDN_DBG_ONES`, `GDN_DBG_DUMP`, `GDN_DBG_SAVE` | **internal probes.** Single/double-letter or `_DBG_` names used by debug dump blocks. Never set these in production — two of them take a value that selects a dump *mode*. |
 
 ---

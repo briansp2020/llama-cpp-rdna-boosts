@@ -26,6 +26,16 @@
 #   4b. `gate-hc-fusions.sh` on the qwen4exp GGUF(s) present here -- the four mix/combine arms
 #      must all reproduce the unfused chain (issue #228: the op-vs-CPU oracle cannot see that
 #      class).  Skipped when no qwen4exp GGUF is present or the applied tree touched no HC path;
+#   4c. `test-logits-width-probe` at the VERIFY widths against the r183 GDN direct-conv folds --
+#      those folds reorder a multi-token step's launches without changing its arithmetic, so
+#      greedy text and the `-ub 1` prefill-logit arm are both blind to them (r80 + PR #177 was
+#      run-to-run unstable at P=3584 with clean text and KLD 0.000000).  Fails unless the default
+#      arm is run-to-run stable, bit-identical to its all-folds-off arm, and really reaches the
+#      fold (`GGML_CUDA_CONV_DEBUG=1` -> `snap=1`) and the reference arm must really have taken
+#      CONCAT+SSM_CONV+CPY.  Runs one single-device arm and, on a 2+ GPU box, `-sm tensor` and
+#      `-sm layer` arms (r186 made the fusion device-count independent, so those are the ones that
+#      can catch a regression).  Skipped when no GDN GGUF is present or the tree touched no
+#      conv-fold source;
 #   5. writes a one-screen summary to $STATE_DIR/runs/<rev>/summary.txt and, on success,
 #      records $STATE_DIR/last-ok.
 #
@@ -41,7 +51,10 @@
 #      KLD_MODEL, KLD_CTX (512), KLD_CHUNKS (40), KLD_BASE_DIR
 #      HC_MODELS                     space-separated qwen4exp GGUFs for the fusion gate (both
 #                                    hc-down classes); HC_ALWAYS=1 forces it
-#      SKIP_LADDER=1 / SKIP_OPTESTS=1 / SKIP_KLD=1 / SKIP_HC=1   narrow the run
+#      GDN_WIDTH_MODELS              space-separated GDN/hybrid GGUFs for the conv-fold width gate
+#                                    (a missing path is skipped); GDN_WIDTH_P ("3584 4096"),
+#                                    GDN_WIDTH_RUNS (3), GDN_WIDTH_TEXT, GDN_WIDTH_ALWAYS=1
+#      SKIP_LADDER=1 / SKIP_OPTESTS=1 / SKIP_KLD=1 / SKIP_HC=1 / SKIP_GDN_WIDTH=1   narrow the run
 #      MAX_ATTEMPTS (3, per rev)         KEEP_RUNS (5)
 #      KLD_ALWAYS=1                      run the prefill-logit gate even when the applied tree
 #                                        did not touch a prefill path (see below)
@@ -103,12 +116,32 @@ KLD_ALWAYS="${KLD_ALWAYS:-0}"
 # A path that does not exist is skipped (each class is optional).
 HC_MODELS="${HC_MODELS:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"
 HC_ALWAYS="${HC_ALWAYS:-0}"
+SKIP_GDN_WIDTH="${SKIP_GDN_WIDTH:-0}"
+# GDN/hybrid GGUFs for the conv-fold width gate (r183).  The subjects are the direct conv's three
+# folds and the shared-expert gate fold, which only act on multi-token steps, so the probe has to
+# run at the verify widths.  Both a MoE (35B-A3B) and a dense (27B) GDN model are wanted: the folds
+# pick up on the dense shape too, and only the MoE one carries the routed-expert path.  A path that
+# does not exist is skipped; a model that never reaches the fold FAILS (a vacuous pass is exactly
+# the blind-probe failure this gate exists to prevent), so keep this list GDN/hybrid models only.
+GDN_WIDTH_MODELS="${GDN_WIDTH_MODELS:-/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
+/llm/models/Qwen3.8/27B/Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf}"
+GDN_WIDTH_TEXT="${GDN_WIDTH_TEXT:-$REPO/prompts/prose-rdna-boosts.txt}"
+GDN_WIDTH_P="${GDN_WIDTH_P:-3584 4096}"
+GDN_WIDTH_RUNS="${GDN_WIDTH_RUNS:-3}"
+GDN_WIDTH_ALWAYS="${GDN_WIDTH_ALWAYS:-0}"
+# The arm list is "<HIP_VISIBLE_DEVICES>:<split>".  r186 made the conv fusion device-count independent, so the
+# MULTI-device arms are the ones that can catch a regression; they are clamped to the GPUs actually present.
+GW_SINGLE_ARM="0:layer"
+GDN_WIDTH_ARMS="${GDN_WIDTH_ARMS:-}"
 
 # Paths whose change makes the prefill-logit gate relevant (AGENTS: "any change to a prefill
 # kernel ... or a default-on approximate path").
 PREFILL_RE='^(ggml/src/ggml-cuda/|ggml/src/ggml\.c|src/llama-graph\.cpp|src/models/|src/llama-kv-cache)'
 # A change to a qwen4exp hyper-connection op/chain/matcher (issue #228) or to the graph that emits it.
 HC_RE='^(ggml/src/ggml-cuda/hc-mix|ggml/src/ggml-cuda/hyperconn|ggml/src/ggml-cuda/ggml-cuda-try-fuse|ggml/src/ggml-cpu/ops\.cpp|ggml/include/ggml\.h|ggml/src/ggml\.c|src/models/qwen4exp\.cpp)'
+# A change to a GDN direct-conv fold, its matchers or the batched-copy run it stands down (r183).
+# `ggml-cuda-try-fuse.cu` carries the dispatcher that emits the fold, `cpy-batch.cu` the run stop.
+GDN_WIDTH_RE='^(ggml/src/ggml-cuda/gdn-conv|ggml/src/ggml-cuda/cpy-batch|ggml/src/ggml-cuda/ggml-cuda-try-fuse)'
 
 log() { echo "$(date -Is) $*"; }
 die() { log "ERROR: $*"; exit 1; }
@@ -340,10 +373,137 @@ if [ "$hc_want" = 1 ]; then
     [ "$hc_ran" = 1 ] || say "hc gate  : skipped (no qwen4exp GGUF on this box; set HC_MODELS)"
 fi
 
+# --- 4c. GDN direct-conv fold width purity (r183) ---------------------------------------------
+# The three GDN decode folds (the direct conv also writing the snapshot tails, the conv-state gather
+# deferral, the 1-token direct conv) and the shared-expert gate fold change the LAUNCH ORDER of a
+# multi-token step, never its arithmetic.  Greedy text and the prefill-logit gate at `-ub 1` are both
+# blind to that class: r80 + PR #177 was run-to-run unstable at P=3584 while its greedy text, its
+# prefill-logit KLD (0.000000 / 100.000 %) and its WITHIN-run width purity all read clean -- the
+# between-runs difference was the whole signal (TODO #75).  `test-logits-width-probe` at the verify
+# widths is the instrument that saw it, so it is the arm a change to these folds owes.  r183 shipped
+# the folds without it; r185 re-checked them with it (see the WORKLOG entry).
+
+# How many GPUs this box exposes.  rocm-smi is not required: if the count cannot be read we report 1 and only
+# the single-device arm runs (never a multi-device claim we did not actually exercise).
+gdn_gpu_count() {
+    local n
+    n=$("$ROCM_DIR/bin/rocm-smi" -i 2>/dev/null || rocm-smi -i 2>/dev/null) || n=""
+    n=$(printf '%s\n' "$n" | grep -oE '^GPU\[[0-9]+\]' | sort -u | wc -l)
+    [ "${n:-0}" -ge 1 ] && printf '%s' "$n" || printf '1'
+}
+
+# "<W8 hash> <row-0 hash>" from a probe log -- the two values a determinism/purity claim is made of.
+# Prints NOTHING when either half is missing (a bare `printf '%s %s'` of two empty strings is a space,
+# which would make the "no hash" guard below unreachable).
+gw_hashes() {
+    local w8 r0
+    w8="$(grep -oE '^W=8 rows=[0-9]+ hash=[0-9a-f]+' "$1" | tail -1 | sed 's/.*hash=//')"
+    r0="$(grep -oE 'row0_row1_hashes: 1:[0-9a-f]+' "$1" | tail -1 | sed 's/.*1://')"
+    [ -n "$w8" ] && [ -n "$r0" ] && printf '%s %s' "$w8" "$r0"
+    return 0
+}
+
+gdn_width_step() {
+    local probe="$BUILD/bin/test-logits-width-probe"
+    local gw_ran=0 gw_fired=0 gw_model gw_arm gw_devs gw_split gw_p gw_r gw_ref gw_on gw_off gw_log gw_tag gw_ngpu arms
+    if ! cmake --build "$BUILD" --target test-logits-width-probe -j "$JOBS" >"$RUN/gdn-width-build.log" 2>&1; then
+        fail "building test-logits-width-probe (log: $RUN/gdn-width-build.log)"
+    fi
+    gw_ngpu="$(gdn_gpu_count)"
+    for gw_model in $GDN_WIDTH_MODELS; do
+        gw_tag="$(basename "$gw_model" .gguf)"
+        if [ ! -f "$gw_model" ]; then
+            say "gdn width: no GDN GGUF at $gw_tag (skipped)"
+            continue
+        fi
+        gw_ran=1
+        if [ -n "$GDN_WIDTH_ARMS" ]; then
+            arms="$GW_SINGLE_ARM $GDN_WIDTH_ARMS"
+        elif [ "$gw_ngpu" -ge 3 ]; then
+            arms="$GW_SINGLE_ARM 0,1,2:tensor 0,1,2:layer"
+        elif [ "$gw_ngpu" -eq 2 ]; then
+            arms="$GW_SINGLE_ARM 0,1:tensor 0,1:layer"
+        else
+            arms="$GW_SINGLE_ARM"
+            say "gdn width: single-GPU box, the multi-device arms are skipped (r186 made the fusion device-count independent, so they are the ones that matter -- run this on a 2+ GPU box before a release)"
+        fi
+        for gw_arm in $arms; do
+            gw_devs="${gw_arm%%:*}"
+            gw_split="${gw_arm##*:}"
+            for gw_p in $GDN_WIDTH_P; do
+                gw_ref=""
+                for gw_r in $(seq 1 "$GDN_WIDTH_RUNS"); do
+                    gw_log="$RUN/gdn-width-$gw_tag-$gw_devs-$gw_split-P$gw_p-r$gw_r"
+                    # default arm: every fold on
+                    if ! HIP_VISIBLE_DEVICES="$gw_devs" SPLIT="$gw_split" LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" \
+                            GGML_CUDA_CONV_DEBUG=1 \
+                            timeout 3600 "$probe" "$gw_model" "$GDN_WIDTH_TEXT" "$gw_p" 512 >"$gw_log.on" 2>&1; then
+                        fail "width probe, folds on ($gw_tag $gw_devs $gw_split P=$gw_p; log: $gw_log.on)"
+                    fi
+                    # kill-switch arm: every fold off (`GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0` too: it is the
+                    # fourth fold and a BF16/F32-gate model is the only one it fires on).  r186: every fusion
+                    # rides GGML_CUDA_DISABLE_CONV_FUSION, so the conv itself is stood down here as well --
+                    # that is the reference path the fused arm must reproduce.
+                    if ! HIP_VISIBLE_DEVICES="$gw_devs" SPLIT="$gw_split" LD_LIBRARY_PATH="$BUILD/bin:$ROCM_DIR/lib" \
+                            GGML_CUDA_CONV_DEBUG=1 GGML_CUDA_DISABLE_CONV_FUSION=1 \
+                            GGML_CUDA_DISABLE_GDN_CONV_SNAP=1 GGML_CUDA_FUSE_GDN_CONV_GATHER=0 \
+                            GGML_CUDA_FUSE_GDN_CONV_DECODE=0 GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0 \
+                            timeout 3600 "$probe" "$gw_model" "$GDN_WIDTH_TEXT" "$gw_p" 512 >"$gw_log.off" 2>&1; then
+                        fail "width probe, folds off ($gw_tag $gw_devs $gw_split P=$gw_p; log: $gw_log.off)"
+                    fi
+                    gw_on="$(gw_hashes "$gw_log.on")"
+                    gw_off="$(gw_hashes "$gw_log.off")"
+                    # both halves present, else the log did not carry a probe result at all
+                    case "$gw_on" in "") fail "width probe produced no W8/row-0 hash ($gw_tag $gw_devs $gw_split P=$gw_p; log: $gw_log.on)";; esac
+                    case "$gw_off" in "") fail "width probe produced no W8/row-0 hash ($gw_tag $gw_devs $gw_split P=$gw_p; log: $gw_log.off)";; esac
+                    grep -q 'GDN_CONV_DIRECT ' "$gw_log.on" \
+                        || fail "the GDN direct conv never ran ($gw_tag $gw_devs $gw_split P=$gw_p) -- a multi-device arm needs 2+ visible devices (GDN_WIDTH_ARMS) and a GDN model (GDN_WIDTH_MODELS); log: $gw_log.on"
+                    # `(^|[[:space:]])snap=1` and not a bare `snap=1`: the same line also carries `n_snap=1`,
+                    # which would make the stand-down check below pass on the OFF arm by accident.
+                    grep -qE '(^|[[:space:]])snap=1([[:space:]]|$)' "$gw_log.on" && gw_fired=1
+                    # The comparison is only meaningful if the two arms really ran different paths: the
+                    # reference arm must have taken CONCAT + SSM_CONV + CPY, with no direct conv at all.
+                    if grep -q 'GDN_CONV_DIRECT ' "$gw_log.off"; then
+                        fail "GGML_CUDA_DISABLE_CONV_FUSION=1 did not stand the conv down, so both arms ran the fused path and this arm is VACUOUS ($gw_tag $gw_devs $gw_split P=$gw_p; log: $gw_log.off)"
+                    fi
+                    if [ -z "$gw_ref" ]; then
+                        gw_ref="$gw_on"
+                    elif [ "$gw_on" != "$gw_ref" ]; then
+                        fail "width probe is NOT run-to-run stable: $gw_tag $gw_devs $gw_split P=$gw_p run $gw_r gave '$gw_on', run 1 gave '$gw_ref' (logs: $gw_log.*)"
+                    fi
+                    [ "$gw_on" = "$gw_off" ] \
+                        || fail "the conv fusion is NOT bit-identical to its reference path: $gw_tag $gw_devs $gw_split P=$gw_p fused '$gw_on' vs reference '$gw_off' (logs: $gw_log.*)"
+                done
+                say "gdn width: $gw_tag $gw_devs $gw_split P=$gw_p  W8/row0 $gw_ref  (== reference path, $GDN_WIDTH_RUNS runs)"
+            done
+        done
+    done
+    if [ "$gw_ran" = 1 ] && [ "$gw_fired" != 1 ]; then
+        fail "no model reached the GDN snapshot fold (never logged snap=1), so the width gate was VACUOUS -- set GDN_WIDTH_MODELS to GDN/hybrid GGUFs or SKIP_GDN_WIDTH=1"
+    fi
+    [ "$gw_ran" = 1 ] || say "gdn width: skipped (no GDN GGUF on this box; set GDN_WIDTH_MODELS)"
+}
+
+if [ "$SKIP_GDN_WIDTH" = 1 ]; then
+    say "gdn width: skipped (SKIP_GDN_WIDTH=1)"
+else
+    if [ -z "$prev_tip" ] || [ "$GDN_WIDTH_ALWAYS" = 1 ]; then
+        gdn_width_step
+    else
+        delta="$(git -C "$LLAMA_REPO" diff --name-only "$prev_tip" HEAD 2>/dev/null || echo ALL)"
+        if printf '%s\n' "$delta" | grep -Eq "$GDN_WIDTH_RE"; then
+            gdn_width_step
+        else
+            say "gdn width: skipped (applied tree touched no GDN conv-fold source; GDN_WIDTH_ALWAYS=1 forces it)"
+        fi
+    fi
+fi
+
 # --- 5. record --------------------------------------------------------------------------------
 # A partial run must NOT mark the rev validated: that would make the next cron pass skip a rev
 # that was never fully gated (hit during the first radiance bring-up).
-if [ "$SKIP_LADDER" = 1 ] || [ "$SKIP_OPTESTS" = 1 ] || [ "$SKIP_KLD" = 1 ] || [ "$SKIP_HC" = 1 ]; then
+if [ "$SKIP_LADDER" = 1 ] || [ "$SKIP_OPTESTS" = 1 ] || [ "$SKIP_KLD" = 1 ] || [ "$SKIP_HC" = 1 ] \
+        || [ "$SKIP_GDN_WIDTH" = 1 ]; then
     say "RESULT   : PASS (a step was skipped, so no up-to-date marker was written -- the next run resumes)"
     log "$short partially validated (summary: $SUMMARY)"
     exit 0

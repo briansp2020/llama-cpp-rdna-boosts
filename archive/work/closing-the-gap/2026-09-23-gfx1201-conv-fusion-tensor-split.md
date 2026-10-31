@@ -105,3 +105,31 @@ Post-fix text hashes (same commands as above):
    numbers measured on 3-GPU `-sm tensor` no longer include the PLE fusion (the GDN half is
    likewise off).  Re-measure the `0004` prefill delta on this box with
    `GGML_CUDA_CONV_FUSION_MULTI=1` to quantify what is being given up.
+
+---
+
+# RESOLVED (r186, 2026-10-31) — the divergence no longer reproduces; the gate is gone
+
+Re-checked on the r186 tree before deciding anything, because three years of releases had landed since.
+
+**The divergence does not reproduce.**  `test-logits-width-probe` at `P=4096`, fused vs
+`GGML_CUDA_DISABLE_CONV_FUSION=1`, is bit-identical (`W8`/row-0 logit hashes) on 8 arms: 27B IQ3_S on
+1 GPU, 2 GPU (`0,2`) tensor, 3 GPU tensor and 3 GPU layer; 35B-A3B Q3_K_M 3 GPU tensor and layer;
+35B-A3B Q4_K_M 3 GPU tensor with `-ncmoe 40`, with and without the expert-cache arena.  The direct
+conv really ran on the shard (`GDN_CONV_DIRECT C=2560` for 3 devices, `C=5120` for 2).  Greedy text,
+MTP Protocol A (text *and* acceptance, both split modes) and a DFlash2 draft arm are identical too,
+and the prefill-logit gate reads 0.000000 / 99.990 %.  Full matrix and throughput:
+`benchmarks/2026-10-31-conv-fusion-multi-device.md`.
+
+**Not root-caused.**  The leading candidate from the analysis above — "a state/snapshot timing or
+view-offset difference that only a sharded graph exposes" — is exactly the code r183 rewrote (the
+snapshot write moved into the conv kernel, and the conv-state gather was deferred into it).  That is
+suggestive, not established, so the reach is empirical.
+
+**Outcome.**  `gdn_conv_enabled()` / `ple_conv_enabled()` no longer test
+`ggml_backend_cuda_get_device_count() <= 1`; `GGML_CUDA_CONV_FUSION_MULTI` is retired and
+`GGML_CUDA_DISABLE_CONV_FUSION` is the A/B arm.  Worth **+5.7 % tg128 / +1.1 % pp2048** on 3 GPU
+`-sm tensor` 27B IQ3_S and **+3.0 % tg128** on 35B-A3B Q4_K_M, and it also brings the r183 GDN decode
+folds to that shape.  Release gate 14 (`MANIFESTS.md`) now runs a **multi-device** arm on every
+release; a future divergence must be gated on the config that shows it, never on a device count.
+Record: `WORKLOG.md` 261031.003 (r186), `patches/README.md` (block 10, "r186").
