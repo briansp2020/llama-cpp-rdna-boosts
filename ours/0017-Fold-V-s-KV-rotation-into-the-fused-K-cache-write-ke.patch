@@ -1,4 +1,4 @@
-From 71499381fc99949fd9a4d67f3db059b63cbaffc0 Mon Sep 17 00:00:00 2001
+From 89429e703beee3ac891a26e09390934248a1aa84 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 06:13:08 +0000
 Subject: [PATCH 17/22] Fold V's KV rotation into the fused K cache-write

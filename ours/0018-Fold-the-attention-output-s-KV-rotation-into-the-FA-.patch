@@ -1,4 +1,4 @@
-From 0d78ca65a6bf1292b24ad13adffb2b952cec662f Mon Sep 17 00:00:00 2001
+From 8fc1a9ed704a4a1f8e1cbf1625d3a6c007a5e38a Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 06:13:08 +0000
 Subject: [PATCH 18/22] Fold the attention output's KV rotation into the FA

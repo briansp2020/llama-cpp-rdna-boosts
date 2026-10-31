@@ -1,4 +1,4 @@
-From 26f9ffa2ef035290383613acff584b10fb76a208 Mon Sep 17 00:00:00 2001
+From 8aa1a5eee9b7e0fb1a9e3d516f5f7d1c50f04331 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 12:41:15 +0000
 Subject: [PATCH 14/22] ours fixes after review: restore the GLU -> Q8_1 mark

@@ -3,8 +3,8 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-6050b467c-r185` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
-`f8eaf8f005b4`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
+**Base:** `v16-6050b467c-r186` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
+`0bd26dbe1951`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
 GDN small-projection gather), r182 took #253 (the 1-token router fold and its RDNA4 gate) and r183 took #256 (the GDN
 decode folds), so they are no longer in this series. 0016-0022 are our open PRs #258, #259 and #260, exactly as posted.
 
@@ -12,11 +12,11 @@ decode folds), so they are no longer in this series. 0016-0022 are our open PRs 
 
 ```
 git checkout 6050b467c
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r185 release, branch rdna-boosts
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r186 release, branch rdna-boosts
 git am <path-to-this-repo>/ours/*.patch              # 22 patches
 ```
 
-Result: tree `d75f9e27bd93`.
+Result: tree `61c9c0363951`.
 
 ## Patches
 
@@ -39,6 +39,12 @@ The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`
 `GGML_CUDA_FUSE_GDN_CONV_DECODE=0`, `GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0`.
 
 ## Validation (2026-10-31, Radeon AI PRO R9700, 1 GPU)
+
+r186 changes only `gdn-conv.cu` and `ple-conv.cu` (the conv fusion runs on every device count), which no patch in this series
+touches; the rebase reproduces the three-way merge tree exactly. Checked on r186: server replies on Qwen3.6-35B-A3B (also with
+`-ctk q8_0 -ctv q8_0`), Qwen3.8-27B, Qwen3.8-27B NVFP4-MTP (plain and MTP `--spec-draft-n-max 3`) and Qwen3.5-4B are
+byte-identical to r186 and to the r185 run below; test-backend-ops SSM_CONV 60 / 60; our production model unchanged, no
+faults. The r185 run:
 
 r185 vs r185 + this series, no env on either side, `ROCBLAS_USE_HIPBLASLT=0`. r184 -> r185 changes only `common/speculative.cpp`
 (the verify width bound); the rebase reproduces the three-way merge tree exactly, and 0016-0022 apply without conflicts and are

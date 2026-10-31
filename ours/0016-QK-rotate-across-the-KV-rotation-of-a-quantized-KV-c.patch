@@ -1,4 +1,4 @@
-From 4790d7fe615b94c54b1c2e0b6136d3567b5f6193 Mon Sep 17 00:00:00 2001
+From 4f8698f6ed0ad1f5ae06136bdf9c987160ab51cc Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 06:13:08 +0000
 Subject: [PATCH 16/22] QK rotate across the KV rotation of a quantized KV

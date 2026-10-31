@@ -1,4 +1,4 @@
-From ff6855549e86a2528dea429d12ae7c7af69c8bc2 Mon Sep 17 00:00:00 2001
+From 7712c88739f2de27ec793d2b7ff16803bbc29009 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 16:42:58 +0000
 Subject: [PATCH 09/22] ggml-cpu: split a large GET_ROWS over the threads

@@ -1,4 +1,4 @@
-From 1c5efd85b9a9f215af55949bbd015e66cab24e97 Mon Sep 17 00:00:00 2001
+From 6e9db39a64047b6e70d3f4090b8a5d3d6f569b17 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 06:38:31 +0000
 Subject: [PATCH 20/22] Rope + KV rotation in one launch for models without Q /

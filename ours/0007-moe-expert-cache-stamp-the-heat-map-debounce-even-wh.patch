@@ -1,4 +1,4 @@
-From 46237648f6b438e09ce7a28cda0ebd32e913ec43 Mon Sep 17 00:00:00 2001
+From 8125ec4d0a3e0b9fb585dca7ea9a4e72ffed8156 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 12:56:10 +0000
 Subject: [PATCH 07/22] moe-expert-cache: stamp the heat-map debounce even when

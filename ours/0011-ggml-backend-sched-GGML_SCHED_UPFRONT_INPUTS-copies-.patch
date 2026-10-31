@@ -1,4 +1,4 @@
-From 64cf04a1841c34edb544b1c41e35fd2c74fa60b6 Mon Sep 17 00:00:00 2001
+From cbd9583dab6338861e58f23c787e6ab233f4d969 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 26 Oct 2026 08:17:21 +0000
 Subject: [PATCH 11/22] ggml-backend sched: GGML_SCHED_UPFRONT_INPUTS copies

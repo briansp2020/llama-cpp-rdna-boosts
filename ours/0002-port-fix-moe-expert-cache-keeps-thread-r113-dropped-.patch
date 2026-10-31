@@ -1,4 +1,4 @@
-From 37f616417f325d35df188d0fd351eed0be84b84d Mon Sep 17 00:00:00 2001
+From 1aba3357f0738e9b4741ebeeda6b7d5779a8286e Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 22 Oct 2026 23:30:11 +0000
 Subject: [PATCH 02/22] port fix: moe-expert-cache keeps <thread> (r113 dropped
