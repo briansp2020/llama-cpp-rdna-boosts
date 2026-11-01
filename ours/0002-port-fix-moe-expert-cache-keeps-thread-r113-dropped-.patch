@@ -1,7 +1,7 @@
-From 6f564e86723decdd361bcf27213ef4041c4d8e99 Mon Sep 17 00:00:00 2001
+From 23bfaba8416753e4c991a387425a9874e56aa7ed Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 22 Oct 2026 23:30:11 +0000
-Subject: [PATCH 02/21] port fix: moe-expert-cache keeps <thread> (r113 dropped
+Subject: [PATCH 02/22] port fix: moe-expert-cache keeps <thread> (r113 dropped
  it with its background worker; the sparse registration uses std::thread)
 
 (cherry picked from commit 13483e8f57d77eeb233597708903ab9de9ede568)
@@ -10,7 +10,7 @@ Subject: [PATCH 02/21] port fix: moe-expert-cache keeps <thread> (r113 dropped
  1 file changed, 1 insertion(+)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index f89b8d6d0..cf9623eb6 100644
+index 1138ff84e..55f41b6d6 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -31,6 +31,7 @@

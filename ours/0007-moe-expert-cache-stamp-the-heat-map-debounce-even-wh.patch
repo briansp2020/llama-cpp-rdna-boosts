@@ -1,7 +1,7 @@
-From 7036f7721ec6de87925e535512cd4b4193bb12e3 Mon Sep 17 00:00:00 2001
+From edbe66cf15c48629989b9cf437f55386d91e17f6 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 12:56:10 +0000
-Subject: [PATCH 07/21] moe-expert-cache: stamp the heat-map debounce even when
+Subject: [PATCH 07/22] moe-expert-cache: stamp the heat-map debounce even when
  the save writes nothing
 
 With no map path (--host-experts mmap never opens one) or a frozen map,
@@ -18,10 +18,10 @@ exit report) pull it themselves.
  1 file changed, 3 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 92ef86246..322a35762 100644
+index 4cbebf886..17e3b71f4 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -5167,6 +5167,9 @@ bool moe_cache_get_stats(int64_t * hits, int64_t * misses, int64_t * arena_bytes
+@@ -5170,6 +5170,9 @@ bool moe_cache_get_stats(int64_t * hits, int64_t * misses, int64_t * arena_bytes
              g_heat_debounce_s) {
              heat_pull_locked();
              heat_map_save_locked();

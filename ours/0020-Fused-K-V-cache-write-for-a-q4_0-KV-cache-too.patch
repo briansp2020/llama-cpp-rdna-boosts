@@ -1,7 +1,7 @@
-From 9097079d5a4286cc82cbb2401d721c06e5faaf32 Mon Sep 17 00:00:00 2001
+From 74ad46b2cececa16e7095fe579e51ccde7be522a Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 18:30:22 +0000
-Subject: [PATCH 20/21] Fused K / V cache write for a q4_0 KV cache too
+Subject: [PATCH 20/22] Fused K / V cache write for a q4_0 KV cache too
 
 The rope + FWHT kernels that write the rotated K row (and the V row) straight into the KV cache
 (rms_norm_mul_rope_f32 kv, the Q / K pair, the rope-only form) quantized only to q8_0, so a q4_0 cache kept

@@ -1,7 +1,7 @@
-From 9c7beb664fc20018a758c78f56c010eca69c4998 Mon Sep 17 00:00:00 2001
+From 71bc1049391f11de809aa6af31f2379095662a9b Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 26 Oct 2026 09:00:06 +0000
-Subject: [PATCH 12/21] sched upfront inputs: per-scheduler flag; llama enables
+Subject: [PATCH 12/22] sched upfront inputs: per-scheduler flag; llama enables
  it for ubatches <= LLAMA_SCHED_UPFRONT_MAX_TOKENS (16)
 
 (cherry picked from commit f201937387f6822278a5f1baa74b126dfa114ca7)
@@ -92,10 +92,10 @@ index c76f7cf91..d9c687bb4 100644
      GGML_ASSERT(sched);
      sched->callback_eval = callback;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6959bc360..bf9a4f79c 100644
+index dbbffb8a6..ab6415bc8 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -2764,6 +2764,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2765,6 +2765,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
  
          ggml_backend_sched_reset(sched.get());
          ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -111,7 +111,7 @@ index 6959bc360..bf9a4f79c 100644
  
          //const auto t_start_us = ggml_time_us();
  
-@@ -4380,6 +4389,7 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -4381,6 +4390,7 @@ ggml_cgraph * llama_context::graph_reserve(
      }
  
      ggml_backend_sched_reset(sched.get());

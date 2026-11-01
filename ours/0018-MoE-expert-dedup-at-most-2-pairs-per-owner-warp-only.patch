@@ -1,7 +1,7 @@
-From fd317e779df16defa1d9f59f87a21370d9237595 Mon Sep 17 00:00:00 2001
+From b979d6d8e8912d45f5c1f7b9ff8a5a913a3a8020 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 15:32:19 +0000
-Subject: [PATCH 18/21] MoE expert dedup: at most 2 pairs per owner warp, only
+Subject: [PATCH 18/22] MoE expert dedup: at most 2 pairs per owner warp, only
  the owner's activation loaded ahead
 
 A group of more than GGML_CUDA_MOE_DDK (2) pairs is split into chunks, each computed by its first pair.  Cuts the dedup

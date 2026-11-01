@@ -1,7 +1,7 @@
-From 1ba218fd716df7e2369ec008ade9f6cecb60fc63 Mon Sep 17 00:00:00 2001
+From 80ee0828835579d20c08c9684d08d630ce3fc7fc Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 20:31:47 +0000
-Subject: [PATCH 21/21] ours: dedup the mmap expert-cache helpers and drop a
+Subject: [PATCH 21/22] ours: dedup the mmap expert-cache helpers and drop a
  no-op (no behaviour change)
 
 - moe_cache_expert_copy: one inlined copy body for the one-fill, stage and route kernels
@@ -19,10 +19,10 @@ Prod model (1 R9700, prod config): greedy a266d1025664, 259.6k needle correct; q
  2 files changed, 122 insertions(+), 182 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 526c7058b..c47ab57b1 100644
+index bbbcc1588..00e33f786 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2028,6 +2028,30 @@ static char * ggml_cuda_pin_chunk(int device, std::unique_lock<std::mutex> & loc
+@@ -2034,6 +2034,30 @@ static char * ggml_cuda_pin_chunk(int device, std::unique_lock<std::mutex> & loc
  // Only a pageable host pointer bounces: a pinned one (e.g. a CUDA_Host graph input) already copies at full speed, so
  // the extra memcpy would be pure overhead.  If the chunk cannot be allocated the copy stays direct.
  // GGML_CUDA_BOUNCE_MIN sets the threshold in bytes (default 1 = every size, 0 or an unparsable value = off).
@@ -53,7 +53,7 @@ index 526c7058b..c47ab57b1 100644
  static size_t ggml_cuda_bounce_min() {
      static const size_t v = [] {
          const char * e = getenv("GGML_CUDA_BOUNCE_MIN");
-@@ -2165,25 +2189,8 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+@@ -2171,25 +2195,8 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
          std::unique_lock<std::mutex> lock;
          char * chunk = size <= chunk_cap ? ggml_cuda_pin_chunk(ctx->device, lock) : nullptr;
          if (chunk != nullptr) {   // no chunk (allocation failed): the per-call buffer below, as before
@@ -81,7 +81,7 @@ index 526c7058b..c47ab57b1 100644
              return;
          }
          if (lock.owns_lock()) {
-@@ -6010,24 +6017,8 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+@@ -6434,24 +6441,8 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
                  std::unique_lock<std::mutex> lock;
                  char * pin = ggml_cuda_pin_chunk(cuda_ctx->device, lock);
                  GGML_ASSERT(pin != nullptr && "cannot allocate the pinned staging chunk");
@@ -109,7 +109,7 @@ index 526c7058b..c47ab57b1 100644
              }
              CUDA_CHECK(s.buf != nullptr ? hipSuccess : hipErrorOutOfMemory);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index f73649be5..7c046a267 100644
+index cb0a5f182..189d93589 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1131,12 +1131,6 @@ static bool sparse_need_all_locked(table_t & t) {
@@ -324,7 +324,7 @@ index f73649be5..7c046a267 100644
              if (err != cudaSuccess) {
                  (void) cudaGetLastError();
                  ok = false;
-@@ -7655,6 +7634,39 @@ static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok,
+@@ -7658,6 +7637,39 @@ static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok,
  }
  
  // Steps 1 and 2 of a take-over for one table (allocation, the one-call-late policy, the map upload).  False: decline.
@@ -364,7 +364,7 @@ index f73649be5..7c046a267 100644
  static bool devremap_prep_locked(table_t & t, void * stream) {
      if (t.dr_device < 0 && !devremap_alloc_locked(t)) {
          return false;
-@@ -7689,34 +7701,8 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+@@ -7692,34 +7704,8 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
      }
  
      // 2. The device map, re-uploaded only after a residency change.
@@ -401,7 +401,7 @@ index f73649be5..7c046a267 100644
  }
  
  // Prefill in place: see table_t::pf_pending.  The device expert -> slot map (the decode remap's) tells the routed-compact
-@@ -7780,22 +7766,8 @@ static bool prefill_inplace_prepare_locked(table_t & t, const ggml_tensor * weig
+@@ -7783,22 +7769,8 @@ static bool prefill_inplace_prepare_locked(table_t & t, const ggml_tensor * weig
      uint8_t *     cold = t.route_pack.data() + n * (sizeof(void *) + sizeof(int32_t));
      int k = 0;
      const auto add = [&](int32_t e) -> bool {
@@ -426,7 +426,7 @@ index f73649be5..7c046a267 100644
          }
          eids[k++] = e;
          return true;
-@@ -7822,30 +7794,8 @@ static bool prefill_inplace_prepare_locked(table_t & t, const ggml_tensor * weig
+@@ -7825,30 +7797,8 @@ static bool prefill_inplace_prepare_locked(table_t & t, const ggml_tensor * weig
      device_guard dg(t.device);
      // the map the kernel reads: current residency (re-uploaded only after a change; decline while the previous upload
      // still reads the staging buffer)
@@ -459,7 +459,7 @@ index f73649be5..7c046a267 100644
      }
      if (k > 0) {
          if (t.route_dev == nullptr && cudaMalloc(&t.route_dev, t.route_pack.size()) != cudaSuccess) {
-@@ -8338,7 +8288,6 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+@@ -8341,7 +8291,6 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
          if (t.arena != arena || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe || t.n_slices > 0) {
              continue;
          }

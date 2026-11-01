@@ -1,7 +1,7 @@
-From 066c3ccbbab8eca3f07d1d048a81c887b5a0f64a Mon Sep 17 00:00:00 2001
+From 9f2aab39ab869fd240ac5a88f1254ed446b48642 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 22 Oct 2026 22:26:23 +0000
-Subject: [PATCH 03/21] port fix: r111 pool-backed staging/upload paths apply
+Subject: [PATCH 03/22] port fix: r111 pool-backed staging/upload paths apply
  only in --host-experts pool (table_pool_backed); a sparse mmap table declines
  the 10-arg staging as in r109
 
@@ -11,7 +11,7 @@ Subject: [PATCH 03/21] port fix: r111 pool-backed staging/upload paths apply
  1 file changed, 12 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index cf9623eb6..92ef86246 100644
+index 55f41b6d6..4cbebf886 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1383,6 +1383,12 @@ static inline bool table_master_pageable(const table_t & t) {
@@ -27,7 +27,7 @@ index cf9623eb6..92ef86246 100644
  // Human-readable cache budget for the log lines: "auto" when MOE_EXPERT_CACHE_MIB was unset (each
  // device is sized from its free VRAM at `alloc_all_locked`), otherwise the requested MiB/device.
  static const char * budget_desc() {
-@@ -6590,7 +6596,7 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
+@@ -6593,7 +6599,7 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
      std::lock_guard<std::mutex> lock(g_mutex);
      const char * s = (const char *) src_host;
      for (table_t & t : g_tables) {
@@ -36,7 +36,7 @@ index cf9623eb6..92ef86246 100644
              continue;
          }
          const char * base = (const char *) t.host;
-@@ -6673,7 +6679,7 @@ bool moe_cache_source_pageable(const void * p) {
+@@ -6676,7 +6682,7 @@ bool moe_cache_source_pageable(const void * p) {
      std::lock_guard<std::mutex> lock(g_mutex);
      const char * c = (const char *) p;
      for (const table_t & t : g_tables) {
@@ -45,7 +45,7 @@ index cf9623eb6..92ef86246 100644
              continue;
          }
          const char * b = (const char *) t.host;
-@@ -6833,11 +6839,12 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -6836,11 +6842,12 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
          // master.  A POOL-BACKED master needs neither: it is filled expert by expert from the pinned pool
          // (or the per-table bounce), so it also serves the pre-sizing prefill (the whole point -- a
          // pageable master must never reach the ring through the pageable upload).
@@ -60,7 +60,7 @@ index cf9623eb6..92ef86246 100644
              return false;
          }
          const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
-@@ -6875,7 +6882,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -6878,7 +6885,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
          // `<= -2` pool slot `-v-2`, `-1` in neither), so the kernel needs no extra bookkeeping; the experts
          // in NEITHER tier are still copied here, one at a time, because each of those is a distinct read
          // from the mapping/disk.

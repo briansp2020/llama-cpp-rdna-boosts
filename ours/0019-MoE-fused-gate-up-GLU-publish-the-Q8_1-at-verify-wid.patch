@@ -1,7 +1,7 @@
-From 258065cdc7334fe4b52285c1c386b5e1da7a34a9 Mon Sep 17 00:00:00 2001
+From 2d350db1d41d42803eb3a464363bd8574e42adde Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 17:11:33 +0000
-Subject: [PATCH 19/21] MoE fused gate/up+GLU: publish the Q8_1 at verify
+Subject: [PATCH 19/22] MoE fused gate/up+GLU: publish the Q8_1 at verify
  widths (2-8 tokens) too, per pair under the expert dedup
 
 Each token warp of the fused gate/up+GLU kernel publishes its own rows, routed and shared lanes, at the row index
@@ -161,10 +161,10 @@ index 9a25ca23d..1b6daf62d 100644
          constexpr int  RPB   = decltype(rpb_c)::value;
          constexpr bool CFUSE = decltype(fusion_c)::value;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index ce7142e91..fec107dd2 100644
+index cd56b38c5..96e412be0 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -2196,33 +2196,38 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1846,33 +1846,38 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;

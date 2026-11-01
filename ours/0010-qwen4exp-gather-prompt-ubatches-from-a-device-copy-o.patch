@@ -1,7 +1,7 @@
-From f9223ada10e13d3914154cd226643abf50682f6d Mon Sep 17 00:00:00 2001
+From 5cef305dd642a9d02e3c26ccb1a57fe4a1b26255 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 18:04:11 +0000
-Subject: [PATCH 10/21] qwen4exp: gather prompt ubatches from a device copy of
+Subject: [PATCH 10/22] qwen4exp: gather prompt ubatches from a device copy of
  the token embedding
 
 The token embedding lives in host memory, so every graph starts with a
@@ -52,10 +52,10 @@ index 9bbd1f4c4..1bcf14a86 100644
      ~llama_model_qwen4exp() override {
          if (lazy_reader) {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 47ff49f75..6065f7702 100644
+index af78c104c..c5f004b9a 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -511,6 +511,14 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+@@ -539,6 +539,14 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
      }
  }
  
@@ -70,7 +70,7 @@ index 47ff49f75..6065f7702 100644
  void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
      LLAMA_LOAD_LOCALS;
  
-@@ -523,6 +531,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -551,6 +559,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
      const int  mtp_flags   = nf.mtp;
  
      tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
@@ -84,7 +84,7 @@ index 47ff49f75..6065f7702 100644
  
      // there is no output_norm: the final hyper-connection mixer carries it
      // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
-@@ -987,7 +1002,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -1015,7 +1030,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
          ggml_build_forward_expand(gf, ple_emb);
      }
  
