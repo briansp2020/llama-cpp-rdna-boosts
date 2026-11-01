@@ -11,20 +11,25 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
+**Renumbered 2026-10-31 (docs-only).**  The r187-r189 sessions allocated `#190`-`#196` (and `#218`) as if the
+sequence had advanced past a run of closed items, but `#119` was the last handle ever allocated and `#120`-`#189`
+were never used.  They are **`#120`-`#126`** now (plus `#127` for the `cpy_2d_vec16` limitation), so the sequence
+is contiguous.  The r187-r190 **commit messages** (immutable) still cite the old handles; they mean these rows.
+The old numbers are **retired** — do not reuse them.
+
 **Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v16-6050b467c-r187`**.  `release.json` is the source of truth for the
+(the 2026-10-25 re-base), release **`v16-6050b467c-r196`**.  Block 15 is the **streamed KV** (the resident
+window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 
 | # | subject | kind | status |
 |---|---|---|---|
-| **118** | windowed KV cache ("Strata-style"): a **fixed VRAM window** instead of `O(-c)`, so (A) a 27B Q8_0 or 35B-A3B Q6_K can run a large context on one 32 GiB card instead of OOM, and slab mode gets the freed VRAM for the decode arena; (B) a sparse attended set (QSA/DSA) streams cheaply; (C) the drafter ring (campaign `wip/kv-residency/`) | performance / memory | **OPEN — the ask is Goal A, order A -> B/C. `O2-PLAN.md` is the plan of record; `A2-MIXED-BACKING.md` is the state of the build.**  **Goal A's A2 (mixed backing: one VA range, the KV's leading cells in pinned system RAM) is BUILT AND MEASURED** on fork branch `wip-kv-residency`: the 27B Q8_0 `-c 262144` OOM config runs (8160 MiB RAM + 544 MiB VRAM), the spill cost matches `(used − resident)/28.8 GB/s` to ~3 % (18.7 / 13.6 / 10.8 t/s at 51 475 tokens), and at 35B-A3B **Q8_0** the arena gains 2.62 GiB with host-expert residency 63.3 % → 77.0 %.  **The SLIDING window is also in** (the newest W *used* cells stay resident): 27B Q8_0 `-c 262144` runs at 18.6 t/s at 51 475 tokens = the fully-resident reference, and at `-n 2000` the arena gain is +7.9 % / +10.1 % decode on 122B-A10B (residency 29.3 → 34.0 %, and 15.6 → 21.5 % at `-ncmoe 40`) with prefill +8.6 % / +13.1 % (Flash-Next).  **Remaining before it is a product:** ~~`--fit` sizing + reporting~~, ~~both state gates~~, ~~the `MemAvailable` gate~~ are DONE (A3).  **A4 (2026-10-30) CLOSED THE PURITY BLOCKER**: a spilled KV is now numerically transparent — the fault was the VMM primitive, not the KV (a `cuMemUnmap` of a device mapping makes the following `cuMemCreate`(HOST)/`cuMemMap` ZERO a live host-location mapping in the same reservation), fixed by a hold taken in `vmm_map` (`LLAMA_KV_REGION_QUARANTINE`, default on, `=0` = the A/B arm that reproduces the bug).  Measured on a SPILLING arm: prefill-logit KLD −0.000000 / 100.000 % (block was 0.004973 / 98.761 %), 27B and 4B text back to the plain hash, and the spill's cost is a straight line — ~61 GB/s effective, ≈3.6 ms/token per 256 MiB (no cliff; the window apparatus is free).  **GOAL A IS PROMOTED: block 15 in r178 (`v16-6050b467c-r178`).**  The window is **opt-in** (`LLAMA_KV_RESIDENT_CELLS=<cells>|auto`); with the knob unset the KV takes the plain device buffer and the run is byte-identical to a build without it, including its OOM.  Promoted as-is except for two shape changes: the region buffer is taken **only** when a window is active (the campaign's O1 fallback — fully-resident, lazily committed — is not shipped, because on a slab-armed MoE config it `GGML_ABORT`s where the plain arm completes), and the provider is on by default with `LLAMA_KV_REGION=0` as the kill switch.  A1 (the superseded two-base FA read) and Goal C (the drafter ring) are **not** in the block.  Records: `patches/0000`…`0015` block 15 + `wip/kv-residency/A2-MIXED-BACKING.md` §3.7.11.  **A5 (2026-10-30) did the §7.2 list and found two more bugs, both fixed:** the state gates and the MTP verify widths pass on arms that provably spill; the Flash-Next/QSA spilling arm is pure (text byte-identical, prefill-logit −0.000000 / 99.994 %, `FLASH_ATTN_QSA` 26/26) after `0013` (a windowed region's tensors were not placed on the driver's map granularity, so the second tensor's first slide was refused and the process aborted) and `0014` (an idle-slot park on a region-backed KV faulted the GPU, so such a cache now declines parking and the server uses its save-and-clear fallback, byte-identical to the parking gate's oracle).  The arena half is measured at the 55.7 GB/s link: **+2.2 to +2.9 GiB of arena (+3.9 to +6.7 points of residency)** whichever way the window is sized, free when `W` is at or above the run's depth (122B-A10B +3.8 % decode / +4.7 % prefill), 11-26 % lost when it is 35 k cells below it; `--fit`'s `auto` ordering (weights → arena reserve → `W` from the residue, capped at `-c`) is the settled policy and `W` stays a cell count.  **r181 (2026-10-30) fixed a crash the single-GPU box could not see**: default `--fit` aborted on EVERY
-  multi-device `-sm tensor` run (the block-15 KV probes look up the backend reg of the Meta wrapper, which has
-  none), and a decided `auto` "no window" was reported as "--fit did not run".  The window is now declined
-  on a tensor split with a message (it is one VMM region per device) and `auto`'s decision reaches the cache
-  as a decision; three `auto` wiring fixes came with it.  **Still open in the campaign: Goal B** (a sparse attended set streamed cheaply — plan + B0/B1 measured, 2026-10-30; B2 implemented, B-A designed (spec in wip/kv-residency/BA-POOL-DESIGN.md)) **and Goal C** (the drafter ring, implemented and measured but not promoted; three questions for the maintainer in `O3-DRAFTER-RING.md` §7), the parking gate's save-and-clear fallback is now graded (A6; the fix is verified and **awaits the maintainer's commit approval** — it used to count the region refusal warning as a park), and a window across a `-sm tensor` split is **designed, not built** (`wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`: five changes plus four `common/fit.cpp` findings an implementation must honour; the arms need a 2/3-device host).  Records: `wip/kv-residency/A2-MIXED-BACKING.md`, cold start `wip/kv-residency/HANDOVER.md`.
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
-
-| **190** | the r187 quantized-KV decode fusions (`GGML_CUDA_QK_ROTATE_HADAMARD`, `GGML_CUDA_FUSE_V_FWHT`, `GGML_CUDA_FA_COMBINE_FWHT`, `GGML_CUDA_QK_PAIR_FWHT`, `GGML_CUDA_FUSE_ROPE_FWHT`) key on the K/V cache `SET_ROWS` being **`GGML_TYPE_Q8_0`**, because that is the quantizer the fused kernels reproduce; `-ctk/-ctv q4_0`, `q5_0`, `iq4_nl` and `bf16` keep their separate launches | parked idea (scope) | **OPEN — not started.**  The win is `q8_0`-only by construction; each further type needs its own fused write kernel (`k_set_rows_<type>_group`'s lane->element map and rounding reproduced in the K kernel / the V rotation) plus the matching `is_row_write` predicate.  No measurement yet; the `q8_0` arm is worth +13.4 % tg128 / +10.1 % @4096 on Qwen3-30B-A3B (gfx1201) and it is that type's own quantize traffic that pays.  Reach: any GGUF whose KV is quantized to `q4_0`-class (`-ctk q4_0 -ctv q4_0` is the common small-memory pairing on 16 GiB cards), so it is worth doing before the next re-base, not after.  Record: `WORKLOG.md` 261031.005, `benchmarks/2026-10-31-kv-rotation-decode.md` |
+| **120** | the r187 quantized-KV decode fusions (`GGML_CUDA_QK_ROTATE_HADAMARD`, `GGML_CUDA_FUSE_V_FWHT`, `GGML_CUDA_FA_COMBINE_FWHT`, `GGML_CUDA_QK_PAIR_FWHT`, `GGML_CUDA_FUSE_ROPE_FWHT`) key on the K/V cache `SET_ROWS` being **`GGML_TYPE_Q8_0`**, because that is the quantizer the fused kernels reproduce; `-ctk/-ctv q4_0`, `q5_0`, `iq4_nl` and `bf16` keep their separate launches | parked idea (scope) | **OPEN — `q4_0` IS DONE, ASSESSED AND RETURNED TO THE SUBMITTER (PR #262).**  PR #262 (r192 session) adds `q4_0` via `ggml_cuda_quantize_q4_0_group` and is **correct and beneficial**: **+11.8 %** tg128 / **+11.4 %** @4096 on gfx1100 (30B-A3B `q4_0` KV) and **+2.6 % / +2.5 %** on gfx1151, `--kv q4_0 --ub 1` A/B `-0.000000 KLD / 100.000 %`, census 6346 -> 4618 (= the `q8_0` count).  It is **not shipped** because on gfx1201 the same tree costs **5-7 % of MTP decode** (dense 27B, `draft-mtp`) **with the fold's kill switch off**, an identical kernel/graph census and identical text/acceptance, each half of the patch alone inert and fast, and a code-layout probe not moving it; an arch gate (RDNA3 family only) makes the fold inert on RDNA4 and **the MTP cost stays**, so it follows the compiled code.  Needs: a gfx1201 MTP repro/bisect from the submitter, then re-land with the gate `ggml_cuda_kv_fold_type_ok` on `RDNA3_0`/`RDNA3_5`.  Full evidence: `benchmarks/2026-10-31-kv-fold-q4_0-assessment.md`.  Remaining scope: `q5_0` has the same shape as `q4_0` (vmax/-16 + high bits), `iq4_nl` searches its scale (a separate piece of work), `bf16` has no fused write kernel |
+| **122** | **Goal A `auto` policy — the arena-vs-window trade** (`wip/kv-residency/A2-MIXED-BACKING.md` §3.7.11.4 A-C, block 15's `LLAMA_KV_RESIDENT_CELLS=auto`) | decision | **DECIDED 2026-10-31 (maintainer): P1 — fittability only — ships, P2 (unconditional arena-first) is rejected, P3 (an explicit spill budget) is not promoted until it is measured to be a better default.**  `auto` therefore keeps sizing a window only when the KV does not fit at the pinned `-c`, and the arena keeps winning the VRAM through `margins[0]`; the reason is that a fit cannot know the run's depth and a `W` below it costs 11-26 % (A2 §3.7.11.4 A/B).  Owed: one line in block 15's note (`patches/README.md`) stating that P1 is the recommendation and that the arena half needs a numeric `W` |
+| **124** | **Goal A across `-sm tensor`** (`wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`): a windowed KV on a tensor split needs per-device region bufts wrapped in a split buft plus a fit that sizes them together | memory | **OPEN — designed only, hardware-blocked here** (one 32 GiB card).  Blocks 15 and 16 both decline `-sm tensor` with one message; the refusals are the r181 crash fix, so do not remove them without the arm |
+| **128** | **a decode-module change costs ~7 % of MTP decode on gfx1201 while being behaviourally inert** (r192 session, found while assessing PRs #260/#262): on 3x R9700, dense 27B UD-Q4_K_XL `--spec-type draft-mtp` reads 76.2 -> 70.7 t/s (1 GPU) / 133.4 -> 126.4 (3 GPU `-sm tensor`) with **either** patch in the tree, with an identical kernel census (6598 kernels, same names/counts/VGPRs), graph census (`direct=4410 replay=22086 capture=810 properties_changed=825`, `graphs reused=54`), compute buffers, text and MTP acceptance, with the fold's kill switch off, with `GGML_CUDA_DISABLE_GRAPHS=1`, and on the speculator arm only (plain decode is flat at d0/8k/65k and `--spec-type none` is identical) | investigation / measurement | **OPEN — it blocks decode-module changes on gfx1201 until it is named; it does NOT affect any shipped release.**  The shipped r191 tree is the *fast* arm in every measurement above (76.2 / 133.4) and a rebuild of it is bit-identical, so no consumer is 7 % down today — the cost appears only when such a change is added, which is why r192 was not tagged.  `gfx1100` and `gfx1151` are **flat for both** patches (7900 XTX: 89.1 vs 89.1; Strix Halo: 98.4 vs 98.1), so it is not either patch's logic — it is this box + driver, the same class as the documented gfx1201 launch-time pathology (ROCm/legacy-rocm-build#6689, `GGML_CUDA_GRID_STALL_PAD`).  Ruled out: the q4_0 quantizer (cost persists with the switch off), the runtime path (an RDNA3-only arch gate makes the fold inert on gfx1201 and the cost stays), graphs, the KV type, plain decode, a random code-layout perturbation (a `noinline, used` helper on the unpatched tree is free), and each *half* of PR #262 on its own (both fast, the union slow).  `GGML_CUDA_GCDBG=1` shows `ev_rest` +8.7 % with `fuse` 85.5 -> 108.0 ms and `fwd` 162.6 -> 207.1 ms; `/usr/bin/time` +0.47 ms/token user against +0.52 ms/token wall.  Next: a per-node/per-kernel census of the MTP step (the profiler's per-kernel totals move by more than the sum of their parts, so the instrument itself may be the key), then a driver-level check (7.14 vs 10.1 on the same tree) — and if it is the driver, a launch-geometry workaround in the same spirit as `GGML_CUDA_GRID_STALL_PAD`.  Evidence: ~~PR #260~~/PR #262 are returned to the submitter with the full evidence and the exact reproducer steps (GitHub comments, 2026-10-31) — reproducing the MTP delta on their RDNA4 card (or its failure to reproduce) is the next datum either way.  `benchmarks/2026-10-31-kv-fold-q4_0-assessment.md`, `WORKLOG.md` 261031.013 |
+| **129** | **`-nkvo` with host experts aborts during warmup**: `-ncmoe 48` + `-nkvo` on qwen4exp aborts in `ggml_backend_sched_copy_input` with `GGML_ASSERT(id >= 0 && id < n_expert)` (`ggml-backend.cpp:2920`, the expert-cache fallback path's host ids read) | correctness (pre-existing) | **OPEN — pre-existing, not a block-15 defect.**  Found while exercising the attention pool (r194): it reproduces with `LLAMA_KV_REGION_POOL=0`, with `--spec-type none`, and on the released **r191** binary, so it predates the pool and Goal C.  A dense model with `-nkvo` is fine (the campaign measured the 4B that way); the combination with host experts is what fails.  Needs its own session: reproduce with a small MoE, read the ids tensor's buffer/backend in that path, and gate it with a text arm against `-nkv` |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -84,6 +89,16 @@ if it ever gets there: a new weight type + kernels + loader + converter is a **l
 call.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
+
+* **`cpy_2d_vec16` covers F32 only** (r189, `TODO` **#127**).  The vectorised fallback for the 2-D block copies
+  r183's guard refuses is restricted to two **F32** tensors with 16-B-aligned width and pitches — the reachable
+  case (qwen4exp's indexer key cache, which is F32 by construction).  Every other type and every unaligned
+  geometry keeps `cpy_scalar`, which is bit-identical but element-per-thread.  Nothing in the delivery reaches a
+  padded block copy of another type today (the census in `benchmarks/2026-10-31-cpy-2d-vec16.md` is F32-only), so
+  this is a "extend it if a BF16/F16 copy shows up" note rather than work: the same 16-B unit is four whole floats
+  but only **eight** halves, so a wider version needs its own alignment rule and its own oracle.  Re-check it when
+  the KV campaign's sparse/pool arm is promoted (that arm is where the copy is made per *decode* step).
+
 
 * **A verify step whose slot cannot draft at all still splits into two ubatches** (TODO #111, investigated and
   declined 2026-10-28).  A slot with `get_n_draft_max() <= 0` -- its last token of the response, or a full
@@ -233,6 +248,10 @@ call.
 
 ## Where the current lists live
 
+- **The KV-residency campaign (Goals A, B and C shipped as block 15; the campaign itself is still OPEN for
+  `TODO` #123-#125, `#122` decided):** `wip/kv-residency/` (`README.md`, `O3-DRAFTER-RING.md`, `HANDOVER.md`
+  §12.4, `BA-POOL-DESIGN.md`); the delivery records are `WORKLOG.md` 261031.007-261031.009 and 261031.014 (`#121`
+  closed: the MTP draft window, r193).
 
 - **Open campaigns and scoping notes:** [`wip/CAMPAIGNS.md`](wip/CAMPAIGNS.md) (the index for `wip/`).
 - **Closed campaigns, with their evidence:** `archive/work/<campaign>/` (`RESOLUTION.md` where the campaign
@@ -247,97 +266,5 @@ call.
 - **Purity/invariant analysis and the instrument rules:** `GREEDY-PURITY.md`.
 - **Benchmarks + gates:** `benchmarks/` (the adaptive-MTP baseline gate: `mtp-adaptive-methodology.md`).
 - **Upstream PR candidates:** `upstream/README.md`.
-
----
-
-## 118. Windowed / streamed KV cache — scope decision 2026-10-29 (campaign `wip/kv-residency/`)
-
-**Number note (2026-10-29).**  The campaign's records cited "TODO #117" for three sessions, but `TODO.md`
-never had a `#117` row — the reference was dangling.  Item **117** was then allocated to the separate MoE
-band-predicate finding in a concurrent session and **closed in r176**, so the campaign takes the next free
-handle, **#118**.
-Old `wip/kv-residency/` text (and the patches' commit messages) still say #117; they mean this item.
-
-**The ask was, and is, a Strata-style windowed KV cache: the KV's VRAM footprint is a *fixed window*
-(host master + residency page table + in-graph resolve), so a large `-c` no longer costs VRAM that the
-expert arena could use.**  That is the campaign's **O2** (`wip/kv-residency/README.md`, cost XL).
-
-**O1 (`--kv-grow`: reserve the KV's VA, map physical lazily) is PARKED.**  It was proposed by the seeding
-session as "the cheap win, do it first" (`README.md` line 43) and slice 2 (the KV region buffer type) was
-built on that basis.  It is **not a step toward O2** — O2's provider is a *fully mapped fixed pool* plus a
-host master and a page table, which lazy growth does not help — and it was measured to regress a config that
-uses most of `-c` on a slab-armed MoE model (35B-A3B `-ncmoe 24 -c 262144` at 253k tokens: region off
-completes, region on refuses at 41k cells because `SLAB_INIT` had already given the freed VRAM to the arena).
-Detail and numbers: `wip/kv-residency/IMPLEMENTATION.md` ("Slice 2" / "KNOWN LIMIT").
-
-**Why it is parked rather than refuted — the maintainer's framing (2026-10-29).**  O1 is a *temporal*
-version of the window: the arena is bigger early and shrinks as the context grows, and once the context is
-large it converges on fully-resident-KV speed.  Until the window fills it is **no faster than the windowed
-design at all**.  The open question is only the crossover: past the window, what costs more — windowing
-(misses through the link) or the shrinking arena (expert-cache misses and the identity cliff)?  There is
-probably a brief window just after it fills where growing is a little faster, and then the arena's miss rate
-steals it back.  **We do not know, and O2 has to be built to find out** — so O1 is waiting on a measurement
-that only O2 can provide, not dismissed.
-
-**CORRECTION 2026-10-29 (immediately after the above was written).**  The "O3 first" order was chosen from
-this file's own option menu and produced a third session on a non-goal.  **The campaign is O2, and only O2**
-(`wip/kv-residency/O2-PLAN.md`).  O1 and O3 are **closed detours**: both were built and measured, neither was
-ever requested, and neither is a step toward the windowed cache.  **Do not restart either.**  Root cause, worth
-remembering: O2's payoff shape (a small window beside a big expert set) needs Flash-Next plus 2-3 GPUs, and only
-one 32 GiB card is attached — so each session quietly substituted something that *was* measurable.  The rule
-from here: if the ask cannot be measured on the attached hardware, say so and build it for correctness with no
-perf claim, or stop.
-
-**The historical order line, kept for the record.**  **O3 (drafter ring) first, then O2.**
-* **O3** is genuinely windowed residency (`--mtp-window` analogue: the draft KV is `O(window)`, not
-  `O(-c)`), it is family-independent, it runs on the 27B dense that fits one card, and its cost is a clean
-  acceptance number.  It is the smallest complete instance of the policy O2 needs — a rehearsal, not a
-  detour.  Note its *standalone* VRAM win is modest (~256 MiB at `-c 65536` on the 27B: 1 draft layer).
-* **O2** then reuses that policy on the K/V page table, on the eligible (bounded attended set) families.
-  Blocked for *measurement* while only one 32 GiB card is attached: its target family is qwen4exp/QSA
-  (Flash-Next, 75 GB).  Correctness work can proceed on a small model with a forced small window.
-
-**PROGRESS 2026-10-30 (A3; fork `wip-kv-residency` tip `59b1bf1a8`, records in
-`wip/kv-residency/A2-MIXED-BACKING.md` §3.7).**  Done: `--fit` **sizes and reports** the window
-(`LLAMA_KV_RESIDENT_CELLS=auto`: bytes-per-cell from the region buffer type, `W` from the VRAM left after the
-arena/slab reserve, the split + modelled cost printed at the calibrated link rate, the user's `-c` kept rather
-than shrunk); the **pinned-RAM ceiling** (`LLAMA_KV_SPILL_RAM_PCT`, clamped at creation and refused at run time
-instead of an OOM kill); `gate-ckpt-reuse.sh` + `gate-state-pipe.sh` **pass on a windowed arm** — and the
-latter found a real ABORT (the batched state save asserted the plain CUDA buffer type, so a windowed KV killed
-the server at the first prompt-cache save); MTP verify widths are byte-identical on a windowed arm (4B).
-Three slide bugs were found and fixed (a coalesced mapping straddling the boundary meant the window spilled
-**nothing**; `cudaMemcpy` into a host-location mapping silently leaves zeros, so the staging is a kernel copy;
-a multi-piece mapping rewrite loses bytes).  The box was re-cabled and re-baselined (**link 28.8 → 55.7 GB/s**).
-
-**The §3.7.6 purity blocker is CLOSED (A4, 2026-10-30)** — the fault was the VMM primitive (a `cuMemUnmap` of a
-device mapping made the next `cuMemCreate`(HOST)/`cuMemMap` zero a *live* host-location mapping), fixed by the hold
-`vmm_map` now takes (`LLAMA_KV_REGION_QUARANTINE`, default on).  Purity is claimed for **spilling** windowed arms
-(prefill-logit −0.000000 / 100.000 %).  The narrative is `A2-MIXED-BACKING.md` §3.7.8.
-
-**What is actually left (2026-10-30, end of A6):**
-
-* **`auto` policy** — the maintainer's call, unchanged by r181: `auto` sizes the window to
-  `free − margin − everything-but-the-KV` (the margin includes the arena/slab reserve, so on a `-ncmoe` config the
-  arena wins the VRAM by design) and it only spills a pinned `-c`.  Deciding measurements: §3.7.11.4 A-C.  `W`
-  stays a cell count.
-* **Goal C** — the drafter ring is measured, not promoted (`O3-DRAFTER-RING.md` §7: default-on or not, one size or
-  per-model, MTP-only or DFlash2).
-* **A `-sm tensor` window** — designed only (`A6-TENSOR-SPLIT-WINDOW.md`); hardware-blocked here.
-* **Goal B** — **B1/B2/B1(c) done (A9); B-A steps 1 and 2 BUILT AND GATED (A10, 2026-10-31); next = the policy
-  (step 3, expected ~1 point of hits) and B3 (the arena half at `-n 2000`).**  Branch `wip-kv-residency-b`
-  `b5d895c59`: `LLAMA_KV_REGION_POOL=<cells>` makes the attention KV a pinned host MIRROR (authoritative, so
-  `seq_rm`/`seq_cp`/defrag/state/park are unchanged code) plus a compact device pool of indexer-block pages with a
-  page table and an in-graph resolve (`GGML_OP_KV_POOL`), and a second id list for the QSA reader's K/V gather.
-  **Measured at 103k with MTP depth 4: pool 48.3 t/s = the sparse ceiling (sparse+resident 47.9), +54 % over B2's
-  spilled arm, at 204 MiB instead of 816 MiB; 89.7 % hit rate; fills ~0.05 ms/step.**  So the pool's job is done
-  and the residual -20 % against resident-dense is the SPARSE ARM's own cost — a page policy cannot recover more
-  than ~0.05 ms/step, and the next lever is the indexer/top-k cost.  Gates: text identical pool on/off (854
-  `43b30de151b9` at 51 475), pool verify 0 mismatches, prefill-logit 0.000000/100.000 %, park/ckpt/state gates
-  PASS, `FLASH_ATTN_QSA` 27/27, no GPU faults.  Full record: `wip/kv-residency/BA-POOL-DESIGN.md` §7.  Previous:  Campaign branch `wip-kv-residency-b` `c045bf866` (based on the shipped tip): B2 (`is_streaming` + `qwen4exp_kv_streams`) makes a windowed KV take the sparse decode arm (+34.3 % at 103k, +47.3 % at 180k; `LLAMA_QSA_DENSE_DECODE_STREAM=0` = A/B).  The census (`wip/kv-residency/qsa-census.py`) says the attended set is 2051 cells/layer/step, Jaccard 0.586, and a compact **page-table pool** (page = 4 cells = one indexer block, host-authoritative mirror, lag-1 admission, adaptive policy) hits **85-90 % with 0.05 ms/step of fills** at 8192 cells/layer = 107 MiB; the region's 4 MiB units (6 %, 90 ms/step) and a static ordering (63-68 %) are both refuted by measurement.  **Spec: `wip/kv-residency/BA-POOL-DESIGN.md`** (four gated steps).  Then B3 (the arena half at `-n 2000`), the MTP draft's sparse-decode re-measure under a streamed cache, and the promotion decision.  Nothing leaves `wip/` until then.
-
-**Nothing from `wip/kv-residency/` is in `patches/` or `release.json`, and nothing may be applied from it
-without an explicit go-ahead.**  The slice-1/2 code is the record, not a candidate: sub-slice 2's *growth*
-must not be promoted; its KV **buffer-type skeleton** (a custom buft carrying a host master + device pool +
-page table, selected per device with a plain-buft fallback) is the container O2 needs and is worth reusing.
 
 ---

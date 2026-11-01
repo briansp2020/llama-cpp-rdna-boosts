@@ -1,4 +1,4 @@
-From 5f6a055273b6035476eaca463e71ffb30db805d7 Mon Sep 17 00:00:00 2001
+From 518b6c0563699704835a344d53110bdbf25cd816 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/15] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -1020,7 +1020,7 @@ index 28d2187b9..692aaf7ff 100644
  
  #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 93b946ad2..704e25b44 100644
+index d85f97a9c..bde0e01ae 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -608,6 +608,8 @@ extern "C" {
@@ -4871,7 +4871,7 @@ index 18d3ff787..11fb5d67e 100644
  
  static const char * ggml_backend_rpc_name(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 399259330..dc4883db3 100644
+index 0adbf61bd..b945670c4 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1114,9 +1114,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -6992,10 +6992,10 @@ index 77471bc25..0079595f5 100644
  LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
  // returns the number of extracted layers from target model
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 383e795f0..d10d3492e 100644
+index a1a2ffb5c..5b0e61353 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1510,6 +1510,10 @@ void llm_graph_result::reset() {
+@@ -1537,6 +1537,10 @@ void llm_graph_result::reset() {
      t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
      std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
  
@@ -7006,7 +7006,7 @@ index 383e795f0..d10d3492e 100644
      t_sampled.clear();
      t_sampled_probs.clear();
      t_sampled_logits.clear();
-@@ -1540,6 +1544,57 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+@@ -1567,6 +1571,57 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
      }
  }
  
@@ -7064,7 +7064,7 @@ index 383e795f0..d10d3492e 100644
  void llm_graph_result::set_outputs(const llm_graph_params & params_l) {
      if (t_logits != nullptr) {
          ggml_set_output(t_logits);
-@@ -1558,8 +1613,22 @@ void llm_graph_result::set_outputs(const llm_graph_params & params_l) {
+@@ -1585,8 +1640,22 @@ void llm_graph_result::set_outputs(const llm_graph_params & params_l) {
          for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
              if (embeddings_layer_inp[il]) {
                  GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
@@ -7088,7 +7088,7 @@ index 383e795f0..d10d3492e 100644
          }
      }
      for (auto * tensor : t_sampled) {
-@@ -1636,6 +1705,12 @@ void llm_graph_result::set_hdmd_input(const ggml_tensor * cur, const ggml_tensor
+@@ -1663,6 +1732,12 @@ void llm_graph_result::set_hdmd_input(const ggml_tensor * cur, const ggml_tensor
  
  void llm_graph_result::set_params(const llm_graph_params & params_l) {
      this->params = params_l;
@@ -7102,10 +7102,10 @@ index 383e795f0..d10d3492e 100644
  
  //
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index c2317fe60..ff5518983 100644
+index 6cf67faa9..4ebe6f298 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -917,6 +917,12 @@ struct llm_graph_params {
+@@ -924,6 +924,12 @@ struct llm_graph_params {
              return false;
          }
  
@@ -7118,7 +7118,7 @@ index c2317fe60..ff5518983 100644
          if (!samplers_equal(samplers, other.samplers)) {
              return false;
          }
-@@ -973,6 +979,15 @@ public:
+@@ -980,6 +986,15 @@ public:
  
      ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
  
@@ -7134,7 +7134,7 @@ index c2317fe60..ff5518983 100644
      ggml_cgraph  * get_gf()  const { return gf; }
      ggml_context * get_ctx() const { return ctx_compute.get(); }
  
-@@ -1011,6 +1026,7 @@ public:
+@@ -1018,6 +1033,7 @@ public:
      ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
  
      std::vector<ggml_tensor *> t_layer_inp;
@@ -7142,7 +7142,7 @@ index c2317fe60..ff5518983 100644
  
      std::vector<ggml_tensor *> t_sampled;
      std::vector<ggml_tensor *> t_sampled_probs;
-@@ -1032,6 +1048,17 @@ public:
+@@ -1039,6 +1055,17 @@ public:
      int64_t max_nodes;
  
  private:
@@ -7671,10 +7671,10 @@ index d4964a477..6374d95b5 100644
      //void mv(uint32_t isrc, uint32_t idst) {
      //    assert(isrc < pos.size());
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index 58243212c..80bce931a 100644
+index 7af458b9a..bee794a97 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
-@@ -538,6 +538,77 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
+@@ -537,6 +537,77 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
      return mem_idx.get();
  }
  
@@ -8670,7 +8670,7 @@ index 98fafd917..af86c33b3 100644
          ggml_tensor * inpSA = inpL;
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index aeff555f6..c5d412967 100644
+index 2189c11bb..f8889cbad 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -1014,7 +1014,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
@@ -9475,5 +9475,5 @@ index 44c05fab0..618a55de0 100644
      assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
 +    assert "making room in the KV cache" not in log.drain()
 -- 
-2.56.0
+2.55.0
 

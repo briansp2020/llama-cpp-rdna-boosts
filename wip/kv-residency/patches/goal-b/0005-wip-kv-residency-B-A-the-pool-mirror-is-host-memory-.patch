@@ -1,0 +1,100 @@
+From de47aa5a6b3ffc2c14a0aa11e48de96a28ecc8f4 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sat, 31 Oct 2026 00:19:31 -0500
+Subject: [PATCH 5/7] wip/kv-residency B-A: the pool mirror is host memory --
+ accept it in the async state copies
+
+The four ggml_backend_*_tensor_*_async paths assert the plain CUDA buffer type and describe their copy as
+D2H/H2D; the pool's mirror is pinned host memory in a device-carrying buffer type, so a 'H2D' into it is not a
+legal description of the copy.  Copy it on the host, ordered behind the compute stream (the state save reads
+bytes a graph may still be writing).
+
+Gates on the pool arm (Flash-Next IQ3_XXS, 1 GPU, -ncmoe 48, LLAMA_KV_REGION_POOL=8192):
+  gate-park-idle-slots.sh   PASS (6 park / 2 unpark moves traced, park == lazyoff)
+  gate-ckpt-reuse.sh        PASS (keep 3 / eager 3, same text, same RSS)
+  gate-state-pipe.sh        PASS (all five arms)
+  gate-prefill-logits.sh    PASS (--ab LLAMA_KV_REGION_POOL=8192: 0.000000 KLD / 100.000 % top-p)
+  test-backend-ops -o FLASH_ATTN_QSA  27/27 OK (with HIP_VISIBLE_DEVICES=0; the iGPU abort is the
+                                    documented gfx-flow trap, not this change)
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 39 +++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e77493ef7..873beff41 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5861,10 +5861,27 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+     delete backend;
+ }
+ 
++
++// wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL's mirror is pinned host memory in a device-carrying
++// buffer type, so the four async tensor copies below must not treat its pointer as device VRAM: a
++// `cudaMemcpyAsync` "H2D" into host memory is not a legal description of the copy, and the "D2H" reads are
++// really host-to-host.  Do them as a host copy, ordered behind the compute stream so a state save cannot read
++// the mirror while a graph is still writing it.  (The pool's own read path never goes through here.)
++static void ggml_cuda_kv_pool_mirror_sync(ggml_backend_cuda_context * cuda_ctx) {
++    ggml_cuda_async_input_drain(cuda_ctx->device);
++    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++}
++
+ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
++    if (ggml_backend_buft_is_cuda_kv_pool_mirror(buf->buft)) {
++        ggml_cuda_kv_pool_mirror_sync(cuda_ctx);
++        memcpy((char *) tensor->data + offset, data, size);
++        return;
++    }
++
+     // wip/kv-residency (TODO #118): a KV region buffer is a CUDA buffer too (`ggml_backend_buft_is_cuda`, the
+     // same function-pointer identity the scheduler gates on), and its VA is a plain device pointer -- the
+     // batched state save/restore copies work unchanged.  The windowed KV has to be accepted here or the
+@@ -5916,6 +5933,12 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
++    if (ggml_backend_buft_is_cuda_kv_pool_mirror(buf->buft)) {
++        ggml_cuda_kv_pool_mirror_sync(cuda_ctx);
++        memcpy(data, (const char *) tensor->data + offset, size);
++        return;
++    }
++
+     // wip/kv-residency (TODO #118): a KV region buffer is a CUDA buffer too (`ggml_backend_buft_is_cuda`, the
+     // same function-pointer identity the scheduler gates on), and its VA is a plain device pointer -- the
+     // batched state save/restore copies work unchanged.  The windowed KV has to be accepted here or the
+@@ -5932,6 +5955,14 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
++    if (ggml_backend_buft_is_cuda_kv_pool_mirror(buf->buft)) {
++        ggml_cuda_kv_pool_mirror_sync(cuda_ctx);
++        for (size_t i = 0; i < n_copies; ++i) {
++            memcpy((char *) tensor->data + offset + i*stride_tensor, (const char *) data + i*stride_data, size);
++        }
++        return;
++    }
++
+     // wip/kv-residency (TODO #118): a KV region buffer is a CUDA buffer too (`ggml_backend_buft_is_cuda`, the
+     // same function-pointer identity the scheduler gates on), and its VA is a plain device pointer -- the
+     // batched state save/restore copies work unchanged.  The windowed KV has to be accepted here or the
+@@ -6031,6 +6062,14 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
++    if (ggml_backend_buft_is_cuda_kv_pool_mirror(buf->buft)) {
++        ggml_cuda_kv_pool_mirror_sync(cuda_ctx);
++        for (size_t i = 0; i < n_copies; ++i) {
++            memcpy((char *) data + i*stride_data, (const char *) tensor->data + offset + i*stride_tensor, size);
++        }
++        return;
++    }
++
+     // wip/kv-residency (TODO #118): a KV region buffer is a CUDA buffer too (`ggml_backend_buft_is_cuda`, the
+     // same function-pointer identity the scheduler gates on), and its VA is a plain device pointer -- the
+     // batched state save/restore copies work unchanged.  The windowed KV has to be accepted here or the
+-- 
+2.55.0
+

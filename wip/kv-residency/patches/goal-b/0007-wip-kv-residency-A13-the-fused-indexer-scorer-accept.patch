@@ -1,0 +1,358 @@
+From 266882ee79104153a1093b3fdc356cae2cc507e0 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sat, 31 Oct 2026 12:33:08 -0500
+Subject: [PATCH 7/7] wip/kv-residency A13: the fused indexer scorer accepts
+ QUANTIZED keys (q8_0 and the q4/q5 family)
+
+The fused INDEXER_SCORE + derived INDEXER_FILL path (both default-on) served only F32/BF16/F16 indexer keys, so a
+quantized KV cache -- the delivery's large-context type, and the one block 15's windowed KV takes by construction
+-- fell back to the per-op chain: get_rows(dequantize) -> pool copy -> scale -> rms_norm -> rope_multi -> score
+mat_mul -> relu -> head-sum -> bias add, re-materialising the WHOLE indexer key cache in F32 every step (47 MiB at
+103k; measured at 5.31 ms/token of generic ops plus the 1.83 ms copy A12 fixed).
+
+This teaches the two kernels a quantized key-row load: 32-element blocks whose byte size is nb[0], dequantized by
+ggml's OWN helpers (dequantize_q8_0/q4_0/q4_1/q5_0/q5_1/q4_nl) -- i.e. the same values get_rows produces, which is
+what keeps the paths byte-identical.  Note the two packings: q8_0 holds one element per byte, the 4/5-bit types put
+a byte's low nibble at channel b and its high nibble at b+16.
+
+  * indexer-score.cu: indexer_score_ld_chan(row, c, nb0K, ktype) replaces indexer_score_ld_val(element addr); the
+    pooling helper is now row-addressed (a bit-identical address for the float types, where nb0K == 4/2/2).
+    indexer_score_ktype() maps the type to the kernel code (0..8, -1 unsupported) and both _supported predicates
+    and both impls' asserts use it.
+  * ggml_indexer_key_type_supported() (ggml.h/ggml.c): one predicate for the constructors, the CUDA kernels and the
+    memory layer; the two indexer ctors accept the widened set.
+  * qwen4exp.cpp: idx_key_float -> idx_key_fused (the predicate), so a quantized cache takes the fused path.
+  * llama-memory-hybrid-idx.cpp: pool_create builds the derived pool for those types too.
+
+Gates (Flash-Next IQ3_XXS, 1 GPU, -ncmoe 48, PLE flags, ROCBLAS_USE_HIPBLASLT=0; the A/B arm is the pre-change
+per-op chain, GGML_CUDA_QSA_INDEXER_SCORE=0):
+
+  text, 5.3k, greedy -- identical on EVERY supported key type (fused vs chain): q8_0 296 91ef8940d66e /
+  sparse 332 dd1981213373 (both == the pre-change build's hashes), f16 333 c42a586a6d13, bf16 296 91ef8940d66e,
+  q4_0 307 097ff06194d6, q4_1 307 097ff06194d6, q5_0 336 bd82b7ed544c, q5_1 296 3205db133b1d, iq4_nl 323
+  d7aba1c58e0c.  q8_0 with GGML_CUDA_QSA_INDEXER_CACHE=0 (fused, no derived pool) also matches.
+  text, 51 475 depth, pool arm: q8_0 854 43b30de151b9 (== the pre-change hash); q4_0 841 65097e7c8630 fused ==
+  chain.
+  prefill-logit gate with --ub 1 (the decode graph, base arm = the chain): 0.000000 KLD / 100.000 % top-p.  The
+  standard ctx-16384 gate against the A12 base: 0.000000 / 100.000 %.  test-backend-ops -o FLASH_ATTN_QSA OK.
+  No GPU faults.
+
+Worth (103k, arms interleaved):
+  plain decode (the non-MTP path): 23.68 -> 17.73 ms/token of GPU kernel time, wall 29.3 -> 36.3 t/s (+24 %);
+  the indexer bucket 5.31 -> 2.01 and "derived indexer cache (pool) = 12 layers ... ENABLED" for q8_0 (it said
+  "skipped (q8_0 keys)" before).  That equals the bf16/fused arm's 17.83 ms/token and 36.2 t/s, i.e. the
+  dequantizing kernel now delivers the whole fused-path prize on the product KV type.
+  MTP-4 (-n 512): sparse 54.26 -> 54.70, pool 54.52 -> 54.65, dense unchanged at 59.10 -- small, because under MTP
+  the indexer is amortised over ~2.84 tokens/step and the MoE/expert traffic dominates the token.
+---
+ ggml/include/ggml.h                 |  5 ++
+ ggml/src/ggml-cuda/indexer-score.cu | 87 ++++++++++++++++++++++-------
+ ggml/src/ggml.c                     | 21 ++++++-
+ src/llama-memory-hybrid-idx.cpp     | 11 ++--
+ src/models/qwen4exp.cpp             | 19 +++----
+ 5 files changed, 105 insertions(+), 38 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index d5374361e..db46f0180 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2685,6 +2685,11 @@ extern "C" {
+     // src5 = per-block bias [n_blocks, n_tps, n_stream]; the remaining args replicate
+     // the ggml rope call's parameters.  dst = [n_blocks, n_tps, n_stream],
+     // byte-identical to the per-op chain's post-bias score.
++    // The cache key types the fused indexer ops accept: F32/BF16/F16 natively and Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL
++    // through ggml's own dequantizers (the same values the per-op chain's get_rows produces).  One predicate for the
++    // constructors, the CUDA kernels' _supported checks and the memory layer's derived-cache pool.
++    GGML_API bool ggml_indexer_key_type_supported(enum ggml_type type);
++
+     GGML_API struct ggml_tensor * ggml_indexer_score(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * k,
+diff --git a/ggml/src/ggml-cuda/indexer-score.cu b/ggml/src/ggml-cuda/indexer-score.cu
+index dea215edc..e81007a70 100644
+--- a/ggml/src/ggml-cuda/indexer-score.cu
++++ b/ggml/src/ggml-cuda/indexer-score.cu
+@@ -24,6 +24,7 @@
+ 
+ #include "indexer-score.cuh"
+ #include "common.cuh"
++#include "dequantize.cuh"
+ #include <algorithm>
+ 
+ // --- rope math copied verbatim from ggml-cuda/rope.cu (rope_yarn) so the cos/sin
+@@ -48,25 +49,55 @@ static __device__ void indexer_score_rope_yarn(
+ }
+ 
+ // --- pool + norm device helpers -----------------------------------------------
+-// cache element ktype: 0 = F32, 1 = BF16 (ggml bits<<16 upcast), 2 = F16 (exact half->f32)
+-static __device__ __forceinline__ float indexer_score_ld_val(const void * p, const int ktype) {
++// cache element ktype: 0 = F32, 1 = BF16 (ggml bits<<16 upcast), 2 = F16 (exact half->f32),
++// 3 = Q8_0, 4 = Q4_0, 5 = Q4_1, 6 = Q5_0, 7 = Q5_1, 8 = IQ4_NL (dequantized by ggml's own helper, i.e. the
++// same value the per-op chain's get_rows produces -- that is what keeps the paths byte-identical).
++//
++// A quantized row is addressed in 32-element blocks whose byte size is what ggml stores in nb[0], and the two
++// nibble families pack a byte's low nibble at channel `b` and its high nibble at channel `b + 16` (the q8_0
++// layout instead holds one element per byte), so the loader takes the ROW base plus the channel.
++static __device__ __forceinline__ float indexer_score_ld_chan(
++        const char * row, const int c, const int64_t nb0K, const int ktype) {
++    if (ktype == 0) {
++        return *(const float *) (row + (int64_t) c * 4);
++    }
+     if (ktype == 1) {
+-        return __uint_as_float(((uint32_t) *(const uint16_t *) p) << 16);
++        return __uint_as_float(((uint32_t) *(const uint16_t *) (row + (int64_t) c * 2)) << 16);
+     }
+     if (ktype == 2) {
+         // f16 -> f32 is exact (bijection); matches get_rows' native half upcast
+-        return __half2float(*(const __half *) p);
++        return __half2float(*(const __half *) (row + (int64_t) c * 2));
++    }
++
++    // quantized: QK8_0-element blocks, `nb0K` bytes each (all supported types share QK == 32)
++    static_assert(QK8_0 == 32, "the packed layouts below assume a 32-element block");
++    const int     iq  = c & (QK8_0 - 1);
++    const char  * blk = row + (int64_t) (c / QK8_0) * nb0K;
++    float2 v;
++    if (ktype == 3) {
++        // q8_0: one element per byte
++        dequantize_q8_0(blk, 0, iq & ~1, v);
++        return (iq & 1) ? v.y : v.x;
+     }
+-    return *(const float *) p;
++    // 4/5-bit: byte iq&15 carries channel (iq&15) in its low nibble and channel (iq&15) + 16 in its high one
++    const int b = iq & 15;
++    switch (ktype) {
++        case 4:  dequantize_q4_0(blk, 0, b, v); break;
++        case 5:  dequantize_q4_1(blk, 0, b, v); break;
++        case 6:  dequantize_q5_0(blk, 0, b, v); break;
++        case 7:  dequantize_q5_1(blk, 0, b, v); break;
++        default: dequantize_q4_nl(blk, 0, b, v); break;
++    }
++    return (iq < 16) ? v.x : v.y;
+ }
+ 
+ static __device__ __forceinline__ float indexer_score_norm_col(
+-        const char * K, const int * blk_row, const int c, const int idx_dim,
++        const char * Ks, const int * blk_row, const int c,
+         const int r, const float rinv, const int64_t nb0K, const int64_t nb1K, const int ktype) {
+     float acc = 0.0f;
+-    const char * Kcol = K + (int64_t) c * nb0K;
+     for (int i = 0; i < r; ++i) {
+-        acc += indexer_score_ld_val(Kcol + (int64_t) blk_row[i] * nb1K, ktype);
++        // identical address and value to the pre-quantized form for F32/BF16/F16 (nb0K == 4/2/2)
++        acc += indexer_score_ld_chan(Ks + (int64_t) blk_row[i] * nb1K, c, nb0K, ktype);
+     }
+     return acc * rinv;
+ }
+@@ -130,7 +161,7 @@ static __global__ void indexer_score_kernel(
+         // --- pass 1: pool columns (increment-1 arithmetic, strided like rms_norm_f32) ---
+         float tmp = 0.0f;
+         for (int c = tid; c < idx_dim; c += IDX_SCORE_BLOCK) {
+-            const float pv = indexer_score_norm_col(Ks, blk_row, c, idx_dim, r, rinv, nb0K, nb1K, ktype);
++            const float pv = indexer_score_norm_col(Ks, blk_row, c, r, rinv, nb0K, nb1K, ktype);
+             vec[c] = pv;
+             tmp += pv * pv;
+         }
+@@ -242,6 +273,22 @@ static __global__ void indexer_score_kernel(
+     }
+ }
+ 
++// host: cache key type -> the kernel's ktype code (-1 = not supported by the fused path)
++static int indexer_score_ktype(ggml_type t) {
++    switch (t) {
++        case GGML_TYPE_F32:   return 0;
++        case GGML_TYPE_BF16:  return 1;
++        case GGML_TYPE_F16:   return 2;
++        case GGML_TYPE_Q8_0:  return 3;
++        case GGML_TYPE_Q4_0:  return 4;
++        case GGML_TYPE_Q4_1:  return 5;
++        case GGML_TYPE_Q5_0:  return 6;
++        case GGML_TYPE_Q5_1:  return 7;
++        case GGML_TYPE_IQ4_NL: return 8;
++        default:              return -1;
++    }
++}
++
+ static void ggml_cuda_indexer_score_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * K   = dst->src[0];
+     const ggml_tensor * BLK = dst->src[1];
+@@ -287,9 +334,10 @@ static void ggml_cuda_indexer_score_impl(ggml_backend_cuda_context & ctx, ggml_t
+     GGML_ASSERT(n_blocks == dst->ne[0]);
+     const int nrows = n_blocks * n_stream;
+ 
+-    const int ktype = K->type == GGML_TYPE_F32 ? 0 : (K->type == GGML_TYPE_BF16 ? 1 : 2);
+-    GGML_ASSERT((K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && BLK->type == GGML_TYPE_I32 &&
++    const int ktype = indexer_score_ktype(K->type);
++    GGML_ASSERT(ktype >= 0 && BLK->type == GGML_TYPE_I32 &&
+                 POS->type == GGML_TYPE_I32 && Q->type == GGML_TYPE_F32 && W->type == GGML_TYPE_F32);
++    GGML_ASSERT(ktype < 3 || idx_dim % QK8_0 == 0);      // quantized rows: whole 32-element blocks
+ 
+     const float theta_scale = powf(freq_base, -2.0f / n_dims);
+     float corr_v[2];
+@@ -337,9 +385,9 @@ bool ggml_cuda_indexer_score_supported(int device, const ggml_tensor * dst) {
+     const ggml_tensor * Q = dst->src[3];
+     const ggml_tensor * W = dst->src[4];
+     const ggml_tensor * B = dst->src[5];
+-    if (!((K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && BLK->type == GGML_TYPE_I32 &&
+-           POS->type == GGML_TYPE_I32 && Q->type == GGML_TYPE_F32 && W->type == GGML_TYPE_F32 &&
+-           B->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32)) {
++    if (indexer_score_ktype(K->type) < 0 || BLK->type != GGML_TYPE_I32 ||
++           POS->type != GGML_TYPE_I32 || Q->type != GGML_TYPE_F32 || W->type != GGML_TYPE_F32 ||
++           B->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+         return false;
+     }
+     if (dst->src[6] != nullptr) {
+@@ -410,7 +458,7 @@ static __global__ void indexer_fill_kernel(
+     // pass 1: pool columns (score kernel's raw pass, same strided walk + reduction)
+     float tmp = 0.0f;
+     for (int c = tid; c < idx_dim; c += IDX_SCORE_BLOCK) {
+-        const float pv = indexer_score_norm_col(Ks, blk_row, c, idx_dim, r, rinv, nb0K, nb1K, ktype);
++        const float pv = indexer_score_norm_col(Ks, blk_row, c, r, rinv, nb0K, nb1K, ktype);
+         vec[c] = pv;
+         tmp += pv * pv;
+     }
+@@ -517,9 +565,10 @@ static void ggml_cuda_indexer_fill_impl(ggml_backend_cuda_context & ctx, ggml_te
+     GGML_ASSERT(n_blocks == dst->ne[1]);
+     const int nrows = n_blocks * n_stream;
+ 
+-    const int ktype = K->type == GGML_TYPE_F32 ? 0 : (K->type == GGML_TYPE_BF16 ? 1 : 2);
+-    GGML_ASSERT((K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) &&
+-                BLK->type == GGML_TYPE_I32 && POS->type == GGML_TYPE_I32 && W->type == GGML_TYPE_F32);
++    const int ktype = indexer_score_ktype(K->type);
++    GGML_ASSERT(ktype >= 0 && BLK->type == GGML_TYPE_I32 &&
++                POS->type == GGML_TYPE_I32 && W->type == GGML_TYPE_F32);
++    GGML_ASSERT(ktype < 3 || idx_dim % QK8_0 == 0);      // quantized rows: whole 32-element blocks
+ 
+     const float theta_scale = powf(freq_base, -2.0f / n_dims);
+     float corr_v[2];
+@@ -555,7 +604,7 @@ bool ggml_cuda_indexer_fill_supported(int device, const ggml_tensor * dst) {
+     const ggml_tensor * POS = dst->src[2];
+     const ggml_tensor * W   = dst->src[3];
+     const ggml_tensor * RNG = dst->src[4];
+-    return (K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && BLK->type == GGML_TYPE_I32 &&
++    return indexer_score_ktype(K->type) >= 0 && BLK->type == GGML_TYPE_I32 &&
+            POS->type == GGML_TYPE_I32 && W->type == GGML_TYPE_F32 && RNG->type == GGML_TYPE_I32 &&
+            dst->type == GGML_TYPE_F32;
+ }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 2012d1530..3815dd1bc 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5968,6 +5968,23 @@ struct ggml_tensor * ggml_indexer_top_k(
+ 
+ // ggml_indexer_score
+ 
++bool ggml_indexer_key_type_supported(enum ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_F32:
++        case GGML_TYPE_BF16:
++        case GGML_TYPE_F16:
++        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_Q4_0:
++        case GGML_TYPE_Q4_1:
++        case GGML_TYPE_Q5_0:
++        case GGML_TYPE_Q5_1:
++        case GGML_TYPE_IQ4_NL:
++            return true;
++        default:
++            return false;
++    }
++}
++
+ struct ggml_tensor * ggml_indexer_score(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * k,
+@@ -5990,7 +6007,7 @@ struct ggml_tensor * ggml_indexer_score(
+         float                 beta_slow,
+         struct ggml_tensor  * pool,
+         struct ggml_tensor  * rng) {
+-    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F16);
++    GGML_ASSERT(ggml_indexer_key_type_supported(k->type));
+     GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
+     GGML_ASSERT(blk_pos->type  == GGML_TYPE_I32);
+     GGML_ASSERT(q->type        == GGML_TYPE_F32);
+@@ -6071,7 +6088,7 @@ struct ggml_tensor * ggml_indexer_fill(
+         float                 attn_factor,
+         float                 beta_fast,
+         float                 beta_slow) {
+-    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F16);
++    GGML_ASSERT(ggml_indexer_key_type_supported(k->type));
+     GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
+     GGML_ASSERT(blk_pos->type  == GGML_TYPE_I32);
+     GGML_ASSERT(w->type        == GGML_TYPE_F32);
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 41069cc42..76ef5d842 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -131,18 +131,17 @@ void llama_memory_hybrid_idx::pool_create(
+ 
+     // the pool backs the fused INDEXER_FILL -> INDEXER_SCORE derived decode path only, and
+     // only when that path can actually run:
+-    //  - the fused ops read the raw indexer keys natively (F32/BF16/F16 only - quantized
+-    //    indexer-key caches, e.g. --cache-type-k q8_0, always take the per-op chain), and
++    //  - the fused ops support this key type (F32/BF16/F16 natively, Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL through
++    //    ggml's dequantizers - ggml_indexer_key_type_supported; any other type takes the per-op chain), and
+     //  - the memory-layer derived cache is engaged (GGML_CUDA_QSA_INDEXER_CACHE, default ON;
+     //    =0 restores the raw-cache re-pool).  With it off, qsa_derived_limits emits an empty fill
+     //    range every step and the pool is never written or read (each decode step would launch an
+     //    empty fill for nothing).
+     // Skip the allocation otherwise - get_pool() then returns nullptr and build_qsa_top_k
+     // runs the fused score with no pool (pools the raw cache: the same F32 arithmetic and
+-    // byte-identical output, minus the dead buffer) or the per-op chain for quantized keys.
+-    if (!derived_enabled || (mem_idx->type_k() != GGML_TYPE_F32 &&
+-                             mem_idx->type_k() != GGML_TYPE_BF16 &&
+-                             mem_idx->type_k() != GGML_TYPE_F16)) {
++    // byte-identical output, minus the dead buffer) or, for a key type the fused op does not
++    // support, the per-op chain.
++    if (!derived_enabled || !ggml_indexer_key_type_supported(mem_idx->type_k())) {
+         LLAMA_LOG_INFO("%s: derived indexer cache pool skipped (%s keys, derived cache %s)\n", __func__,
+                 ggml_type_name(mem_idx->type_k()), derived_enabled ? "enabled" : "disabled");
+         return;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 253355bf8..230efe5b1 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1932,14 +1932,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+             ext_factor, attn_factor, beta_fast, beta_slow);
+     cb(q, "indexer_q", il);
+ 
+-    // the fused score ops read the raw cache rows natively - the kernels' load dispatch is
+-    // F32/BF16/F16 only, and the ggml_indexer_score/fill constructors assert the same, so a
+-    // quantized indexer key cache (e.g. --cache-type-k q8_0, which is applied to the indexer
+-    // store too) must NOT reach them.  Fall back to the per-op chain below, whose get_rows
+-    // dequantizes any cache type on gather (the BF16/f32 fused decode path is unchanged).
+-    const bool idx_key_float = k_all->type == GGML_TYPE_F32 ||
+-                               k_all->type == GGML_TYPE_BF16 ||
+-                               k_all->type == GGML_TYPE_F16;
++    // the fused score ops read the raw cache rows themselves and dequantize a quantized indexer key cache
++    // in-kernel with ggml's own helpers, so they serve --cache-type-k q8_0 (and the q4/q5 family) with the same
++    // values the per-op chain's get_rows would produce.  A type the fused op does not support (e.g. q6_k) still
++    // falls back to the per-op chain below, whose get_rows dequantizes ANY cache type on gather.
++    const bool idx_key_fused = ggml_indexer_key_type_supported(k_all->type);
+ 
+     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
+     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+@@ -1989,9 +1986,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     ggml_tensor * top_k = nullptr;
+ 
+     ggml_tensor * score = nullptr;
+-    if (idx_score_fused && idx_key_float && n_tokens == 1 && blk_bias && n_idx_h <= 8 &&
++    if (idx_score_fused && idx_key_fused && n_tokens == 1 && blk_bias && n_idx_h <= 8 &&
+             rope_type == GGML_ROPE_TYPE_IMROPE) {
+-        // FUSED PROBE (env-gated, GGML_CUDA_QSA_INDEXER_SCORE=1): ONE kernel replaces the
++        // FUSED SCORE (default on, GGML_CUDA_QSA_INDEXER_SCORE=0 is the per-op-chain A/B): ONE kernel replaces the
+         // per-token decode chain gather + r-slice pool + scale + rms_norm + rope_multi +
+         // score mul_mat + relu + head-sum + bias (~12 kernels/layer) with the fused
+         // INDEXER_SCORE op.  The kernel replicates the per-op F32 arithmetic byte-
+@@ -1999,7 +1996,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         // IMROPE half-pair rope, mmvf F32 vec-dot order) - see ggml-cuda/indexer-score.cu.
+         ggml_tensor * score_pool = nullptr;   // derived-cache pool view (fill dst), if used
+         if (idx_cache && inp->rng != nullptr) {
+-            // DERIVED-CACHE PROBE (env-gated, GGML_CUDA_QSA_INDEXER_CACHE=1, on top of the fused
++            // DERIVED CACHE (default on, GGML_CUDA_QSA_INDEXER_CACHE=0 is the A/B, on top of the fused
+             // score): a fill op first writes the completed blocks' pooled+normed+ROTATED vectors
+             // into the memory-layer pool (rows [from, lim) of this step's range leaf), then the
+             // score op reads the pool rows for blocks below the limit instead of re-pooling the
+-- 
+2.55.0
+

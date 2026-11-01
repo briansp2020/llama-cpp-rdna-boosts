@@ -1,0 +1,146 @@
+From 630b9428bfe023aad306ec6e480c6b954843e3cd Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Fri, 30 Oct 2026 18:19:07 -0500
+Subject: [PATCH 2/7] wip/kv-residency B2: a STREAMING KV takes the sparse QSA
+ decode arm (+34/+47 %)
+
+A windowed KV (block 15) keeps only its newest W cells in VRAM; the tail
+lives in pinned host RAM, so a spilled read costs bytes/55.7 GB/s instead
+of bytes/565 GB/s.  The dense decode arm reads the whole used extent every
+step, so on a streaming cache it is the wrong arm -- but qwen4exp's arch
+policy only knew DEPTH (qsa_dense_decode_until = 1<<62 on gfx1201), never
+the cache's placement.
+
+  llama_kv_cache::is_streaming(n_kv)  (and the context accessor) answers
+  'a window is active and the used extent has passed it', and
+  qwen4exp_kv_streams() skips the dense decode arm when it holds.
+
+Measured (Flash-Next GSQ-IQ3_XXS, -ncmoe 48, q8_0, 1 GPU, -n 400,
+-ot per_layer_token_embd.*=CPU -lm none -lzm off, 2 reps, +-0.2 %):
+  depth     resident+dense   streamed+dense   streamed+B2(default sparse)
+  102 899      42.16          23.42 / 23.54      31.43 / 31.46  (+34.3 %)
+  180 035      37.10          16.51 / 16.50      24.31 / 24.29  (+47.3 %)
+Arena on the streamed arms: 25 338.3 MiB / 61.9 % vs 23 580 / 57.6 %
+(103k) and 22 701 / 55.5 % (180k).
+
+Text: resident default == resident flag-off (853 chars 77a40bf40be1, so
+the change is inert on a resident cache); streamed default == streamed
+forced-sparse (1159, e6080aaf2318, so the default IS the sparse arm);
+streamed dense differs (1158, 0f1ad14496c9 -- a documented regime change,
+GREEDY-PURITY.md 45/63).  Prefill is untouched (always QSA).
+
+LLAMA_QSA_DENSE_DECODE_STREAM=0 restores the pre-B2 behaviour.
+Campaign branch only.
+---
+ src/llama-kv-cache.cpp  | 11 +++++++++++
+ src/llama-kv-cache.h    | 10 ++++++++++
+ src/models/qwen4exp.cpp | 33 ++++++++++++++++++++++++++++++++-
+ 3 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 5aefac9f8..b99688d04 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1961,6 +1961,17 @@ bool llama_kv_cache::get_can_shift() const {
+     return true;
+ }
+ 
++bool llama_kv_cache::is_streaming(uint32_t n_kv) const {
++    // The window is a CELL count and it is only ever set when the region provider is in use; a cell at or
++    // above it is backed by pinned host RAM (the slide is monotone).  `n_kv` is the extent the graph is
++    // about to read, so this answers the question the arm choice actually asks.
++    return kv_resident_cells != 0 && n_kv > kv_resident_cells;
++}
++
++bool llama_kv_cache_context::is_streaming(uint32_t n_kv) const {
++    return kv->is_streaming(n_kv);
++}
++
+ uint32_t llama_kv_cache::get_size() const {
+     const auto & cells = v_cells[seq_to_stream[0]];
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index e9b68c867..274c82ce6 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -182,6 +182,13 @@ public:
+     uint32_t get_n_seq_max() const;
+     uint32_t get_n_stream() const;
+ 
++    // wip/kv-residency (TODO #118) B2: is this cache's KV STREAMING at the extent `n_kv` -- i.e. is a
++    // resident window active and has the used extent passed it, so that the tail of every tensor lives in
++    // pinned host RAM?  A read of a spilled cell comes over the PCIe link (~55 GB/s) instead of VRAM
++    // (~565 GB/s), which is what makes the attention ARM worth switching (a streamed cache prefers the
++    // sparse QSA decode, a resident one the dense arm; wip/kv-residency/B1-STRATA-PLAN.md §3.2).
++    bool is_streaming(uint32_t n_kv) const;
++
+     bool get_has_shift() const;
+ 
+     ggml_type type_k() const;
+@@ -469,6 +476,9 @@ public:
+ 
+     uint32_t get_n_kv() const;
+ 
++    // wip/kv-residency (TODO #118) B2: see llama_kv_cache::is_streaming
++    bool is_streaming(uint32_t n_kv) const;
++
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+ 
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 47ff49f75..de29b02ea 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -166,6 +166,34 @@ static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
+     return false;
+ }
+ 
++// wip/kv-residency (TODO #118) B2: does the ATTENTION cache stream at this extent?
++//
++// A windowed KV (block 15, `LLAMA_KV_RESIDENT_CELLS`) keeps only its newest W cells in VRAM and the older
++// tail in pinned host RAM.  When the used extent has passed W, every read of a spilled cell comes over the
++// PCIe link instead of VRAM, so the DENSE decode arm -- which reads the whole used extent every step -- pays
++// `bytes/55.7 GB/s` where the sparse arm reads ~top_k cells.  Measured on Flash-Next IQ3_XXS (`-ncmoe 48`,
++// q8_0, 1 GPU, `-n 400`): a streamed KV decodes **+34 % (51k) / +32.5 % (103k) / +49 % (180k)** faster with the
++// sparse arm, while a RESIDENT KV is the other way round (dense +18 / +23 / +46 %, because VRAM is ~10x the
++// link and the sparse arm adds the `O(depth)` indexer score + top-k).  So the arm depends on PLACEMENT, not
++// depth alone -- which is what the arch policy's `qsa_dense_decode_until` could not see
++// (../llama-cpp-rdna-boosts/wip/kv-residency/B1-STRATA-PLAN.md §3.2).
++//
++// Default ON.  `LLAMA_QSA_DENSE_DECODE_STREAM=0` keeps the pre-B2 behaviour (the dense decode arm on a
++// streaming cache) for A/B.  This is a DECODE ARM choice, i.e. a different attention regime, so its greedy
++// text differs from the dense arm by construction (a config difference, GREEDY-PURITY.md §45/§63); prefill is
++// untouched (always QSA), so the prefill-logit gate is unaffected.
++static bool qwen4exp_kv_streams(const llama_memory_hybrid_idx_context * mctx, int64_t n_kv) {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_QSA_DENSE_DECODE_STREAM");
++        return env == nullptr || atoi(env) != 0;
++    }();
++    if (!enabled || mctx == nullptr) {
++        return false;
++    }
++    const llama_kv_cache_context * attn = mctx->get_attn();
++    return attn != nullptr && attn->is_streaming((uint32_t) std::max<int64_t>(n_kv, 0));
++}
++
+ // The prefill half of the QSA arm policy is the static lambda next to the decode gate in
+ // build_layer_attn (default 0 = QSA prefill always, per the documented 2026-09-07 arch policy;
+ // LLAMA_QSA_DENSE_PREFILL_UNTIL is the opt-in A/B).
+@@ -2542,10 +2570,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+         const int64_t qsa_decode_band = std::max<int64_t>(QSA_DECODE_BAND, (int64_t) cparams.n_rs_batch);
+         if (shortcut && n_kv <= width) {
+             build_qsa_store_k(mctx_hyb, cur, il);
+-        } else if (qsa_dense_decode_until > 0 && n_tokens <= qsa_decode_band && n_kv < qsa_dense_decode_until) {
++        } else if (qsa_dense_decode_until > 0 && n_tokens <= qsa_decode_band && n_kv < qsa_dense_decode_until &&
++                   !qwen4exp_kv_streams(mctx_hyb, n_kv)) {
+             // arch policy gate: dense decode below the crossover depth (store keys only).
+             // qsa_decode_band, not n_tokens == 1: the verify batch must take the same arm as
+             // the W=1 decode (see QSA_DECODE_BAND above).
++            // B2: ... but NOT while the KV is streaming -- a spilled read is `bytes/55.7 GB/s` over the link,
++            // so the dense arm's `O(depth)` read dominates and the sparse arm wins (see qwen4exp_kv_streams).
+             build_qsa_store_k(mctx_hyb, cur, il);
+         } else if (qsa_dense_prefill_until > 0 && n_tokens > qsa_decode_band &&
+                    n_kv < qsa_dense_prefill_until) {
+-- 
+2.55.0
+

@@ -97,7 +97,7 @@ amendment, or a note in the relevant record).
 | `BASELINE.md` | fork point, what the patches are, how they are cut, drift policy. Its dated baseline/re-base records are in `archive/docs/baseline-history.md` |
 | `TODO.md` | **forward-looking only**: open items, items waiting on someone else, accepted limitations, parked ideas. A closed item is one `WORKLOG.md` entry — never a TODO entry. `#NN` numbers are permanent handles and are never reused |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims); dated narratives/evidence are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
-| `patches/` | **the delivery set** (0000-0015: block 00 + blocks 01-15) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 15 is the windowed KV** (the promoted Goal A of `TODO` #118: an opt-in fixed-VRAM resident window with a pinned-host tail, `LLAMA_KV_RESIDENT_CELLS`). **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
+| `patches/` | **the delivery set** (0000-0015: block 00 + blocks 01-15) + `README.md`, the per-block reference (what each block contains, its knobs, its purity notes). **Block 15 is the streamed KV**: both Goals A and B of `TODO` #118 — an opt-in fixed-VRAM resident **window** with a pinned-host tail (`LLAMA_KV_RESIDENT_CELLS`) *and* the opt-in attendance **pool** (`LLAMA_KV_REGION_POOL`: the authoritative KV in a pinned host mirror plus a compact device pool the sparse decode resolves through) — **both default off**, fittability features that cost the sparse-vs-dense gap on a config whose KV fits. **Block 14 is TEMPORARY** (`-sm relaxed-tensor`, a local relaxation of upstream #31081, no upstream candidate, tracked as `TODO` #104) — keep it separate and expect to drop it. The dated amendment notes moved to `archive/docs/patch-notes-history.md` |
 | `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback, **deterministic commit ids**), `fork-refresh.sh` (the release-time fork refresh: re-cut, tree/tip check, optional build/gates/push — the `.tip` rule below), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `gate-per-block-build.sh` (a clean build per block commit — `all` by default, `--fast` for the release profile), `gate-park-idle-slots.sh` (the server idle-slot parking gate: park == lazy-off text + the indexer cache moves with the attention cache, issue #227), `gate-hc-fusions.sh` (the qwen4exp hyper-connection fusion-equivalence gate: all four mix/combine arms must reproduce the unfused chain, once per hc-down weight class, issue #228), `gate-ckpt-reuse.sh` (the context-checkpoint reuse gate: a kept restored checkpoint changes no token, and only a hybrid/recurrent target reaches the keep path), `gate-state-pipe.sh` (the batched state save/restore gate: the pipelined / plain-memcpy-copy / pipelining-off / save-only / synchronous arms must restore byte-identical text, and it is the only gate that reaches that code), `gate-spec-width-band.sh` (the speculative verify-WIDTH gate: a band-0 3-GPU server at 1/2/4 slots, the bound must fire and win at 4 slots and be inert at 1-2 — the only gate that reaches it), `gate-qwen4exp-quant-coherence.sh`, `check-gpu-faults.sh` (reads the kernel journal and scans a llama log for **real** GPU faults, filtering the echoed prompt lines — never grep a log for `page fault`/`slab` by hand), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `build-containers.sh` (the image build itself), `container-watch.sh` (the off-host release watcher, run on `radiance`), `cleanup-ghcr.py` (GHCR version retention; called by `build-containers.sh --push`), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes), `check-windows-paths.sh` (fails on a path that Windows cannot check out), `check-windows-portability.sh` (fails on a POSIX-only call outside a Windows-excluding region in a file the delivery adds, issue #231; run by `validate-set.sh`). **Index: `scripts/README.md`** |
 | `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
 |  `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
@@ -181,19 +181,30 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   Without it, the interactive chat loop blocks forever. Wrap potentially blocking commands in `timeout`.
 - **Apply method:** all 16 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
   `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
-- **Naming (V2.1):** the current set is **16 blocks, 00-15** (block 15 is the windowed KV, the promoted
-  Goal A of `TODO` #118; block 14 is the temporary `-sm relaxed-tensor`
-  block, see `patches/README.md`; the release tag lives in `release.json` — read `.release` there, it is
-  never restated here).  **15** (r178) the windowed KV: an opt-in fixed-VRAM resident window
-  (`LLAMA_KV_RESIDENT_CELLS`) with the tail in pinned system RAM — one VA range, no kernel change; a run
-  without the knob keeps the plain device buffer and its OOM.  Every `block NN`
+- **Naming (V2.1):** the current set is **16 blocks, 00-15** (block 15 is the **streamed KV** — both Goals
+  A and B of `TODO` #118; block 14 is the temporary `-sm relaxed-tensor` block, see `patches/README.md`;
+  the release tag lives in `release.json` — read `.release` there, it is never restated here).  **15**
+  carries **two opt-in placements of the same cache**, mutually exclusive by construction: the **window**
+  (r178; `LLAMA_KV_RESIDENT_CELLS` — an opt-in fixed-VRAM resident window with the tail in pinned system
+  RAM, one VA range, no kernel change) and the **attendance pool** (r190; `LLAMA_KV_REGION_POOL` — the
+  authoritative copy in a pinned host mirror plus a compact device pool the sparse decode arm resolves its
+  top-k through), plus the streaming arm policy that makes either take the sparse decode (r190).  Both are
+  **default OFF** — fittability features, and on a config whose KV fits they cost the sparse-vs-dense gap.
+  A run with both knobs unset keeps the plain device buffer and its OOM.  **15 also carries Goal C** (r193,
+  `LLAMA_SPEC_DRAFT_WINDOW`): the MTP draft context's KV is a *window* instead of `-c` cells, **default ON**
+  because it measures non-negative (adaptive = a quarter of the context clamped to [32768, 65536], `0` is the
+  kill switch), and an embedded MTP head's slab draft reserve is derived with it (aux 3.50 -> 0.76 GiB, arena
+  +2.8 GiB).  MTP only, embedded-head only; a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full
+  cache.  The ring is `find_slot`'s `n_swa` reclaim, so no allocator and no mask change — and `kq_mask_derivable`
+  needs **no** exclusion, because its predicate compares each cell's *position*.  Every `block NN`
   reference elsewhere in this file that is not one of the V2.1 numbers below is the **pre-V2.1 16-block
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,
   **03** chunked GDN, **04** BF16 KV, **05** FA band/native/derived, **06** MMB, **07** k-quant,
   **08** fused kernels (fused MoE), **09** host-resident MoE (slab/cache), **10** slab + fusion dispatcher
   + async input ring + the rope/row-concat reorders + the 1-token router fold (infrastructure), **11**
   qwen4exp (model/QSA/HC/lazy reader), **12** campaign
-  remainder, **13** MTP draft vocabulary subset (opt-in).  V2.1 split r109's old block 10 in two: the
+  remainder, **13** MTP draft vocabulary subset (opt-in), **15** the streamed KV: window (Goal A) + attendance
+  pool (Goal B), both opt-in.  V2.1 split r109's old block 10 in two: the
   **infrastructure stays 10**, the **qwen4exp architecture is 11** (QSA went with it by decision), so
   every pre-r109 "block 10" note about slab / dispatcher / async-input is still block 10 while a note
   about qwen4exp / QSA / HC / the lazy reader is now block 11.
@@ -303,7 +314,7 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   rotation runs as before and no cache entry is created), `GGML_CUDA_QK_PAIR_FWHT` (the pair, quantized form) and
   `GGML_CUDA_FUSE_ROPE_FWHT` (rope + rotation for models without Q/K norm — **the only one that runs in prefill
   too**, so it carries the prefill-logit obligation; it fires on gpt-oss on our models, not on qwen/gemma).
-  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` (other types keep their launches, `TODO` #190), and
+  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` (other types keep their launches, `TODO` #120), and
   they are worth **+13.4 % tg128 / +10.1 % @4096** on a 30B-A3B q8_0-KV arm (gfx1201) with **f16 KV unchanged** —
   so **a coherence or perf claim about them must name a `q8_0` KV arm**, and multi-device arms are mandatory
   (the submitter tested one card).  `GREEDY-PURITY.md` §74, `benchmarks/2026-10-31-kv-rotation-decode.md`,
@@ -557,6 +568,13 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   same-kernel ubatch change measures 0.105 / 85 %) and always prints a same-kernel control, so the
   absolute limits stay the criterion without an insensitive point waving a bad change through.
   Protocol: `benchmarks/prefill-logit-methodology.md`, `GREEDY-PURITY.md` §46.
+  **A base is per ROCm line (r192, TODO #126).**  The `.meta` records the ROCm line the base's binary
+  linked, and a compare against a build on a different line is **refused** (`--allow-base-mismatch` shows
+  the number anyway): the same tree reads 0.005657 / 96.794 % on 10.1.0 and 0.005688 / 96.765 % on 7.14.1
+  at the 35B-A3B point, i.e. a cross-line "divergence" is the compiler.  When a gate failure appears at a
+  point that used to pass, check `.meta`'s `build=`/`rocm=` and the `gate-prefill-logits.sh` header line
+  before suspecting the change: a stale base read as a gate failure for six releases (#126) because the
+  r161 re-record was written on another host.
 - **The sequences that verify in one step must present the same row count (r153, issue #234).**
   `llama_memory_hybrid::init_batch()` splits a decode with `llama_batch_allocr::split_equal()`, which takes one
   token per sequence set per round and **stops at the shortest set**, so two slots verifying different draft
@@ -1121,6 +1139,21 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `--cache-reuse`).  The per-sequence tracker is block 03's (`prepare()` folds in every ubatch;
   `LLAMA_RS_ROLLBACK_DEBUG=1` shows `RSPREP`/`RSROLL`).  Record + probe:
   `archive/work/rs-rollback-boundary/`.
+- **A recurrent cell that `find_slot` moves keeps its rollback snapshot planes (r195, PR #261, block 03).**
+  `build_rs` relocates the "extra states" (the cells inside `[head, head + n_rs)` that no sequence of the
+  ubatch uses); it used to copy **plane 0 only**, so from 3 cells on a moved cell's planes `1..n_rs_seq`
+  stayed at the old index and were overwritten by the cells that took their place, and that sequence's next
+  rollback read another sequence's snapshot: silent wrong text on a multi-slot server, no log line.  It now
+  also copies planes `1..n_rs_seq` through the new input `s_copy_extra`, gathered **before** the ubatch's
+  snapshot writes (**node order is the only ordering guarantee**: two views of one tensor create no
+  dependency edge), with the ids from `s_src()` because `s_copy()` *consumes* the sequence's pending
+  rollback index.  Where `n_rs == n_seqs` (every single-sequence batch, and a 2-cell cache) the graph does
+  not change, so every single-sequence gate (coherence, prefill-logit, the four-axis MTP protocol) is blind
+  to it, as is text in general (the wrong read is still fluent).  The defect is **upstream's** (`6050b467c`
+  and master `0ec4027a2` both carry it), so the same change is kept as an upstream candidate.  Gate:
+  `test-recurrent-state-depth`'s **Phase C** (two-arm replay-logit comparison; 15/15 arms differ by
+  2.94-9.64 logits on r194 and by 0 on r195, 1 GPU and 3 GPU `-sm tensor`).  Record:
+  `archive/work/recurrent-moved-cell-snapshots/`, `GREEDY-PURITY.md` §79.
 - **Test baselines are per box *and* per model: never compare to a number in this file.**  E.g.
   `test-recurrent-state-depth` on Qwen3.6-35B-A3B-UD-Q3_K_M: **130** failures on gfx1201, **153** on
   gfx1151; the gate is that the per-arm FAIL/PASS set is unchanged, not that the count is zero.  Run it
@@ -1252,9 +1285,19 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `Flash-Next GSQ-IQ3_XXS -sm tensor -ncmoe 48` abort at load on r182 and earlier (`ggml_cuda_cpy`, device 1,
   qwen4exp's `blk.1.ple_conv1d.weight` column view; `-sm layer` and `GGML_CUDA_SLAB=0` both loaded).  The exact
   driver rule is unverified (shrinking the 2-D copy by one row still failed), so the guard is deliberately
-  conservative; the scalar kernels are bit-identical and no other model we hold reaches the path (0 2-D copies
-  in an instrumented run of 35B-A3B / 4B / 27B / gpt-oss).  Do not restore the unconditional fast path without
-  reproducing the arm.  `archive/work/cpy-2d-memcpy-guard/README.md`.
+  conservative and **stays**.  What it does *not* leave alone is the fallback: r183's "no other model reaches
+  the path" was wrong for Flash-Next, which with a **quantized indexer key cache** (`-ctk q8_0`; the fused
+  `INDEXER_SCORE`/`INDEXER_FILL` path is F32/BF16/F16 only) takes qwen4exp's per-op chain and makes one refused
+  copy per layer per prefill chunk — and `cpy_scalar` costs three divisions and three modulos **per element**
+  (1010 ms of a 105k prefill).  Since **r189** the refused F32/16-B-aligned case is copied by `cpy_2d_vec16`
+  (one 16-byte unit per thread, row from the grid, bit-identical): 1010 -> 637 ms there, wall time unchanged on
+  our arms (a **regression fix**, not a speed-up — the campaign's 5.20 -> 1.83 ms/token is its sparse/pool
+  decode shape, which no delivery-only arm reproduced).  "The guard refused" is an **explicit flag**, never
+  inferred from a partially-filled geometry: the `spitch < width || dpitch < width` rejection is a different
+  case (overlapping rows need the flat mapping) and must not reach a row-per-row copy
+  (`GREEDY-PURITY.md` §76).  Do not restore the unconditional fast path without reproducing the arm, and do not
+  narrow the guard without the driver's actual rule.
+  `archive/work/cpy-2d-memcpy-guard/README.md`, `archive/work/cpy-2d-vec16/README.md`.
 - **A `-sm tensor` model load uploads tensors through a pinned staging buffer, one alloc/free per
   tensor** (`ggml_backend_cuda_buffer_set_tensor_2d`, 678 pairs = 2.2 s + 1.1 s of a ~10.7 s load on a 27B
   Q8_0 at 3 devices).  This is *load* time, not decode.  Since **r116** the staging buffer is grow-only

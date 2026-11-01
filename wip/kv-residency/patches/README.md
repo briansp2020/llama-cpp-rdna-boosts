@@ -9,6 +9,13 @@ in `patches/`, not in `release.json`, and no block in the delivery reads them.  
 They are stored here so a cold session can reproduce the exact tree the campaign was measured on, and so the
 work is backed up with the record that explains it.
 
+**Two series live here.**  `0001..0014` in *this* directory are **Goal A's** series (base r174, `5bdec04ab`);
+it shipped as delivery **block 15** and is kept as the Goal A measurement record.  **Goal B's** series is
+[`goal-b/`](goal-b/README.md) — 7 patches on the **r186** base (`8f9dad0be`), applied tree
+`14e76aa2af4135b13cd3657895f04460d3d80774` == branch `wip-kv-residency-b` (`b98cb3e43`), verified 2026-10-31.
+Patches 0006/0007 of that series (A12, A13) are **delivery fixes**, not campaign code, and are also staged as
+`beta/0016-copy-2d-vec16/` / destined for blocks 10 and 11.
+
 ## How to reproduce the tree
 
 The patches apply to the **r174** release tip, `5bdec04ab` (`v15-6050b467c-r174`, base `6050b467c`).

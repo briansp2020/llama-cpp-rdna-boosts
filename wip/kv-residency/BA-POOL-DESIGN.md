@@ -3,8 +3,10 @@
 **Status: STEPS 1 AND 2 ARE BUILT AND GATED (session A10, §7), the ACCEPTANCE TABLE IS COMPLETE AT THREE DEPTHS
 and the sparse arm is attributed (session A11, §8), and the page policy (step 3 of §4) is measured dead (§8.4).**
 A12 (§9) rebased the branch onto r186, found and fixed a delivery regression the rebase exposed, and identified
-the indexer chain's root cause: with a quantized indexer key cache the fused/derived scorer is skipped entirely.
-What is left is the quantized-key fused path (§9.4) and the promotion decision (§8.6).  Every number is measured on this box
+the indexer chain's root cause (a quantized indexer key cache skipped the fused/derived scorer entirely); **A13
+(§10) fixed that too** — the fused scorer now serves q8_0 and the q4/q5 family byte-identically, worth **+24 %**
+plain decode at 103k.  What is left is a re-measure of the other two depths, the delivery placement of the A12/A13
+fixes, and the promotion decision (§8.6).  Every number is measured on this box
 (1 R9700).  Plan context:
 [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) §3.2-§3.5; instrument and trace: [`qsa-census.py`](qsa-census.py) over a
 48-step decode trace (Flash-Next IQ3, `-c 131072`, 102 912 cells, sparse arm, `GGML_CUDA_DISABLE_GRAPHS=1`).
@@ -261,19 +263,22 @@ bucket, with the call-count filter).
 
 | depth | arm | gen t/s | tokens/step | draft / accepted | prefill t/s |
 |---|---|---|---|---|---|
-| **5 298** (`16384`) | resident dense | **70.94** (71.11 / 70.77) | 2.65 | 766 / 319 (41.6 %) | 523-526 |
-| | resident sparse | **70.65** (70.67 / 70.63) | 2.78 | 728 / 328 (45.1 %) | 523-525 |
-| | pool (204 MiB) | **70.30** (70.31 / 70.29) | 2.78 | 728 / 328 | 520-522 |
+| **5 298** (`16384`) | resident dense | **72.09** (A11: 70.94) | 2.65 | 766 / 319 (41.6 %) | 525.8 |
+| | resident sparse | **71.58** (A11: 70.65) | 2.78 | 728 / 328 (45.1 %) | 524.5 |
+| | pool (204 MiB) | **71.27** (A11: 70.30) | 2.78 | 728 / 328 | 522.0 |
 | **102 899** (`131072`) | resident dense | **58.27** | 2.83 | 715 / 331 (46.3 %) | 518.3 |
 | | resident sparse | **53.92** (−7.5 %) | 2.84 | 715 / 332 (46.4 %) | 518.0 |
 | | pool (204 MiB, mirror 1.6 GiB) | **54.20** (−7.0 %) | 2.84 | 715 / 332 | 491.4 (−5.1 %) |
-| **180 035** (`196608`) | resident dense | **48.73** (48.72 / 48.74) | 2.75 | 739 / 326 (44.1 %) | 482.3 |
-| | resident sparse | **42.93** (−11.9 %) | 2.71 | 745 / 323 (43.4 %) | 482.0 |
-| | pool (204 MiB, mirror 2.4 GiB) | **43.09** (−11.6 %) | 2.71 | 745 / 323 | 443.8 (−8.0 %) |
+| **180 035** (`196608`) | resident dense | **48.94** (A11: 48.73) | 2.75 | 739 / 326 (44.1 %) | 480.9 |
+| | resident sparse | **43.16** (−11.8 %) (A11: 42.93) | 2.71 | 745 / 323 (43.4 %) | 480.9 |
+| | pool (204 MiB, mirror 2.4 GiB) | **43.41** (−11.3 %) (A11: 43.09) | 2.71 | 745 / 323 | 443.6 (−7.8 %) |
 
 * **The pool lands on the sparse ceiling at every depth** (+0.5 % / +0.6 % / +0.35 % vs the forced-sparse arm —
   i.e. all noise), so the pool's *placement* is free and the remaining gap to a resident KV is the sparse decode
   arm's own cost (8.5).
+* The **5.3k row was re-measured after A12/A13** (`acceptance-arms.sh 5k`): the arms are ~1.4 % faster than the A11
+  numbers in parentheses and the *ratios* are unchanged (pool −1.1 % vs dense), with text byte-identical to A11's
+  (`296 91ef8940d66e` / `332 dd1981213373`) and 99.26 % pool hits.
 * **5.3k is the first depth where the pool is free** (the brief expected a −3.5 % streaming tax there; it is not
   there): a 16 416-cell pool is *the whole cache* at `-c 16384` (the KV is 204 MiB there, i.e. the same 204 MiB
   as the pool), so 99.25 % of ids hit and only the misses and the indexer touch the mirror; prefill is neutral
@@ -284,6 +289,15 @@ bucket, with the call-count filter).
   **204 MiB pool instead of the resident attention KV's 1 632 MiB (103k) / 2 448 MiB (180k)** — plus the arena
   gain of §7.5.  (§7.4's "816 MiB resident KV" was the `-c 65536` arm's KV at a 103k-deep prompt, not the 103k
   arm's; a q8_0 cell is 1 088 B × 12 layers, so `-c × 13 056 B`.)
+* **The 180k row was re-measured on the final build (2026-10-31, A14: the r188 base with A12 + A13)**, since it
+  was the one row that predated both fixes: dense **48.94** / sparse **43.16** / pool **43.41** t/s at 2.75 /
+  2.71 / 2.71 tokens per step (739/326, 745/323, 745/323 drafts), prefill 480.9 / 480.9 / 443.6, pool hits
+  **93.34 %** of ids over 2 268 resolves.  The sparse penalty is **−11.8 %** and the pool lands on the sparse
+  ceiling (**+0.58 %**, i.e. noise), exactly as the A11 row did.  Text at this depth (`-n 64`): pool == sparse
+  **861 chars `263c7f2be4d9`**, dense **835 chars `0024435b7077`** (a different attention regime,
+  `GREEDY-PURITY.md` §45/§63) — the same shape as 5.3k and 51 475.  Re-gated on the r190 delivery build:
+  pool == sparse `332 dd1981213373` (5.3k), `854 43b30de151b9` (51 475), `861 263c7f2be4d9` (180k), pool verify
+  `bad 0`, prefill-logit 0.000000 / 100.000 % against this campaign's own base (PPL 2.9225, sha256 `acfb4145…`).
 * Pool hit rate: **99.25 %** (5.3k), **92.5 %** (103k), **93.4 %** (180k) of ids; 2 160-2 268 resolves.
 * Text: pool **==** sparse at every depth measured (5.3k `332 chars dd1981213373`, 51 475
   `854 chars 43b30de151b9`); dense differs from both (the documented regime change, `GREEDY-PURITY.md`
@@ -454,7 +468,11 @@ multiples of 16 B (and both pointers are 16-B aligned), copy the same block with
 thread**, the row index taken from the grid so there is no division at all.  Bit-identical by construction
 (16 B = four whole floats, same type, same offsets); every other geometry falls back exactly as before, and
 **the guard itself is untouched**, so the r183 load fix stands.  Commit `f8e47e392` on the campaign branch;
-it belongs in **block 10** (`ggml/src/ggml-cuda/cpy.cu`).
+it belongs in **block 10** (`ggml/src/ggml-cuda/cpy.cu`).  **PROMOTED: shipped in `v16-6050b467c-r189`**
+(block 10, plus an explicit `guard_refused` flag instead of the `width != 0` inference -- see
+`archive/work/cpy-2d-vec16/`, `GREEDY-PURITY.md` §76, `benchmarks/2026-10-31-cpy-2d-vec16.md`; the delivery's
+own arms show the copies are *prefill*-phase, so the r189 record carries it as a regression fix, and the
+decode-side numbers above are this campaign's pool/sparse shape).
 
 | measured (103k, `-n 512`, MTP-4, q8_0; arms interleaved) | rebased r186 | with the fix | r182-era |
 |---|---|---|---|
@@ -516,3 +534,75 @@ Three conclusions:
 * **A13-2 (policy, only if A13-1 is rejected):** keep the *indexer* cache in bf16 while the attention KV stays
   q8_0.  Costs `O(depth)` VRAM — at 103k the keys-only indexer cache goes 158 MiB → 316 MiB — and needs the
   `-ctk` plumbing, `--fit` and the docs to know it is a separate type.
+
+## 10. A13 (2026-10-31) — the fused indexer scorer now accepts QUANTIZED keys (the item, done)
+
+§9.3 named the root cause: with a quantized indexer key cache the fused `INDEXER_SCORE` + derived `INDEXER_FILL`
+path (both default-on) was skipped, and the per-op chain re-materialised the whole indexer key cache in F32 every
+step.  A13 closes it for the block types whose 32-element block divides `idx_dim` (128): **q8_0 and the whole
+q4/q5 family plus iq4_nl** — i.e. every quantized `-ctk` except the k-quants.
+
+**Branch `wip-kv-residency-b` `b98cb3e43`.**  Five files:
+
+* `ggml/src/ggml-cuda/indexer-score.cu` — `indexer_score_ld_chan(row, c, nb0K, ktype)` replaces the
+  element-address loader; the pooling helper is row-addressed (a bit-identical address for the float types, where
+  `nb0K` is 4/2/2).  Quantized rows are addressed in `nb0K`-byte blocks and dequantized with **ggml's own**
+  `dequantize_q8_0/q4_0/q4_1/q5_0/q5_1/q4_nl`, i.e. the same values `get_rows` gives the chain — that is what keeps
+  the two paths byte-identical.  Two packings matter: q8_0 holds one element per byte, while the 4/5-bit types put
+  a byte's low nibble at channel `b` and its high nibble at `b + 16`.  `indexer_score_ktype()` maps the type to the
+  kernel code and is used by both `_supported` predicates and both impls' asserts.
+* `ggml/include/ggml.h` + `ggml/src/ggml.c` — `ggml_indexer_key_type_supported()`, one predicate for the two
+  constructors, the CUDA kernels and the memory layer; the ctors accept the widened set.
+* `src/models/qwen4exp.cpp` — `idx_key_float` → `idx_key_fused` (the predicate), so a quantized cache takes the
+  fused path; the stale "env-gated probe" comments now say default-on (`GGML_CUDA_QSA_INDEXER_SCORE=0` is the chain).
+* `src/llama-memory-hybrid-idx.cpp` — `pool_create` builds the derived pool for those types too.
+
+### 10.1 Gates (Flash-Next IQ3_XXS, 1 GPU, `-ncmoe 48`, PLE flags, `ROCBLAS_USE_HIPBLASLT=0`)
+
+The A/B is the **pre-change per-op chain**, `GGML_CUDA_QSA_INDEXER_SCORE=0` — a built-in arm, not a second build.
+
+| gate | result |
+|---|---|
+| text, 5.3k greedy, **every supported key type** (fused vs chain) | **identical on all 8**: q8_0 296 `91ef8940d66e` / sparse 332 `dd1981213373` (**== the pre-change build's hashes**), f16 333 `c42a586a6d13`, bf16 296 `91ef8940d66e`, q4_0 307 `097ff06194d6`, q4_1 307 `097ff06194d6`, q5_0 336 `bd82b7ed544c`, q5_1 296 `3205db133b1d`, iq4_nl 323 `d7aba1c58e0c` |
+| q8_0 with `GGML_CUDA_QSA_INDEXER_CACHE=0` (fused, **no** derived pool) | 296 `91ef8940d66e` — the same, so the raw-pooling branch is covered too |
+| text, 51 475 depth, pool arm | q8_0 **854 `43b30de151b9`** (== the pre-change hash); q4_0 841 `65097e7c8630`, fused == chain |
+| prefill-logit gate **`--ub 1`** (the decode graph; base arm = the chain) | **0.000000 KLD / 100.000 % top-p** |
+| prefill-logit gate, ctx 16384, against the A12 base | 0.000000 / 100.000 % |
+| `test-backend-ops -o FLASH_ATTN_QSA` | OK |
+| `check-gpu-faults.sh` over every log | clean |
+
+### 10.2 Worth (103k, arms interleaved)
+
+| | A12 (copy fix) | **A13 (fused path)** | bf16 fused (the proxy) |
+|---|---|---|---|
+| plain decode, decode GPU kernel time | 23.68 ms/token | **17.73** | 17.83 |
+| plain decode, wall (profiled) | 29.3 t/s | **36.3 (+24 %)** | 36.2 |
+| indexer bucket, plain decode | 5.31 ms/token | **2.01** | 2.01 |
+| MTP-4 `-n 512`, resident dense | 58.63 | 59.10 | 55.38 (2x KV bytes) |
+| MTP-4 `-n 512`, resident sparse | 54.26 | **54.70** | 50.40 |
+| MTP-4 `-n 512`, pool | 54.52 | **54.65** | 50.96 |
+
+* The log now says *"derived indexer cache (pool) = 12 layers x 128 dims x 1 streams, ENABLED"* for q8_0 (it said
+  *"skipped (q8_0 keys, derived cache enabled)"*).
+* **Plain decode gets the whole fused-path prize on the product KV type**: the dequantizing kernel lands exactly
+  where the bf16 arm did (17.73 vs 17.83 ms/token), so nothing is lost to the quantized load.
+* **MTP-4 barely moves (+0.8 %)** — as §9.3 predicted: the indexer is amortised over ~2.84 tokens/step there and
+  the MoE/expert traffic owns the token.  The campaign's MTP-shape row is therefore unchanged by A13; its 103k row
+  is now **59.10 / 54.70 / 54.65** (dense / sparse / pool, `-n 512`).
+* Compared with where A12 started on the rebased tree (58.92 / 50.42 / 50.63), the two sessions together are
+  **+0.3 % / +8.5 % / +7.9 %** on the three arms, and plain decode is 27.02 → 17.73 ms/token (**−34 %**).
+
+### 10.3 What is left
+
+> **PROMOTED in r190** (block 11, TODO #118): the quantized-key fused scorer is in the delivery,
+> together with A12 (block 10, r189), the pool itself (block 15) and B2 (block 15).  §10.3's items 1-2 are
+> therefore done; k-quant indexer keys (item 3) remain the accepted limitation.
+
+1. **Re-measure the other two depths on this build** (5.3k and 180k, `-n 512`) — the 180k row predates A12 and A13.
+2. **Where A12 and A13 land in the delivery** (the maintainer's call): A12's `cpy_2d_vec16` repairs r183's guard
+   fallback (**block 10**), A13's quantized-key fused loader is qwen4exp/QSA code (**block 11**).  Both are
+   delivery fixes in their own right, independent of the pool's promotion.
+3. **k-quant indexer keys remain on the chain** (`q6_k` etc.): their 256-element superblock does not divide
+   `idx_dim` = 128, so a row is not a whole number of blocks and this loader cannot serve them.  A12's copy fix is
+   what keeps that path cheap.  Accepted limitation.
+4. Promotion of the pool is still the maintainer's decision (§8.6 item 4).

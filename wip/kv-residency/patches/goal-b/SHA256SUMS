@@ -1,0 +1,7 @@
+916caa87412c628a545d3199c20ad3681b5054a5180dbf67532741724b63f382  0001-wip-kv-residency-B1-per-cache-window-override-DIAGNO.patch
+c94b4ef2b00966e90d9e8ad41ea1cbc21258d139d88d349f89791ae7e222acef  0002-wip-kv-residency-B2-a-STREAMING-KV-takes-the-sparse-.patch
+bef89bf593f65976b6c0109b515536a1387a5fc6939456fd36e0c1f397e0c516  0003-wip-kv-residency-B1-c-attended-set-census-top-k-trac.patch
+364640651f3b24b68999057a5eb209fa5886001dbc9be453734b120ba3058e07  0004-wip-kv-residency-B-A-the-attendance-pool-for-the-att.patch
+6882a06484f0a873ddf5bfb1dadc68bf4fb5e663b6d7c282de08aadaddef9a3a  0005-wip-kv-residency-B-A-the-pool-mirror-is-host-memory-.patch
+139526df79eebe0968c8962ae4b1a594431aef434365f816ccd72d388c7fe5ac  0006-wip-kv-residency-A12-a-vectorised-fallback-for-the-2.patch
+8fddf35246faa01d35e620c41beec093977cc82475768b04a6f962aecb8c8858  0007-wip-kv-residency-A13-the-fused-indexer-scorer-accept.patch

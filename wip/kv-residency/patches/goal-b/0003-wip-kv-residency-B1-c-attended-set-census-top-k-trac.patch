@@ -1,0 +1,86 @@
+From 381df88508cbae49bfd733aa88d9b73ae81fce2b Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Fri, 30 Oct 2026 21:11:02 -0500
+Subject: [PATCH 3/7] wip/kv-residency B1(c): attended-set census (top-k trace
+ + replayer)
+
+LLAMA_QSA_STREAM_CENSUS=<path> records every decode-band top-k list
+([nrows,k,n_kv,n_blocks,name_len,name,ids...]); qsa-census.py (delivery
+repo, wip/) turns it into the attended set's size, its step-to-step
+Jaccard, and the hit rate an LRU / F-LRU / static-ordering pool of N
+cells would get.  A readback cannot be captured, so the arm needs
+GGML_CUDA_DISABLE_GRAPHS=1 and the sparse arm.
+
+Result (48 steps, 12 layers, -c 131072, 102 912 cells): 2051 attended
+cells/layer/step, Jaccard median 0.586, LRU 84.5 % at 4096 cells/layer
+and 90.2 % at 8192 (2.5 MiB/token vs 25.5 zero-hit); adaptive beats a
+pre-calculated static ordering (84-90 % vs 63-68 %).
+
+Diagnostic only, campaign branch.
+---
+ ggml/src/ggml-cuda/indexer-topk.cu | 35 ++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
+index 19335a582..c858ed933 100644
+--- a/ggml/src/ggml-cuda/indexer-topk.cu
++++ b/ggml/src/ggml-cuda/indexer-topk.cu
+@@ -1,6 +1,10 @@
+ #include "indexer-topk.cuh"
+ #include "common.cuh"
+ 
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
+ // Fused indexer expand + mask + top-k.
+ //
+ // The qwen4exp indexer scores blocks, then every cell of a block carries the
+@@ -927,6 +931,18 @@ static void indexer_topk_radix_cuda_blocks(
+ }
+ 
+ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    // wip/kv-residency (TODO #118) B1(c) DIAGNOSTIC -- campaign branch only, NEVER shipped.  See the dump at
++    // the end of this function.
++    static FILE * qsa_census_f = []() -> FILE * {
++        const char * p = getenv("LLAMA_QSA_STREAM_CENSUS");
++        if (p == nullptr || p[0] == '\0') {
++            return nullptr;
++        }
++        FILE * fp = fopen(p, "ab");
++        GGML_LOG_WARN("%s: DIAGNOSTIC: attended-set census -> %s (run with GGML_CUDA_DISABLE_GRAPHS=1 and the "
++                      "sparse decode arm; timings from this arm are meaningless)\n", __func__, p);
++        return fp;
++    }();
+     const ggml_tensor * score    = dst->src[0];
+     const ggml_tensor * cell_blk = dst->src[1];
+     const ggml_tensor * additive = dst->src[2];
+@@ -989,6 +1005,25 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+         indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data, extra,
+                 dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, false, stream);
+     }
++
++    // wip/kv-residency (TODO #118) B1(c): record this call's selection, DECODE BAND ONLY (`nrows <= 8`; a
++    // prefill row set is thousands of queries wide and irrelevant to a residency policy).  One record is
++    // [nrows, k, n_kv, n_blocks, name_len, name, ids...]; `wip/kv-residency/qsa-census.py` turns them into
++    // the attended set's size and its step-to-step stability (the hit rate a pool of N cells would get),
++    // which is what decides whether an attendance-driven pool beats block 15's recency window
++    // (../llama-cpp-rdna-boosts/wip/kv-residency/B1-STRATA-PLAN.md §3.4).
++    if (qsa_census_f != nullptr && nrows > 0 && nrows <= 8 && k > 0) {
++        std::vector<int> host((size_t) k * nrows);
++        CUDA_CHECK(cudaMemcpyAsync(host.data(), dst_d, host.size() * sizeof(int), cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        const int hdr[4]   = { nrows, k, n_kv, n_blocks };
++        const int name_len = (int) strlen(dst->name);
++        fwrite(hdr, sizeof(int), 4, qsa_census_f);
++        fwrite(&name_len, sizeof(int), 1, qsa_census_f);
++        fwrite(dst->name, 1, (size_t) name_len, qsa_census_f);
++        fwrite(host.data(), sizeof(int), host.size(), qsa_census_f);
++        fflush(qsa_census_f);
++    }
+ }
+ 
+ bool ggml_cuda_indexer_top_k_supported(int device, const ggml_tensor * dst) {
+-- 
+2.55.0
+
