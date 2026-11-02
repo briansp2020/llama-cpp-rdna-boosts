@@ -1,7 +1,7 @@
-From 4c91394f931ac54acde972b94883dc4f3f9b1396 Mon Sep 17 00:00:00 2001
+From 171cccbdd3d556fc797698157c304dc7499ae8c9 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 21:37:18 +0000
-Subject: [PATCH 15/22] ours: the pinned snapshot ring and lazy split events by
+Subject: [PATCH 16/23] ours: the pinned snapshot ring and lazy split events by
  default only with more than one device
 
 On a single GPU both measured about -1 % decode each (FINDINGS 639); on 1x R9700 the gate gives tg128 +1.8 % on
@@ -14,7 +14,7 @@ one non-CPU backend / CUDA device) keeps the previous behaviour.
  2 files changed, 27 insertions(+), 6 deletions(-)
 
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index d9c687bb4..0731b3acd 100644
+index 02e9cef6a..44b922ffd 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1210,7 +1210,11 @@ struct ggml_backend_sched {
@@ -29,7 +29,7 @@ index d9c687bb4..0731b3acd 100644
      struct ggml_tensor ** graph_inputs;
      int n_graph_inputs;
      int graph_inputs_capacity;
-@@ -2772,9 +2776,9 @@ static bool sched_sync_graph_inputs(void) {
+@@ -2817,9 +2821,9 @@ static bool sched_sync_graph_inputs(void) {
  }
  
  
@@ -42,7 +42,7 @@ index d9c687bb4..0731b3acd 100644
  }
  
  // The split event of backend `b`, recorded now if the split end left it pending.
-@@ -3241,7 +3245,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -3308,7 +3312,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
  
          // record the event of this split
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -51,7 +51,7 @@ index d9c687bb4..0731b3acd 100644
                  sched->events_pending[split_backend_id][sched->cur_copy] = true;
              } else {
                  ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
-@@ -3288,6 +3292,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -3355,6 +3359,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->n_backends = n_backends;
      sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
@@ -72,10 +72,10 @@ index d9c687bb4..0731b3acd 100644
      // initialize hash table
      // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index c6e9ed655..bbbcc1588 100644
+index f46749f72..452e9985a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6256,14 +6256,18 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -6285,14 +6285,18 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
      // where it was before r90: one H2D on this backend's stream, already ordered after the scheduler's
      // wait.  (local: r90 queued the snapshot on the graph-input upload ring, whose batch kernel /
      // per-thread-stream copy with cross-stream event waits cost ~2.7 % decode here, at ~13 such small

@@ -1,7 +1,7 @@
-From 80ee0828835579d20c08c9684d08d630ce3fc7fc Mon Sep 17 00:00:00 2001
+From 3391929c3c0e93b76e37fb689839ebe6e7ce44f6 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 20:31:47 +0000
-Subject: [PATCH 21/22] ours: dedup the mmap expert-cache helpers and drop a
+Subject: [PATCH 20/23] ours: dedup the mmap expert-cache helpers and drop a
  no-op (no behaviour change)
 
 - moe_cache_expert_copy: one inlined copy body for the one-fill, stage and route kernels
@@ -19,7 +19,7 @@ Prod model (1 R9700, prod config): greedy a266d1025664, 259.6k needle correct; q
  2 files changed, 122 insertions(+), 182 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index bbbcc1588..00e33f786 100644
+index 452e9985a..fbca779df 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2034,6 +2034,30 @@ static char * ggml_cuda_pin_chunk(int device, std::unique_lock<std::mutex> & loc
@@ -81,7 +81,7 @@ index bbbcc1588..00e33f786 100644
              return;
          }
          if (lock.owns_lock()) {
-@@ -6434,24 +6441,8 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+@@ -6492,24 +6499,8 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
                  std::unique_lock<std::mutex> lock;
                  char * pin = ggml_cuda_pin_chunk(cuda_ctx->device, lock);
                  GGML_ASSERT(pin != nullptr && "cannot allocate the pinned staging chunk");

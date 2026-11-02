@@ -1,7 +1,7 @@
-From 1ecf84bff6e593f329eead981c124cf744a05235 Mon Sep 17 00:00:00 2001
+From 0545e01f6bf6cbcc0af1a0bc5b32c7a0b60443dc Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 1 Nov 2026 11:16:31 +0000
-Subject: [PATCH 22/22] moe cache device remap: review fixes -- forget_all
+Subject: [PATCH 21/23] moe cache device remap: review fixes -- forget_all
  drops the pending sibling batches, a sibling joins a launch only for its own
  last routing buffer and stream, system-scope lag flag store
  (__hip_atomic_store / atomicExch)

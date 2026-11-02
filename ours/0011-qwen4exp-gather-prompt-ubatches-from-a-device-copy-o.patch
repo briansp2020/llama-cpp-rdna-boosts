@@ -1,7 +1,7 @@
-From 5cef305dd642a9d02e3c26ccb1a57fe4a1b26255 Mon Sep 17 00:00:00 2001
+From f028aed7615472ce5a629ef5441f6f6fe73ee45e Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 18:04:11 +0000
-Subject: [PATCH 10/22] qwen4exp: gather prompt ubatches from a device copy of
+Subject: [PATCH 11/23] qwen4exp: gather prompt ubatches from a device copy of
  the token embedding
 
 The token embedding lives in host memory, so every graph starts with a
@@ -26,7 +26,7 @@ rotated (Hadamard) table.  Same dequantized values.
  3 files changed, 24 insertions(+), 1 deletion(-)
 
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 78f231057..df56fc32e 100644
+index 74f90509c..1ac0d1687 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -754,6 +754,7 @@ struct llama_model {
