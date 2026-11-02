@@ -1,4 +1,4 @@
-From 58252b4e855c28a87f0225ad43c97b82eef0767d Mon Sep 17 00:00:00 2001
+From e4f84f5ad4cfe09921987f47f29576e33bb1919c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: relaxed-tensor split mode
@@ -136,7 +136,7 @@ index db30957cd..4b2783ec4 100644
          GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
          GGML_BACKEND_SPLIT_AXIS_UNKNOWN = 99,
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 68f2161fe..05fad4da3 100644
+index ca66455a2..d929ed5db 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -54,6 +54,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
@@ -453,5 +453,5 @@ index 696812526..5f2b6e9be 100644
          g.cb(logits, "dflash2_logits_gathered", -1);
      }
 -- 
-2.55.0
+2.56.0
 
