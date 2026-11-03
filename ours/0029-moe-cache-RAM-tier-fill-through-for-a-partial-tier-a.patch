@@ -1,0 +1,138 @@
+From 1175809570d13f6d9db3c840d9cd83eb07550ee9 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 2 Nov 2026 08:25:57 +0000
+Subject: [PATCH 29/41] moe cache RAM tier: fill-through for a partial tier --
+ a routed expert outside the tier is copied into it in place of its coldest
+ unrouted member, so a partial table never declines or reads the file alias
+ (GGML_MOE_TIER_FILL)
+
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 74 +++++++++++++++++++++++---
+ 1 file changed, 68 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 3f7d840c2..da2897ea8 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -919,6 +919,16 @@ static int64_t g_tier_partial = 0;   // tables left without a tier by the pin bu
+ static int64_t g_tier_share_tables = 0;   // tables given a partial tier (an equal per-layer share of the budget)
+ static int64_t g_tier_file_fills   = 0;   // admissions of an expert outside a partial tier (filled from the alias)
+ static int64_t g_tier_file_victims = 0;   // victims of a partial tier with no RAM slot (back to the file alias)
++static int64_t g_tier_thru = 0;           // fill-through: routed experts outside a partial tier copied into it
++// GGML_MOE_TIER_FILL (default on): a partial tier fills its routed non-members through (tier_fill_through_locked) and
++// never reads the file alias; =0 reads them through the registered alias (declines when it cannot register).
++static bool tier_fill_on() {
++    static const bool v = [] {
++        const char * e = getenv("GGML_MOE_TIER_FILL");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return v;
++}
+ static int64_t g_tier_swaps_d2h = 0;   // swaps that copied the victim back on the compute stream
+ static int64_t g_tier_nospare   = 0;   // misses served cold because no spare RAM slot (or precopy of the victim) was ready
+ static int64_t g_pc_issued = 0, g_pc_used = 0, g_pc_reclaimed = 0;
+@@ -1400,6 +1410,54 @@ static void precopy_plan_locked(table_t & t, void * stream, const int32_t * prot
+ 
+ static cudaError_t sparse_fill_locked(const table_t & t, void * dst, int32_t e, void * stream);
+ 
++// Partial tier, eager call (GGML_MOE_TIER_FILL): copy every routed expert that is neither resident nor a member into the
++// tier, in the RAM slot of the member with the smallest decaying demand (ghost, then oldest use) that this call does not
++// route; its cold pointer is set on the compute stream before the op.  The GPU reads none of those slots now: the
++// scheduler synchronized for the routing readback, the slots of pending swaps (ram_pending) and copy-back targets
++// (t.precopy) belong to no member, and an expert outside the tier is never read (this runs before every read of it).
++// False when no member can make room (the caller declines, as without the fill).
++static bool tier_fill_through_locked(table_t & t, const std::vector<int32_t> & used, void * stream) {
++    if (!t.ram_partial || t.ram_base == nullptr || stream == nullptr || !tier_fill_on()) {
++        return true;
++    }
++    std::vector<uint8_t> routed((size_t) t.n_experts, 0);
++    for (int32_t e : used) {
++        routed[(size_t) e] = 1;
++    }
++    device_guard       dg(t.device);
++    const cudaStream_t s  = (cudaStream_t) stream;
++    const size_t       eb = t.expert_bytes;
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        if (!routed[(size_t) e] || t.ram_slot[(size_t) e] >= 0 || t.expert_slot.find(e) != t.expert_slot.end()) {
++            continue;
++        }
++        int32_t v = -1;
++        for (int32_t c = 0; c < t.n_experts; c++) {
++            if (t.ram_slot[(size_t) c] < 0 || routed[(size_t) c]) {
++                continue;
++            }
++            if (v < 0 || t.ghost[(size_t) c] < t.ghost[(size_t) v] ||
++                (t.ghost[(size_t) c] == t.ghost[(size_t) v] && t.last[(size_t) c] < t.last[(size_t) v])) {
++                v = c;
++            }
++        }
++        if (v < 0) {
++            return false;
++        }
++        const int32_t q = t.ram_slot[(size_t) v];
++        char *        d = t.ram_base + (size_t) q * eb;
++        t.ram_slot[(size_t) v] = -1;
++        sparse_pack_expert(t, e, d);
++        t.ram_slot[(size_t) e] = q;
++        moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, e, (uintptr_t) d);
++        if (cudaGetLastError() != cudaSuccess) {
++            return false;
++        }
++        g_tier_thru++;
++    }
++    return true;
++}
++
+ static cudaError_t tier_swap_locked(table_t & t, void * dst, int32_t e, int32_t victim, void * stream) {
+     const int32_t p  = e >= 0 && e < (int32_t) t.ram_slot.size() ? t.ram_slot[(size_t) e] : -1;
+     const auto    pc = victim >= 0 ? precopy_find(t, victim) : t.precopy.end();
+@@ -1552,8 +1610,8 @@ static void sparse_trim_locked(const char * why) {
+         }
+         any = true;
+         t.sparse_all = false;
+-        if (t.ram_base != nullptr && !t.ram_partial) {
+-            continue;   // RAM tier: nothing of this master is read in place
++        if (t.ram_base != nullptr && (!t.ram_partial || tier_fill_on())) {
++            continue;   // RAM tier: nothing of this master is read in place (a partial tier with the fill too)
+         }
+         if (!t.allocated || t.sparse_off || t.arena == nullptr || t.slots <= 0) {
+             continue;   // no arena: nothing reads this master in place (update_host / get_cold decline the table)
+@@ -3245,11 +3303,11 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+                 // file again, so it must be cached and registered
+                 const bool to_file = t.ram_free.empty() && precopy_find(t, victim) == t.precopy.end();
+                 const bool victim_prov = slot < (int) t.slot_prov.size() && t.slot_prov[slot] != 0;
+-                if (to_file && !victim_prov && !sparse_in_ram_locked(t, victim)) {
++                if (to_file && !tier_fill_on() && !victim_prov && !sparse_in_ram_locked(t, victim)) {
+                     g_sreg_stay++;
+                     return { nullptr, false };
+                 }
+-                if (!sparse_need_locked(t, expert) || (to_file && !sparse_need_locked(t, victim))) {
++                if (!sparse_need_locked(t, expert) || (to_file && !tier_fill_on() && !sparse_need_locked(t, victim))) {
+                     g_sreg_keep++;
+                     return { nullptr, false };
+                 }
+@@ -7935,6 +7993,9 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     // fixes the value, and the protection makes the success/failure of this hook CONSTANT per table
+     // (true whenever `slots >= used.size()`), which is what a CUDA graph replay needs - a decision that
+     // flips per token cannot be baked into one captured graph.
++    if (!tier_fill_through_locked(t, used, stream)) {
++        all = false;   // no member to make room: the routed non-members are read through the alias, or decline
++    }
+     for (int32_t e : used) {
+         bool cold = false;
+         (void) access_locked(t, e, stream, used.data(), (int) used.size(), &cold);
+@@ -9085,8 +9146,9 @@ void moe_cache_report() {
+     }
+     if (g_tier_swaps > 0 || g_tier_bytes > 0) {
+         GGML_LOG_WARN("%s: RAM tier: %lld tables with a partial tier, %lld fills from the file, %lld victims back to the "
+-                      "file\n", __func__, (long long) g_tier_share_tables, (long long) g_tier_file_fills,
+-                      (long long) g_tier_file_victims);
++                      "file, %lld filled through into the tier, %lld declines\n", __func__, (long long) g_tier_share_tables,
++                      (long long) g_tier_file_fills, (long long) g_tier_file_victims, (long long) g_tier_thru,
++                      (long long) g_decline_all);
+         GGML_LOG_WARN("%s: RAM tier: %.1f MiB pinned, %lld swaps%s; pin budget %.0f MiB, %lld tables without a tier, "
+                       "%lld registrations refused by it\n", __func__, g_tier_bytes / 1048576.0, (long long) g_tier_swaps,
+                       g_tier_off ? " (off)" : "", pin_budget_bytes() / 1048576.0, (long long) g_tier_partial,
+-- 
+2.53.0
+

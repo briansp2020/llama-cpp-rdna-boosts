@@ -1,7 +1,7 @@
 From 6e6bd8b87b3de0f175829f871b6a3b0cc366f14f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 23 Oct 2026 03:52:11 +0000
-Subject: [PATCH 06/23] llama-context: LLAMA_UB_SMALL_SPLIT only for causal
+Subject: [PATCH 06/41] llama-context: LLAMA_UB_SMALL_SPLIT only for causal
  prompt chunks (<= 1 output) and when K > the recurrent rollback tail (review:
  split_equal assert with n-max >= K-1; non-causal; multi-stream verify
  batches)

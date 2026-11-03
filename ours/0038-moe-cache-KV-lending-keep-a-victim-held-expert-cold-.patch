@@ -1,0 +1,111 @@
+From 42186b879610791f4913fdcf40245720ace174b0 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 3 Nov 2026 04:23:15 +0000
+Subject: [PATCH 38/41] moe cache KV lending: keep a victim-held expert cold
+ instead of evicting for it (GGML_MOE_KV_LEND_STAY, default on)
+
+With no free arena slot, a miss on an expert whose victim copy cold_ptrs already names is read from VRAM as it is: no
+eviction and no fill (victims' stream only).  Q2_0 on rdna3: ~18k fewer swaps per run, decode after a 35.8k prompt
+48.1/47.2 vs 41.9/40.5 t/s, identical sha.  Also count the touch-rejected cold misses in the report's victim hits.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 41 ++++++++++++++++++++------
+ 1 file changed, 32 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 6822aaa61..06439cc5f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1048,7 +1048,8 @@ static void *  g_kvl_stream     = nullptr;              // the main model's deco
+                                                         // only stream that makes or drops victims (the MTP draft is
+                                                         // another context with its own stream)
+ static int     g_kvl_pin        = -1;                   // a slot the next fill reads: not reused meanwhile
+-static int64_t g_kvl_fills = 0;                         // admissions filled from a victim slot (device to device)
++static int64_t g_kvl_fills = 0;
++static int64_t g_kvl_stays = 0;                         // misses served from a victim instead of evicting a resident                         // admissions filled from a victim slot (device to device)
+ static int64_t g_kvl_inserts = 0, g_kvl_hits = 0, g_kvl_misses = 0, g_kvl_drops = 0, g_kvl_takes = 0, g_kvl_gives = 0;
+ static double  g_kvl_ms = 0;
+ 
+@@ -1066,6 +1067,12 @@ static bool kvl_on() {
+     static const bool v = getenv("GGML_MOE_KV_LEND") != nullptr && atoi(getenv("GGML_MOE_KV_LEND")) > 0;
+     return v;
+ }
++// GGML_MOE_KV_LEND_STAY (default on with lending): a miss on an expert with a victim copy is served from it (a VRAM cold
++// read) when admitting it would evict a resident, instead of the eviction and fill
++static bool kvl_stay_on() {
++    static const bool v = !getenv("GGML_MOE_KV_LEND_STAY") || atoi(getenv("GGML_MOE_KV_LEND_STAY")) != 0;
++    return v;
++}
+ static int64_t kvl_step() {
+     return 4096;   // rows; a multiple of every n_kv pad
+ }
+@@ -1219,6 +1226,15 @@ static int kvl_keep_locked(table_t & t, int32_t victim, const char * src, cudaSt
+     g_kvl_inserts++;
+     return i;
+ }
++// A miss served cold: a victim copy (if any) serves it from VRAM (reference bit for CLOCK) -- counted for the report.
++static void kvl_note_cold_locked(const table_t & t, int32_t expert) {
++    if (expert >= 0 && expert < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) expert] >= 0) {
++        g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) expert]].ref = true;
++        g_kvl_hits++;
++    } else if (kvl_eligible(t)) {
++        g_kvl_misses++;
++    }
++}
+ // Forget one expert's victim: the caller re-points its cold pointer itself (on the victims' stream).
+ static void kvl_forget_locked(table_t & t, int32_t e) {
+     if (e < 0 || e >= (int32_t) kvl_kvv(t).size() || kvl_kvv(t)[(size_t) e] < 0) {
+@@ -3592,6 +3608,17 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+             if (t.slot_expert[s] < 0) { slot = s; break; }
+         }
+     }
++    // KV lending: with no free slot, an expert whose victim copy cold_ptrs already names is read from VRAM as it is
++    // (no eviction, no fill); the victims' stream only, so its cold pointer is ordered with this call's kernel.
++    if (slot < 0 && cold_ok && out_cold != nullptr && kvl_on() && kvl_stay_on() && g_kvl_in_decode && stream == g_kvl_stream &&
++        expert >= 0 && expert < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) expert] >= 0) {
++        g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) expert]].ref = true;
++        g_kvl_hits++;
++        g_kvl_stays++;
++        *out_cold = true;
++        g_acc_colds++;
++        return { nullptr, false };
++    }
+     // A tier table evicts into a free RAM slot; with none free this call (the spare is still the source of a pending
+     // copy), the miss is served cold and the expert can be admitted on a later call.
+     if (slot < 0 && t.ram_base != nullptr && !t.ram_partial && !t.ram_incl && t.ram_free.empty() && t.precopy.empty()) {
+@@ -3640,6 +3667,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+             g_acc_colds++;
+             g_cold_bytes += (int64_t) t.expert_bytes;
+             *out_cold = true;
++            kvl_note_cold_locked(t, expert);
+             return { nullptr, false };
+         }
+         if (slot >= 0) {
+@@ -3684,12 +3712,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+             *out_cold = true;
+             g_acc_colds++;
+             g_cold_bytes += (int64_t) t.expert_bytes;
+-            if (expert >= 0 && expert < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) expert] >= 0) {
+-                g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) expert]].ref = true;
+-                g_kvl_hits++;
+-            } else if (kvl_eligible(t)) {
+-                g_kvl_misses++;
+-            }
++            kvl_note_cold_locked(t, expert);
+         }
+         return { nullptr, false };
+     }
+@@ -9859,9 +9882,9 @@ void moe_cache_report() {
+                 held += sl.table >= 0;
+             }
+             GGML_LOG_WARN("%s: KV lending: %zu victim slots (%lld held), line %lld of %lld rows; %lld kept, %lld cold reads served "
+-                          "from VRAM, %lld not, %lld dropped, %lld fills from a victim; %lld takes (%.1f ms), %lld gives\n", __func__, g_kvl_slots.size(),
++                          "from VRAM (%lld kept cold), %lld not, %lld dropped, %lld fills from a victim; %lld takes (%.1f ms), %lld gives\n", __func__, g_kvl_slots.size(),
+                           (long long) held, (long long) g_kvl_line, (long long) g_kvl_rows, (long long) g_kvl_inserts,
+-                          (long long) g_kvl_hits, (long long) g_kvl_misses, (long long) g_kvl_drops, (long long) g_kvl_fills, (long long) g_kvl_takes,
++                          (long long) g_kvl_hits, (long long) g_kvl_stays, (long long) g_kvl_misses, (long long) g_kvl_drops, (long long) g_kvl_fills, (long long) g_kvl_takes,
+                           g_kvl_ms, (long long) g_kvl_gives);
+         }
+         GGML_LOG_WARN("%s: RAM tier: %d spares, precopy %s: %lld issued, %lld used (%lld waited), %lld reclaimed; %lld swaps copied back "
+-- 
+2.53.0
+

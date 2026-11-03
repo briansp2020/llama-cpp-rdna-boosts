@@ -19,10 +19,10 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 ```
 git checkout 6050b467c
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r204 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 23 patches
+git am <path-to-this-repo>/ours/*.patch              # 41 patches
 ```
 
-Result: tree `9851e4c9335a`.
+Result: tree `ee0373496f8d`.
 
 ## Patches
 
@@ -41,7 +41,14 @@ Result: tree `9851e4c9335a`.
 | 0019 | the fused MoE gate/up+GLU publishes its Q8_1 at verify widths (2-8 tokens) too, per pair under the dedup | `GGML_CUDA_MOE_GLU_Q8_MULTI=0` |
 | 0020 | cleanup of 0002's mmap expert-cache code: shared helpers for the copy kernels, the expert-source choice, the device-map upload, the seed fill and the pinned-chunk upload; an empty function removed (no behaviour change) | - |
 | 0021 | review fixes for 0002's decode device remap: unloading a model drops the pending sibling batches (they hold table indices); a sibling table joins a remap launch only when its own last routing buffer and stream match; the lag-flag store is a system-scope atomic (`__hip_atomic_store`, `atomicExch` on CUDA) | `GGML_MOE_DEVREMAP=0` / `GGML_MOE_DEVREMAP_BATCH=0` |
-| 0022-0023 | `--host-experts mmap` RAM tier: K spare RAM slots, and the likely victims copied back ahead on a side stream, so an admission rarely waits for its copy-back (`GGML_MOE_TIER_SPARES`, default 4; we run 8 with `MOE_EXPERT_CACHE_TOUCH=3`); 0023 hardens its error paths (a failed event record drains the side stream, a failed wait fails the swap) | `GGML_MOE_TIER_PRECOPY=0` |
+| 0022-0023 | `--host-experts mmap` RAM tier: K spare RAM slots, and the likely victims copied back ahead on a side stream, so an admission rarely waits for its copy-back (`GGML_MOE_TIER_SPARES`; 0024 makes 8 spares and the 3rd-touch admission the default); 0023 hardens its error paths (a failed event record drains the side stream, a failed wait fails the swap) | `GGML_MOE_TIER_PRECOPY=0` |
+| 0024 | RAM tier defaults: 8 spares, admission from the 3rd touch with the copy-back ahead | `GGML_MOE_TIER_SPARES`, `GGML_MOE_TIER_TOUCH` |
+| 0025-0026 | `--host-experts mmap` pin budget: one budget for the RAM tier and the sparse registration (hottest tables first, a partial tier instead of all-or-nothing, the warm-up bounded too); a declined read of a sparse master goes through the per-table pinned bounce | `GGML_MOE_PIN_BUDGET_MIB` |
+| 0027-0032 | RAM tier at a tight pin budget: a partial tier per layer; a fused MoE op whose lanes cannot be redirected together runs unfused when a lane was taken over; fill-through (a routed expert outside a partial tier is copied in place of its coldest unrouted member, so a partial table never declines) with review fixes; hybrid share (the hottest layers keep a full tier, every other layer at least 30 % of its own) | `GGML_MOE_TIER_SHARE=0`, `GGML_MOE_FUSED_LANE_GUARD=0`, `GGML_MOE_TIER_FILL=0`, `GGML_MOE_TIER_SHARE_MIN_PCT=0` |
+| 0033-0035 | debug and analysis tools, off by default: `GGML_MOE_ROUTE_LOG=<file>` (the routing each decode policy call sees, for offline replay; never changes residency), an inclusive RAM tier (`GGML_MOE_TIER_INCL=1`), and byte checks of the arena, RAM tier, device map and cold pointers against the file (`GGML_MOE_VERIFY_AT` / `GGML_MOE_VERIFY_EVERY`) | - |
+| 0036-0038 | KV lending, off by default (`GGML_MOE_KV_LEND=1`): the KV cache rows past the context in use hold VRAM copies of evicted experts, so a later miss reads or refills them over VRAM instead of PCIe; the rows go back to the KV cache when the context grows; with lending on, a miss on a victim-held expert is read from it without evicting (`GGML_MOE_KV_LEND_STAY`, default on) | - |
+| 0039 | a sparse (mmap) table without a RAM tier admits a routed expert it cannot register (filled through the bounce) instead of declining it per token; the decline could be captured into a CUDA graph and replayed for other routing (wrong output at a tight pin budget) | `GGML_MOE_FORCE_ADMIT=0` |
+| 0040-0041 | fill fence: in a decode take-over, the RAM-tier swaps, the device-map upload and the copy-back-ahead waits are ordered by the remap kernel's lag flag instead of one event record each (each record costs ~4-10 us of compute-queue idle on RDNA4) | `GGML_MOE_FILL_FENCE=0` |
 
 The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`, `GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4=0`,
 `GGML_CUDA_MMVQ_CONCAT_REORDER=0`, `GGML_CUDA_ROUTER_TOPK=0`, `GGML_CUDA_DISABLE_GDN_CONV_SNAP=1`,
@@ -49,10 +56,10 @@ The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`
 `GGML_CUDA_FUSE_V_FWHT=0`, `GGML_CUDA_FA_COMBINE_FWHT=0`, `GGML_CUDA_QK_PAIR_FWHT=0`, `GGML_CUDA_FUSE_ROPE_FWHT=0`,
 `GGML_CUDA_MOE_SHARED_GLU_Q8=0`), `GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0` (#260) and `GGML_CUDA_KV_FOLD_Q4_0=0` (#262).
 
-## Validation (2026-11-01, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
+## Validation (2026-11-03, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
 
 r204 vs r204 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-full`, no env on either side,
-`ROCBLAS_USE_HIPBLASLT=0`. The series replays onto 0001 without conflicts.
+`ROCBLAS_USE_HIPBLASLT=0`.
 
 - Greedy server replies (12 multi-turn replies per model) are byte-identical to r204 on Llama-3.2-1B, Qwen3-30B-A3B,
   Qwen3.6-35B-A3B, gemma-4-26B-A4B, Qwen3.8-27B, Qwen3.8-27B NVFP4-MTP (plain and MTP `--spec-draft-n-max 3`) and Qwen3.5-4B;
@@ -60,21 +67,26 @@ r204 vs r204 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-
 - KLD on wikitext-2 `-c 512`, 24 chunks, against r204's logits: 0 on all six non-MTP models (same top token 99.98-100 %).
 - test-backend-ops (ROCm0, with `ROCBLAS_USE_HIPBLASLT=0`): 21675 / 21676 passed; the one failure,
   `MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32)`, comes from that env (the release shows the same with it).
-- Our production model (Qwen3.8-Flash-Next IQ3_S, `--host-experts mmap`, MTP draft) on one GPU: greedy replies
-  identical to stock r204, the 259.6k-token needle answered correctly, no faults. Against our previous build (r196 + the
-  previous series): greedy decode 77.0 vs 74.5 t/s (+3.4 %), two concurrent streams 96.9 vs 97.6 t/s (4 alternating runs).
+- Our production model (Qwen3.8-Flash-Next IQ3_S, `--host-experts mmap`, MTP draft, `GGML_MOE_KV_LEND=1`) on one GPU,
+  3 alternating fresh loads against our previous production build (0001-0032): greedy replies identical, the 259.6k-token needle answered
+  correctly and the 256 tokens after it identical, no faults; the byte checks found 0 differences; greedy decode 83.6 / 81.8
+  vs 80.1 / 77.2 t/s (first / second pass, +4.3 / +6.0 %), two concurrent streams 107.4 vs 99.1 t/s (+8.4 %). Of that,
+  KV lending is +3.8 / +4.9 % and +9 %; the series with lending off is +0.5 / +1.1 %.
+- 0039 was validated on the #267 branch, without 0027-0032: at a 28 GB pin budget, 16 fresh loads all gave the correct
+  greedy output (13 of 31 were wrong without it). With 0027-0032 every table gets at least a partial tier at that budget,
+  so 0039 is a backstop here.
 
 llama-bench `-fa 1 -p 512 -n 128 -r 5`, 2 alternating rounds, tg128 means:
 
 | model | r204 -> r204 + series |
 |---|---|
-| Llama-3.2-1B UD-Q4_K_XL | 432.8 -> 432.7 (=) |
-| Qwen3-30B-A3B Q4_K_M | 167.1 -> 167.6 (=) |
-| Qwen3.6-35B-A3B Q4_K_M | 138.1 -> 139.8 (+1.2 %) |
+| Llama-3.2-1B UD-Q4_K_XL | 433.1 -> 432.5 (=) |
+| Qwen3-30B-A3B Q4_K_M | 167.0 -> 169.1 (+1.3 %) |
+| Qwen3.6-35B-A3B Q4_K_M | 138.4 -> 139.6 (+0.9 %) |
 | gemma-4-26B-A4B MXFP4_MOE | 93.9 -> 93.7 (=) |
-| Qwen3.8-27B Q4_K_M | 31.94 -> 32.06 (=) |
-| Qwen3.8-27B NVFP4-MTP-HIGH | 30.55 -> 30.12 (-1.4 %) |
+| Qwen3.8-27B Q4_K_M | 32.12 -> 32.11 (=) |
+| Qwen3.8-27B NVFP4-MTP-HIGH | 30.45 -> 30.06 (-1.3 %) |
 | Qwen3.5-4B Q8_0 | 102.1 -> 102.0 (=) |
 
-The dedup (0017-0018) and the copy-back ahead (0022) help only a model whose routed experts are partly in host memory:
-our production model.
+The dedup (0017-0018), the RAM-tier work (0022-0032), KV lending and the fill fence help only a model whose routed
+experts are partly in host memory: our production model.

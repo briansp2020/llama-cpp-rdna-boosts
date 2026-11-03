@@ -1,7 +1,7 @@
 From 3391929c3c0e93b76e37fb689839ebe6e7ce44f6 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 20:31:47 +0000
-Subject: [PATCH 20/23] ours: dedup the mmap expert-cache helpers and drop a
+Subject: [PATCH 20/41] ours: dedup the mmap expert-cache helpers and drop a
  no-op (no behaviour change)
 
 - moe_cache_expert_copy: one inlined copy body for the one-fill, stage and route kernels

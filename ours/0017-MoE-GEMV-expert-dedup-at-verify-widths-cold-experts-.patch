@@ -1,7 +1,7 @@
 From 04d2d517709407a7a9599745b71bb185f2e2003b Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 15:26:48 +0000
-Subject: [PATCH 17/23] MoE GEMV: expert dedup at verify widths (cold experts;
+Subject: [PATCH 17/41] MoE GEMV: expert dedup at verify widths (cold experts;
  GGML_CUDA_MOE_DEDUP)
 
 At 2-4 tokens the (slot, token) pairs routed to the same cold expert are computed by one warp, the first pair in

@@ -1,0 +1,276 @@
+From fb8852ec47e634b19820bdaa4ea3afa0b260b6af Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 3 Nov 2026 00:48:00 +0000
+Subject: [PATCH 39/41] moe cache: a sparse table without a RAM tier admits a
+ routed expert it cannot register instead of declining
+
+With a pin budget that refuses registrations, the remap hook of a sparse (mmap) table without a RAM tier declined
+whenever a routed expert was neither resident nor registrable: a routing-dependent outcome, while the CUDA graph
+capture gate assumes the take-over decision is constant per graph shape.  A graph captured on one outcome and
+replayed on the other read the wrong source, so about 40 % of fresh loads at a 28 GB budget gave wrong output for the
+whole load (identical with GGML_CUDA_DISABLE_GRAPHS=1: 6/6 correct).  Such an expert is now admitted regardless of the
+admission rule, into a free slot or over the coldest resident the call does not route, filled from the mapping through
+the capped per-table pinned bounce (shared with upload_pageable), and these tables also take the per-shape slot bound,
+which guarantees that slot.  GGML_MOE_FORCE_ADMIT=0 restores the decline.
+
+The per-shape bound also applies to a sparse table that runs without a tier for any other reason (the tier off or
+dropped): a batch wider than its slots now declines where the cold read used to serve it.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 198 +++++++++++++++++++------
+ 1 file changed, 155 insertions(+), 43 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 06439cc5f..8bcdeb5a2 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -486,6 +486,7 @@ int64_t                             g_cold_reaches    = 0;
+ //   2 = touch  : fill only on the expert's 2nd+ use since it was last resident (doorkeeper)
+ int                                 g_admit           = 0;
+ int64_t                             g_cold_admits     = 0;  // misses served cold by the admission rule (not by a full/declined table)
++int64_t                             g_force_admits    = 0;  // routed experts of a sparse table without a tier filled through the bounce (see force_admit_locked)
+ int64_t                             g_touch           = 2;  // `admit=touch`: uses since last resident before a fill is allowed
+ int64_t                             g_takeover        = 0;
+ int64_t                             g_decline_all     = 0;
+@@ -3356,6 +3357,55 @@ static int bounce_acquire(table_t & t) {
+     return (int) t.bounce.size() - 1;
+ }
+ 
++// A pinned per-table bounce entry for a copy out of a sparse (mmap) master: one whose copy has drained, else a new one,
++// at most 8 per table (a declined read can be a whole master, and an unbounded ring would pin a copy of it outside the
++// pin budget); a full ring waits for one copy and reuses its entry.  -1 when no entry can be allocated.
++static int bounce_acquire_capped(table_t & t) {
++    int idx = -1;
++    for (int i = 0; i < (int) t.bounce.size(); i++) {
++        if (t.bounce[(size_t) i].busy) {
++#if defined(GGML_USE_HIP)
++            const bool ready = hipEventQuery((hipEvent_t) t.bounce[(size_t) i].ev) != hipErrorNotReady;
++#else
++            const bool ready = cudaEventQuery(t.bounce[(size_t) i].ev) != cudaErrorNotReady;
++#endif
++            (void) cudaGetLastError();
++            if (!ready) {
++                continue;
++            }
++            t.bounce[(size_t) i].busy = false;
++        }
++        idx = i;
++        break;
++    }
++    if (idx < 0 && t.bounce.size() >= 8) {
++        idx         = t.bounce_rr % (int) t.bounce.size();
++        t.bounce_rr = idx + 1;
++        (void) cudaEventSynchronize(t.bounce[(size_t) idx].ev);
++        (void) cudaGetLastError();
++        t.bounce[(size_t) idx].busy = false;
++    }
++    if (idx < 0) {
++        device_guard dg(t.device);
++        void *      mem = nullptr;
++        cudaEvent_t ev  = nullptr;
++        if (cudaHostAlloc(&mem, t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
++            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            if (mem != nullptr) { (void) cudaFreeHost(mem); }
++            if (ev  != nullptr) { (void) cudaEventDestroy(ev); }
++            return -1;
++        }
++        bounce_t b;
++        b.host = (char *) mem;
++        b.ev   = ev;
++        b.busy = false;
++        t.bounce.push_back(b);
++        idx = (int) t.bounce.size() - 1;
++    }
++    return idx;
++}
++
+ // `protect`/`n_protect`: experts that belong to the token currently being staged and must NOT be chosen as
+ // an eviction victim.  Without this, an expert admitted earlier in the same token can be evicted by a later
+ // one (its freshly-seeded count is the smallest), which is what made the hook's `all` flag flip from token
+@@ -3807,6 +3857,98 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+ 
+ 
+ 
++// A routed expert of a sparse (mmap) table without a RAM tier that is neither resident nor registrable (the pin budget
++// refused it) has no read path, and declining the call for it would make the hook's outcome depend on the routing: a CUDA
++// graph captured on one outcome and replayed on the other reads the wrong source (wrong output for the whole load).  So
++// it is admitted regardless of the admission rule: into a free slot, else over the coldest resident this call does not
++// route, filled from the mapping through the pinned bounce (no registration).  The bytes are the file's, as on every
++// other path.  Returns the slot, or -1 (no slot, or a copy error: the admission is undone and the call declines).
++// GGML_MOE_FORCE_ADMIT=0: off (the call declines, as before).
++static bool g_force_admit = [] {
++    const char * e = getenv("GGML_MOE_FORCE_ADMIT");
++    return e == nullptr || atoi(e) != 0;
++}();
++
++static int force_admit_locked(table_t & t, int32_t expert, void * stream, const int32_t * protect, int n_protect) {
++    if (t.slots <= 0 || t.arena == nullptr || t.host == nullptr || stream == nullptr || expert < 0 ||
++        expert >= t.n_experts) {
++        return -1;
++    }
++    int     slot   = -1;
++    int32_t victim = -1;
++    if ((int) t.expert_slot.size() < t.slots) {
++        for (int s = 0; s < t.slots; s++) {
++            if (t.slot_expert[s] < 0) { slot = s; break; }
++        }
++    }
++    if (slot < 0) {
++        // the victim rule of access_locked: the smallest decaying count, tie -> oldest use, never this call's experts
++        for (int s = 0; s < t.slots; s++) {
++            const int32_t e = t.slot_expert[s];
++            bool prot = false;
++            for (int i = 0; i < n_protect && !prot; i++) {
++                prot = protect[i] == e;
++            }
++            if (e < 0 || prot) { continue; }
++            if (victim < 0 || t.count[e] < t.count[victim] ||
++                (t.count[e] == t.count[victim] && t.last[e] < t.last[victim])) {
++                victim = e;
++                slot   = s;
++            }
++        }
++    }
++    if (slot < 0) {
++        return -1;
++    }
++    const int idx = bounce_acquire_capped(t);
++    if (idx < 0) {
++        return -1;
++    }
++    char * buf = t.bounce[(size_t) idx].host;
++    memcpy(buf, (const char *) t.host + (size_t) expert * t.host_bytes, t.host_bytes);
++    expert_src_t src;
++    src.base   = buf;
++    src.kind   = cudaMemcpyHostToDevice;
++    src.bounce = idx;
++    char * dst = (char *) t.arena + (size_t) slot * t.expert_bytes;
++    if (copy_slot_from_src(t, dst, src, (cudaStream_t) stream) != cudaSuccess) {
++        GGML_LOG_WARN("%s: bounce fill failed table layer=%d role=%s expert=%d: %s\n", __func__, t.layer, t.role.c_str(),
++                      expert, cudaGetErrorString(cudaGetLastError()));
++        // a fused table issues one copy per slice: earlier slices may be in flight from the entry and in the slot, so the
++        // entry stays busy until they drain and the victim's slot is freed (its bytes may be partly overwritten)
++        expert_src_done(t, nullptr, src, stream, /*retire*/ false);
++        if (victim >= 0) {
++            t.expert_slot.erase(victim);
++            t.slot_expert[slot] = -1;
++            t.slot_dirty = true;
++            t.evictions++;
++        }
++        return -1;
++    }
++    expert_src_done(t, nullptr, src, stream, /*retire*/ false);
++    if (victim >= 0) {
++        t.expert_slot.erase(victim);
++        t.slot_expert[slot] = -1;
++        t.evictions++;
++    }
++    t.slot_expert[slot]   = expert;
++    t.expert_slot[expert] = slot;
++    t.slot_dirty          = true;
++    if (slot < (int) t.slot_prov.size()) {
++        t.slot_prov[slot] = 0;
++    }
++    t.count[expert]++;
++    if (expert < (int32_t) t.ghost.size()) {
++        t.ghost[expert] = 0;
++    }
++    t.last[expert] = t.clock;
++    t.fills++;
++    g_acc_fills++;
++    g_fill_bytes += (int64_t) t.expert_bytes;
++    g_force_admits++;
++    return slot;
++}
++
+ // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): one-shot bulk admission of the
+ // experts the prefill routing touched most, applied at arena sizing (after the arena/policy state exist).
+ // wip/first-prefill-latency: the arena is sized against the full slab region, but a wide prefill reclaims
+@@ -7501,49 +7643,9 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
+         while (done < n_total) {
+             const size_t n = std::min(n_total - done, t.host_bytes);
+             // Acquire a pinned bounce entry, fill it from the mapping, and issue a pinned H2D.
+-            int idx = -1;
+-            for (int i = 0; i < (int) t.bounce.size(); i++) {
+-                if (t.bounce[(size_t) i].busy) {
+-#if defined(GGML_USE_HIP)
+-                    const bool ready = hipEventQuery((hipEvent_t) t.bounce[(size_t) i].ev) != hipErrorNotReady;
+-#else
+-                    const bool ready = cudaEventQuery(t.bounce[(size_t) i].ev) != cudaErrorNotReady;
+-#endif
+-                    (void) cudaGetLastError();
+-                    if (!ready) {
+-                        continue;
+-                    }
+-                    t.bounce[(size_t) i].busy = false;
+-                }
+-                idx = i;
+-                break;
+-            }
+-            // At most 8 entries per table: a declined sparse read can be a whole master, and an unbounded ring would pin
+-            // a copy of it outside the pin budget.  A full ring waits for one copy and reuses its entry.
+-            if (idx < 0 && t.bounce.size() >= 8) {
+-                idx         = t.bounce_rr % (int) t.bounce.size();
+-                t.bounce_rr = idx + 1;
+-                (void) cudaEventSynchronize(t.bounce[(size_t) idx].ev);
+-                (void) cudaGetLastError();
+-                t.bounce[(size_t) idx].busy = false;
+-            }
++            const int idx = bounce_acquire_capped(t);
+             if (idx < 0) {
+-                device_guard dg(t.device);
+-                void *      mem = nullptr;
+-                cudaEvent_t ev  = nullptr;
+-                if (cudaHostAlloc(&mem, t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+-                    cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+-                    (void) cudaGetLastError();
+-                    if (mem != nullptr) { (void) cudaFreeHost(mem); }
+-                    if (ev  != nullptr) { (void) cudaEventDestroy(ev); }
+-                    return false;
+-                }
+-                bounce_t b;
+-                b.host = (char *) mem;
+-                b.ev   = ev;
+-                b.busy = false;
+-                t.bounce.push_back(b);
+-                idx = (int) t.bounce.size() - 1;
++                return false;
+             }
+             char * buf = t.bounce[(size_t) idx].host;
+             memcpy(buf, s + done, n);
+@@ -8382,7 +8484,10 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     // DETERMINISTICALLY (this bound is a constant per shape) so a shape never captures the arena and then
+     // declines it on a later replay.  With UVA cold reads the overflow is representable (id = slots+e),
+     // so a small arena is fine and the decline is not needed.
+-    if (!table_cold_ok(t) && t.slots < (int) (n_used * n_tok)) {
++    // A sparse table without a RAM tier is bounded too when the forced admission is on: it needs a slot (or a victim
++    // outside this call's experts) for every routed expert it cannot register, and only this bound guarantees one.
++    const bool force = g_force_admit && t.host_sparse && t.ram_base == nullptr;
++    if ((!table_cold_ok(t) || force) && t.slots < (int) (n_used * n_tok)) {
+         g_decline_all++;
+         return false;
+     }
+@@ -8417,6 +8522,9 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+                 // region of the id space - the kernel reads `id - n_res_slots` from the host alias.
+                 remap[(size_t) tok * n_used + j] = n_res_slots + e;
+                 g_cold_reaches++;
++            } else if (const int fs = force ? force_admit_locked(t, e, stream, used.data(), (int) used.size()) : -1;
++                       fs >= 0) {
++                remap[(size_t) tok * n_used + j] = fs;
+             } else {
+                 all = false;   // evicted and not re-admitted, or slots == 0: fall back
+             }
+@@ -9862,6 +9970,10 @@ void moe_cache_report() {
+                       (long long) g_sreg_fail, (long long) g_sreg_keep, (long long) g_sreg_stay, (long long) g_sreg_trims,
+                       (long long) g_sreg_nolock, (long long) g_stage_tables, (long long) g_sreg_remaps,
+                       (long long) g_route_fills);
++        if (g_force_admits > 0) {
++            GGML_LOG_WARN("%s: sparse tables without a tier: %lld routed experts admitted through the bounce "
++                          "(GGML_MOE_FORCE_ADMIT)\n", __func__, (long long) g_force_admits);
++        }
+     }
+     if (g_tier_incl_tables > 0) {
+         GGML_LOG_WARN("%s: RAM tier: %lld tables with an inclusive tier (GGML_MOE_TIER_INCL)\n", __func__,
+-- 
+2.53.0
+

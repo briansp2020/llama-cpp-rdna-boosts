@@ -1,0 +1,222 @@
+From e31fbe650cd9bdeea4bb2bb425d340234f61e397 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 3 Nov 2026 07:58:55 +0000
+Subject: [PATCH 41/41] moe cache: copy-back ahead in a decode take-over waits
+ on the compute stream only for slots of unknown fill state
+ (GGML_MOE_FILL_FENCE)
+
+precopy_plan_locked recorded pol_ev on the compute stream for the side stream's wait whenever it issued copies: one
+more marker packet per policy call (FINDINGS 745).  Each arena slot now knows when its last fill landed (slot_seq: 0 for
+the synchronous seeds, the committing take-over's lag-flag value for a deferred fill, -1 otherwise).  Inside a decode
+take-over a candidate whose fill the flag shows landed is copied without a wait, one filled in this take-over or not
+landed yet is left for a later call, and pol_ev is recorded (once) only before a copy of a slot of unknown state.
+Outside a take-over and with GGML_MOE_FILL_FENCE=0 every copy waits as before.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 72 ++++++++++++++++++++++++--
+ 1 file changed, 68 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 206669ff0..845563e0b 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -147,6 +147,11 @@ struct table_t {
+     bool        map_mark_flag  = false;
+     int32_t     map_mark_seq   = 0;
+     void *      mark_stream    = nullptr;   // the stream the deferred work went to
++    // Per arena slot, when its last fill is known to have landed (copy-back ahead reads the slot on the side stream):
++    // 0 = complete (a synchronous fill), > 0 = once the lag flag reaches that value, -1 = unknown (the side stream
++    // waits on pol_ev, as before), -2 = filled in the open decode take-over (not yet committed).  Missing = -1.
++    std::vector<int32_t> slot_seq;
++    std::vector<int32_t> defer_slots;       // slots at -2: the commit gives them its seq, a flush makes them -1
+     // Copy-back ahead (GGML_MOE_TIER_PRECOPY): spare RAM slots that already hold a copy of a resident the policy is likely
+     // to evict next (D2H on the device's side stream, done when `ev` fires), so its admission needs no D2H on the compute
+     // stream.  The copy stays valid while the expert is resident (weights never change); an entry is consumed by the swap
+@@ -965,6 +970,9 @@ static const bool g_fill_fence = [] {
+ }();
+ static const void * g_defer_tab = nullptr;   // the table whose decode take-over defers its markers (else none)
+ static int64_t g_fence_commits = 0, g_fence_flushes = 0;
++static int64_t g_pc_polev = 0;   // precopy plans that still waited on the compute stream (pol_ev)
++static bool    fence_done_locked(const table_t & t, int32_t seq);
++static int32_t slot_seq_get_locked(const table_t & t, int slot);
+ static int64_t g_pc_waited = 0;   // admissions whose precopy had not completed yet (the GPU waited for it)
+ // GGML_MOE_TIER_PRECOPY=0: no copy-back ahead (each swap copies its victim back on the compute stream, as before).
+ static const bool g_precopy = [] {
+@@ -1710,8 +1718,10 @@ static void precopy_plan_locked(table_t & t, void * stream, const int32_t * prot
+         }
+     }
+ 
+-    cudaStream_t ss    = nullptr;
+-    int          n_new = 0;
++    cudaStream_t ss     = nullptr;
++    int          n_new  = 0;
++    bool         waited = false;
++    const bool   fenced = g_defer_tab == &t;   // only a decode take-over defers (GGML_MOE_FILL_FENCE)
+     for (const int32_t e : cand) {
+         if (n_new >= 2) {
+             break;   // bounds the hook's host time per call; later calls continue
+@@ -1726,17 +1736,30 @@ static void precopy_plan_locked(table_t & t, void * stream, const int32_t * prot
+         if (rs == t.expert_slot.end() || rs->second < 0) {
+             continue;
+         }
++        // GGML_MOE_FILL_FENCE, decode take-over: a slot whose fill the lag flag shows landed needs no wait
++        bool need_wait = true;
++        if (fenced) {
++            const int32_t q = slot_seq_get_locked(t, rs->second);
++            if (q == -2 || (q > 0 && !fence_done_locked(t, q))) {
++                continue;   // filled in this take-over or not landed yet: a later call copies it
++            }
++            need_wait = q == -1;
++        }
+         if (ss == nullptr) {
+             ss = precopy_stream(t.device);
+             if (ss == nullptr) {
+                 return;
+             }
++        }
++        if (need_wait && !waited) {
+             if ((t.pol_ev == nullptr && cudaEventCreateWithFlags(&t.pol_ev, cudaEventDisableTiming) != cudaSuccess) ||
+                 cudaEventRecord(t.pol_ev, (cudaStream_t) stream) != cudaSuccess ||
+                 cudaStreamWaitEvent(ss, t.pol_ev, 0) != cudaSuccess) {
+                 (void) cudaGetLastError();
+                 return;
+             }
++            waited = true;
++            g_pc_polev++;
+         }
+         cudaEvent_t ev = nullptr;
+         if (!t.precopy_idle.empty()) {
+@@ -1950,8 +1973,26 @@ static bool fence_done_locked(const table_t & t, int32_t seq) {
+     const uint32_t v = (uint32_t) __atomic_load_n(&t.dr_lag_host[t.dr_cap], __ATOMIC_ACQUIRE);
+     return (int32_t) (v - (uint32_t) seq) >= 0;
+ }
++static void slot_seq_set_locked(table_t & t, int slot, int32_t v) {
++    if (slot < 0) {
++        return;
++    }
++    if ((size_t) slot >= t.slot_seq.size()) {
++        t.slot_seq.resize((size_t) slot + 1, -1);
++    }
++    t.slot_seq[(size_t) slot] = v;
++}
++static int32_t slot_seq_get_locked(const table_t & t, int slot) {
++    return slot >= 0 && (size_t) slot < t.slot_seq.size() ? t.slot_seq[(size_t) slot] : -1;
++}
+ // Deferred swaps / map upload that no launch will cover: record their events now (on the stream they went to).
+ static void fence_flush_locked(table_t & t) {
++    for (int32_t sl : t.defer_slots) {
++        if (slot_seq_get_locked(t, sl) == -2) {
++            slot_seq_set_locked(t, sl, -1);   // its fill is covered by swap_ev only: the side stream waits on pol_ev
++        }
++    }
++    t.defer_slots.clear();
+     if (!t.swap_defer && !t.map_defer) {
+         return;
+     }
+@@ -1970,6 +2011,12 @@ static void fence_flush_locked(table_t & t) {
+ }
+ // The remap launch that writes lag flag value `seq` covers the deferred work.
+ static void fence_commit_locked(table_t & t, int32_t seq) {
++    for (int32_t sl : t.defer_slots) {
++        if (slot_seq_get_locked(t, sl) == -2) {
++            slot_seq_set_locked(t, sl, seq);
++        }
++    }
++    t.defer_slots.clear();
+     g_fence_commits += t.swap_defer || t.map_defer;
+     if (t.swap_defer) {
+         t.swap_defer = false; t.swap_mark_flag = true; t.swap_mark_seq = seq;
+@@ -3854,6 +3901,12 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+     t.slot_expert[slot] = expert;
+     t.expert_slot[expert] = slot;
+     t.slot_dirty = true;
++    if (g_defer_tab == &t) {
++        slot_seq_set_locked(t, slot, -2);
++        t.defer_slots.push_back(slot);
++    } else {
++        slot_seq_set_locked(t, slot, -1);
++    }
+     if (slot < (int) t.slot_prov.size()) {
+         t.slot_prov[slot] = 0;   // a real (policy-chosen) admission is not provisional
+     }
+@@ -4110,6 +4163,7 @@ void apply_prefill_seed_locked(table_t & t) {
+         }
+         t.slot_expert[i] = e;
+         t.expert_slot[e] = i;
++        slot_seq_set_locked(t, i, 0);   // a synchronous seed
+         t.slot_prov[i]  = 1;   // provisional until first hit (MOE_EXPERT_CACHE_PROVISIONAL=1)
+         // `count` is "uses while RESIDENT", and a pre-filled expert has not been used yet - so seed it 0,
+         // NOT 1.  Seeding 1 made the arbitrary experts outrank a freshly-admitted real hot expert (also
+@@ -4188,6 +4242,7 @@ void apply_heat_seed_locked(table_t & t) {
+         }
+         t.slot_expert[i] = e;
+         t.expert_slot[e] = i;
++        slot_seq_set_locked(t, i, 0);   // a synchronous seed
+         t.slot_prov[i]   = 1;
+         t.count[e]       = 0;
+         t.ghost[e]       = 0;
+@@ -5293,6 +5348,7 @@ void alloc_table_locked(table_t & t, int slots) {
+     const size_t arena_size = (size_t) slots * t.expert_bytes + head_pad;
+     (void) cudaMemset(t.arena, 0, arena_size);
+     t.slot_expert.assign(slots, -1);
++    t.slot_seq.assign(slots, -1); t.defer_slots.clear();
+     t.slot_prov.assign(slots, 0);
+     t.count.assign(t.n_experts, 0);
+     t.ghost.assign(t.n_experts, 0);
+@@ -5328,6 +5384,7 @@ void alloc_table_locked(table_t & t, int slots) {
+             } else {
+                 t.slot_expert[e] = e;
+                 t.expert_slot[e] = e;
++                slot_seq_set_locked(t, e, 0);   // synchronous identity fill
+             }
+         }
+         if (ok && cudaDeviceSynchronize() != cudaSuccess) {
+@@ -5343,6 +5400,7 @@ void alloc_table_locked(table_t & t, int slots) {
+         } else {
+             t.expert_slot.clear();
+             t.slot_expert.assign(slots, -1);
++            t.slot_seq.assign(slots, -1);
+             GGML_LOG_WARN("%s: identity fill failed for layer=%d role=%s; keeping the remap path\n",
+                           __func__, t.layer, t.role.c_str());
+         }
+@@ -5375,6 +5433,7 @@ void alloc_table_locked(table_t & t, int slots) {
+                 for (int i = 0; i < k; i++) {
+                     t.slot_expert[i] = i;
+                     t.expert_slot[i] = i;
++                    slot_seq_set_locked(t, i, 0);   // synchronous staged fill
+                     if (i < (int) t.slot_prov.size()) {
+                         t.slot_prov[i] = 1;
+                     }
+@@ -8414,6 +8473,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+         t.device = device;
+         alloc_table_locked(t, old_slots);
+         t.slot_expert.assign(t.slots, -1);
++        t.slot_seq.assign(t.slots, -1); t.defer_slots.clear();
+         t.expert_slot.clear();
+         GGML_LOG_WARN("%s: migrated layer=%d role=%s arena from device %d to %d (%d slots)\n",
+                       __func__, t.layer, t.role.c_str(), old_device, device, t.slots);
+@@ -8742,6 +8802,9 @@ static bool devremap_alloc_locked(table_t & t) {
+     t.dr_lag_n  = 0;
+     t.dr_lag_host[t.dr_cap] = 0;
+     t.dr_lag_seq  = 0;
++    for (int32_t & v : t.slot_seq) {
++        v = v > 0 ? -1 : v;   // relative to the counter just reset
++    }
+     t.dr_lag_flag = false;
+     t.dr_last_ids    = nullptr;
+     t.dr_last_stream = nullptr;
+@@ -10113,9 +10176,10 @@ void moe_cache_report() {
+                       "in-stream; %lld misses cold for lack of a spare\n", __func__, g_tier_spares, g_precopy ? "on" : "off",
+                       (long long) g_pc_issued, (long long) g_pc_used, (long long) g_pc_waited, (long long) g_pc_reclaimed,
+                       (long long) g_tier_swaps_d2h, (long long) g_tier_nospare);
+-        GGML_LOG_WARN("%s: device remap: %lld calls%s; fill fence %s: %lld take-overs marked by the lag flag, %lld by events\n",
++        GGML_LOG_WARN("%s: device remap: %lld calls%s; fill fence %s: %lld take-overs marked by the lag flag, %lld by events; %lld precopy plans waited (pol_ev)\n",
+                       __func__, (long long) g_devremap_calls, g_devremap ? "" : " (GGML_MOE_DEVREMAP=0)",
+-                      g_fill_fence ? "on" : "off (GGML_MOE_FILL_FENCE=0)", (long long) g_fence_commits, (long long) g_fence_flushes);
++                      g_fill_fence ? "on" : "off (GGML_MOE_FILL_FENCE=0)", (long long) g_fence_commits, (long long) g_fence_flushes,
++                      (long long) g_pc_polev);
+         int n_pairs = 0, n_diff = 0;
+         for (const table_t & g : g_tables) {
+             if (g.role.find("ffn_gate_exps") == std::string::npos || g.ram_base == nullptr) {
+-- 
+2.53.0
+
