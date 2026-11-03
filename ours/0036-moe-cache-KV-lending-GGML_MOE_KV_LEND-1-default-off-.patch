@@ -1,4 +1,4 @@
-From 844c57d7925645ea21f7dfc4413837f1d50e641d Mon Sep 17 00:00:00 2001
+From 342c0a9bdd868876992b9b9020865e4b2c5fba90 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 02:41:53 +0000
 Subject: [PATCH 36/43] moe cache: KV lending (GGML_MOE_KV_LEND=1, default off)

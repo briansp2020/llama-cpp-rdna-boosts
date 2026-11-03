@@ -1,4 +1,4 @@
-From 6e6bd8b87b3de0f175829f871b6a3b0cc366f14f Mon Sep 17 00:00:00 2001
+From a85125d9da2d9ce94416435ddde1579ce9a0e396 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 23 Oct 2026 03:52:11 +0000
 Subject: [PATCH 06/43] llama-context: LLAMA_UB_SMALL_SPLIT only for causal

@@ -1,4 +1,4 @@
-From fcf04c0aeda965a42567d368dc76cfa16ee534df Mon Sep 17 00:00:00 2001
+From 5e05e683fe23d3c5667b590bd513ad9118f35530 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 23 Oct 2026 03:17:02 +0000
 Subject: [PATCH 05/43] llama-context: LLAMA_UB_SMALL_SPLIT=K splits

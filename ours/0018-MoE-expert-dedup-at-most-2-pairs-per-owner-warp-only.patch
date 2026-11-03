@@ -1,4 +1,4 @@
-From ee7573c69560162a22d56711bf9aab2a978bba89 Mon Sep 17 00:00:00 2001
+From 4c33462c8dba3fbe52ff8171b5530a0f90d37224 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 15:32:19 +0000
 Subject: [PATCH 18/43] MoE expert dedup: at most 2 pairs per owner warp, only

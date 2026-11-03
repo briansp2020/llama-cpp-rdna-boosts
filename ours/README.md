@@ -3,12 +3,13 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-6050b467c-r204` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
-`6260370949c1`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
+**Base:** `v16-6050b467c-r206` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
+`1bac1001f178`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
 GDN small-projection gather), r182 took #253 (the 1-token router fold and its RDNA4 gate), r183 took #256 (the GDN
 decode folds), r187 took #258 (the quantized-KV rotations), r188 took #259 (the shared-expert GLU Q8_1), r198 took #260
 (the mixed K-quant x Q6_K row concat), r199 took #262 (the q4_0 KV write fold) and r203 took #266 (host-expert decode
-without the per-op routing sync), so they are no longer in this series.
+without the per-op routing sync), so they are no longer in this series. r205 and r206 took none of it; the series
+replays onto r206 unchanged.
 
 0001 takes #266's device remap and pool cold read back out of the release: this series has carried its own variant of
 that remap since before #266 (in 0002, with the review fixes in 0021: freshness rounds, and the remap forwarded through
@@ -18,11 +19,11 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 
 ```
 git checkout 6050b467c
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r204 release, branch rdna-boosts
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r206 release, branch rdna-boosts
 git am <path-to-this-repo>/ours/*.patch              # 43 patches
 ```
 
-Result: tree `13e744ed4278`.
+Result: tree `618376e2663c`.
 
 ## Patches
 
@@ -59,17 +60,19 @@ The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`
 
 ## Validation (2026-11-03, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
 
-r204 vs r204 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-full`, no env on either side,
+r206 vs r206 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-full`, no env on either side,
 `ROCBLAS_USE_HIPBLASLT=0`.
 
-- Greedy server replies (12 multi-turn replies per model) are byte-identical to r204 on Llama-3.2-1B, Qwen3-30B-A3B,
+- Greedy server replies (12 multi-turn replies per model) are byte-identical to r206 on Llama-3.2-1B, Qwen3-30B-A3B,
   Qwen3.6-35B-A3B, gemma-4-26B-A4B, Qwen3.8-27B, Qwen3.8-27B NVFP4-MTP (plain and MTP `--spec-draft-n-max 3`) and Qwen3.5-4B;
   also with `-ctk q8_0 -ctv q8_0` and `-ctk q4_0 -ctv q4_0`. No faults.
-- KLD on wikitext-2 `-c 512`, 24 chunks, against r204's logits: 0 on all six non-MTP models (same top token 99.98-100 %).
+- KLD on wikitext-2 `-c 512`, 24 chunks, against r206's logits: 0 on all six non-MTP models (same top token 99.98-100 %).
 - test-backend-ops (ROCm0, with `ROCBLAS_USE_HIPBLASLT=0`): 21675 / 21676 passed; the one failure,
   `MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32)`, comes from that env (the release shows the same with it).
-- Our production model (Qwen3.8-Flash-Next IQ3_S, `--host-experts mmap`, MTP draft, `GGML_MOE_KV_LEND=1`) on one GPU,
-  3 alternating fresh loads against our previous production build (0001-0032): greedy replies identical, the 259.6k-token needle answered
+- Our production model (Qwen3.8-Flash-Next IQ3_S, `--host-experts mmap`, MTP draft, `GGML_MOE_KV_LEND=1`) on one GPU:
+  this series on r206 vs the same series on r204, 3 alternating fresh loads: greedy replies identical, the needle and the
+  256 tokens after it identical, greedy decode 83.5 / 81.7 vs 83.2 / 81.2 t/s, two concurrent streams 107.6 vs 107.6 t/s.
+  On r204, 3 alternating fresh loads against our previous production build (0001-0032): greedy replies identical, the 259.6k-token needle answered
   correctly and the 256 tokens after it identical, no faults; the byte checks found 0 differences; greedy decode 83.6 / 81.8
   vs 80.1 / 77.2 t/s (first / second pass, +4.3 / +6.0 %), two concurrent streams 107.4 vs 99.1 t/s (+8.4 %). Of that,
   KV lending is +3.8 / +4.9 % and +9 %; the series with lending off is +0.5 / +1.1 %.
@@ -78,20 +81,20 @@ r204 vs r204 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-
   so 0039 is a backstop here.
 - 0042-0043 at a 28 GB pin budget (51 partial-tier tables, ~215k fill-throughs per load), 2 fresh loads against 0001-0041
   and the default budget once: greedy output identical, no faults, 0 declines, speed the same; at the default budget no
-  table has a partial tier, so they do not run there. The 7-model checks above ran on 0001-0041; 0042-0043 change only
-  the partial-tier paths of `--host-experts mmap`, which those models do not use.
+  table has a partial tier, so they do not run there.
 
-llama-bench `-fa 1 -p 512 -n 128 -r 5`, 2 alternating rounds, tg128 means:
+llama-bench `-fa 1 -p 512 -n 128 -r 5`, 2 alternating rounds, tg128 means (three single rounds with a +-9..45 t/s spread
+left out: r206 Qwen3-30B and Qwen3.5-4B round 2, the series' gemma-4 round 2):
 
-| model | r204 -> r204 + series |
+| model | r206 -> r206 + series |
 |---|---|
-| Llama-3.2-1B UD-Q4_K_XL | 433.1 -> 432.5 (=) |
-| Qwen3-30B-A3B Q4_K_M | 167.0 -> 169.1 (+1.3 %) |
-| Qwen3.6-35B-A3B Q4_K_M | 138.4 -> 139.6 (+0.9 %) |
+| Llama-3.2-1B UD-Q4_K_XL | 432.8 -> 433.3 (=) |
+| Qwen3-30B-A3B Q4_K_M | 164.9 -> 168.6 (+2.2 %) |
+| Qwen3.6-35B-A3B Q4_K_M | 138.0 -> 138.9 (+0.7 %) |
 | gemma-4-26B-A4B MXFP4_MOE | 93.9 -> 93.7 (=) |
-| Qwen3.8-27B Q4_K_M | 32.12 -> 32.11 (=) |
-| Qwen3.8-27B NVFP4-MTP-HIGH | 30.45 -> 30.06 (-1.3 %) |
-| Qwen3.5-4B Q8_0 | 102.1 -> 102.0 (=) |
+| Qwen3.8-27B Q4_K_M | 31.88 -> 31.96 (=) |
+| Qwen3.8-27B NVFP4-MTP-HIGH | 30.51 -> 30.20 (-1.0 %) |
+| Qwen3.5-4B Q8_0 | 102.0 -> 102.0 (=) |
 
 The dedup (0017-0018), the RAM-tier work (0022-0032), KV lending and the fill fence help only a model whose routed
 experts are partly in host memory: our production model.

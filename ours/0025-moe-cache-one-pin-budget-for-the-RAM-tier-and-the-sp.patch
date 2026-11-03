@@ -1,4 +1,4 @@
-From 761b483b4d2a68cb27287bc71c3325de32a63459 Mon Sep 17 00:00:00 2001
+From e3084d53579c03d942be2bcbdf931ad3dff83529 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 1 Nov 2026 21:24:45 +0000
 Subject: [PATCH 25/43] moe cache: one pin budget for the RAM tier and the

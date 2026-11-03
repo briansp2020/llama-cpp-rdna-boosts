@@ -1,4 +1,4 @@
-From 04d2d517709407a7a9599745b71bb185f2e2003b Mon Sep 17 00:00:00 2001
+From 63b7ed00f9d3a2811cd5c0993a599ad102770d1c Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 15:26:48 +0000
 Subject: [PATCH 17/43] MoE GEMV: expert dedup at verify widths (cold experts;

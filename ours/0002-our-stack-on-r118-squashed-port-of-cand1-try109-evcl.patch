@@ -1,4 +1,4 @@
-From 540da9e8492949766a4fbfee3a6b99670c39f65c Mon Sep 17 00:00:00 2001
+From e9f3a3ed45cfad18ceabe54676c21202dd990df2 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 22 Oct 2026 22:14:57 +0000
 Subject: [PATCH 02/43] our stack on r118 (squashed port of cand1 = try109 +
@@ -819,10 +819,10 @@ index e849ccbf8..7f150f2a6 100644
  }
  
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-index 62c61f5d3..46b7ef6d0 100644
+index ad00d6773..d3370eebc 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-@@ -1019,6 +1019,23 @@ static size_t ggml_cuda_slab_narrow2_pin_locked(int device, ggml_cuda_slab & s,
+@@ -1029,6 +1029,23 @@ static size_t ggml_cuda_slab_narrow2_pin_locked(int device, ggml_cuda_slab & s,
          }
          // mapped physical above `off` is in the way: it has to be evicted before the pin (the eviction
          // re-enters the slab through `arena_free`, so it cannot run under this lock).
@@ -846,7 +846,7 @@ index 62c61f5d3..46b7ef6d0 100644
          *evict = off < s.mapped;
          return off;
      }
-@@ -1257,7 +1274,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1267,7 +1284,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
          // carved ring region was never armed (`ring_slot_capacity() == 0`): the H2D staging fell back to a
          // capped cudaMalloc and the prefill streamed.  Only force it when a region was actually carved, so
          // a no-ring model keeps the plain size classification.
@@ -857,7 +857,7 @@ index 62c61f5d3..46b7ef6d0 100644
          // A view that is NOT a requested wide (prefill) pass belongs to the always-resident narrow band even
          // when it is wider than the floor established so far.  The ring region is only carved while a wide
          // pass is live, so when it is not (`boundary <= narrow_floor` and the ring is disarmed) a wider
-@@ -1274,8 +1293,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1284,8 +1303,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
          // unrelated narrow view) -- treating either as "the ring may not move" stopped the band from
          // being learned on a single device: measured gfx1100 `-ncmoe 40`, floor 1280 MiB against a
          // 1536 MiB decode view, one arena eviction per prefill -> decode transition.
@@ -870,10 +870,10 @@ index 62c61f5d3..46b7ef6d0 100644
              // reserve that is not necessarily the widest narrow layout (the `n_rs_batch` probe measures
              // 1792 MiB where the MTP decode/verify graph needs 2304), and `ggml_cuda_slab_set_narrow_floor`
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 5e305b720..eca232b91 100644
+index 5887851d6..115e1c219 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2159,12 +2159,6 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2167,12 +2167,6 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
          return n_cpy_batch;
      }
  
@@ -886,7 +886,7 @@ index 5e305b720..eca232b91 100644
      // Upstream fused shared-expert MMVQ (owned by mmvq.cu).
      if (const int n_shared_expert = ggml_cuda_match_shared_expert_try_fuse(*cuda_ctx, cgraph, i)) {
          return n_shared_expert;
-@@ -2694,6 +2688,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2702,6 +2696,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
              // MMB fused MoE gate+up+swiglu (pwilkin port). Prefill-only by the shared predicate.
              if (op == GGML_OP_MUL_MAT_ID && ids != nullptr &&
                      ggml_cuda_mmb_supported_glu(gate->src[0], up->src[0], src1, ids, glu)) {
@@ -895,7 +895,7 @@ index 5e305b720..eca232b91 100644
                  ggml_cuda_mul_mat_id_mmb_glu(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu);
                  fused_mul_mat_vec = true;
                  fused_node_count  = 3;
-@@ -2721,11 +2717,12 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2729,11 +2725,12 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                  // instead of the full expert tables.  Redirect BOTH lanes together (the cache took
                  // both inputs over, skipping the scheduler copy); on a decline the scheduler's full
                  // copy stands and the original tensors are used.
@@ -911,7 +911,7 @@ index 5e305b720..eca232b91 100644
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
                  } else {
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
-@@ -2773,6 +2770,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2781,6 +2778,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                  fusion_data.glu_op    = ggml_get_glu_op(glu);
                  fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
  

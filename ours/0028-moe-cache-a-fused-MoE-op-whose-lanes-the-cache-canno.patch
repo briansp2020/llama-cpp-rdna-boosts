@@ -1,4 +1,4 @@
-From 621cf6b06cd6a942e116116d23b11441e3e2ed63 Mon Sep 17 00:00:00 2001
+From 09f525d6a842e7163a676cd872bdb6206c789698 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 06:07:22 +0000
 Subject: [PATCH 28/43] moe cache: a fused MoE op whose lanes the cache cannot
@@ -13,10 +13,10 @@ Subject: [PATCH 28/43] moe cache: a fused MoE op whose lanes the cache cannot
  4 files changed, 38 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index adf52744c..98213e573 100644
+index e733e2997..126ec9824 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2730,6 +2730,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2738,6 +2738,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                      fusion_local.gate     = &gate_c;
                      fusion_local.gate_ids = &gate_ids_c;
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);

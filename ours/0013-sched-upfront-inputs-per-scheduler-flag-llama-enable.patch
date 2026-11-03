@@ -1,4 +1,4 @@
-From 4827662a16b4d0ce34329d50861dfb6ee7b70bf3 Mon Sep 17 00:00:00 2001
+From 112e8006559d1997c5e9b079a63e0ae63f218044 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 26 Oct 2026 09:00:06 +0000
 Subject: [PATCH 13/43] sched upfront inputs: per-scheduler flag; llama enables
