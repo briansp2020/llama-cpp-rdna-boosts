@@ -19,10 +19,10 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 ```
 git checkout 6050b467c
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r204 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 41 patches
+git am <path-to-this-repo>/ours/*.patch              # 43 patches
 ```
 
-Result: tree `ee0373496f8d`.
+Result: tree `13e744ed4278`.
 
 ## Patches
 
@@ -49,6 +49,7 @@ Result: tree `ee0373496f8d`.
 | 0036-0038 | KV lending, off by default (`GGML_MOE_KV_LEND=1`): the KV cache rows past the context in use hold VRAM copies of evicted experts, so a later miss reads or refills them over VRAM instead of PCIe; the rows go back to the KV cache when the context grows; with lending on, a miss on a victim-held expert is read from it without evicting (`GGML_MOE_KV_LEND_STAY`, default on) | - |
 | 0039 | a sparse (mmap) table without a RAM tier admits a routed expert it cannot register (filled through the bounce) instead of declining it per token; the decline could be captured into a CUDA graph and replayed for other routing (wrong output at a tight pin budget) | `GGML_MOE_FORCE_ADMIT=0` |
 | 0040-0041 | fill fence: in a decode take-over, the RAM-tier swaps, the device-map upload and the copy-back-ahead waits are ordered by the remap kernel's lag flag instead of one event record each (each record costs ~4-10 us of compute-queue idle on RDNA4) | `GGML_MOE_FILL_FENCE=0` |
+| 0042-0043 | review fixes for 0029's fill-through: with every member routed a spare RAM slot takes the expert; the trim keeps a partial tier's registered non-member aliases; a fill waits for the last sparse staging launch on the device (its kernel reads tier slots through source pointers taken at launch); `GGML_MOE_TIER_FILL=0` also turns the share off; 0043 makes the victim-copy check of 0036 skip the spare case | - |
 
 The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`, `GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4=0`,
 `GGML_CUDA_MMVQ_CONCAT_REORDER=0`, `GGML_CUDA_ROUTER_TOPK=0`, `GGML_CUDA_DISABLE_GDN_CONV_SNAP=1`,
@@ -75,6 +76,10 @@ r204 vs r204 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-
 - 0039 was validated on the #267 branch, without 0027-0032: at a 28 GB pin budget, 16 fresh loads all gave the correct
   greedy output (13 of 31 were wrong without it). With 0027-0032 every table gets at least a partial tier at that budget,
   so 0039 is a backstop here.
+- 0042-0043 at a 28 GB pin budget (51 partial-tier tables, ~215k fill-throughs per load), 2 fresh loads against 0001-0041
+  and the default budget once: greedy output identical, no faults, 0 declines, speed the same; at the default budget no
+  table has a partial tier, so they do not run there. The 7-model checks above ran on 0001-0041; 0042-0043 change only
+  the partial-tier paths of `--host-experts mmap`, which those models do not use.
 
 llama-bench `-fa 1 -p 512 -n 128 -r 5`, 2 alternating rounds, tg128 means:
 

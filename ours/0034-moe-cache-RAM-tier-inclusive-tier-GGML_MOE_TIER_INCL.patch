@@ -1,7 +1,7 @@
 From ceb7c2cf09b453a73c4236b31785937152b9cdbc Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 16:17:35 +0000
-Subject: [PATCH 34/41] moe cache RAM tier: inclusive tier (GGML_MOE_TIER_INCL,
+Subject: [PATCH 34/43] moe cache RAM tier: inclusive tier (GGML_MOE_TIER_INCL,
  default off) -- every expert keeps its RAM copy, so an eviction only flips
  the remap and an admission is one H2D copy; only from the pin budget the
  plain tiers leave over (GGML_MOE_TIER_INCL_MARGIN_MIB)

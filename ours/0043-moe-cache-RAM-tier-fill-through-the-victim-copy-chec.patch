@@ -1,0 +1,26 @@
+From 9b26c1732dbcc551b4d06491d2caa4936b1578a5 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 3 Nov 2026 18:03:13 +0000
+Subject: [PATCH 43/43] moe cache RAM tier fill-through: the victim-copy check
+ skips v = -1 (a spare took the expert, no member was displaced)
+
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 3c3e6ee60..da8246a66 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1852,7 +1852,7 @@ static bool tier_fill_through_locked(table_t & t, const std::vector<int32_t> & u
+         moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, e, (uintptr_t) d);
+         // a victim copy of either is still exact: point back at it (VRAM) on the victims' stream, else forget it
+         for (const int32_t x : { v, e }) {
+-            if (x < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) x] >= 0) {
++            if (x >= 0 && x < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) x] >= 0) {   // v is -1 when a spare took e
+                 if ((void *) s == g_kvl_stream) {
+                     moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, x, (uintptr_t) kvl_ptr(g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) x]]));
+                 } else {
+-- 
+2.53.0
+

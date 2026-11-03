@@ -1,0 +1,117 @@
+From 53e1f0d092c8f416a29ba877c15fa66414647227 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 2 Nov 2026 15:09:47 +0000
+Subject: [PATCH 42/43] moe cache RAM tier fill-through, review fixes: a spare
+ slot takes a routed expert when every member is routed; the trim keeps a
+ partial tier's registered non-member aliases; a fill waits for the last
+ sparse staging on the device; GGML_MOE_TIER_FILL=0 turns the share off
+
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 54 ++++++++++++++++++++------
+ 1 file changed, 43 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 845563e0b..3c3e6ee60 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -939,8 +939,8 @@ static int64_t g_tier_file_fills   = 0;   // admissions of an expert outside a p
+ static int64_t g_tier_file_victims = 0;   // victims of a partial tier with no RAM slot (back to the file alias)
+ static int64_t g_tier_thru = 0;
+ static int64_t g_tier_incl_tables = 0;     // tables with an inclusive tier (GGML_MOE_TIER_INCL)           // fill-through: routed experts outside a partial tier copied into it
+-// GGML_MOE_TIER_FILL (default on): a partial tier fills its routed non-members through (tier_fill_through_locked) and
+-// never reads the file alias; =0 reads them through the registered alias (declines when it cannot register).
++// GGML_MOE_TIER_FILL (default on): a partial tier fills its routed non-members through (tier_fill_through_locked); =0
++// turns the share off as well (a partial tier without the fill declines when the alias cannot register).
+ // GGML_MOE_TIER_INCL=1 (default off): a full tier also keeps a copy of the experts resident in VRAM, when the pin budget
+ // fits it.  Admission = one RAM -> VRAM copy; eviction = the remap only (the victim's cold pointer is its permanent copy).
+ static bool tier_incl_on() {
+@@ -1377,7 +1377,7 @@ static void tier_share_plan_locked(const std::map<int, std::vector<int>> & by_la
+                                    const std::vector<int> & layer_order) {
+     static const bool on = [] {
+         const char * e = getenv("GGML_MOE_TIER_SHARE");
+-        return e == nullptr || atoi(e) != 0;
++        return (e == nullptr || atoi(e) != 0) && tier_fill_on();   // without the fill a partial tier can decline
+     }();
+     g_tier_share.clear();
+     if (!on) {
+@@ -1795,7 +1795,13 @@ static cudaError_t sparse_fill_locked(const table_t & t, void * dst, int32_t e,
+ // route; its cold pointer is set on the compute stream before the op.  The GPU reads none of those slots now: the
+ // scheduler synchronized for the routing readback, the slots of pending swaps (ram_pending) and copy-back targets
+ // (t.precopy) belong to no member, and an expert outside the tier is never read (this runs before every read of it).
+-// An expert no member can make room for stays outside the tier (pass 2 registers it and reads it through the alias).
++// With every member routed a spare slot takes the expert; only with no spare either does it stay outside the tier (pass 2
++// registers it and reads it through the alias, which the trim keeps registered).
++// The last sparse staging launch per device (moe_cache_stage_table, on the copy stream): its kernel reads tier slots through
++// host-side source pointers taken at launch, so a fill waits for it before the CPU rewrites a slot.
++static cudaEvent_t g_stage_ev[GGML_CUDA_MAX_DEVICES] = {};
++static bool        g_stage_ev_live[GGML_CUDA_MAX_DEVICES] = {};
++
+ static bool tier_fill_through_locked(table_t & t, const std::vector<int32_t> & used, void * stream) {
+     if (!t.ram_partial || t.ram_base == nullptr || stream == nullptr || !tier_fill_on()) {
+         return true;
+@@ -1821,13 +1827,26 @@ static bool tier_fill_through_locked(table_t & t, const std::vector<int32_t> & u
+                 v = c;
+             }
+         }
+-        if (v < 0) {
++        if (v < 0 && t.ram_free.empty()) {
+             continue;
+         }
+-        const int32_t q = t.ram_slot[(size_t) v];
+-        char *        d = t.ram_base + (size_t) q * eb;
+-        t.ram_slot[(size_t) v] = -1;
+-        moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, v, tier_file_ptr(t, v));   // q is e's from here on
++        if (t.device >= 0 && t.device < GGML_CUDA_MAX_DEVICES && g_stage_ev_live[t.device]) {
++            if (cudaEventSynchronize(g_stage_ev[t.device]) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return false;
++            }
++            g_stage_ev_live[t.device] = false;
++        }
++        int32_t q;
++        if (v >= 0) {
++            q = t.ram_slot[(size_t) v];
++            t.ram_slot[(size_t) v] = -1;
++            moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, v, tier_file_ptr(t, v));   // q is e's from here on
++        } else {
++            q = t.ram_free.back();   // every member is routed: a spare (no cold pointer reads it) joins the tier
++            t.ram_free.pop_back();
++        }
++        char * d = t.ram_base + (size_t) q * eb;
+         sparse_pack_expert(t, e, d);
+         t.ram_slot[(size_t) e] = q;
+         moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, e, (uintptr_t) d);
+@@ -2116,8 +2135,8 @@ static void sparse_trim_locked(const char * why) {
+         }
+         any = true;
+         t.sparse_all = false;
+-        if (t.ram_base != nullptr && (!t.ram_partial || tier_fill_on())) {
+-            continue;   // RAM tier: nothing of this master is read in place (a partial tier with the fill too)
++        if (t.ram_base != nullptr && !t.ram_partial) {
++            continue;   // RAM tier: nothing of this master is read in place
+         }
+         if (!t.allocated || t.sparse_off || t.arena == nullptr || t.slots <= 0) {
+             continue;   // no arena: nothing reads this master in place (update_host / get_cold decline the table)
+@@ -4987,6 +5006,19 @@ bool moe_cache_stage_table(const void * src, size_t offset, size_t total, void *
+         if (cudaGetLastError() != cudaSuccess) {
+             return false;
+         }
++        if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
++            if (g_stage_ev[device] == nullptr &&
++                cudaEventCreateWithFlags(&g_stage_ev[device], cudaEventDisableTiming) != cudaSuccess) {
++                (void) cudaGetLastError();
++                g_stage_ev[device] = nullptr;
++            }
++            if (g_stage_ev[device] != nullptr && cudaEventRecord(g_stage_ev[device], (cudaStream_t) stream) == cudaSuccess) {
++                g_stage_ev_live[device] = true;
++            } else {
++                (void) cudaGetLastError();
++                (void) cudaStreamSynchronize((cudaStream_t) stream);   // no event: the staging is done before any fill
++            }
++        }
+         // the host pack is per table and re-filled only by the next ubatch's staging of this table (the scheduler
+         // synchronizes between ubatches), so the async upload has consumed it by then
+         g_stage_tables++;
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From c719db0a226c406578bf43c635ff6c3f92d4170e Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 10:55:50 +0000
-Subject: [PATCH 31/41] moe cache RAM tier: hybrid share
+Subject: [PATCH 31/43] moe cache RAM tier: hybrid share
  (GGML_MOE_TIER_SHARE_MIN_PCT): the hottest layers keep a full tier while
  every other layer still gets that share of its own; the rest share what is
  left

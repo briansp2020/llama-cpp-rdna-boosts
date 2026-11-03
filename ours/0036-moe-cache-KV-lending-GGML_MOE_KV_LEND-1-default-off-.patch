@@ -1,7 +1,7 @@
 From 844c57d7925645ea21f7dfc4413837f1d50e641d Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 02:41:53 +0000
-Subject: [PATCH 36/41] moe cache: KV lending (GGML_MOE_KV_LEND=1, default off)
+Subject: [PATCH 36/43] moe cache: KV lending (GGML_MOE_KV_LEND=1, default off)
  -- the KV cache rows past the context in use hold copies of evicted experts
 
 The main model's K/V tensors (one stream, V not transposed, no windowed KV / KV pool) are registered with the expert

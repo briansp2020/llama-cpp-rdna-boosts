@@ -1,7 +1,7 @@
 From e5bd2aa8c1ac77b5d751a5dd9c3ad923c97177c6 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 07:17:27 +0000
-Subject: [PATCH 40/41] moe cache: mark a decode take-over's swaps and map
+Subject: [PATCH 40/43] moe cache: mark a decode take-over's swaps and map
  upload done by the remap lag flag, not an event each (GGML_MOE_FILL_FENCE,
  default on)
 
