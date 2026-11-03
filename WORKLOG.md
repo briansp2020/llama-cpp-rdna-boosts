@@ -1,3 +1,196 @@
+## 261101.020 (r206) -- the slab headroom default is `1152 + 128 x n_gpu` MiB, and block 15 gets the residency gate it shipped without
+
+**Released as `v16-6050b467c-r206` (16 blocks; block 10 amended).**  Fork point unchanged (`6050b467c`), new
+tip **`efaa60db0`**, tree **`1bac1001f1780a5907fbce256ceeeaac8b8561ec`** (r205 was `7afa30c8e` / `d6e7190119`).
+The working chain read `261e22d7d` (same tree).  `release.json` refreshed; `patches/` regenerated from
+`6050b467c..r206-chain`; `scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c` tarball,
+tree `1bac1001f`, 286 files through the Windows portability lint); `gate-per-block-build.sh --fast
+--changed-from 7afa30c8e --tip 261e22d7d` 2/2 (block 10 + the tip).
+
+**Shipped -- one default, not a code path (block 10).**  `GGML_CUDA_SLAB_HEADROOM_MIB` is the steady-state free
+VRAM the movable-boundary slab leaves outside itself; the default was `640 + 128 x n_gpu` (768 / 896 / 1024 MiB
+for 1 / 2 / 3 GPUs) since r86.  It is now **`1152 + 128 x n_gpu`**, i.e. **1280 / 1408 / 1536 MiB**.  The 640
+base was sized on the field GSQ / `-ub 4096` shape, whose widest outside transient is ~300 MiB per device, and
+block 15's `-c 262144` host-expert runme is a harder one: r194's record is that the then-default 768 left
+`hipBLASLt out of memory` on the first prefill and 1536 was the workaround, i.e. the shipped default was one
+workspace short on a documented configuration.  A default that needs the operator to know that shape is the
+wrong default; `1280` covers it with the ~1.2x margin the header asks for.
+
+**`1280` is margin, not a demonstrated fix -- say so.**  This session did **not** reproduce the r194 cliff on any
+arm it could build: Flash-Next GSQ-IQ3_XXS, 1 GPU, `-ncmoe 48`, q8_0 KV, `-c 262144`, at a 5 246, a 25 763 and a
+51 475-token prefix, at 768 **and** at 1280 -- every arm completed and every arm produced the same text.  r194
+itself calls the failure order-dependent, so one clean pass proves nothing either way.  What is measured is the
+**cost**: field shape (1 GPU, `-ncmoe 48`, `-c 32768` q8_0, 5 246-token prompt, `-n 2000`, interleaved,
+`ROCBLAS_USE_HIPBLASLT=0`) 768 -> arena **24 691.7 MiB**, `h` **0.9603**, **47.95 t/s** vs 1280 -> arena
+**24 576.4 MiB**, `h` **0.9602**, **47.98 t/s**, i.e. **-115 MiB of arena, -0.01 pt of expert hit rate, decode
+flat**.  An explicit value is still taken verbatim, so 768 stays one env var away.
+
+**Coherence (no objection).**  Byte-identical to the pre-change build on every arm: dense 4B Q8_0
+(`d2ffb97ccb76`), host-expert 35B-A3B UD-Q4_K_M `-ncmoe 24` (`727d7d1558b4`), Flash-Next GSQ + MTP-4
+`-c 32768` (`f260d1824ab3`), and the `-c 262144` arms (`7c5a512a8447` at 5 246 tokens, `7a3474cbe5f1` at
+25 763, `6c0561298cf1` at 51 475) agreeing across 768/1280.  `gate-prefill-logits.sh` **0.000000 KLD /
+100.000 %** on the 27B Q8_0 point (build `efaa60db0`); MTP Protocol A P axis (dense 27B UD-Q4_K_XL, 1 GPU,
+`-c 102400` bf16 KV, `-n 3000`, prose): plain **30.1** t/s vs `draft-mtp` **55.3** t/s with **byte-identical**
+text (`b9c10f46b5ae`, 11 413 chars); `check-gpu-faults.sh --since "6 hours ago"` clean.  `fork-refresh.sh
+--build --gates` re-cut the branch from `6050b467c`, reproduced tree `1bac1001f` and printed the canonical tip
+**`efaa60db0`** (now `release.json.tip`).
+
+**Block 15 gets the gate it shipped without (campaign `wip/kv-residency-cleanup/` §2.1 = the archive plan's
+phase P0).**  `scripts/gate-kv-residency.sh` is repo tooling, not a patch: two placements, each with a resident
+arm and a forced-miss one, on one binary, with same-seed text (and the drafter's acceptance) as the oracle and
+the residency numbers as the proof that the arm left the resident placement.  Window: `wref`/`wres` (`W=8192`,
+above the run depth)/`wspill` (`W=2048`).  Pool: `pref` (the sparse arm the pool replaces)/`pres`
+(`LLAMA_KV_REGION_POOL=32768`, the whole cache)/`pfloor` (`=512`).  It also prints a per-cache **KV accounting**
+block from the log -- the P0 report -- and `REUSE=1 KEEPOUT=<dir>` re-grades a run instead of re-running it.
+Measured: `wref == wres == wspill` (`be904e86f248`) with 0 flips and 0 host MiB on `wres` and 16 flips /
+64 MiB host-backed on `wspill`; `pref == pres == pfloor` (`f260d1824ab3`) with draft 71/43 on all three,
+`bad 0`, 8 192 pages vs 4 104, 252 resolves on both, **144.2 -> 216.5 claims/resolve** and **90.91 -> 90.03 %**
+hits (on the released tree; the counters move ~1 % run to run because the claim cursor is an `atomicAdd`, so
+the gate asserts a strict inequality and never an absolute).  **Negative-tested** as the plan demands: an off-by-one pool slot in `kv_pool_map_fill_kernel` diverges
+the text and the acceptance and the gate FAILs (and `LLAMA_KV_POOL_VERIFY=1` stays `bad 0` under it -- VERIFY
+compares the pool's bytes, so a wrong READER index is invisible to it, which is exactly why the text oracle is
+the gate).
+
+**Three things the plan's own arm design got wrong** (recorded in the campaign file and the script header, so
+they are not re-derived): a pool cannot be made "deliberately undersized" in cells -- `LLAMA_KV_REGION_POOL` is
+floored to one decode band, so `512` *becomes* 4 104 pages; a resident pool does **not** report ~0 misses (the
+claim cursor is round-robin and the top-k selection moves: 144 claims/resolve with the whole cache resident);
+and `hits %` can never read 100 % (a block claimed by the same launch is neither hit nor miss).
+
+**`TODO` #122 retired in this session** (`WORKLOG.md` 261101.019, docs only): the Goal A `auto` policy is P1 and
+block 15's note already said so.  `TODO.md` now carries no decision rows.
+
+**Wiring.**  `scripts/README.md` (command list + the table row), `MANIFESTS.md` release gate **17** (and "run the
+GPU gates alone"), `AGENTS.md`'s change-to-gate table, `wip/kv-residency-cleanup/README.md` §2.1 (DONE, with the
+three corrections and the numbers) and `wip/CAMPAIGNS.md`.  Not wired into `scripts/validate-gpu.sh`: the worker
+has one gfx1151 card and no Flash-Next GGUF, so this stays a by-hand release gate like park/ckpt/state.
+
+## 261101.019 (docs) -- `TODO` #122 retired: the Goal A `auto` policy is P1, and the note already said so
+
+No delivery change (nothing outside `patches/*.patch` moved, so no new tag for this entry).  #122 was the
+`LLAMA_KV_RESIDENT_CELLS=auto` policy question -- the arena-vs-window trade the campaign left open in
+`archive/work/kv-residency/A2-MIXED-BACKING.md` §3.7.11.4 A-C.  The maintainer decided it on 2026-10-31
+(§3.7.14): **P1 (fittability only) ships**, `auto` sizes a window only when the KV does not fit at the pinned
+`-c` and the expert arena keeps the VRAM through `margins[0]`; **P2** (unconditional arena-first) is rejected
+because a fit cannot know the run's depth (a `W` 35k cells below it costs 11-26 %); **P3** (an explicit
+per-token spill budget) stays parked until it measures better than P1 as a default.
+
+What was owed on the row was one line of block 15's note, and **it was already there** (r193,
+`patches/README.md`): the sentence asserted P1 and the numeric-`W` requirement before the decision was
+formally recorded.  So the retirement is bookkeeping plus three doc corrections:
+
+* the block-15 line now names the decision, its date and its record (§3.7.14, `TODO` #122), instead of reading
+  as a self-evident statement;
+* `wip/kv-residency-cleanup/README.md` drops the #122 close-out bullet, and its knob table loses a stale
+  row that still said the window is declined on `-sm tensor` and is "one device only" -- r204 shipped the
+  split window (`TODO` #124), so the line described a limitation two releases old;
+* `TODO.md` loses the row (numbers are permanent handles and are not reused).
+
+The engineering facts did not change, so no measurement is recorded here: `auto` behaves exactly as r181's
+"a decision, not a guess" note describes, and §3.7.11.4's tables A/B (a `W` at the depth is free and worth
++2.2..+2.9 GiB of arena; a `W` 35k below it costs 11-26 %) remain the numbers of record.
+
+## 261101.018 (docs) -- r205 published: CI green on both pushes, the fork branch at `7afa30c8e`
+
+No delivery change (docs only; no new tag).  `v16-6050b467c-r205` is tagged and pushed; `main` is at the r205
+commit (`8fe8584e`).  CI: **Validate delivery set** green on both the `main` push and the tag push (strict 16/16
+apply on a fresh tarball, tree `d6e71901`, the Windows path + portability lints), **Release patch set** green
+(assets `patches.tar.gz`, `rdna-boosts-all.patch`, `release.json`, `SHA256SUMS`).  The personal fork's
+`rdna-boosts` branch was force-pushed to **`7afa30c8e`** by `scripts/fork-refresh.sh --push` (re-cut from
+`6050b467c`, tree `d6e71901` reproduced, `release.json.tip` matched; the lease moved `aaf30b6b4...7afa30c8e`).
+The first attempt aborted at the `proceed? [y/N]` prompt because it was driven non-interactively — the script
+needs `--yes`, worth remembering.  The ROCm container images are built and pushed off-host by the worker watcher
+(`radiance`), which polls for the tag.
+
+## 261101.017 (r205) -- the `q5_0` and `iq4_nl` KV cache write folds land in block 10; `TODO` #120 closed (`bf16` is unreachable, not unfused)
+
+**Released as `v16-6050b467c-r205` (16 blocks; block 10 amended).**  Fork point unchanged (`6050b467c`), new
+tip **`7afa30c8e`**, tree **`d6e7190119879b1847668cd7fc9fab3e31cc56c5`** (r204 was `aaf30b6b4` / `62603709`; this
+session's working chain read `e8f94e05d`, the same tree).  `release.json` refreshed; `patches/` regenerated from
+`6050b467c..r205-chain`; `scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c` tarball,
+tree `d6e71901`, 286 files through the Windows portability lint); `gate-per-block-build.sh --fast --changed-from
+aaf30b6b4 --tip <shared-chain tip>` 2/2 (block 10 + the tip); `fork-refresh.sh --build --gates` re-cut the branch
+from the base, reproduced tree `d6e71901`, and passed coherence + the canonical prefill-logit gate.  Record:
+[`benchmarks/2026-11-01-kv-fold-q5_0-iq4_nl-promotion.md`](benchmarks/2026-11-01-kv-fold-q5_0-iq4_nl-promotion.md).
+
+**Shipped -- `TODO` #120's last reachable half.**  The r187 quantized-KV decode folds (`GREEDY-PURITY.md` §74)
+keyed on the cache `SET_ROWS` being `q8_0` (r187) or `q4_0` (r199, wave32), so a `q5_0` or `iq4_nl` cache kept
+K's and V's own `k_set_rows_quant`, V's own `fwht_cuda<64>` and the two single Q / K norm+rope launches
+(8547 launches per 12-token decode on a 30B-A3B against 6915 for the `q8_0` arm).
+`ggml_cuda_quantize_q5_0_group` reproduces `quantize_f32_q5_0_block` from one 32-lane wave — q4_0's
+**first-of-largest** seed, the reference's `-16` divisor and `min(31, (int8_t)(x + 16.5f))`, lane `j` packing
+element `j` with `j + 16`, and `qh` (the one 32-bit word of 5th bits) written whole by lane 0 from a **ballot over
+the 32 lanes**.  `ggml_cuda_quantize_iq4_nl_group` reproduces `quantize_f32_iq4_nl_block` — `kvalues_iq4nl[0]`'s
+seed, `best_index_int8` per element, and the reference's **16-term scale search**, which is order-sensitive: lane
+`j` computes term `j` and the terms are broadcast **in `j` order** and added one at a time (32 `__shfl_sync` per
+block), because a butterfly association is a different float and would have flipped cache bytes.  The cache
+quantizer stays the kernels' compile-time `kv` value (now 0..4); the launcher's 3-width x 2-`has_ff` x
+2-`no_norm` arm matrix is written once by a local `RMR_FWHT_LAUNCH(NORM, KV)` macro (and `RMR_PAIR_LAUNCH(KV)` in
+the pair launcher), so a new quantizer is one `case`; both types are wave32 only; `GGML_CUDA_KV_FOLD_Q5_0=0` /
+`GGML_CUDA_KV_FOLD_IQ4_NL=0` are the kill switches.  Census (gfx1201, graphs off, 12-token decode): **8547 ->
+6915** on the 30B-A3B (`rms_norm_mul_rope_f32_qk_pair<..,128,3|4>` x336 + `rms_norm_mul_rope_f32<..,128,3|4>`
+x144) and **9831 -> 9063** on gpt-oss-20b (its rope-only `FUSE_ROPE_FWHT` form, `..,64,3|4,true` x384).
+
+**Measured** (`llama-bench -fa 1 -p 0 -n 128 -d 0,4096 -r 5 -t 8`, 3 interleaved rounds per arm,
+`ROCBLAS_USE_HIPBLASLT=0`, one idle box per arch, baseline = a pristine r204 build of the same tree):
+**gfx1201** Qwen3-Coder-30B-A3B Q4_K_M `q5_0` **+10.2 % tg128 / +8.8 % @4096** (155.9 -> 171.8 / 139.3 ->
+151.5), `iq4_nl` **+24.8 % / +22.1 %** (130.4 -> 162.7 / 120.1 -> 146.6); **gfx1100** the same model
+**+12.2 % / +11.1 %** and **+23.4 % / +22.8 %**; **gfx1151** Qwen3.6-35B-A3B Q4_K_M **-0.1 % / -0.1 %** (flat)
+and **+0.5 % / +0.5 %** — the fold fires there (16139 -> 15839 launches) but a 35B-A3B at 16 ms/token is not
+launch-bound.  `f16`, `q8_0` and `q4_0` KV unchanged against the pristine build (172.5 / 175.7 / 172.7 tg128).
+`iq4_nl` gains most because the standalone `k_set_rows_quant<.., quantize_f32_iq4_nl_block>` is the expensive one
+(a 15-step binary search per element, one thread per block).
+
+**`bf16` is not reachable and was deliberately not shipped — the finding of this session.**  `TODO` #120 assumed
+a bf16 cache "has no fused write kernel".  The premise is wrong: `llama_kv_cache`'s `attn_rot_k`/`attn_rot_v`
+both require `ggml_is_quantized(type_k/type_v)`, so `-ctk/-ctv bf16` logs **`n_rot_k = 0, n_rot_v = 0`** and the
+graph carries no `attn_inp_k_rot` at all — there is no rotation to fold.  A bf16 write arm (`kv = 5`, the plain
+`ggml_cuda_cast<nv_bfloat16>`) was implemented, built and measured: the census on a bf16-KV 30B-A3B is
+`k_set_rows<float,int64_t,nv_bfloat16>` x960 + `rms_norm_mul_rope_f32<256,false,float,0,0,false>` x960, i.e.
+**zero** folded launches, and its `--ub 1` A/B read `-0.000001 / 100.000 %` — which the *noise-floor* arm (both
+sides fold-on, an irrelevant switch in the base) reproduced exactly, so that point cannot decide a bf16 arm at
+all.  The arm was removed rather than shipped unreachable-and-unvalidated.  The only path where a non-quantized
+cache *does* rotate is the forced indexer exception (DeepSeek32 / DeepSeek4 / GLM-DSA / DOTS3NOTE with
+`n_embd_head_k_full == indexer_head_size`); no such model fits this box, so it is an **accepted limitation**
+(`INVARIANTS.md`, `GREEDY-PURITY.md` §74), not shipped code.
+
+**Purity (no objection).**  `gate-prefill-logits.sh --kv q5_0 --ub 1 --chunks 8 --ab "GGML_CUDA_KV_FOLD_Q5_0=0"`
+**0.000000 KLD / 100.000 %**, `--kv iq4_nl` **-0.000000 / 100.000 %**; the gpt-oss-20b default-ubatch arm (its
+rope-only form is the one prefill path) **0.000000 / 99.990 %** and **0.000000 / 100.000 %**;
+`test-logits-width-probe` `KV=q5_0`/`KV=iq4_nl` at `P=3584` and `P>=4096` — every `W=1..8` row hash identical
+on/off, `width_purity=PASS`; greedy text byte-identical on **25 arms** (1 GPU: 30B-A3B `q5_0`/`iq4_nl`/`q8_0`/
+`q4_0`/`f16`, dense 27B `q5_0`, gpt-oss-20b `q5_0`/`iq4_nl`, 35B-A3B `-ncmoe 40` `q5_0`) and on gfx1100 and
+gfx1151, always r204 == patched == switch-off (`a292d7672787`, `fa1e77d808b8`, `c82282369771`, `b133a6de8786`,
+`20db30e33028`, `10a82b5559a9`, `910a68488e03`, `95a2fa898505`, `15787727b69d`, `680ba3a5c15c` /
+`58fea34493f7`, `dae072eeaf78` / `061add8deaba`); `test-backend-ops -o ROPE,SET_ROWS,FLASH_ATTN_EXT`
+**7059/7059**.
+
+**Other release gates.**  MTP Protocol A (dense 27B UD-Q4_K_XL, 1 GPU, `-c 32768`, `q5_0` KV, `-n 3000`,
+`--spec-type none` vs `draft-mtp`): plain **29.3** t/s both arms, `draft-mtp` **67.0 vs 67.1**, drafts **2816 /
+accepted 2059 (0.731)** in both.  Band gate `llama-batched-bench -npp 512 -ntg 128 -npl 1,4,8` (27B Q8_0, 1 GPU)
+flat (`q5_0` 6.71/7.68/9.24 -> 6.78/7.52/9.26 tg).  Graph replay census `direct=3 replay=5 capture=2
+properties_changed=0`; `check-gpu-faults.sh --since "4 hours ago"` clean.  The multi-device-only gates
+(`gate-spec-align`, `gate-spec-width-band`, `gate-state-pipe`'s 2-GPU arm, `gate-kv-window-split`) cannot run on
+this box (one R9700); they were green in r204 on three, and this change reaches no scheduler, state, checkpoint
+or window path.  The fork's `rdna-boosts` branch was force-with-lease pushed to `7afa30c8e`
+(`fork-refresh.sh --push`), the delivery repo and the tag are pushed, and the ROCm container images are the
+`radiance` watcher's job (it picks the tag up within ~10 minutes).
+
+**Tooling fixed on the way in.**  `scripts/gate-per-block-build.sh` *defaults* `--tip` to
+`release.json`'s `.tip`, i.e. the **last released** chain — so running it before the release commit (with
+`--changed-from <previous tip>`) re-verifies the previous release: every block reads "delta unchanged" and only
+the tip builds, a vacuous pass.  This session hit exactly that (the first run gated `6050b467c..aaf30b6b4` and
+printed 15 skips + one 11 s tip build).  The script now **warns** when the defaulted tip is a strict ancestor of
+the checkout's `HEAD`, prints the `--tip $(git rev-parse HEAD)` invocation to use, and is unchanged otherwise
+(`scripts/`, not a delivered artifact).
+
+**Docs.**  `patches/README.md` (block 10 table row + a new r205 block note), `ENVIRONMENT.md` (the two kill
+switches + the corrected "which cache types are folded" paragraph), `INVARIANTS.md` (the r187 KV-fusion bullet
+corrected in place, plus two new facts: a non-quantized cache has no rotation; `iq4_nl`'s scale search is
+order-sensitive), `GREEDY-PURITY.md` §74 (rule 6 extended to `q5_0`/`iq4_nl` with the association-order rule, the
+Scope paragraph now states the `f16`/`bf16` non-reachability, index row updated), `MANIFESTS.md` (the block-10
+per-block row gains the r205 arm and the bf16 note), `TODO.md` (**#120 removed**).  `TODO` #120 is closed.
+
 ## 261101.016 (r204) -- the windowed KV across a `-sm tensor` split: `TODO` #124 closed, and four path defects fixed with it
 
 **Delivery change.  Block 15 amended** (the streamed KV), fork point unchanged (`6050b467c`), new tip

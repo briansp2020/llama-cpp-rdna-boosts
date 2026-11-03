@@ -7,9 +7,10 @@ archived** on 2026-11-01 as
 B (the attendance pool) and C (the MTP draft window) all ship in **block 15**; the r197 release is
 `v16-6050b467c-r197` (tip `ba7c2b7b8`, tree `eaf673210`), which also closed `TODO` #129.
 
-**This campaign is only the residue**: one missing gate, one go/no-go, one measurement-heavy code item, one
-policy question, and the record hygiene they imply.  Nothing here is a new mechanism for a *shipped* feature,
-and **nothing here is in `patches/` or gets applied to the fork** (`AGENTS.md`, WIP rules).
+**This campaign is only the residue**: one go/no-go, one measurement-heavy code item, one policy question, and
+the record hygiene they imply (**the missing gate, P0, is BUILT — 2026-11-01, `scripts/gate-kv-residency.sh`**).
+Nothing here is a new mechanism for a *shipped* feature, and **nothing here is in `patches/` or gets applied to
+the fork** (`AGENTS.md`, WIP rules).
 
 ---
 
@@ -20,7 +21,7 @@ Block 15 is **three opt-in placements of the attention KV, one default-on draft 
 
 | knob | default | what it does |
 |---|---|---|
-| `LLAMA_KV_RESIDENT_CELLS` | off (`0`/unset) | the **window**: newest `W` cells in VRAM, the tail in pinned system RAM in one VA reservation (no kernel change).  `auto` = `--fit` sizes it.  `-sm tensor` declines it; `-nkvo` declines it (r197); one device only |
+| `LLAMA_KV_RESIDENT_CELLS` | off (`0`/unset) | the **window**: newest `W` cells in VRAM, the tail in pinned system RAM in one VA reservation (no kernel change).  `auto` = `--fit` sizes it, and only for a `-c` the user pinned (the decision `TODO` #122 records: P1, fittability only).  `-nkvo` declines it (r197); a `-sm tensor` split carries it, one region per child device (r204, `TODO` #124); a MIRRORED dsv4/HRM cache declines it |
 | `LLAMA_KV_REGION_POOL` | off (`0`/unset) | the **pool**: the authoritative KV in a pinned host mirror + a compact device pool of indexer-block pages, resolved in-graph by `GGML_OP_KV_POOL`.  qwen4exp/QSA only (it is the sparse reader's page table); declines while a window is active, on `!offload` and on a `-sm tensor` split |
 | `LLAMA_SPEC_DRAFT_WINDOW` | **on** (`auto`) | the **MTP draft window**: the embedded MTP head's draft KV is a quarter of the context clamped to [32768, 65536] cells, `0` = off.  MTP + embedded head only |
 | `LLAMA_KV_SPILL_RAM_PCT` / `LLAMA_KV_POOL_MIRROR_UNIT_MIB` | 85 % / 1 MiB | the pinned-RAM ceilings and the mirror's grow unit |
@@ -46,39 +47,51 @@ is history and its arms are `scripts/gate-kv-window-split.sh` (plus the `LLAMA_K
 
 ## 2. The work, in the order I would take it
 
-### 2.1 The residency gate — build it (`README.md` §8 **P0** in the archive)
+### 2.1 The residency gate — **DONE (2026-11-01)**, `scripts/gate-kv-residency.sh`
 
-**Why.**  The plan said the streamed KV "cannot ship without" a residency gate, and it shipped on a
+**Why it existed.**  The plan said the streamed KV "cannot ship without" a residency gate, and it shipped on a
 *substitute*: `LLAMA_KV_POOL_VERIFY=1` (verify kernel, 0 mismatches) plus a hand-run acceptance table at
-5.3k / 103k / 180k.  There is **no `scripts/gate-*.sh` for residency or for the pool**, and the release
-flow's park / ckpt / state gates do not measure hit rates — so a pool regression between releases is
-invisible unless someone re-runs that table by hand.  This is the only shipped block-15 feature with no
+5.3k / 103k / 180k.  There was **no `scripts/gate-*.sh` for residency or for the pool**, and the release
+flow's park / ckpt / state gates do not measure hit rates — so a pool regression between releases was
+invisible unless someone re-ran that table by hand.  This was the only shipped block-15 feature with no
 release gate of its own.
 
-**What to build.**  `scripts/gate-kv-residency.sh`, two arms per placement, both with counters:
-1. **resident** — sized so the placement holds everything the run touches (window: `W` at or above the run's
-   depth, so nothing flips; pool: `LLAMA_KV_REGION_POOL` in **cells** — 4 cells = one page = one indexer
-   block — large enough that nothing is claimed out twice), and
-2. **forced misses** — deliberately undersized (window: `W` well below the depth; pool: a small cell count,
-   e.g. `512` cells = 128 pages, against a 103k-token run).
+**What shipped.**  `scripts/gate-kv-residency.sh` (indexed in `scripts/README.md`, `MANIFESTS.md` release gate
+17, `AGENTS.md`'s change-to-gate table), two arms per placement, text as the oracle and the residency numbers
+as the proof that the arm left the resident placement: window `wref`/`wres` (`W=8192`, above the run depth)/
+`wspill` (`W=2048`) on the 4B at `-c 16384`; pool `pref`/`pres` (`=32768`, the whole cache)/`pfloor` (`=512`)
+on Flash-Next + MTP at `-c 32768`.  It also prints a per-cache **KV accounting** block from the log, which is
+the "cells / bytes / resident share / bookkeeping / fit consequence from the log rather than a guess" half of
+the plan's P0.
 
-The counters are part of the assertion, not a diagnostic: the resident arm must report ~0 misses and the
-undersized arm must report **misses > 0 with hits > 0** — otherwise it never actually left the cache and the
-comparison proved nothing.
+**Three things the plan's own arm design got wrong — do not re-derive.**
+1. **A pool cannot be made "deliberately undersized" by cells.**  `LLAMA_KV_REGION_POOL` is floored to one
+decode band (`8 x ceil(top_k / page)` pages, 4 104 pages on Flash-Next), so the plan's `512`-cell arm becomes
+exactly that floor: 204 MiB of pool, not 128 pages.  The forced-miss arm has to be expressed against the
+**working set** instead — the same pool at a depth that does not fit it (25 763 tokens = 6 441 blocks against
+4 104 pages).
+2. **A resident pool does not report ~0 misses.**  The claim cursor is round-robin (it hands out the next slot
+whether or not the block is resident) and a decode step's top-k selection moves, so every step pulls in blocks
+it did not read before: 144 claims/resolve at `-c 32768` with the pool holding the WHOLE cache.  The
+separation is claim pressure and hit rate (144 -> 218 claims/resolve, 90.95 -> 89.64 % hits), not an absolute.
+3. **`hits %` can never read 100 %**: an id whose block another thread of the SAME launch just claimed is
+neither a hit nor a miss.
+4. **The counters move run to run**: the claim cursor is an `atomicAdd`, so the same two arms read 144.3/218.4
+claims per resolve in one run and 144.2/216.5 in the next (hits 90.95/89.64 vs 90.91/90.03).  The gate asserts
+a strict inequality between the arms, never an absolute threshold.
 
-Assert: same-seed greedy text **byte-identical** between the two arms (text from runs **without** `-v`,
-`scripts/extract-generated.py`), identical `draft_n`/`draft_n_accepted` on an MTP arm (`-n 512`+), `bad 0`
-from `LLAMA_KV_POOL_VERIFY=1`, the hit/miss line from `LLAMA_KV_POOL_STATS=<path>` (a **path**, never
-stderr), and the window arm's spill proof (`KVREGION_FREE … host=`, `FLIP > 0`) — **a gate that cannot
-leave the resident arm is not a gate**, so fail if the two arms report the same hit rate.
+**Negative test (the plan's "shown to fail").**  An off-by-one pool slot in `kv_pool_map_fill_kernel` (a
+wrong-page resolve) makes `pres`/`pfloor` diverge in text AND in acceptance, and the gate FAILs on all three.
+Note `LLAMA_KV_POOL_VERIFY=1` stays `bad 0` under it: VERIFY compares the pool's BYTES against the mirror, so
+it cannot see a wrong READER index — the text is the only oracle for that class, which is the whole reason the
+gate exists.
 
-**Model.**  Flash-Next GSQ-IQ3_XXS (`qwen4exp` — the only pool-capable model), 1 GPU, `-ncmoe 48`, q8_0 KV,
-the PLE flags below.  A window arm can use a smaller model (the 4B at `-c 16384` really spills; at
-`-c 4096` it never does).
-
-**Done when** the script is in `scripts/README.md`, wired into the release flow (and optionally
-`scripts/validate-gpu.sh`), and has been shown to *fail* on a deliberately broken arm (e.g. a pool whose
-resolve is made to read the wrong page).  Size: S-M.
+**Measured (this box, one R9700, r205/r206 build).**  Window: `wref == wres == wspill` (`be904e86f248`), 0
+flips / 0 host MiB on `wres`, 16 flips / 64 MiB host-backed on `wspill`.  Pool: `pref == pres == pfloor`
+(`f260d1824ab3`), draft 71/43 on all three, `bad 0`, 8 192 pages (408.0 MiB) on `pres` vs 4 104 (204.4 MiB) on
+`pfloor`, 252 resolves on both, 144.3 -> 218.4 claims/resolve.  Runtime: ~15 s window, ~4m45 s pool.
+**Not wired into `scripts/validate-gpu.sh`** (the worker has one gfx1151 card and no Flash-Next GGUF); it is a
+by-hand release gate, like the park/ckpt/state gates.
 
 ### 2.2 O1 "KV-grow" — decide it, then either ship or close (`README.md` §8 **P1**, §11(5))
 
@@ -151,8 +164,6 @@ open:
 * **k-quant indexer keys** (accepted limitation: a 256-element superblock does not divide `idx_dim` = 128;
   `HANDOVER.md` §12.6, `BA-POOL-DESIGN.md` §10.3): add it to `TODO.md`'s **accepted limitations** list, so a
   reader of `TODO.md` alone can find it.
-* **`TODO` #122** (the Goal A `auto` policy): decided (P1) and its owed `patches/README.md` line is present,
-  so the row can be retired to one `WORKLOG.md` entry whenever the maintainer wants.
 
 ---
 
@@ -192,8 +203,9 @@ open:
   `0.000000 / 100.000 %` on that arm (`scripts/gate-prefill-logits.sh`), the selftest pair above, and the
   state/checkpoint/park gates if the memory type is touched.
 * **Pool change:** text identity against the pool-off arm, `LLAMA_KV_POOL_VERIFY=1`, `LLAMA_KV_POOL_STATS`,
-  `scripts/gate-park-idle-slots.sh`, `scripts/gate-ckpt-reuse.sh`, `scripts/gate-state-pipe.sh` on a
-  **pooled** cache, `test-backend-ops -o FLASH_ATTN_QSA`, `check-gpu-faults.sh`.
+  `scripts/gate-kv-residency.sh` (r206: both placements, each with a resident and a forced-miss arm, plus the KV
+  accounting block), `scripts/gate-park-idle-slots.sh`, `scripts/gate-ckpt-reuse.sh`, `scripts/gate-state-pipe.sh`
+  on a **pooled** cache, `test-backend-ops -o FLASH_ATTN_QSA`, `check-gpu-faults.sh`.
 * **Delivery change** (anything that reaches `patches/`): `scripts/validate-set.sh`, the per-block build gate
   `--changed-from <previous tip>` (and an `all` build at the tip), and the standard prefill-logit point at the
   27B Q8_0 before a tag.  `scripts/gate-prefill-logits.sh` bases are **per ROCm line** — a cross-line compare
