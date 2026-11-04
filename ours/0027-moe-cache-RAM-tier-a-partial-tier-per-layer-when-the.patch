@@ -1,7 +1,7 @@
 From 78d9a9061925743ed1cfb693d096ada1d613fce4 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 03:34:24 +0000
-Subject: [PATCH 27/43] moe cache RAM tier: a partial tier per layer when the
+Subject: [PATCH 27/44] moe cache RAM tier: a partial tier per layer when the
  full tier does not fit the pin budget (GGML_MOE_TIER_SHARE)
 
 When the full tier of every sparse table exceeds the pin budget, every layer gets an equal share of it (the budget less

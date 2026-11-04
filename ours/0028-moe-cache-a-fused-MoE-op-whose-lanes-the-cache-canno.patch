@@ -1,7 +1,7 @@
 From 09f525d6a842e7163a676cd872bdb6206c789698 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 06:07:22 +0000
-Subject: [PATCH 28/43] moe cache: a fused MoE op whose lanes the cache cannot
+Subject: [PATCH 28/44] moe cache: a fused MoE op whose lanes the cache cannot
  redirect together runs unfused when a lane was taken over (the scheduler
  skipped its copy; GGML_MOE_FUSED_LANE_GUARD)
 

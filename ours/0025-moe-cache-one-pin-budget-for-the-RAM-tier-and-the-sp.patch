@@ -1,7 +1,7 @@
 From e3084d53579c03d942be2bcbdf931ad3dff83529 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 1 Nov 2026 21:24:45 +0000
-Subject: [PATCH 25/43] moe cache: one pin budget for the RAM tier and the
+Subject: [PATCH 25/44] moe cache: one pin budget for the RAM tier and the
  sparse registration (GGML_MOE_PIN_BUDGET_MIB), a partial tier (hottest tables
  first) instead of all-or-nothing, the warm-up bounded too
 

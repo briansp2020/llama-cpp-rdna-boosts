@@ -20,10 +20,10 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 ```
 git checkout 6050b467c
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r206 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 43 patches
+git am <path-to-this-repo>/ours/*.patch              # 44 patches
 ```
 
-Result: tree `618376e2663c`.
+Result: tree `3c7604d4c635`.
 
 ## Patches
 
@@ -51,6 +51,7 @@ Result: tree `618376e2663c`.
 | 0039 | a sparse (mmap) table without a RAM tier admits a routed expert it cannot register (filled through the bounce) instead of declining it per token; the decline could be captured into a CUDA graph and replayed for other routing (wrong output at a tight pin budget) | `GGML_MOE_FORCE_ADMIT=0` |
 | 0040-0041 | fill fence: in a decode take-over, the RAM-tier swaps, the device-map upload and the copy-back-ahead waits are ordered by the remap kernel's lag flag instead of one event record each (each record costs ~4-10 us of compute-queue idle on RDNA4) | `GGML_MOE_FILL_FENCE=0` |
 | 0042-0043 | review fixes for 0029's fill-through: with every member routed a spare RAM slot takes the expert; the trim keeps a partial tier's registered non-member aliases; a fill waits for the last sparse staging launch on the device (its kernel reads tier slots through source pointers taken at launch); `GGML_MOE_TIER_FILL=0` also turns the share off; 0043 makes the victim-copy check of 0036 skip the spare case | - |
+| 0044 | 0039's forced admission also covers a partial-tier table, for shapes that fit its arena (larger shapes keep the cold reads): with every member routed, no spare free and the pin budget refusing the registration, a tight share otherwise read an unregistered alias (wrong output, then a GPU fault); a force-evicted victim with a copy-back ahead waits for it and keeps that RAM copy, otherwise its cold pointer goes back to the file | `GGML_MOE_FORCE_ADMIT=0` |
 
 The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`, `GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4=0`,
 `GGML_CUDA_MMVQ_CONCAT_REORDER=0`, `GGML_CUDA_ROUTER_TOPK=0`, `GGML_CUDA_DISABLE_GDN_CONV_SNAP=1`,
@@ -82,6 +83,9 @@ r206 vs r206 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-
 - 0042-0043 at a 28 GB pin budget (51 partial-tier tables, ~215k fill-throughs per load), 2 fresh loads against 0001-0041
   and the default budget once: greedy output identical, no faults, 0 declines, speed the same; at the default budget no
   table has a partial tier, so they do not run there.
+- 0044 at an 8 GB pin budget with `GGML_MOE_TIER_SPARES=1` and `GGML_MOE_TIER_SHARE_MIN_PCT=5`: without it, 2 of 2 fresh loads
+  gave wrong greedy output from the first request and then an illegal memory access in the MoE GEMV; with it, correct output
+  (9335 forced admissions), no faults. At 20 GB, 16 GB and the default budget it never runs and changes nothing.
 
 llama-bench `-fa 1 -p 512 -n 128 -r 5`, 2 alternating rounds, tg128 means (three single rounds with a +-9..45 t/s spread
 left out: r206 Qwen3-30B and Qwen3.5-4B round 2, the series' gemma-4 round 2):

@@ -1,7 +1,7 @@
 From 56d0db10e0a13876abce7390bb43ec0737a5ddf0 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 12:56:10 +0000
-Subject: [PATCH 08/43] moe-expert-cache: stamp the heat-map debounce even when
+Subject: [PATCH 08/44] moe-expert-cache: stamp the heat-map debounce even when
  the save writes nothing
 
 With no map path (--host-experts mmap never opens one) or a frozen map,

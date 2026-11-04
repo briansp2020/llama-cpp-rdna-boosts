@@ -1,7 +1,7 @@
 From 1a96ad166cf9b0b8f9990271e194cfb2a0c2c3dd Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 1 Nov 2026 18:04:52 +0000
-Subject: [PATCH 24/43] moe cache RAM tier: 8 spares and admission from the 3rd
+Subject: [PATCH 24/44] moe cache RAM tier: 8 spares and admission from the 3rd
  touch by default with the copy-back ahead (GGML_MOE_TIER_TOUCH)
 
 ---
