@@ -20,10 +20,10 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 ```
 git checkout 6050b467c
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r206 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 44 patches
+git am <path-to-this-repo>/ours/*.patch              # 45 patches
 ```
 
-Result: tree `3c7604d4c635`.
+Result: tree `b03c0e279f6f`.
 
 ## Patches
 
@@ -52,6 +52,7 @@ Result: tree `3c7604d4c635`.
 | 0040-0041 | fill fence: in a decode take-over, the RAM-tier swaps, the device-map upload and the copy-back-ahead waits are ordered by the remap kernel's lag flag instead of one event record each (each record costs ~4-10 us of compute-queue idle on RDNA4) | `GGML_MOE_FILL_FENCE=0` |
 | 0042-0043 | review fixes for 0029's fill-through: with every member routed a spare RAM slot takes the expert; the trim keeps a partial tier's registered non-member aliases; a fill waits for the last sparse staging launch on the device (its kernel reads tier slots through source pointers taken at launch); `GGML_MOE_TIER_FILL=0` also turns the share off; 0043 makes the victim-copy check of 0036 skip the spare case | - |
 | 0044 | 0039's forced admission also covers a partial-tier table, for shapes that fit its arena (larger shapes keep the cold reads): with every member routed, no spare free and the pin budget refusing the registration, a tight share otherwise read an unregistered alias (wrong output, then a GPU fault); a force-evicted victim with a copy-back ahead waits for it and keeps that RAM copy, otherwise its cold pointer goes back to the file | `GGML_MOE_FORCE_ADMIT=0` |
+| 0045 | a captured CUDA graph keeps each MoE op's choice between the expert-cache arena (through the slot remap) and the scheduler copy; when a table declined after the capture, the replay read the previous token's remap (wrong experts). The graph now records which ops read the arena and recaptures when that changes; in normal use it never forces a recapture | `GGML_CUDA_GRAPH_MOE_SIG=0` |
 
 The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`, `GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4=0`,
 `GGML_CUDA_MMVQ_CONCAT_REORDER=0`, `GGML_CUDA_ROUTER_TOPK=0`, `GGML_CUDA_DISABLE_GDN_CONV_SNAP=1`,
@@ -86,6 +87,11 @@ r206 vs r206 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-
 - 0044 at an 8 GB pin budget with `GGML_MOE_TIER_SPARES=1` and `GGML_MOE_TIER_SHARE_MIN_PCT=5`: without it, 2 of 2 fresh loads
   gave wrong greedy output from the first request and then an illegal memory access in the MoE GEMV; with it, correct output
   (9335 forced admissions), no faults. At 20 GB, 16 GB and the default budget it never runs and changes nothing.
+- 0045 with a debug-only switch that makes every 7th host-path call of a RAM-tier table decline: without it every pass gave wrong
+  greedy output, with CUDA graphs off or with 0045 every pass was correct. In the production config (2 fresh loads): greedy
+  output identical, the 259.6k-token needle answered correctly and the 256 tokens after it identical, no faults; graph
+  captures 532 vs 543 per load, speed within noise (12 loads per side: greedy -0.4 %, two streams -1.9 %, pass-to-pass
+  spread ~4 %). Seven 1-GPU models identical to the r206 release, KLD 0.
 
 llama-bench `-fa 1 -p 512 -n 128 -r 5`, 2 alternating rounds, tg128 means (three single rounds with a +-9..45 t/s spread
 left out: r206 Qwen3-30B and Qwen3.5-4B round 2, the series' gemma-4 round 2):
