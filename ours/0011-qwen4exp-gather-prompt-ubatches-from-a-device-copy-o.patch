@@ -1,7 +1,7 @@
-From 58c45cb55edf49b828cf3667ce15e8c558eff59e Mon Sep 17 00:00:00 2001
+From b2cc1304441fd080e52c2958a701e94b84c64a64 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 18:04:11 +0000
-Subject: [PATCH 11/44] qwen4exp: gather prompt ubatches from a device copy of
+Subject: [PATCH 11/45] qwen4exp: gather prompt ubatches from a device copy of
  the token embedding
 
 The token embedding lives in host memory, so every graph starts with a
@@ -52,7 +52,7 @@ index 9bbd1f4c4..1bcf14a86 100644
      ~llama_model_qwen4exp() override {
          if (lazy_reader) {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index af78c104c..c5f004b9a 100644
+index c5e0697a7..8d511057e 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -539,6 +539,14 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {

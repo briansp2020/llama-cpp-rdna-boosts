@@ -1,7 +1,7 @@
-From a7f3ff2acbeb19187e71b876c59cef4f9056ddc4 Mon Sep 17 00:00:00 2001
+From fcde5e460fdcdd1d5112bd28f4c2a1f7f7e590a8 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 13:31:34 +0000
-Subject: [PATCH 09/44] meta: do not zero-fill the cached split state on a hit
+Subject: [PATCH 09/45] meta: do not zero-fill the cached split state on a hit
 
 Only the max(n_segments, 1) x n_bufs prefix of ne is meaningful; the
 2128-byte zero fill in split_state_entry::get() was ~1/3 of
@@ -14,7 +14,7 @@ ggml_backend_meta_get_split_state's self time on short server turns
  1 file changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index a08ddc17c..1c3f975a1 100644
+index aad63df68..c5d1bdaa1 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -852,7 +852,10 @@ struct ggml_backend_meta_buffer_context {

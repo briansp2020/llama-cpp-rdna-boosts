@@ -1,7 +1,7 @@
-From 78d9a9061925743ed1cfb693d096ada1d613fce4 Mon Sep 17 00:00:00 2001
+From c2ffc3594f4a4d15e6df617b5360cb9cbcb523ae Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 03:34:24 +0000
-Subject: [PATCH 27/44] moe cache RAM tier: a partial tier per layer when the
+Subject: [PATCH 27/45] moe cache RAM tier: a partial tier per layer when the
  full tier does not fit the pin budget (GGML_MOE_TIER_SHARE)
 
 When the full tier of every sparse table exceeds the pin budget, every layer gets an equal share of it (the budget less
@@ -16,7 +16,7 @@ GGML_MOE_TIER_SHARE=0: the previous all-or-nothing tier per table.
  1 file changed, 157 insertions(+), 19 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 8824380e0..bb4ad9de6 100644
+index fe9cd1329..a1ecbc7ed 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -128,6 +128,8 @@ struct table_t {

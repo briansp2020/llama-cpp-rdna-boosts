@@ -1,7 +1,7 @@
-From 6417a40e307f935737e2f37a02074d6866674660 Mon Sep 17 00:00:00 2001
+From d1c34b7f525d99e0091b6f3b88706387a49e5a1c Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 27 Oct 2026 05:31:54 +0000
-Subject: [PATCH 14/44] port fix: devremap_free_locked forces a graph recapture
+Subject: [PATCH 14/45] port fix: devremap_free_locked forces a graph recapture
  (r149 per-layer keys replay; the device-remap buffers are local and not
  covered by stew's free-site bumps)
 
@@ -10,7 +10,7 @@ Subject: [PATCH 14/44] port fix: devremap_free_locked forces a graph recapture
  1 file changed, 1 insertion(+)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 17e3b71f4..cb0a5f182 100644
+index 7903f54bb..c9b85fc70 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -7615,6 +7615,7 @@ static void devremap_free_locked(table_t & t) {

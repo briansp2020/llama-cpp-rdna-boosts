@@ -1,7 +1,7 @@
-From b50554daf06b7834d081a69e552cf40a107a838e Mon Sep 17 00:00:00 2001
+From 2a1a4fea124cd66c58f068a355d5ae082de48308 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 07:58:55 +0000
-Subject: [PATCH 41/44] moe cache: copy-back ahead in a decode take-over waits
+Subject: [PATCH 41/45] moe cache: copy-back ahead in a decode take-over waits
  on the compute stream only for slots of unknown fill state
  (GGML_MOE_FILL_FENCE)
 
@@ -16,7 +16,7 @@ Outside a take-over and with GGML_MOE_FILL_FENCE=0 every copy waits as before.
  1 file changed, 68 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 206669ff0..845563e0b 100644
+index 9fe341aa3..eb4d3553c 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -147,6 +147,11 @@ struct table_t {

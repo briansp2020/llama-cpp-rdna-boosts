@@ -1,7 +1,7 @@
-From d399c114406dbc1601434b905301746834f441ab Mon Sep 17 00:00:00 2001
+From 603fa5d1f605fbb60e857b46351efe0a671854e6 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 09:27:59 +0000
-Subject: [PATCH 30/44] moe cache RAM tier fill-through, review fixes: an
+Subject: [PATCH 30/45] moe cache RAM tier fill-through, review fixes: an
  expert no member can make room for stays outside the tier instead of
  declining the table; a demoted member points back at the file alias
 
@@ -10,7 +10,7 @@ Subject: [PATCH 30/44] moe cache RAM tier fill-through, review fixes: an
  1 file changed, 4 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index da2897ea8..b944e0c4d 100644
+index 3ed49175e..e39fd1dd4 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1415,7 +1415,7 @@ static cudaError_t sparse_fill_locked(const table_t & t, void * dst, int32_t e,

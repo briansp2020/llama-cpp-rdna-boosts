@@ -1,7 +1,7 @@
-From 7da17bff9c0644f87bb7d11a2f43579e4bf60c2b Mon Sep 17 00:00:00 2001
+From 972a07d71c495abfecb3bbb101e0e2e2d219ab55 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 1 Nov 2026 15:44:01 +0000
-Subject: [PATCH 22/44] moe cache RAM tier: K spare slots + copy-back ahead on
+Subject: [PATCH 22/45] moe cache RAM tier: K spare slots + copy-back ahead on
  a side stream (GGML_MOE_TIER_PRECOPY, GGML_MOE_TIER_SPARES)
 
 ---
@@ -9,7 +9,7 @@ Subject: [PATCH 22/44] moe cache RAM tier: K spare slots + copy-back ahead on
  1 file changed, 218 insertions(+), 8 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 21d1cc58b..9c82b9c8d 100644
+index ab6e3ff29..73d1c016e 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -126,11 +126,19 @@ struct table_t {

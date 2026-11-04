@@ -1,7 +1,7 @@
-From 70336543d066b3a8d1ca424258f432c7e85651ca Mon Sep 17 00:00:00 2001
+From 2a80740280f6e4b2ad91872371ae6b7a945c3fb6 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 12:16:32 +0000
-Subject: [PATCH 32/44] moe cache RAM tier: hybrid share by default
+Subject: [PATCH 32/45] moe cache RAM tier: hybrid share by default
  (GGML_MOE_TIER_SHARE_MIN_PCT=30; 0 = the equal share)
 
 ---
@@ -9,7 +9,7 @@ Subject: [PATCH 32/44] moe cache RAM tier: hybrid share by default
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 95e7d2170..4c9d2d6ef 100644
+index ff270d75d..1976f55ab 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1121,11 +1121,11 @@ static void tier_share_plan_locked(const std::map<int, std::vector<int>> & by_la

@@ -1,7 +1,7 @@
-From d55f26c10fd799b8206d8a7517d9f3542fdc476a Mon Sep 17 00:00:00 2001
+From 8c542eb60448bbb791e09a76c045221c97fafada Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 03:15:53 +0000
-Subject: [PATCH 37/44] moe cache KV lending: the victims' stream is the lowest
+Subject: [PATCH 37/45] moe cache KV lending: the victims' stream is the lowest
  remapped layer's
 
 A fully resident layer 0 never records a remap stream, so on prod (-ncmoe 47) no victim was ever made.  Take the lowest
@@ -11,7 +11,7 @@ layer whose remap has run, never the highest layer (the MTP draft's own tables).
  1 file changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index a69616eb2..6822aaa61 100644
+index f2ec6ca29..ff529b2c9 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1176,10 +1176,16 @@ static int kvl_keep_locked(table_t & t, int32_t victim, const char * src, cudaSt

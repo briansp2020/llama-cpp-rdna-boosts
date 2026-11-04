@@ -1,7 +1,7 @@
-From e84336b7c67ae6e595e068e7a6abba6845c9a6af Mon Sep 17 00:00:00 2001
+From 4e288873d81ff11e78a0de7e668ecdbd318db750 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 00:05:12 +0000
-Subject: [PATCH 26/44] moe cache: a declined read of a sparse (mmap) master
+Subject: [PATCH 26/45] moe cache: a declined read of a sparse (mmap) master
  goes through the per-table pinned bounce
 
 The scheduler fallback for a read the cache declines issued a pageable cudaMemcpyAsync from the file mapping.  ROCclr
@@ -17,7 +17,7 @@ No kill switch: the old path gives wrong output.
  1 file changed, 16 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 304b85e7e..8824380e0 100644
+index f6d27ddf8..fe9cd1329 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -104,6 +104,7 @@ struct table_t {

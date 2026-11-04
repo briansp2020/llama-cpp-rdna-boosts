@@ -3,13 +3,19 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-6050b467c-r206` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
-`1bac1001f178`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
+**Base:** `v16-6050b467c-r209` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
+`8c6c992db70c`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
 GDN small-projection gather), r182 took #253 (the 1-token router fold and its RDNA4 gate), r183 took #256 (the GDN
 decode folds), r187 took #258 (the quantized-KV rotations), r188 took #259 (the shared-expert GLU Q8_1), r198 took #260
 (the mixed K-quant x Q6_K row concat), r199 took #262 (the q4_0 KV write fold) and r203 took #266 (host-expert decode
-without the per-op routing sync), so they are no longer in this series. r205 and r206 took none of it; the series
-replays onto r206 unchanged.
+without the per-op routing sync), so they are no longer in this series. r205-r209 took none of it.
+
+0000 keeps `moe-expert-cache.cu` at its r206 state: r207 rewrote the host pool path in that file (the pool-tier gather,
+per-table pool sizing, the `MOE_HOST_POOL_RAM_PCT` ceiling), and that code sits where this series replaces the release's
+remap and changes the bounce, gather and report paths for `--host-experts mmap`. So with this series `--host-experts pool`
+behaves as in r206, and `moe_cache_table_is_pool` answers false, so the scheduler's new default gathers nothing (r206's
+default). Everything else in r207-r209 (RDNA2 flash attention, Windows host memory, the scheduler and loader changes) is
+in, as released.
 
 0001 takes #266's device remap and pool cold read back out of the release: this series has carried its own variant of
 that remap since before #266 (in 0002, with the review fixes in 0021: freshness rounds, and the remap forwarded through
@@ -19,16 +25,17 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 
 ```
 git checkout 6050b467c
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r206 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 45 patches
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r209 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 46 patches (0000-0045)
 ```
 
-Result: tree `b03c0e279f6f`.
+Result: tree `26ef73be42d8`.
 
 ## Patches
 
 | | what | env switch (off) |
 |---|---|---|
+| 0000 | keeps `moe-expert-cache.cu` at r206 (r207's host-pool-speed is not carried: pool mode as in r206); `moe_cache_table_is_pool` answers false | - |
 | 0001 | the release without #266's device remap and pool cold read (see above) | - |
 | 0002 | our earlier stack, squashed (expert cache, MoE / GDN / shared-expert fusions, scheduler and server items) | per feature |
 | 0003-0004, 0014 | port fixes for the expert cache and graph recapture | - |
@@ -60,18 +67,22 @@ The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`
 `GGML_CUDA_FUSE_V_FWHT=0`, `GGML_CUDA_FA_COMBINE_FWHT=0`, `GGML_CUDA_QK_PAIR_FWHT=0`, `GGML_CUDA_FUSE_ROPE_FWHT=0`,
 `GGML_CUDA_MOE_SHARED_GLU_Q8=0`), `GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0` (#260) and `GGML_CUDA_KV_FOLD_Q4_0=0` (#262).
 
-## Validation (2026-11-03, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
+## Validation (2026-11-04, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
 
-r206 vs r206 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-full`, no env on either side,
+r209 vs r209 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-full`, no env on either side,
 `ROCBLAS_USE_HIPBLASLT=0`.
 
-- Greedy server replies (12 multi-turn replies per model) are byte-identical to r206 on Llama-3.2-1B, Qwen3-30B-A3B,
+- Greedy server replies (12 multi-turn replies per model) are byte-identical to r209 on Llama-3.2-1B, Qwen3-30B-A3B,
   Qwen3.6-35B-A3B, gemma-4-26B-A4B, Qwen3.8-27B, Qwen3.8-27B NVFP4-MTP (plain and MTP `--spec-draft-n-max 3`) and Qwen3.5-4B;
   also with `-ctk q8_0 -ctv q8_0` and `-ctk q4_0 -ctv q4_0`. No faults.
-- KLD on wikitext-2 `-c 512`, 24 chunks, against r206's logits: 0 on all six non-MTP models (same top token 99.98-100 %).
+- KLD on wikitext-2 `-c 512`, 24 chunks, against r209's logits: 0 on all six non-MTP models (same top token 99.98-100 %).
 - test-backend-ops (ROCm0, with `ROCBLAS_USE_HIPBLASLT=0`): 21675 / 21676 passed; the one failure,
-  `MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32)`, comes from that env (the release shows the same with it).
-- Our production model (Qwen3.8-Flash-Next IQ3_S, `--host-experts mmap`, MTP draft, `GGML_MOE_KV_LEND=1`) on one GPU:
+  `MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32)`, comes from that env (the release shows the same with it): rocBLAS's f16 -> f32
+  `gemm_ex` then leaves every output column from 2^21 on unwritten, with a success status; hipBLASLt (the default) is correct.
+- Our production model (Qwen3.8-Flash-Next IQ3_S, `--host-experts mmap`, MTP draft, `GGML_MOE_KV_LEND=1`,
+  `LLAMA_SPEC_BATCH_BUDGET=6`) on one GPU: this series on r209 vs the same series on r206, 3 alternating fresh loads:
+  greedy replies identical, the 259.6k-token needle answered correctly and the 256 tokens after it identical, no faults,
+  greedy decode 83.7 / 82.9 vs 82.7 / 80.9 t/s, two concurrent streams 110.2 vs 110.2 t/s. On r206 (2026-11-03),
   this series on r206 vs the same series on r204, 3 alternating fresh loads: greedy replies identical, the needle and the
   256 tokens after it identical, greedy decode 83.5 / 81.7 vs 83.2 / 81.2 t/s, two concurrent streams 107.6 vs 107.6 t/s.
   On r204, 3 alternating fresh loads against our previous production build (0001-0032): greedy replies identical, the 259.6k-token needle answered
@@ -93,17 +104,16 @@ r206 vs r206 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-
   captures 532 vs 543 per load, speed within noise (12 loads per side: greedy -0.4 %, two streams -1.9 %, pass-to-pass
   spread ~4 %). Seven 1-GPU models identical to the r206 release, KLD 0.
 
-llama-bench `-fa 1 -p 512 -n 128 -r 5`, 2 alternating rounds, tg128 means (three single rounds with a +-9..45 t/s spread
-left out: r206 Qwen3-30B and Qwen3.5-4B round 2, the series' gemma-4 round 2):
+llama-bench `-fa 1 -p 512 -n 128 -r 5`, 2 alternating rounds, tg128 means:
 
-| model | r206 -> r206 + series |
+| model | r209 -> r209 + series |
 |---|---|
-| Llama-3.2-1B UD-Q4_K_XL | 432.8 -> 433.3 (=) |
-| Qwen3-30B-A3B Q4_K_M | 164.9 -> 168.6 (+2.2 %) |
-| Qwen3.6-35B-A3B Q4_K_M | 138.0 -> 138.9 (+0.7 %) |
-| gemma-4-26B-A4B MXFP4_MOE | 93.9 -> 93.7 (=) |
-| Qwen3.8-27B Q4_K_M | 31.88 -> 31.96 (=) |
-| Qwen3.8-27B NVFP4-MTP-HIGH | 30.51 -> 30.20 (-1.0 %) |
+| Llama-3.2-1B UD-Q4_K_XL | 432.8 -> 433.8 (=) |
+| Qwen3-30B-A3B Q4_K_M | 166.8 -> 167.4 (+0.4 %) |
+| Qwen3.6-35B-A3B Q4_K_M | 137.8 -> 138.6 (+0.6 %) |
+| gemma-4-26B-A4B MXFP4_MOE | 93.9 -> 93.6 (=) |
+| Qwen3.8-27B Q4_K_M | 31.70 -> 32.01 (+1.0 %) |
+| Qwen3.8-27B NVFP4-MTP-HIGH | 30.59 -> 30.20 (-1.3 %) |
 | Qwen3.5-4B Q8_0 | 102.0 -> 102.0 (=) |
 
 The dedup (0017-0018), the RAM-tier work (0022-0032), KV lending and the fill fence help only a model whose routed

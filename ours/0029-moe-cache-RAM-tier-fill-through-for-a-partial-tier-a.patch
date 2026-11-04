@@ -1,7 +1,7 @@
-From aa292477584b2ff8a01e72fb814fa99a31aeeab1 Mon Sep 17 00:00:00 2001
+From ce43234d6fa6b949620de7673c242bb9b7b89a4e Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 08:25:57 +0000
-Subject: [PATCH 29/44] moe cache RAM tier: fill-through for a partial tier --
+Subject: [PATCH 29/45] moe cache RAM tier: fill-through for a partial tier --
  a routed expert outside the tier is copied into it in place of its coldest
  unrouted member, so a partial table never declines or reads the file alias
  (GGML_MOE_TIER_FILL)
@@ -11,7 +11,7 @@ Subject: [PATCH 29/44] moe cache RAM tier: fill-through for a partial tier --
  1 file changed, 68 insertions(+), 6 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 3f7d840c2..da2897ea8 100644
+index 6303f238a..3ed49175e 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -919,6 +919,16 @@ static int64_t g_tier_partial = 0;   // tables left without a tier by the pin bu

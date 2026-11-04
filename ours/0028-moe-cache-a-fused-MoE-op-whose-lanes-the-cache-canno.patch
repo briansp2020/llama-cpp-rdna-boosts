@@ -1,7 +1,7 @@
-From 09f525d6a842e7163a676cd872bdb6206c789698 Mon Sep 17 00:00:00 2001
+From ee2013117a64ef4a96d222bc94e8e147acdcda9b Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 06:07:22 +0000
-Subject: [PATCH 28/44] moe cache: a fused MoE op whose lanes the cache cannot
+Subject: [PATCH 28/45] moe cache: a fused MoE op whose lanes the cache cannot
  redirect together runs unfused when a lane was taken over (the scheduler
  skipped its copy; GGML_MOE_FUSED_LANE_GUARD)
 
@@ -40,7 +40,7 @@ index 020660b66..26e66aa57 100644
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index bb4ad9de6..3f7d840c2 100644
+index a1ecbc7ed..6303f238a 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -8848,6 +8848,36 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
@@ -81,10 +81,10 @@ index bb4ad9de6..3f7d840c2 100644
  // `identity` decision for THIS table, with no side effects, so the fusion guard and the scheduler
  // take-over agree per table instead of on the whole-graph `moe_cache_has_arena()`.
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 9172a73a1..7da911b67 100644
+index c3fbb61c5..a2189810c 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -341,6 +341,9 @@ bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_te
+@@ -347,6 +347,9 @@ bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_te
  // op (declined for the shape, or disabled), in which case the caller keeps the original tensors - which
  // the scheduler copied in full.  Both tables must be redirected together: the hook takes over each of
  // them independently and skips the scheduler's copy, so a mixed redirect would read a stale table.

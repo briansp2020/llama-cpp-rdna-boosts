@@ -1,7 +1,7 @@
-From 403d12e586dae9eb430a6be8188e9012df93289f Mon Sep 17 00:00:00 2001
+From d252cd636fe1f6beae4d794d04f52b9502b3e17f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 26 Oct 2026 08:17:21 +0000
-Subject: [PATCH 12/44] ggml-backend sched: GGML_SCHED_UPFRONT_INPUTS copies
+Subject: [PATCH 12/45] ggml-backend sched: GGML_SCHED_UPFRONT_INPUTS copies
  user inputs once per graph (no per-split host wait)
 
 (cherry picked from commit ec358ad37c878d91518d5a88498977b8ef52ca5b)
@@ -10,7 +10,7 @@ Subject: [PATCH 12/44] ggml-backend sched: GGML_SCHED_UPFRONT_INPUTS copies
  1 file changed, 80 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 5a72f758f..8017eced4 100644
+index e68d613b9..b407706e0 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,7 @@
@@ -88,7 +88,7 @@ index 5a72f758f..8017eced4 100644
      // add leafs from the original graph
      for (int i = 0; i < graph->n_leafs; i++) {
          struct ggml_tensor * leaf = graph->leafs[i];
-@@ -2822,7 +2869,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2840,7 +2887,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
      auto & used_ids        = st.used_ids;
  
  
@@ -99,7 +99,7 @@ index 5a72f758f..8017eced4 100644
          (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(input) != nullptr)) {
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-@@ -3157,6 +3206,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -3175,6 +3224,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      int prev_backend_id = -1;
      ggml_backend_sched_copy_state st;
  
