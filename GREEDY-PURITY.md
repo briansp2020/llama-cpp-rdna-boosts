@@ -2228,3 +2228,56 @@ acceptance 0.76089 = 1397/1836 (P) and 0.83340 = 2141/2569 (R) on both arms; pre
 
 **Record:** `WORKLOG.md` 261101.011, `benchmarks/2026-11-01-host-expert-device-remap.md`,
 `archive/work/pinned-decode-remap/`, `patches/README.md` (block 09).
+
+## 83. Skipping a routed expert is not a speed-up — it is a different model (2026-11-02, from the no-XNACK / Avalon analysis)
+
+**The claim.**  A "boutique" MoE engine can buy generation throughput by dropping, per token, the experts whose
+routing rank falls below a threshold — Avalon ships it as `GGML_CUDA_MOE_TAIL_SKIP` (**on by default**, citing
+`Strata` for the same practice) and reports its owners' own sensitivity as 66.1 vs 62.8 t/s on a short prompt and
+57.3 vs 51.2 t/s at 250k filled, i.e. **+5.3 % and +11.9 % generation**, with "GSM8K the same with and without".
+
+**The rule.**  **Never adopt this in the delivery, not even gated.**  A routed expert's output is multiplied by
+its router weight and summed; dropping it removes a term from the layer's arithmetic.  That is not an
+approximation of the same function — it is a *different model*, and the error compounds autoregressively, so it
+is worst exactly where it is least measurable: deep context, long chains of thought, low-margin tokens.  Three
+consequences follow, and they are policy, not preference:
+
+* a number measured with a tail skip is **not a number about llama.cpp or about the model** — it may not be
+  quoted, compared, promoted or used as a baseline anywhere in this repo, in a release note or in a reply;
+* when benchmarking against an engine that ships it (Avalon, Strata), **turn their switch off** (`Avalon:
+  `GGML_CUDA_MOE_TAIL_SKIP=0`) or state in the same sentence that the comparison is between two degraded
+  engines; their published "44 % faster than Strata" is both-engines-degraded, which makes it apples-to-apples
+  and still tells you nothing about quality;
+* "GSM8K is unchanged" is not evidence.  It is a short, templated, near-greedy eval — the instrument that
+  cannot see this class of defect, the same way a 32-token greedy oracle cannot see a uniform prefill-logit
+  shift.  The instruments that *can* see it are the delivery's own: long-horizon same-seed greedy purity at
+  depth, the MTP four-axis acceptance gate, and the prefill-logit KLD gate.  A tail skip fails all three by
+  construction, which is why it can never be "validated" here.
+
+**Numbers.**  Theirs, as published (Nov 2026, one 7900 XT, one 4090): +5.3 % / +11.9 % generation.  Ours: none,
+and none is owed — the delivery does not implement it and will not.  The figure to remember is the *size* of the
+temptation: a 5-12 % generation "win" for silently deleting part of the model, which is exactly the trade the
+`GREEDY-PURITY` invariants exist to refuse.
+
+**This repo already measured it once, in the engine's own log.**  `archive/work/moe-cache-coverage/
+FINDINGS-2026-10-17-coverage-vs-defrag.md` row 3 dissects Strata's `STRATA_ROUTE_TAIL_SKIP=7` (**default ON**;
+`src/core/expert_source.cpp:3702-3712`): a missed expert that every token of the window routes at rank >= 7 is
+*neither copied nor computed*, its contribution dropped **without renormalisation**, and because it is not a
+lookup it is not counted as a miss either.  It is worth **6.5 points** of that engine's reported hit rate, and in
+the maintainer's own run it silently skipped **201 978 experts in one request** — the same run is 98.4 % as
+reported and **91.9 %** on an apples-to-apples "was the expert resident" basis, against **90.6 %** for this
+delivery's own cache at 38.3 % of pairs held, i.e. *within 1-2 points on comparable accounting*.
+
+**Two inflations, and they are not the same thing.**  *The hit rate* is inflated **definitionally**: the skip
+happens before the accounting, so it removes both the fetch and the miss — one cannot miss on an expert one has
+decided not to fetch.  The rest of that engine's "astronomical" figure is not even the skip: it is routing
+concentration (holding 63.7 % of the pairs serves 98 % of the lookups, because the routing distribution is
+extremely peaked).  *The tokens/s* is inflated by **work not done**: the model computing less, not the engine
+computing faster.  So a hit rate from such an engine is not a residency metric at all, and its throughput is not
+comparable to an exact engine's — which is why both strictures in the rule above exist, and why the only fair
+comparison is its switch **off** with both sides on the same accounting.
+
+**Record.**  This entry.  Source analyses: `archive/work/moe-cache-coverage/FINDINGS-2026-10-17-coverage-vs-defrag.md`
+(row 3, the numbers above — do not re-derive them) and `wip/no-xnack-and-avalon/README.md` (`~/Avalon`, commits to
+`c24c03d84`); the no-XNACK constraint that makes such engines reach for it is `INVARIANTS.md`
+(device-visible host memory must be resident).

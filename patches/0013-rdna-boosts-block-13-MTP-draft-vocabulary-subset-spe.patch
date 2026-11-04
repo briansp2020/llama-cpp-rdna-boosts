@@ -1,4 +1,4 @@
-From 473331c1908846e31892f1b0acfc3adfb66f4775 Mon Sep 17 00:00:00 2001
+From a670d3a73e8759f2b15f7f3c174feb0271590e5d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -64,10 +64,10 @@ Co-authored-by: Martino B <martino2k6@users.noreply.github.com>
  create mode 100644 tests/test-mtp-draft-vocab.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 4c2e0fa63..5a3a44ff5 100644
+index 579233f13..7a9910282 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -4225,6 +4225,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4226,6 +4226,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_max = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
@@ -125,7 +125,7 @@ index 48b1c9379..f63dca95a 100644
          // LLAMA_MTP_DRAFT_OP_OFFLOAD=0: keep the draft context's host-resident ops (e.g. the MTP
          // layer's experts under -otd exps=CPU) on the host instead of offloading them to the device
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 79f56a2d1..ca66455a2 100644
+index 9d8f8911d..070d4952c 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -2337,6 +2337,59 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
@@ -617,7 +617,7 @@ index 4e0a587d9..9ac1f47cb 100644
  
      res->t_logits = cur;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index f8889cbad..84f1fa08b 100644
+index 35502ad0b..4e6acca4c 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -1377,7 +1377,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_

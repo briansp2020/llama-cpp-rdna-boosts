@@ -1429,3 +1429,138 @@ change), and let `WORKLOG.md` carry the narrative.
   24 691.7 MiB / `h` 0.9603 / 47.95 t/s vs 1280 -> **24 576.4 MiB / 0.9602 / 47.98 t/s**, i.e. **-115 MiB of
   arena, -0.01 pt of expert hit rate, decode flat**, text byte-identical.  An explicit `GGML_CUDA_SLAB_HEADROOM_MIB`
   is still taken verbatim (no per-GPU addition), so the old value stays one env var away.
+
+- **Device-visible host memory must be `RESIDENT`, not merely addressable — `hipHostRegister` does not provide
+  residency, and without XNACK there is no fault-and-retry (closed 2026-11-02: `archive/work/host-experts-window-beta` / `archive/work/host-expert-pinned-window`,
+  2026-11-02).**  A registered range installs page tables (UVA alias) but leaves the pages ordinary reclaimable
+  page-cache pages (`Mlocked` stays 0 — that is exactly the property the window campaign advertised).  On a
+  no-XNACK GPU a device read of a page that is **not present** is a fatal `Page not present` fault, so a
+  registered-but-unlocked range is sound ONLY while nothing evicts it.  Measured on 1x R9700, Flash-Next IQ4_NL
+  (93.16 GiB model, 98 GB RAM): `--host-experts window -ncmoe 44` (host set ~59 GB) faults the GPU —
+  `mul_mat_vec_q_moe` → `Page not present` — while `pinned -ncmoe 44` runs (its pages are never evictable) and
+  `-ncmoe 32` is clean.  So "one residency tier, registration instead of pinning" needs **locked or provably
+  resident** pages; `MOE_EXPERT_WINDOW_MLOCK` was written as an optional extra and is in fact a REQUIREMENT
+  (needs `LimitMEMLOCK=infinity`/`CAP_IPC_LOCK`; the hard limit is 8 MiB by default).
+  **And the evidence that claimed otherwise was void**: `probe-cold-read` reads a HOT 8 MiB window, so its
+  `MADV_PAGEOUT` arm and even 70 GiB of anonymous pressure never evict the range (re-verified 2026-11-02: all
+  arms `DATA IDENTICAL`), and every real run before the gather memcpy'd the whole host expert set through the
+  host on each ubatch — an accidental prefetch that re-faulted every page immediately before the device read it.
+  A reclaim-safety test must actually evict the range it reads; the gather (which removed that prefetch) is what
+  finally exposed this.
+  **CORRECTED 2026-11-03 (`archive/work/host-expert-locked-window/`): `hipHostRegister` DOES take a hold.**  The
+  paragraph above ("maps without pinning", "leaves the pages ordinary reclaimable page-cache pages") is wrong on
+  ROCm 10.1 / kernel 7.2.15 / gfx1201, measured three ways: registering over **absent** pages faults them in
+  (page cache `0/425` -> `425/425`, proven through a *fresh* mapping, never the registered one); a registered
+  window's bytes survive `hipHostUnregister`, `munmap`, a `MAP_FIXED` remap, every registration flag
+  (`ro`/`portable`/`mapped`) and **67 GiB of real anonymous pressure** with cgroup `file` unchanged (1 GiB
+  scratch-file window: +1027.9 MiB at register, still +1037.0 MiB after unmap + pressure); and under a 4 GiB
+  cgroup a 6144 MiB registration returns `ok`, pegs `memory.current` at the limit, leaves 14/16 sampled windows
+  non-resident, and a non-resident window still reads.  So the reason a sliding window cannot be built is that
+  the hold has **no release**, not that it is absent — and "registered-but-unheld" is a state that does not
+  exist for a range that was ever resident at registration time.  The 2026-11-02 fault is not explained by this
+  and did **not** reproduce for a partially-registered range; do not re-cite "maps without pinning", and do not
+  build a sliding host window (successor: `wip/host-expert-eager-push/`).
+
+  **And `Mlocked` is not a pinning probe**: a `hipHostMalloc`'d buffer is pinned by the driver yet reports
+  `Mlocked: 0 kB` — measured 2026-11-02 with two 256 MiB buffers that stayed data-identical through 61.7 GiB of
+  real anonymous pressure (`archive/work/host-expert-pinned-window/probe-host-malloc-mapped.cpp`).  So "`Mlocked`
+  stayed 0" is not, on its own, evidence that pages can be reclaimed (nor that they cannot); `hipHostAlloc`/
+  `hipHostMalloc` pin without mlocking, and `hipHostRegister` maps without pinning.  The same probe confirms the
+  pinned path itself: a kernel (SM) read of a `hipHostMalloc`'d buffer is data-identical at **51.8 GiB/s** with
+  `hipHostMallocDefault` and with `hipHostMallocMapped` alike, and `hipHostGetDevicePointer` returns the identity
+  pointer on this platform (`unifiedAddressing` reports NO but `canMapHostMemory` yes), so the `Mapped` flag is
+  not what buys anything here — the pinning is.
+
+- **A 1-D copy-engine push out of the pageable model mapping does not tear here (wip, 2026-11-03;
+  `archive/work/host-expert-locked-window/MEASUREMENTS.md` §5/§6).**  The delivery carries "a pageable
+  `cudaMemcpyAsync` ... is staged through a shared internal bounce and tears under back-to-back use (measured:
+  nondeterministic greedy text)" (`ggml-cuda.cu:6255`, prior campaign `PROTOTYPE.md:47`) and that note is what
+  justifies the pool's `memcpy` into a pinned slot.  It has **no dated record, no ROCm line and no
+  reproduction** in the repo, and it does not reproduce for a 1-D push on ROCm 10.1: 8-64 copies in flight
+  (13-128 MiB) over 2-4 streams from one host thread, sources plain pageable / `mlock`ed / registered /
+  `cudaMallocHost`, every copy verified against its own source — **0 torn in 20-100 iterations each**, including
+  repeated pushes from the same page-cache regions (so one-shot semantics buy nothing).  The **2-D** path the
+  note actually names is 4-5x slower (376 us per 1.66 MiB vs 66-93 us 1-D) but also clean here.  What the same
+  probe measures is why the direction is worth pursuing: a CE push straight from the mapping costs **66-93 us
+  hot / 1.32 ms cold** per 1.66 MiB against the pool's **137 us / ~3.5 ms**, i.e. the memcpy is the entire gap.
+  The claim is NOT refuted for ROCm **7.14** (the delivery ships both lines) or for the **async-input ring**
+  (a shared *destination*, a different failure); `wip/host-expert-eager-push/` P1 settles it in the real path
+  before any default flips.
+- **A pool-backed expert table must be served by the device gather in the prefill band; its whole-table staging
+  is the slow path at every width (r207, block 12).**  For `--host-experts pool` the master is the read-only
+  model mapping, so staging a table for a wide ubatch reads the pageable mapping plus the pool's host alias and
+  degrades as coverage rises: on the 122B-A10B across three RDNA4 GPUs (`-ncmoe 48`, 5258-token prompt,
+  `-ub 2048`, 2000-token greedy decode) pool FRAC 80 staged at 134.3 t/s and FRAC 95 at 12.9, against
+  **1507.7-1631.3** with the gather and `pinned`'s 634-638; the same arm with `GGML_SCHED_DEVGATHER=0` collapses
+  to 16.9.  Its prefill logits are **bit-identical** to the staging path (KLD -0.000000 / same-top-p 100.000 %),
+  so this is a transport fact, not a numerics one.  The gate is a **band** one: `n_tokens > moe_cache_band`, because
+  taking the decode band over with the gather costs an order of magnitude (1.2-4.1 t/s) — the decode band is
+  served from the arena by the slot-remap read.  Do not widen the gather to the decode band, and do not make
+  `GGML_SCHED_DEVGATHER=1` (force) the default: it costs a pinned master ~47 % prefill at two devices.
+- **A memory ceiling on a cache must be applied to the DISTRIBUTION, not to whatever registers last (r207, block
+  16).**  `MOE_HOST_POOL_RAM_PCT` shaved the registration-order tail to the one-slot floor: on the 122B at
+  `RAM_PCT=70` that was 26 of 144 tables at one slot and **10.94 t/s**, while 10 % more ceiling decoded 19.52.
+  Scaling every table's slot count by one process-wide factor gave **17.44** at the same pinned bytes (+73 % with
+  `MOE_HOST_POOL_SIZING=1`: 18.92), and `RAM_PCT=85` went 19.52 -> 20.97.  A per-table floor is only defensible
+  where the ceiling cannot cover one slot.  Same rule for a concentration fit: it must be fitted *to* the ceiling,
+  because a uniform rescale of a fitted plan collapses it back to uniform.
+- **At `-ncmoe 48` on a three-device split the expert set is fully VRAM-resident, and the DEFAULT mode still
+  re-copies it out of the arena on every prefill ubatch (r207, `TODO` #133).**  The arena sizes to
+  `67110.0 MiB of 67110.0` (256/256 slots/table, identity), yet the prefill stages **61 GiB for a 3049-token
+  prompt** with `arena=61031.5 MiB host=510.5 MiB` — 99.2 % of it read back out of VRAM into the op's per-split
+  weight buffer, once per table per ubatch, serialised against the compute (copy table -> compute -> copy next) at
+  ~8 GB/s aggregate.  Consequences: `pinned` prefill at 3 GPUs (394-426 t/s) is *slower* than at 1 GPU (755.5)
+  despite 3x the VRAM and 3x the compute, and `-sm layer` at 3 GPUs prefills at 944.3 for the same redundant bytes
+  because it issues one staging call per table instead of one per table *per device*.  Host residency is
+  irrelevant to this cost; a fully resident table should serve the prefill op in place.
+- **A launch cap whose justification is an occupancy QUERY has to be re-checked when the query is replaced
+  (r208, block 05).**  `rdna_cap_ncols2` capped the D=256 tile variants at `ncols2 <= 2` because HIP's RDNA2
+  occupancy calculator (it assumes a quarter of the WGP register file) returned 0 blocks and the launcher
+  asserted.  r76 replaced that query with a manual WGP computation, and the cap then guarded nothing: every
+  D=256 shape the launcher can pick measures **>= 2 blocks** on the patched gfx1030 HSACO (4x8 = 235 VGPR,
+  29 696 B LDS, 4 blocks), so the assert is unreachable.  A stale cap is not free: it was also withholding the
+  GQA fold from D=256, which is most of the RDNA2 prefill deficit of issue #214.  When a "this aborts" cap and
+  the mechanism it blamed are in different layers, prove the mechanism still exists before keeping the cap.
+- **`i_sup - 1` in the RDNA2 tile tail is deliberately allowed to be -1 (r208, block 05).**  A V chunk that
+  lies wholly past the KV end (the tail length is an exact multiple of `nbatch_V`) loads with `i_sup == 0`, so
+  the clamped row index is `-1` and row `-1` of that chunk is `k_VKQ_max - 1`, the last VALID row; every weight
+  in the chunk is zero, so the values are unused.  Do not "fix" it to `max(i_sup - 1, 0)`: row 0 of such a
+  chunk IS `k_VKQ_max`, one row past the cache.  The comment in the loader says so for the same reason.
+- **Two compiles of the same source do not produce byte-identical objects, so object or `.so` hashes are not
+  a codegen oracle (r208).**  Comparing a release's `libggml-hip.so` before and after a change reports a
+  difference even when nothing changed (the symbol/string-table order varies run to run).  What *is* stable is
+  the code object: extract `.hip_fatbin`, unbundle it per arch, and compare each kernel's `.text` slice by
+  symbol address/size, plus the amdhsa resource usage (`.vgpr_count`, `.vgpr_spill_count`,
+  `.group_segment_fixed_size`).  That comparison is what proved r208's RDNA2-gated changes leave gfx1201
+  bit-identical (88/88 and 106/106 kernels).
+- **On Windows `hipMemGetInfo` is not a free-VRAM figure (r209, block 09).**  It counts only this process's
+  allocations, so with any other process holding memory on the card it over-reports free VRAM; and WDDM does
+  not refuse an allocation past that point, it pages the excess to system RAM and the GPU reads it over PCIe
+  (issue #216).  The adapter's own figure is `D3DKMTQueryStatistics` over the non-aperture segments,
+  `CommitLimit - BytesResident`, which counts every process; `cudaMemGetInfo` now returns the smaller of the
+  two (`GGML_CUDA_WDDM_FREE=0` keeps HIP's).  Two consequences to keep straight: the reading is honest, but
+  **an overcommit still does not fail**, so `TODO` #216's accepted limitation stands; and the two figures are
+  not interchangeable — HIP's is this process's remaining budget, WDDM's is the adapter's remaining commit
+  room, and the WDDM one *includes* memory other processes will keep.
+- **Windows `llama_mmap::unmap_fragment` used to be a no-op, so every loader release freed nothing (r209,
+  block 09).**  A view cannot be unmapped in part, so the Windows implementation now drops the range from the
+  working set with `VirtualUnlock` on unlocked pages (it reports `ERROR_NOT_LOCKED` and the clean file pages
+  move to the standby list; it still unlocks a locked page in the range, as `munmap` would).  The mapping and
+  the data pointer stay valid, so unlike POSIX this is safe even for a range something still reads — do not
+  "restore symmetry" by making the POSIX side a trim, because there the release is what bounds peak RSS.
+  Measured on the reporter's box (Flash-Next, `--fit`): working set after load 67.4 -> 21.2 GiB.
+- **Windows has no `MemAvailable`, and before r209 the delivery's two RAM ceilings and the pool's fill-mode
+  decision therefore did not exist there (r209, blocks 12 and 15).**  `pool_available_ram_bytes()` returned
+  `-1`, so `MOE_HOST_POOL_DIO=auto` always resolved to `O_DIRECT` ("no MemAvailable") and neither
+  `MOE_HOST_POOL_RAM_PCT` nor `LLAMA_KV_SPILL_RAM_PCT` applied.  `GlobalMemoryStatusEx().ullAvailPhys` (free
+  plus standby) is the counterpart and is what they now read; it is a *different* quantity from the WDDM
+  device figure above, and one may not substitute for the other.
+- **A Windows-only change can be folded into the delivery when it is provably inert on Linux, and the proof
+  is preprocessing, not inspection (r209).**  Compile each changed translation unit with the delivery's own
+  compile command (`build-rocm/compile_commands.json`) as `-E -P` on both trees and diff the token streams:
+  identical apart from `__FILE__`/`__LINE__` strings is the statement "the Linux build compiles the same
+  code"; object or `.so` hashes are not (see the r208 entry).  A header change is inert by construction when
+  its only delta is inside `#if defined(_WIN32)`.  What this method cannot do is validate the Windows arms —
+  those stay the reporter's numbers, and no gate on this box reaches them (there is no Windows toolchain,
+  `TODO` #95).  Also: `ggml/src/ggml-cuda/CMakeLists.txt` globs `*.cu` **without** `CONFIGURE_DEPENDS`, so a
+  newly added CUDA source needs a cmake re-run, not just a rebuild.

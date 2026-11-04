@@ -35,7 +35,14 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
 
 ## Current candidates
 
-_None — both candidates held here were promoted in `v12-097cf33d9-r86` (2026-10-19)._
+**None.**  `0016-host-experts-window` was **withdrawn 2026-11-02**: the mode is unimplementable on a no-XNACK
+GPU (a kernel read of a reclaimable registered page is a fatal fault, and holding it is pinning — the RAM saving
+disappears).  It is archived with a resolution at
+[`../archive/work/host-experts-window-beta/`](../archive/work/host-experts-window-beta/README.md) and
+[`../archive/work/host-expert-pinned-window/RESOLUTION.md`](../archive/work/host-expert-pinned-window/RESOLUTION.md);
+the two mechanisms worth keeping moved to [`../wip/host-pool-speed/`](../wip/host-pool-speed/HANDOVER-2026-11-02.md).
+
+(Empty before this: both earlier candidates were promoted in `v12-097cf33d9-r86`, 2026-10-19.)_
 
 ## Recently promoted
 

@@ -34,8 +34,14 @@ Accounting caveats (read before quoting a number):
   * An IDENTITY (fully resident) table is not traced on the decode band (its routing is never read
     back).  Such a table cannot miss, so a trace from a fully-resident run has no decode records at
     all -- trace a partially-resident config (e.g. `MOE_EXPERT_CACHE_MIB=4096`).
-  * The trace records the routing, not the timing.  `h` is comparable to the logged `h=`; throughput is
-    not.
+  * The trace records the routing, not the timing.  `h` is comparable to the logged `h=`, but ONLY on the
+    decode band: the runtime's `h=` comes from `moe_cache_update_host`'s access path, and the PREFILL band
+    returns before it (whole-table staging, or a decline), so a prefill position never reaches `hits`/
+    `misses`.  Measured on the 122B-A10B campaign trace: 2,145,816 reaches = 1,863 decode steps x 144 tables
+    x 8 experts, i.e. the trace's 740,814 prefill positions contribute exactly zero.  Scoring them anyway
+    (`--score-band all`, the old default) biases `shipped` low by ~0.15 (0.1956 vs the run's 0.3488 at
+    3,932 MiB, 0.6328 vs 0.7543 at 22,517 MiB); on the decode band the model lands within 0.3 %
+    (0.3492 / 0.7513).  `wip/host-pool-speed/HANDOVER.md` §4/F2 has the table.
 """
 
 import argparse
@@ -464,7 +470,8 @@ class TwoTier:
 
     __slots__ = ("slots_a", "slots_p", "a_slot", "a_map", "a_count", "a_ghost", "a_last",
                  "p_slot", "p_map", "p_last", "clock", "pclock", "last_decay",
-                 "hits", "misses", "p_hits", "l3", "promote", "handover", "evictions", "p_evict")
+                 "hits", "misses", "p_hits", "p_cold", "l3", "promote", "handover", "evictions",
+                 "p_evict")
 
     def __init__(self, t, slots_a, slots_p):
         self.slots_a = min(slots_a, t.n_experts)
@@ -480,7 +487,7 @@ class TwoTier:
         self.p_last = collections.Counter()
         self.pclock = 0
         self.last_decay = 0
-        self.hits = self.misses = self.p_hits = self.l3 = self.promote = 0
+        self.hits = self.misses = self.p_hits = self.p_cold = self.l3 = self.promote = 0
         self.handover = self.evictions = self.p_evict = 0
 
     # -- pool helpers ---------------------------------------------------------
@@ -504,6 +511,9 @@ class TwoTier:
         old = self.p_slot[slot]
         if old >= 0:
             self.p_map.pop(old, None)
+        prev = self.p_map.get(expert)   # mirror `pool_slot_assign_locked`: never two indices for one expert
+        if prev is not None and prev != slot and 0 <= prev < self.slots_p and self.p_slot[prev] == expert:
+            self.p_slot[prev] = -1
         self.p_slot[slot] = expert
         self.p_map[expert] = slot
         self.p_last[expert] = self.pclock
@@ -514,6 +524,20 @@ class TwoTier:
             self.p_slot[slot] = -1
 
     # -- one routed expert ------------------------------------------------
+    def cold_read(self, e):
+        """A miss that is NOT admitted (or cannot be) still reads the expert's bytes once.  Where from?
+        In pool mode with `MOE_HOST_POOL_COLD` (default 1) a pool-resident expert is read IN PLACE from
+        the pool's device alias -- a PCIe read of pinned RAM, NOT a disk read.  Only an expert in neither
+        tier goes to the mapping/disk (L3).  Mirroring that is what makes `l3` comparable to
+        /proc/diskstats: measured on the 122B at `-ncmoe 48`, the disk reads per decode token are
+        ~163 / ~53 / ~13 MiB at pool FRAC 50 / 80 / 100, and conflating pool cold reads with L3 reads
+        predicted ~460 MiB/token at every FRAC."""
+        if self.slots_p > 0 and e in self.p_map:
+            self.p_cold += 1
+            self.p_last[e] = self.pclock
+            return
+        self.l3 += 1
+
     def access(self, e, policy, protect, period, admit, touch):
         self.clock += 1
         if self.clock - self.last_decay >= period:
@@ -529,7 +553,7 @@ class TwoTier:
         self.misses += 1
         self.a_ghost[e] += 1
         if self.slots_a <= 0:
-            self.l3 += 1                    # served cold straight from L3
+            self.cold_read(e)               # served cold: the pool alias when resident, else L3
             return
         slot = -1
         for s in range(self.slots_a):
@@ -546,13 +570,13 @@ class TwoTier:
                         (self.a_count[v] == self.a_count[victim] and self.a_last[v] < self.a_last[victim]):
                     victim, slot = v, s
             if slot < 0:
-                self.l3 += 1                # every arena slot is protected: served cold
+                self.cold_read(e)           # every arena slot is protected: served cold
                 return
             if admit == "value" and self.a_ghost[e] <= self.a_count[victim]:
-                self.l3 += 1
+                self.cold_read(e)
                 return
             if admit == "touch" and self.a_ghost[e] < touch:
-                self.l3 += 1
+                self.cold_read(e)
                 return
         # ---- where do the incoming bytes come from?
         if self.slots_p > 0 and e in self.p_map:
@@ -581,7 +605,11 @@ class TwoTier:
                     w = self.p_weakest()
                     if w >= 0:
                         self.p_evict += 1
-                        self.p_slot[w] = -1
+                        # 2026-11-02: this was `self.p_slot[w] = -1`, which freed the slot but left the
+                        # evicted expert in `p_map` forever -- p_map then grew past `slots_p` and
+                        # `e in p_map` turned phantom experts into pool hits (measured: 26,769 "resident"
+                        # experts in 9,216 slots at --pool-frac 25).  Drop it properly, as the C++ does.
+                        self.p_drop(self.p_slot[w])
                 free = self.p_free()
                 if free >= 0:
                     self.pclock += 1
@@ -752,6 +780,7 @@ def score_pool(tables, passes, slots_a, slots_p, policy, pool_init="heat", perio
     misses = sum(s.misses for s in states.values())
     p_hits = sum(s.p_hits for s in states.values())
     l3 = sum(s.l3 for s in states.values())
+    p_cold = sum(s.p_cold for s in states.values())
     promote = sum(s.promote for s in states.values())
     handover = sum(s.handover for s in states.values())
     evict = sum(s.evictions for s in states.values())
@@ -768,6 +797,8 @@ def score_pool(tables, passes, slots_a, slots_p, policy, pool_init="heat", perio
         "policy": policy, "hits": hits, "misses": misses, "reaches": reaches,
         "h": (hits / reaches) if reaches else 0.0,
         "pool_h": (p_hits / misses) if misses else 0.0,
+        "pool_cold": p_cold,
+        "pool_cold_pct": (100.0 * p_cold / misses) if misses else 0.0,
         "l3": l3, "l3_mib": l3_mib, "l3_mib_per_tok": (l3_mib / tokens) if tokens else 0.0,
         "promote_mib": promote_mib, "handover_mib": handover_mib,
         "hostlink_mib": promote_mib + handover_mib,
@@ -839,11 +870,11 @@ def main(argv=None):
                          "suffix first heat-seeds the ARENA with the same prior and then gives the pool "
                          "only the non-resident experts (the real layout, and the one that makes "
                          "arena U pool cover the set)")
-    ap.add_argument("--score-band", choices=("all", "decode"), default="all",
-                    help="which passes the arena policies are scored on (default 'all', which is what the "
-                         "runtime's logged h= counts and therefore what the shipped-vs-measured calibration "
-                         "needs; 'decode' drops the prefill band, whose whole-table staging is not what an "
-                         "arena policy is about -- use it for policy comparisons, never for calibration)")
+    ap.add_argument("--score-band", choices=("all", "decode"), default="decode",
+                    help="which passes the arena policies are scored on (default 'decode', which is what the "
+                         "runtime's logged h= counts: the prefill band returns before the cache's access path, "
+                         "so its positions never reach hits/misses.  'all' includes them and biases `shipped` "
+                         "low by ~0.15 on the 122B trace -- it is a diagnostic, never a calibration)")
     ap.add_argument("--decode-only", action="store_true", default=True,
                     help="score the decode band only (the prefill stages whole tables, so it does not "
                          "discriminate between pool policies); default on")
@@ -1001,9 +1032,9 @@ def main(argv=None):
         if sh and args.measured_h is not None:
             print("calibration: model 'shipped' h=%.4f vs the run's logged h=%.4f (error %+.4f)"
                   % (sh["h"], args.measured_h, sh["h"] - args.measured_h))
-            print("             (the model has no persisted heat prior, no seed and no arena shortfall, so")
-            print("              it is usually a little optimistic; judge POLICIES by their delta, not by")
-            print("              the absolute h)")
+            print("             (pass --seed sidecar:<the run's .moe-heatmap> for the real prior, and --slots <the")
+            print("              run's per-table count> when the log has it -- with both, the decode band lands within")
+            print("              0.3 %.  See wip/host-pool-speed/HANDOVER.md §4/F2)")
         if sh and "quota" in results:
             q = results["quota"]
             print("quota vs shipped: h %+.4f, MiB/token %+.1f%% (%s)"

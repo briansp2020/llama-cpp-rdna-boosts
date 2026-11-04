@@ -1,3 +1,1581 @@
+## 261103.014 (r209) -- DELIVERY: Windows host memory folded into blocks 09/11/12/15 (PR #269)
+
+**Delivery change.**  PR #269 (`@overdoingism`, `wip/windows-host-memory/`) is **folded into the blocks that own
+each concern**, not merged as a fourth source area: the set stays **16 patches (0000-0015)** and `release.json` is
+`v16-6050b467c-r209`, tip `27271aa91`, tree `8c6c992db70cb2316bf1ef66b0702f124454b336`.  Placement: **block 09**
+the WDDM free-VRAM figure (`vendors/hip.h` + the new `ggml-cuda/wddm-mem.cu`) and the Windows working-set release
+in `llama-mmap.cpp`; **block 11** the qwen4exp PLE prefetch; **block 12** the host pool's available-RAM figure;
+**block 15** the KV spill ceiling's.  Per-block reference: `patches/README.md` (r209 notes in 09/11/12/15);
+variables: `ENVIRONMENT.md` (`GGML_CUDA_WDDM_FREE`, plus Windows notes on `LLAMA_LOAD_RELEASE_MMAP`,
+`MOE_HOST_POOL_DIO`/`_RAM_PCT`, `LLAMA_KV_SPILL_RAM_PCT`); facts: `INVARIANTS.md` (four r209 entries).
+
+**What it does (all Windows-only, `_WIN32`-gated).**  (1) `cudaMemGetInfo` returns the smaller of HIP's free
+figure and the adapter's WDDM figure (`D3DKMTQueryStatistics` over the non-aperture segments,
+`CommitLimit - BytesResident`, adapter by LUID, entry point resolved from `gdi32.dll` at run time), so the slab,
+the expert-cache sizing, `--fit` and `GGML_CUDA_MIN_FREE_MIB` stop believing another process's memory is free
+(issue #216); `GGML_CUDA_WDDM_FREE=0` keeps HIP's.  It makes the figure honest and **does not** make an
+overcommit fail, so `TODO` #216's accepted limitation is unchanged.  (2) the host pool and the KV spill ceiling
+read `GlobalMemoryStatusEx().ullAvailPhys` instead of `-1`; before this the pool always resolved
+`MOE_HOST_POOL_DIO` to `O_DIRECT` and neither RAM ceiling applied.  (3) `llama_mmap::unmap_fragment` drops the
+range from the working set (`VirtualUnlock`) instead of being a no-op, so the r49 per-tensor release and the
+end-of-load release actually free the pages of an uploaded tensor.  (4) the qwen4exp host-resident PLE gather
+prefetches its ubatch through `llama_prefetch_rows`, the helper gemma4 and deepseek41 already use.
+
+**Why folding it is safe on Linux: measured, not argued.**  Every changed translation unit was preprocessed with
+the delivery's own compile commands (`build-rocm/compile_commands.json`, `-E -P`) on the r208 tree and on the
+folded tree: `ggml-cuda.cu`, `moe-expert-cache.cu`, `src/llama-mmap.cpp` and `src/models/qwen4exp.cpp` are
+**identical token streams apart from `__FILE__`/`__LINE__` strings**, the only header edit (`vendors/hip.h`) is
+inside `#if defined(_WIN32)` so it cannot affect a non-Windows preprocess, and the new `wddm-mem.cu` compiles as
+an empty TU off Windows (it does need a cmake re-run: the CUDA list is `file(GLOB "*.cu")` without
+`CONFIGURE_DEPENDS`).  The `.cu` also passes `check-windows-portability.sh`, which now scans it as an added file.
+
+**Gates** (gfx1201, ROCm 10.1, `~/llama.cpp` on the folded chain, build `17a28ac6d`):
+* **Coherence**: 4B Q8_0, `prompts/prose-rdna-boosts.txt`, `-n 200 --seed 42 --temp 0`: 1 GPU **897 chars
+  `a77fa8c1107a`** and 3 GPU `-sm tensor` **964 `eab86065e67e`** -- byte-identical to r208 on both arms.
+* **Prefill logits**: `gate-prefill-logits.sh` **KLD 0.000000 / same-top-p 100.000 %** (bit-identical prefill).
+* **Per-block build**: `gate-per-block-build.sh --changed-from f12c2b0d6` (targets `all`, fresh build dir per
+  commit) **4/4 built, 0 failed** in 1073 s; every other block's delta is unchanged by construction.
+* **GPU faults**: `check-gpu-faults.sh --since "3 hours ago"` over the journal and the two coherence logs --
+  clean.
+* **Delivery contract**: `validate-set.sh` green -- 16/16 strict `git am` on the fresh tarball, applied tree
+  `8c6c992db`, every artifact sha256, the conflict-marker scan and the Windows portability lint (287 added
+  files).  `.tip` re-cut twice from `patches/` in two fresh clones and both printed `27271aa91`, i.e. the
+  deterministic re-cut still holds.
+
+**Not run, and why.**  The MTP four-axis protocol and the seven per-block arms: no Linux-visible code changed
+(the four preprocessed TUs are token-identical and prefill logits are bit-identical), so every arm would
+measure the r208 build.  No Windows gate exists on this box (no toolchain, `TODO` #95): the Windows numbers in
+the block notes are the reporter's and are labelled as such.  Their own record also says the exact four-commit
+combination was never built (their measured tree carried a dropped fifth commit), commits 3 and 4 were measured
+together, and commit 1 measured ~2 t/s decode *slower* on their headless card -- all preserved in the archived
+campaign so a Windows regression report starts from the truth.
+
+**Campaign.**  `wip/windows-host-memory/` is promoted and its record moved to
+[`archive/work/windows-host-memory/`](archive/work/windows-host-memory/README.md) with a `RESOLUTION.md` (what
+shipped, what stayed the submitter's, and the Windows re-entry conditions); no stub is left in `wip/`, and
+`wip/CAMPAIGNS.md` records the promotion.
+
+## 261103.013 (r208) -- DELIVERY: block 05 amended with the RDNA2 (gfx1030) FA prefill/tail work (PR #270/#271)
+
+**Delivery change.**  PR #270 and PR #271 (`@slavap`, RDNA2 `fattn-tile.cuh`) are **folded into block 05**, not cut
+as new blocks 17/18: it is block 05's kernel, the same call as r76/r88 for this author's RDNA2 work.  The set stays
+**16 patches (0000-0015)**; `release.json` is `v16-6050b467c-r208`, tip `f12c2b0d6`, tree
+`f79a2f4aeda1f726731c4fca08f06a45e53c9a20`.  Block 05's own delta is `+5565 / -624` over 295 files.  Per-block
+reference: `patches/README.md` block 05 (r208 bullet); RDNA2 reader-facing note: `CONTAINERS.md`.
+
+**What it does.**  Three RDNA2-only changes to the tile kernel: (1) the global-half2 Q path
+(`GGML_CUDA_FATTN_TILE_Q_GLOBAL`) now requires **64** columns instead of 16, so at the prefill shape (16x2 = 32
+columns) Q comes back out of LDS and the checked tail stops spilling ~180 VGPRs; the two kernel-side conditions,
+the `Q_tmp_count` stub and all **seven** launcher `q_h2` arguments move together (one that lags is the r88
+null-`Q_h2` fault); (2) `rdna_cap_ncols2` is **lifted for `DKQ == 256`** (D=128 keeps it), which lets D=256 take
+the GQA fold; (3) the checked tail **clamps out-of-range rows to the last in-bounds row** instead of branching to
+a local zero array -- the values are discarded by the `k_VKQ_sup` guards, every read stays inside the KV cache,
+and the pointer-select the branch existed to avoid (the kv=113 flat-scratch fault) goes with it.
+
+**This is issue #214's RDNA2 deficit.**  The reporter's RX 6700 XT (gfx1031 as gfx1030) and @slavap's V620 both
+measured the delivery 14-19 % *slower* than stock at 120k.  The gap was the launch config plus the checked tail,
+not the host side.  The submitter's numbers (V620, Qwen3.6-35B-A3B IQ4_XS, `-b 8192 -ub 2048 -fa 1`): pp2048 @
+d32768 **1041.0 -> 1259.8** t/s (stock 1231.7), pp2048 @ d131072 **368.2 -> 474.7**, tg256 @ d131072 **50.9 ->
+62.4**, tg256 @ d32768 82.5 -> 85.5, and pp2048 @ d0 unmoved (2330 -> 2375).  Those numbers stay the submitter's:
+RDNA2 is best-effort ("no performance claims and no purity gates for it", `CONTAINERS.md`), and we cannot run it.
+
+**Why the cap lift is safe (the one behavioural reversal in the PRs).**  The cap dated from r76 and its comment
+said the wide D=256 variants overflow the register file and the occupancy query returns 0, i.e. an abort.  r76
+itself replaced that query with a manual WGP computation, so the cap has guarded nothing since.  Applied the
+tree's own formula (`4*waves_per_simd/waves_per_block`, LDS-capped at `128K/lds`) to the patched gfx1030 HSACO:
+**every** D=256 shape the launcher can now pick reports `>= 2` blocks (4x8: 235 VGPR, 29 696 B LDS, 4 blocks;
+16x2: 242 VGPR, 2 blocks), so `GGML_ASSERT(max_blocks_per_sm > 0)` is unreachable, and the family's largest
+static LDS stays 63 488 B of gfx1030's 65 536 B.  Also verified on that HSACO: the D=256 4x8/16x2 checked-tail
+scratch goes **480/500 B -> 0** (the submitter's 488/520 on their toolchain), and 16x1 keeps 76 B (so "0 spills"
+is true where it is claimed, not universally -- 16x1 and `dkq64` keep a little).
+
+**Blast radius is RDNA2 only, and it is measured rather than argued.**  Both levers are `#if defined(RDNA2)` or
+`GGML_CUDA_CC_IS_RDNA2`, so for **gfx1201** every tile kernel's machine code is bit-identical before and after:
+extracted `.hip_fatbin` from the *build objects* of `fattn-tile-instance-dkq256-dv256-f16` and
+`-dkq128-dv128-f16`, unbundled per arch, and compared each kernel's `.text` slice plus amdhsa resource usage
+(88/88 and 106/106 kernels identical, host `.text` identical).  Two compiles of the *same* source differ in
+symbol-table order, so `.o`/`.so` hashes are NOT a codegen oracle -- recorded in `INVARIANTS.md` with the method.
+RDNA3_0/RDNA3_5/NVIDIA/MUSA/SYCL are unchanged by the same preprocessor structure.  Both levers also compile
+clean for **gfx1030** on ROCm 10.1 (all 12 `template-instances` tile TUs, no warnings) -- which the r88 note said
+was impossible on the old toolchain; ROCm 10.1 has `oclc_isa_version_1030.bc`, so gfx1030 codegen is available
+here and is worth using for RDNA2 review in future.
+
+**Gates** (gfx1201, ROCm 10.1, `~/llama.cpp` at the release tree):
+* **Coherence, and it is an A/B this time**: rebuilt r207 (`3333f387a`) and r208 in the same path and ran both
+  arms on both builds -- 4B Q8_0, `prompts/prose-rdna-boosts.txt`, `-n 200 --seed 42 --temp 0`: 1 GPU **897 chars
+  `a77fa8c1107a`** and 3 GPU `-sm tensor` **964 `eab86065e67e`** on *both* builds, byte-identical.
+* **Prefill logits**: `gate-prefill-logits.sh` (gfx1201, 27B Q8_0, 40 chunks, f16 KV) **KLD 0.000000 /
+  same-top-p 100.000 %** -- bit-identical prefill, as the machine-code comparison predicts.
+* **MTP**: prose axis (`-n 3000`, 27B UD-Q4_K_XL, `--spec-draft-n-max 7`) `draft-mtp` **74.7 t/s** vs `none`
+  **30.1**, acceptance **0.58448** (pos 1 0.901) -- rules 1-2 green.  **The other three axes were not re-run**
+  and that is deliberate: the R (reasoning-on), C (code) and K (recall) arms compare against the same r207
+  numbers (0.81370 / 0.75408 / 0.89175 / 0.98148, 261103.012) on a build whose gfx1201 device code is
+  bit-identical, so they cannot move; re-running them would cost wall-clock and prove nothing.
+* **Per-block build**: `gate-per-block-build.sh --changed-from 3333f387a` -- 2/2 built (block 05 with the fold,
+  `414s`; the tip, `4s`); every other block's delta is unchanged by construction.
+* **GPU faults**: `check-gpu-faults.sh --since "90 min ago"` over the journal and all four coherence logs --
+  clean.
+* **`validate-set.sh`**: green on a fresh tarball, applied tree = `release.json.tree`, plus the new
+  delivery-repo marker scan (see below).
+
+**Not taken from the PRs.**  Their `patches-rdna2-r205/` + `release-rdna2-r205.json` +
+`scripts/apply-rdna2-r205.sh` re-packaging (the same call as r88: `release.json` and `patches/` stay the single
+source of truth), and the **block 16 two-lane prefill** (`LLAMA_PREFILL_LANES`) that both branches were stacked
+on -- that is PR #268, a separate candidate, and it is not in this tree.  Reported to the submitter on both PRs,
+which are closed by this release.  Their "the current release is r206" is stale (r207 was current, `fattn-tile.cuh`
+is unchanged r205 -> r208, so the patches applied cleanly regardless).
+
+**One repo defect found and fixed on the way (no delivery change, commit `314b883e`).**  `wip/CAMPAIGNS.md` shipped
+in 7112063b with two leftover `<<<<<<< HEAD` lines and a pasted commit line, because `validate-set.sh`'s
+conflict-marker scan only ever looked at the *applied block trees* and never at this repo's own tracked files.
+Markers removed, and the same three patterns now run against the delivery repo in `validate-set.sh` (CI catches
+the class on the next push).
+
+**Published (2026-11-03).**  Tag `v16-6050b467c-r208` (annotated) on the delivery repo; the fork's `rdna-boosts`
+branch force-pushed to `f12c2b0d6` (the deterministic re-cut, tree checked against `release.json`).  The ROCm
+images are built and pushed off-host by the worker watcher (`scripts/container-watch.sh` on `radiance`), which
+picks the tag up within ~10 minutes; nothing else is needed here.
+
+---
+
+## 261103.012 (r207) -- DELIVERY: block 12 amended with host-pool-speed (the pool gather default, the RAM-ceiling distribution, the diagnostics)
+
+**Delivery change.**  `wip/host-pool-speed/` is promoted **into block 12** (the pool's block -- no new block: it is
+this block's code, and the campaign's own promotion checklist pointed at the block-12 note).  The set stays
+**16 patches (0000-0015)**; `release.json` is `v16-6050b467c-r207`, tip `3333f387a`, tree
+`3bbd3613abb202de32bb65863a98b42f1ebd6f0f` (unchanged by the fold -- only block 12's commit content moved).  `pinned` (the default `--host-experts` mode) is byte-for-byte
+unchanged; everything here is `--host-experts pool`.  Per-block reference: `patches/README.md` block 12 (`r207` note); the
+measured record is `wip/host-pool-speed/README.md` §18 (four sessions, 1/2/3 x R9700, 122B-A10B).
+
+**What it does.**  (1) A POOL-backed table is served by the device **gather in the prefill band** by default --
+its whole-table staging is the slow path at every width: 3-GPU `pool` FRAC 95 prefill **1507.7-1631.3 t/s** with
+the gather, **16.9** without, against `pinned` 634-638, with decode at parity (67.2-67.7) and **bit-identical
+prefill logits** (KLD -0.000000 / same-top-p 100.000 %).  `GGML_SCHED_DEVGATHER` becomes three-valued (unset =
+pool-backed only, `0` = kill switch, `1`/`force` = the old A/B arm, which costs `pinned` ~47 % prefill at two
+devices, so it is not the default).  (2) `MOE_HOST_POOL_RAM_PCT` now **scales every table** instead of starving the
+registration-order tail (`RAM_PCT=70`: **10.94 -> 17.44 t/s**, +73 % with `SIZING=1` at identical pinned bytes;
+`85`: 19.52 -> 20.97).  (3) `MOE_HOST_POOL_SIZING`/`_COV_PCT` (opt-in): per-table slots from routing
+concentration, +7.5 %/+16.4 % decode at FRAC 80/60 for -13/-15 % prefill.  (4) The pool's diagnostics report the
+RUN (the `atexit` report used to print an emptied cache in every mode), a forced `DIO` logs its mode,
+`bounce_acquire` owns the pinned bounce ring (2209-3108 MiB on the 122B, uncapped on purpose: a cap costs 8-25 %
+prefill at FRAC 80), pool fills are timed by source, and the gather reports its calls.  (5) The dead
+`MOE_HOST_POOL_PREFETCH` is removed (`TODO` #268 closed).
+
+**Block, not a new block (the maintainer's call).**  `261103.011` recommended promoting this as a *new* block 16
+for mechanical simplicity; the maintainer's instruction was to fold it into an existing block, and **block 12** is
+the right home (it owns the pool; the campaign's own promotion checklist named "the block-12 note").  The fold was
+done by moving the candidate commit next to block 12 in the chain and squashing it there: **the resulting tree is
+identical** (`3bbd3613...`), only block 12's commit content and message changed.  Precedent: the same shape was
+resolved the same way at r190, when Goal B's block 16 was folded into block 15.
+
+**Published (2026-11-03).**  Tag `v16-6050b467c-r207` (annotated) pushed to the delivery repo's `origin`; the fork's
+`rdna-boosts` branch force-pushed to `3333f387a` with the same tree, so a consumer can clone the fork and check the
+branch out instead of applying the patches.  `release.yml` builds the release assets from the tag; the ROCm container
+images are built and pushed **off-host** by the worker watcher on `radiance` (`scripts/container-watch.sh`, which
+polls for the new tag -- `CONTAINERS.md`), not in CI and not on this box.
+
+**Held back deliberately:** `MOE_HOST_POOL_FRAC=100` as the default.  It is +16 % decode over 80 on ONE GPU, but
+the RAM ceiling does not yet reserve the model's own pageable footprint, and on a split 100 % measured **9 %
+slower** than 95 % (4 GiB more pinned, 42 GiB more disk per run), over-committed a 91 GiB box once, and lost to
+80 % on the 1-GPU srv cell.  The default stays 80 and the reasoning is in the code comment + `ENVIRONMENT.md`.
+
+**Measured on a clean box** (after the restart that cleared a tmpfs `/tmp` + a 70 GiB orphan, see 261103.011's
+session note; two runs per arm, `swap 0`, `MemAvailable >= 83.7 GiB`): 3 GPUs `pinned` 67.7/67.3 decode and
+638.2/634.1 prefill vs `pool` FRAC 95 67.7/67.2 and 1631.3/1507.7; pair `pinned` 49.2/49.2 and 1651.4/1642.3 vs
+`pool` 38.5/38.5 and 1446.2/1461.3 (-21.7 % decode, the campaign's open item `TODO` #132); 1 GPU `pinned`
+25.4/25.4 and 724.6/723.2 vs `pool` FRAC 100 23.4/23.4 and 718.3/718.1 (-7.9 %).
+
+**Gates:** greedy text byte-identical across modes on 1/2/3 GPUs (5835 chars `dc178c29fe89`, 6079
+`01607c16b483`, 5917 `5421cf18bed5`; 257 `5531ae33f0f7` on the 64-token oracle) and again on the final tree;
+prefill-logit **KLD -0.000000 / top-p 100.000 %**; MTP four-axis acceptance **identical to 5 decimals** on all
+four axes (0.81370 / 0.75408 / 0.89175 / 0.98148) with `none` == `draft-mtp` text; `llama-batched-bench
+-npl 4,8` pool **338.5/835.8** vs pinned 81.8/136.0 pp t/s (`npl=1` is a tool artefact, see below);
+`check-gpu-faults.sh` clean; `scripts/validate-set.sh` green (17 blocks, applied tree = `release.json.tree` in a
+fresh tarball).
+
+**Two measurement traps recorded** (both cost time this session): (a) `/tmp` on `soar` is **tmpfs** -- run
+artefacts there consume RAM, and with the 122B that pushed the box into swap and produced impossible numbers;
+the campaign now uses `tools/arm-run-261103.sh`, which refuses to record an arm unless the box is clean and logs
+to disk.  (b) `llama-batched-bench` at `-npl 1 -npp 64` reports pool prefill **~1 t/s** (1.00 with the gather,
+0.96 without, i.e. not a path question) while `llama-cli` at the same 64-token width gives 71.2 vs pinned's 33.8
+and `pinned` is itself 3.5x depressed in that tool; at `npl` 4/8 the tool is sane.  Read that gate at `npl >= 4`.
+
+**Open** (`TODO`): #131 (the pool staging path's own root cause; now reachable only via the kill switch -- fix or
+delete), #132 (the pair's synchronous demand read, ~25-30 % overlap ceiling there), #133 (a fully-resident table
+is still re-copied out of the arena per prefill ubatch -- the DEFAULT mode's own prefill defect, up to ~3x, found
+while measuring this block).
+
+## 261103.011 (wip) -- promotion assessment: the re-base is 207 upstream commits, so promotion and re-base split
+
+No delivery change.  Continues `261103.002`.  Requested work: rebase, gates, promote.
+
+**The rebase is not "a few commits".**  `git fetch https://github.com/ggml-org/llama.cpp master` puts upstream at
+`6b9c0cfcb`; `6050b467c..upstream/master` is **207 commits**, and the delivery's **very first block already
+conflicts** (`git am -3` of `patches/000*.patch` onto `6b9c0cfcb` fails at block 00 in `ggml/src/ggml-cuda/mmq.cu`,
+`src/llama-graph.cpp`, `src/llama-kv-cache.cpp`, `src/llama-model.cpp`, `src/llama-vocab.cpp`).  Upstream has also
+touched the files this campaign edits and the mechanisms it uses: `ggml-cuda.cu` (7 commits), `llama-model.cpp`
+(13), `llama-graph.cpp` (11), `common/arg.cpp` (5), `llama-model-loader.cpp` (3), `ggml-backend-meta.cpp` (3), and —
+the two that actually overlap our work — **`f5222f25c` "cuda: fuse MoE (MUL_MAT_ID) gate/up and GLU in MMQ"** and
+**`740251a92` "cuda: gather batched tensor reads into mapped host memory"**, plus `8fc037672` (Q8_1 correction sum)
+and `1b6935b22` (flash_attn_ext_rows).
+
+**Recommendation: two releases, not one.**  (a) Promote the six campaign patches onto the *current* base
+`6050b467c` as a **new block 16** (safer than amending blocks 09/12, which would require re-laddering every block
+after them), with the gates still owed.  (b) Treat the 207-commit re-base as its own session: re-cut every block,
+run the per-block ladder, re-record the prefill-logit base on the new base, and review the two overlapping upstream
+commits for semantic conflict — the repo's own rule says a re-base is a decode *and* prefill change and must be
+measured before tagging, not verified.  Mixing the two would produce a change nobody can review or attribute.
+
+**Numbering note (rebase onto `origin/main`).**  The three host-pool-speed entries of this date were allocated
+`261103.001-.003` in this branch, which a *parallel* campaign (`host-expert-eager-push`, same date) had also used;
+after rebasing onto `origin/main` they are **`.009`, `.010`, `.011`** (the commit messages still carry the old
+numbers — they are immutable).  The parallel campaign's `.001-.008` are untouched and their content is unchanged.
+
+**Gates still owed for the promotion** (none run yet, all mandatory per `MANIFESTS.md` for this change class): the
+MTP four-axis protocol (0006 sits in the scheduler's MoE input path; the band gate should keep the verify band on
+the arena), `llama-batched-bench -npl 1,4,8` (multi-sequence decode exceeds the band, so it *does* take the new
+path), and `gate-prefill-logits.sh` with a base recorded on the target tree for both arms.
+`check-gpu-faults.sh` and the greedy-text oracle are already green this session.
+
+## 261103.010 (wip) -- #131 fixed: a pool-backed expert table gathers in the prefill band (campaign patch 0006)
+
+No delivery change (nothing promoted; `patches/` and `release.json` untouched).  Continues `261103.001`.  Record:
+[`wip/host-pool-speed/README.md`](wip/host-pool-speed/README.md) §18.2 (Finding B resolution); set is now **six**
+patches, applied tree `07660557c05bf0a6c462212c4746c5bc6ce40afe` (fresh-worktree `git am` verified).
+
+**The defect.**  `--host-experts pool` whole-table *staging* is the slow path for a pool-backed table — its source
+is the pageable model mapping plus the pool's host alias — and it degrades as pool coverage rises.  Instrumented
+end-to-end: the staging copy is **not** the cost (423 calls = 1.6 s host + 0.7 s device of a 273 s prefill), nor is
+the per-table `cudaMalloc` (0.00 s), nor the GPU kernels (5.04 s vs `pinned`'s 4.08 s at the same prompt), nor the
+page cache (evicting it with `posix_fadvise(DONTNEED)` changes nothing).  What tracks it is the **pool size**: at 3
+devices, FRAC 30 → 206 t/s, FRAC 80 → 134-144, FRAC 95 → 12.9-16.9.  The device gather does not use that path at
+all — which is why it is the fix and why the numbers are so lopsided.
+
+**The fix (`patches/0006`).**  A new optional device-iface query `moe_cache_pool_backed(backend, weight)` (the CUDA
+cache answers "this table's master is the read-only mapping"; the Meta backend forwards it to its simple devices)
+lets `sched_input_gatherable` route a pool-backed table to the gather in the **prefill band only**
+(`n_tokens > moe_cache_band`).  `GGML_SCHED_DEVGATHER` becomes three-valued: unset = pool-backed tables only (the
+new default), `0` = kill switch (old behaviour), `1`/`force` = the historical A/B arm (not the default: it costs a
+`pinned` master ~47 % prefill at two devices).
+
+**Measured** (3 × R9700 `-sm tensor`, 122B-A10B `-ncmoe 48`, 5258-token prompt, `-ub 2048`, 2000-token greedy):
+`pinned` 471.8 prefill / **67.6** decode; `pool` FRAC 80 **1502.6** / 67.1; `pool` FRAC 95 **1569.2** / 67.1;
+`pool` FRAC 95 with `GGML_SCHED_DEVGATHER=0` **16.9** / 27.3.  Neutral elsewhere: pair `pinned` 1671.6 (never
+gathers), pair `pool` 948.6 (staging 1024.1), 1-GPU `pool` F100 734.2 vs `pinned` 755.5.  So on the box's own
+three-device shape the pool is **-0.7 % decode and 3.2x `pinned`'s prefill** — at or past PR #267's published
+envelope.  The first cut had no band gate and decode fell to 1.2-4.1 t/s: the decode band is served from the arena
+by the slot-remap read and the gather must not take it over.
+
+**Correctness.**  `257 chars sha=5531ae33f0f7` on all eight mode/device arms (pair and 3-GPU, gather default and
+forced) and **`5835 chars sha=dc178c29fe89`** across `pinned` / `pool` F80 / `pool` F95 at 3 GPUs with a
+2000-token decode behind a 5258-token **multi-ubatch gather-served prefill** — the exact width the source's own
+"one-time expert-head zero" warning was about.  `check-gpu-faults.sh` clean.
+
+**Is it corruption?  No — checked before the number was quoted.**  `scripts/gate-prefill-logits.sh --ab
+"GGML_SCHED_DEVGATHER=0"` (3 GPUs, `-sm tensor`, `-ncmoe 48`, pool FRAC 95, `-ub 2048`, ctx 2048 × 6 chunks, kv
+f16) reports **mean KLD −0.000000 / same-top-p 100.000 %**, base PPL 3.5537 on both arms — the gather default's
+prefill logits are *bit-identical* to the staging path's.  Greedy text is byte-identical too (5835 chars
+`dc178c29fe89` over 2000 tokens behind a 5258-token gather-served prefill; 257 chars `5531ae33f0f7` on all eight
+mode/device arms).  Physically the rate is achievable because the gather does **not** copy the routine expert
+bytes: it reads them in place from pinned memory through the pool alias (only 1200 neither-tier experts, 1014.5
+MiB H2D, are copied), and the worst-case in-place read is 19 GB/s per device against a measured 28.6 GB/s H2D
+calibration.  Two cautions recorded rather than hidden: the `GGML_MOE_GATHER_ONCE=1` corruption control is
+**vacuous at this width/quant** (it only re-zeros the expert head pad; the text stays correct — a control that no
+longer bites), and one earlier `pinned` reading of **75.2 t/s is withdrawn** — it did not reproduce in **three back-to-back
+reruns (394.1 / 425.7 / 425.2 t/s, prompt 3049 tokens, `-n 4`, logs kept)**, so `pinned` is stable at ±4 % within
+a group and the pool is 2.7-3.7x it.  The `llama-bench pp1024` arm (pool 130 ± 73 vs pinned 271 ± 2.5, the
+opposite ordering, in the one regime where the CLI and `llama-bench` disagree) remains unexplained and must be
+re-measured before the head-to-head quotes a `-ub 1024` number.
+
+**Still open:** the staging path's own root cause (`TODO` #131 keeps it: reachable only via the kill switch now);
+promotion of `0006` and the `ENVIRONMENT.md` row for the three-valued switch; `HEAD-TO-HEAD.md` (now writable — the
+3-GPU pool arm is legitimate); the pair's remaining decode gap (`TODO` #132, the synchronous demand read).
+
+## 261103.009 (wip) -- host-pool-speed on the multi-GPU box: F7 was an env artefact, the gather's real shape, W3 shipped
+
+No delivery change (nothing promoted; `patches/` and `release.json` untouched).  Continues `261102.020`.  Measured
+record: [`wip/host-pool-speed/README.md`](wip/host-pool-speed/README.md) §18; the campaign set is now **five**
+patches (`0005` = W3), applied tree `5fb99c1c9e45a485fc8780898fecfcb77b0544af` on the r206 tip `efaa60db0`
+(fresh-worktree `git am` verified).
+
+**1. F7 is closed, and it was an environment mistake.**  The handover's inherited blocker ("under `-sm tensor`
+`pinned` never sizes the expert cache, so its 14.46 t/s was the no-cache rate") reproduces exactly with
+**`MOE_EXPERT_CACHE_MIB=0`** in that arm's environment: cache off -> `offload_op` falls back to the batch-size
+test -> a 1-token decode leaves the routed `MUL_MAT_ID` on the CPU (98 decode splits vs 50, no slab, no
+`alloc_all_locked`, 14.40 t/s / prefill 887.2).  With the shipped default the pair sizes **49808.2 MiB of
+per-device arena, 190 slots/table on each device, h=0.9477** and decodes ~30 t/s at `-n 8` / 39.7 at
+`-n 2000`.  Instrumented to be sure: `moe_host_expert_dev_count=2` (33555 MiB per device) and
+`layer_dev=Meta() meta=1` distributed to ROCm0/ROCm1 — the split accounting is healthy.
+
+**2. W1: the multi-device arms, measured (122B-A10B, `-ncmoe 48`, 2000-token decodes, `-lv 4`).**  Pair
+(`HIP_VISIBLE_DEVICES=0,2`): `pinned` **39.72-39.87** decode / 1604-1648 prefill; `pinned`+gather 39.81 /
+**832.5 (-47 %)**; `pool` F80 staging 26.08 / 1024.1; `pool` F80+`SIZING=1` **28.02** / 698.7.  3 GPUs
+(`0,1,2`): `pinned` **51.97-52.04** / 565-606; `pinned`+gather 51.71 / 587.8 (+4 %); `pool` F80 staging 49.99 /
+**16.85**; `pool` F80+gather **49.48 / 1126.8 (+66x)**; `pool` F95 staging **51.03** / 15.03; `pool` F30 staging
+47.25 / 206.3.  So (a) W1's "gather >= staging per split mode" assertion **fails** on the pair — the gather is a
+large-table / pool-staging-rescue mechanism, not a general prefill win — and (b) **`--host-experts pool` prefill
+collapses at three devices** (16.85 vs 564.65; the `pinned` arm stages the same bytes through the same kernel at
+full speed) while the gather restores it.  That is a **delivery defect in block 12**, tracked as `TODO` #131 with
+the probes that did not move it (`STAGE_BATCH=0` 31.99, `DIO=0` 8.12, `FRAC 95` 15.03, `FRAC 30` 206.3 — it scales
+with the pinned pool size).  Greedy text `257 chars sha=5531ae33f0f7` on all eight arms; `check-gpu-faults.sh`
+clean from 04:10 (a 03:58:53 burst predates the session).
+
+**3. W3 shipped as `patches/0005`** — the `MOE_HOST_POOL_RAM_PCT` ceiling was shaving the registration-order tail
+to the one-slot floor (26 of 144 tables at 1 slot on the 122B at `RAM_PCT=70`, 10.94 t/s; 2 tables at 85 %, from
+layer 18 on).  It now scales **every** table's slot count by one process-wide factor and lets `SIZING=1` fit its
+concentration plan to the ceiling.  Measured (1 GPU, `-sm layer`, FRAC 100, 2000-token): `RAM_PCT 70`
+**10.94 -> 17.44 t/s (+59 %)**, **+73 %** with cov90 (18.92), prefill 343 -> 598, at identical pinned bytes;
+`RAM_PCT 85` **19.52 -> 20.97 (+7 %)**; `pinned` control 22.36.
+
+**4. The pair's decode deficit is the synchronous demand read** (`TODO` #132): 20.7 demand fills/token at ~0.55 ms
+= **11.3 ms of a 38.3 ms step (29 %)**, against 5.1 fills = 5.2 ms of 56 ms (9 %) on one GPU — i.e. **86 %** of the
+pair's 13.2 ms/token gap to `pinned` is one `O_DIRECT` read per uncovered expert per token, and the overlap
+candidate the 1-GPU ~6 % ceiling declined has a **~25-30 %** ceiling on a split.  On the 3-GPU shape, where the
+arena holds the whole set, the pool is at **-1.8 %** decode (51.03 vs 51.97) — inside PR #267's own envelope.
+
+**Not done / owed:** `HEAD-TO-HEAD.md` (needs a legitimate 3-GPU pool prefill arm = `#131`, plus the 1-GPU control
+and an MTP arm), `gate-prefill-logits.sh` on this box (no base recorded here), and W2 (`TODO` #269, tensor-split
+remap) — measured as no longer the biggest item, and still waiting on the maintainer's `§7` decisions.
+
+## 261103.008 (wip) -- eager-push pushed for the 3-GPU gate test
+
+No delivery change.  Continues `261103.007`.
+
+**Published.**  The delivery repo is pushed (`origin/main` @ `6cc1eb67`).  The two experiment branches are on
+the **personal fork** (`origin` = `git@github.com:stew675/llama.cpp.git`) so the multi-GPU box can check out the
+state instead of re-applying patches: `p1-push-src` @ `be83da8f0` (transport switch) and
+`p2-pinned-working-set` @ `f131cef2f` (all four patches).  **`rdna-boosts` is untouched** (`efaa60db0`); no
+release branch was pushed, and per the pushing policy nothing went to upstream.
+
+**New instrument** [`wip/host-expert-eager-push/p2-gate-3gpu.sh`](wip/host-expert-eager-push/p2-gate-3gpu.sh):
+the device-set gate test.  It runs the rotate arm and the rotation-off control on a tensor split, prints
+`released`/`release_denied`, the text hash and t/s for each, and runs `check-gpu-faults.sh` on both.  PASS =
+`release_denied` materially > the 1 measured on one GPU with identical text and no faults; FAIL = `released > 0`
+with `release_denied == 0` (the device set is wrong and the gate is decorative) or a fault (a release happened
+early).  Recorded in `PUSH-MLOCK-TIER.md` §8b with the checkout + build commands.
+
+## 261103.007 (wip) -- eager-push P2 increment 3: the device-set eviction gate + rotation, additive and free
+
+No delivery change.  Continues `261103.006`.
+
+**Implemented** (`patches/0004`, 293 lines, fork branch `p2-pinned-working-set` @ `f131cef2f`): the **device-set
+eviction gate** — a pinned range is `munlock`ed only when no device can still be reading it (one boundary event
+per device per op recorded on that device's stream, a per-expert read epoch, a 4-deep ring, conservative on a
+stale slot; the device set is cached per table) — and **rotation**: release only what the policy says is cold
+(not arena-resident AND decayed count 0), at most 8 experts per sweep, on a wall-clock cadence
+(`MOE_HOST_PUSH_MLOCK_PERIOD_MS`, default 2000).
+
+**Three measured traps, now encoded.**  (1) The staleness signal must be the *policy's*: using "was it filled
+lately" released hot-but-arena-resident experts, collapsed the pinned set to 33 experts and dropped generation
+to **1.0 t/s**.  (2) The cadence must not be derived from an op/table count: the table set grows lazily, so
+"every g_period boundaries" fired every 1-2 tables and cost **156 ms/token** (5.7 then 9.2 t/s); wall clock
+fixed it.  (3) `mlock`/`munlock` on populated page-cache pages is ~ms/MiB (far above the 48.7 us/MiB measured on
+a sparse scratch file), so the pinned set must be near-static — 4 232 releases over 500 tokens was
+unaffordable, 16 is free.
+
+**Measured after the fixes** (35B-A3B, 1 GPU, `-ncmoe 40`, forced misses, budget 512 MiB, 500 tokens, root):
+**47.9 t/s with rotation vs 47.9-48.9 without**, pinned set stable at 511 MiB / 837 experts,
+`seeded=725 first_use=128 released=16 release_denied=1` over 17 037 boundaries.
+
+**Additive by construction** (the maintainer's constraint, with `wip/host-pool-speed/` owning the pool path):
+the entire diff against the release tip is **189 insertions, 0 deletions**, every line behind a default-off
+`MOE_HOST_PUSH_*` variable, and a default-arm run logs **zero** `P1-PUSH` lines.  Nothing here changes a
+default and the pool/bounce path is untouched.  Next: the **multi-device gate test** (2-GPU `-sm tensor`, where
+`release_denied` must be non-trivial — the only real proof the gate denies), then the 122B cold arm, then the
+7.14 gate.  `patches/`, `release.json` and `rdna-boosts-all.patch` untouched.
+
+## 261103.006 (wip) -- eager-push P2 increment 2: the pinned set is seeded from the heat prior
+
+No delivery change.  Continues `261103.005`, per the maintainer's call ("seed from the heat map if present").
+
+**Implemented** (`patches/0003`, 98 lines, fork branch `p2-pinned-working-set`): `push_mlock_seed_locked()`
+runs at sizing immediately after the arena's own `apply_heat_seed_locked()` and pins the mapping's top-ranked
+experts **in the same order the arena seeds itself** (`heat_rank_vec`, the decode-band ranking) until the budget
+is exhausted.  `MOE_HOST_PUSH_MLOCK_SEED=0` disables it (first-use only, the A/B arm).  No prior → no seeding,
+and first-use admission fills the set as before; the graceful refusal path is shared (seeding stops at
+`RLIMIT_MEMLOCK` with the same single message).
+
+**Measured** (35B-A3B, 1 GPU, `-ncmoe 40 --host-experts pool`, forced misses, budget 4096 MiB, root, with a
+prior from earlier runs): `pinned working set 4095 MiB in 6769 experts (seeded=6013 first_use=756,
+refusals=0)` — the 756 are tables with no usable prior entry, i.e. the designed mixture.  **The pinned set is a
+performance artifact and never a result**: text byte-identical with seeding on and off (`sha=0cf4a62aa63f`),
+`check-gpu-faults` clean, t/s equal (48.6 vs 48.7) on this box where the whole set is page-cache hot.  The
+seed's value is on a cold/not-fitting arm, which is the next measurement.
+
+**Both host tiers now agree on the hot set** (arena slots and the pinned mapping are ranked by the same prior),
+which is what makes `push` an extension of the arena rather than a second cache.  Still owed: rotation by decay
+(demote + `munlock`, gated on a device set), the 122B cold arm, the 7.14 gate, and the A/B with the pool
+actually built.  `patches/`, `release.json` and `rdna-boosts-all.patch` untouched.
+
+## 261103.005 (wip) -- eager-push P2 increment 1: the pinned working set, with graceful degradation
+
+No delivery change.  Continues `261103.004`.
+
+**Implemented** (`patches/0002`, 136 lines, fork branch `p2-pinned-working-set` @ `7699a492e`):
+`MOE_HOST_PUSH_MLOCK_MIB=N` pins up to N MiB of the host expert set in place — `mlock` over the mapping on
+**first use** (the fill path is the routing), one byte per expert of state, one process-wide budget.  It is
+**policy enforcement, not transport**: the driver is not told, the copy stays pageable, and what it buys is
+residency, so a push of a warm expert is not a disk read.
+
+**Refusal is not fatal, by design** (the maintainer's call): `RLIMIT_MEMLOCK` is 8 MiB on this box and often
+far below the budget, so the kernel refuses at the limit — one message names the remedy (`LimitMEMLOCK=` in
+the unit, or `CAP_IPC_LOCK`) and the actual limit, everything already pinned stays pinned, and the remainder is
+served from the page cache exactly as before.  A partly-pinned working set is the normal state, not an error.
+
+**Measured** (35B-A3B, 1 GPU, `-ncmoe 40 --host-experts pool`, forced misses, `MOE_HOST_PUSH_SRC=mapping`):
+unprivileged with a 64 MiB request → **7 MiB pinned in 11 experts, one refusal message, run correct**
+(17 421 mapping fills continue); root with 4096 MiB → **4095 MiB pinned in 6 744 experts, zero refusals**; text
+**byte-identical** with and without pinning (`sha=0cf4a62aa63f`); `check-gpu-faults.sh --since 12 min` clean.
+No throughput claim from these runs (single-shot, and the first arm pays the cold page cache).
+
+**Not yet: rotation.**  This pins monotonically on first use and stops at the budget; rotation needs a demotion
+at the cache policy's boundary, `munlock` on eviction, and — the hard part — a **device-set** event gate, since
+a locked range must not be released while any device's copy still reads it (`-sm tensor`).  That is the next
+increment, and it is where the campaign can still fail.  `patches/`, `release.json` and
+`rdna-boosts-all.patch` untouched.
+
+## 261103.004 (wip) -- eager-push: the pool splits into transport (drop) and residency (keep as an mlock'd working set)
+
+No delivery change.  Continues `261103.003`; the maintainer's refinement, measured the same day.
+
+**The proposal** (maintainer): do away with the pool's bounce buffer — its true cost is RAM, not speed — and
+enforce the FRAC policy by `mlock`ing portions of the weights so the hot set is not reclaimed while the
+remainder cycles.  Then `push` is a true extension of the arena rather than a streamer.
+
+**The property it needs, measured** (`archive/work/host-expert-locked-window/probe-locked-window.cpp`, new arm
+`mlockram`; residency through a *fresh* mapping, pressure **held** while measuring): `mlock` holds through
+67 GiB of anonymous pressure (4 MiB and 1024 MiB windows, 262144/262144 resident), `MADV_PAGEOUT` is refused
+while locked (`EINVAL`) and **succeeds after `munlock`, dropping the window to 0/262144**; `mlock` eager
+48.7 us/MiB in, 0.81 us/MiB out (4.6x cheaper per MiB than `mlock2(ONFAULT)`+populate).  So `mlock` is a
+**releasable** residency knob — precisely the property `hipHostRegister` does not have, which is why the closed
+window campaign's wall does not apply here.
+
+**Recorded** in [`wip/host-expert-eager-push/PUSH-MLOCK-TIER.md`](wip/host-expert-eager-push/PUSH-MLOCK-TIER.md):
+L1 arena, **L2 pinned working set over the mapping (no second copy)**, L3 reclaimable page cache, L4 disk; the
+FRAC budget now counts bytes *locked*; rotation incremental at the policy's decay period (a whole 8 GiB
+re-mlock would cost ~400 ms).  Caveats carried: `LimitMEMLOCK`/`CAP_IPC_LOCK` becomes a deployment
+requirement; an over-large pinned set is an OOM hazard exactly as the pool is (but it is the only pinned
+tier); `mlock` does not change the transport (still a pageable H2D), so the 1-D tearing evidence and the 7.14
+gate stand unchanged.  Next: pinned set over a real mapping, rotation cost under load, the L3 reclaim
+interaction, and `-sm tensor` (one budget per host tensor, release gated on a device set).  `patches/`,
+`release.json` and `rdna-boosts-all.patch` untouched.
+
+## 261103.003 (wip) -- eager-push P1: the bypass switch is green on 10.1 for correctness, and reframes the mode ladder
+
+No delivery change.  Continues `261103.002`.
+
+**[`wip/host-expert-eager-push/P1-RESULTS.md`](wip/host-expert-eager-push/P1-RESULTS.md)** — the P1 switch
+(`patches/0001`, `MOE_HOST_PUSH_SRC=mapping`, default off; loose patch on the fork branch `p1-push-src`,
+`be83da8f0`) makes a pool-backed master the copy engine's source directly, deleting the per-miss `memcpy`.
+
+**Correctness GREEN on ROCm 10.1.**  35B-A3B, 1 GPU, `-ncmoe 40 --host-experts pool`, forced misses
+(`MOE_EXPERT_CACHE_MIB=2048`, `FRAC=50`): **33 393 direct pageable DMA fills** (47 427 on the 122B arm), text
+**byte-identical** to `pinned` (`sha=0cf4a62aa63f`), identical access census (`hits=64947 fills=30033
+colds=39420`, `h=48.32 %`), `check-gpu-faults.sh --since 16 min` **clean** — the "tears under back-to-back
+use" claim is refuted in the real path (10.1 only; 7.14 still owed).
+
+**Performance produced two findings instead of the A/B.**  (a) Where the page cache is hot the pool's `memcpy`
+is already **hidden behind the DMA**: warm/warm 102.9 (`pinned`) vs 102.6 (`mapping`) t/s, i.e. the archived
+campaign's serialized 137 vs 66-93 us does not translate to a pipeline win.  (b) A direct mapping push
+**bypasses the pool's `O_DIRECT` decision**, so the 122B arm's 18-19 vs 3.2-3.3 t/s is page-cache-vs-DIO, not a
+copy win; with `MOE_HOST_POOL_DIO=0` forced on both arms it is inconclusive at 64 tokens.
+
+**Consequence: the modes are a memory ladder, not alternatives** — `pinned` (whole set non-reclaimable) →
+**`push` (reclaimable page cache, the missing middle rung)** → `pool`/DIO (streams from disk when the set does
+not fit).  `push` is not a `pool` replacement.  Next: make the mapping source honour DIO per table, run a
+warm-up + interleaved + >= 500-token A/B, then the 7.14 correctness gate; then P2 eagerness.  `patches/`,
+`release.json` and `rdna-boosts-all.patch` untouched.
+
+## 261103.002 (wip) -- new campaign: `host-expert-eager-push` (never device-pull; the host pushes)
+
+No delivery change.  Seeded at the maintainer's call, the same day its predecessor closed.
+
+**[`wip/host-expert-eager-push/`](wip/host-expert-eager-push/README.md)** — the reframing: the GPU is never given a
+host address to read; every host-resident expert byte reaches VRAM through a copy the host (copy engine) issues,
+ordered by an event, into a slot the policy owns.  `pinned` stays the mode of choice when the set fits in RAM; the
+not-fitting case gets `--host-experts push` (alias `window`), which **deletes the pool's `memcpy`** by DMA-ing
+straight out of the read-only model mapping.  Invariants P1-P7 in `DESIGN.md` (never device-pull; eager; explicit
+slot ownership; no whole-set hold; counted fallback; split-portable; byte-identical).  P0 is inherited from the
+closed campaign: a direct push is **66-93 us hot / 1.32 ms cold** per 1.66 MiB against the pool's **137 us /
+~3.5 ms**, i.e. the memcpy is the entire gap — and the delivery's "tears under back-to-back use" note does not
+reproduce for a 1-D push here.  **P1 is a reproduce-or-refute gate in the real path on both ROCm lines**, because
+that claim is the only thing standing in the way and it has no dated record.  Nothing in `patches/`.
+
+## 261103.001 (wip) -- `--host-experts window` as a bounded sliding hold: CLOSED, blocked by the driver
+
+No delivery change.  The campaign seeded this morning is archived the same day as
+[`archive/work/host-expert-locked-window/`](archive/work/host-expert-locked-window/RESOLUTION.md).
+
+**The mechanism it needed does not exist.**  `hipHostRegister` is an eager, **unreleasable** process-lifetime
+hold: registering over absent pages faults them in (page cache 0/425 -> 425/425, proven through a *fresh* mapping
+on every step), and a window's bytes are still there after `hipHostUnregister`, `munmap`, a MAP_FIXED remap, every
+registration flag (`ro`/`portable`/`mapped`) and **67 GiB of real anonymous pressure** (cgroup `file` unchanged;
+1 GiB scratch-file window: +1027.9 MiB at register, +1037.0 MiB after unmap + pressure).  Under a 4 GiB cgroup a
+6144 MiB registration returns `ok`, pegs `memory.current` at the limit, leaves 14/16 sampled windows non-resident,
+and a non-resident window still reads.  So a bounded sliding window cannot exist, the footprint is the whole
+registered set, and the mode is `pinned` with a longer load — no help for the case `pool` exists for.  Costs kept
+for re-derivation: grant/release 16.35 us / 0.49 us per 1.66 MiB hot (1.2-3.2 ms cold), `mlock2`+populate 375 us
+hot / 18.6 ms cold, a pageable in-place read is a fatal `Page not present`.
+
+**And the claim that made the pool's copy mandatory does not reproduce for a 1-D push**: 8-64 copies in flight
+(13-128 MiB), 2-4 streams, pageable/`mlock`ed/registered/`pinned` — **0 torn** in 20-100 iterations each, with
+re-reads of the same regions.  The 2-D path the warning names is 4-5x slower (376 us per 1.66 MiB) but clean here.
+That is what seeded `wip/host-expert-eager-push/`.  `INVARIANTS.md` carries the corrected fact; `patches/`,
+`release.json` and `rdna-boosts-all.patch` untouched.
+
+## 261102.020 (wip) -- multi-GPU handover written; the campaign's remaining work moves to `soar`
+
+No delivery change.  Continues `261102.019`.
+
+**New: [`wip/host-pool-speed/HANDOVER-MULTIGPU.md`](wip/host-pool-speed/HANDOVER-MULTIGPU.md)** — a cold-start
+handover for the multi-GPU box, because the two remaining items (the tensor-split-aware remap and the multi-device
+arms that gate it) cannot be done on the 1-GPU host.  It carries: the acceptance criterion and what "done" means;
+the tree state (four campaign patches, applied tree `ac580a8e3`, per-patch build 4/4, text `4ac3a523160f`); the
+inherited blocker (F7: under `-sm tensor` `pinned` never sizes the cache and `FRAC 100` stalled a prepopulate
+once — so no pair number means anything until `llama_model_moe_host_expert_dev_count` under the Meta wrapper is
+understood); the ordered work (W1 make the multi-device arms mean something and gate the gather there at
+`-p 2048+`; W2 the remap over pool slots per `TODO` #269, tensor-split aware, with the layout-epoch/freeze
+invariant; W3 the `RAM_PCT` clamp-distribution defect that starves the registration-order tail; W4 the Phase-1
+baseline on `soar` and the `HEAD-TO-HEAD` against #267); every trap that has cost a run (the iGPU pin, the x8 pair
+`0,2`, `-lv 4`, `SRVENV` commas, the below-floor arena, `perf` `-g`/`rocprofv3` caveats and not committing 40-75 MB
+CSVs); the gate table including `--extra` for a host-expert KLD arm; the decisions the maintainer still owes; and a
+promotion checklist.
+
+`HANDOVER.md` keeps its role as the **1-GPU session-2 record** with a supersession pointer at its §0 (its §3
+numbers are `soar`'s own and its §4/F7 is the first blocker the multi-GPU session inherits); `README.md` §13 and
+§11 and `wip/CAMPAIGNS.md` now point at the new handover.  Nothing else changed: `patches/`, `release.json` and
+`rdna-boosts-all.patch` untouched.
+
+## 261102.019 (wip) -- PR #266's disposition decided (remap stays, tensor-split aware); coalesced multi-expert fills built, measured and REFUTED
+
+No delivery change.  Continues `261102.018`.
+
+**Decision recorded (`TODO` #269, campaign README §3.1):** PR #266's **`GGML_MOE_DEVREMAP` survives** the #266
+reversion as a delivery capability — it is the one piece whose removal costs real throughput (+3.3 % measured on
+this host's 122B arm, r203's own cell said +8.1 %) — and everything else in #266 is dropped, including
+`MOE_HOST_POOL_COLD`, which the pool-aware gather now subsumes (15.54 -> 19.57 t/s at `COLD=0`).  **The condition
+is that the remap be tensor-split aware:** a per-device map whose cold-id encoding is per-device-slice aware (each
+device's arena slots differ; the pool slot does not) with the freshness invariant held per device, gated on 1 GPU
+*and* the multi-device `-sm tensor` arm.  A single-device-only implementation is not acceptable.
+
+**Coalesced multi-expert fills: implemented, measured, reverted.**  The staging miss loop walks experts in
+ascending order, so a run of consecutive misses was read with ONE aligned pread of up to 16 MiB into a shared
+4-slot pinned scratch and issued as ONE H2D (`MOE_HOST_POOL_COALESCE=0` as the kill switch, 1:1 geometry only).
+Result: FRAC 80 prefill **590.1 vs 629.8** and decode **16.24 vs 17.65** (-6 % / -8 %), FRAC 100 inert
+(896.2/912.9, 25.48/25.25).  The reason is structural: **the pool's residency is heat-ranked, not expert-ordered**,
+so "the experts this table does not hold" is a scattered file subset — the run finder produced runs of ~1.2 experts
+(3503 runs covering 7.7 of 69 GiB), and the prepopulate (29 376-36 864 of the fills) fills slots in *rank* order,
+so it cannot coalesce either.  The read path is also already at device speed: in situ 2.4-2.6 GB/s, *above* the
+`O_DIRECT` dd ceiling on the real shard (587 MB/s at 1792 KiB, 1.5-1.7 GB/s at >= 4 MiB), because thousands of
+back-to-back preads already present a deep sequential stream.
+
+So P1-a/§4.1 is **closed on evidence**: neither coalescing (refuted) nor an overlap worker (~6 % ceiling at
+FRAC 80, ~0 at FRAC 100, two measured negatives) is worth building.  What is left for the campaign is P0-a
+(`TODO` #269), the `soar` multi-device `-sm tensor` arm, and the §5 knob collapse.
+
+Verified after the revert: greedy text `sha=4ac3a523160f` (`pool`), tree clean.
+
+## 261102.018 (wip) -- the pool's pinned bounce ring and the synchronous fill, measured: 3-4 ms/token of serialised read, 2.2-3.1 GiB of bounce, and the "4.7x fill" is not ours
+
+No delivery change.  Continues `261102.017`.  Record: `wip/host-pool-speed/README.md` §16, `patches/0004`, data
+`data/20261102-session3-fillcost`, `data/20261102-session3-ring`, `data/20261102-session3-profile/kt*`.
+
+**The item-1 chase ended in a negative result, and that is the useful part.**  The `fillBufferUnAligned` kernel
+that carried 42 % of §15.1's "residual" is **ROCclr internal, not ggml**: env-gated instrumentation of *both*
+memset entry points logs 8 calls in an 8-token run and zero `memset_tensor` calls while the tracer counts 441
+fills on the same arm, with **identical dispatch counts in both arms** (144 grid-8192 + 288 grid-256), on stream 0,
+with **no overlap** and a GPU concurrency factor of 1.00.  So §15.1's per-stream duration sum overstated the
+residual: the pool arm issues **58 more `copyBuffer` calls per decode step** (161 vs 103) and its timelines are
+longer, but there is no fill-kernel regression to fix.  `tools/rocprof-summarise.py` now flags that row shape.
+
+**The pinned bounce ring was under-reported and is 2.2-3.1 GiB.**  `moe_cache_upload_pageable` kept its own copy
+of the acquire/grow loop, so the old counter never saw `bounce_acquire` (which `expert_host_src` also uses).
+Honest totals on the 122B reference arm: **2209.7 MiB at FRAC 100, 3107.7 MiB at FRAC 80**, from 732
+`cudaHostAlloc` calls in an *8-token* run at ~274 us median.  `bounce_acquire` is now the ring's only owner
+(`patches/0004`).
+
+**Capping it -- the charter's §4.4 / PR #267's 0010 -- was implemented, swept and REVERTED.**  Cap 8 is neutral at
+FRAC 100 (prefill 887/916, decode 25.99/26.07 vs 918/921 and 26.12/25.73 uncapped) but costs **8-25 % of prefill
+at FRAC 80** (573-644 vs 759-763); cap 4 gives 870/891, cap 2 846/839.  The memory is the **prefill miss path**
+legitimately holding one entry per expert in flight while a whole table's miss set is read, and the scheduler-copy
+path never exceeds ~5 entries (capping *it* is inert, waits = 0).  A control build of the parent commit measures
+FRAC 80 at 720.1 prefill / 18.52 decode against this tree's 721.5 / 18.56, so the surviving change is neutral and
+the 759-763-to-721 drift is box state.
+
+**The synchronous fill is now sized, and it is smaller than the crude estimate.**  `pool_fill_slot_locked` times
+its two sources: FRAC 80 = 38 836 storage reads, 69.1 GiB, **27.3 s** (2.6 GB/s); FRAC 100 = 44 980 reads, 80.0 GiB,
+**34.5 s** (2.4 GB/s); zero mapping memcpys.  One expert per read (1.8 MiB), 100 % serialised with compute, so
+**~3-4 ms of a 52 ms decode step (~6 %)** after subtracting the one-shot prepopulate -- not the ~19 % an earlier
+`/proc/diskstats` estimate implied (it counted the model load and the prepopulate).  Consequences: the **overlap**
+candidate has a hard ~6 % ceiling at FRAC 80 and ~0 at FRAC 100 (hit 0.91) against two measured negatives, so it
+stays unbuilt; **coalescing** is worth screening because O_DIRECT on the real 46 GiB shard reads **587 MB/s at our
+1792 KiB size vs 1.5-1.7 GB/s at >= 4 MiB**, and it is also the only *bounded* fix for the ring.
+
+**Item 3 (P0-a, `GGML_MOE_DEVREMAP` over pool slots) is recommended for deferral, with its ceiling measured:**
++3.3 % on this arm (§15), i.e. ~1.1 t/s, versus a layout-epoch/freeze design.  The promotion blocker remains the
+`soar` multi-device `-sm tensor` arm, not the remap.
+
+**Delivery state:** campaign set is now **four** patches, applied tree `ac580a8e3a6f12ccb5f673dace82b16ec4f1f275`,
+per-patch build 4/4 clean, greedy text `sha=4ac3a523160f` in `pool` and `pool`+gather.  `patches/` (delivery),
+`release.json` and `rdna-boosts-all.patch` untouched.
+
+## 261102.017 (wip) -- Step 0: the remap is worth +3.3 % on this host (not +8.1), the copy kind is nil, and ~18 % of the pool's decode gap is GPU work in one runtime kernel
+
+No delivery change.  Continues `261102.016`.  Record: `wip/host-pool-speed/README.md` §15, data
+`data/20261102-session3-step0`, `data/20261102-session3-profile`.
+
+**Why it was run.** The plan going in was "close the ~8 % `GGML_MOE_DEVREMAP` gap on pool tables (P0-a), then
+re-measure".  One 15-minute measurement re-ordered the campaign instead.  122B reference arm (`-ncmoe 48`,
+5258-token prompt, 1862-token greedy decode), alternating, one binary:
+
+| arm | decode t/s | prefill t/s |
+|---|---|---|
+| `pinned` (remap on) | 32.77 | 1024.0 |
+| `pinned`, `GGML_MOE_DEVREMAP=0` x2 | 31.73 / 31.63 | 1026.2 / 1007.1 |
+| `pool` FRAC 100 x2 | 26.12 / 25.73 | 918.1 / 920.7 |
+| `pool` FRAC 100 + `MOE_HOST_POOL_H2D=1` x2 | 25.90 / 25.85 | 915.6 / 914.8 |
+
+**The remap is worth +3.3 % here, not +8.1 %** (32.77 vs 31.68), so P0-a's ceiling on this arm is ~1.1 t/s: it is
+demoted from the campaign's top item (the r203 figure came off a different box, model and cell).  The copy kind is
+**nil** a second time (H2D 25.90/25.85 vs D2D 26.12/25.73), now at full coverage.  And **~18 % is unexplained** --
+and not by traffic: identical arena (22517.6 MiB), identical reaches (2 150 688/turn), *more* arena hits, **fewer**
+expert bytes moved (943.8 vs 962.2 GiB) and fewer disk bytes than the pinned arm.
+
+**Localised with the right instrument.** `perf` on the host thread is a dead end (the process is mostly idle: 64 %
+of its CPU cycles are ROCr `AsyncEventsLoop`, 22 % `__memmove`).  `rocprofv3 --kernel-trace` on a pure-decode
+workload compares per-kernel durations with identical dispatch counts:
+
+* **`__amd_rocclr_fillBufferUnAligned`: 367.2 vs 78.5 us per dispatch, 441 dispatches in BOTH arms** -- +0.127 s of
+  the +0.303 s GPU-time delta, i.e. **42 % of the residual**, with no change in how often it runs;
+* **58 extra `__amd_rocclr_copyBuffer` calls per decode step** (161 vs 103) -- the pool's per-expert fetch path;
+* the two routed matvec kernels 5-16 % slower per dispatch (78.1 vs 69.1 us, 81.9 vs 78.0 us).
+
+So the new P0 is the residual 18 %, starting with "what fills ~MBs per decode step in the pool arm, and why do the
+same 441 fills cost 4.7x".  P0-a still has to happen for `#266`'s removal (pool slots are pinned, so the in-place
+read is sound) -- it just is not what moves the acceptance criterion.
+
+**Also retired:** `MOE_EXPERT_CACHE_COLD=uva` is default-on and **20.5 % of reaches are served cold** in both modes
+(441 399 cold reaches/turn, 801 GiB of the 944 GiB of expert traffic) -- the cold path, not the fill path, is where
+the bytes are.  **And found:** `MOE_HOST_POOL_PREFETCH` is a **dead parse** (set at init, never read) while
+`ENVIRONMENT.md` documents it as a live opt-in -- recorded as `TODO.md` #268 (re-wire deliberately or remove; do not
+leave a documented no-op).
+
+**Instrument notes for the next session:** `perf record` works here but `-g` is refused (`perf_event_paranoid`=2 --
+do not raise it silently); `rocprofv3 --kernel-trace -f csv` works and its durations are comparable, but its
+achieved rate is not (13.3 vs 27.2 t/s on the same two arms), so never quote a t/s from a traced run.
+
+## 261102.016 (wip + one delivery script) -- `gate-prefill-logits.sh --extra` committed; an external pipelined-staging proposal reviewed and recorded
+
+**Delivery script change (committed with the maintainer's go-ahead):** `scripts/gate-prefill-logits.sh` gains
+`--extra "ARGS"` (`PPL_EXTRA`), extra `llama-perplexity` arguments — word-split, folded into the base-file name so
+a base recorded on one configuration is never reused for another.  **Why it was needed:** the gate could not
+judge *any* non-default configuration, so the host-expert arm this campaign has to gate
+(`-ncmoe 40 --host-experts pool`) was unmeasurable through it — the alternative was a hand-rolled
+`llama-perplexity` invocation with no base-meta check.  Additive; no existing arm changes.  Used for
+`261102.015`'s KLD result (mean `-0.000000` / same-top-p `100.000 %`).  No change to `patches/`,
+`release.json` or `rdna-boosts-all.patch`.
+
+**External proposal recorded, not scheduled** (`wip/host-pool-speed/PROPOSAL-pipelined-staging.md`): a
+"pipelined asynchronous staging" idea — a multi-buffered pinned ring, `O_DIRECT` reads straight into pinned host
+memory, and a background thread filling the next buffer while the GPU runs the current one, offered as the way
+to hide the bounce/CPU-copy cost.  Three quarters of it **is the shipped design**: the staging ring
+(`GGML_SCHED_STAGE_SLOTS`, default 8, copy stream + per-slot events), the tier-resident fill as one kernel
+launch (`MOE_HOST_POOL_STAGE_BATCH=1`, 1564 -> 2103 t/s prefill), and `O_DIRECT` landing directly in the pinned
+pool slot (`MOE_HOST_POOL_DIO`, `pool_dio_read` into `cudaHostAlloc` memory — no bounce, no CPU copy).  Its two
+framings do not apply here: the delivery never used managed memory (the *faulting* design was `window`, closed
+as fatal on no-XNACK hardware), and the remaining bounce cost is measured at 56.4 MiB (srv cell) to 3664 MiB
+(122B) per run, <=0.3 % of wall clock.
+
+What is genuinely open is a **demand-fill worker** (overlap the host-side `pread` of the current ubatch's misses
+with the previous ubatch's compute).  Sized before anything is built: 122B FRAC 80 reads 160-165 GiB/run, of
+which ~73 GiB is the model load and ~53.7 GiB the one-shot prepopulate, leaving **~18 MiB/token of demand reads
+= ~10 ms of a 51.8 ms step (~19 % ceiling)** — and **zero at FRAC 100** (hit rate 0.91), i.e. it buys nothing on
+the "pool big enough for the whole set" case the acceptance criterion is about.  Two measured precedents are
+negative (`MOE_HOST_POOL_PREFETCH` default 0 because it hurt until near-full residency; r113's background
+worker cost 2x decode for 0 MiB of L3), so the recorded order is: replayer screen (§9.6) -> a `pread` wall-time
+histogram over a 2000-token decode -> only then a single-worker demand fill **into pool slots** (never a second
+bounce ring, never eviction-side), with `io_uring` explicitly not the first step.
+
+## 261102.016 (wip) -- "use hipHostMalloc(Mapped) + hipHostGetDevicePointer" -- already the delivery's default; measured, and it costs exactly what we knew
+
+No delivery change.  Answering a suggestion (from an external assistant) that this pair is the way to handle a
+missing XNACK.  It is -- and it is `--host-experts pinned`, the delivery's default: `bind_host_dev_locked()`
+tries `cudaHostGetDevicePointer` FIRST and, on success, sets `host_pinned`, which is the flag that permits every
+in-place kernel read (cold read, staging kernel, gather).  Probe added:
+`archive/work/host-expert-pinned-window/probe-host-malloc-mapped.cpp` (with a positive control, so "identical"
+means something).
+
+| arm (256 MiB, 1x R9700) | kernel read | data | under 61.7 GiB of real anon pressure |
+|---|---|---|---|
+| `hipHostMallocDefault` | 51.8 GiB/s SM / 51.7 CE | IDENTICAL | IDENTICAL |
+| `hipHostMallocMapped` | 51.8 SM / 52.1 CE | IDENTICAL | IDENTICAL |
+
+**Why it works is the point**: it does not make the no-XNACK fault survivable, it makes it impossible -- pinned
+pages cannot be evicted, so there is nothing to fault on.  And that is the whole cost: the host expert set stops
+being swappable (68.6 GB RSS on the srv cell, ~59 GB on the IQ4_NL cell), which is precisely what `window` tried
+to avoid and could not without XNACK.  The bounded middle ground -- pinned but only `RAM_PCT` of the set -- is
+`--host-experts pool`, i.e. the live campaign.
+
+**Two facts recorded in `INVARIANTS.md`.**  (a) On this platform `Mapped` buys nothing: `unifiedAddressing`
+reports NO yet `hipHostGetDevicePointer` returns the IDENTITY pointer for both flags, at identical bandwidth --
+what matters is that `hipHostMalloc` pins (the code calls `GetDevicePointer` rather than assuming identity, which
+is what keeps it correct where the alias does differ).  (b) **`Mlocked: 0` is not a pinning probe**: both pinned
+buffers reported `Mlocked: 0 kB` / `Unevictable: 162 MB` while surviving 61.7 GiB of pressure.  The closed
+campaign leaned on "`Mlocked` stayed 0, so the registration is a mapping not a lock" -- right conclusion for the
+registration (no GUP), unsafe inference from `Mlocked` alone.
+
+## 261102.015 (wip) -- host-pool-speed Phase 1 on the 1-GPU host: the re-base is a no-op, the pool's 285.3 reference is withdrawn, and the pool-aware gather lands prefill ahead of `pinned`
+
+No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched; one **gate-script**
+change is staged uncommitted, see the end).  Continues `261102.014`.  Campaign: `wip/host-pool-speed/`
+(`README.md` §14 is the measured record, `patches/0003` the new mechanism).
+
+**The re-base was unnecessary and the record was mis-stated.** `wip/host-pool-speed/patches/` was described as
+"validated on soar against tree `0b8cc5a8b`, current tip `efaa60db0`".  `0b8cc5a8b` is the *applied tree*: the
+patches' pre-image blob at `efaa60db0` (`ggml/src/ggml-cuda/moe-expert-cache.cu` = `334931ecd`) is the patch
+`index` line, so 0001/0002 apply with **no conflict** (the window campaign's edits exist only in its archived
+reference diff).  Verified on a fresh worktree + `git am`, per-patch build 3/3 clean, greedy text 150 chars
+`sha=4ac3a523160f` (identical in `pool`, `pool`+gather and `pinned` on the final binary).
+
+**A charter reference number is withdrawn, with the cause.** The pool's srv-cell `285.3 / 48.8` was measured on
+the window **beta** tree, whose `moe_cache_stage_table` dispatch WORKLOG 261102.008 itself records as a
+regression for the pool arm.  On the delivery + campaign-patch tree the identical arm (Flash-Next GSQ-IQ3_XXS,
+`-ncmoe 48`, 5258-token prompt, request 3) reads **641-647 t/s prefill / 53.5 gen** against `pinned`'s 739.2 /
+60.0 (which reproduces the charter's 734.5 / 59.5).  So pool's prefill was never 2.6x behind `pinned`, and the
+handover's comparison table was corrected in place (§6a) rather than left to be re-derived.
+
+**Phase 1 baselines, this host (1 x R9700; the x8 pair is NOT runnable here -- one R9700 + the iGPU, so the
+`-sm tensor` pair arm is flagged for `soar`).** 122B-A10B `-ncmoe 48`, 1862-token greedy decodes, alternating:
+`pinned` **32.82-34.20 / 1025.7-1067.2** (decode/prefill), `pool` FRAC 80 **19.25-19.94 / 759-763** (-42 % /
+-27 %), `pool` FRAC 100 (the patch-0002 default) **26.74 / 925.7** (-22 % / -14 %).  This host's `pinned` arm is
+~1.5x session 2's on soar (22.3) at the same `h=0.754`, so only the ratios carry over.
+
+**Mechanism (b) -- the pool-aware gather -- implemented (`patches/0003`) and it puts the pool ahead of `pinned`
+on prefill.**  The kernel resolves arena slot -> **pool slot** -> caller-filled destination, and the experts in
+neither tier are copied into the destination from a pinned source before the launch, so no kernel ever reads the
+pageable mapping (the pinned-master arm keeps `prs == nullptr` and its old behaviour).  srv cell: prefill
+**641-647 -> 832-878 t/s (+29..36 %)**, decode flat, **+18.7 % over `pinned`'s 739.2**.  122B: neutral (pool
+-1 %, `pinned` -11 % -- its 180 MB tables are below the 224 MiB always-gather gate, so only the sub-gate
+ubatches gather).  Also the **portable end of PR #266's decode win**: with the gather, `MOE_HOST_POOL_COLD=0`
+goes **15.54 -> 19.57 t/s**, i.e. the gather substitutes for the in-place pool-slot read that declines when
+`device_count != 1` (OPEN A answered).
+
+**Mechanism (a) -- registered-range CE copies -- measured and dropped for pool mode.**  `moe_cache_upload_pageable`
+is pool mode's *fallback*; counted exposure is 56.4 MiB over a 3-request srv-cell run and 3664 MiB on the 122B
+(0.26 % of wall clock), bounce ring 43 MiB-1.2 GiB.  The handover's `-6.7 GB RSS` / `+42 % prefill` were
+window-**staging** artefacts, so registering the whole model mapping would buy <=0.3 % while taking on the
+pin-budget tail §6/§8 refuse.
+
+**OPEN B -- `RAM_PCT` 85 % does not thrash on the PLE-free control, and lowering it is a cliff.** 122B FRAC 100,
+2000-token decode: `RAM_PCT=85` -> all 144 tables at full slots, **26.29 t/s**, zero process `VmSwap`, 0.5 MiB
+`pswpout`; `RAM_PCT=70` -> 129/144 tables full and **14 tables starved to the one-slot floor**, 10 % fewer slots
+and **-40 % decode (15.86)**.  The ceiling's per-table *distribution* is the defect, not its level (the
+Flash-Next/PLE thrash stays Phase 2).
+
+**Gates (all on the gather change, host-expert arms):** greedy 150 chars `sha=4ac3a523160f` in both arms;
+`gate-prefill-logits.sh` **mean KLD -0.000000 / same-top-p 100.000 %** on `-ncmoe 40 --host-experts pool`;
+four-axis **acceptance identical to 5 decimals** on all four axes with `none` == `draft-mtp` text;
+`llama-batched-bench -npl 1,4,8` within run-to-run noise; `check-gpu-faults.sh` clean; and the
+`GGML_MOE_GATHER_ONCE=1` control **reproduces Hole B** (2000 chars, `2ef00a0e243f`, 1326.9 t/s = 1.5x the honest
+arm) so the clean arm is evidence, not an unfalsifiable pass.
+
+**Owed / for decision.**  (a) The `-sm tensor` x8-pair arm needs `soar` (`-p 2048+`, never a 32-token smoke).
+(b) `scripts/gate-prefill-logits.sh` gained an `--extra "ARGS"` passthrough (word-split, folded into the base
+file name) because the gate could not otherwise judge a host-expert arm at all -- it is **staged, uncommitted**,
+awaiting the maintainer's call, since it is a delivery script.  (c) The acceptance criterion is still **not met
+on decode**: pool trails `pinned` by 10.8 % (srv cell) to 22 % (122B), and PR #267's `mmap` was *equal* to
+`pinned`, so `mmap` still offers a decode advantage; the remaining gap is P0-a (`GGML_MOE_DEVREMAP` over pool
+slots), not started here.
+
+## 261102.015 (wip) -- new campaign: `wip/moe-static-hot-tier/` -- fill the static VRAM tier by HEAT and freeze it outside the movable boundary
+
+No delivery change; no code.  Seeded at the maintainer's call after the `-ncmoe` discussion on the 1-GPU host.
+Indexed in `wip/CAMPAIGNS.md`.
+
+**The arithmetic that motivates it.**  `-ncmoe N` is tail placement here, so `-ncmoe 44` on 48 layers keeps four
+layers device-resident: that is **1/12 of the expert bytes for exactly 1/12 of the routed mass**, because every
+token routes `k` experts through every layer (measured: each table is 1/144 of the mass on Flash-Next).  The
+measured coverage curve says the same bytes spent on the hottest pairs buy **~40-45 %** of the mass (10 % of pairs
+= 48.5 %).  So the static tier is not wrong, its *fill policy* is.
+
+**Why the tier must stay** (the maintainer's correction, recorded so it is not "simplified" away later):
+`-ncmoe 0` is fully VRAM resident -- no host experts, no cache -- and pinning some experts as residents gives the
+GPU **work to hide the ring's streaming prefill I/O behind** (a real small-ubatch win that amortises at large
+ubatch), while being **immune to the ubatch VRAM pressure that evicts arena tables wholesale** (observed here:
+`evicted 5132.0 MiB of arena tables from the taken slab chunks`, `re-armed 30 stood-down expert-cache tables after
+a compute-buffer drop`).
+
+**What exists / what is missing.**  The `MHT2` heat prior and `apply_heat_seed_locked`'s top-`slots` seeding
+already exist -- but those slots are ordinary evictable arena slots.  There is **no freeze partition** in the
+cache (`g_heat_frozen` is about the *map file*, not residency; the staging snapshot's "no freeze partition" is
+literal), and per-table slot counts are allocated **uniformly**, not by concentration.  The four steps are
+written out in the campaign README, and the load-bearing one is allocating frozen slots **outside the
+movable-boundary slab** -- a frozen slot inside a lendable chunk is not frozen, and if that cannot be solved
+without gutting the slab's lending the honest outcome is "not viable".
+
+**Dimensioning constraint recorded up front.**  r74 measured a conversation-local F-LRU + heat seed beating a
+static cross-run top-`f` set by **+1.8 pts** at equal residency, so freezing the whole budget costs coverage; the
+shape to build is "freeze the robust core (top ~5-10 % of pairs, ~35-49 % of the mass), let the arena own the
+rest".
+
+**Protocol, so the first step is not code.**  Simulate with `scripts/moe-trace-replay.py --churn on --seed
+sidecar:<map>` sized to the layer tier's expert bytes, against the adaptive default; score `h`, L3/disk bytes per
+token and distinct ranges touched.  If the simulation does not separate them, stop.  If it does, measure the
+ubatch matrix (prefill `-ub 512/2048/4096` x {no tier, layer tier, heat-frozen equal bytes}; decode >= 2000
+tokens) and judge on the **eviction/re-arm fingerprint** as well as the numbers -- the prefill-logit gate is blind
+to residency defects.  The campaign also records that routing sidecars are MHT2 and the old `heatmap-audit.py` is
+MHT1-only.
+
+## 261102.014 (wip) -- window CLOSED and archived; beta 0016 WITHDRAWN; the pool campaign takes the two sound mechanisms
+
+No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched).  Continues `261102.013`.
+
+**`--host-experts window` is closed** — `wip/host-expert-pinned-window/` -> `archive/work/host-expert-pinned-window/`
+with a `RESOLUTION.md`, and **`beta/0016-host-experts-window/` withdrawn** to `archive/work/host-experts-window-beta/`.
+The beta's own gates were green on 1 GPU (prefill taken from 375.9 to 693.7 t/s, 1037.9 with the gather; text,
+MTP acceptance and the prefill-logit gate all clean) and none of that matters: the mode cannot be made sound on a
+no-XNACK GPU.  `hipHostRegister` provides addressability, not residency; a kernel read of a reclaimable page is
+fatal, and holding it is pinning — the RAM saving, which was the entire proposition, disappears.  Measured both
+ways on 261102.012/.013; the fact is in `INVARIANTS.md`.
+
+**What survives, and where it went.**  Two mechanisms are copies rather than in-place reads, so they are sound
+and they are now `wip/host-pool-speed/`'s:
+
+1. **CE copies out of a registered mapping** instead of `memcpy` into the per-table bounce + pinned H2D
+   (`moe_cache_upload_pageable`): measured on the window arm as prefill **375.9 -> 532.6 t/s** and **-6.7 GB
+   RSS** (the bounce ring was a second pinned copy of the host set); Avalon prices the same trick at
+   **fills 115 -> 61 us**, with -8 % prefill for a copy ending outside a registered range and -25 % for one
+   registration per expert (so: per tensor, page-rounded, overlaps merged).
+2. **The arena-aware device gather**, re-pointed at the **pool slots**: the staging kernel's `prs` map already
+   encodes both tiers (`>= 0` arena, `<= -2` pool slot `-v-2`), and a pool slot is `cudaHostAlloc`'d, so an SM read
+   of it needs no hold.  Worth **+41 % prefill** where it applies (`pinned` 735 -> 1036 t/s on the srv cell).
+
+Both are written up in [`wip/host-pool-speed/HANDOVER-2026-11-02.md`](wip/host-pool-speed/HANDOVER-2026-11-02.md),
+which also answers the three questions the maintainer asked at hand-over: **does the gather work with pool** (yes,
+with a third source in the kernel — arena slot, pool slot, bounce; never the pageable master), **is it portable
+to `-sm tensor`** (yes — pool is already split-native, the meta backend forwards both the gather and the new
+capability predicate, and the failure mode if the predicate answers 'no' after staging was skipped is a silent
+5-10x prefill collapse, measured as 49.6 t/s on the single-backend case, so the predicate must be pool-aware and
+the 3-GPU arm must run a `-p 2048+` prefill, not a smoke), and **how pool compares with `pinned`** (2.6x behind on
+prefill and 18 % on decode on the srv cell; that campaign's own reference arm 22.33 vs 17.76 t/s).  It also
+records the plan consequence: **`GGML_MOE_DEVREMAP` is the one piece of PR #266 whose removal would cost real
+throughput, and pool can host it soundly** because pool slots are pinned — so re-implement it over pool slots
+rather than dropping it with the rest of #266.
+
+**Process note, recorded because it cost a day.**  The constraint window violated was written down the whole time,
+in the parallel campaign's `README.md` §7 (*pinned AND resident before the go-ahead; no fallback that copies from
+pageable memory*).  The two campaigns ran simultaneously on different hosts with no cross-reference.  Both
+READMEs now point at each other, and the campaign README's §5.3 — which had called the hold a "deployment, not a
+blocker" caveat and the unheld window "correct, just slower on a refill" — is corrected in place (the earlier
+correction had landed in `PROTOTYPE.md` by mistake; the misleading line was still live).
+
+**Housekeeping.**  The whole window tree as measured is kept for reference as
+`archive/work/host-expert-pinned-window/reference-window-261102.diff` (15 files, +640 -181, against `efaa60db0`) —
+**not applied to anything**.  `~/llama-scratch` is reset to a clean `efaa60db0` for the pool work.  `beta/` is
+empty again (`beta/README.md` says so, and why).
+
+## 261102.013 (wip) -- host-expert window: the ORIGINAL design restored in code -- the hold (`mlock`) is a requirement, and every in-place kernel read is gated on it
+
+No delivery change (`patches/`/`release.json` untouched); the beta candidate is amended in the scratch tree and
+needs a re-cut.  Continues `261102.012`.
+
+**What was wrong, in one sentence.**  `hipHostRegister` installs page tables but holds nothing, and on a
+no-XNACK GPU a device read of a page that is not present is a fatal fault — so the code must never let an
+*unheld* registered master reach an in-place kernel read, and it did: the hold was opt-in (`=0` default), a
+refused `mlock` was counted and ignored, and `host_dev` was set for every table regardless.
+
+**The change (three parts).**
+
+1. `MOE_EXPERT_WINDOW_MLOCK` is now **default ON** and is a *requirement*, not an option.  `=0` re-enables the
+   unsafe behaviour and exists for measurement only.
+2. `bind_host_dev_locked` **declines the registration when the hold cannot be taken** — it unregisters, leaves
+   `host_dev` null and returns, so that table falls back to the pinned pool / the per-table bounce, which are
+   safe by construction.  The warning names the fix (`sudo prlimit --memlock=unlimited`, `LimitMEMLOCK`,
+   or fewer `-ncmoe` layers).
+3. A new per-table `host_locked` flag (set from the shared registration's `locked`) gates **every in-place
+   KERNEL read**: `table_master_kernel_readable() = host_dev && cold_safe && (host_pinned || host_locked)` is
+   what the whole-table staging dispatch, the cold read and `moe_cache_gather_ok` now test.  The **copy engine
+   is deliberately exempt**: a CE read of a reclaimed registered page refills through the driver instead of
+   faulting, so the alias-fill D2D keeps using `host_dev` while unheld.
+
+**Verified (1x R9700, IQ4_NL 93.16 GiB, `-ncmoe 44`, `-c 8192`, `--fit off`, memlock lifted with
+`sudo -n prlimit --memlock=unlimited`):**
+
+```
+moe_cache_report: host-expert WINDOW: 88 host tensors registered (0 refused, 0 mlock_fail),
+                  38.7 GiB mapped (held), 0 in-place cold reads, 0 cold ids
+WINDOW EXIT tensors=88 reg_fail=0 ml_fail=0 alias_d2d=16972 reg_bytes=41523970048
+```
+
+and the server answered correctly (`" Paris. The capital of Germany is Berlin. The capital of Italy is Rome"`),
+with **no GPU fault and no hang** — where the same cell without the hold hung outright (the earlier 38.7 GB
+`Mlocked` plateau *was* the whole registerable set; the rest of the `mlock` calls were failing silently, which is
+exactly what `ml_fail` now surfaces).  `alias_d2d=16972` confirms the CE alias fill still works unheld-gated.
+
+**Two config traps found while measuring (both cost a run here).**
+
+* **A too-small auto arena silently disables the whole expert cache.**  `-ncmoe 32 -c 8192` gave
+  `auto arena would be 6996.0 MiB < floor 7776.0 MiB -> disabling the MoE expert cache for this run`, so no
+  tables exist, nothing registers (`tensors=0`) and decode runs the uncached path (**24.5 t/s** vs ~39).  Looks
+  exactly like "window is broken"; it is a VRAM-budget decision.  Pass `MOE_EXPERT_CACHE_MIB`, or a smaller
+  `-c`, or fewer GPU layers.
+* **A killed `sudo` wrapper leaves the server holding VRAM.**  `kill $!` after `sudo … &` kills sudo, not the
+  child, and the next model load then fails with `unable to allocate ROCm0 buffer`.  Kill the *child* pid
+  (and note `pkill -f llama-server` also matches the shell that launched it).
+
+**Owed.**  A/ab measurement at the locked config (every number in `261102.010` was measured on the *unlocked*
+build, so the gather prefill figures need re-taking now that the hold gates the gather); a re-cut of the beta
+patch; `ENVIRONMENT.md` entries for the four window variables at promotion; and the 3-GPU arm — where
+`LimitMEMLOCK` must be raised too, or `window` will (correctly, now) decline every registration and measure
+`pool` semantics instead.
+
+## 261102.012 (wip) -- host-expert window: FATAL on a model larger than RAM (GPU page fault reading a reclaimed registered page); DEVREMAP is one of the two readers
+
+No delivery change (the beta candidate is unchanged); this is a **limitation finding** for `window`, from
+trying to make it the default on the IQ4_NL Flash-Next cell (93.16 GiB model, 98 GB RAM, 1x R9700).
+
+**What happens.**  `--host-experts window -ncmoe 44` faults the GPU on the first completion:
+
+```
+Memory access fault by GPU node-1 on address 0x7f6fc8f4d000. Reason: Page not present or supervisor privilege
+kernel: mul_mat_vec_q_moe<(ggml_type)20, ...>     (also a GPU coredump in llama-bench -p 2048)
+```
+
+It is **not** a stale-address bug: it is the mode's own premise turning against it.  `window` registers the
+model mapping instead of pinning it, so a GPU read requires the page to be **present**; on a no-XNACK GPU
+there is no fault-and-retry.  With a 93 GiB model plus a ~59 GiB host expert set in 98 GB of RAM the kernel
+reclaims expert pages under pressure, and the next GPU read of one is fatal.  `pinned` never sees it because
+those pages are never evictable — which is exactly the trade the mode was supposed to win.
+
+**Measured, this box, this model:**
+
+| config | result |
+|---|---|
+| `pinned`, `-ncmoe 44` | ok — pp2048 452.2 / tg128 39.0 (the previous runme) |
+| `window`, `-ncmoe 44`, `GGML_MOE_DEVREMAP` on | GPU page fault on the first completion *(`mul_mat_vec_q_moe`)* |
+| `window`, `-ncmoe 44`, `GGML_MOE_DEVREMAP=0` | 16-token smoke ok; `llama-bench -p 2048` GPU coredump |
+| `window`, `-ncmoe 32` | ok (smoke, and the config `/llm/models/.../IQ4_NL/runme` now uses) |
+
+So there are at least **two** GPU readers of the registered range that fault once the pages are evictable —
+the decode-band in-place cold read (reachable via `GGML_MOE_DEVREMAP`, which is why killing that switch
+stabilised the short smoke) and the prefill side.  Killing the switch is a workaround, not a fix; the real
+constraint is **the host expert set has to fit comfortably in RAM**, which is the opposite of the
+sub-residency regime the campaign tuned on (40 GiB set in 98 GB) and of the "fittability" case in the
+campaign's own framing.
+
+**Consequences recorded for the maintainer (not fixed here).**
+
+* The 1-GPU campaign cells are unaffected (40 GiB host set, 98 GB box, zero disk I/O, clean); this is the
+  *model-larger-than-RAM* case.
+* `window` must not be promoted as a "fittability" mode for a set that does not fit RAM until either
+  (a) the registration holds what the device may read (`MOE_EXPERT_WINDOW_MLOCK`, refused on this box's
+  8 MiB `RLIMIT_MEMLOCK`, needs root) or (b) the read path tolerates a miss — no XNACK, so that means a
+  pinned tier, i.e. `pool`/`pinned`, i.e. the thing the mode exists to delete.  Worth deciding deliberately
+  before the `pinned`/`pool` removal the maintainer wants.
+* `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/runme` now defaults to `window -ncmoe 32` with
+  `GGML_MOE_DEVREMAP=0`, documents the fault, and keeps the known-good `pinned -ncmoe 44` arm.  Verify any
+  window arm with `llama-bench -p 2048`, **never** a short prompt: the eviction case needs a multi-ubatch
+  prefill to show.
+* Still owed and now more important: the 3-GPU `-sm tensor` arm must run a **multi-ubatch prefill**
+  (`-p 2048+`), not only the 32-token smoke in `BETA-TESTING.md` §3 — a box with more RAM will not
+  reproduce this, and a box with less will fault.
+
+**Addendum (same entry) — the two follow-ups the maintainer asked for.**
+
+*Does `GGML_SCHED_DEVGATHER=0` fix it?*  **No.**  With the box in today's (warm) pressure state, `window
+-ncmoe 44` passes **both** ways — gather off: pp2048 442.2 / tg128 37.4; gather on (the default): 442.6 / 35.5
+(pinned: 452.2 / 39.0; `-r 1`, `-p 2048`).  The fault is therefore **pressure-dependent, not gate-dependent**:
+the gather only *increases exposure* (it stops the host touching every expert page each ubatch), it is not the
+cause.  Forcing the pressure needed `systemd-run --scope -p MemoryMax=...`, which is refused here (polkit wants
+interactive auth), so the pressure arm could not be run as a cgroup.
+
+*Why was "locked or provably resident" dropped?*  It was dropped in **this campaign's own README**, in three
+recorded steps, and the record now marks them:
+1. §5.2 designed exactly the right policy — `promote: mlock(range) + hipHostRegister(range)`, `demote: munlock
+   + hipHostUnregister` — and measured it as cheap (register 0.6 us, copy rate unchanged, 20x promote loop with
+   no degradation);
+2. §5.3 then reclassified the `RLIMIT_MEMLOCK` cap (8 MiB soft AND hard on this box) as a *"deployment, not a
+   blocker"* caveat and asserted the un-locked variant was **"correct, but a reclaim under pressure turns a fill
+   into a fault-speed refill"** — i.e. it priced a reclaim as a slow *host* refill, which is the wrong model for
+   a no-XNACK device, where the in-place read simply faults;
+3. v4/v5 then moved to whole-tensor registration and stated the virtue as *"does not hold the pages (`VmLock`
+   stays 0), so there is nothing for a budget to bound"* — which deleted the promote/mlock policy altogether and
+   promoted the un-locked registration to *the* design.
+The pincer that made it invisible: **every test was structurally unable to see it.**  `probe-cold-read` reads a
+hot 8 MiB window (re-run today: `DATA IDENTICAL` on all four arms, including under 70.7 GiB of anonymous
+pressure — the range is never actually evicted), and every real run before the gather memcpy'd the entire host
+expert set through the host on every ubatch, re-faulting each page immediately before the device read it.  So
+the campaign validated the property with an instrument that kept the property true, and then removed the
+mechanism (staging) that was keeping it true — which is when it broke.
+
+Recorded as an engineering fact in `INVARIANTS.md` (device-visible host memory must be RESIDENT; registration
+provides addressability only), marked void in `PROTOTYPE.md` §4/§5.3, and stated as a requirement in the beta
+README.  Nothing is promoted, nothing in `patches/` changes.
+
+## 261102.011 (wip) -- host-expert window: forward the gather capability predicate through the meta backend; beta re-cut a third time
+
+No delivery change.  Continues `261102.010`.  Patch sha256 `3548105…`, beta commit `c326828de`, applied tree
+`01e1abc96d9ffb83eea6fef66a71649940ba3996` (fresh `6050b467c` + `apply-all.sh --include-beta`, byte-identical
+to the measured tree).
+
+**Why.**  Writing the 3-GPU validation prompt surfaced a hole in `261102.010`: `moe_cache_gather_ok` was
+added as the **last** member of `ggml_backend_i`, and the other backends' positional initializers leave it
+NULL — which `sched_input_gatherable` reads as "the historical behaviour, skip staging and hope".  On a
+`-sm tensor` split that is the one dangerous case: the meta gather returns false if ANY device declines, and
+the split then falls to the slow host path *after* staging was skipped (the same collapse measured on a
+simple backend with `--host-experts pool`: 49.6 t/s on the first request against 232-285 with the predicate
+in place).  `ggml_backend_meta_moe_cache_gather_ok` now forwards to every simple backend and answers true
+only if all of them will serve their slice.
+
+**Verification.**  1 GPU cannot construct the meta backend, so the 1-GPU arms are unchanged by construction
+(oracle still 150 chars `sha=4ac3a523160f` for `window` and `pinned`) — the forwarding itself is
+**unverified on hardware** and is item 1 of `BETA-TESTING.md` §3, with a cheap on/off prefill comparison as
+the tell.  Recorded honestly rather than left for the 3-GPU box to trip over.
+
+## 261102.010 (wip) -- host-expert window: the arena-aware device gather lands prefill at parity and beyond (1037.9 vs pinned 1036.3 t/s); beta re-cut again
+
+No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched).  Continues `261102.009`.
+`beta/0016-host-experts-window/` re-cut: patch sha256 `389df8db…`, beta commit `b121ebc7d`, applied tree
+`74e71c13da593e2e38f9829db79858cc83bcd9ff` (fresh `6050b467c` + `apply-all.sh --include-beta`, verified
+byte-identical to the tree measured).  15 files, `+571 −181`.
+
+**The gather was already there, already sound, and already losing.**  `moe_cache_gather_host` has been in
+the tree since the MoE campaign, r206 already re-arms the MMQ guard pad on **every** gather (Hole B fixed;
+`GGML_MOE_GATHER_ONCE=1` restores the old arm), and it reads `t.host_dev` so a *registered* master works too.
+It stayed default-off because a correct gather still lost to whole-table staging — it sent every routed
+expert over PCIe on every ubatch even when the cache already held it, which is the 132.6 GiB-per-request
+re-read that `261102.009` could not get rid of any other way.
+
+**The change: a resident expert comes from its arena slot.**
+
+1. `moe_cache_gather_kernel` takes (`arena`, `slots`, `prs`); a resident routed expert is a VRAM copy, only
+   a non-resident one is read from the host master, so a prefill moves ~8 of 256 experts per table per
+   ubatch instead of the whole non-resident set.
+2. The residency snapshot is factored into `prs_refresh_locked` and shared with the staging path; the gather
+   refreshes it on the **compute** stream (same stream the kernel runs on), so no cross-stream order is
+   needed and the `prs_gen`/arena/slots key stops either consumer rebuilding the other's work.
+3. Default-on required a capability predicate: the scheduler skips whole-table staging for a gatherable
+   table *before* it knows whether the backend will serve it, and a `pool` master has no device-readable
+   alias — forced on, pool fell to the host path (**49.6 t/s** on the first request).  `moe_cache_gather_ok`
+   is appended to `ggml_backend_i` as the **last** member (so the other backends' positional initializers
+   stay valid, the same rule `moe_cache_remap` documents) and the scheduler asks it before skipping staging.
+
+Persistent server (`-ncmoe 48`, arena auto, request 3, quiet box):
+
+| arm | prefill | gen |
+|---|---|---|
+| `window`, staging | 698.4 | 60.1 |
+| **`window`, gather (default)** | **1037.9-1040.3** | **60.1** |
+| `pinned`, staging | 734.5 | 59.5 |
+| `pinned`, gather (default) | 1036.3-1040.5 | 59.1 |
+| `pool` (staging, unchanged) | 285.3 | 48.8 |
+
+So `window >= pinned` on **prefill and decode** with zero pinned host RAM — the precondition for the
+maintainer's end-game (drop `pinned`; then `pool`, and with it PR #266's `MOE_HOST_POOL_COLD`; `DEVREMAP`
+keys off `host_dev` and survives).  `GGML_SCHED_DEVGATHER=0` is the kill switch.
+
+**Cleared against Hole B with a control, not a speed comparison** -- the point the maintainer raised, and the
+delivery's own record (`archive/work/moe-mmq-overread/RESOLUTION.md`) makes it mandatory:
+
+* `GGML_MOE_GATHER_ONCE=1` on the same binary reproduces the documented corruption exactly: **1706.1 t/s**
+  and **2000 chars** of repeated-`/` garbage, 2/2 runs (the correct arms give 5851 chars, the same text as
+  `pinned`/`pool`);
+* the candidate arm: 1009-1040 t/s, 5851-char text, oracle 150 chars `sha=4ac3a523160f` 3/3 in
+  `window`/`pinned`/`pool`, 3 prompts x n96 byte-identical, prefill-logit mean KLD **-0.000000** / max
+  0.000065 / same-top-p **100.000 %** against a `pool` base, `check-gpu-faults.sh` clean on every log;
+* byte accounting: the gather moves ~97 % fewer host bytes than staging and runs *below* what staging
+  already achieves per byte — the opposite of the 2650-3060 t/s the record condemns (which exceeded the PCIe
+  ceiling for the bytes it had to move).
+
+**Two cautions recorded for the next reader.**  (a) **The prefill-logit gate is blind to Hole B**: the
+once-only arm passes it at rounding level at `-c 512` *and* at `-c 4096 -ub 1024`, so a KLD pass is NOT
+evidence that a gather is sound — the server cell plus the `GGML_MOE_GATHER_ONCE` control decide it.  (b) A
+corrupted gather reads ~1.7x its neighbours, so a gather "win" of that size is a corruption signature.
+
+**Owed before promotion:** the 3-GPU `-sm tensor` arm on the other box (the gather is per device and
+`moe_cache_gather_ok` is per backend, so the tensor path should take it, but that is unproven — `reg_fail=0`,
+`tensors=` = host tensor count, `cold_dev>0`), and the MTP four-axis / batched-bench / `-ncmoe` matrix /
+kill-switch arms (`GGML_SCHED_DEVGATHER=0`, `MOE_EXPERT_WINDOW_ALIAS_FILL=0`, `MOE_EXPERT_TENSOR_REG=0`,
+`GGML_MOE_DEVREMAP=0`, `MOE_HOST_POOL_COLD=0`).
+
+## 261102.009 (wip) -- host-expert window: the residual 5.7 % is chased to the end of the candidate list; the obvious next lever is a sound device gather
+
+No delivery change; continues `261102.008` (which re-cut the beta).  All of it is in
+`wip/host-expert-pinned-window/` (`PROTOTYPE.md` §8.2c, two new probes) and the beta README.
+
+**What the residual is not.**  Window sits at 692.7-693.7 t/s prefill against `pinned`'s 734.5 (persistent
+server, `-ncmoe 48`, request 3).  Each of these was eliminated by measurement today:
+
+* **not the staged volume** -- the exit counter is the *same string* in both arms (`ok=3762 unusable=891;
+  arena=646107.1 MiB host=407417.9 MiB, H2D 38.7 %`);
+* **not a registration tax on unrelated kernels** -- new `probe-pollution.cpp`: a latency-bound VRAM kernel
+  over 256 MiB takes 4.97 s next to a pinned stream, 4.97 s next to the registered stream and 4.97 s next to
+  a `MADV_COLLAPSE`d 2 MiB-page stream, with 145 in-situ registrations (32.7 GiB) live;
+* **not the aperture, the page size, the geometry, the cold read, DEVREMAP or the alias fill** (recorded in
+  `261102.008`);
+* **not residency** -- the deficit is ~constant: `-ncmoe` 48 pinned 734.5 / window 692.8 (-5.7 %), 32:
+  788.0 / 736.1 (-6.6 %), 16: 1009.6 / 956.0 (-5.3 %);
+* **not launch count, serialization or a missing fusion** -- identical kernel sets and counts, 96 % overlap
+  (recorded in `261102.008`).
+
+**A measurement trap worth its own line.**  Window reads **692.7-693.7** on a quiet box and **662.9** when a
+`pinned` arm ran just before it: that arm's 40 GiB `hipHostMalloc` evicts the page cache the window master
+lives in, and the mode's whole premise is that the page cache is the tier.  Measure window first, or accept
+the ~4 % and say so -- do not compare across arms in the wrong order.  (`srv-test.sh` gained `NCMOE=` for the
+residency axis.)
+
+**The one lever left, and it is the strategic one.**  Everything above says the bytes must be *removed*, not
+moved faster, and the only mechanism that removes them is the **device gather**: it copies only the ~8 of 256
+experts a ubatch actually routes (the staging re-reads the whole 39 % non-resident set ~8.7x per request).
+Its shipped form is known-unsound -- `archive/work/moe-mmq-overread/RESOLUTION.md` Hole B, the destination's
+512 B MMQ guard pad is zeroed once per buffer and does not survive a multi-ubatch prefill, so NaN routing
+skipped expert work and the recorded 2650-3060 t/s were never real -- and that document already lists what a
+sound version needs: a persistent destination the graph allocator never reuses, a per-ubatch re-arm of the
+guard pad, and the `-sm tensor` redirect fix.  Reading it from **window's registered alias** is what could put
+window *ahead* of `pinned`, which is the precondition for the end-game the maintainer wants: delete `pinned`
+(and with it PR #266's `GGML_MOE_DEVREMAP` restriction argument), then delete `pool` (and with it `#266`'s
+`MOE_HOST_POOL_COLD`).
+
+**Owed before promotion, unchanged:** the 3-GPU `-sm tensor` arm, and the MTP four-axis / batched-bench /
+`-ncmoe` matrix / kill-switch gates.
+
+## 261102.008 (wip) -- host-expert window: prefill 375.9 -> 693.7 t/s (+84 %), 5.7 % behind `pinned`; the beta candidate is re-cut
+
+No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched).  Continues `261102.007`.
+`beta/0016-host-experts-window/` is **re-cut** (patch sha256 `56dd1dfe…`, beta commit `8417ede3c`, applied
+tree `2344889727ce4b2746b918232ab16cb2a245f5e1`, verified on a fresh `6050b467c` +
+`apply-all.sh --include-beta` and byte-identical to the tree measured).
+
+**The prefill blocker is closed as far as the mechanism goes.**  Persistent `llama-server` (`srv-test.sh`:
+Flash-Next GSQ-RCO-IQ3_XXS 75.8 GB, 1x R9700, `-ncmoe 48`, arena auto 25.38 GiB of a 40.0 GiB host set,
+`-c 8192`, q8_0 KV, request 3 = steady state, zero disk reads):
+
+| arm | prefill req3 | gen | RSS |
+|---|---|---|---|
+| `pinned` | 734.5-735.0 | 59.5 | 68.6 GB |
+| `window`, beta as first cut | 375.9 | 60.2 | 75.2 GB |
+| + `MOE_EXPERT_WINDOW_ALIAS_FILL` default-on | 532.6 | 60.4 | 68.5 GB |
+| + that, plus the two staging fixes below | **693.1-693.7** | **60.4** | **68.5 GB** |
+
+**The hand-over's diagnosis was right about the mechanism and wrong about the fix.**  §3.1 (dispatch the
+staging on device-readability instead of `host_pinned`) **alone is a regression**: 515.6 t/s and +5 GB RSS,
+because it sends more tables down a fallback that was itself paying a host memcpy.  There were three costs,
+and they have to be paid together:
+
+1. `MOE_EXPERT_WINDOW_ALIAS_FILL` is now **default on** (the env var is the kill switch, per the default-on
+   policy).  Byte-identical, inert where there is no registration, and it deletes the per-table bounce ring
+   that window mode was carrying as a second pinned copy of the host expert set (-6.7 GB RSS).
+2. `moe_cache_upload_pageable` stages a range from the registered alias with **one D2D copy**.  This is the
+   fallback for every table the cache staging declines -- a stood-down table, the pre-sizing pass, ~24 % of
+   the calls here -- and a registered master used to pay a **host memcpy of the whole range into the
+   per-table bounce** on every ubatch, where `pinned` pays a direct H2D DMA from its master.
+3. `moe_cache_stage_table` dispatches on **device-readability** (`host_dev != nullptr && cold_safe`), so a
+   registered master takes `pinned`'s single-launch path.  Before, it fell into the pool branch, where --
+   window mode having no pool tier -- every expert became one `cudaMemcpyAsync`: **400 356** copies for a
+   5246-token prefill against **1 564** launches for `pinned`, 3.41 s of `__amd_rocclr_copyBuffer` alone.
+   §3.2 (the alias as a second source in the pool branch) is therefore not needed.
+
+**PR #266 is not involved.**  Its two mechanisms are decode-band: `GGML_MOE_DEVREMAP` is only reached from
+the decode hook (`moe_cache_update_host` returns early above `MAX_TOK`, `devremap_prep_locked` is gated on
+`table_cold_ok` = `host_dev != nullptr`) and `MOE_HOST_POOL_COLD` requires `host_dev == nullptr`, i.e. it is
+structurally inert for a pinned master.  Measured: pinned pp512/tg256 = 1442.8/101.33 default,
+1449.7/101.16 `DEVREMAP=0`, 1440.3/101.18 `POOL_COLD=0`, 1441.9/101.38 both -- neither switch touches these
+numbers.  The 735 prefill is the block-09 staging engine (TODO #87 / r114) that predates #266.  Consequence
+for the mode-collapse goal: the pinned path is now only needed for *where the bytes live*, not *how they are
+staged*; `DEVREMAP` survives deleting `pinned` (it keys off `host_dev`), and it is `MOE_HOST_POOL_COLD` that
+dies with the pool.
+
+**The residual 5.7 % is a memory-latency effect, and it is measured as such.**  With all three changes the
+two arms issue **the same kernels with identical launch counts** (1254 staging kernels, 3726
+`__amd_rocclr_copyBuffer`, 1692 descriptor builds) and the staging overlaps compute 2.98 s of 3.11 s -- but
+the same kernels each run 7-21 % slower: `moe_cache_stage_kernel` 2.57 -> 3.11 s,
+`build_mmq_routed_descriptors` 0.48 -> 0.63 s, `mm_ids_helper` 0.34 -> 0.40 s, the big matmuls +2 %.
+Eliminated by measurement, one instrument at a time (new `probe-aperture.cpp` in the campaign dir):
+
+* **read bandwidth** -- pinned buffer, registered mapping, and the same mapping collapsed to 2 MiB pages all
+  read at **52 GiB/s**, including the exact in-situ shape (48 tables x 512 blocks x 256 threads, flat
+  473600 B per block: 51.87 vs 51.88 GiB/s) at 2, 8 and 12 GiB working sets;
+* **page size / TLB** -- `MADV_COLLAPSE` really produces huge pages (`FilePmdMapped` 8.4 GB) and moves the
+  number not at all;
+* **geometry** -- this model is `host_pitch = 0`, so the staging kernel does a flat per-expert copy;
+* **cold read / DEVREMAP / the alias fill** -- all inert on the prefill band (`COLD_UVA=0`: 614.5 vs 614.9);
+* **serialization, launch count, a missing fusion** -- identical counts and 96 % overlap, above.
+
+`GGML_SCHED_DEVGATHER=1` measures 676 t/s here and is **discarded, not quoted**: it is the Hole-B path
+(`archive/work/moe-mmq-overread/RESOLUTION.md`) whose numbers the delivery already established were never
+real.  So the remaining levers are the ones the shape implies -- **fewer host bytes per ubatch** (the same
+39 % non-resident set is re-read ~8.7x per request; only residency removes it) or a different registration
+(which is what `pinned` exists for).  Recorded in `PROTOTYPE.md` §8.2c and
+`beta/0016-host-experts-window/README.md`; the next campaign step is the residency/`-ncmoe` axis.
+
+**Purity (this revision, 1 GPU).**  Prefill-logit gate against a `--host-experts pool` base (Q4_K_M,
+`-ncmoe 40`, `-c 512 --chunks 40`): mean KLD **-0.000000**, maximum 0.000065, same-top-p **100.000 %**
+(limits 0.005 / 98 %).  Greedy text 150 chars `sha=4ac3a523160f` in `pinned` / `pool` / `window` /
+`window + ALIAS_FILL=0`; 3 prompts x n96 byte-identical across the four arms; `check-gpu-faults.sh` clean
+on every run (the journal's only faults today are a single 09:00:04 burst, hours before this work).
+
+**Findings recorded for the maintainer, not fixed here.**  (a) `srv-test`'s request-3 text hash is **not** a
+reproducible oracle -- two `pinned` runs gave `4c88b625a400` and `4e2fdac2bfab` -- so the hand-over's
+"server-path text identical across arms" row cannot be a gate; the short-horizon oracle plus acceptance is
+the gate, as `INVARIANTS.md` already says for a MoE.  (b) `llama-bench` badly understates this gap
+(631 vs 645 with no decode between passes, 594 vs 649 with 2000 tokens) while the server shows 693 vs 735:
+the server's 5246-token prompt with arena re-arm/eviction between requests is the only instrument that
+reproduces it.  (c) The first measurement after a cold build read 334.7 t/s for an arm that then measured
+532.1/532.2/532.6 on three consecutive runs -- discard any arm whose first run follows a build.
+
+**Owed before promotion** (the beta exists for this): the 3-GPU `-sm tensor` arm on the other box
+(`reg_fail=0`, `tensors=` = host tensor count, `cold_dev>0`), and the MTP four-axis / batched-bench /
+`-ncmoe` matrix / kill-switch arms that the prefill work did not re-run (the text and prefill-logit gates
+are green above).
+
+## 261102.007 (wip) -- host-expert window: PREFILL is the promotion blocker (1.95x behind pinned, and systemic); hand-over written for the fix
+
+No delivery change (`patches/`/`release.json` untouched); the beta candidate is unchanged and still staged.
+Continues `261102.006`.  New: `wip/host-expert-pinned-window/HANDOVER-PREFILL-PARITY.md` and the
+instrument `wip/host-expert-pinned-window/srv-test.sh`; `PROTOTYPE.md` §8.2b.
+
+**Why this is a blocker.**  Multi-device is looking fine on the 3-GPU box, but a **persistent**
+`llama-server` (prompt cache off, three sequential requests, same 5246-token prompt, 2000 tokens out --
+Flash-Next GSQ-RCO-IQ3_XXS 75.8 GB, 1x R9700, `-ncmoe 48`, arena auto 25.38 GiB of a 40.0 GiB host set =
+63 % resident, `-c 8192`, q8_0 KV) shows window prefill **1.95x behind pinned**, steady state:
+
+| arm | prefill req1 -> req2 -> req3 | gen (req3) | disk reads req2/3 | RSS |
+|---|---|---|---|---|
+| `pinned` | 652.7 -> 734.4 -> **734.0** | 59.5 | 0.00 / 0.00 GB | 68.5 GB |
+| `window` | 342.8 -> 373.4 -> **375.9** | 60.2 | 0.00 / 0.00 GB | 75.2 GB |
+| `window` + `MOE_EXPERT_WINDOW_ALIAS_FILL=1` | 476.3 -> 532.9 -> **532.8** | 60.5 | 0.00 / 0.00 GB | 68.5 GB |
+
+**It is not a page-cache fill.**  Requests 2 and 3 read **exactly zero** bytes from the block device
+(`/proc/<pid>/io`), the mapping stays resident, RSS is flat -- and prefill still sits at 375.9, with only a
++9 % first-request transient (342.8 -> 373.4).  The process-restarting `llama-cli` numbers quoted earlier
+(346.6 / 353.3) were the partially-warm case; steady state is 375.9 and the gap does not close.
+
+**Cause.**  `moe_cache_stage_table` dispatches on `t.host_pinned`, not on device-readability: a `pinned`
+master stages the whole table with **one** kernel launch reading `host_dev` in place, while a registered
+(window) master falls into the pool branch, where -- with no pool -- every expert becomes one
+`expert_host_src` + copy whose source is the per-table **bounce**, i.e. a host `memcpy` of each staged
+expert per table per ubatch (~144 tables x 256 experts of per-copy issues instead of one launch).  The
+alias-fill arm is the proof it is the copy and not the faults: identical I/O, identical page state, memcpy
+removed -> **+42 % prefill and -6.7 GB RSS** (that RSS is the bounce ring, i.e. window mode today carries a
+second pinned copy -- the thing it exists to delete).
+
+**The plan, in the hand-over.**  (1) Flip `MOE_EXPERT_WINDOW_ALIAS_FILL` to default-on in window mode --
+one line, byte-identical, +42 % prefill, -6.7 GB; keep the env var as the kill switch per the default-on
+policy.  (2) The true fix: make the staging dispatch test **device-readability** (`t.host_dev != nullptr`,
+which `bind_host_dev_locked` sets for a pinned *and* a registered master) instead of `t.host_pinned`, so a
+registered master takes the same single-launch path -- expected to land at `pinned`'s ~734 t/s.  Known
+consequence to decide deliberately: that path requires a built arena, so window mode would decline the
+pre-sizing prefill the pool branch serves (`pinned` has always behaved that way); the fallback shape (keep
+the pool branch and pass the alias as its second source via the existing `-(s+2)` encoding, with the expert
+id as the index) is written out in §3.2 of the hand-over.
+
+**Also recorded.**  Decode is at parity or slightly better throughout (60.2 / 60.5 vs 59.5), so prefill is
+the only open axis; and the three arms produce identical text on the *server* path
+(`5851 chars sha=381dedfe3567`), which is a useful extra datapoint for the host-expert-hook gate.
+
+## 261102.006 (wip) -- host-expert window promoted to `--host-experts window` and staged as `beta/0016-host-experts-window/`; all 1-GPU gates green, `-sm tensor` owed
+
+No delivery change to `patches/`/`release.json`/`rdna-boosts-all.patch`.  Continues `261102.005`;
+`wip/host-expert-pinned-window/` (`PROTOTYPE.md` §8) and the new
+[`beta/0016-host-experts-window/`](beta/0016-host-experts-window/README.md).  Per the maintainer: the
+feature becomes a **mode** (`--host-experts window`), opt-in, and the candidate is a `beta/` patch so the
+3-GPU box can apply and build it with one flag while multi-GPU validation continues.
+
+**The mode.**  13 files, `+368 -130`: `include/llama.h` (`LLAMA_HOST_EXPERTS_MODE_WINDOW`),
+`common/arg.cpp`, `src/llama-model-loader.cpp` (`host_expert_buft` + `llama_host_experts_mode_apply` + the
+no-mmap warning), `tools/llama-bench/`, a new device iface entry
+`ggml_backend_dev_moe_cache_set_host_window` (backend.h / backend-impl.h / backend.cpp / the CUDA wrapper,
+explicit nulls in cpu, rpc and meta) and `moe-expert-cache.{h,cu}`.  The env surface is now only the A/B:
+`MOE_EXPERT_TENSOR_REG` (kill switch, on in window mode), `MOE_EXPERT_WINDOW_MLOCK`,
+`MOE_EXPERT_WINDOW_TRACE`, `MOE_EXPERT_WINDOW_ALIAS_FILL`.  **`MOE_EXPERT_WINDOW` and
+`MOE_EXPERT_WINDOW_MIB` are deleted**: the registration is whole-tensor and does not hold the pages
+(`VmLock` 0.00 MB throughout, and the arm is correct inside a `MemoryMax=10G` cgroup over a 22.6 GB
+mapping), so there is nothing for a byte budget to bound -- the answer to "how much gets pinned at once"
+is *none*.  `MOE_HOST_POOL_MIB` now only sizes a fallback ring.
+
+**Gates, all on 1x R9700 (gfx1201, PCIe 5.0 x16, ROCm 10.1.0, 35B-A3B, `-ncmoe 40`).**
+
+* greedy text: reference `150 chars sha=4ac3a523160f` in **every** arm -- `pinned`, `pool`, `window`, and
+  `window` with `MOE_EXPERT_TENSOR_REG=0`, `GGML_MOE_DEVREMAP=0`, `MOE_HOST_POOL_COLD=0` and all three --
+  3/3 runs per arm, on Q4_K_M and on Q8_0; 3 prompts x `n 96` byte-identical on four arms.
+* **MTP four-axis** (`-n 3000`, nmax 3, reasoning pinned per axis): Q4_K_M acceptance
+  **0.81370 / 0.75408 / 0.89175 / 0.98148**, mean len 3.44 / 3.26 / 3.68 / 3.94 -- **identical `pool` vs
+  `window`** -- with `none` == `draft-mtp` text on all four axes, and window 118.3 / 110.4 / 121.5 / 138.3
+  t/s against pool 71.8 / 71.3 / 76.5 / 84.1.  Q8_0: 0.75118 / 0.75379 / 0.87798 / 0.98667, identical
+  across arms and identical text; plain 79.1-82.6 vs 64.6-67.0.
+* `llama-batched-bench -npp 512 -ntg 128 -npl 1,4,8`: S_TG 55.4 / 108.2 / 56.9 -> **73.4 / 206.5 / 281.4**.
+
+**Where the win is (three cells, three answers).**  Sub-residency arena (Q4_K_M, arena 4096, ~22 % of the
+host set): **+35 %** over both `pool` and `pinned`.  High residency (arena auto = 26.56 GiB of 33.0):
+`window` == `pinned` (58.6-63.3 vs 58.8-65.7) and +13 % over `pool`.  A model that does not fit (Q8_0,
+37.8 GB on a 34.2 GB card, auto sizing): **+17-26 %** and **peak RSS 58.5 -> 33.7 GB** (the pool's auto
+80 % is 25 GB of non-swappable `cudaHostAlloc`).  So the window is a miss-path optimisation, `>= pinned`
+everywhere, and its margin grows exactly as the host set stops fitting.
+
+**Two findings recorded as campaign notes, no `TODO` (maintainer's call).**  (a) The **Q8_K_XL file's MTP
+head is damaged**: acceptance ~0 in *every* mode on the same binary (`pinned` 0.00000, `window` 0.00000,
+`pool` 0.00589) where `Q8_0` and `UD-Q4_K_M` give 0.878 / 0.892 -- a model-file defect, not a mode one, so
+it is not a gate model.  (b) `pool` and `window` can give **different greedy text** on a MoE (Q8_K_XL: 96
+chars vs 50, each stable 3/3; Q4_K_M and Q8_0 agree exactly), not root-caused and not an arena-alignment
+artefact (both per-expert strides are page multiples).  That is `INVARIANTS.md`'s existing rule in
+practice: gate on **in-mode** identity plus acceptance, never on cross-config text.
+
+**The beta.**  `beta/0016-host-experts-window/` (`README.md`, `BETA-TESTING.md`,
+`host-experts-window.patch` sha256 `3502e334d674b985a22dcb803e5216a00a726b96f961601172fe66d4b9704da6`),
+cut against `release.json`'s tree `1bac1001…`; a fresh `scripts/apply-all.sh --include-beta` on
+`6050b467c` gives 16 blocks + beta commit `142b06212` / tree
+**`5101f0e43ecf889394bc9d6b24f349faaadd96b5`**, which is byte-identical to the tree these numbers were
+measured on, and a cold `cmake` build of it was verified clean.  The one open item is the reason it is a
+beta: the registration is keyed by the **host tensor with a refcount** because a `-sm tensor` split has
+three per-device children over one master and a second `cudaHostRegister` of the same range is refused as
+an overlap -- untested on more than one device.  `BETA-TESTING.md` §3 names the assertion
+(`MOE_EXPERT_WINDOW_TRACE=1` `tensors=` must be the *host tensor* count, not one third of it, with
+`reg_fail=0` and `cold_dev>0`).
+
+## 261102.005 (wip) -- host-expert window: ONE residency tier works -- +35-40 % decode, byte-identical, the pinned pool deleted; the two "bugs" do not reproduce
+
+No delivery change.  Continues `261102.004`; `wip/host-expert-pinned-window/` (`PROTOTYPE.md` v4,
+`prototype-v4-onetier.patch`), work on the r206 tree in `~/llama-scratch`.  Two new campaign tools so an arm
+is one command: `oracle.sh <label>` (the deterministic greedy oracle) and `bench.sh <label>` (`llama-bench
+-p 256 -n 128 -r 2`), both selecting the arm from the caller's environment.
+
+**Result (1x R9700 @ PCIe 5.0 x16, ROCm 10.1.0, 35B-A3B Q4_K_M, `-ncmoe 40`, arena 4096, pool 2048):**
+
+| arm | pp256 | tg128 | peak RSS | text |
+|---|---|---|---|---|
+| `--host-experts pinned` (delivery default) | 686-689 | 53.8 / 56.6 | -- | `4ac3a523160f` |
+| `--host-experts pool` (delivery) | 687-722 | 52.3-56.9 | 15.4 GB | `4ac3a523160f` |
+| pool + window, ring of 8, no registration | 685-687 | 52.1 / 53.1 | **13.4 GB** | `4ac3a523160f` |
+| **one tier** (`MOE_EXPERT_WINDOW=1 MOE_EXPERT_TENSOR_REG=1`) | 687-722 | **72.6-77.9** | 19.8 GB | `4ac3a523160f` |
+
+So the maintainer's target shape is real: register the host master once, read non-resident experts **in
+place**, and the pinned copy has nothing left to do.  `table_pool_locked` now returns null for a registered
+table, so there is no per-table pinned allocation, prewarm or rerank at all -- the residency is the arena plus
+the **page cache**, one tier, and `MOE_HOST_POOL_MIB` degrades to a fallback ring (32 / 2048 / absent measure
+75.9 / 74.0 / 72.4 t/s, i.e. its size no longer matters).
+
+**Attribution, one switch at a time** (each against the same one-tier arm): `MOE_EXPERT_CACHE_COLD_UVA=0` ->
+**53.5 t/s**, i.e. the whole win is the in-place cold read (with it off the arm is exactly the delivery's
+53.8); `GGML_MOE_DEVREMAP=0` -> 67.9, so the registration also unlocks the sync-free decode remap that was
+gated to pinned masters (+9 %); `-ncmoe 48` -> 77.0 vs pool 56.9.  `--host-experts pinned` gets **no** benefit
+from the same cold read and never beats the pool: a `hipHostMalloc` range is the slowest source for device
+access (the campaign's own copy-path probe: 241 us vs 155 us for a registered mapping), so the existing
+pinned-master tier is paying for an aperture, not for the copy.
+
+**The registration is a mapping, not a lock** -- which is why the design is safe.  `hipHostRegister` makes a
+range device-addressable (UVA alias, 0.6 us, `Mlocked` 0.00 GB throughout); the pages stay reclaimable.  In
+situ: the whole arm runs correctly inside a `MemoryMax=10G` cgroup on a 22.6 GB mapping, i.e. the device is
+reading pages the kernel is reclaiming and re-faulting underneath it.  The +4.4 GB of peak RSS against the
+pool arm is the page cache holding the expert set, not a pin.
+
+**The ring sweep was a clamp, not a sweep.**  `pin_slots = 8` segfaulted because the pool kept a slot table
+(larger than the allocation), so two resident slots could alias one ring entry -- converting every
+`p.base + slot*host_bytes` site to `slot % pin_slots` would have fixed the crash and left the silent
+corruption.  `host_pool_t` now has **one** number (`slots`), `base` holds exactly that many experts, so a slot
+index IS a ring index and every site is in bounds by construction.  The sweep that the ring made visible is
+pure deletion: the per-slot backing vectors (`slot_base`/`slot_dev`/`slot_reg*`, written and never read), the
+per-slot registration pair (`if (true) return false`), and `pool_slot_locked`/`pool_slot_sync` (no caller
+left).  `MOE_EXPERT_WINDOW=1` alone is RSS 15.4 -> 13.4 GB at parity: the memory half, on its own.
+
+**Bugs A and B do not reproduce** (`PROTOTYPE.md` §5.3).  On the saved `prototype-v3` tree,
+`MOE_EXPERT_WINDOW=1 MOE_EXPERT_TENSOR_REG=1` gives the 150-char reference while the device remap encodes
+**200 cold experts of 256 on every table** (1916 map rebuilds), and re-enabling the alias fill reproduces the
+reported counters (10 570 D2D fills, 0 cold reads) with byte-identical text.  The likely reading is that both
+were measured while the *per-slot* registration was still live beside the whole-tensor one (v3's own comment
+records 3881 `cudaHostRegister` refusals from that overlap).  Recorded as **not reproduced**, not as fixed.
+The real defect they hid is fixed: the registration was per **table**, and a `-sm tensor` split has three
+per-device children over one host master, so the 2nd/3rd would have been refused as an overlap and left with
+no alias -- PR #266's restriction, reached by accident.  It is now keyed by the **host tensor** with a
+refcount (`g_win_tensors`).  Also fixed: `moe_cache_gather_host` (which the registration newly makes
+reachable) reads `t.host_dev` instead of `weight->data`, so it no longer relies on the UVA alias happening to
+equal the host pointer.
+
+**Opt-in, deliberately** (`MOE_EXPERT_TENSOR_REG=1`, off by default): the MTP four-axis protocol, the
+prefill-logit gate, the `-ncmoe` matrix and the `-sm tensor` arm are all still owed, and per `AGENTS.md`
+default-on policy the flip belongs at promotion, in the same change that gates it.  Nothing here touches
+`patches/`.
+
+## 261102.004 (wip) -- host-expert window: the cold read is legal without mlock, but two integration bugs stand between the prototype and the memory win
+
+No delivery change.  Continues `261102.003`; `wip/host-expert-pinned-window/` (`PROTOTYPE.md` §5, patches
+`prototype-v1/-v2/-v3`), work on the r206 tree in `~/llama-scratch`.  Direction: (c) then (a); multi-GPU deferred.
+
+**(c) established, by probe.**  A GPU *kernel* read of a **registered** mapping range is **data-identical** --
+resident, after `MADV_PAGEOUT`, and under **70 GiB of real anonymous memory pressure** (`probe-cold-read`); an
+*unregistered* pageable read is the fatal `Page not present` fault issue #116 describes (reproduced).  So the
+cold read needs **registration, not `mlock`** -- the campaign's earlier "registration does not protect the pages"
+reading was an instrument error (`mincore`/`Mlocked` measure PTEs / mlock accounting, not device access).  The
+alias transport is also byte-stable at 64 MiB-1 GiB registrations (`probe-alias-d2d`, 0/24 bad).
+
+**Two integration bugs, both in the cold/alias area, both now default-off:**
+(A) filling the arena with a D2D from the *whole-tensor* alias gives a deterministic wrong answer in situ
+(287 chars `1e68091940d0` vs the 150-char reference, 10 560 alias fills, 0 cold reads) even though the same copy
+is byte-stable in the probe -- the shortcut is withdrawn; (B) with the per-tensor registration on, the cold read
+engages and the answer is wrong at every arena size (279 chars) -- suspects are the remap/DEVREMAP cold encoding
+(it does not bump `g_cold_reaches`, so the cold read may be reached by an encoding the eager-path validation
+never covered) and the cold geometry handed to the kernel.
+
+**Verified state (v3 = v2 + the cold-read switch, off by default).**  1x R9700, 35B-A3B Q4_K_M, `-ncmoe 40`,
+`--host-experts pool`, arena 4096, pool 2048: text **3/3 runs identical** (`sha=4ac3a523160f`, same as the pool
+arm) and `llama-bench -p 256 -n 128 -r 2` **parity** -- pool tg128 48.3/45.1 vs window 48.7/48.4.  The memory
+half (`pin_slots = 8`, RSS 21.3 -> 18.8 GB) still segfaults: not every consumer of `p.base + slot*host_bytes` is
+on the per-slot ring index yet, which is a mechanical sweep.
+
+Deterministic-oracle note for the record: **a `--fit`-sized run is not a greedy oracle on Qwen3.6** (the chat
+template injects per-run content, so the same seed gives different tokens).  Pin `-c` and keep `-lv 2` off; that
+combination reproduced byte-identically every time.
+
+## 261102.003 (wip) -- prototype v2: ONE host-expert residency tier (the pool's slots backed by the mapping) is at decode parity; the memory half hits a runtime SIGSEGV
+
+No delivery change (WIP; `wip/host-expert-pinned-window/PROTOTYPE.md`, patches `prototype-v1-*.patch` /
+`prototype-v2-*.patch`, both against the r206 tree in `~/llama-scratch`).  Direction from the maintainer: the
+pool and the pinned master should be **one integrated system** whose only variable is how much is pinned, plus
+the mechanism that makes the needed experts resident (design B); and it must not inherit PR #266's
+`-sm tensor` restriction.
+
+**v2 (the one that works).**  The pool keeps its slots, policy, LRU/rerank and cold read; a slot's *backing*
+becomes either a pinned copy (today) or a **registered view of the read-only model mapping**
+(`MOE_EXPERT_WINDOW=1`, on top of `--host-experts pool`, which is what gives the mapping-backed master -- so
+no llama.cpp loader change at all).  Registration goes through `pool_slot_register_win_locked`, the alias
+through `cudaHostGetDevicePointer`, and the fill becomes a D2D from the view: **no copy on the fill path**.
+Releasing a view drains the slot first (unregistering under a queued copy is a SIGSEGV in libamdhip64's
+staging memmove -- measured).  Measured on 1x R9700 @ PCIe 5.0 x16, 35B-A3B Q4_K_M, `-ncmoe 40`,
+`MOE_EXPERT_CACHE_MIB=4096`, `MOE_HOST_POOL_MIB=2048`, `llama-bench -p 256 -n 128 -r 2`, alternating:
+pool tg128 **54.0 / 56.7** vs window **53.7 / 54.0** -- parity, and the text is byte-identical
+(`sha=4ac3a523160f` for pool, window and window-with-no-arena).
+
+**v1 (superseded, kept for the four lessons).**  A per-table window with its own budget and a hook ahead of the
+pool: byte-identical but **12 t/s** vs the pool's ~50.  Four independent causes, all fixed in v2: (1)
+`cudaMemcpyHostToDevice` from a *registered* range is staged by ROCm as a **pageable** upload -- resolve the UVA
+alias and copy D2D (the pool's transport); (2) demoting on the promote path can never succeed during a burst
+(every entry is in flight), so the fill fell through to the per-table *bounce*, the slowest path -- use a
+per-call boundary event; (3) the per-entry demote check was a device query inside a rescan loop, i.e. O(n^2)
+queries per call (~90 ms/token) -- one query per boundary, batch release; (4) a per-fill LRU window keeps
+nothing (118 hits in 11 776 promotes) because the arena is the real cache -- the window must be the pool's
+*storage*, which is the maintainer's point.
+
+**Open blocker (the memory half).**  Shrinking the pool's pinned allocation to a small fallback ring
+(`pin_slots = 8`) drops peak RSS **21.3 -> 18.8 GB**, i.e. it is the "remove the wasted copies" win, but the
+decode phase then SIGSEGVs inside `libamdhip64`'s staging memmove (`__memmove_avx512 -> libamdhip64`), with the
+full-size base stable.  Not our arithmetic; candidate causes (a copy the runtime decides to stage from a view,
+or a reused ring slot racing a queued copy) are listed in `PROTOTYPE.md` §5 and need a profiler session.  Until
+then v2 is a fill-path change only.  `-sm tensor` is untestable on this box (single usable GPU) but the design
+carries no single-device gate: the pool is keyed by the master and the Meta backend already forwards
+`moe_cache_update`/`moe_cache_take_over` per child, unlike `GGML_MOE_DEVREMAP` and `MOE_HOST_POOL_COLD`.
+
+## 261102.002 (wip) -- the `--host-experts pool` bounce buffer is priced against a registered window over the mapping (campaign opened)
+
+No delivery change.  New campaign [`wip/host-expert-pinned-window/`](wip/host-expert-pinned-window/README.md),
+asking whether the **pool** tier can shed its pinned duplicate and let the page cache be the only cache: the pool
+exists because the read-only GGUF mapping is pageable and a no-XNACK GPU cannot read it (issue #116), and a miss
+costs a synchronous `memcpy` out of the page cache on the token's critical path (`moe-expert-cache.cu:1368`,
+`:274`).  The arena stays in every variant -- the question is only what the **fill** reads.
+
+Probe: `wip/host-expert-pinned-window/probe-pinned-window.cpp` (§1-§11) + `probe-copy-path.cpp`
+(`rocprofv3 --memory-copy-trace`).  1x R9700 (gfx1201) at **PCIe 5.0 x16**, ROCm 10.1.0, 35B-A3B Q4_K_M, one
+1.66 MiB expert blob, 40 runs per arm, medians, every arm byte-checked.  Log:
+`runs/probe-20261102-080314.log`.
+
+**Miss path (arena fill), 1.66 MiB expert:** pool `memcpy`+CE **137.3 µs** (host memcpy 50.1 + CE 66.4) vs
+**B (register the mapping range in place + CE) 62.1 µs** (register 1.3 + CE 43.2) -- **2.2x**; 0.75x at 256 KiB,
+**0.40x at 32 MiB**; deferred-unregister B 48.0 µs.  Cold page-cache miss (8 MiB, real disk): pool memcpy
+**17.0 ms** vs register **2.3 ms**.  Sustained from a registered window: **55.7 GB/s** (the x16 ceiling).
+Registration itself is free (0.6 µs at any size up to 256 MiB; the pin is deferred -- one-time 3.0 ms on the
+process's first copy out of registered memory, then full rate).
+
+**A (zero-copy SM read) is not better than B**: 42.3 GB/s in place vs 40.3 GB/s via the CE, equal at every size
+-- so keep the arena and let B serve the fill.  This also retires the "device gather is 35 % slower" worry for
+the *read* itself: the SM saturates the link here, so the in-tree gather's loss is compute interference / the
+head-zero guard / multi-ubatch effects, not read bandwidth (`GGML_SCHED_DEVGATHER` stays default-off).
+
+**Pin / demote contract (the design's steady state), measured:** `hipHostRegister` alone does **not** hold the
+pages -- 8 MiB copies 191 µs warm and **15.1 ms** after `MADV_PAGEOUT` (fault-speed refill), bytes still
+identical (slow, not wrong).  `mlock` + register **is** a hold: 4 MiB warm baseline 92.8 µs, `mlock`+`PAGEOUT`
+**92.3 µs (held)**; demote (`munlock`+`hipHostUnregister`) **92.3 µs** with the pages still cached, re-promote
+**91.4 µs full rate**; 20x demote/re-promote loop: register 0.6 µs, copy 166.7 µs, **no degradation**.
+Constraint: `RLIMIT_MEMLOCK` is **8 MiB** here, so a GiB window needs `LimitMEMLOCK=infinity`/`CAP_IPC_LOCK`;
+without `mlock` the window is "cached but reclaimable" (correct, but a reclaim costs a fault-speed refill).
+
+**No `madvise` in the runtime path:** demote is `munlock` + `hipHostUnregister` and nothing else -- reclaim is
+the default state of a file page, so there is nothing to advise.  `MADV_PAGEOUT` is only the probe's pressure
+source (the test must try to take the pages away to know whether `mlock` holds); the design consequence is the
+SLO, not a call: a demoted range can be reclaimed at any moment, so a re-promote is "cached if we are lucky"
+and the fill must absorb a ~13 ms/8 MiB refill.
+
+**Kept as designed:** the pool still owns the bulk/prefill policy and the "host set larger than RAM" case (§5.5)
+-- a page-cache window cannot prefetch a set that does not fit.  The window is the decode/verify fill tier.
+
+Measurement traps recorded (each produced a wrong number first): `/tmp` is tmpfs here (a cold-page test there
+measures RAM); `POSIX_FADV_DONTNEED` skips pages with PTEs; **`MADV_DONTNEED` cannot test reclaim on a
+`MAP_SHARED` file mapping** -- it drops only the process's PTEs (`VmRSS` fell exactly the 8 MiB of the test
+range) while the page cache keeps the pages (host re-read afterwards 95.7 us for 4 MiB, a cache hit, vs ~8.7 ms
+cold), so it frees no memory and does no I/O; it is also a poor *demote* primitive, because it unpins nothing
+and makes the next **device** fill cost ~1.9 ms/4 MiB while the driver re-establishes its mapping over the
+zapped PTEs.  `madvise(MADV_PAGEOUT)` is used instead -- the only user-space call that asks the kernel to
+reclaim, i.e. to behave like memory pressure; `mincore` is not authoritative for "pinned"; a
+blocking `hipMemcpy` busy-waits at 100 % of wall, so host CPU time cannot separate DMA from a bounce; and a
+host-DRAM contention test gave **opposite verdicts on two runs** (marked VOID in the probe).
+`rocprofv3 --memory-copy-trace` shows one H2D per source and **no kernel**, with the registered source at
+155.6 µs vs the pageable control at 155.9 µs (a `hipHostMalloc` source is *slower*, 241 µs) -- so "direct DMA
+vs internal bounce" remains unresolved, and it does not change any measured number.  No delivery change, no tag.
+
+## 261102.001 (tool) -- `moe-trace-replay.py` scores the decode band by default, so it now calibrates to <0.3 %
+
+No delivery change (a tool fix: no `patches/`, no `release.json`, no new tag).  The replayer's `--score-band`
+default was `all`, justified in its own docstring as *"what the runtime's logged `h=` counts"*.  That premise is
+false.  The runtime's `h=` comes from `moe_cache_update_host`'s access path, and the PREFILL band returns before
+it (whole-table staging, or a decline), so a prefill position never reaches `hits`/`misses`.  Evidence from the
+`wip/host-pool-speed` reference arm (122B-A10B, `-ncmoe 48`, `GGML_MOE_DEVREMAP=0`, 5258-token prompt + 2000
+generated): `takeover=268272` = 144 tables x 1,863 decode steps, and `hits+fills+colds` = **2,145,816** reaches =
+`144 x 1,863 x 8` exactly, while the same trace carries 423 `P` records holding **740,814** prefill positions
+that contribute zero.  Scoring them anyway biased `shipped` down by ~0.15 and is what made the replayer look
+uncalibrated (the previous session's finding F2, which blocked the campaign's "simulate before implementing"
+rule).  With the decode band it lands on the run's own `h=`:
+
+| arena | run's `h=` | `--score-band all` | `--score-band decode` |
+|---|---|---|---|
+| 3,932 MiB / 15 slots | 0.3488 | 0.1956 (-0.153) | **0.3492 (+0.0004)** |
+| 22,517 MiB / 85 slots | 0.7543 | 0.6328 (-0.122) | **0.7513 (-0.0030)** |
+
+Change: `--score-band` defaults to `decode`; the module docstring's accounting caveat now says why (with the
+reach arithmetic), and the `--measured-h` calibration note points at `--seed sidecar:<the run's .moe-heatmap>`
+and `--slots <the run's per-table count>` (the ±1 slot matters: 0.3390 at 14 slots vs 0.3492 at 15).  `all`
+stays available as a diagnostic.
+
+**Two `TwoTier` (pool) model defects fixed in the same change, and the model now predicts the disk tier.**  (a)
+`pool-shipped`'s hand-over evicted the weakest pool entry with `self.p_slot[w] = -1`, which left the evicted
+expert in `p_map` forever — `p_map` grew past `slots_p` (26,769 "resident" experts in 9,216 slots at
+`--pool-frac 25`) and a phantom entry counted as a pool hit; it now calls `p_drop()`, and `p_put()` mirrors
+`pool_slot_assign_locked`'s one-index-per-expert rule.  (b) A cold (admission-rejected) miss was counted as an
+L3/disk read even when the expert was pool-resident, although `MOE_HOST_POOL_COLD` (default 1) reads such an
+expert **in place** from the pool's device alias — a PCIe read of pinned RAM, not a disk read; the new
+`TwoTier.cold_read()` splits `pool_cold` from `l3`, which is what makes `l3` comparable to `/proc/diskstats`.
+Validation against the measured 122B pool arms (`wip/host-pool-speed/HANDOVER.md` §3.2/§4): model L3
+**160.1 / 48.7 / 0.0** MiB per decode token at pool `FRAC` 50 / 80 / 100 against a measured **~163 / ~53 / ~13**
+(the 100 % residual is page-cache warmth in the measured arm).  Before the fix the model said ~460 MiB/token at
+every `FRAC`.  The single-tier `shipped` calibration is unchanged (0.3492 / 0.7513).  With that in place the
+replayer separates a concentration-based per-table pool sizing (`cov90`) from the shipped uniform rule
+(**-42 %** disk bytes/token at `FRAC` 80) and shows that a per-table *heat-mass* sizing is exactly degenerate
+(every table routes `n_used` experts per token, so its total mass is a constant).  Two candidate causes were tested and killed in the same pass: the `ghost`
+reset on admission (the real `access_locked` zeroes it when it admits) moves the decode h by 0.0002, and
+`--churn off` fits neither band.  Study, sweep tool and data: `wip/host-pool-speed/` (`HANDOVER.md` §4/F2,
+`tools/replayer-calib.py`, `data/traces/trace-122b-ncmoe48-devremap0.txt.gz`).
+
+## 261101.021 (docs) -- r206 published: CI green on all three runs, the fork branch at `efaa60db0`
+
+No delivery change (docs only; no new tag).  `v16-6050b467c-r206` is tagged and pushed; `main` is at the r206
+tip commit (`2668977a`).  CI: **Validate delivery set** green on the `main` push and on the tag push (strict
+16/16 apply on a fresh tarball, tree `1bac1001f`, the Windows path + portability lints), **Release patch set**
+green (assets `patches.tar.gz` 1 669 556 B, `rdna-boosts-all.patch` 5 446 468 B, `release.json`, `SHA256SUM`).
+The personal fork's `rdna-boosts` branch was force-pushed to **`efaa60db0`** -- re-cut from `6050b467c` by
+`scripts/fork-refresh.sh`, tree `1bac1001f` reproduced, `release.json.tip` matched.  The first
+`--force-with-lease` was rejected with **`stale info`**: the local `origin/rdna-boosts` tracking ref still named
+`aaf30b6b4` (the r204 tip, because r205's push went out under a different lease), so the lease could not be
+satisfied from a stale ref.  Fix: `git fetch origin rdna-boosts`, then pin the lease explicitly with
+`--force-with-lease=rdna-boosts:<the sha `git ls-remote` reports>` -- worth remembering, because the generic
+`--force-with-lease` cannot recover on its own.  The ROCm container images are built and pushed off-host by the
+worker watcher (`radiance`), which polls for the tag.
+
 ## 261101.020 (r206) -- the slab headroom default is `1152 + 128 x n_gpu` MiB, and block 15 gets the residency gate it shipped without
 
 **Released as `v16-6050b467c-r206` (16 blocks; block 10 amended).**  Fork point unchanged (`6050b467c`), new
