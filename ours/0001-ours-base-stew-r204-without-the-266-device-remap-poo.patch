@@ -1,7 +1,7 @@
-From 18a74320a1c3310fc99b1da5c804de97ec207c3e Mon Sep 17 00:00:00 2001
+From 3c64f0fc2420294702fb3a41e2b6dfdd2706ad66 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 02:18:17 +0000
-Subject: [PATCH 01/49] ours base: stew r204 without the #266 device remap +
+Subject: [PATCH 01/50] ours base: stew r204 without the #266 device remap +
  pool cold (ours carries its own device remap variant)
 
 ---
@@ -19,7 +19,7 @@ Subject: [PATCH 01/49] ours base: stew r204 without the #266 device remap +
  11 files changed, 2 insertions(+), 417 deletions(-)
 
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 8606145fe..df885d7c4 100644
+index 46313d7f7..d0895b884 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -287,11 +287,6 @@ extern "C" {
@@ -47,10 +47,10 @@ index 9e08103b3..619e32b77 100644
  };
  
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 15be30a3c..3e8d0de65 100644
+index 169f901a9..bc67bedd8 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -2998,17 +2998,6 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3043,17 +3043,6 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                  }
              }
  
@@ -110,17 +110,17 @@ index 310a748ca..f67f584ee 100644
  size_t ggml_backend_cuda_fattn_stage_used(ggml_backend_t backend);
  size_t ggml_backend_cuda_h2d_stage_used(ggml_backend_t backend);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f40e3f9cc..26a14f4f3 100644
+index 08eea6151..493633938 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -8624,7 +8624,6 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -8643,7 +8643,6 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_take_over     = */ ggml_backend_cuda_moe_cache_take_over,
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
 -    /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
      /* .moe_cache_pool_backed   = */ ggml_backend_cuda_moe_cache_pool_backed,
+     /* .cpy_tensor_async_nowait = */ ggml_backend_cuda_cpy_tensor_async_nowait,
  };
- 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 index 1dc0fc344..5ff1cb1b9 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu

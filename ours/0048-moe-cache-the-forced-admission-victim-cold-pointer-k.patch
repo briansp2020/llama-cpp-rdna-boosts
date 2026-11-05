@@ -1,7 +1,7 @@
-From a599c0d686aa601ff9f011cc90bd44af3ce261c3 Mon Sep 17 00:00:00 2001
+From 6b6a964d48b535ac86412f06e8ec3863c3e332c1 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 14:05:32 +0000
-Subject: [PATCH 48/49] moe cache: the forced admission victim cold pointer
+Subject: [PATCH 48/50] moe cache: the forced admission victim cold pointer
  kernel launches with its device current
 
 force_admit_locked runs on the eager hook, which does not set the device.  With two GPUs the launch ran with the other

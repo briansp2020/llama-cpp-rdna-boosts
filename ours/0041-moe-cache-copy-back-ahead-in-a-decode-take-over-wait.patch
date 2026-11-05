@@ -1,7 +1,7 @@
-From fe8f81869fb4b54a34ba9926155f7dace92b27dd Mon Sep 17 00:00:00 2001
+From 772ed32124232ef52fc2d4110b3b38122dc6e9a3 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 07:58:55 +0000
-Subject: [PATCH 41/49] moe cache: copy-back ahead in a decode take-over waits
+Subject: [PATCH 41/50] moe cache: copy-back ahead in a decode take-over waits
  on the compute stream only for slots of unknown fill state
  (GGML_MOE_FILL_FENCE)
 

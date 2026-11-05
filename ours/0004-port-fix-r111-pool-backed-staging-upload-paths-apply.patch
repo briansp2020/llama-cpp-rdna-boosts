@@ -1,7 +1,7 @@
-From 67db7f860861d525d256148c9ed83c33d3db4479 Mon Sep 17 00:00:00 2001
+From 4a5eb65fc86a7d8b03784e618bc629981014f499 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 22 Oct 2026 22:26:23 +0000
-Subject: [PATCH 04/49] port fix: r111 pool-backed staging/upload paths apply
+Subject: [PATCH 04/50] port fix: r111 pool-backed staging/upload paths apply
  only in --host-experts pool (table_pool_backed); a sparse mmap table declines
  the 10-arg staging as in r109
 

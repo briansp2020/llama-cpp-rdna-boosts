@@ -1,7 +1,7 @@
-From 2b6b2fa97c3e9ab4df678733e82a4588d07dbc10 Mon Sep 17 00:00:00 2001
+From 461e35f0d93eb21adedce812270e43c1905b7af5 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 20:31:47 +0000
-Subject: [PATCH 20/49] ours: dedup the mmap expert-cache helpers and drop a
+Subject: [PATCH 20/50] ours: dedup the mmap expert-cache helpers and drop a
  no-op (no behaviour change)
 
 - moe_cache_expert_copy: one inlined copy body for the one-fill, stage and route kernels
@@ -19,7 +19,7 @@ Prod model (1 R9700, prod config): greedy a266d1025664, 259.6k needle correct; q
  2 files changed, 122 insertions(+), 182 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 58038d899..8d7934887 100644
+index 6f50465e4..bb1ff9a34 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2034,6 +2034,30 @@ static char * ggml_cuda_pin_chunk(int device, std::unique_lock<std::mutex> & loc
