@@ -1,0 +1,224 @@
+From 4a51474a567225f17ad2ba513cda1f771e258745 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 5 Nov 2026 04:31:26 +0000
+Subject: [PATCH] moe cache: lend the prefill prefetch staging to KV lending
+ between prefills (GGML_MOE_PF_LEND)
+
+The two prefill-prefetch staging buffers (2 x ~957 MiB, kept for the whole run) join the KV-lending victim grid
+while no prefill runs. The first prefetched op of a prefill takes them back (device sync, victims pointed back at
+their fallback); a few decode policy steps without a prefetch lend them again. Single device only; GGML_MOE_PF_LEND=0
+turns it off. Prod model, 1 R9700, 8 pairs: greedy +3.5 %, two streams +4.6 %, prompt -0.6 %, outputs identical
+(FINDINGS 773).
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 125 ++++++++++++++++++++++++-
+ 1 file changed, 124 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 40daed88d..d2cfb178e 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1057,6 +1057,7 @@ struct kvl_tensor_t {
+     char *  data;
+     size_t  bytes;
+     size_t  row_bytes;
++    bool    pf = false;   // a prefill-prefetch staging buffer (GGML_MOE_PF_LEND), lent while g_pf_lent
+ };
+ struct kvl_slot_t {
+     int     tensor;
+@@ -1081,6 +1082,12 @@ static int64_t g_kvl_fills = 0;
+ static int64_t g_kvl_stays = 0;                         // misses served from a victim instead of evicting a resident                         // admissions filled from a victim slot (device to device)
+ static int64_t g_kvl_inserts = 0, g_kvl_hits = 0, g_kvl_misses = 0, g_kvl_drops = 0, g_kvl_takes = 0, g_kvl_gives = 0;
+ static double  g_kvl_ms = 0;
++// GGML_MOE_PF_LEND (default on with KV lending): between prefills the prefill prefetch's two staging buffers hold victim
++// slots too.  The first prefetched layer of a prefill takes them back (a device synchronize, as for KV rows); a few decode
++// policy steps without a prefetch lend them again.
++static bool    g_pf_lent  = false;
++static int64_t g_pf_lends = 0, g_pf_takes = 0;
++static double  g_pf_ms    = 0;
+ 
+ // per table (by index in g_tables): expert -> the victim slot holding a copy of it (-1: none); kept outside table_t
+ static std::vector<std::vector<int32_t>> g_kvl_kvv;
+@@ -1117,7 +1124,11 @@ static char * kvl_ptr(const kvl_slot_t & sl) {
+     return g_kvl_tensors[(size_t) sl.tensor].data + sl.off;
+ }
+ static bool kvl_avail(const kvl_slot_t & sl) {
+-    return (int64_t) sl.off >= g_kvl_line * (int64_t) g_kvl_tensors[(size_t) sl.tensor].row_bytes;
++    const kvl_tensor_t & kt = g_kvl_tensors[(size_t) sl.tensor];
++    if (kt.pf) {
++        return g_pf_lent;
++    }
++    return (int64_t) sl.off >= g_kvl_line * (int64_t) kt.row_bytes;
+ }
+ static bool kvl_eligible(const table_t & t) {
+     return kvl_on() && !g_kvl_tensors.empty() && t.device == g_kvl_device && t.cold_ptrs != nullptr && t.cold_safe &&
+@@ -9131,6 +9142,8 @@ static void verify_all_locked(bool data) {
+                   (long long) bad_ptr, (long long) n_kvv, (long long) bad_kvv);
+ }
+ 
++static void pf_lend_maybe_locked(cudaStream_t s);
++
+ static bool devremap_prep_locked(table_t & t, void * stream) {
+     {
+         static const int64_t verify_at = getenv("GGML_MOE_VERIFY_AT") ? atoll(getenv("GGML_MOE_VERIFY_AT")) : 0;
+@@ -9172,6 +9185,7 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+         const int n = (int) t.dr_lag_n;
+         t.dr_lag_n = 0;
+         route_log_locked(t, 'C', t.dr_lag_host, n);
++        pf_lend_maybe_locked(s);
+         g_kvl_in_decode = true;   // victims only from the decode policy, on the stream that reads cold_ptrs
+         for (int i = 0; i < n && !g_tier_off; i++) {
+             bool cold = false;
+@@ -9347,12 +9361,102 @@ struct pf_dev_t {
+     int          ahead_buf   = -1;
+     uint64_t     ahead_seq   = 0;
+     int64_t      n_hit = 0, n_miss = 0, n_map = 0, n_take = 0;
++    int          n_tab       = 0;
++    cudaStream_t last_s      = nullptr;               // the stream of the last prefetched op (the staging's readers)
++    cudaEvent_t  ev_lend[2]  = { nullptr, nullptr };   // GGML_MOE_PF_LEND: the copy stream / the readers, before lending
++    int64_t      lend_idle   = 0;                     // decode policy calls since the last prefetched op
+ };
+ pf_dev_t g_pf[16];
+ }
+ 
+ static size_t pf_align(size_t x) { return (x + 255) & ~(size_t) 255; }
+ 
++static bool pf_lend_on() {
++    static const bool v = !getenv("GGML_MOE_PF_LEND") || atoi(getenv("GGML_MOE_PF_LEND")) != 0;
++    return v;
++}
++
++// Add the two staging buffers to the KV-lending grid (not lent until the first decode steps after this prefill).
++static void pf_lend_add_locked(pf_dev_t & P, int device) {
++    if (!kvl_on() || !pf_lend_on() || g_kvl_tensors.empty() || device != g_kvl_device) {
++        return;
++    }
++    for (const table_t & t : g_tables) {
++        if (t.device != device) {
++            // the take-back synchronises the device from the split-input hook: with a second device that could hold back
++            // its half of an all-reduce, so lending the staging is single-device only
++            return;
++        }
++    }
++    for (int b = 0; b < 2; b++) {
++        if (cudaEventCreateWithFlags(&P.ev_lend[b], cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return;
++        }
++    }
++    for (int b = 0; b < 2; b++) {
++        kvl_tensor_t kt = { P.buf[b], P.buf_bytes, 0 };
++        kt.pf = true;
++        g_kvl_tensors.push_back(kt);
++        if (!g_kvl_slots.empty()) {   // the grid exists already: this buffer's slots go after it
++            for (size_t off = 0; off + g_kvl_slot_bytes <= kt.bytes; off += g_kvl_slot_bytes) {
++                kvl_slot_t sl;
++                sl.tensor = (int) g_kvl_tensors.size() - 1;
++                sl.off    = off;
++                g_kvl_slots.push_back(sl);
++            }
++        }
++    }
++    GGML_LOG_WARN("moe_cache prefill prefetch: device %d: the 2 x %.1f MiB staging is lent to the KV-lending grid between "
++                  "prefills (GGML_MOE_PF_LEND=0: off)\n", device, P.buf_bytes / 1048576.0);
++}
++
++// The first prefetched layer of a prefill: point the victims in the staging back at their fallback before the copy stream
++// overwrites them.
++static void pf_take_back_locked() {
++    const auto t0 = std::chrono::steady_clock::now();
++    device_guard dg(g_kvl_device);
++    (void) cudaDeviceSynchronize();   // no reader of a victim may be in flight
++    g_pf_lent = false;
++    std::vector<std::pair<uintptr_t *, uintptr_t>> w;
++    for (kvl_slot_t & sl : g_kvl_slots) {
++        if (sl.table >= 0 && !kvl_avail(sl)) {
++            kvl_release_locked(sl, nullptr, &w);
++        }
++    }
++    for (const auto & pw : w) {
++        (void) cudaMemcpy(pw.first, &pw.second, sizeof(uintptr_t), cudaMemcpyHostToDevice);
++    }
++    (void) cudaDeviceSynchronize();
++    (void) cudaGetLastError();
++    g_pf_takes++;
++    g_pf_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++}
++
++// The decode policy, on the stream that makes victims: lend the staging after a few steps without a prefetch.  The
++// staging's last writer (the copy stream) and readers (the prefetched ops) are ordered before the victims' copies.
++static void pf_lend_maybe_locked(cudaStream_t s) {
++    if (g_pf_lent || !pf_lend_on() || g_kvl_device < 0 || g_kvl_stream == nullptr || (void *) s != g_kvl_stream) {
++        return;
++    }
++    pf_dev_t & P = g_pf[g_kvl_device];
++    if (!P.ok || P.ev_lend[0] == nullptr || P.ev_lend[1] == nullptr) {
++        return;
++    }
++    if (++P.lend_idle < 4 * (int64_t) P.n_tab) {
++        return;
++    }
++    (void) cudaEventRecord(P.ev_lend[0], P.cs);
++    (void) cudaStreamWaitEvent(s, P.ev_lend[0], 0);
++    if (P.last_s != nullptr && P.last_s != s) {
++        (void) cudaEventRecord(P.ev_lend[1], P.last_s);
++        (void) cudaStreamWaitEvent(s, P.ev_lend[1], 0);
++    }
++    (void) cudaGetLastError();
++    g_pf_lent = true;
++    g_pf_lends++;
++}
++
+ static bool pf_table_ok(const table_t & t, int device) {
+     return g_sized && !g_tier_off && t.host_sparse && !t.sparse_off && t.arena != nullptr && t.slots >= 2 &&
+            !t.identity && t.device == device && t.ram_base != nullptr && t.ram_bytes > 0 && t.expert_bytes > 0 &&
+@@ -9416,7 +9520,9 @@ static bool pf_init_locked(pf_dev_t & P, int device) {
+         (void) cudaMemsetAsync(P.buf[b], 0, maxb, P.cs);   // finite pad bytes past the last staged expert
+     }
+     P.buf_bytes = maxb;
++    P.n_tab     = n_tab;
+     P.ok = true;
++    pf_lend_add_locked(P, device);
+     GGML_LOG_WARN("moe_cache prefill prefetch: device %d: %d tables in %zu layers, staging 2 x %.1f MiB\n", device,
+                   n_tab, P.layer_tables.size(), maxb / 1048576.0);
+     return true;
+@@ -9496,6 +9602,11 @@ static bool moe_cache_pf_take(const ggml_tensor * weight, const ggml_tensor * we
+     }
+     const cudaStream_t s = (cudaStream_t) stream;
+     device_guard dg(device);
++    if (g_pf_lent && device == g_kvl_device) {
++        pf_take_back_locked();
++    }
++    P.lend_idle = 0;
++    P.last_s    = s;
+     if (map_changed) {
+         memcpy(t.pf_map_host, m.data(), m.size() * sizeof(int32_t));
+         moe_cache_copy_kernel<<<4, 256, 0, s>>>((char *) t.pf_map_dev, (const char *) t.pf_map_hdev, m.size() * sizeof(int32_t));
+@@ -10194,6 +10305,9 @@ void moe_cache_kv_unregister() {
+     }
+     moe_cache_kv_need(INT64_MAX);
+     std::lock_guard<std::mutex> lock(g_mutex);
++    if (g_pf_lent && g_kvl_device >= 0) {
++        pf_take_back_locked();   // the staging's victims go back to their fallback before the grid is forgotten
++    }
+     g_kvl_tensors.clear();
+     g_kvl_slots.clear();
+     for (table_t & t : g_tables) {
+@@ -10268,6 +10382,15 @@ void moe_cache_report() {
+                           (long long) held, (long long) g_kvl_line, (long long) g_kvl_rows, (long long) g_kvl_inserts,
+                           (long long) g_kvl_hits, (long long) g_kvl_stays, (long long) g_kvl_misses, (long long) g_kvl_drops, (long long) g_kvl_fills, (long long) g_kvl_takes,
+                           g_kvl_ms, (long long) g_kvl_gives);
++            if (g_pf_lends > 0 || g_pf_takes > 0) {
++                int64_t pf_held = 0;
++                for (const kvl_slot_t & sl : g_kvl_slots) {
++                    pf_held += sl.table >= 0 && g_kvl_tensors[(size_t) sl.tensor].pf;
++                }
++                GGML_LOG_WARN("%s: KV lending: the prefill prefetch staging lent %lld times, taken back %lld times (%.1f ms), "
++                              "%lld victims held there now\n", __func__, (long long) g_pf_lends, (long long) g_pf_takes,
++                              g_pf_ms, (long long) pf_held);
++            }
+         }
+         GGML_LOG_WARN("%s: RAM tier: %d spares, precopy %s: %lld issued, %lld used (%lld waited), %lld reclaimed; %lld swaps copied back "
+                       "in-stream; %lld misses cold for lack of a spare\n", __func__, g_tier_spares, g_precopy ? "on" : "off",
+-- 
+2.53.0
+

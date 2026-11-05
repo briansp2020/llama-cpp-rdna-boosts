@@ -26,10 +26,10 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 ```
 git checkout 6050b467c
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r209 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 46 patches (0000-0045)
+git am <path-to-this-repo>/ours/*.patch              # 47 patches (0000-0046)
 ```
 
-Result: tree `26ef73be42d8`.
+Result: tree `c7a58b240215`.
 
 ## Patches
 
@@ -60,6 +60,7 @@ Result: tree `26ef73be42d8`.
 | 0042-0043 | review fixes for 0029's fill-through: with every member routed a spare RAM slot takes the expert; the trim keeps a partial tier's registered non-member aliases; a fill waits for the last sparse staging launch on the device (its kernel reads tier slots through source pointers taken at launch); `GGML_MOE_TIER_FILL=0` also turns the share off; 0043 makes the victim-copy check of 0036 skip the spare case | - |
 | 0044 | 0039's forced admission also covers a partial-tier table, for shapes that fit its arena (larger shapes keep the cold reads): with every member routed, no spare free and the pin budget refusing the registration, a tight share otherwise read an unregistered alias (wrong output, then a GPU fault); a force-evicted victim with a copy-back ahead waits for it and keeps that RAM copy, otherwise its cold pointer goes back to the file | `GGML_MOE_FORCE_ADMIT=0` |
 | 0045 | a captured CUDA graph keeps each MoE op's choice between the expert-cache arena (through the slot remap) and the scheduler copy; when a table declined after the capture, the replay read the previous token's remap (wrong experts). The graph now records which ops read the arena and recaptures when that changes; in normal use it never forces a recapture | `GGML_CUDA_GRAPH_MOE_SIG=0` |
+| 0046 | lends the prefill prefetch's two staging buffers (2 x ~957 MiB on the production model, kept for the whole run) to KV lending between prefills: while no prefill runs they hold copies of experts the arena evicted, like the KV rows past the context in use. The first prefetched op of a prefill takes them back (one device sync, the copies dropped); a few decode steps without a prefill lend them again. Single device only | `GGML_MOE_PF_LEND=0` |
 
 The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`, `GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4=0`,
 `GGML_CUDA_MMVQ_CONCAT_REORDER=0`, `GGML_CUDA_ROUTER_TOPK=0`, `GGML_CUDA_DISABLE_GDN_CONV_SNAP=1`,
@@ -103,6 +104,10 @@ r209 vs r209 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-
   output identical, the 259.6k-token needle answered correctly and the 256 tokens after it identical, no faults; graph
   captures 532 vs 543 per load, speed within noise (12 loads per side: greedy -0.4 %, two streams -1.9 %, pass-to-pass
   spread ~4 %). Seven 1-GPU models identical to the r206 release, KLD 0.
+- 0046 on the production config (`GGML_MOE_KV_LEND=1`), 8 interleaved pairs against 0000-0045: greedy decode +3.5 % (95 % CI
+  +2.3..+4.7), two concurrent streams +4.6 % (+2.7..+6.6), fresh 4.4k-token prompts -0.6 % (the take-back, ~32 ms per
+  prompt), greedy and prompt-test output identical in all 16 loads, no faults; one load with the 259.6k-token needle: same
+  prefill speed (1841 t/s), correct answer, the 256 tokens after it identical.
 
 llama-bench `-fa 1 -p 512 -n 128 -r 5`, 2 alternating rounds, tg128 means:
 
