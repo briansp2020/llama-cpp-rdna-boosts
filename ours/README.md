@@ -26,10 +26,10 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 ```
 git checkout 6050b467c
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r209 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 47 patches (0000-0046)
+git am <path-to-this-repo>/ours/*.patch              # 48 patches (0000-0047)
 ```
 
-Result: tree `c7a58b240215`.
+Result: tree `6ffd77d2fd8c`.
 
 ## Patches
 
@@ -61,6 +61,7 @@ Result: tree `c7a58b240215`.
 | 0044 | 0039's forced admission also covers a partial-tier table, for shapes that fit its arena (larger shapes keep the cold reads): with every member routed, no spare free and the pin budget refusing the registration, a tight share otherwise read an unregistered alias (wrong output, then a GPU fault); a force-evicted victim with a copy-back ahead waits for it and keeps that RAM copy, otherwise its cold pointer goes back to the file | `GGML_MOE_FORCE_ADMIT=0` |
 | 0045 | a captured CUDA graph keeps each MoE op's choice between the expert-cache arena (through the slot remap) and the scheduler copy; when a table declined after the capture, the replay read the previous token's remap (wrong experts). The graph now records which ops read the arena and recaptures when that changes; in normal use it never forces a recapture | `GGML_CUDA_GRAPH_MOE_SIG=0` |
 | 0046 | lends the prefill prefetch's two staging buffers (2 x ~957 MiB on the production model, kept for the whole run) to KV lending between prefills: while no prefill runs they hold copies of experts the arena evicted, like the KV rows past the context in use. The first prefetched op of a prefill takes them back (one device sync, the copies dropped); a few decode steps without a prefill lend them again. Single device only | `GGML_MOE_PF_LEND=0` |
+| 0047 | `GGML_CUDA_SLAB_WORK_MIN_MIB` sizes the slab's work band when the model loads. With `GGML_CUDA_SLAB_RING_PREFILL=0`, a prefill view wider than the band learned from the reserves (`-ub 4096`: 2304 MiB vs 1792) was placed above the unused ring candidate; that moved the boundary ~6.6 GB after the arena was filled, evicted arena tables and switched the RAM tier off for the run (decode 83 -> 26 t/s on the production model). Production sets it to 2304 with `-ub 4096 -b 4096` | unset (default): unchanged |
 
 The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`, `GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4=0`,
 `GGML_CUDA_MMVQ_CONCAT_REORDER=0`, `GGML_CUDA_ROUTER_TOPK=0`, `GGML_CUDA_DISABLE_GDN_CONV_SNAP=1`,
@@ -108,6 +109,12 @@ r209 vs r209 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-
   +2.3..+4.7), two concurrent streams +4.6 % (+2.7..+6.6), fresh 4.4k-token prompts -0.6 % (the take-back, ~32 ms per
   prompt), greedy and prompt-test output identical in all 16 loads, no faults; one load with the 259.6k-token needle: same
   prefill speed (1841 t/s), correct answer, the 256 tokens after it identical.
+- 0047 on the production config, `-ub 4096 -b 4096` + `GGML_CUDA_SLAB_WORK_MIN_MIB=2304` against 0000-0046 at `-ub 2048`, 2 loads
+  per side: fresh 101k-token prompt +10.6 %, 259.6k-token needle prefill +12.4 % (125 vs 140 s), 4.4k-token prompts +7.1 %,
+  greedy decode -1.9 %, two concurrent streams -3.3 %, arena 12.7 vs 13.3 GB; no evictions, RAM tier stayed on, no faults, needle
+  correct in every load. This is a batch size change, so it is not output-identical: short-prompt greedy output and the 101k
+  reply are identical, but replies to prompts longer than one 2048-token batch can change. With the env unset, the code path
+  does not change. The cause of the decode loss is not established; the smaller arena is the likely part.
 
 llama-bench `-fa 1 -p 512 -n 128 -r 5`, 2 alternating rounds, tg128 means:
 
