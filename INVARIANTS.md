@@ -1892,3 +1892,82 @@ path.**
 6. **A draft found AHEAD of the target is rejected by BOTH branches**, so the overlapping tail is trimmed
    unconditionally (`pos_max + 1 > pos_first`): a checkpoint restore can put the draft past the position the
    task resumes from, and this call re-ingests those positions anyway.
+
+## r219 -- the host pool's disk tier is an OPTIMISATION, and a failed fill is never resident (issue #274)
+
+1. **A pool fill must never depend on a tier the platform may not have (r219, block 12).**  The bounded host
+   pool's master IS the read-only model mapping, so `src_host` (the mapping) can always serve a fill; the pool's
+   DISK TIER (`MOE_HOST_POOL_DIO=1`, `pread`/`O_DIRECT`) only decides whether the page cache is populated.  The
+   file I/O is a compile-time stub on Windows (`pool_open_file` returns -1, issue #130), so treating it as
+   required failed every fill there.  Measured on Windows (reporter, r209, `--load-mode mmap --n-cpu-moe 47`
+   `--host-experts pool`, 38 GB free against a 40 GB host expert set): **7281 x** `access_locked: async fill
+   failed ... : no error` and `fill_slot_from_host: no pinned host source ... (pool and bounce both
+   unavailable)`, a 4996-token prompt at 20.4 t/s and a ONE-token generation.  r212 had already made
+   `MOE_HOST_POOL_DIO=auto` mirror `--load-mode` (a mapped load fills buffered), which removes the default path
+   into this -- but the mode is one env var away, and the failure mode was silent corruption, not a slow run.
+   The fix: the disk tier is best-effort everywhere (`pool_fill_slot_locked`, `expert_host_src`'s bounce ring),
+   a requested O_DIRECT is refused with one WARN on a platform without the file I/O, and a pool whose disk read
+   fails falls back to the mapping instead of marking itself failed.  Reproduced on Linux with the new
+   `MOE_HOST_POOL_DIO_FAULT` diagnostic; the pre-fix build then shows the issue's exact two messages and
+   garbage text (`b7e2732392540006`), the fixed build is byte-identical to the shipped arm (`a99ccbd97ecb`).
+2. **A failed fill must ROLL BACK: a slot is never resident because a copy was attempted.**  `access_locked()`
+   registered `t.expert_slot[expert]` and returned the arena pointer BEFORE the copy, so a fill that could not
+   be serviced left a resident slot holding whatever the arena had there.  That is a wrong answer, not a slow
+   one (the reporter's one token, `h=0.4939`), and its only trace was `cudaGetErrorString(cudaGetLastError())`
+   = `"no error"` -- `cudaGetLastError()` is empty for a host-side failure, which is why the message looked like
+   a driver note.  The admission now rolls back, the table is marked `fill_failed` and stands down wholesale
+   (`moe_cache_update_host`, `moe_cache_get_table`), so the scheduler serves the op from the host master, and
+   the census reports `FAILED fills: N` plus `the slot is NOT resident` per table.  Measured with
+   `MOE_HOST_POOL_FILL_FAULT`: 2790 rolled-back fills and **byte-identical** text to the shipped arm
+   (`a99ccbd97ecb`); the first cut of the rollback alone was NOT enough -- it left the eager take-over emitting
+   pool-cold ids for a table whose arena was empty, and that arm ran garbage (`b7e2732392540006`), which is why
+   the stand-down is part of the fix and `gate-host-pool.sh` gates the text, not just the log.
+3. **A one-off tier decision at INFO is invisible.**  `common_log_get_verbosity()` maps `GGML_LOG_LEVEL_INFO`
+   to `LOG_LEVEL_TRACE` against a default threshold of `LOG_LEVEL_INFO`, so at the default verbosity an operator
+   sees only WARN and above.  The reporter's log therefore contained every FAILURE and none of the decisions
+   that produced them: no `host experts:` tier census, no `host pool enabled`, no per-table `host pool (...)`
+   build line, no fill mode.  `report_host_expert_placement()` is now WARN (it is a one-off decision line, the
+   same class as `MoE expert cache (auto): arena ...`) and it carries the pool-source count
+   (`141/141 pool sources registered`), which is the first number a "the pool never appeared" report needs.
+   Do not "quiet" a decision line back to INFO: at the default level it does not exist.
+
+---
+
+## r220 -- a backend-count gate is inert under `-sm tensor`; the copy event must be per copy (PR #268)
+
+1. **`-sm tensor` is ONE backend, whatever the device count.**  `llama_prepare_model_devices()` wraps
+   N devices in a single **Meta device** (`ggml_backend_meta_device`), and `llama_context` creates one
+   backend per `model.devices` entry, so anything gated on "how many non-CPU backends" sees `1` under
+   `-sm tensor --device 0,1,2` (measured, 3 x R9700).  A feature that pairs *backend schedulers* can
+   therefore never reach a tensor split, and no amount of extra GPUs changes that: pairing devices inside
+   the Meta device is a different feature.  The same gate is also inert under **plain `-sm layer`**,
+   because the scheduler's own pipeline parallelism is enabled there
+   (`pipeline_parallel = n_devices > 1 && all layers on GPU && -sm layer && offload_kqv &&
+   !has_tensor_overrides() && moe_cache_size == 0`), and a two-lane prefill declines when it is on.  The
+   reachable case is a layout where pipeline parallelism is *already* off -- `--override-tensor`, `-sm row`
+   -- which is exactly the layout the PR was measured in.  **Measure a scheduler feature's REACHABILITY
+   before its gain** (`optional/two-lane-prefill/README.md` carries the table).
+2. **A queued HIP stream wait binds to the LATEST record, so a shared copy event re-binds consumers.**
+   The cross-backend split-input copy used to record the backend's shared per-device `copy_event` and make
+   the destination stream wait on it.  A copy still in flight re-records that event, and a wait that is
+   already queued then resolves against the newer record: independent cross-backend copies serialize
+   against each other.  @slavap hit it as ~0 % overlap in a two-lane prefill (PR #268) and it is reachable
+   in this delivery wherever two copies overlap, which the pipelined layer split does.  r220 makes the
+   ordering event **per copy** (`cpy_tensor_async_nowait` + a per-source-backend ring, re-recording a slot
+   only after its previous record completed) and keeps `GGML_SCHED_COPY_EVENT=shared` as the A/B kill
+   switch.  Bit-exact: same-seed greedy text identical on `-sm tensor`, `-sm layer` and `-sm layer -ncmoe`,
+   and throughput-neutral (pp8192 3-GPU `-sm layer` 6311 vs 6317 t/s) -- the repair is a decoupling, not a
+   speedup on a box where the copies were not actually contending.
+3. **An overlap technique buys nothing on devices of equal throughput.**  With identical cards every split
+   is already the critical path, so a second ubatch in flight adds queueing and no work: measured +0.03 %
+   (MoE 35B-A3B Q8_0) and nil (dense 27B Q6_K_XL) with the pair engaged (`pair decided: splits a=4 b=4,
+   interleaved=1`) on 3 x R9700.  The submitter's +34 %/+13 % are a 7900 XTX (gfx1100) + V620 (gfx1030)
+   pair, whose devices differ ~3x: the overlap hides an imbalance.  A device-heterogeneous layout is not
+   one of this delivery's validated configurations, which is why that feature is `optional/`, not a block.
+4. **A `hip*` spelling in `ggml-cuda.cu` needs the `#ifdef GGML_USE_HIP` form.**  `ggml-cuda.cu` still
+   builds under nvcc for CUDA, and `hipEventDefault` / `hipEventElapsedTime` have no `cuda*` alias in this
+   toolchain (using `cudaEventElapsedTime` in a HIP build fails with `use of undeclared identifier`).  The
+   file's precedent is `#ifdef GGML_USE_HIP ... #else cudaEventDefault ... #endif`; an unguarded `hip*`
+   call breaks the CUDA build (PR #268 did, fixed in the optional artifact's rebase).  Related: do not
+   switch every backend event to a **timing** event to serve one diagnostic -- create the timing event only
+   on the debug path, or the cost lands on users who never set the knob.

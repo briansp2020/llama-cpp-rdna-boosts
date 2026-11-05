@@ -1,3 +1,192 @@
+## 261105.006 (r220) -- PR #268 assessed: the copy-event fix is promoted into block 12, the two-lane prefill becomes the first `optional/` artifact
+
+**Released as `v16-6050b467c-r220` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),
+canonical tip **`4be5690b696ae635cbbcd5ab8303a3d0cd7bc2d4`**, tree
+**`e77a08d9d2f553b53fdbae19b50d5e61b3a2200c`**.  Contribution: **[PR #268](https://github.com/stew675/llama-cpp-rdna-boosts/pull/268)
+by @slavap** -- a two-lane prefill (`LLAMA_PREFILL_LANES`, two consecutive prefill ubatches on two backend
+schedulers with interleaved splits) plus the copy-event diagnosis that made it work.  Cut against r205; rebased,
+reviewed, and split into two very different fates.
+
+### The assessment (all measured here, 3 x R9700 / gfx1201)
+
+1. **It cannot reach either split this delivery validates -- measured, not inferred.**  The feature's gate
+   counts non-CPU *backends* (`n_gpu >= 2`), and under `-sm tensor` this tree has exactly **one**: a tensor
+   split is a single **Meta device** wrapping N GPUs (`llama_prepare_model_devices` ->
+   `ggml_backend_meta_device`).  Measured: `sched_reserve: LLAMA_PREFILL_LANES ignored (n_gpu = 1,
+   pipeline_parallel = 0)`.  Plain `-sm layer` is refused too, because the scheduler's own pipeline
+   parallelism is enabled in exactly that configuration: `ignored (n_gpu = 3, pipeline_parallel = 1)`.  The
+   only reachable layouts are ones where pipeline parallelism is *already* off (`--override-tensor`, `-sm
+   row`) -- which is the submitter's MoE layout (`-sm layer -ts 1,0 -ot ...`).  **The PR's own dense
+   reference layout (`-sm layer -ts 1,1`, no `-ot`) is refused on the base it targets**, so the +13.3 % it
+   reports was not measured with this patch on this base.
+2. **On balanced devices the overlap buys nothing, with the pair engaged.**  Same binary, env-gated A/B,
+   pp8192 / `-ub 2048`, `-r 3`, two rounds in ABBA order, `pair decided: splits a=4 b=4, interleaved=1` in
+   both shapes: MoE 35B-A3B Q8_0 **+0.03 %** (6132.3/6182.2 vs 6130.5/6188.7 t/s), dense 27B Q6_K_XL
+   **nil** (1210.1/1201.0 vs 1204.0/1202.5).  The submitter's **+34 % / +13 %** are an RX 7900 XTX (gfx1100)
+   + Radeon Pro V620 (gfx1030) pair, whose devices differ **~3x** in throughput: the fast card waits on the
+   slow one at every split and a second ubatch fills that wait.  It is an **imbalance-hiding** technique, not
+   a general prefill win, which is why it is not a block (`INVARIANTS.md` r220 facts 1 and 3).
+3. **Two defects that would have shipped with it.**  `hipEventDefault` / `hipEventElapsedTime` were spelled
+   unconditionally in `ggml-cuda.cu`, which still builds under nvcc for CUDA and has no `cuda*` alias for
+   them (the tree's own precedent is the `#ifdef GGML_USE_HIP` form) -- an unguarded `hip*` call is a CUDA
+   build break; and *every* backend event was switched to a **timing** event so one diagnostic API could
+   work, a debug cost on users who never set the knob.  Both are fixed in the artifact below.
+
+### What shipped: the copy-event fix (block 12)
+
+The diagnosis is the valuable half and it is **not** about two lanes: the scheduler's cross-backend
+split-input copy recorded the backend's **shared** per-device `copy_event` and waited the destination
+stream on it, and a queued HIP stream wait resolves against the **latest** record at execution -- so a copy
+still in flight re-records the event and re-binds the consumers already queued on it, serializing
+independent copies.  That is reachable in this delivery wherever two copies overlap (the pipelined layer
+split does it).  `cpy_tensor_async`'s body is now `cpy_tensor_async_impl(..., ev_nowait)`; the new optional
+iface member `cpy_tensor_async_nowait` takes a **caller-owned** event, recorded on the source stream right
+behind the copy and waited on by the consumer, so no wait is ever re-bound.  The scheduler keeps a ring of
+those events per source backend (a slot is re-recorded only after its previous record completed) and
+restarts the rings at every full synchronize.  `GGML_SCHED_COPY_EVENT=shared` restores the old path (kill
+switch, A/B and bisection; `ENVIRONMENT.md` §2).
+
+**Bit-exact and throughput-neutral** (pp8192 3-GPU `-sm layer`: 6311 vs 6317 t/s): the repair decouples
+copies, it is not a speedup where they were not contending -- and on this box they were not.
+
+### What shipped: `optional/` -- a new artifact category (and the first artifact in it)
+
+Reviewing this patch produced a category the repo did not have.  `beta/` is a *validation window* for a
+promotion candidate; this is a *finished* feature with **no validated win on the delivery's own
+configurations**, which would put unvalidated code in everyone's build and owe the full gate ladder for a
+feature most consumers cannot reach.  `optional/<name>/` now holds exactly that (`AGENTS.md`,
+`optional/README.md`): a patch cut against the **current `release.json` tree**, rebased onto every release,
+applied only by `scripts/apply-all.sh --include-optional` (strict `git am` on the verified tree; a 3-way
+merge is refused, because a stale cut must fail loudly), reviewed for build / default-path neutrality /
+cross-backend consistency, and **not covered by the delivery's gates**.
+
+`optional/two-lane-prefill/` (sha256 `07b7bf14d5080f…`, applied tree `ada5e221e34b77aeffbb3747d16b126f022c3d5b`)
+is the PR rebased onto r220 and reduced: it **drops** the copy-event machinery and the per-copy ring (the
+delivery carries them now, so the artifact uses `ggml_backend_sched_next_copy_event` /
+`cpy_tensor_async_nowait` instead of redefining them -- the naive rebase produced a duplicate ring **and a
+duplicate free loop, i.e. a double free and an abort at exit**, which is how it was found), fixes the CUDA
+portability and the timing-event cost, and documents the reachability table above instead of implying
+`-sm layer -ts 1,1` works.  Verified on the new base: pair engages under `-ot` (`splits a=4 b=4,
+interleaved=1`), greedy text byte-identical between lanes and to the delivery build
+(`61d387d6e21c` on the `-ot` layout, `d34f2e4e737c` on `-sm tensor`), no abort, default path unchanged.
+
+### Gates
+
+`scripts/validate-set.sh` green (checksums, fresh-tarball strict apply, 16 blocks, tree `e77a08d9`).
+Coherence: same-seed greedy identical to r219 on `-sm tensor`, `-sm layer` and `-sm layer -ncmoe 20`
+(`d34f2e4e737c`), and the kill-switch arms agree (`GGML_SCHED_COPY_EVENT=shared`,
+`GGML_MOE_DEVREMAP=0`).  `scripts/gate-prefill-logits.sh` **PASS** -- mean KLD **0.000000**, same-top-p
+**100.000 %** (bit-identical, as a data-movement change must be).  `scripts/gate-per-block-build.sh
+--changed-from 2f7761bf5` **2/2** (amended block 12 + tip, `all` target).  `scripts/gate-host-pool.sh`
+**18/18** (four arms byte-identical, `a99ccbd97ecb`) -- it owns this file.  MTP: r219 vs r220 on the 27B
+`draft-mtp` arm is 104.3 vs 104.4 t/s and `none` 40.9 vs 40.9, with `llama-batched-bench -npl 1,4,8`
+within noise -- a *reduced* Protocol A (one axis, `-c 8192`) rather than the four-axis sweep, because the
+change is bit-exact (KLD 0.000000) and acceptance is a function of token ids that did not move.  GPU faults:
+`check-gpu-faults.sh` clean over the whole session window; the journal's only `page fault` entries are from
+2026-11-04 (the previous day's work).  Not run: `gate-kv-residency.sh` -- the change is not in the KV
+window/region provider, `is_streaming()` or the sparse decode arm.
+
+### What was declined, and why
+
+Block status (a block carries a validated win on a validated config -- this has none in any reachable
+layout), and default-on status (a feature with no measurable win here would cost everyone a second set of
+compute buffers and a second scheduler).  The reachability and imbalance findings are `INVARIANTS.md` r220;
+the artifact's future is in `optional/two-lane-prefill/README.md` (promotion needs an imbalanced
+multi-device pair as a validated target).
+
+## 261105.005 (r219) -- issue #274: on Windows the host pool's fills could not be serviced, and a failed fill was served as resident (block 12)
+
+**Released as `v16-6050b467c-r219` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),
+canonical tip **`2f7761bf5`**, tree **`d9a6468856304e9cf81fbfebcfe5c9366ec10c26`**.  Reported by **@DanoPTT**
+([issue #274](https://github.com/stew675/llama-cpp-rdna-boosts/issues/274)) on **Windows 11 / ROCm 10.0**, one
+R9700, 47.3 GB RAM, Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS with `--n-cpu-moe 47 --host-experts pool --load-mode
+mmap`: a 4996-token prompt prefilled at **20.4 t/s**, `MoE arena = 0.4939`, and greedy generation stopped after
+**one token**.  Every diagnostic below is reproducible with the two new diagnostic knobs, which is the point:
+this box has no Windows toolchain (`TODO` #95), so the platform state and the forced failure are now *arms*.
+
+### What was wrong (two defects, and the reporter's log named both)
+
+1. **The pool's DISK TIER was treated as required.**  A fill has two possible sources: the read-only model
+   mapping (a `memcpy` out of the page cache -- always present, because a pool's master *is* that mapping) and
+   the pool's disk tier (`MOE_HOST_POOL_DIO=1`, `pread`/`O_DIRECT`).  The file I/O is a **compile-time stub on
+   Windows** (`pool_open_file` -> -1, the issue-#130 portability shape), so with the disk tier selected every
+   pool fill failed, `pool_fill_empty_locked` marked the pool `failed`, and `table_pool_locked()` returned null
+   for the rest of the run -- the pool "never appeared".  The per-table bounce fallback then asked for the same
+   missing tier and returned false: `fill_slot_from_host: no pinned host source for layer=37 ... (pool and
+   bounce both unavailable)`.  **The reporter reached the disk tier by default**: r209's `MOE_HOST_POOL_DIO=auto`
+   chose `O_DIRECT` whenever `pool + host set > MemAvailable` (30 GB + 40 GB against 38 GB), which is exactly
+   their box.  r212 has since made `auto` mirror `--load-mode` (a mapped load fills buffered), so the default
+   path into this is gone -- but the mode is one env var away and the failure was silent corruption.
+2. **A fill that failed was recorded as RESIDENT.**  `access_locked()` registered `t.expert_slot[expert]` and
+   returned the arena pointer *before* the copy, so a failed fill left the slot serving stale bytes: the arena
+   "hit rate" (`h`) still looked plausible, the text was garbage, and the only trace was
+   `access_locked: async fill failed table layer=1 role=blk.1.ffn_gate_exps.weight expert=320: no error` --
+   `cudaGetLastError()` is empty for a host-side failure, so the message hid the cause.  The reporter guessed
+   this half of it ("the fill also still returns the slot as resident") and was right.
+3. **The decisions were invisible.**  Every line that would have explained the state (`host experts:` tier
+   census, `host pool enabled`, the per-table `host pool (...)` build line, the fill mode) is `GGML_LOG_INFO`,
+   and `common_log_get_verbosity()` maps INFO to `LOG_LEVEL_TRACE` against a default threshold of
+   `LOG_LEVEL_INFO`: at the default verbosity an operator sees **only** WARN and above, i.e. every failure and
+   none of the decisions.  That is why a pool that had *failed* looked like a pool that was never requested.
+
+### The fix (block 12, no new default, no behaviour change where the disk tier exists)
+
+* The disk tier is **best-effort everywhere**: `pool_fill_slot_locked()` falls back to the mapping when the
+  file cannot be opened or a read fails (it must not fail the pool), `pool_mirror_bulk_fill_locked()`'s failure
+  now falls through to the ranked per-slot path, `expert_host_src()`'s bounce ring falls back to the mapping
+  instead of returning false, and `pool_dio_effective()` **refuses** a requested `O_DIRECT` on a platform with
+  no pool file I/O, with one WARN.  The pool, its pin and the in-place cold read are untouched.
+* A failed fill **rolls the admission back** (no `expert_slot` entry, the fill counters undone), the census
+  reports `FAILED fills: N`, and the message carries the real cause (`cudaGetErrorString(err)`, once per table
+  plus every 10000th).  The table is then marked `fill_failed` and **stands down wholesale**
+  (`moe_cache_update_host`, `moe_cache_get_table`) -- the same policy as `alloc_failed` -- so the scheduler
+  serves the op from the host master instead of the arena.  The stand-down is *part of the fix*, not a
+  belt-and-braces: with the rollback alone, the eager take-over still emitted pool-cold ids for a table whose
+  arena was empty and the arm produced garbage (the first cut measured `b7e2732392540006`, i.e. wrong).
+* `report_host_expert_placement()` is **WARN** (a one-off decision line, the same class as
+  `MoE expert cache (auto): arena ...`) and carries the pool-source count (`141/141 pool sources registered`),
+  which is the first number a "the pool never appeared" report needs.
+
+### Reproduced, then gated -- with the Windows shape as a gate arm
+
+No Windows box here, so the platform state is an env: **`MOE_HOST_POOL_DIO_FAULT=1`** makes the pool's file
+I/O report "not available" (the Windows stub, on Linux) and **`MOE_HOST_POOL_FILL_FAULT=1`** makes
+`expert_host_src()` fail for a pageable master.  Pre-fix, on the instrumented reproduction build (the fault
+injection alone), the `nodisk` arm prints **7281** `async fill failed ... : no error` and
+`no pinned host source ... (pool and bounce both unavailable)` and generates
+`b7e2732392540006` -- garbage after "We need answer".  Post-fix the same arm is byte-identical to the shipped
+arm (`a99ccbd97ecb`).  New gate `scripts/gate-host-pool.sh` (four arms: shipped / `MOE_HOST_POOL_DIO=1` /
+`MOE_HOST_POOL_DIO_FAULT=1` / `MOE_HOST_POOL_FILL_FAULT=1`) is 18/18, registered in `MANIFESTS.md` (the block-12
+row), `scripts/README.md` and the `AGENTS.md` gate table.
+
+### Gates (gfx1201, ROCm 10.1.0, `~/bin/build-llama-rocm`; `build-base` = r217, commit `541a94a32`)
+
+| gate | result |
+|---|---|
+| `gate-host-pool.sh` | **PASS 18/18** -- the three healthy arms byte-identical (182 chars `a99ccbd97ecb`) with a live pool (55272 / 54990 / 54849 slots of 512, 30.6 / 30.5 / 30.4 GiB pinned; fill mode buffered / **O_DIRECT** / buffered) and **no** fill failure; `nodisk` logs the refusal (not vacuous); `fail` is byte-identical too, with **2790** rolled-back fills, `the slot is NOT resident` per table, and no `async fill failed` |
+| pool kill-switch arms (Flash-Next `-ncmoe 47`, 1 GPU) | text identical in all four: shipped, `MOE_HOST_POOL_COLD=0`, `GGML_MOE_DEVREMAP=0`, and a fresh default arm (`abe986e7eeee35d7`) |
+| coherence, same-seed greedy vs `build-base` | text **identical 6/6**: 4B Q8_0 1 GPU `7e6229b260f6` (= 3 GPU `-sm tensor`), 27B UD-Q4_K_XL 1 GPU and `draft-mtp n3` `d45e2221805a`, 35B-A3B `-ncmoe 40` 2 GPU `-sm layer` and 3 GPU `-sm layer` `461ca8cd0e88` (the 2-GPU host arm re-ran 69.7/70.0 vs 70.3/70.1 t/s: flat) |
+| MTP four-axis (27B UD-Q4_K_XL, 1 GPU, `-c 32768`, bf16 KV, `-n 2000`, adaptive, seed 42) | text identical 4/4 to r217 **and** to r218's recorded hashes (R `0ffad0c34953` 9243, P `4f0d1ea854e9` 5830, C `95603a6a89a4` 8966, K `a87c4318b649` 2174); acceptance **bit-identical** (R 0.52690 = 1224/2323, P 0.81305 = 1383/1701, C 0.86236 = 1441/1671, K 0.99200 = 372/375, mean len 2.58/3.44/3.59/3.98); t/s flat (54.6/71.2/74.9/82.8 vs 54.3/71.1/75.0/82.8) |
+| 2-slot server, **sequentially** driven (35B-A3B `-ncmoe 40`, 2 GPU `-sm layer`, `--parallel 2 --kv-unified`) | slot 0 and slot 1 text identical on both builds (`ffe5048f3f82`, 107 chars) and throughput flat (69.9/71.2 vs 71.0/70.9 t/s) -- never a concurrent diff (`GREEDY-PURITY.md` §38/§82) |
+| `llama-batched-bench -npl 1,4,8` (35B-A3B `-ncmoe 40`, 2 GPU) | tg128 B=1 **69.18 vs 69.30**, B=4 **210.08 vs 210.07**, B=8 **306.59 vs 305.01**, pp512 3045 / 3096 vs 3094 / 3110; both builds report the same mirror pool (120 tensors, 30720 slots, 18662 MiB pinned, h=1.0000) |
+| prefill logits (`gate-prefill-logits.sh`) | **0.000000 / 100.000 %** |
+| per-block build (`--fast --tip 1beee61a6 --changed-from f235fdaee`) | **2/2** (block 12 13 s, the tip 7 s); blocks 13-15 patch-ids unchanged |
+| GPU faults (`check-gpu-faults.sh --since "4 hours ago"`) | clean (the journal's last faults are 2026-11-04, before this session) |
+| `validate-set.sh` | GREEN -- checksums, strict **16/16** on a fresh tarball, tree == `release.json.tree`, Windows portability lint 287 files |
+
+### Notes
+
+* `SLAB_STATS ... pool=%.1f MiB` is the **CUDA async pool**, not the host pool -- the reporter read `pool=4.4
+  MiB` as "the host pool is 4.4 MiB" and that number says nothing about it.  The host pool's own census is
+  `moe_cache_report: host pool (L2): N tensors, N slots, N MiB pinned` (WARN, at exit).
+* Two diagnostics are added (`MOE_HOST_POOL_DIO_FAULT`, `MOE_HOST_POOL_FILL_FAULT`), both in `ENVIRONMENT.md`
+  as `diagnostic` class and both reachable only from `gate-host-pool.sh`.  Nothing is gated off by default and
+  no default changed: a mapped load already fills buffered since r212.
+* `--host-experts pool` is the deprecated spelling of `-lme auto` and still selects the pool (mode `AUTO`,
+  which places every host expert in the mapping and sizes the pool); the reporter's flag was right.
+* The gate was re-run against the re-cut release tree (`2f7761bf5`) after `fork-refresh.sh`: 18/18 again, the
+  same four text hashes.  Its per-arm `Prompt:` figures are warmup noise (a 22-token prompt) and are not gated.
+
 ## 261105.004 (r218) -- issue #272: a partially reused prompt invalidated the drafter's KV (blocks 02 and 12)
 
 **Released as `v16-6050b467c-r218` (16 blocks; blocks 02 and 12 amended).**  Fork point unchanged (`6050b467c`),
