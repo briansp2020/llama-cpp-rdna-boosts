@@ -1,0 +1,97 @@
+From 95529db77c54a48e99f8ec03404a0f155e48d7ca Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 5 Nov 2026 14:56:21 +0000
+Subject: [PATCH 49/49] kv lending: the main indexer key cache follows the
+ attention cache lend line (GGML_MOE_KV_LEND_IDX)
+
+The keys-only indexer cache uses the attention cache slot layout, so rows past the attention line are idle in it too.
+Its tensors join the victim grid under the same line; a take-back zeroes them with the others.  =0 keeps it out.
+---
+ src/llama-kv-cache.cpp          | 35 ++++++++++++++++++++++++++++++++-
+ src/llama-kv-cache.h            |  2 ++
+ src/llama-memory-hybrid-idx.cpp |  3 +++
+ 3 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 49c61bb99..521db18d5 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1156,6 +1156,39 @@ void llama_kv_cache::lend_attach() {
+                    __func__, n, (int) (2 * layers.size()), get_size());
+ }
+ 
++// The indexer's keys-only cache uses the attention cache's slot layout, so the attention cache's lend line covers its
++// rows too.  GGML_MOE_KV_LEND_IDX=0 keeps it out.
++void llama_kv_cache::lend_follow(const llama_kv_cache & owner) {
++    const char * e = getenv("GGML_MOE_KV_LEND_IDX");
++    if ((e != nullptr && atoi(e) == 0) || g_kv_lend_owner != &owner || other || n_stream != 1 || v_trans || kv_region ||
++        has_kv_pool() || layers.empty() || get_size() != owner.get_size()) {
++        return;
++    }
++    for (const auto & layer : layers) {
++        if (layer.v != nullptr || layer.k == nullptr || layer.k->buffer == nullptr || !ggml_is_contiguous(layer.k) ||
++            layer.k->ne[1] != (int64_t) get_size() || layer.k->ne[2] != 1) {
++            return;
++        }
++    }
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layers[0].k->buffer));
++    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++    auto reg_fn = reg ? (llama_kv_lend_register_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_kv_register") : nullptr;
++    if (reg_fn == nullptr) {
++        return;
++    }
++    int n = 0;
++    size_t bytes = 0;
++    for (const auto & layer : layers) {
++        if (reg_fn(layer.k->data, ggml_nbytes(layer.k), layer.k->nb[1], (int64_t) get_size())) {
++            n++;
++            bytes += ggml_nbytes(layer.k);
++        }
++    }
++    lend_follower = n > 0;
++    LLAMA_LOG_WARN("%s: KV lending: %d of %d indexer key tensors (%.0f MiB) follow the attention cache's line\n",
++                   __func__, n, (int) layers.size(), bytes / 1048576.0);
++}
++
+ void llama_kv_cache::lend_need(uint32_t at_least) const {
+     if (g_kv_lend_owner != this || g_kv_lend_need == nullptr) {
+         return;
+@@ -2430,7 +2463,7 @@ bool llama_kv_cache_context::is_streaming(uint32_t n_kv) const {
+ }
+ 
+ llama_kv_cache::~llama_kv_cache() {
+-    if (g_kv_lend_owner == this) {
++    if (g_kv_lend_owner == this || lend_follower) {   // a follower goes first (lending ends while the owner's rows live)
+         if (g_kv_lend_unregister != nullptr) {
+             g_kv_lend_unregister();
+         }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 9f81f57e1..0ca8d1314 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -279,6 +279,8 @@ public:
+ 
+     // KV lending (GGML_MOE_KV_LEND=1): this cache's rows past the context in use may hold MoE expert copies
+     void lend_attach();
++    void lend_follow(const llama_kv_cache & owner);   // keys-only cache on owner's slot layout: lent by owner's line
++    bool lend_follower = false;
+     void lend_need(uint32_t at_least) const;   // the next write or read reaches up to row `at_least`
+ 
+     //
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 1cc8a5304..0c8d3b4d3 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -115,6 +115,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+     derived_enabled = env_cache == nullptr || std::atoi(env_cache) != 0;
+ 
+     if (mem_idx) {
++        if (hparams_idx.indexer_kpool == 0) {   // the k-pool path uses row n_kv as a sentinel member, which may be lent
++            mem_idx->lend_follow(*get_mem_attn());
++        }
+         pool_create(model, filter_idx);
+     }
+ }
+-- 
+2.53.0
+

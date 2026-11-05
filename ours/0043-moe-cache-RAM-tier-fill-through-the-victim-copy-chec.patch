@@ -1,7 +1,7 @@
-From 876a1f313d7b37f76f49f2324dfec46aa2c30d9a Mon Sep 17 00:00:00 2001
+From 4d6bfb177e4be23dd48faeb7e46953d72bbf149f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 18:03:13 +0000
-Subject: [PATCH 43/45] moe cache RAM tier fill-through: the victim-copy check
+Subject: [PATCH 43/49] moe cache RAM tier fill-through: the victim-copy check
  skips v = -1 (a spare took the expert, no member was displaced)
 
 ---
@@ -9,7 +9,7 @@ Subject: [PATCH 43/45] moe cache RAM tier fill-through: the victim-copy check
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 2aeafa2ef..cfa8f7083 100644
+index 5d0558e0a..b755a2d70 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1852,7 +1852,7 @@ static bool tier_fill_through_locked(table_t & t, const std::vector<int32_t> & u

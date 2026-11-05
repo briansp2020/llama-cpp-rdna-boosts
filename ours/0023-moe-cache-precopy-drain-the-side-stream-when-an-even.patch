@@ -1,7 +1,7 @@
-From a03e0e16c6c19d9dfdcfa07eb7a0dbbce37fa359 Mon Sep 17 00:00:00 2001
+From 84868e6ecbd0ef26684d779ec3d0452bda41284a Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 1 Nov 2026 16:15:27 +0000
-Subject: [PATCH 23/45] moe cache precopy: drain the side stream when an event
+Subject: [PATCH 23/49] moe cache precopy: drain the side stream when an event
  record fails after a launch; a failed wait fails the swap
 
 ---
@@ -9,7 +9,7 @@ Subject: [PATCH 23/45] moe cache precopy: drain the side stream when an event
  1 file changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 73d1c016e..2b89fe751 100644
+index 01f47d2bc..1ad50aefd 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1201,6 +1201,8 @@ static void precopy_plan_locked(table_t & t, void * stream, const int32_t * prot

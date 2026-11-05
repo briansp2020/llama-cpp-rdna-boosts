@@ -1,7 +1,7 @@
-From 45038de51aaa7a1dbbaa009e878d49116e7d42d6 Mon Sep 17 00:00:00 2001
+From d1b1d02ad9c627a0194655a77bdc86a7f81d3a65 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 23 Oct 2026 03:52:11 +0000
-Subject: [PATCH 06/45] llama-context: LLAMA_UB_SMALL_SPLIT only for causal
+Subject: [PATCH 06/49] llama-context: LLAMA_UB_SMALL_SPLIT only for causal
  prompt chunks (<= 1 output) and when K > the recurrent rollback tail (review:
  split_equal assert with n-max >= K-1; non-causal; multi-stream verify
  batches)
@@ -12,7 +12,7 @@ Subject: [PATCH 06/45] llama-context: LLAMA_UB_SMALL_SPLIT only for causal
  1 file changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2d835ed55..dbbffb8a6 100644
+index 9fa27f561..3ed03452c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3234,8 +3234,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {

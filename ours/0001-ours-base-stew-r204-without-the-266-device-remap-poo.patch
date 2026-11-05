@@ -1,7 +1,7 @@
-From c115ba2c2cac5dcfe44f33376ea5f552dcd1f935 Mon Sep 17 00:00:00 2001
+From 18a74320a1c3310fc99b1da5c804de97ec207c3e Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 02:18:17 +0000
-Subject: [PATCH 01/45] ours base: stew r204 without the #266 device remap +
+Subject: [PATCH 01/49] ours base: stew r204 without the #266 device remap +
  pool cold (ours carries its own device remap variant)
 
 ---
@@ -19,7 +19,7 @@ Subject: [PATCH 01/45] ours base: stew r204 without the #266 device remap +
  11 files changed, 2 insertions(+), 417 deletions(-)
 
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index c664b6802..c3b372d56 100644
+index 8606145fe..df885d7c4 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -287,11 +287,6 @@ extern "C" {
@@ -35,10 +35,10 @@ index c664b6802..c3b372d56 100644
          // (`--host-experts pool`) rather than by a pinned master?  A pool-backed table's whole-table
          // STAGING is the slow path at every width (its source is the pageable model mapping plus the pool
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 1f8717c1d..1bb758987 100644
+index 9e08103b3..619e32b77 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -4508,7 +4508,6 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -4509,7 +4509,6 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .moe_cache_take_over     = */ ggml_backend_meta_moe_cache_take_over,
      /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
@@ -47,10 +47,10 @@ index 1f8717c1d..1bb758987 100644
  };
  
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index d9bc8fd13..284b81dc9 100644
+index 15be30a3c..3e8d0de65 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -2968,17 +2968,6 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2998,17 +2998,6 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                  }
              }
  
@@ -81,7 +81,7 @@ index 30898273c..8d1dcd6f4 100644
  
  static ggml_guid_t ggml_backend_cpu_guid(void) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-index accf66f03..e849ccbf8 100644
+index 7623cb2d3..b2c1ac5c6 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 @@ -252,12 +252,6 @@ bool ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tenso
@@ -110,10 +110,10 @@ index 310a748ca..f67f584ee 100644
  size_t ggml_backend_cuda_fattn_stage_used(ggml_backend_t backend);
  size_t ggml_backend_cuda_h2d_stage_used(ggml_backend_t backend);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index ebe1b1ddd..632a51afb 100644
+index f40e3f9cc..26a14f4f3 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -8598,7 +8598,6 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -8624,7 +8624,6 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_take_over     = */ ggml_backend_cuda_moe_cache_take_over,
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
@@ -122,7 +122,7 @@ index ebe1b1ddd..632a51afb 100644
  };
  
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index cc0ce7f97..e83d2cafb 100644
+index 1dc0fc344..5ff1cb1b9 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -130,23 +130,6 @@ struct table_t {
@@ -623,10 +623,10 @@ index cc0ce7f97..e83d2cafb 100644
          int64_t p_slots = 0, p_hits = 0, p_misses = 0, p_fills = 0, p_evict = 0, p_bytes = 0;
          for (const auto & kv : g_host_pools) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index ee357ecbb..481d624f8 100644
+index 0bdd1c650..0d2c3745f 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -265,11 +265,6 @@ void moe_cache_heat_observe(const struct ggml_tensor * op, const struct ggml_ten
+@@ -284,11 +284,6 @@ void moe_cache_heat_observe(const struct ggml_tensor * op, const struct ggml_ten
  // `slice_off`/`split_axis` are the per-device slice geometry under `-sm tensor` (see `moe_cache_table`);
  // they are `0`/`-1` for an unsplit table (1 GPU and `-sm layer`).  When the split backend is the Meta
  // backend it computes them per device and forwards here once per simple device.
@@ -639,7 +639,7 @@ index ee357ecbb..481d624f8 100644
                             const int32_t * ids, int64_t n_used, int64_t n_tok,
                             size_t ids_nb0, size_t ids_nb1, void * stream,
 diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
-index b3269e4a5..fecab644b 100644
+index a5eb90a03..d57cb10bc 100644
 --- a/ggml/src/ggml-cuda/vendors/hip.h
 +++ b/ggml/src/ggml-cuda/vendors/hip.h
 @@ -68,7 +68,6 @@

@@ -1,7 +1,7 @@
-From cf650612845ae38b05bb489bd8399c8320e41cec Mon Sep 17 00:00:00 2001
+From ce18defece51b311e5a8c21968f305dffa809da3 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 23 Oct 2026 03:17:02 +0000
-Subject: [PATCH 05/45] llama-context: LLAMA_UB_SMALL_SPLIT=K splits
+Subject: [PATCH 05/49] llama-context: LLAMA_UB_SMALL_SPLIT=K splits
  K+1..31-token batches into K-token ubatches (short-turn chunks stay in the
  MoE decode band)
 
@@ -11,7 +11,7 @@ Subject: [PATCH 05/45] llama-context: LLAMA_UB_SMALL_SPLIT=K splits
  1 file changed, 8 insertions(+), 1 deletion(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 9d28d1183..2d835ed55 100644
+index 045a3a226..9fa27f561 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3229,7 +3229,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {

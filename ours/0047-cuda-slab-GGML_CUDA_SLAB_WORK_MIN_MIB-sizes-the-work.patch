@@ -1,8 +1,8 @@
-From e29a9166aa8889a79dfa1c0656caac171ad017e5 Mon Sep 17 00:00:00 2001
+From 99c71c100ee7ff90d1b17464ac5be2c1b5c8baa2 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 06:27:59 +0000
-Subject: [PATCH] cuda slab: GGML_CUDA_SLAB_WORK_MIN_MIB sizes the work band up
- front
+Subject: [PATCH 47/49] cuda slab: GGML_CUDA_SLAB_WORK_MIN_MIB sizes the work
+ band up front
 
 A compute view wider than the band learned from the reserves (the -ub 4096 prefill view, 2304 MiB vs 1792) moved
 the boundary after the arena was filled, evicted arena tables and latched the RAM tier off for the run (decode
@@ -14,7 +14,7 @@ set_narrow_floor, shrink floor) and the seed floor is the band itself. Default 0
  1 file changed, 22 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-index d3370eebc..db1271bb3 100644
+index a7fbd479d..80f46cc4f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 @@ -286,6 +286,7 @@ static bool ggml_cuda_slab_narrow2_enabled() {
@@ -63,7 +63,7 @@ index d3370eebc..db1271bb3 100644
  // fit-slab-accounting revival (G3): the MTP/DFlash draft context's VRAM, passed to the MoE preflight
  // before the slab is armed.  The reserve uses it because the draft is created AFTER the slab.
  static size_t g_slab_aux_reserve_bytes = 0;
-@@ -1116,7 +1134,7 @@ static void * ggml_cuda_slab_narrow2_alloc(int device, size_t need) {
+@@ -1142,7 +1160,7 @@ static void * ggml_cuda_slab_narrow2_alloc(int device, size_t need) {
              if (s.declined) {
                  return nullptr;
              }
@@ -72,7 +72,7 @@ index d3370eebc..db1271bb3 100644
                  return nullptr;
              }
          }
-@@ -1258,7 +1276,7 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1284,7 +1302,7 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
              if (s.declined) {
                  return nullptr;   // declined once: do not retry init or repeat the diagnostic
              }
@@ -81,7 +81,7 @@ index d3370eebc..db1271bb3 100644
                  return nullptr;
              }
              s.work_needs.insert(ggml_cuda_slab_up(need, s.chunk));
-@@ -1271,7 +1289,7 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1297,7 +1315,7 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
          // one) stays at base 0 until the graph allocator re-creates it above the ring on the next wide
          // reserve; `work_needs` still floors the boundary at the wide need meanwhile.
          if (s.narrow_floor == 0 && need < s.boundary) {
@@ -90,7 +90,7 @@ index d3370eebc..db1271bb3 100644
              s.ring_region = ggml_cuda_slab_ring_candidate(s, s.narrow_floor);
              s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
              s.ring_used   = 0;
-@@ -1343,7 +1361,7 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1369,7 +1387,7 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
              s.wide_n_inval++;
          }
          const size_t contrib = ret_off + ggml_cuda_slab_up(need, s.chunk);

@@ -1,7 +1,7 @@
-From d252cd636fe1f6beae4d794d04f52b9502b3e17f Mon Sep 17 00:00:00 2001
+From 7f88792d5d7156db5a4ba7559f2dc134f2620c20 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 26 Oct 2026 08:17:21 +0000
-Subject: [PATCH 12/45] ggml-backend sched: GGML_SCHED_UPFRONT_INPUTS copies
+Subject: [PATCH 12/49] ggml-backend sched: GGML_SCHED_UPFRONT_INPUTS copies
  user inputs once per graph (no per-split host wait)
 
 (cherry picked from commit ec358ad37c878d91518d5a88498977b8ef52ca5b)
@@ -10,7 +10,7 @@ Subject: [PATCH 12/45] ggml-backend sched: GGML_SCHED_UPFRONT_INPUTS copies
  1 file changed, 80 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index e68d613b9..b407706e0 100644
+index d9e8f7dd4..d21700cfc 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,7 @@
@@ -21,7 +21,7 @@ index e68d613b9..b407706e0 100644
  
  // getenv() is cheap on Linux but takes a lock and rescans the environment block on Windows.  These
  // debug / A-B gates sit on per-graph and per-split paths, so resolve each one once per call site:
-@@ -1495,6 +1496,27 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
+@@ -1525,6 +1526,27 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
  
  // the graph input a tensor ultimately refers to, following view chains, or NULL if it is not (a
  // view of) a graph input.  The recurrent-state copy, for one, is only ever read through views.
@@ -49,7 +49,7 @@ index e68d613b9..b407706e0 100644
  static struct ggml_tensor * ggml_backend_sched_graph_input(struct ggml_tensor * t) {
      while (t != NULL) {
          if (t->flags & GGML_TENSOR_FLAG_INPUT) {
-@@ -2081,6 +2103,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -2111,6 +2133,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                              } else if (src->flags & GGML_TENSOR_FLAG_OUTPUT) {
                                  ggml_set_output(tensor_copy); // the source must stay alive for the whole graph: so must its copy
                              }
@@ -60,7 +60,7 @@ index e68d613b9..b407706e0 100644
                              tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                              SET_CAUSE(tensor_copy, "4.cpy");
                          }
-@@ -2315,6 +2341,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -2345,6 +2371,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
          }
      }
  
@@ -88,7 +88,7 @@ index e68d613b9..b407706e0 100644
      // add leafs from the original graph
      for (int i = 0; i < graph->n_leafs; i++) {
          struct ggml_tensor * leaf = graph->leafs[i];
-@@ -2840,7 +2887,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2870,7 +2917,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
      auto & used_ids        = st.used_ids;
  
  
@@ -99,7 +99,7 @@ index e68d613b9..b407706e0 100644
          (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(input) != nullptr)) {
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-@@ -3175,6 +3224,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -3205,6 +3254,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      int prev_backend_id = -1;
      ggml_backend_sched_copy_state st;
  

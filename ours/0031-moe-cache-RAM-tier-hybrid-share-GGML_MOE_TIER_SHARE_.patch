@@ -1,7 +1,7 @@
-From cab803b8b1fcf4db7bad02f3057f543745e5e80d Mon Sep 17 00:00:00 2001
+From aa1bfad2f90a227a8076a37d8c21f801cd07062d Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 10:55:50 +0000
-Subject: [PATCH 31/45] moe cache RAM tier: hybrid share
+Subject: [PATCH 31/49] moe cache RAM tier: hybrid share
  (GGML_MOE_TIER_SHARE_MIN_PCT): the hottest layers keep a full tier while
  every other layer still gets that share of its own; the rest share what is
  left
@@ -11,7 +11,7 @@ Subject: [PATCH 31/45] moe cache RAM tier: hybrid share
  1 file changed, 49 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index e39fd1dd4..ff270d75d 100644
+index d6186d2cd..f532667a5 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1088,7 +1088,8 @@ static int64_t tier_budget_bytes();

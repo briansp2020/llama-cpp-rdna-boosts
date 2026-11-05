@@ -1,7 +1,7 @@
-From db51bf3d84422c09cf1ffb9b82e20db573ef58d4 Mon Sep 17 00:00:00 2001
+From b77aa198e3b8c07ad3693e42c4c7e6f52e873db3 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 07:17:27 +0000
-Subject: [PATCH 40/45] moe cache: mark a decode take-over's swaps and map
+Subject: [PATCH 40/49] moe cache: mark a decode take-over's swaps and map
  upload done by the remap lag flag, not an event each (GGML_MOE_FILL_FENCE,
  default on)
 
@@ -16,7 +16,7 @@ pol_ev (the precopy side stream's wait) is unchanged.  GGML_MOE_FILL_FENCE=0 res
  1 file changed, 118 insertions(+), 7 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 9e64657a7..9fe341aa3 100644
+index c58c85202..8b2fc2b09 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -137,6 +137,16 @@ struct table_t {

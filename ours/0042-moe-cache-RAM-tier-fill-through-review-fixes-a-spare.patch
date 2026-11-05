@@ -1,7 +1,7 @@
-From 27dfe153ebe5375b61572212fddbef00547f84d0 Mon Sep 17 00:00:00 2001
+From 185bbca4d0e22d5eea3f9198b59a4b3de7c74b54 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 15:09:47 +0000
-Subject: [PATCH 42/45] moe cache RAM tier fill-through, review fixes: a spare
+Subject: [PATCH 42/49] moe cache RAM tier fill-through, review fixes: a spare
  slot takes a routed expert when every member is routed; the trim keeps a
  partial tier's registered non-member aliases; a fill waits for the last
  sparse staging on the device; GGML_MOE_TIER_FILL=0 turns the share off
@@ -11,7 +11,7 @@ Subject: [PATCH 42/45] moe cache RAM tier fill-through, review fixes: a spare
  1 file changed, 43 insertions(+), 11 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index eb4d3553c..2aeafa2ef 100644
+index d3804b5b6..5d0558e0a 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -939,8 +939,8 @@ static int64_t g_tier_file_fills   = 0;   // admissions of an expert outside a p

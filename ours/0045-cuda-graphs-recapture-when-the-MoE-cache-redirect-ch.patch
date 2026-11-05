@@ -1,7 +1,7 @@
-From 40bde5df93fed89a597b76477c15633738e388ba Mon Sep 17 00:00:00 2001
+From ee271b7f46ab0da1a732f28813d4b94464e3dfd8 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 4 Nov 2026 07:01:02 +0000
-Subject: [PATCH 45/45] cuda graphs: recapture when the MoE cache redirect
+Subject: [PATCH 45/49] cuda graphs: recapture when the MoE cache redirect
  choice of a node changed (FINDINGS 716)
 
 The per-op MoE consumer decides at dispatch whether a MUL_MAT_ID reads the expert-cache arena through
@@ -17,7 +17,7 @@ a graph recaptures when it differs from the one stored at capture (GGML_CUDA_GRA
  4 files changed, 55 insertions(+), 11 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 3c5e7cbde..9f6a9485c 100644
+index e8ec35d62..a9306a581 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1486,6 +1486,8 @@ struct ggml_cuda_graph {
@@ -30,16 +30,16 @@ index 3c5e7cbde..9f6a9485c 100644
      // guards a replay is O(nodes) and runs on EVERY graph_compute (the scheduler mints a fresh
      // `cgraph->uid` per split, so the `uid` early-out in ggml_cuda_graph_update_required cannot fire),
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index b4acae497..3d26bbe6e 100644
+index 9d7f8287d..b5be62140 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -7693,8 +7693,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7719,8 +7719,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      // recapture a graph whose pool temporaries or scratch buffers were freed since its capture
                      // (GGML_CUDA_GRAPH_MEM_GEN=0 disables the check, A/B only)
-                     static const bool mem_gen_check = !getenv("GGML_CUDA_GRAPH_MEM_GEN") || atoi(getenv("GGML_CUDA_GRAPH_MEM_GEN")) != 0;
+                     static const bool mem_gen_check = [] { const char * e = getenv("GGML_CUDA_GRAPH_MEM_GEN"); return !e || atoi(e) != 0; }();
 +                    // and one whose MoE redirect choice changed (a table declined or took over since its capture;
 +                    // GGML_CUDA_GRAPH_MOE_SIG=0 disables the check, A/B only)
-+                    static const bool moe_sig_check = !getenv("GGML_CUDA_GRAPH_MOE_SIG") || atoi(getenv("GGML_CUDA_GRAPH_MOE_SIG")) != 0;
++                    static const bool moe_sig_check = [] { const char * e = getenv("GGML_CUDA_GRAPH_MOE_SIG"); return !e || atoi(e) != 0; }();
                      cuda_graph_update_required = graph->instances.empty() ||
 -                        (mem_gen_check && graph->mem_gen != ggml_cuda_graph_mem_gen(cuda_ctx->device));
 +                        (mem_gen_check && graph->mem_gen != ggml_cuda_graph_mem_gen(cuda_ctx->device)) ||
@@ -47,7 +47,7 @@ index b4acae497..3d26bbe6e 100644
                  }
              }
  
-@@ -7744,6 +7748,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7770,6 +7774,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
          }
  
          graph->mem_gen = ggml_cuda_graph_mem_gen(cuda_ctx->device);
@@ -56,7 +56,7 @@ index b4acae497..3d26bbe6e 100644
      }
  
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 64b674e9a..40daed88d 100644
+index 30fa3d29d..ef1188927 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -404,6 +404,7 @@ int64_t g_pool_total_bytes = 0;   // PROCESS-WIDE total budget (split over all r
@@ -155,10 +155,10 @@ index 64b674e9a..40daed88d 100644
  // remap shape the fused kernel cannot take).  The scheduler skipped the copy of every taken-over input, so the original
  // tensors are stale for that lane: the caller must not fuse, and each op reads its own table through the per-op
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 43e062208..ebbd78d4b 100644
+index d7f252fde..08db04627 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -338,6 +338,10 @@ bool moe_cache_get_table(const struct ggml_tensor * op, const struct ggml_tensor
+@@ -357,6 +357,10 @@ bool moe_cache_get_table(const struct ggml_tensor * op, const struct ggml_tensor
                           void ** arena, int64_t * n_slots,
                           size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok);
  

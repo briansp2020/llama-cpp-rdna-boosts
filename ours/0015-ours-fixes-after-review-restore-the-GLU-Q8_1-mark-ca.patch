@@ -1,7 +1,7 @@
-From 6a2a7d8f91e576937309534fa1198c2ba20d9fb8 Mon Sep 17 00:00:00 2001
+From 5d4685e267b44eaf278dbfc9a3a4f3cbcc72700f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 12:41:15 +0000
-Subject: [PATCH 15/45] ours fixes after review: restore the GLU -> Q8_1 mark
+Subject: [PATCH 15/49] ours fixes after review: restore the GLU -> Q8_1 mark
  call that the r176 rebase dropped from ggml_cuda_try_fuse (the publish was
  dead: Qwen3.6-35B-A3B tg128 +8.3 % vs r176 with it, R9700); the shared-expert
  gate fold admits only BF16 / F32 weights (F16 would take the half-accumulator
@@ -12,10 +12,10 @@ Subject: [PATCH 15/45] ours fixes after review: restore the GLU -> Q8_1 mark
  1 file changed, 6 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 115e1c219..e733e2997 100644
+index 9a5165a82..b9f0e7551 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2167,6 +2167,12 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2169,6 +2169,12 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
          return n_cpy_batch;
      }
  

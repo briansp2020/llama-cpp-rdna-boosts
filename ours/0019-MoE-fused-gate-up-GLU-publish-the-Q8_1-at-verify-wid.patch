@@ -1,7 +1,7 @@
-From fde68e0021578d27cc67bdb9705279ce1be51da4 Mon Sep 17 00:00:00 2001
+From d3e8ac7e73865fec022d98fa8f48edf62cf65f54 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 17:11:33 +0000
-Subject: [PATCH 19/45] MoE fused gate/up+GLU: publish the Q8_1 at verify
+Subject: [PATCH 19/49] MoE fused gate/up+GLU: publish the Q8_1 at verify
  widths (2-8 tokens) too, per pair under the expert dedup
 
 Each token warp of the fused gate/up+GLU kernel publishes its own rows, routed and shared lanes, at the row index
@@ -11,14 +11,14 @@ skip their quantize_q8_1.  Same quantize arithmetic: bit-identical.  GGML_CUDA_M
 ---
  ggml/src/ggml-cuda/common.cuh  |  2 +
  ggml/src/ggml-cuda/mmvq-moe.cu | 80 ++++++++++++++++++----------------
- ggml/src/ggml-cuda/mmvq.cu     | 23 ++++++----
- 3 files changed, 58 insertions(+), 47 deletions(-)
+ ggml/src/ggml-cuda/mmvq.cu     | 22 ++++++----
+ 3 files changed, 57 insertions(+), 47 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 0ec10b4c4..3c5e7cbde 100644
+index bb42f6082..e8ec35d62 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -2836,6 +2836,8 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -2842,6 +2842,8 @@ struct ggml_cuda_mm_fusion_args_device {
      block_q8_1 * glu_q8 = nullptr;
      int * glu_q8_cnt = nullptr;
      uint32_t glu_q8_stride_channel = 0;
@@ -28,7 +28,7 @@ index 0ec10b4c4..3c5e7cbde 100644
      // counters follow the routed lanes' (lane index = the number of routed lanes)
      block_q8_1 * shared_glu_q8 = nullptr;
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
-index 9a25ca23d..1b6daf62d 100644
+index 978eaf7d0..44dd9a1f9 100644
 --- a/ggml/src/ggml-cuda/mmvq-moe.cu
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -616,39 +616,8 @@ static __global__ void mul_mat_vec_q_moe(
@@ -161,10 +161,10 @@ index 9a25ca23d..1b6daf62d 100644
          constexpr int  RPB   = decltype(rpb_c)::value;
          constexpr bool CFUSE = decltype(fusion_c)::value;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 70db773c8..020660b66 100644
+index 3139c303d..f1cdd80ac 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1846,33 +1846,38 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1846,33 +1846,37 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -174,9 +174,8 @@ index 70db773c8..020660b66 100644
 +        // MUL_MAT_ID finds it in the quantize cache and skips its quantize_q8_1 launch.  GGML_CUDA_MOE_GLU_Q8=0: off.
 +        // Verify widths (2-8 tokens) too: each token's warp publishes its own rows, at the row index quantize_q8_1 uses
 +        // for [ne0, n_used, n_tokens] (slot + token*n_used).  GGML_CUDA_MOE_GLU_Q8_MULTI=0: 1 token only.
-         static const bool glu_q8_on = getenv("GGML_CUDA_MOE_GLU_Q8") == nullptr || atoi(getenv("GGML_CUDA_MOE_GLU_Q8")) != 0;
-+        static const bool glu_q8_multi = getenv("GGML_CUDA_MOE_GLU_Q8_MULTI") == nullptr ||
-+                                         atoi(getenv("GGML_CUDA_MOE_GLU_Q8_MULTI")) != 0;
+         static const bool glu_q8_on = [] { const char * e = getenv("GGML_CUDA_MOE_GLU_Q8"); return e == nullptr || atoi(e) != 0; }();
++        static const bool glu_q8_multi = [] { const char * e = getenv("GGML_CUDA_MOE_GLU_Q8_MULTI"); return e == nullptr || atoi(e) != 0; }();
          if (glu_q8_on && ids && fusion->gate && ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
 -                dst->ne[2] == 1 && dst->ne[3] == 1 && dst->ne[0] % QK8_1 == 0 &&
 -                ggml_is_contiguous(dst) && dst->ne[1]*(dst->ne[0]/QK8_1) <= GGML_CUDA_MOE_GLU_Q8_CNT) {

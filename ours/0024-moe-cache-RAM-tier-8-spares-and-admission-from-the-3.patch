@@ -1,7 +1,7 @@
-From 0c9def36eb0e365646cf7aec5f621747e9ee21e3 Mon Sep 17 00:00:00 2001
+From ffae6171da4c08a1b664437f968a6d5442748d89 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 1 Nov 2026 18:04:52 +0000
-Subject: [PATCH 24/45] moe cache RAM tier: 8 spares and admission from the 3rd
+Subject: [PATCH 24/49] moe cache RAM tier: 8 spares and admission from the 3rd
  touch by default with the copy-back ahead (GGML_MOE_TIER_TOUCH)
 
 ---
@@ -9,7 +9,7 @@ Subject: [PATCH 24/45] moe cache RAM tier: 8 spares and admission from the 3rd
  1 file changed, 13 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 2b89fe751..a330da227 100644
+index 1ad50aefd..60429a341 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -869,12 +869,22 @@ static const bool g_precopy = [] {

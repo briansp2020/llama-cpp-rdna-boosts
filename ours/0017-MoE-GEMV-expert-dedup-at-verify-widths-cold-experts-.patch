@@ -1,7 +1,7 @@
-From b1b5314bf36c90e42707ed77378bcc5a4a7480a1 Mon Sep 17 00:00:00 2001
+From 5832818d041ad67a9def9e8c3eb0402540ae0985 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 15:26:48 +0000
-Subject: [PATCH 17/45] MoE GEMV: expert dedup at verify widths (cold experts;
+Subject: [PATCH 17/49] MoE GEMV: expert dedup at verify widths (cold experts;
  GGML_CUDA_MOE_DEDUP)
 
 At 2-4 tokens the (slot, token) pairs routed to the same cold expert are computed by one warp, the first pair in
@@ -16,10 +16,10 @@ A/B; =0 off).  Not with the 1-token folds (down + weighted reduction, GLU -> Q8_
  2 files changed, 188 insertions(+), 7 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 5f40b930d..0ec10b4c4 100644
+index 6fb774841..bb42f6082 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -2815,6 +2815,8 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -2821,6 +2821,8 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate = nullptr;
      const int32_t * gate_ids = nullptr;
      uint32_t gate_ids_stride = 0;
@@ -29,7 +29,7 @@ index 5f40b930d..0ec10b4c4 100644
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
-index a1f284e25..653d28b25 100644
+index 5d0037d7d..5d61a98a3 100644
 --- a/ggml/src/ggml-cuda/mmvq-moe.cu
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -32,6 +32,16 @@ static __device__ __forceinline__ void moe_iq4nl_load(moe_iq4nl_raw & r, const v

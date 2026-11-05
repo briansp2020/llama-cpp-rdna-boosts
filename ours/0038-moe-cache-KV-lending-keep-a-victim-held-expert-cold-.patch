@@ -1,7 +1,7 @@
-From 4036ed567c8ea0dd541438cd0fa71c4fc2bdcfa0 Mon Sep 17 00:00:00 2001
+From 96e60d62bf1e7870f71df18c7b4ecfa0956fb99b Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 04:23:15 +0000
-Subject: [PATCH 38/45] moe cache KV lending: keep a victim-held expert cold
+Subject: [PATCH 38/49] moe cache KV lending: keep a victim-held expert cold
  instead of evicting for it (GGML_MOE_KV_LEND_STAY, default on)
 
 With no free arena slot, a miss on an expert whose victim copy cold_ptrs already names is read from VRAM as it is: no
@@ -12,7 +12,7 @@ eviction and no fill (victims' stream only).  Q2_0 on rdna3: ~18k fewer swaps pe
  1 file changed, 32 insertions(+), 9 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index ff529b2c9..7e3f0ae0d 100644
+index e134fb635..2293d0329 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1048,7 +1048,8 @@ static void *  g_kvl_stream     = nullptr;              // the main model's deco

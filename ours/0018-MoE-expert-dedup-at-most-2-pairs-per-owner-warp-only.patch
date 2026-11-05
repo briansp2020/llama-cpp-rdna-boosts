@@ -1,7 +1,7 @@
-From d1457af0ca539c820050d8129a365a756edd75f4 Mon Sep 17 00:00:00 2001
+From 60b15ca1b904f5b0726a3e1b67420e321b49ce08 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 15:32:19 +0000
-Subject: [PATCH 18/45] MoE expert dedup: at most 2 pairs per owner warp, only
+Subject: [PATCH 18/49] MoE expert dedup: at most 2 pairs per owner warp, only
  the owner's activation loaded ahead
 
 A group of more than GGML_CUDA_MOE_DDK (2) pairs is split into chunks, each computed by its first pair.  Cuts the dedup
@@ -12,7 +12,7 @@ so a launch without groups costs +7 % instead of +16..+28 %.  Same per-pair arit
  1 file changed, 24 insertions(+), 14 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
-index 653d28b25..9a25ca23d 100644
+index 5d61a98a3..978eaf7d0 100644
 --- a/ggml/src/ggml-cuda/mmvq-moe.cu
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -303,7 +303,11 @@ static __global__ void mul_mat_vec_q_moe(

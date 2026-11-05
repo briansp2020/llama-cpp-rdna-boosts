@@ -3,19 +3,19 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-6050b467c-r209` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
-`8c6c992db70c`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
+**Base:** `v16-6050b467c-r218` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
+`d362b5d67b14`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
 GDN small-projection gather), r182 took #253 (the 1-token router fold and its RDNA4 gate), r183 took #256 (the GDN
 decode folds), r187 took #258 (the quantized-KV rotations), r188 took #259 (the shared-expert GLU Q8_1), r198 took #260
 (the mixed K-quant x Q6_K row concat), r199 took #262 (the q4_0 KV write fold) and r203 took #266 (host-expert decode
-without the per-op routing sync), so they are no longer in this series. r205-r209 took none of it.
+without the per-op routing sync), so they are no longer in this series. r205-r218 took none of it.
 
 0000 keeps `moe-expert-cache.cu` at its r206 state: r207 rewrote the host pool path in that file (the pool-tier gather,
 per-table pool sizing, the `MOE_HOST_POOL_RAM_PCT` ceiling), and that code sits where this series replaces the release's
 remap and changes the bounce, gather and report paths for `--host-experts mmap`. So with this series `--host-experts pool`
 behaves as in r206, and `moe_cache_table_is_pool` answers false, so the scheduler's new default gathers nothing (r206's
-default). Everything else in r207-r209 (RDNA2 flash attention, Windows host memory, the scheduler and loader changes) is
-in, as released.
+default). Everything else in r207-r218 (RDNA2 flash attention, Windows host memory, the scheduler and loader changes) is
+in, as released, and so are r210-r218.
 
 0001 takes #266's device remap and pool cold read back out of the release: this series has carried its own variant of
 that remap since before #266 (in 0002, with the review fixes in 0021: freshness rounds, and the remap forwarded through
@@ -25,11 +25,11 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 
 ```
 git checkout 6050b467c
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r209 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 48 patches (0000-0047)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r218 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 50 patches (0000-0049)
 ```
 
-Result: tree `6ffd77d2fd8c`.
+Result: tree `6ee039d6dd45`.
 
 ## Patches
 
@@ -62,6 +62,8 @@ Result: tree `6ffd77d2fd8c`.
 | 0045 | a captured CUDA graph keeps each MoE op's choice between the expert-cache arena (through the slot remap) and the scheduler copy; when a table declined after the capture, the replay read the previous token's remap (wrong experts). The graph now records which ops read the arena and recaptures when that changes; in normal use it never forces a recapture | `GGML_CUDA_GRAPH_MOE_SIG=0` |
 | 0046 | lends the prefill prefetch's two staging buffers (2 x ~957 MiB on the production model, kept for the whole run) to KV lending between prefills: while no prefill runs they hold copies of experts the arena evicted, like the KV rows past the context in use. The first prefetched op of a prefill takes them back (one device sync, the copies dropped); a few decode steps without a prefill lend them again. Single device only | `GGML_MOE_PF_LEND=0` |
 | 0047 | `GGML_CUDA_SLAB_WORK_MIN_MIB` sizes the slab's work band when the model loads. With `GGML_CUDA_SLAB_RING_PREFILL=0`, a prefill view wider than the band learned from the reserves (`-ub 4096`: 2304 MiB vs 1792) was placed above the unused ring candidate; that moved the boundary ~6.6 GB after the arena was filled, evicted arena tables and switched the RAM tier off for the run (decode 83 -> 26 t/s on the production model). Production sets it to 2304 with `-ub 4096 -b 4096` | unset (default): unchanged |
+| 0048 | the forced admission's victim cold pointer kernel launches with its device current: the eager hook runs with whichever device computed last, so on two GPUs the launch could go to the wrong one. One device: no change | none |
+| 0049 | KV lending also covers the main indexer key cache. It holds one raw key row per KV cell on the attention cache's slot layout (12 tensors, 408 MiB on the production model), and rows past the context in use are idle, so they follow the attention cache's lend line and hold evicted-expert copies too. Models with a k-pool indexer (glm5-next) stay out | `GGML_MOE_KV_LEND_IDX=0` |
 
 The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`, `GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4=0`,
 `GGML_CUDA_MMVQ_CONCAT_REORDER=0`, `GGML_CUDA_ROUTER_TOPK=0`, `GGML_CUDA_DISABLE_GDN_CONV_SNAP=1`,
@@ -69,7 +71,19 @@ The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`
 `GGML_CUDA_FUSE_V_FWHT=0`, `GGML_CUDA_FA_COMBINE_FWHT=0`, `GGML_CUDA_QK_PAIR_FWHT=0`, `GGML_CUDA_FUSE_ROPE_FWHT=0`,
 `GGML_CUDA_MOE_SHARED_GLU_Q8=0`), `GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0` (#260) and `GGML_CUDA_KV_FOLD_Q4_0=0` (#262).
 
-## Validation (2026-11-04, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
+## Validation on r218 (2026-11-05, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
+
+r218 vs r218 + this series, same method as the r209 run below: greedy server replies are byte-identical on all seven models
+(plain, quantized KV and MTP where that run had them), KLD 0, `llama-bench` within noise, no faults. test-backend-ops
+21675/21676; the one failure is the known `MUL_MAT` f16 case on `ROCBLAS_USE_HIPBLASLT=0`, the same as on r209.
+
+0049 on the production config at `-c 262144`, against `GGML_MOE_KV_LEND_IDX=0`, 2 interleaved loads per side: lent slots 6232 vs
+5788, cold reads served from VRAM +7.4 %, greedy decode 84.9 vs 83.6 t/s, two concurrent streams 113.9 vs 110.7 t/s, within
+the load-to-load spread. Greedy, prompt-test and post-needle output identical, no faults or evictions. One load with
+`GGML_MOE_VERIFY_AT=300000`: 0 differing arena, RAM-tier, map, cold-pointer or KV-victim slots (5956 KV victims). Prefill is
+unchanged.
+
+## Validation on r209 (2026-11-04, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
 
 r209 vs r209 + this series, both built and run in `rocm/dev-ubuntu-24.04:10.1.0-full`, no env on either side,
 `ROCBLAS_USE_HIPBLASLT=0`.

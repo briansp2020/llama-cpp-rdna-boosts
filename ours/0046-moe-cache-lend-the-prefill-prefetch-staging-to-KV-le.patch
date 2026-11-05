@@ -1,8 +1,8 @@
-From 4a51474a567225f17ad2ba513cda1f771e258745 Mon Sep 17 00:00:00 2001
+From 5ef3af5c83c213a7d9ff34a7f9c6118611b09b2b Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 04:31:26 +0000
-Subject: [PATCH] moe cache: lend the prefill prefetch staging to KV lending
- between prefills (GGML_MOE_PF_LEND)
+Subject: [PATCH 46/49] moe cache: lend the prefill prefetch staging to KV
+ lending between prefills (GGML_MOE_PF_LEND)
 
 The two prefill-prefetch staging buffers (2 x ~957 MiB, kept for the whole run) join the KV-lending victim grid
 while no prefill runs. The first prefetched op of a prefill takes them back (device sync, victims pointed back at
@@ -14,7 +14,7 @@ turns it off. Prod model, 1 R9700, 8 pairs: greedy +3.5 %, two streams +4.6 %, p
  1 file changed, 124 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 40daed88d..d2cfb178e 100644
+index ef1188927..3496d3b5e 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1057,6 +1057,7 @@ struct kvl_tensor_t {

@@ -1,7 +1,7 @@
-From 8f0a162019c375830a1864bd33ce1bf83d2cc7ef Mon Sep 17 00:00:00 2001
+From 1f38dab26f17c715a42111243e22f59a7ed716c0 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 02:41:53 +0000
-Subject: [PATCH 36/45] moe cache: KV lending (GGML_MOE_KV_LEND=1, default off)
+Subject: [PATCH 36/49] moe cache: KV lending (GGML_MOE_KV_LEND=1, default off)
  -- the KV cache rows past the context in use hold copies of evicted experts
 
 The main model's K/V tensors (one stream, V not transposed, no windowed KV / KV pool) are registered with the expert
@@ -23,10 +23,10 @@ slot holds that expert.  GGML_MOE_KV_LEND_LOG=1 logs each line move; moe_cache_r
  5 files changed, 510 insertions(+), 10 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 824b49151..b4acae497 100644
+index 8d7934887..9d7f8287d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -10005,6 +10005,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -10058,6 +10058,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_cuda_kv_region_spill_ram_reserve") == 0) {
          return (void *) ggml_backend_cuda_kv_region_spill_ram_reserve;
      }
@@ -43,7 +43,7 @@ index 824b49151..b4acae497 100644
          return (void *) ggml_backend_cuda_rows_topk_async;
      }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 2dd3cdb42..f2ec6ca29 100644
+index 96885a679..137768a65 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1017,6 +1017,225 @@ static uintptr_t tier_file_ptr(const table_t & t, int32_t e) {
@@ -581,7 +581,7 @@ index 2dd3cdb42..f2ec6ca29 100644
                        "in-stream; %lld misses cold for lack of a spare\n", __func__, g_tier_spares, g_precopy ? "on" : "off",
                        (long long) g_pc_issued, (long long) g_pc_used, (long long) g_pc_waited, (long long) g_pc_reclaimed,
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index a2189810c..43e062208 100644
+index 0b2b40c61..d7f252fde 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
 @@ -145,6 +145,11 @@ void moe_cache_disable_streaming(const char * why);
@@ -597,7 +597,7 @@ index a2189810c..43e062208 100644
  // reassign those chunks to the work pool (the movable-boundary design's boundary move).  This is the ONLY
  // loss of resident entries: the tables that live in the taken chunks go non-resident -- their storage is
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 81ccf1e4d..abc929d98 100644
+index 57e6b4a62..49c61bb99 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -339,6 +339,20 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -621,7 +621,7 @@ index 81ccf1e4d..abc929d98 100644
  //
  // llama_kv_cache
  //
-@@ -1057,6 +1071,60 @@ llama_kv_cache::llama_kv_cache(
+@@ -1098,6 +1112,60 @@ llama_kv_cache::llama_kv_cache(
  
      const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
      debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
@@ -682,7 +682,7 @@ index 81ccf1e4d..abc929d98 100644
  }
  
  void llama_kv_cache::clear(bool data) {
-@@ -1068,6 +1136,7 @@ void llama_kv_cache::clear(bool data) {
+@@ -1109,6 +1177,7 @@ void llama_kv_cache::clear(bool data) {
      parked.clear();
  
      if (data) {
@@ -690,7 +690,7 @@ index 81ccf1e4d..abc929d98 100644
          for (auto & [_, buf] : ctxs_bufs) {
              ggml_backend_buffer_clear(buf.get(), 0);
          }
-@@ -1451,6 +1520,7 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+@@ -1497,6 +1566,7 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
      if (!can_park()) {
          return false;
      }
@@ -698,7 +698,7 @@ index 81ccf1e4d..abc929d98 100644
  
      // wip/kv-residency (TODO #118): a park MOVES cells, and park_bound() is the top of the CACHE -- above the cell
      // watermark a growable/windowed region has mapped.  The move is `ggml_backend_tensor_copy` (the copy engine),
-@@ -1534,6 +1604,7 @@ bool llama_kv_cache::seq_unpark(llama_seq_id seq_id) {
+@@ -1580,6 +1650,7 @@ bool llama_kv_cache::seq_unpark(llama_seq_id seq_id) {
      if (it == parked.end()) {
          return true;
      }
@@ -706,7 +706,7 @@ index 81ccf1e4d..abc929d98 100644
  
      auto & cells = v_cells[0];
  
-@@ -1944,6 +2015,8 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
+@@ -1993,6 +2064,8 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
  
          LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);
  
@@ -715,7 +715,7 @@ index 81ccf1e4d..abc929d98 100644
          // apply K-shift if needed
          if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE &&
                  std::any_of(layers.begin(), layers.end(), [&](const auto & layer) {
-@@ -2274,6 +2347,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+@@ -2323,6 +2396,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
  
          head = sinfo.idxs[s].back() + 1;
      }
@@ -725,7 +725,7 @@ index 81ccf1e4d..abc929d98 100644
  }
  
  bool llama_kv_cache::get_can_shift() const {
-@@ -2305,6 +2381,14 @@ bool llama_kv_cache_context::is_streaming(uint32_t n_kv) const {
+@@ -2354,6 +2430,14 @@ bool llama_kv_cache_context::is_streaming(uint32_t n_kv) const {
  }
  
  llama_kv_cache::~llama_kv_cache() {
@@ -740,7 +740,7 @@ index 81ccf1e4d..abc929d98 100644
      // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
      // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
      // counters back synchronises the device).
-@@ -4061,6 +4145,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+@@ -4123,6 +4207,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
  bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
      auto & cells = v_cells[strm];
  
@@ -752,7 +752,7 @@ index 81ccf1e4d..abc929d98 100644
      // from inclusive, to exclusive - same convention as cell_ranges_t
      // contiguous cells yield a single run covering the whole block
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 39e27f6b1..a2659fd15 100644
+index 74c0b18d5..9f81f57e1 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -277,6 +277,10 @@ public:

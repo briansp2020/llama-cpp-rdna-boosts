@@ -1,7 +1,7 @@
-From 6c36365b773d22e9d7fd4293066c0151ee699527 Mon Sep 17 00:00:00 2001
+From 44e3fa225456d5656213bb2f809b599bcd7327b8 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 17:45:27 +0000
-Subject: [PATCH 35/45] moe cache: GGML_MOE_VERIFY_AT / GGML_MOE_VERIFY_EVERY
+Subject: [PATCH 35/49] moe cache: GGML_MOE_VERIFY_AT / GGML_MOE_VERIFY_EVERY
  debug checks (arena and RAM-tier bytes vs the file; device map and cold
  pointers vs the host bookkeeping); off by default
 
@@ -10,7 +10,7 @@ Subject: [PATCH 35/45] moe cache: GGML_MOE_VERIFY_AT / GGML_MOE_VERIFY_EVERY
  1 file changed, 120 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 5bee1a047..2dd3cdb42 100644
+index 73d1bcad8..96885a679 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1232,8 +1232,8 @@ static bool tier_build_locked(table_t & t) {

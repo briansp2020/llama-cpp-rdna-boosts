@@ -1,7 +1,7 @@
-From c72b7e89ebdc847c5604f573606a7f2f9552731b Mon Sep 17 00:00:00 2001
+From df29a4f91d93d8819ece1ccb1ec19741c1e47cb2 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 1 Nov 2026 21:24:45 +0000
-Subject: [PATCH 25/45] moe cache: one pin budget for the RAM tier and the
+Subject: [PATCH 25/49] moe cache: one pin budget for the RAM tier and the
  sparse registration (GGML_MOE_PIN_BUDGET_MIB), a partial tier (hottest tables
  first) instead of all-or-nothing, the warm-up bounded too
 
@@ -13,7 +13,7 @@ registration fails for any reason is not retried until the next trim (a retry pe
  1 file changed, 105 insertions(+), 20 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index a330da227..f6d27ddf8 100644
+index 60429a341..32db21f22 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -121,6 +121,7 @@ struct table_t {

@@ -1,7 +1,7 @@
-From 72fb10e90e6ee646eea53a2e650a1b5364a1cf4e Mon Sep 17 00:00:00 2001
+From b0c2b8a00befce1c80934c7d530bdd73a2c20b8f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 23 Oct 2026 17:30:24 +0000
-Subject: [PATCH 07/45] server: LLAMA_CKPT_USER_MERGE=K, no checkpoint break at
+Subject: [PATCH 07/49] server: LLAMA_CKPT_USER_MERGE=K, no checkpoint break at
  a user message followed by <= K prompt tokens (local, default off)
 
 (cherry picked from commit b78b01c965c642090e6d91098cde2dca1639f097)
@@ -10,10 +10,10 @@ Subject: [PATCH 07/45] server: LLAMA_CKPT_USER_MERGE=K, no checkpoint break at
  1 file changed, 10 insertions(+), 1 deletion(-)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 19c39cbd8..2b39ed27b 100644
+index ea6236890..c3b71f2a1 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -4739,7 +4739,16 @@ private:
+@@ -4746,7 +4746,16 @@ private:
                          slot.prompt.tokens.push_back(cur_tok);
  
                          // break at the last user message, or at user messages at least min step past the last checkpoint

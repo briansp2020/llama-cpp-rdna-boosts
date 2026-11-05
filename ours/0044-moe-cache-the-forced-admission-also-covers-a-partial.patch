@@ -1,7 +1,7 @@
-From 70194e38ee1f24dde2b81c53477526024befc90a Mon Sep 17 00:00:00 2001
+From 212d308230ec4f4c55193c02bc264c3ce6c13da1 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 20:03:18 +0000
-Subject: [PATCH 44/45] moe cache: the forced admission also covers a
+Subject: [PATCH 44/49] moe cache: the forced admission also covers a
  partial-tier table (it can decline the same way), repoints an evicted
  victim's cold pointer to the file, and leaves the slot's fill state unknown
  (GGML_MOE_FORCE_ADMIT)
@@ -11,7 +11,7 @@ Subject: [PATCH 44/45] moe cache: the forced admission also covers a
  1 file changed, 33 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index cfa8f7083..64b674e9a 100644
+index b755a2d70..30fa3d29d 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -4025,6 +4025,23 @@ static bool g_force_admit = [] {
