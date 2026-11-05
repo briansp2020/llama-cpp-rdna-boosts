@@ -1564,3 +1564,331 @@ change), and let `WORKLOG.md` carry the narrative.
   those stay the reporter's numbers, and no gate on this box reaches them (there is no Windows toolchain,
   `TODO` #95).  Also: `ggml/src/ggml-cuda/CMakeLists.txt` globs `*.cu` **without** `CONFIGURE_DEPENDS`, so a
   newly added CUDA source needs a cmake re-run, not just a rebuild.
+- **A pageable push costs nothing where a fill batch goes to ONE device, and that is the whole present
+  constraint (r209, `wip/host-expert-eager-push` P3).**  Making the copy engine's source the read-only model
+  mapping (no memcpy into a pinned slot) measured **55.1 -> 53.6 t/s** on 1 GPU and **55.6 -> 53.7 t/s** on a
+  3-device `-sm layer` split — parity, byte-identical text — but **52.5 -> 26.1** on a 2-device and
+  **20.6 -> 16.3** on a 3-device `-sm tensor` split, the configuration that issues the fills of *several
+  devices inside one op*.  The marginal per-fill cost over the pool's memcpy+pinned+CE shape is 28 us / 205 us /
+  302 us / 41 us for 1 dev / 2 dev tensor / 3 dev tensor / 3 dev layer, against a host that already spends
+  ~1 core-second of CPU per token on the tensor-split host-expert path.  The driver's pageable staging
+  ("staged through a shared internal bounce", `ggml-cuda.cu:6255`) is real and widens with device count
+  (1.06x -> 1.54x of the pool's per-fill cost) but is ~20x too small to explain the tensor-split loss, so do
+  not attribute it to the driver alone.  Record and candidate causes: `wip/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §2-§3.
+- **The 1-D pageable tearing claim stays refuted, now multi-device (r209).**  Up to 65 260 consecutive direct
+  pageable fills produced byte-identical greedy text on 1, 2 and 3 devices with no GPU fault, so the
+  "nondeterministic greedy text" half of the `ggml-cuda.cu:6255` comment has no recorded reproduction here —
+  the cost half does (previous entry).  Both ROCm lines still owe their own record; this one is 10.1 only.
+- **A `-sm tensor` split never reaches `moe_cache_update_host`, so no per-op host boundary exists there
+  (r209).**  With tensor split the whole graph is one Meta split, so a routed expert op's ids are computed
+  inside that split and the issue-#129 guard stands the scheduler's host-readback branch down
+  (`ggml-backend.cpp`, `host_expert_input && node_n_consumers == 1 && !ids_computed_here`); measured 3
+  boundary events (the sizing calls, one per device) at 2 and 3 devices against 60 357 on `-sm layer`.  The
+  expert arena is still driven (take-over + demand fills), so a policy hook placed there silently does nothing
+  on a split — and a split is the only configuration where one host tensor has a device set > 1, so a
+  cross-device release gate is currently unreachable in *any* configuration.
+- **A diagnostic written to stderr from the fill path can corrupt a text-purity comparison (r209).**  Callers
+  capture `2>&1`, so an unthrottled `fprintf(stderr, ...)` lands in the middle of llama-cli's streamed
+  generation and an otherwise byte-identical arm hashes differently — measured twice: a `-lv 4` log (stats
+  interleaved, which `scripts/extract-generated.py` documents) and a per-event `P1-PUSH` message re-fired
+  after a budget reset.  Keep capture streams separate (`>out 2>err`: the text is stdout, every log line is
+  stderr) and make such messages once-per-process.
+
+## r210 — the host-expert tier is one pinned per-expert pool, and the pool mirrors the arena when the budget allows
+
+Established 2026-11-04 (`wip/host-expert-eager-push/P5-RESULTS.md`, `P6-POOL-REGION.md`).  Each entry is a fact that
+cost a session to learn; do not re-derive them.
+
+1. **The pool IS the "pinned region addressed by expert index with a presence bitmap"** the design asked for: a
+   pinned per-host-tensor allocation addressed by `expert -> slot`, with `slot_state` as the presence bitmap,
+   `base_dev` as the UVA alias, heat-ranked contents and a native fill (a resident is a 1.3 µs D2D).  Nothing else
+   had to be built to make it a tier — only permissions.
+2. **A pool-resident expert can be cold-read in place at any device count.**  The historical restriction
+   (`device_count == 1 && src_off == 0`) was a geometry accident: `base_dev` is already the cross-device D2D fill
+   source, and a slice offset is folded into the cold base for a pinned master anyway.  Worth **+11.5 %** decode at
+   `-lme 8` and **+10 %** for the not-fitting band (2 devices, byte-identical).  The host-side admission decision
+   and the kernel-side cold description MUST share one predicate — if they disagree the host emits a cold id the
+   kernel resolves from a different base, i.e. a silently wrong matmul, not a crash.
+3. **"The pool is the arena's complement" is what forced page-cache re-staging.**  Two paths un-loaded an expert
+   from the pool the moment VRAM also held it (the arena-seed retire, and the heat re-rank's wanted set).  At full
+   coverage that emptied 44 % of the pool at start-up, and the first arena evictions of those experts then had to
+   re-read from the model mapping: **20 116 synchronous 288 KiB `memcpy`s in the first 300 decode tokens**, i.e.
+   11 % of decode — and invisible to the fill probe, which times only the `cudaMemcpyAsync` (1.2-1.4 µs), not the
+   host memcpy that precedes it.
+4. **The right layout rule is one rule: the complement first, then mirrored residents while capacity lasts.**  A
+   budget that merely covers the complement already stops the re-read cycle; a budget that covers the set makes the
+   pool a full mirror (`h=1.0000`, zero evictions, **no page-cache re-read at all**).  Measured at 2 devices:
+   prefill **1318** vs a pinned master's 1105 (**+19 %**) and decode within 0.5-2 % (n=2000: 82.5 vs 82.9) **for the
+   same 18 662 MiB of pinned RAM**.
+5. **At equal RAM, a partial budget belongs to the pool, not to per-tensor pinning** — decoding interpolates
+   linearly on the pinned fraction (0 % 37.4, 21 % 42.4, 43 % 50.1, 86 % 65.7, 100 % 71.9 t/s) while 8 064 MiB of
+   pinned whole tensors measures 505 prefill / 50.1 decode against 713 / 57 for a 9 331 MiB per-expert pool.
+6. **An eager back-fill of the arena's evicted victim does NOT pay** (built, measured, dropped): the victim is by
+   construction the least-demanded resident, `ghost` cannot predicate it (reset to 0 on admission), and the copy
+   competes with the demand path — page cache 52.8 vs 56.4, `O_DIRECT` disk 15.1 vs 15.9 with prefill collapsing
+   24.1 → 16.3.  Same lesson as the L3 model: the pool's CONTENT matters far more than any hand-over policy.
+7. **A worker thread must not be the first to touch the ROCm runtime** from a foreign thread: its lazily created
+   `AsyncEventsLoop` aborts the process (`std::system_error: Operation not permitted`).  Keep HIP calls on the main
+   thread; a host-only worker plus main-thread event polling is the shape that works.
+8. **The `-ncmoe` tail bound is `hparams.n_layer()`, not `n_layer_all`** (the latter also counts the nextn/MTP
+   head, which is never hosted) — an off-by-one there plans a pinned MTP head and misses trunk layer 0.
+
+## r211 — the take-over guard is about REPRESENTABILITY; a covering pool is a complete cold source, and every block tree must build
+
+1. **The eager take-over's completeness guard must not bound a covering pool by the arena.**
+   `if (!table_cold_ok(t) && t.slots < n_used * n_tok) decline` is a statement about *representability* ("can
+   every routed expert be expressed as a remap id"), not about arena capacity.  `table_cold_ok()` requires
+   `host_dev != nullptr`, which is **null for every pool-backed (pageable-master) table**, so the guard silently
+   bounded the *shipped default* tier by arena slots: at `-llama-batched-bench -npl 8` that is 8x8 = 64 ids
+   against 56 slots, and EVERY routed op declined (`decline_all=1920`, `takeover=0`) and the run read the
+   pageable mapping -- **tg 49.2 against 270.5** at `-npl 8` while `-npl 4` (32 <= 56) was untouched.  A pool
+   whose capacity covers the tensor has the pinned master's own property (every expert is pool-resident, so
+   `id = n_res_slots + slot` is a valid cold id for all of them), so `pool_covers_table()` -- the shared
+   `pool_cold_geometry_ok()` **and** `slots >= n_experts`, plus an O(1) residency re-check -- exempts it.  Measured
+   with the exemption: `-npl 8` **270.3 tg / 1829.5 pp** (best of every arm; pinned 276.5 / 1262.8, `-lme 64`
+   full-coverage pool 271.4 / 1820.1).  A budget that does NOT cover the tensor keeps the bound (r211
+   `-lme 8` still declines at `-npl 8`: 50.4 tg), because with `slots < n_experts` the resident set moves per
+   token and a static per-shape bound cannot guarantee a complete remap.
+2. **Do not reach for a `region`/`region_dev` rebind to express this, and never rebind `t.host`.**  The pool's
+   cold encoding is already "a slot index into one pinned base", so the whole fix is one predicate; `t.host` is
+   the key into `g_host_pools`/`g_host_src` and is shared by every per-device table of one tensor.
+3. **A structural change to the host-expert tier is a decode-band change even when it looks like a prefill one.**
+   The r210 handover attributed the `-npl 8` collapse to `moe_cache_stage_table`'s two-tier staging.  Measured
+   false: for a covering table every expert is non-(-1) in that map, so staging is ONE kernel launch (the same
+   shape as a pinned master's) and the pool's npl-8 prefill is **44 % faster** than pinned's; `GGML_SCHED_DEVGATHER`
+   on/off changes nothing about the collapse (568 vs 635 pp, identical tg).  What looks like a 3x prefill collapse
+   in that table is the **cold first-pass** shape (the arena is sized on the first decode-band pass, so the first
+   prompt batch has none) -- the pre-r210 tree shows the same 128 vs 588 pp at `-npl 1`.
+4. **A block tree that uses a later block's machinery is a broken delivery, and only gate 4 sees it.**  The r210
+   fold left blocks 09/10/11 unbuildable: a spliced function body, `t.n_slices` read before block 10 grows it,
+   `heat_prior_t` used before block 12 defines it, an iface entry pointing at a block-12 function, and a loader
+   calling `plan_host_expert_placement`/`llama_host_experts_mode_apply` before they exist -- plus an out-of-line
+   1-arg `host_expert_buft` that the header's inline forwarder already defines.  Rule: hoist the **definition**
+   to the block that needs it (or restore the pre-fold body), and prefer the tip's content where the hoist would
+   need a later block's *backend API* (an iface member shifts every backend's positional initializer).  The tip
+   tree must be byte-identical afterwards -- check `git rev-parse HEAD^{tree}` at every step, not at the end.
+5. **`MOE_HOST_LIMIT_FRAC=1` no longer means "force the pool".**  The `-lme` budget in the not-fitting band IS
+   `auto_cap` = `MOE_HOST_LIMIT_FRAC` % of `MemAvailable` and it **overrides `MOE_HOST_POOL_MIB`**, so `=1` sizes
+   an 812.9 MiB pool (11 slots/table) and every arm measured with it is a tiny-pool arm.  Use `-lme 64` (the whole
+   set as a pool) and `-lme 8` (a genuine sub-complement budget) for those A/Bs.
+
+## r212 — the host pool's fill mode mirrors `--load-mode` (the operator's caching decision), not a RAM guess
+
+1. **`MOE_HOST_POOL_DIO=auto` mirrors `--load-mode`.**  A mapped load is a request for the page cache, so the pool fills through it
+   (a `memcpy` out of the model mapping); O_DIRECT fills are an explicit `MOE_HOST_POOL_DIO=1`.  The pool only exists on a mapped
+   load (its master *is* the mapping), so in practice auto = buffered.  The old rule ("the set does not fit beside the pool ->
+   O_DIRECT") is preserved as a **note** on the decision line, not as the decision.
+2. **The measured cost of getting this wrong is the POPULATION, not the steady state.**  On a 113 GB Flash-Next, 2 devices,
+   `-ncmoe 48 -lme 60` (host expert set 71.7 GiB, pool 60 GiB, `per_layer_token_embd` 26.8 GiB host-resident): O_DIRECT fills read
+   **97 692 × 1.0 MiB = 95.20 GiB at 2 785 MiB/s in 35.8 s** of drive time, all of it inside the load/first-prefill window
+   (`TODO` #142), which reads as "prefill is reading every weight from disk".  Buffered: the same 95.20 GiB at **4 062 MiB/s in
+   24.8 s**, and the pages stay reusable.  Nothing is evicted either way (`evictions=0`, `h=0.9073`).
+3. **`-lme N` is a byte budget, so N below the host expert set is a SUB-COVER pool, and the model's expert count decides the
+   coverage.**  On a 512-expert/layer model, `-lme 60` against a 71.7 GiB set is 428 slots of 512 = **84 %**, not "it fits"; the
+   plan line prints both numbers, so read it before believing a pool is complete.  A pool *is* complete only when `slots >=
+   n_experts` per table (`pool_covers_table()`, r211).
+4. **A mapping-backed pool's master is the read-only model mapping, so `--load-mode dio`/`none` cannot have a pool** — the plan
+   reports "NOT APPLIED: a pool needs a mapped load" and the whole-tensor pinned master is used instead.  Do not read that as the
+   pool being disabled by a bug.
+
+## r213 -- the attendance pool on a multi-device `-sm layer` split (per-device buffer types and counters)
+
+1. **A per-device buffer type's NAME must be device-unique.**  `llama_kv_cache` keys its `buft -> ggml_context` map by
+   `strcmp` on `ggml_backend_buft_name()` (deliberately, so the order is well defined), so two bufts that answer the same
+   string are ONE entry and every tensor created for the second device lands in the first device's context and buffer.
+   The pool's mirror buft returned a constant `ROCm_KV_Pool_Mirror` and did exactly that; the windowed KV's region buft
+   reuses the plain CUDA getter (`ROCm<N>`) for this reason.  Any new per-device buft in this tree: make the name carry
+   the device (and check `allocation` of a >1-device cache), or the collapse is silent until something reads the wrong
+   device's memory.
+2. **One counter block per DEVICE, never one per cache.**  A resolve node runs on its layer's device, so everything it
+   reads/writes must be there: `kvpool_ctr` (epoch, claim cursor, miss list) was created once in the first pool layer's
+   context, which put device-0 memory in every other device's `GGML_OP_KV_POOL` node.  `ggml_backend_cuda_device_supports_op`
+   refuses an op whose CUDA-buffer source is on another device and the CPU backend has no `KV_POOL`, so *no* backend
+   claims the node and the scheduler aborts at load -- `GGML_ASSERT(*cur_backend_id != -1)` in `ggml_backend_sched_split_graph`,
+   inside the `--fit` probe's graph.  A cross-device src is a load-time assert, not a wrong answer.
+3. **A per-device placement is invisible unless the report says so.**  The pool stats line now prints the number of
+   counter blocks it summed; a 2-device arm reporting 1 means the blocks (or the bufts) collapsed, which is the defect
+   above surfacing in a number instead of an abort.  `gate-kv-residency.sh` asserts it, and the enable line reports the
+   device span.
+4. **The pool is not the cause of every 2-device large-context fault.**  On the reported arm (`-c 204800`, 2 devices,
+   `-ncmoe 48`, mmap) prefill faults `rms_norm_f32` on GPU 1 (`HSA_STATUS_ERROR_MEMORY_FAULT` + `gfxhub page fault`)
+   right after `moe_cache_evict_slab_range` discards 5.4-5.8 GiB of arena tables, and it **reproduces with
+   `LLAMA_KV_REGION_POOL=0`**; `-c 131072` (2 devices) and `-c 204800` (1 device) are clean.  Before blaming block 15 for a
+   multi-device fault, run the same arm with the pool off.  (**Fixed in r214**, `TODO` #143: the fault was the
+   slab's narrow-2 draft-compute region being handed out with its top unmapped -- see the r214 section below.)
+
+
+## r214 -- the slab's narrow-2 region is MAPPED for its whole extent; the draft compute term is a measured floor
+
+1. **A slab region handed to a graph must have physical behind EVERY byte of it.**  Reserved VA is not presence: the
+   slab reserves `size` but maps `mapped`, and the gap (`va_spare`, deliberately left for `slab_extend`) is unmapped VA.
+   `ggml_cuda_slab_narrow2_commit_locked()` mapped the narrow-2 (MTP draft compute) region **only when it lay entirely
+   above `mapped`**; in the documented shortfall case, where the region straddles `mapped`
+   (`narrow2_off < mapped < narrow2_off + nf2`), it took the "arena gave it up" branch and mapped **nothing**, so the
+   top of the draft's compute buffer was absent VA and the first device access past `mapped` was an unrecoverable
+   `HSA_STATUS_ERROR_MEMORY_FAULT` (no XNACK on RDNA4).  The commit now maps whichever part of
+   `[off, off + nf2)` has no physical behind it and advances `s.mapped`.  The `min(mapped, ceiling)` clamp in
+   `ggml_cuda_slab_arena_top()` is therefore **load-bearing**, not defensive (`mapped` ends up above `narrow2_off`).
+2. **A page fault inside `rms_norm_f32` is not evidence of a host read.**  On the #143 arm the kernel is
+   `rms_norm_f32<1024,1,false,false,false,false>` -- the plain instantiation, no fused `mul`/`add` -- over the MTP
+   head's `mtp_h_state` `reshape_3d(inp->h, n_embd, hc, n_tokens)`, with **both** `src0` and `dst` in `ROCm1`
+   (`host=0`).  The `per_layer_token_embd` host override (H1) and the block-12 arena evictions logged immediately
+   before it (H2) were both innocent: the clean `-c 131072` arm evicts *more* (9.4 vs 5.7 GiB), and the fault address
+   was inside the *draft's* compute region, `/proc/<pid>/maps` showing the slab's `---s /dev/dri` mapping ending
+   exactly at the mapped boundary.  Attribute a fault by address-to-buffer (`-lv`/maps/slab line), never by the
+   kernel name.
+3. **The draft context's compute buffer grows with the draft's CONTEXT, in 256 MiB lumps -- a flat tier is wrong.**
+   Measured per device (gfx1201, Flash-Next GSQ-RCO IQ3_S + shared `mtp-...-Q4_K_M`, `-ub 4096`, q8_0 KV):
+   0.75 GiB at `-c 32768`/65536, 1.00 at 98304/131072, 1.25 at 163840/196608 (and 1.25 at 204800 on ONE device),
+   1.50 at 204800/229376, 1.75 at 262144.  The old 512/768 MiB `compute` tier in `common_draft_reserve_estimate` was
+   measured at `-c 16384`, i.e. 2-3.5x short at any real context, which is what pushed narrow-2 across `mapped`.
+   The term is now the measured **floor** and stays a floor on purpose: over-estimating is not free either -- on a box
+   with no VRAM left `slab_extend` cannot reclaim the surplus, so it stays unmapped, while a shortfall costs only a
+   bounded, one-time arena yield that the pin now maps correctly.
+4. **A shortfall is cheaper than a surplus on a full box.**  With the estimate corrected, the repro arm moved from
+   the arena-yield branch to the clean spare branch and used *less* VRAM (32.82/33.11 vs 32.89/33.24 GB, 1.50 GiB
+   pinned either way), because the yield path had mapped the region's tail on top of what the arena already held.
+   Do not "safety-margin" this reserve upward without measuring: the margin comes straight out of the MoE arena.
+
+## r215 -- the host pool's fill and backing (block 09/12 amendment)
+
+**Measured facts.  Do not re-derive; do not "simplify" either mechanism back.**
+
+1. **`--load-mode mmap` and `--load-mode none` read the SAME bytes.**  `/proc/PID/io read_bytes` is 54.6 GiB in
+   both arms at 1 and at 2 devices, and the 48 GiB host-expert set lands in RAM in both.  A startup-time
+   difference between them is a *mechanism* difference, never an amount-of-work difference -- measure the bytes
+   before theorising.
+2. **A mirror pool's fill order is content-free, so it must be read sequentially.**  When the budget covers the
+   whole host tensor the pool is a MIRROR (`slots == n_experts`), its memory is one contiguous
+   `n_experts * host_bytes` allocation, and the GGUF expert layout is expert-major at that same stride (slot `e`
+   == file offset `file_offs + e*host_bytes`).  One sequential read of the tensor is 6.5 GB/s against 4.5 GB/s for
+   one `host_bytes` `memcpy` per heat-ranked slot out of the demand-faulted mapping, and it avoids faulting a
+   second copy of the bytes into a page cache that cannot be kept beside the pinned mirror (48 GiB: 10.8 s ->
+   7.4 s).  A *partial* pool is a different thing -- there the prior decides the content, so the ranked path stays.
+3. **`cudaHostAlloc(Portable|Mapped)` pins page by page, and pinning an EMPTY region is the expensive half.**  48 GiB
+   = 5.4 s, and it allocates+pins a zero page for every 4 KiB page the fill then overwrites.  `mmap` +
+   `MADV_HUGEPAGE` (2 MiB pages) + `cudaHostRegister` **after** the fill is ~1 ms plus page allocation the fill
+   needed anyway.  Same UVA device alias, same in-place cold read, same cross-device D2D fill source.
+4. **`cudaHostRegister` needs `Mapped`, not just `Portable`.**  A `Portable`-only registration returns success and
+   then faults the GPU on the first in-place cold read ("Page not present or supervisor privilege") -- found at
+   block 09, invisible in the log.  This stack has no XNACK, so an unregistered/unmapped range is not readable.
+5. **The pin is tied to the VMA: `cudaHostUnregister` alone does NOT release it** (2.0 of 256 MiB re-readable after
+   unregister, and it is not deferred -- `archive/work/host-expert-eager-push/` P4 §5).  The release is
+   `unregister` + `munmap`; verified end to end (`AnonHugePages` 48.97 GiB -> 0 at teardown, `MemAvailable` back to
+   baseline).  Anonymous THP is not a hugetlbfs carve-out, so nothing is retained.
+6. **Slot recycling must never touch the pin, and does not.**  A pool slot is index bookkeeping inside the one
+   per-tensor allocation, so churn pins nothing: with an 8 GiB partial pool and 35 559 slot fills, exactly
+   144 `hostRegister` / 144 `hostUnregister` (one per host tensor).  Any future design that allocates per SLOT
+   re-introduces pin/unpin churn and is wrong.
+7. **A registered source under the expert cache is NOT automatically a prefill loss.**  The archived -22 % 1-device
+   prefill regression (`archive/work/host-expert-eager-push/P4-ROOT-CAUSE.md` §5d) was a *pageable mapping*
+   registered in place, whose fills became synchronous DMA; it does not transfer to a pinned mirror whose transport
+   is unchanged.  Re-measured after this change: prefill 999.7 t/s (registered THP mirror) against 984.0 (the r214
+   `cudaHostAlloc` pair), and the multi-slot band at B=8 is 121 against 118 t/s, not the r210 ~50 collapse.  Test
+   both shapes anyway -- the mechanism is close enough that it must be re-measured, not assumed.
+8. **Startup timing is sensitive to `MemAvailable` at the FIRST pool build.**  `MOE_HOST_POOL_RAM_PCT` (85) of
+   `MemAvailable`, measured once, sizes the pool: a run started while the page cache still holds the model sizes a
+   smaller pool (45 504 slots / 29.6 GiB against 73 728 / 47.9 GiB) and then takes the loader's pinned-master path
+   (a 13.5 s load).  Drop the page cache (`POSIX_FADV_DONTNEED`) before any start-time comparison.
+
+## r216 -- block 15 Goal B is a DECODE placement: its page-fill path is ~50 % of the prompt on a KV that fits
+
+**Measured facts.  Do not re-derive; do not enable the pool on a prompt-heavy server.**
+
+1. **The pool's page-fill path is per DECODE step, so at PROMPT time it is pure overhead.**  `LLAMA_KV_REGION_POOL=16384`
+   against the plain device KV, one RX 7900 XTX, `-c 204800`, Qwen3.8-Flash-Next GSQ-RCO-IQ3_S (`-ncmoe 48`, q8_0
+   KV): **pp32K 427.5 against 829.3 t/s**, pp8K 463 against 769, **pp113K 409.2 against 808.2**.  A prompt chunk
+   writes every cell of its range, so the fill it pays is never reused; a decode step re-reads the same pages.
+2. **The pool's decode gain is exactly the arena it frees, and it is small.**  Same run: +12 % decode (59.4 against
+   52.8 t/s over 192 tokens) for 2.3 GiB of arena (12 084 against 9 742 MiB).  The KV here is ~13 KiB per token
+   (`2.6 GiB` at `-c 204800`), so on a 24 GiB card the pool's fittability case does not arise; Goal A's window
+   (`LLAMA_KV_RESIDENT_CELLS`) buys the same arena with no kernel change, free up to its own depth (530.1 against
+   808.2 at pp113K once it spills past 64K).
+3. **Prefill at this shape is not thread-, ubatch- or host-RAM-bound -- measure before tuning any of them.**
+   `--threads` 7/12/14/16 = 769/771/769/769 t/s at pp8K; `-ub 4096` against 2048 = 771 against 769;
+   `--cache-ram 6144 -> 0` = 768; `GGML_CUDA_SLAB_HEADROOM_MIB 1536 -> 768` = 776 (+1 %) for +843 MiB of arena.
+   The expert arena is a decode feature: `MOE_EXPERT_CACHE_MIB=4096` = 789 pp / 38 tg, `=0` = 890 pp / 10.8 tg.
+4. **A fixed `--limit-host-experts N` makes a config host-RAM-specific and refuses to start below it.**  `N` is
+   refused when the pinned master would exceed 90 % of the memory available at load (`54` on a 59 GiB host:
+   `more than 90 % of the available memory (59 GiB)`), and a later flag on the command line cannot rescue it
+   because the refusal happens while the argument is parsed.  Use `auto` in anything shared.
+5. **Pool on and pool off can differ by a near tie; the DEFAULT is the arm with the strong property.**  Same prompt,
+   temp 0, 128 output tokens: pool / plain / window all produced `00f5b00b804d2ebf`.  A 32K prompt at 48 output
+   tokens flipped one token between pool-on and pool-off (stable across two prompts).  The shipped default is the
+   plain device KV -- block 15 unset, the arm `patches/README.md` calls byte-identical to a build without the block
+   -- and `scripts/gate-kv-residency.sh` is the arbiter for the pool arm, not a sampled text hash.
+
+## r217 -- the gfx1201 stall is a FIXED cost (it only pays on short grids); a parked slot bounds `seq_rm`; every `getenv` is read once
+
+**Measured facts behind issue #273.  Do not re-derive; do not "optimise" the arms that are neutral.**
+
+1. **The gfx1201 grid-size stall is a fixed ~10 us added to a short kernel, so padding it only pays below ~2048
+   blocks.**  `archive/work/rdna4-grid-stall-pad/graphgap.hip` (2000 dependent trivial kernels in a captured HIP
+   graph, 256 threads/block), extended to large grids: 256 blocks **12.63 us** against 257 **2.34**, 512 **13.63** /
+   513 **2.71**, 1024 **11.62** / 1025 **3.32**, 1536 **6.42** / 1537 **4.21** -- then 2048 5.08 / 2049 4.83, 4096
+   7.54 / 4097 7.52, 8192 12.71 / 8193 12.76, 16384 24.41 / 16385 24.49, 32768 46.06 / 32769 45.86.  Above ~2048
+   blocks the kernel's own runtime hides the fixed cost and the pad changes nothing (it stays harmless and
+   bit-identical).  A block-value multiple of 256 or a work-item multiple of 65536 both trigger it; a launch can
+   hit the condition and be **neutral** -- check the grid size before claiming a gain (issue #273: the reporter's
+   256-block grids pay, a 27B model's 16384-block grid does not).
+2. **A parked idle slot sits at the TOP of a unified cache, so `used_max_p1()` is the cache size.**  `seq_rm()`
+   must therefore scan to `used_max_p1_below(park_bound())` for a sequence that is **not** parked (a parked
+   sequence holds only cells at or above the bound, and no other sequence has a cell there).  Measured on a
+   131 072-cell unified cache with 4096 live cells and a 64-cell parked sequence: **42.127 us -> 1.358 us** per
+   removal (31x); the parked cells, a full removal of the live sequence and the unpark are unchanged
+   (`scripts/gate-park-idle-slots.sh` is the end-to-end arbiter).  The negative `seq_id` (any-sequence) branch
+   must keep scanning the whole used range -- it has to remove parked cells too.
+3. **A per-op `getenv()` is a measurable cost AND a correctness hazard, so every read is latched once.**  One call
+   is **21.74 ns** here (a latched `static` 0.18 ns) and much worse on Windows (the CRT lock), but the harder
+   reason is that the ROCm 7.14 `rocprofiler-register` calls `setenv()` during early init and can reallocate the
+   process environment under a concurrent `getenv()` (ROCm issue #10196), which once made an env gate read as
+   unset -- see the comment at the top of `src/models/qwen4exp.cpp`.  Audit with an `LD_PRELOAD` interposer that
+   counts `getenv` per name on a real run: before r217 `GGML_CUDA_MMB_TYPES` (per matmul) was read 7 657-22 913
+   times per run, `GGML_CUDA_SLAB_STATS` 7 681-15 552, `GGML_STAGE_TRACE` 144-240, `GGML_CUDA_FA_STAGE_CHUNK_DEBUG`
+   125-431.  `getenv("X") ? atoi(getenv("X")) : D` (the doubled read) is gone from the tree; a read is
+   `[] { const char * e = getenv("X"); return ...; }()` into a `static`, or a file-local accessor when several
+   functions need it.  A `static` inside a **template** function is one copy per instantiation (that is the only
+   multi-read left, e.g. `GGML_CUDA_DISABLE_MMQ_ROUTED` in `mmq.cuh`).
+4. **Without media, the server slot's own token vector IS the prompt the drafters read**, so `slot.spec_prompt`
+   must only be copied when `tokens.has_mtmd`; the copy is 2.8 us/step at 10.5K tokens and **28.8 us/step at
+   110K**.  The drafters read it inside `common_speculative_draft()`, before the batch changes the prompt.
+
+## r218 -- the drafter's KV must stay contiguous with the rows it ingests (issue #272)
+
+**Measured facts.  Do not re-derive; a rejected draft batch is a HTTP 500 on the user's request, not a slow
+path.**
+
+1. **The ingest tail leaves the draft's cache ending below the first row a PARTIALLY reused prompt ingests.**
+   `LLAMA_DFLASH_INGEST_TAIL` (block 12, r130) and `LLAMA_MTP_INGEST_TAIL` (block 02, r118) ingest only the
+   last `n_swa` rows of the prompt.  A slot keeps a prefix from an earlier task, so when the new turn adds
+   more than `n_swa` tokens the new prompt's window starts *past* the rows the draft kept: the draft's
+   `seq_pos_max` is the reused prefix's end (P-1) while the first row the task injects is at
+   `ingest_from = prompt_end - n_swa > P`.  The batch check requires `seq_pos_min == seq_pos_max + 1`.
+2. **A strict (non-M-RoPE) draft is REJECTED; an M-RoPE draft is allowed to jump.**  `llama_batch_allocr::init()`
+   has two branches: `n_pos_per_embd > 1` (M-RoPE: `X < Y` for tokens, `X <= Y` for embeddings) and the
+   `Y = X + 1` rule otherwise.  A DFlash/DSpark draft carries `dflash.rope.dimension_sections` when it drafts
+   for an M-RoPE target (`LLAMA_ROPE_TYPE_MROPE`, `n_pos_per_embd = 4`) and takes `NORM`/`NEOX`
+   (`n_pos_per_embd = 1`) otherwise, so the same defect is a 500 for one draft class and a silently
+   context-starved batch for the other.
+3. **Reproduced on gfx1201, issue #272 (the reporter's shape).**  35B-A3B UD-Q4_K_M + the 35B-A3B DFlash2-Q8_0
+   draft, `-np 2 --kv-unified -ctxcp 4 -fa on -c 49152`, three turns of `prompts/prose-rdna-boosts.txt`
+   (+5246 tokens per turn, 2048-position window, `prompt_n` 5246/5251/5224, `cache_n` 0/5242/10516): the
+   pre-fix build answers turn 2 with `HTTP 500 decode() failed: failed to process speculative batch` and
+   `inconsistent sequence positions ... sequence 0 ... X = 5241 ... starting position of Y = 8445`.  The
+   reporter's DSpark arm measured the same message at `X = 1995, Y = 2242` (prefix 1996 reused, window start
+   2242).  `LLAMA_DFLASH_INGEST_TAIL=0` passes on the pre-fix build - the tail is the trigger.
+4. **A metadata-only non-M-RoPE copy of an M-RoPE draft is a faithful stand-in, so the two draft classes can be
+   compared on one model pair.**  Zeroing `dflash.rope.dimension_sections` (`[64,0,0,0] -> [0,0,0,0]`) switches
+   only the batch-check rule: the derived draft measures the **same acceptance** as the original
+   (0.42424 = 14 accepted / 33 generated, 0.20833 = 10/48, 0.35135 = 13/37, mean len 2.56/1.77/2.30) and the
+   same text on every turn, i.e. an M-RoPE rotation with one section is numerically what the strict backbone
+   does.  That is what makes `scripts/gate-spec-reuse-window.sh` able to hold one model pair for both rules.
+5. **The stale prefix carries nothing, so dropping it is exact.**  Every row below `ingest_from` is masked for
+   the prompt-end query (`GREEDY-PURITY.md` §53), and the injection batch does not contain them, so they can
+   neither be attended nor re-ingested: the only exact repair is to drop them and start a fresh window at the
+   first ingested row, exactly as the first-ever prompt of a session does.  After the repair the tail and
+   no-tail arms produce byte-identical text on every turn of the reuse replay (6/6 requests across the two
+   draft classes) - the drafter proposes, the target verifies.
+6. **A draft found AHEAD of the target is rejected by BOTH branches**, so the overlapping tail is trimmed
+   unconditionally (`pos_max + 1 > pos_first`): a checkpoint restore can put the draft past the position the
+   task resumes from, and this call re-ingests those positions anyway.
