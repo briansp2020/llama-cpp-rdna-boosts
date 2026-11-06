@@ -1,7 +1,7 @@
-From 83d660e2f42e84b8548026fa3046e56486eb89df Mon Sep 17 00:00:00 2001
+From 4f9cb4626625aa87f38ae6fcbeb45043f1742b0a Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 1 Nov 2026 15:44:01 +0000
-Subject: [PATCH 22/53] moe cache RAM tier: K spare slots + copy-back ahead on
+Subject: [PATCH 22/54] moe cache RAM tier: K spare slots + copy-back ahead on
  a side stream (GGML_MOE_TIER_PRECOPY, GGML_MOE_TIER_SPARES)
 
 ---

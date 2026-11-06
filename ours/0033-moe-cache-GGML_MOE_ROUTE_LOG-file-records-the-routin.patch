@@ -1,7 +1,7 @@
-From 0eb000ffbc4a4530b94a92e65ce93f2893b2486f Mon Sep 17 00:00:00 2001
+From 53f37e9ff1fe50804b4b6a84038184be17b9ea6b Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 05:55:46 +0000
-Subject: [PATCH 33/53] moe cache: GGML_MOE_ROUTE_LOG=<file> records the
+Subject: [PATCH 33/54] moe cache: GGML_MOE_ROUTE_LOG=<file> records the
  routing each decode policy call sees (plus table snapshots and hit/miss/fill
  totals) for offline policy replay; off by default, never changes residency
 

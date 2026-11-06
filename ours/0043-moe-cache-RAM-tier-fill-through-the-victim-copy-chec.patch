@@ -1,7 +1,7 @@
-From 2f929020399d5e412ff54c1958411b166f2ff519 Mon Sep 17 00:00:00 2001
+From 9fdb2745ca3d4b5fce6a00d0feaf58d0071fd9a3 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 18:03:13 +0000
-Subject: [PATCH 43/53] moe cache RAM tier fill-through: the victim-copy check
+Subject: [PATCH 43/54] moe cache RAM tier fill-through: the victim-copy check
  skips v = -1 (a spare took the expert, no member was displaced)
 
 ---

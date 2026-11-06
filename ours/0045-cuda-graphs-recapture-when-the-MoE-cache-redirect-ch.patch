@@ -1,7 +1,7 @@
-From 55218ed8984e0b7a6dce78469d0c963c695239a8 Mon Sep 17 00:00:00 2001
+From 49a429704eaa4d303ca54a30ea1538527585302c Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 4 Nov 2026 07:01:02 +0000
-Subject: [PATCH 45/53] cuda graphs: recapture when the MoE cache redirect
+Subject: [PATCH 45/54] cuda graphs: recapture when the MoE cache redirect
  choice of a node changed (FINDINGS 716)
 
 The per-op MoE consumer decides at dispatch whether a MUL_MAT_ID reads the expert-cache arena through

@@ -1,7 +1,7 @@
-From 55876f3477583eb63dfe177ecf1766a24f3919c7 Mon Sep 17 00:00:00 2001
+From 780eb4a50f27eeeb3c177731297d63f40e248648 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 18:04:11 +0000
-Subject: [PATCH 11/53] qwen4exp: gather prompt ubatches from a device copy of
+Subject: [PATCH 11/54] qwen4exp: gather prompt ubatches from a device copy of
  the token embedding
 
 The token embedding lives in host memory, so every graph starts with a

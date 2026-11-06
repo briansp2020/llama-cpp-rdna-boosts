@@ -1,7 +1,7 @@
-From a61bfc2d3008b7888a96f852889912cd24ffbcf2 Mon Sep 17 00:00:00 2001
+From b7528bc55afe494757fb729a2e84b7a539e70cc3 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 06:27:59 +0000
-Subject: [PATCH 47/53] cuda slab: GGML_CUDA_SLAB_WORK_MIN_MIB sizes the work
+Subject: [PATCH 47/54] cuda slab: GGML_CUDA_SLAB_WORK_MIN_MIB sizes the work
  band up front
 
 A compute view wider than the band learned from the reserves (the -ub 4096 prefill view, 2304 MiB vs 1792) moved

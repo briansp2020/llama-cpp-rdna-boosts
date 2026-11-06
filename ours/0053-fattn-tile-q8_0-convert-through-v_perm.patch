@@ -1,7 +1,7 @@
-From 6d334c7b7fc560d938c9ee5f043c4b25aa9135f7 Mon Sep 17 00:00:00 2001
+From d8f5362dd9c7d9218da4adf532a6815b66aa3c19 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 6 Nov 2026 08:26:34 -0800
-Subject: [PATCH 53/53] fattn-tile: q8_0 convert through v_perm
+Subject: [PATCH 53/54] fattn-tile: q8_0 convert through v_perm
 
 The q8_0 tile dequant on RDNA3/RDNA4 converts int8 to f16 with v_perm:
 byte ^ 0x80 under 0x64 is the f16 1024 + (q + 128) exactly, and one packed

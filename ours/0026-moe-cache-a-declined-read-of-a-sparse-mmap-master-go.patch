@@ -1,7 +1,7 @@
-From 45d6ca33b2bc9a0b17d0b415ee69c857d2c03c67 Mon Sep 17 00:00:00 2001
+From 3136619f05da814a239fe14bfbe42a9252f4fed8 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 00:05:12 +0000
-Subject: [PATCH 26/53] moe cache: a declined read of a sparse (mmap) master
+Subject: [PATCH 26/54] moe cache: a declined read of a sparse (mmap) master
  goes through the per-table pinned bounce
 
 The scheduler fallback for a read the cache declines issued a pageable cudaMemcpyAsync from the file mapping.  ROCclr

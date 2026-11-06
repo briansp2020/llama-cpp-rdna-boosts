@@ -1,7 +1,7 @@
-From fc704e3f2e01e8571b592885425d5083c23c2522 Mon Sep 17 00:00:00 2001
+From 3b5d4d9ab66a1af8b0034e734e9affe16023d7ff Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 02:18:17 +0000
-Subject: [PATCH 01/53] ours base: stew r204 without the #266 device remap +
+Subject: [PATCH 01/54] ours base: stew r204 without the #266 device remap +
  pool cold (ours carries its own device remap variant)
 
 ---

@@ -1,7 +1,7 @@
-From 22a196ebbaf1af745271df676874e2568472084c Mon Sep 17 00:00:00 2001
+From 4139d2ac0c28c9f4cd2b2eb3c5b538ecd61c5bfa Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 6 Nov 2026 00:34:03 +0000
-Subject: [PATCH 51/53] moe cache: batched decode admissions, one layer step =
+Subject: [PATCH 51/54] moe cache: batched decode admissions, one layer step =
  two kernels (GGML_MOE_FILL_BATCH)
 
 Inside one moe_cache_remap_dev call the victim saves, fills, cold pointer writes and map uploads of a layer are queued and

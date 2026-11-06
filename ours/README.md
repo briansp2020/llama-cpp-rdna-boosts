@@ -3,19 +3,19 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-6050b467c-r226` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
-`a07a5f81e2ce`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
+**Base:** `v16-6050b467c-r228` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
+`44b8fc4d8b92`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
 GDN small-projection gather), r182 took #253 (the 1-token router fold and its RDNA4 gate), r183 took #256 (the GDN
 decode folds), r187 took #258 (the quantized-KV rotations), r188 took #259 (the shared-expert GLU Q8_1), r198 took #260
 (the mixed K-quant x Q6_K row concat), r199 took #262 (the q4_0 KV write fold) and r203 took #266 (host-expert decode
-without the per-op routing sync), so they are no longer in this series. r205-r226 took none of it.
+without the per-op routing sync), so they are no longer in this series. r205-r228 took none of it.
 
 0000 keeps `moe-expert-cache.cu` at its r206 state: r207 rewrote the host pool path in that file (the pool-tier gather,
 per-table pool sizing, the `MOE_HOST_POOL_RAM_PCT` ceiling), and that code sits where this series replaces the release's
 remap and changes the bounce, gather and report paths for `--host-experts mmap`. So with this series `--host-experts pool`
 behaves as in r206, and `moe_cache_table_is_pool` answers false, so the scheduler's new default gathers nothing (r206's
-default). Everything else in r207-r226 (RDNA2 flash attention, Windows host memory, the scheduler and loader changes) is
-in, as released, and so are r210-r226, except the host pool changes of r219, r223 and r224 in that file (r219's rollback rule is ported in 0050).
+default). Everything else in r207-r228 (RDNA2 flash attention, Windows host memory, the scheduler and loader changes) is
+in, as released, and so are r210-r228, except the host pool changes of r219, r223, r224, r227 and r228 in that file (r219's rollback rule is ported in 0050).
 
 0001 takes #266's device remap and pool cold read back out of the release: this series has carried its own variant of
 that remap since before #266 (in 0002, with the review fixes in 0021: freshness rounds, and the remap forwarded through
@@ -25,11 +25,11 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 
 ```
 git checkout 6050b467c
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r226 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 54 patches (0000-0053)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r228 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 55 patches (0000-0054)
 ```
 
-Result: tree `d2e326bb7e79`.
+Result: tree `a1032ded184f`.
 
 ## Patches
 
@@ -68,12 +68,22 @@ Result: tree `d2e326bb7e79`.
 | 0051 | decode admissions are batched: inside one remap call, a layer's victim saves, fills, cold pointer writes and map uploads are queued and launched just before the remap, one layer step = two kernels. Same bytes and pointers, fewer dispatches. On the production config, greedy +1.6 % and the first answer after a cold load +12.5 % | `GGML_MOE_FILL_BATCH=0` |
 | 0052 | keeps the GDN conv inputs alive to the end of its q/k norm pair, so the allocator can no longer place the norm outputs over them and decline the fold depending on the graph layout. 1..255 tokens only. Neutral on the production model, a gain on Qwen3.6-35B-A3B (28 of 30 GDN layers fold again) | `GGML_CUDA_GDN_CONV_NORM_HOLD=0` |
 | 0053 | the q8_0 `flash_attn_tile` converts int8 to f16 through `v_perm`, on RDNA3 and RDNA4. Same product of the same operands, fewer instructions. This is the tile kernel only: Qwen3-30B-A3B at depth 32768 +3.8 %, the production model never launches it | `GGML_CUDA_FA_TILE_PERM=0` |
+| 0054 | `GGML_MOE_VERIFY_AT` and `GGML_MOE_VERIFY_EVERY` flush the fill batch before they compare. A check that fell inside a layer saw the host bookkeeping of the admissions queued by 0051, ahead of the device, and reported differences that were not real. Debug path only | none |
 
 The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`, `GGML_CUDA_MMVQ_ROW_CONCAT_RDNA4=0`,
 `GGML_CUDA_MMVQ_CONCAT_REORDER=0`, `GGML_CUDA_ROUTER_TOPK=0`, `GGML_CUDA_DISABLE_GDN_CONV_SNAP=1`,
 `GGML_CUDA_FUSE_GDN_CONV_DECODE=0`, `GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0`, #258's / #259's (`GGML_CUDA_QK_ROTATE_HADAMARD=0`,
 `GGML_CUDA_FUSE_V_FWHT=0`, `GGML_CUDA_FA_COMBINE_FWHT=0`, `GGML_CUDA_QK_PAIR_FWHT=0`, `GGML_CUDA_FUSE_ROPE_FWHT=0`,
 `GGML_CUDA_MOE_SHARED_GLU_Q8=0`), `GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0` (#260) and `GGML_CUDA_KV_FOLD_Q4_0=0` (#262).
+
+## Validation on r228 (2026-11-06, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
+
+For a Linux build, r227 and r228 reach this series only as Windows-guarded lines in `wddm-mem.cu`, because their other change is in
+the file 0000 holds at r206. So the source is the same as the r226 validation below, plus 0054, and that run was not repeated in
+full. The binaries do differ from r226, the cause not established, so these checks ran on the r228 binary: the varied-prompt test on
+Qwen3-30B-A3B and Qwen3.6-35B-A3B at 15K and 30K tokens, same text as r226 (before 0054). On the production config with 0054: greedy,
+prompt-test and post-needle output identical, no faults or evictions, `GGML_MOE_VERIFY_AT=300000` 0 differing slots.
+`GGML_MOE_VERIFY_EVERY=997` over short traffic: 354 passes, none with differences; 35 of 361 had differences without 0054.
 
 ## Validation on r226 (2026-11-06, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
 

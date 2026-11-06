@@ -1,7 +1,7 @@
-From 99cc6d15580347f72ffbc24da3f35842752d3448 Mon Sep 17 00:00:00 2001
+From 671b8d4377d4f3f04e45155f28eff20adc026e59 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 17:58:08 -0800
-Subject: [PATCH 52/53] cuda: keep the GDN conv inputs alive to the end of its
+Subject: [PATCH 52/54] cuda: keep the GDN conv inputs alive to the end of its
  q/k norm pair
 
 The direct conv kernel also writes the q/k l2 norm SCALE outputs when they do

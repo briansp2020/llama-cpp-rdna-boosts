@@ -1,7 +1,7 @@
-From eeae5878df758184bd8bef2befec2d719cc2df2d Mon Sep 17 00:00:00 2001
+From 792aa1a806a0f05c68ce053cae5b5e8382aa0aab Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 20:03:18 +0000
-Subject: [PATCH 44/53] moe cache: the forced admission also covers a
+Subject: [PATCH 44/54] moe cache: the forced admission also covers a
  partial-tier table (it can decline the same way), repoints an evicted
  victim's cold pointer to the file, and leaves the slot's fill state unknown
  (GGML_MOE_FORCE_ADMIT)

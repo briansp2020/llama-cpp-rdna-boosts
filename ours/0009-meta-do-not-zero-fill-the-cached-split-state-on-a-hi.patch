@@ -1,7 +1,7 @@
-From ba952f78ca9fcf89e43e2280959100c282cf561f Mon Sep 17 00:00:00 2001
+From e4a946581412fb0a4bf4053576a3b7bfa8532f37 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 13:31:34 +0000
-Subject: [PATCH 09/53] meta: do not zero-fill the cached split state on a hit
+Subject: [PATCH 09/54] meta: do not zero-fill the cached split state on a hit
 
 Only the max(n_segments, 1) x n_bufs prefix of ne is meaningful; the
 2128-byte zero fill in split_state_entry::get() was ~1/3 of

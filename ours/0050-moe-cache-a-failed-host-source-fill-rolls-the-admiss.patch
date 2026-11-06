@@ -1,7 +1,7 @@
-From f0145db413cac0a677fad15ce9f2c7a38eddf32e Mon Sep 17 00:00:00 2001
+From 35245c006be45be07fb938835a0fb67a6bbd6f09 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 20:54:49 +0000
-Subject: [PATCH 50/53] moe cache: a failed host-source fill rolls the
+Subject: [PATCH 50/54] moe cache: a failed host-source fill rolls the
  admission back and stands the table down (GGML_MOE_FILL_ROLLBACK)
 
 The remap is built from expert_slot, so a slot whose bytes never arrived served stale data: wrong output and only a warning.

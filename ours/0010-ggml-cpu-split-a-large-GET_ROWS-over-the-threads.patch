@@ -1,7 +1,7 @@
-From 1e7166d3b116998bcd68a7fa5538e49ecf9202f1 Mon Sep 17 00:00:00 2001
+From 3f835572c5611e12ed871987394c7850db329746 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 25 Oct 2026 16:42:58 +0000
-Subject: [PATCH 10/53] ggml-cpu: split a large GET_ROWS over the threads
+Subject: [PATCH 10/54] ggml-cpu: split a large GET_ROWS over the threads
 
 GET_ROWS always ran as one task (FIXME: thread launch cost with GPU
 offload).  For a prompt ubatch the CPU token-embedding lookup is
