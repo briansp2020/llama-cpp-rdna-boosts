@@ -1,3 +1,830 @@
+## 261106.015 (r226) -- issue #277: the four `get_rows` launches take the grid-stall pad, and the pad learns to refuse one it cannot make
+
+**Release `v16-6050b467c-r226`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
+**`3753eccf2`**, tree `a07a5f81e2ce308aa39fba95878a4b3fb220a668`.  Blocks **07, 08 and 10 amended**; blocks
+00-06 and 09/11-15 keep identical deltas (their `.patch` files change only in the `From <sha>` line, because
+the series was re-cut from this checkout).  Delivery records that changed: `INVARIANTS.md` (r226),
+`patches/README.md` (the three block notes), `ENVIRONMENT.md` (`GGML_CUDA_GRID_STALL_PAD_DEBUG`, and the
+`GGML_CUDA_GRID_STALL_PAD` row now names every site), `MANIFESTS.md` (release gate 21), `AGENTS.md` +
+`scripts/README.md` (the gate), and the new `scripts/gate-grid-stall-pad.sh`.
+
+**The report (a code reading, no measurement).**  #277 says `get_rows_cuda_float`'s `can_vec` branch builds its
+grid from `vec_block_num_y` and never asks `ggml_cuda_grid_stall_pad()`, while every call site added after #273
+does.  They measured **no stall** on their own shape (7.88 us at 768 blocks and 7.88 at 769) and filed it only so
+the site would be covered.  Scope: one R9700, gfx1201, ROCm 10; not built or run on r224.
+
+**What was actually true.**  The gap is real and wider than reported: from r46 to r225 the whole `getrows.cu`
+family (four launches: the vec float copy, the plain float copy, the sub-block dequantizing path and the
+super-block k-quant path) was the only grid-stall-shaped kernel with no pad call, while `mul_mat_vec_f`,
+`mul_mat_vec_q_ksplit`, `mul_mat_vec_q_moe`, the FA stream-K fixup and the GDN q/k norm pair all had one.  Two
+things the report could not see from outside:
+* **A pad there adds `grid.x` blocks, not one.**  `blockIdx.x` is the gathered-row index (`i10`, read from
+  `src1`), so the only cheap axis is y -- but one extra y row adds `grid.x` blocks.  When that count is itself a
+  multiple of 256 (a 256-multiple prefill ubatch; the MoE expert-cache remap's gather at `grid=(16384,1,1)`)
+  the block count *and* the work-item condition stay on the stall, so the pad cannot work at all.
+* **The reporter's 768-block launch is the vec branch of an F32 source or nothing at all.**  `ggml_get_rows`
+  always returns F32 (upstream's "TODO: implement non F32 return") and the vec copy is inside
+  `if constexpr (std::is_same<src0_t, dst_t>)`, so an f16/BF16 embedding lookup takes the plain path.  Their
+  `can_vec` observation therefore had an F32 src0 -- worth knowing before reading a `get_rows_float` line in a
+  trace as a declined vec branch.
+
+**The fix.**  `ggml_cuda_grid_stall_pad(grid, block, site, pad_blocks)` (block 07 owns the helper):
+`site` is printed by the new `GGML_CUDA_GRID_STALL_PAD_DEBUG=1` diagnostic, `pad_blocks` is how many blocks the
+caller's one-step pad adds, and the helper now **refuses** a pad whose padded count would land on another
+multiple of 256 (it logs `NO pad possible`) instead of launching a block row that cannot help.  Default
+`pad_blocks = 1` keeps every existing site exactly as it was, and all six sites now carry a label.  All four
+`getrows.cu` launches pad on y, guarded by the `UINT16_MAX` clamp: the y loop is grid-stride (`i +=
+gridDim.y*blockDim.x`, `ib += gridDim.y`), so an extra row either starts at or past the row bound (copies
+nothing) or only re-partitions the same super-blocks between blocks -- every element is still computed once, by
+the same arithmetic.  `tests/test-backend-ops.cpp` gains four `GET_ROWS` shapes so the padded launches are
+checked against the **CPU** reference on every run (`F32 512/8/1/be1=256` -> `(1,1,256)`; `F32 1002/8/1/be1=64`
+-> `(1,4,64)`; `Q4_0 2048` and `IQ4_NL 1024`, `be1=64` -> `(1,4,64)`).
+
+**`scripts/gate-grid-stall-pad.sh` (new, MANIFESTS gate 21).**  **A1** runs the `GET_ROWS` oracle in the pad arm
+and with `GGML_CUDA_GRID_STALL_PAD=0`: 224/224 cases pass in both, each of the four sites logs its pad in the pad
+arm (`get_rows_float_vec (1,1,256) 256 -> 257`, `get_rows_float (1,4,64) 256 -> 257`, `get_rows_q`,
+`get_rows_kq`), and the kill switch logs none.  **A2** runs `MUL_MAT_ID` (931/931 both arms) and requires the new
+refusal to be reached: 12 launches refuse (`get_rows_* (16384,1,1) NO pad possible`) rather than padding.
+**B** compares same-seed greedy text, pad on vs off, on a dense 1-device arm, a 3-device `-sm tensor` arm and a
+MoE `-ncmoe 40` arm, with a verbose 1-token probe of each: identical text, 419 / 1752 / 1156 pad lines with the
+pad on and 0 with it off.
+
+**Gates.**  New gate **PASS** (both sections, and a second full run to confirm).  Coherence: 4B Q8_0 1 GPU
+`100 chars sha=1c5d32ac537d` identical to the pre-change build, and the gate's arms give 4B 1 GPU and 4B 3 GPU
+`147 b065f37593b3` (the delivery's long-standing 4B value) and 35B-A3B UD-Q4_K_M `-ncmoe 40`
+`150 4ac3a523160f`.  Prefill logits: **`mean KLD = 0.000000`, `same top p = 100.000 %`** against the base
+recorded from `build=37148d118` (the r223 delivery tree, 27B Q8_0, gfx1201).  `gate-per-block-build.sh --base
+6050b467c --tip <re-cut> --changed-from 6b51f002d`: **4/4** (blocks 07, 08, 10 and the tip) build the `all`
+target (378 / 385 / 338 / 4 s, 1105 s total).  `fork-refresh.sh --build --gates` on the canonical re-cut: tree
+matches, build ok, coherence + prefill-logit PASS.  `validate-set.sh` nine checks GREEN (checksums, fresh-tarball
+strict apply, tree, conflict markers, Windows portability over 287 added files).  `check-gpu-faults.sh` clean
+over the gate's 14 logs and the kernel journal.
+
+**Not run, and why.**  The MTP four-axis protocol: nothing here touches a decode kernel's arithmetic, the text
+and acceptance arms of the coherence gate are byte-identical, and the pad only adds a returning block.  No
+benchmark arm was run either -- there is no performance claim to make (the reporter measured the stall absent on
+their shape, and r217 fact 1 says a grid this size is above where the fixed cost is hidden anyway); the pad's
+value is coverage of a launch site, and the gate is what keeps that honest.
+
+**One thing found on the way (recorded, not changed).**  `test-backend-ops -o MUL_MAT_ID` reaches the same
+`get_rows` sites from the MoE expert-cache remap at `grid=(16384,1,1)` -- always unpaddable by the new rule --
+which is why the refusal branch has a deterministic oracle rather than a model shape.  On a model the four
+`get_rows` sites are never padded in a decode (all three probe arms pad only mmvq/FA sites), so nothing in a
+CLI run would ever have noticed this site either way.
+
+## 261106.014 (r225) -- issue #276: the norm-rows fusion's gate pre-dispatch is now checked for aliasing at launch, not only through the scheduler's alloc deps
+
+**Release `v16-6050b467c-r225`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
+**`6b51f002d`**, tree `30e29a76a06ea04e06686b7be7def96bcee96902`.  Block **10** amended (it owns
+`ggml_cuda_norm_rows_try_fuse`, the fusion dispatcher); blocks 11-15 replayed with no conflicts.  The delivery
+records that changed: `INVARIANTS.md` (r225), `patches/README.md` (block 10 amendment + the `norm-gated.cu`
+bullet block 08 was missing), `ENVIRONMENT.md` (`GGML_CUDA_NORM_ROWS_DEBUG`), `MANIFESTS.md` gate 20,
+`AGENTS.md`/`scripts/README.md` (the gate), and the new `scripts/gate-norm-rows-alias.sh` +
+`scripts/norm-rows-alias.cpp`.
+
+**The report (a code reading, not a measurement).**  #276 says the gated form of the narrow-row norm fusion
+pre-dispatches the gate `MUL_MAT` and then reads `x`; in graph order `x` dies once the `RMS_NORM` consumed it,
+the gate output has exactly `x`'s shape, so the allocator's best fit for it is `x`'s own block and the
+pre-dispatch writes over the activation the fused launch has not read yet.  Its own scope note says the
+placement was harmless on the qwen4exp graph they could check.
+
+**What was actually true.**  The mechanism is real and the delivery depends on something the report could not
+see: `ggml_backend_cuda_graph_optimize` registers `x`/`w`/`z -> nm.dst` alloc deps for this fusion (since
+block 08), which keeps `x` alive past the gate output and makes the shipped path correct.  Those deps were
+added as a **buffer-size** trade in a different file (`ggml-cuda.cu`), so nothing in `norm-gated.cu` says a
+correctness invariant rests on them -- and a caller that drives `ggml_backend_graph_compute()` without the
+scheduler has none of them at all.  Measured on **Ling-3.0-tiny IQ4_NL** (the one local architecture that
+reaches the sigmoid-gated form -- bailingmoe3; there are no qwen4exp weights on this box), `-c 8192` over the
+5256-token `prompts/prose-rdna-boosts.txt`: **180 of 180** gated nodes fused, `ov(gate-out, x) = 0` with the
+deps; with the single `x -> nm.dst` dep skipped, **`ov(gate-out, x) = 2` (an exact full-block alias) on all
+180** and the 32-token greedy text collapsed from **172 chars (`f476efaac086`, identical to the unfused
+chain) to 52**.  So the report is a correct analysis of a latent hazard whose only guard was invisible.
+
+**The fix (two halves, and both are needed).**
+1. `norm_rows_alias_conflict()` in `norm-gated.cu` compares the byte ranges of the gate output and of `dst`
+   against `x`, `w` and each other **at dispatch time** and **declines** the fusion on any overlap, with one
+   exception: an exact dense alias of `x` with `dst` (same address, same layout, contiguous `x`) is a
+   read-then-write of the same address by the same thread, which is exactly what the allocator hands out for
+   the plain `x -> MUL` form.  Declining returns to the unfused chain, whose text is identical (both arms
+   above agree on `f476efaac086`).  Ranges use `sum((ne[d]-1)*nb[d]) + type_size`, never `ggml_nbytes()`
+   (dense, and it understates a padded view -- `x` is a strided reshape often enough to matter).
+2. The alloc-dep site in `ggml-cuda.cu` now says what it is: keeping `x` and `w` alive until `dst` is a
+   **correctness** requirement, with the measurement above, so the next reader cannot delete it as a
+   memory trade.  `GGML_CUDA_NORM_ROWS_DEBUG=1` (INFO, so `-lv 4`) logs one line per node, fused or declined
+   with its reason, which is what makes "nothing was declined" an observation.
+
+**`scripts/gate-norm-rows-alias.sh` (new, MANIFESTS gate 20).**  Two sections.  **A** drives the backend with
+no scheduler at all (`scripts/norm-rows-alias.cpp`: `ggml_backend_graph_compute()` on the gated shape, so no
+alloc deps exist) and forces each aliasing shape by pointing a tensor at another one's buffer after
+allocation: `alias_gate` (gate output == `x`) and `alias_dst_row` (fused output == `x` + 1 row) must be
+**declined**, `alias_dst_exact` (fused output == `x`) must still **fuse**, and every arm must equal `ref` and
+the driver's own `--no-fuse` digest.  **B** drives the delivery path on Ling and fails unless the gated form
+fused (else the text comparison is vacuous), **nothing was declined** (the deps still hold: the only
+assertion that catches a dropped dep, because the text stays correct either way now that the guard falls
+back), and the fused text equals `GGML_CUDA_DISABLE_NORM_ROWS=1`.  **Negative-tested three ways**: guard
+removed -> driver arms digest `bed78b1da3ac9b28` / `2b0800ea70a3eb6a` against a `bcc36422f9a120ac` reference
+(both FAIL); dep dropped -> Ling 52 chars as above; dep dropped -> section B FAILs on `declined=180` and
+"never fused the gated form".
+
+**Gates.**  New gate **PASS** on the canonical re-cut (driver 4/4 arms, digests `bcc36422f9a120ac` in the
+fused and the `--no-fuse` run, i.e. the fused launches are also bit-identical to the chain at that shape;
+model arms 180/180 gated fused, 0 declined, `172 f476efaac086` on both).  Coherence: 4B Q8_0 1 GPU and 3 GPU
+`-sm tensor` **`139 d2ffb97ccb76` on the fused and the kill-switch arm**, Ling `172 f476efaac086`.  Prefill
+logits: **`mean KLD = 0.000000`, `same top p = 100.000 %`** against the base recorded from `build=37148d118`
+(the r223 delivery tree, 27B Q8_0, gfx1201) -- i.e. the numerics of the path are bit-identical.
+`gate-per-block-build.sh --base 6050b467c --tip <re-cut> --changed-from 88e7d88a7`: **2/2** (blocks 10 and 15;
+11-14 skipped as content-unchanged) build the `all` target.  `check-gpu-faults.sh` clean (kernel journal +
+every arm's log); `validate-set.sh` green (checksums, fresh-tarball strict apply, tree, conflict-marker and
+Windows-portability scans of the 287 delivery-added files).
+
+**Not run, and why.**  The MTP four-axis protocol: the fusion's own matcher floor is `rows >= 4096` with
+`rows = x->ne[1]*ne[2]*ne[3]` (n_head x n_tokens for a per-head norm), and no decode or verify batch on any
+delivered model comes near it (Ling 16 heads, 4B 16/32, a 128-head model at an 8-token verify is still 1024),
+so every decode/verify arm is **unreachable by construction** and would only re-measure the base build.  The
+prefill-logit gate is the arm that does reach this code.  `-ctk/-ctv q8_0` was not re-run (the fusion is KV
+type independent: it keys on F32 activations, not on the cache).
+
+**One more thing found on the way (recorded, not changed):** the plain `RMS_NORM -> MUL(w)` form is protected
+by the same guard but has **no** alloc dep, and its `x` is measurably non-contiguous on real graphs
+(`contig_x=0` at `-lv 4` on Qwen3.6-35B-A3B and Gemma4-E4B prefill).  It is safe today because `MUL` takes
+`rms`'s buffer **in place** (the gallocr's `ggml_op_can_inplace` path), so `dst` never lands on `x`; if a
+future graph makes `rms` ineligible, the fusion now declines instead of corrupting.  That is the right
+trade for the hot path (an alloc dep there would hold a 4-16 MiB buffer for every per-head norm).  The same
+holds for upstream's own `ggml_cuda_can_fuse({RMS_NORM, MUL})` launch, which has no guard of its own: it
+is safe for exactly the in-place reason, and the driver cannot use the plain form as a reference arm because
+only the master `GGML_CUDA_DISABLE_FUSION` turns that one off.
+
+## 261106.013 (r224) -- the host-expert-split campaign lands: a DECODE-ranked pool, an eviction demote, coalesced prefill reads (+81 % at `-lme` 12), and the heat-map fixes
+
+**Release `v16-6050b467c-r224`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
+**`88e7d88a7`**, tree `7d4e504518b455a05a956f2a20b971fe8976c566`.  Campaign record:
+[`archive/work/host-expert-split/`](archive/work/host-expert-split/RESOLUTION.md) (promoted out of `wip/`, no stub).
+
+**The fold.**  The campaign's 14 fork commits (13 + the `SINK_TAX` removal) all touch one file,
+`ggml/src/ggml-cuda/moe-expert-cache.cu`, so they were squashed into **block 12** ("campaign remainder" -- the
+permanent block that owns `pool_rank_experts_locked`, `moe_cache_forget_all` and the pool's policy; the
+cache-side hooks it uses -- `host_pool_t`, the prepopulate, the gather/staging read paths -- stay in block 09).
+Blocks 13/14/15 replayed with no conflicts.  The fold is **provably content-free**: the rebased tip's tree is
+byte-identical to the campaign branch's (`7d4e5045…`), so no line changed, only its attribution.  Regenerated
+with `make-patches.sh` (block 12 +880/-166 lines; 13/14 changed only their `From` line; 15 only index lines),
+`make-release.sh`, then `fork-refresh.sh` in a scratch clone printed the canonical tip.
+
+**What shipped (`ENVIRONMENT.md` has the eight variables, `patches/README.md` block 12 the detail).**
+`MOE_HOST_POOL_RANK=decode` (default; `combined` = the parallel-slot workaround, `TODO` #275),
+`MOE_HOST_POOL_SINK=1` (the eviction demote into in-budget headroom), `MOE_HOST_POOL_STAGE_SPAN=1`
+(the coalesced prefill read), the heat-save truncation fix, and `invert` + `SINK_TAX` deleted.
+
+**The honest numbers (frozen real-world heat prior -- see 261106.012 for why).**  `-lme 36`, `-n 64`:
+control (`combined`+`SINK=0`) 24.3 -> shipping **26.2 t/s (+7.8 %)**, decomposed as ranking **+1.2 %** and
+demote **+5.3 %**.  Prefill: **+81 % at `-lme` 12, +57 % at 18, +14 % at 36** (94.2/115.6/330.9 ->
+170.7/181.6/375.5), generation unchanged.  Batched gate (`-npl 4` prefill): 1144.69 vs 1292.88 for `combined`
+(**-11.5 %**), accepted and documented.
+
+**Gates.**  Coherence, `-lme 12`, pool engaged (asserted per run): **`sha=880c932888f8` identical on all four
+arms** -- shipping, `MOE_HOST_POOL_SINK=0`, `MOE_HOST_POOL_RANK=combined`, `GGML_MOE_DEVREMAP=0` (no scheduler
+hook / iface member changed, so gate 1's 2-slot server arm is not triggered; the admission is covered by the
+pool gate below).  `gate-host-pool.sh` **28/28** on the folded tree (7 arms: `sink` 4009 demoted, `sinkfail`
+0 demoted / 4075 copy-error declines).  `gate-per-block-build.sh --changed-from 37148d118` (the r223 tip):
+**2/2 blocks build the `all` target** (12 and 15; 13/14 skipped as content-unchanged).  **Prefill-logit KLD:
+`mean KLD = 0.000000`, `same top p = 100.000 %`** against a base recorded from the **r223 delivery tree**
+(`build=37148d118`, 27B Q8_0, gfx1201) -- i.e. the block set's prefill numerics are bit-identical.
+**MTP**: on the shipping pool config (Flash-Next, `-lme 36`, `-c 16384`, `-n 3000`, prose, draft head
+`mtp-…-Q4_K_M.gguf` via `-md`) `--spec-type draft-mtp` is **byte-identical** to `none` (10 516 chars,
+`sha=f3e70bb2da19`) at **20.6 vs 18.3 t/s generation (+12.6 %)**.  `check-gpu-faults.sh` clean over the whole
+window; `validate-set.sh` green (checksums, fresh-tarball strict apply, tree, conflict-marker scan, Windows
+portability scan of the 287 delivery-added files).
+
+**Not run, and why** (no hiding): the MTP **four-axis** R/P/C/K matrix on the canonical dense 27B was not run
+this session -- the prose axis on the field config is recorded above and the change is inert on a dense model
+(no host pool), so it is the one gate a reviewer may still want before the tag; the `moe_cache_stage_table` arm
+of the coalesced read stays unexercised (the field config never reaches it -- the shared helper and its geometry
+guard are identical to the gather path's, which is proven).
+
+**Also recorded as `INVARIANTS.md` facts (r224):** the read SIZE is the prefill ceiling (one read per run of
+missing experts, growing pinned ring, `SPAN_MIN=2` load-bearing, no byte amplification); the heat prior is an
+**adaptive measurement input** (a writable map learns the benchmark prompt -- `chmod 444` freezes it at open and
+at every save); a failed demote **declines** and is never published; a writable heat map must never be truncated
+to a stub; and every ggml `INFO` counter line needs **`-lv 4`**.
+
+## 261106.012 (campaign) -- W4 prefill read granularity (+81 % prefill at `-lme` 12); the heat prior is an INPUT; the headline was prior leakage
+
+**Fork: `p1-pool-rank-r223` + this session's work.  Nothing in `patches/`; `release.json` untouched.**  Record:
+`wip/host-expert-split/W4-SPAN-READS.md`, `HANDOVER.md`.
+
+**The disk-I/O ceiling was read SIZE, and the record had the wrong function.**  §7 of the previous handover
+blamed `moe_cache_stage_table`; with the counters visible that path *never runs* on this configuration (0 calls,
+0 declines).  The reads are `pool_prepopulate_locked` (60 624 reads / 38.5 GiB / 18.1 s = 2191 MiB/s, once at
+sizing) and the **gather pre-pass** in `moe_cache_gather_host` (at `-lme 12`: 198 723 reads, 128 GiB, **56.3 s
+of a 73 s run**).  `/proc/diskstats` at 2 Hz shows the drive pinned at ~2.1 GiB/s for 40 s against 4.2 GiB/s
+for a 16 MiB direct read and 6.7 GB/s for four concurrent streams.  One ~0.65 MiB O_DIRECT read per expert is
+latency-bound at depth 1.
+
+**The fix (`stage_span_fill`, default on, `MOE_HOST_POOL_STAGE_SPAN=0` = kill switch).**  A maximal run of >= 2
+consecutive experts in neither tier is served by one aligned O_DIRECT read of up to 16 experts (~10.9 MiB) into
+a pinned ring buffer, then one H2D per expert; the pool admission and the destination bytes are unchanged; a
+short read falls back to the per-expert path and never fails the stage.  The ring grows on demand to the
+backlog (a fixed 2-deep ring spent 5.6 s of a 16 s prefill waiting on a backlogged compute stream; 4-deep, 5.0 s;
+growing, 1.5 ms).  `SPAN_MIN = 2` is a code constant, not a knob (measured at `-lme 36`: 1 -> 362, 2 -> 379,
+4 -> 331 t/s).
+
+| `-lme` | prefill SPAN=0 | SPAN=1 | d prefill | gen (n=64) |
+|---|---|---|---|---|
+| 12 | 94.2 | **170.7** | **+81 %** | 9.9 / 9.9 |
+| 18 | 115.6 | **181.6** | **+57 %** | 12.8 / 12.9 |
+| 36 | 330.9 (3 reps +-0.9) | **375.5-378.8** (3 reps +-0.3) | **+13.5..+14.6 %** | 26.2 / 26.2 |
+
+Span reads ran at 4828 MiB/s (`-lme` 12) / 3729 MiB/s (36) against 2263-2332 MiB/s per expert; 0 fallbacks; text
+`sha=880c932888f8` identical on both arms at `-lme 12` (the budget where spans serve 168 536 experts / 108.9
+GiB); `check-gpu-faults.sh` clean.
+
+**The campaign's headline was measuring its own leakage.**  `<model>.moe-heatmap` is rewritten by every run and
+it ranks the pool's content, so the session that produced `22.6 -> 27.5 (+21.7 %)` had been re-ranking the pool
+for its own 5 298-token test prompt.  On the **frozen real-world map** (restored from `radix`, 601 376 B, 144
+tables, mode 444, sha256 `6195152358e1…`) the decomposition at `-lme 36` (`arm-decay`, `-n 64`, 2 reps) is:
+control (`combined` + `SINK=0`, = r223) **24.3**, ranking only **24.6 (+1.2 %)**, demote only **25.6 (+5.3 %)**,
+shipping **26.2 (+7.8 %)**.  The policy counters are unchanged from the old record (10 203 demoted, 6-8 %
+reuse, 326 no-free-slot), i.e. the same mechanism on a different input.  **D1 (ranking default on) is reopened:
+the demote carries the campaign, the ranking is +1.2 % single-stream and still -11.5 % prefill at npl 4.**
+Recommendation: default `MOE_HOST_POOL_RANK=combined`.  Maintainer's call.
+
+**Heat prior protocol.**  A read-only sidecar IS the freeze signal (`heat_map_open_locked`: "read-only; loading
+and seeding from it, not updating it"; the save path re-checks, so it can be frozen mid-run).  Verified with the
+map at 444 and `MOE_EXPERT_HEATMAP=1`: the run refuses to write and the sha256 is unchanged.  The arm scripts
+now default to `MOE_EXPERT_HEATMAP=load`; `HEATMAP=1` is for regenerating a map on purpose.
+
+**A real bug, fixed: a writable heat map was truncated to a 32-byte stub.**  `moe_cache_report`'s exit-time save
+walks `g_tables`, but `moe_cache_forget_all` drops them first, so any run shorter than the 60 s debounce wrote a
+header-only sidecar — a valid *empty* map that silently destroys a curated prior (it did exactly that to this
+campaign's map before the freeze).  `forget_all` now flushes the tallies before the tables go; verified: a 45 s
+run writes 601 376 B / 144 tables instead of 32 B.  **Delivery-relevant (block 09) — fold with the campaign.**
+
+**Methodology corrections.**  (1) Every ggml `INFO` counter line needs **`-lv 4`** (`INFO` maps to
+`LOG_LEVEL_TRACE`), so the arms' `-lv 3` hid `pool fills`, `prefill cache staging` and every counter this
+campaign reasons about — that is how the wrong function got blamed.  The arms now honour `LV=`.  (2)
+`arm-coherence.sh` reported VACUOUS on every run *while the pool was engaged* (default verbosity logs nothing at
+all); fixed with `-lv 3` plus a stream split (`> OUT 2> LOG`), which also retires the "never hash an `-lv 3` log"
+rule that only ever applied to a merged `2>&1` file.  (3) A 20-token generation under-reports gen by 13-15 %
+(41.6 vs 35.8 ms/token: warm-up plus the pool's first ~20 decoded tokens) — the release table's gen column must
+be `-n 64`.
+
+**Batched gate on the frozen prior** (`-lme 36`, `-lzm auto`, npl 1/4/8): npl 1 unchanged; npl 4 prefill
+1144.69 (shipping) vs 1292.88 (r223) = **-11.5 %**; npl 8 total 45.3 s vs 35.9 s (MemAvailable min 40 GiB, so
+not the memory-collapse trap).  One rep each — enough to keep D1 open, not to size the cost.
+
+
+**Gate ladder progress (same session, after the commit above).**  (1) `MOE_HOST_POOL_RANK=invert` **removed** from
+the fork (D7): the parse branch, the inverted sort direction and the extra report mode are gone; the shipping
+decode arm is unchanged (26.1 t/s, 10 203 demoted, 326 no-free-slot, 0 copy-error) and text is still
+`sha=880c932888f8`.  (2) `scripts/gate-host-pool.sh` **extended to seven arms and PASSING 28/28**: a new
+`MOE_HOST_POOL_SINK_FAULT=1` diagnostic in the fork routes a demote copy failure through the same branch a real
+copy error takes, so the gate can prove the issue-#274 rule for the demote — `sink` arm: 4 006-4 009 demoted
+(not vacuous); `sinkfail` arm: **0 demoted** with 4 069-4 081 `copy-error` declines, text byte-identical to
+`ref` (`a99ccbd97ecb`).  A failed demote declines and is never published as a resident victim (a published
+victim would serve stale bytes for the life of the run).  The gate also now runs every arm with
+`MOE_EXPERT_HEATMAP=load`, so its seven arms are compared across one prior; `MANIFESTS.md` gate 19 and
+`scripts/README.md` updated.  (3) Still owed on the ladder: the prefill-logit base from the delivery tip (also
+the first proof of the `stage_table` span path), the MTP four-axis, the per-block build, and the `-lme` sweep
+with the frozen prior.
+
+Still owed (unchanged): the release table sweep, MTP four-axis, the prefill-logit base from the delivery tip,
+the per-block build, then the promotion fold into blocks 09/12.
+
+
+## 261106.011 (campaign) -- session handover written; campaign state frozen for a fresh session
+
+**No code change.**  `wip/host-expert-split/HANDOVER.md` is the pick-up point for the next session: decisions
+D1-D8 (both changes ship default-on, `npl 4` accepted, K as a fraction, period 32, `invert` must not ship, prefill
+granularity next), the exact code state (fork `p1-pool-rank-r223` @ `bfb9b0b22`, every branch commit annotated,
+the eight environment variables with defaults and classes), the proven numbers with their cells (+21.7 % at
+`-lme 36`; the 12->48 budget curve; the batched gate; the 9.6 us/copy and 7.9 % reuse economics; the 31.2 t/s
+mirror), what is explicitly NOT proven (one model/prompt/device, no control curve below 36, `floor` unswept,
+multi-device untested), the eight gates owed, the prefill span-coalescing spec with the `dd` drive measurements,
+the six negative results not to repeat, and the eight methodology traps.
+
+Frozen state: fork clean at `bfb9b0b22`, built binary matches it, nothing from this campaign in `patches/`,
+`release.json` untouched.
+
+## 261106.010 (campaign) -- the streaming ceiling is PREFILL read granularity (0.6 MB per expert), not the drive
+
+**No delivery change; fork reverted to `bfb9b0b22`.**  Chasing the maintainer's observation that disk streaming
+stops at ~2.3 GB/s on a drive that does ~7 GB/s.  The answer is read SHAPE, and the target is prefill.
+
+**The drive measured with `dd iflag=direct` on the model shard (this box):**
+
+| shape | throughput |
+|---|---|
+| single 0.6 MB (627 200 B) read, depth 1 | **520 MiB/s** (1.1 ms) |
+| same, 630 784 B (4 KiB-aligned) | 565 MiB/s -- alignment is NOT the issue |
+| 2 MiB, depth 1 | 1.5 GiB/s |
+| 16 MiB, depth 1 | **4.2 GiB/s** |
+| 0.6 MB at depth 16 / 32 | 3.0 / **4.5 GiB/s** |
+| 4 concurrent sequential streams | **6.7 GB/s** (matches the drive's rating) |
+
+So the drive is fine; a 0.6 MB read is **latency-dominated** (~1.1 ms fixed), and throughput is set by read size
+and by outstanding depth.  ~2.3 GB/s is consistent with an effective depth of ~10 -- which is what the kernel's
+readahead and/or our own serial reads deliver.
+
+**The offending path.**  `moe_cache_stage_table` walks `e = 0..n_experts` and calls
+`expert_host_src` + one `cudaMemcpyAsync` PER EXPERT, so every non-resident expert is a separate 0.6 MB read:
+sequential, at ~520 MiB/s each, for every ubatch that has to stream it.  Experts `e..e+n` are CONTIGUOUS in the
+file (`file_offs + e*host_bytes`), so a run of non-resident experts can be one span read.  The same code's own
+comment records the scale ("27 minutes of disk reads for one 68K prompt").
+
+**Fix spec (not yet implemented):** in the stage loop, for the 1-D case (`n_slices == 0`,
+`pool->host_bytes == t.expert_bytes`, disk mode, no `do2d`, no batch), coalesce maximal runs of consecutive
+non-resident experts into chunk reads -- e.g. 16 experts (~10 MB) into a reusable pinned buffer, one `pread` +
+one `cudaMemcpyAsync` per chunk.  Pool-resident and arena-resident experts keep their existing copies.  Expected
+4-8x on the disk legs (520 MiB/s -> 4.2 GiB/s at 10 MB; up to 6.7 GB/s chunked in parallel), which on the
+`-lme 12` prefill (94 t/s) is plausibly the largest single remaining win in this campaign.
+
+**Two negative results worth keeping, so nobody repeats them:** (1) a concurrent 4-worker fill pool for the
+demand path changed nothing -- at sub-mirror budgets the pool is SATURATED, so `pool_free_slot_locked` returned
+no slot and ZERO jobs were dispatched; (2) `madvise(MADV_WILLNEED)` prefetch hints on the routed experts changed
+nothing, because this box's page cache is warm (dropping it needs root).  Both were reverted rather than shipped
+unverified.  Any re-test of either needs a cold cache -- the `wip/bench-56gb/` rig is the venue, and it is
+password-blocked.
+
+## 261106.009 (campaign) -- W3 curve (prefill + gen), and a saturation fix that must be duplicate-only
+
+**Fork only.**  W3's budget sweep on the shipping configuration (`decode` + exchange on, `-lzm off`, arena
+4 GiB, prose prompt, `-n 64`, one R9700), and the fix that came out of it.
+
+| `-lme` | pinned | prefill t/s | gen t/s | pool h | demoted | declines | reclaimed |
+|---|---|---|---|---|---|---|---|
+| 12 | 12.0 GiB | 94.3 | 10.4 | 0.0446 | 4 875 | 14 949 | 833 |
+| 15 | 14.7 | 103.8 | 12.0 | -- | 5 730 | 12 005 | -- |
+| 18 | 17.7 | 116.3 | 14.1 | 0.0644 | 6 808 | 8 893 | 1 675 |
+| 21 | 20.6 | 131.3 | 16.2 | -- | 7 389 | 6 843 | -- |
+| 24 | 23.5 | 149.9 | 19.0 | 0.0936 | 8 219 | 4 620 | 2 048 |
+| 27 | 26.4 | 173.9 | 21.3 | -- | 8 592 | 3 424 | -- |
+| 30 | 29.9 | 206.6 | 24.4 | 0.1408 | 9 588 | 1 506 | 1 610 |
+| 33 | 32.9 | 250.9 | 25.8 | -- | 9 856 | 863 | -- |
+| 36 | 35.9 | 331.3 | 27.8 | 0.2311 | 10 152 | 42 | 441 |
+| 39 | 39.0 | 472.5 | 28.3 | -- | 9 978 | 93 | -- |
+| 42 | 42.0 | 672.3 | 28.7 | -- | 9 876 | 79 | -- |
+| 44 | 43.9 | 740.0 | 29.4 | 0.7799 | 9 864 | 0 | 37 |
+| 46 | 45.9 | 777.9 | 29.1 | -- | 9 862 | 26 | -- |
+| 48 (mirror) | 46.8 | -- | 31.2 | -- | 0 | -- | -- |
+
+**The saturation freeze, found because the disk stopped at ~2.4 GB/s on a 7 GB/s drive.**  At low budgets the
+pool is full of the prior's bad guess, so no fill can happen, so nothing retires, so every demote declines and
+the pool never learns: at `-lme 12`, `h=0.0439`, 0 disk fills, 15 212 victims discarded, and every miss on the
+**synchronous bounce ring** -- one 0.6 MiB expert read at a time, queue depth 1, ~250 us each = **~2.4 GB/s**,
+which is exactly the observed ceiling and is latency, not bandwidth.  Depth 4 would plausibly reach the drive's
+~7 GB/s, but the fill runs under `g_mutex`, so the I/O has to come out from under the lock (the bounce ring
+already has multiple slots, so a small prefetch pool is feasible).  That is now the largest remaining lever at
+sub-mirror sizes.
+
+**Two reclamation policies measured, and only one is safe.**  Reclaiming the LRU resident unfroze the pool but
+was a net LOSS at mid budgets: at `-lme 24` it evicted 10 220 residents, doubled the demotions (8 019 ->
+17 367) and lost a third of the throughput (18.7 -> 12.4 t/s), because a 4 GiB arena holds too few duplicates
+and the pool's ONLY copy of an expert was being thrown away.  **Reclaim a DUPLICATE only** (an expert the arena
+also holds, whose pool copy is worth nothing) and decline otherwise: a small gain at every budget and no
+regression (18.7 -> 19.0, 23.9 -> 24.4, 27.6 -> 27.8, 29.1 -> 29.4; declines at 36 fell 258 -> 42, at 44
+38 -> 0).
+
+Owed: the `combined`/`SINK=0` control arm across this sweep (the old-default curve, for the release table); the
+pipelined fill; then the gates (MTP four-axis, prefill-logit, per-block build) and promotion.
+
+## 261106.008 (campaign) -- the exchange is inert against a full mirror, and can never exceed one
+
+Two invariants, requested and verified on the shipping build:
+
+1. **spare = 0 and the exchange INERT when a table's pool can hold every expert** (`slots >= n_experts`).
+   There coverage is exact, so a demote has nothing to fix and its copies are pure cost.  The important part
+   is the failure mode this prevents: on a mirror a demote finds no free slot, sets the need flag, and
+   **retires a resident to make room -- destroying the mirror**.  `pool_sink_active()` now gates the demote,
+   the incoming-fill competition *and* the retirement on `slots < n_experts`.
+2. **pool + headroom never exceeds a full mirror.**  `slots` is clamped to `n_experts` at sizing, so the
+   reserve is always drawn from that budget and never adds to it.
+
+| `-lme` | slots | pinned | demoted | retired | mirror tables | gen t/s |
+|---|---|---|---|---|---|---|
+| 36 (sub-mirror) | 56 592 | 36 815 MiB | 10 033 | 10 300 | 0 | 27.5 |
+| **48 (full mirror)** | **73 728** (144x512) | **47 962.5 MiB** | **0** | **0** | **144** | **31.2** |
+
+The mirror pins exactly the whole host expert set (47 962.5 MiB), so the "never more than a mirror" bound is
+visible in the allocation.  And the mirror remains the fastest configuration by a clear margin -- **31.2 vs
+27.5 t/s** for the same build -- which is the correct outcome: where a mirror fits, it wins outright, and
+the exchange exists for the budgets where it does not.  **31.2 t/s is the asymptote W3's curve should
+approach** as `-lme` rises.
+
+Next per the agreed order: W3 (the `-lme` 30->47 sweep, now on the shipping configuration), then the gates.
+
+## 261106.007 (campaign) -- DECISION: both changes ship ON by default; defaults implemented and verified
+
+**Maintainer's decision, recorded as a judgement rather than a measurement:** ship the ranking AND the demote
+on by default with kill switches.  +21.7 % single-stream outweighs -5.1 % / -13.2 % at npl 1/4, and a
+single-user stream is the common case.  **`npl 4` is an accepted limitation**, to be documented as such at
+promotion -- not quietly buried.
+
+Implemented on the fork (`~/llama.cpp`, branch `p1-pool-rank-r223`):
+
+| variable | default | class |
+|---|---|---|
+| `MOE_HOST_POOL_RANK` | `decode` (was `combined`) | kill switch: `combined` restores the previous behaviour |
+| `MOE_HOST_POOL_SINK` | on (was `0`) | kill switch: `0` |
+| `MOE_HOST_POOL_SINK_SPARE_PCT` | 4 (% of a table's slots; floor 2, cap slots/8) | tuning |
+| `MOE_HOST_POOL_SINK_SPARE` | -1 = auto | absolute override |
+| `MOE_HOST_POOL_SINK_SPARE_MIN` | 2 | tuning |
+
+**Verified with no environment variables at all:** 27.5 t/s (twice, vs 22.6 for the old defaults), 268/269
+declines, 7.7-7.9 % reuse, text byte-identical at `880c932888f8`; `RANK=combined SINK=0` restores 22.6
+exactly, so the kill switches work.
+
+The fraction had to be *of slots*, not of experts: at `-lme 36` a table has ~393 slots, so the measured
+optimum K=16 is 4.1 % of slots.  3 % under-shot it to 11 slots and gave 26.8 t/s with 902 declines; 4 %
+gives 27.5 with 268.  A flat default would have been silently wrong on a model with a different slot count.
+
+Owed before promotion (unchanged plan: fraction done -> W3 -> gates -> present): W3's `-lme` 30->47 sweep now
+measures the SHIPPING configuration; the MTP four-axis protocol; the prefill-logit gate (base must be
+recorded from the delivery tip); the per-block build gate; `invert` must be REMOVED from the build;
+`ENVIRONMENT.md` entries for the six variables (`SINK_TAX` excluded -- diagnostic only); and the r113
+"no write-back" invariant corrected in place.
+
+## 261106.006 (campaign) -- batched gate re-run with the demote: it repairs half of the ranking's 4-slot loss
+
+**Fork only.**  The batched gate had only ever been measured for the ranking, so it was re-run with the
+demote present.  `-lme 36`, `-lzm auto`, npl 1/4/8, one R9700:
+
+| arm | npl 1 | npl 4 | npl 8 |
+|---|---|---|---|
+| `combined`, no demote | 26.22 | **50.07** | 33.72 |
+| `decode`, no demote | 24.89 (-5.1 %) | 43.46 (**-13.2 %**) | 33.64 |
+| `decode` + demote | 25.21 (-3.8 %) | 45.90 (-8.3 %) | 33.53 |
+| `combined` + demote | **26.70** (+1.8 %) | 49.60 (-0.9 %) | 33.81 |
+
+**The demote repairs about half of the ranking's 4-slot loss and no more**, which splits the default
+decision cleanly:
+
+* **the demote is safe in every cell measured** -- +7.5 % single-stream, +1.8/-0.9/+0.3 % at npl 1/4/8 --
+  so it is a defensible default-on with an env kill-switch once its gates pass;
+* **the ranking stays opt-in** -- +11.1 % single-stream, -13.2 % at 4 slots.  Its sign is workload-dependent
+  and the demote does not rescue it.  That conclusion survives this round.
+
+**Two of my own bugs surfaced on the way, both of which looked like policy results:**
+
+1. `pool_free_slot_locked` did a full count pass over 56 592 slots on EVERY fill (the reserve check), i.e.
+   ~10^9 iterations a run, on the `SINK=0` path too.  Fixed: the count only happens when a reserve is asked
+   for; otherwise it is the original single scan.
+2. The batched arm had been switched to `-lzm off` by me earlier, which makes PLE resident (~24 GiB).  With
+   a 36.8 GiB pool and a 23 GiB arena the box over-subscribes and **npl 8 collapses from 33.7 to 8-18 t/s**
+   (MemAvailable min 46 -> 18 GiB).  That is indistinguishable from a policy regression in the numbers.
+   `arm-batched.sh` now defaults `LZM=auto`; the single-user arms keep `-lzm off`, where the PLE confound
+   matters and the memory does not.  Recorded in `tools/README.md` and `PLAN.md`.
+
+## 261106.005 (campaign) -- decay knee located: a plateau 32-64 with 32 at its top edge
+
+Filled in the decay curve between 16 and 64 (2 runs each at 24/28/32, single runs elsewhere),
+`decode`+K=16, `-lme 36`, one R9700:
+
+| period | 16 | 20 | 24 | 28 | **32** | 36 | 40 | 44 | 48 | 56 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| t/s | 27.0 | 27.1 | 27.2 | 27.2 | **27.6** | 27.3 | 27.4 | 27.3 | 27.3 | 27.3 | 27.5 | 26.9 | 26.1 |
+| demoted | 8 683 | 9 168 | 9 579 | 9 828 | 10 110 | 10 433 | 10 793 | 10 903 | 11 146 | 11 280 | 11 798 | 13 492 | 15 232 |
+
+It is a **plateau from ~32 to ~64 with 32 at its top edge** and the fewest demotions of the fast
+configurations.  The step below 32 is real (27.0-27.2, reproducible across repeats), so 32 is not merely
+"the default we started with".  **Keep 32.**
+
+**Correction to a natural but wrong inference -- fewer demotions is not fewer disk reads.**  `fills` is
+**60 513 in every period from 16 to 128**, identical to the digit, so the pool's fill traffic (the reads that
+reach the mapping/disk) does not move with the decay at all.  What moves is arena churn, and a *rejected*
+admission is not a read avoided: it is served cold per access for as long as the expert is routed.  That is
+why period 16 has both the fewest demotions (8 683) and the lowest throughput (27.0) -- the short half-life
+shrinks `ghost`, the `touch`-2 gate rejects more, and those experts are re-read on every use instead of being
+admitted once.  Fewer demotions is better **at equal coverage**, which is why 32 beats 16 as well as 56.
+
+The cold-traffic half of that argument is mechanism + throughput, not a printed counter: these logs do not
+emit `takeover=`/`cold_reaches=`.  Owed: make the report print `cold_reaches`/`cold_bytes` unconditionally
+and re-run 16 vs 32, which turns the inference into a measurement.
+
+## 261106.004 (campaign) -- the demote's reuse measured (7.9 %), and the decay swept: keep 32
+
+**Fork only.**  Added a reuse instrument to the sink: a per-slot flag marking content that came from a
+demote, and a counter for how often such a slot is later wanted again.  `copies` alone cannot say whether
+the demote pays -- a demoted expert never read back is pure wasted bandwidth.
+
+`-lme 36`, `decode`, K=16, one R9700, single device, pool active:
+
+| `MOE_EXPERT_CACHE_PERIOD` | gen t/s | demoted | reuse of demoted slots |
+|---|---|---|---|
+| **32 (current default)** | **27.6** | 10 110 | **7.9 %** |
+| 64 | 27.5 | 11 798 | 12.0 % |
+| 128 | 26.9 | 13 492 | 16.1 % |
+| 256 | 26.1 | 15 232 | 20.9 % |
+
+**The decay is not the lever; 32 stays.**  A longer half-life (`count`/`ghost` halved every N accesses per
+table -- 32 is ~a 4-token horizon with top-k routing) raises reuse but costs throughput *and* raises the
+demotion count, so the extra reuse is concentrated in low-value experts that churn between the tiers.
+
+**7.9 % reuse against W1's ~3 % break-even on this box's NVMe (0.2 % on a 125 MB/s device)** is the
+mechanistic reason the demote adds +7.6 % on top of the ranking rather than a coincidence: it is not merely
+cheap transport, it is being spent on experts that do come back.  On slow storage the same 7.9 % is worth
+far more.
+
+Still owed (unchanged): W3 (the `-lme` 30->47 sweep -- the only place "does this buy back pinned bytes" is
+answered), the batched gate, the MTP four-axis protocol, the prefill-logit gate, the reserve as a fraction
+of slots, and an `allow_empty_fill` A/B now that the reserve protects the headroom.
+
+## 261106.003 (campaign) -- the demote works: +21.7 % single-user at -lme 36, with the ranking
+
+**Fork only.**  `MOE_HOST_POOL_SINK` measured on the single-user cell (`llama-cli`, prose, `-n 64`, one
+R9700, `MOE_HOST_POOL_DIO=1`, `-lzm off`, `-lme 36`, pool active, text byte-identical at `880c932888f8`):
+
+| arm | gen t/s | vs 22.6 | demoted | declines |
+|---|---|---|---|---|
+| `combined`, no demote | 22.6 | -- | -- | -- |
+| `decode`, no demote | 25.1 | +11.1 % | -- | -- |
+| `combined` + demote K=16 | 24.3 | +7.5 % | 9 922 | 9 % |
+| `decode` + demote K=8 | 27.0 | +19.5 % | 8 921 | 15 % |
+| **`decode` + demote K=16** | **27.5** (2 runs) | **+21.7 %** | 10 113 | **1.8 %** |
+| `decode` + demote K=32 | 27.0 | +19.5 % | 10 398 | 0 |
+
+So the two changes **compose**: the ranking (+11.1 %) and the demote (+7.6 % on top of it) are independent
+in mechanism -- one improves what the pool holds at layout time, the other what it learns from evictions --
+and together they are +21.7 % against the shipped default.  Every arm is placement-only: 3/3 configs
+(`SINK=0`, `SINK=1 K=8`, `SINK=1 K=16`) hash to `880c932888f8`.
+
+**Two bugs found on the way, both of which looked like "the knob does nothing":**
+
+1. **Reserving headroom by shrinking `slots` reserves nothing.**  `slots` is the capacity everywhere, so
+   `slots -= K` just builds a smaller pool that the fill paths fill completely; the decline rate was
+   identical at K=2 (4 631), K=4 (4 690) and K=8 (4 765) -- and *rising*, which was the tell.  The reserve
+   must be a `keep_free` argument on `pool_free_slot_locked` that every fill path respects and only the
+   demote may dip below.  With that fixed, declines fell 4 631 -> 2 361 -> 1 020 -> 184 as K rose 2 -> 8 ->
+   16, i.e. the knob started behaving like a knob.
+2. **A miss frees one slot but wants two.**  `retired == demoted + declined` to the digit (11 089 == 6 458
+   + 4 631) showed the incoming fill competing with the demote for the same freed slot.  Under the sink the
+   incoming expert is now refused an empty pool slot (`allow_empty_fill = !g_pool_sink`) and arrives via
+   the pinned bounce ring -- exactly what already happens on a full pool.
+3. Also split the decline counter by cause (issue #274's lesson): `no-free-slot` vs `geometry` vs
+   `copy-error`.  The split is what proved the 42 % decline rate was pure headroom and not the 1-D
+   geometry guard; `geometry` and `copy-error` are 0 in every run.
+
+K=16 is tuned, not derived: 16/512 = 3.1 % of a table's slots, and K=32 costs 0.5 t/s because the reserve's
+coverage loss overtakes the extra demotes.  Owed: express the reserve as a fraction, an A/B of
+`allow_empty_fill` now that the reserve protects the headroom, the batched gate, MTP four-axis,
+prefill-logit, and W3 (the `-lme` 30->47 sweep).
+
+## 261106.002 (campaign) -- W2 demote implemented (the in-pool exchange), and a vacuous gate found and fixed
+
+**Fork only; nothing in `patches/`.**  Two things.
+
+**1. W2: the demote, using the maintainer's in-pool exchange.**  `S7` in `PLAN.md` turned out to be false --
+the pool slot that serves an admission holds the *incoming* expert until its H2D drains, and that H2D has
+already overwritten the victim, so "the victim takes the vacated slot" is not implementable and a staging buffer
+would make it two copies.  The maintainer's fix is better than the three options PLAN.md recorded: plan **K
+slots of exchange headroom below the budget** (`slots -= K`, so the pool does not grow), let the demote write
+the victim straight into a free slot (**one** D2H, so W1's 9.6 us/copy stands), and retire the promoted
+expert's slot back into the free list only when the headroom has run dry.  That preserves #87's
+keep-the-duplicate win in the steady state and makes the retirement harmless, because the vacancy is refilled
+by a just-evicted hot expert rather than left empty.  `MOE_HOST_POOL_SINK=1` / `MOE_HOST_POOL_SINK_SPARE=2`
+(default off).  1-D only (`n_slices == 0`), declines rather than disturbing a fill.  First run at `-lme 36`:
+**3712 demoted (2401 MiB), 6497 slots retired, 4983 declined**; slot count 56304 instead of 56592, i.e. the
+288 reserved slots are visible in the layout.  The 57 % decline rate is the open tuning item (incoming misses
+also draw on the headroom).
+
+**2. The coherence gate was vacuous.**  `sha=dfc26e26f38c`, quoted since P1 as "text-neutral with the pool",
+came from `-p "The capital of France is" -n 24` -- a 9-token prompt that never reaches the first decode-band
+pass, so **no pool was built** and the hash only proved the non-pool path unchanged.  Found while checking why
+the coherence arm printed no pool line.  Two independent log traps on the way: the pool report is a WARN and
+default verbosity filters it (`-lv 1` = ERROR only), while `-lv 3` shows it but interleaves per-token timing
+into the generated text (1691 chars vs 126).  Fixed: the arm uses the prose prompt, hashes at default
+verbosity, and pool engagement is asserted out-of-band at `-lv 2` on the identical config.  With the pool
+engaged, **4/4 arms are byte-identical at `sha=880c932888f8`** (combined/decode x SINK 0/1), which is now the
+reference hash for a pool-active arm.
+
+Also fixed on the fork: `expert_src_done` was called twice per successful fill (harmless today -- an
+idempotent event re-record -- but the second call sat outside the success guard, so a future fallback would
+have published a slot as drained that was never written).
+
+## 261106.001 (campaign) -- W1: the swap's marginal cost, and the batched/lazy methodology corrections
+
+**No delivery change.**  Three things, in the order they mattered.
+
+**1. The `-npl 8 +20.8 %` is retracted.**  Three alternating repeats give +0.96 % (per-rep +4.06 / +0.03 /
+-1.20) with the pool hit rate identical to three decimals -- at `-lme 44` the pool is 94 % of the set, i.e.
+nearly a mirror, where the ranking is inert by construction.  The original pair compared a cold first run with
+a warm second one.  Methodology rule added to `PLAN.md`: `llama-batched-bench` is a **gate**, never a
+tie-breaker; decisions are made on the single-user cells.  The reason is measured: at `-lme 36` the ranking is
+**+9.6 %** single-stream and **-11.4 %** at 4 batched slots (3 reps each, no memory confound), because the
+benefit depends on the prompt population.
+
+**2. The lazy-PLE confound.**  Every arm ran `-lm mmap -lzm auto`.  `auto` does not engage the managed PLE
+reader (`llama_lazy_managed_budget()` is 0 without `LLAMA_LAZY_BUF_MB`) but it does leave the CPU-offloaded PLE
+on the classic mmap-lazy path, page-fault loading *during* the measurement and competing for the page cache the
+pool's `MOE_HOST_POOL_DIO=1` makes it bypass.  With `-lzm off` the single-user ranking delta is **+9.6 %**
+(22.6 -> 24.77) against +10.7 % under `auto`.  Corollary: process `read_bytes` is not comparable across lazy
+modes (78 GB vs ~102 GB on the same cells) -- quote the pool's own DIO counters.  All four harness arms now
+default to `-lzm off`.
+
+**3. W1 -- the campaign's decisive constant, measured and a GO** (`W1-SINK-TAX.md`).  A `SINK_TAX=1`
+diagnostic issues exactly the one D2H the demote would issue per admitted miss, at exactly its stream position,
+changing nothing else.  Measured on one R9700, arena 4 GiB, `MOE_HOST_POOL_DIO=1`, `-lzm off`:
+
+| `-lme` | gen t/s tax0 | gen t/s tax1 | copies (decode share) | copies/token | ms/token | `c_pcie` |
+|---|---|---|---|---|---|---|
+| 36 | 22.60 (3) | 22.07 (3) | 11 685 (7 098) | 111 | 1.06 (-2.3 %) | **0.0140 ms/MiB** |
+| 44 | 27.75 (2) | 26.25 (2) | 10 572 (5 988) | 94 | 2.06 (-5.4 %) | 0.0324 ms/MiB |
+
+The prefill share (4 587 / 4 584) came from `-n 0`, so the per-decode-token rate is a subtraction.  **9.6 µs
+per 679 762 B copy is ~2/3 hidden behind compute** (~71 GB/s effective, against a naive 26 µs/26 GB/s) --
+the opposite direction from the 0.04 ms/MiB assumption `PLAN.md` §2 carried.  Against a read that must cost
+>= 0.3 ms on this box (>= 5.4 ms on a 125 MB/s device), the break-even reuse rate is **~3 % here, ~0.2 % on
+slow storage**: the demote does not need a better prior, only that a few percent of demoted victims are wanted
+again.  The cost is roughly constant in pool size (arena-driven) while the benefit falls as the pool grows, so
+its best cell is the below-complement one -- where the holes are.  **W2 (the demote) is GO.**
+
+Also found, not fixed (an instrument must not fix what it measures): `fill_slot_from_host` calls
+`expert_src_done(..., retire=false)` **twice** on the success path -- a latent double-retire.
+
+## 261105.020 (campaign) -- `PLAN.md`: the forward path, and the one constant it turns on
+
+**No delivery change.**  Post-investigation / pre-implementation plan for the rest of the campaign:
+`wip/host-expert-split/PLAN.md`.  It fixes the eleven settled facts (the ranking finding, the mirror
+inertness, holes-not-transport, why r113's refusal does not bound this case, slot-neutrality, the warmer's
+mmap-only scope, the periodic swap's rejection), then orders the work:
+
+* **W0** close out P1: the MTP four-axis protocol (**not run**), `gate-prefill-logits.sh` (needs a base recorded
+  from the *delivery tip* first), the `-npl 8` repeat, `ENVIRONMENT.md`, the default-on call.
+* **W1** measure `c_pcie` for a 1-D D2H **before writing the policy**: the demote adds exactly one D2H per
+  admission, so a `SINK_TAX` instrument reproduces its marginal cost in ~30 lines.  Go/no-go at ~1.5 ms/token.
+* **W2** the demote itself (`MOE_HOST_POOL_SINK`, default 0), with the seven measured constraints (slot-neutral,
+  kernel copy not `hipMemcpyAsync`, retire-then-publish, decline-never-lie, 1-D only, no new memory, counters).
+* **W3** the three-arm split curve (combined / decode / decode+SINK) over `-lme` 30-47 at two arena shapes,
+  accepted at >= 12.8 GiB of equivalent pinned RAM.
+* **W4** the mmap-only, self-disabling warmer (`fadvise(WILLNEED)`, no thread), never sold as a fix for the
+  constrained case.  **W5** the promotion path.
+* The exchange rate that makes it a decision: matching an exclusive tier costs **+9.2 to +17.7 GiB (mean
+  12.8)** of pinned RAM, or ~1.1 ms/token of copies at `c_pcie` 0.04 ms/MiB — and it is worthless at 0.4.
+
+## 261105.019 (campaign, no delivery change) -- write-back vs page-cache warmer, priced
+
+The maintainer's question: an admitted expert's arena victim is dropped and re-read from storage; why not
+write it back, and (with mmap) why not at least warm the dropped expert into the page cache?
+
+* **The description is correct**, and the delivery does drop the victim (no write-back) — in the complement
+  case the pool does not hold it either.
+* **Why r113's refusal does not cover this case**: its `pool-swap-slot` arm had a pool that *covered* the
+  complement (0 MiB of L3 to win) and ran `-sm tensor`, where the copy is a 2-D strided
+  `cudaMemcpy2DAsync` (6 259 swaps).  The complement-scarce single-device case is 1-D and the replay says it
+  removes ~65 % of the L3 at 1.55 copies per MiB; and a write-back is **slot-neutral** (the promoted expert
+  vacated the pool slot the victim takes), so it needs no extra memory.
+* **The warmer was modelled and measured** (`--evict-warm` in the replayer): **-20.5 % / -15.7 % / -15.0 %**
+  of the storage-read traffic at 19 GiB/50 %, 19 GiB/40 %, 10 GiB/50 %, with **zero device copies**.
+* **The distinction that decides it**: a write-back *eliminates* the read and so saves **bandwidth**; a warmer
+  only moves the read's **latency** and saves no bandwidth, so on a bandwidth-bound box it competes with the
+  critical path.  The warmer is right for a big box where a miss was already cheap; the write-back is the one
+  that helps the memory-tight box the campaign cares about.  Neither exists in the delivery.
+
+## 261105.018 (campaign, fork branch `p1-pool-rank-r223`) -- the prefill A/B and the runnable half of the gate ladder
+
+**No delivery change**; the default stays `combined`.  Record: `wip/host-expert-split/P1-POOL-RANK.md`.
+
+* **Coherence: 9/9 byte-identical** (`sha=dfc26e26f38c`) across three pool budgets (`-lme 36` below the
+  complement, 44 at it, 47 the mirror) x three rankings.  The first attempt looked like a nine-way failure at
+  identical length because `-lv 3` interleaves timing lines into the generated text — never hash an `-lv 3`
+  log.
+* **Prefill A/B**: `decode`/`floor` are never worse than `combined` and the mirror is provably inert.
+  `-lme 36`: prompt 309.5 -> 313.1, gen 18.2 -> 20.6.  **`-lme 44` (a full complement) is where it is
+  biggest: pool `h` 0.666 -> 0.795 (+19 % relative)**, prompt 719.5 -> 727.4, gen 22.8 -> 23.9.  `-lme 47`
+  (mirror, all 46.84 GiB): identical counters to the digit (`h=1.0000 (13606/13606)`), 833.7/835.0/833.4 t/s
+  — a mirror holds every expert, so a ranking cannot matter there.  Mechanism for the complement case: the
+  loader's "complement" is the *prior's* complement, and the decode vector predicts the arena's actual
+  residency better.
+* **`llama-batched-bench -npl 1,4,8`** (at `-lme 44`): tg 38.41 -> 38.60 (npl 1), 83.99 -> 83.18 (npl 4),
+  **24.99 -> 30.20 (npl 8, +20.8 %, single run — needs a repeat)**; prompt within ±3.6 %.
+* **Owed, and stated as owed**: the four-axis MTP protocol has **not** run, and `gate-prefill-logits.sh`
+  cannot be run honestly (no base for this model; recording one from the modified build is vacuous).
+
+## 261105.017 (campaign, fork branch `p1-pool-rank-r223` @ `b2a8d2e76`) -- the pool ranked by the DECODE counter: +10.6 % generation
+
+**No delivery change.**  `patches/`, `release.json` and the tag are untouched; the default is unchanged, so
+delivery behaviour is byte-identical.  The fork arm is `~/llama.cpp` branch `p1-pool-rank-r223`.
+
+* **The change** (+68 lines): `MOE_HOST_POOL_RANK=combined|decode|floor|invert` selects which persisted
+  counter ranks the pool's complement.  `combined` (default) is the shipped `t.heat`; `decode` is
+  `heat_rank_vec()` — the vector the arena already seeds from (TODO #88); `floor` keeps the prefill-hot
+  `MOE_HOST_POOL_RANK_FLOOR` % ahead so the pool's whole-table prefill staging duty survives; `invert` is a
+  diagnostic inversion probe.
+* **Measured** (1 x R9700, Flash-Next GSQ-RCO IQ3_S, `-ncmoe 48 -lme 36` = a pool below the complement,
+  4 GiB arena, `MOE_HOST_POOL_DIO=1` so a miss is a real disk read, three runs per arm in both orders):
+  **generation 22.6 -> 25.0 t/s (+10.6 %)**, prompt 311.0 -> 314.3 (+1.1 %), pool `h` 0.2090 -> 0.2205.
+  Order-independent.  Record: `wip/host-expert-split/P1-POOL-RANK.md`.
+* **The inversion probe is the negative result that matters**: ascending heat collapses to `h` 0.114 /
+  16.7 t/s, so the counters are not read backwards and the pool's low `h` (0.22 at 77 % coverage) is not an
+  inversion bug — it is the pool's prefill staging traffic and the arena's miss distribution sharing one
+  counter, which is also why `h` must never be quoted as "the fraction of misses the pool answered".
+* **Owed before a flip**: the prefill A/B (`floor` sweep, prefill-heavy shapes), the four-axis MTP protocol,
+  `llama-batched-bench -npl 1,4,8`, `gate-prefill-logits.sh` (a placement prior must be KLD 0), and the
+  `ENVIRONMENT.md` entries.  The default-on call is the maintainer's — `floor` rather than `decode` is the
+  defensible flip value because of the staging duty.
+* **The demote is now clearly second**: its whole advantage was "foreknowledge of the arena's complement",
+  and the cheapest 10.6 % came from fixing the ranking instead.  `STEP1-REPLAY.md` §7 keeps the bound.
+
+## 261105.016 (campaign, no delivery change) -- the pool is ranked by a counter that is worse than chance for decode
+
+**No delivery change.**  Investigation before implementing (the maintainer's call), and it changed the plan.
+
+* The campaign's open number (`STEP1-REPLAY.md` §5.4) is resolved: the arena holds 93.5 % of reaches at
+  39.5 % of the set while a 50 %-of-the-set prior-ranked complement answers 56.5 % of its misses.  Two of my
+  own errors framed it wrongly (the tool's `pool_h` counts only *promotions*, not in-place `pool_cold` reads,
+  and the 83 % expectation assumed uniform misses over the complement).  The real cause:
+  **`pool_rank_experts_locked` sorts by `t.heat`, the combined prefill+decode counter, which overlaps this
+  workload's own hot set at 10.5 % over top-64 against 12.5 % chance — worse than chance**, while `heat_dec`
+  (the counter the ARENA already seeds from, TODO #88) is 24.2 %.  The persisted prior is otherwise flat:
+  reach mass by its rank decile is 4.8-12.1 % against a uniform 10 %.
+* **Worth 12-19 % of the decode L3 traffic for zero copies**: ranking the pool by `heat_dec` models as
+  26.1 -> 23.3 MiB/token (`always`), 31.6 -> 29.7 (`touch 2`), 46.8 -> 39.0 (frac 40).  This is now the
+  cheapest candidate in the campaign and ships on its own if the device measurement holds — **but the pool
+  also stages whole tables for prefill, so the ranking change owes a prefill A/B** (the design comment that
+  chose the combined vector is about prefill, and it is not wrong about prefill).
+* **It also bounds the demote**: with an *oracle* pool content the on-demand sink reaches 3.0 MiB/token where
+  no fixed layout gets below 23-30, so the residual gap is **foreknowledge**, not transport.  Order of work
+  revised: the ranking vector first, and any demote measured against the decode-ranked layout.
+* Tooling: `scripts/moe-trace-replay.py --pool-band all|decode` (with the finding recorded in its help text).
+
+## 261105.015 (campaign, no delivery change) -- `wip/host-expert-split/` step 1: the trace, the replay, two replayer fixes, and the answer to "is a swap worth it"
+
+**No delivery change.**  `patches/`, `release.json` and the tag are untouched.
+
+* **The trace** (one bounded `llama-cli` run, 1 R9700, no all-reduce, no drafter, 83 s) is in
+  `wip/host-expert-split/STEP1-REPLAY.md` with the full grid.  Model calibration: `h` 0.6117 against the run's
+  own turn counter 0.6300.
+* **Two replayer defects found and fixed** (`scripts/moe-trace-replay.py`, `scripts/README.md`):
+  (a) `--pool-init sidecar-complement` leaves slots EMPTY when the budget exceeds the arena's complement, which
+  the shipped re-rank never does — the new **`pool-layout`** policy models the delivery (heat-seeded arena, pool
+  re-laid out as complement + mirrored residents at the first decode pass) and reproduces the measured mirror
+  (0.00 MiB/token of L3, as `wip/bench-56gb/RESULTS.md` measured); `pool-none` read 16.6 for the same budget.
+  (b) the pool table's copy columns are now per-token from the tool's own decode-band denominator — dividing by
+  the trace's total token count inflated every "MiB saved per MiB copied" ratio ~5.7x and inverted a ranking
+  for an hour of this session.
+* **The answer.**  A swap is worth it **exactly where an arena miss would be expensive**: it removes ~1 MiB of
+  L3 per 1.55 MiB of extra PCIe copy (0.65 MiB saved per MiB copied), so on a 56 GiB disk-bound box it is
+  decisive and on a page-cached box it is ~+9 %.  At a budget that covers the complement it removes nothing and
+  costs 5-6 MiB/token: r113 stands, and so does PR #267's own -3 %.
+* **The maintainer's periodic conditional swap** (every N rounds, coldest arena vs hottest pool, only if
+  hotter; K per round) was modelled as `--rebalance`: it is **4-5x less copy-efficient than the on-demand sink**
+  (0.12-0.18 against 0.65), K=4 is *worse* than K=1, and converted to time it is **negative on a page-cached
+  box**.  The guard is doing real work (guard off costs 3.3x the copies); the counter-transfer subtlety is not
+  (`carry`/`reset`/`prior` are identical on this trace, because after decay every resident's count sits at 0-1).
+  Reported, not adopted.
+* **Next**: no C1 until the open question in `STEP1-REPLAY.md` §5.4 is answered — our arena holds 93.5 % at 43 %
+  of the set while a 50 %-of-the-set prior-ranked complement answers only 56 % of its misses, where the
+  coverage arithmetic predicts ~88 %.  If that is the prior being weak, the fix is `pool_rerank_from_heat_locked`
+  and a demote buys little; if it is the replay's arena drift, the demote is worth building.  That is one
+  measurement on the 56 GiB rig, and it decides the campaign.
+
+## 261105.014 (campaign, no delivery change) -- `wip/host-expert-split/` opened: PR #267 reviewed and designed; `scripts/gpu-watch.sh` added after a hard lockup
+
+**No delivery change.**  `patches/`, `release.json` and the tag `v16-6050b467c-r223` are untouched.  This
+starts the campaign `wip/CAMPAIGNS.md` had as a scoping note and adds one tool.
+
+* **PR #267 reviewed** (`@briansp2020`, `wip-mmap-host-experts-r204`, head `691108ffab8d`, 10 patches on
+  **r204**, ~2 600 lines): `--host-experts mmap` + an 873-line sparse registration of a file alias, a **RAM
+  tier** that holds exactly the arena's non-resident experts with a one-spare swap-on-admission, K spare RAM
+  slots with a **copy-back-ahead** side stream, and one pin budget with a partial tier by hotness.  The review
+  and the convergence plan are `wip/host-expert-split/DESIGN.md`.  **No patch applies as-is** (r209-r223 moved
+  every file it touches).
+* **The delta is smaller than the PR implies.**  Since r223 the placement is one budget (`-lme [auto|N]`;
+  `--host-experts` is a deprecated alias), and below the host expert set `-lme N` *is* a per-expert pinned pool
+  laid out as the arena's complement with in-place cold reads and a promote path.  So the only missing
+  direction is **demote**: an arena eviction drops its victim instead of parking it in the pool slot the
+  promoted expert vacated.  That is one call site, not a tier.  The PR's `mmap` mode and its sparse
+  registration are **not** adopted first (the win being chased — a cheap miss — is bought by demote alone).
+* **Why r113 is not simply repeated.**  Its refutation of the literal swap was measured on `-sm tensor`,
+  where an axis-0 slice makes the copy a 2-D strided `cudaMemcpy2DAsync` (6 259 swaps = 2× decode), and with a
+  pool that already covered the complement (nothing left to win on L3).  The PR is single-device and 1-D, and
+  the open case is a pool **below** the complement on a 56 GiB box, where a miss is a file read.
+* **Step 1 is the offline replay** (`scripts/moe-trace-replay.py`; `pool-swap-slot`/`pool-swap-weakest` are his
+  shape, `pool-none`/`pool-retire` are ours) across three miss models.  The command line was smoke-tested on a
+  synthetic trace; it needs **one** bounded trace run, which is held pending the maintainer's go-ahead.
+* **`scripts/gpu-watch.sh` added.**  On 2026-11-05 this box locked up with a R9700 pinned at 100 % and had to be
+  power-cycled, and the kernel journal recorded **nothing** — the previous boot's last line was ~70 min before
+  the end (no ring timeout, no `GPU reset begin!`, no OOM, no hung-task trace), and no build or benchmark from
+  this session was running.  An out-of-band 2 s sampler is the only evidence that survives that, so every long
+  arm now runs under `gpu-watch.sh --cmd` (sysfs GPU-use/VRAM + `MemAvailable`/`Shmem`/`Mlocked` + the llama
+  pids, `rocm-smi` every N ticks as the cross-check, a kernel-log snapshot on exit).  Indexed in
+  `scripts/README.md`; it is a flight recorder, not a fault check (`check-gpu-faults.sh` keeps that job).
+
+Open, waiting on the maintainer: the go-ahead for the one trace run; whether a demote is in scope for
+`-sm tensor` (a 2-D strided copy there is the r113 mechanism) or 1-D only; and the `gate-host-pool.sh`
+extension a demote implies (a failed demote must DECLINE, the same rule the failed fill already has).
+
+## 261105.013 (r223 addendum, no delivery change) -- the per-block ladder and the GPU-fault scan, taken after the tag
+
+**No delivery change.**  `patches/`, `release.json`, the tag `v16-6050b467c-r223` (tip `37148d118`, tree
+`680e043b3c`) and the fork branch are untouched; this adds the two gates the release entry listed as outstanding.
+
+* `scripts/gate-per-block-build.sh --fast --changed-from 21644fb51 --tip 37148d118` (the amended block 12 plus
+  the replayed 13/14/15, a wiped build dir per commit): **4/4 built, 0 failed in 128 s** (block 12 / 13 / 14 /
+  15: 10 s / 11 s / 101 s / 6 s).  `--fast` is the release profile, not the r2 `all` standard; the tip's own
+  release gates cover `all`.
+* `scripts/check-gpu-faults.sh --since "4 hours ago"`: **clean** (kernel journal and the session's logs).
+
+Still not run, and only a Windows box can: finding 4's mechanism and finding 5's attribution (`TODO` #95).
+
 ## 261105.012 (r223) -- issue #274 follow-up: a call that fails a fill must decline, and a refused pinned allocation is a latch
 
 **Released as `v16-6050b467c-r223` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),

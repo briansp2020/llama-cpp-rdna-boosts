@@ -398,12 +398,18 @@ in CI.  The model-level gates are manual:
    claims otherwise is wrong.  r209: 4 TUs token-identical, coherence `897 a77fa8c1107a` / `964 eab86065e67e`
    (== r208), KLD 0.000000 / 100.000 %, per-block 4/4, no faults.
 
-19. **Host-expert pool** — `scripts/gate-host-pool.sh` (r219, issue #274; five arms since r223): one pool-backed host-expert config
+19. **Host-expert pool** — `scripts/gate-host-pool.sh` (r219, issue #274; five arms since r223, **seven** with the
+   demote arms added for the host-expert-split campaign): one pool-backed host-expert config
    (Flash-Next, `--n-cpu-moe 47`, `--load-mode mmap`, a `MOE_HOST_LIMIT_FRAC` low enough that the set does not
    fit), arms and same-seed greedy text: shipped / `MOE_HOST_POOL_DIO=1` / `MOE_HOST_POOL_DIO_FAULT=1` (a
    platform with NO pool disk tier: the Windows shape) / `MOE_HOST_POOL_FILL_FAULT=1` (no source can be
    resolved at all) / `MOE_HOST_POOL_FILL_FAULT=late` (each table gets one source, then loses it: the mid-run
-   shape of the issue #274 follow-up).  It **fails** unless the three healthy arms are byte-identical with a
+   shape of the issue #274 follow-up) / `MOE_HOST_POOL_SINK=1` (the eviction demote: an admitted miss copies its
+   arena victim into a free pool slot, and the arm must actually demote or it is vacuous) /
+   `MOE_HOST_POOL_SINK=1 MOE_HOST_POOL_SINK_FAULT=1` (every demote copy fails, so the arm proves the #274 rule
+   holds for the demote too: **`0 demoted`** with `copy-error` declines > 0 -- a failed demote declines and is
+   never published as a resident victim, which would serve stale bytes for the life of the run).  Every arm runs
+   with `MOE_EXPERT_HEATMAP=load`, so the seven arms are compared across one prior.  It **fails** unless the three healthy arms are byte-identical with a
    real pool (slots > 0, MiB pinned > 0) and no fill failure, the disk-tier arms are not vacuous, and the two
    failure arms are still byte-identical with `FAILED fills: N`, `the slot is NOT resident` per table and
    **`takeover=0`** (the call that fails a fill must decline; taking the op over leaves `input_cpy` unfilled
@@ -413,6 +419,48 @@ in CI.  The model-level gates are manual:
    the slot.  Required for any change to a pool fill/staging path, `expert_host_src()`, the cache's admission,
    the `-lme`/`--host-experts pool` placement or the loader's host-expert source registration; every release.
    ~3 min on one GPU (the pool prewarm dominates).
+
+20. **Narrow-row norm fusion aliasing** — `scripts/gate-norm-rows-alias.sh` (r225, issue #276): the
+   `RMS_NORM -> MUL(w)` fusion (and its sigmoid-gated `-> MUL_MAT -> SIGMOID -> MUL` form) reads `x`, `w`
+   and the gate output `z` while it writes `dst`, but the gated form dispatches the gate `MUL_MAT`
+   **itself**, ahead of the launch.  In graph order `x` is dead as soon as the `RMS_NORM` has consumed it
+   and the gate output has exactly `x`'s shape, so the allocator's best fit for it is `x`'s own block.
+   The gate drives the fusion **without a scheduler** (`scripts/norm-rows-alias.cpp` calls
+   `ggml_backend_graph_compute()` directly, i.e. none of the alloc deps the sched's optimize pass
+   registers exist) and forces each aliasing shape by pointing a tensor at another one's buffer after
+   allocation: `alias_gate` (gate output == `x`) and `alias_dst_row` (fused output == `x` + one row) must
+   be **declined**, `alias_dst_exact` (fused output == `x` exactly, a read-then-write of the same address
+   by the same thread) must still **fuse**, and every arm must reproduce `ref` byte for byte and equal
+   the driver's own `--no-fuse` (chain) digest.  It then drives the **delivery path** on a real gated
+   GGUF (Ling-3.0-tiny, `-c 8192` over the 5256-token `prompts/prose-rdna-boosts.txt`) and fails unless
+   the gated form **fused** (>= 1 `norm-rows: ... fused=1 gated=1` line, so the text comparison cannot be
+   vacuous), **nothing was declined** (the scheduler's alloc deps still hold `x`/`w` for the fused
+   launch: this is the assertion that catches a dropped or renumbered dep, which is silent -- the text
+   stays correct because the guard falls back), the fused and `GGML_CUDA_DISABLE_NORM_ROWS=1` arms are
+   byte-identical, and neither arm aborts or faults a GPU.  `GGML_CUDA_NORM_ROWS_DEBUG=1` is the
+   diagnostic that makes the decision observable.  Required for any change to `norm-gated.cu`, to the
+   norm-rows alloc-dep registration in `ggml-cuda.cu`, or to the fusion's dispatch order; every release
+   (no other gate reaches this code, and `test-backend-ops` cannot: the fused kernel is compared against
+   a chain, not against an allocator).
+
+21. **gfx1201 grid-stall pad** — `scripts/gate-grid-stall-pad.sh` (r226, issue #277, extending #273): the
+   pad is DEFAULT ON and is a *launch-shape* change at six sites, so two properties have to be observed
+   rather than assumed: a padded launch must not change a byte (a wrong row guard or grid-stride bound
+   computes a row twice and can still read plausible on the shapes that do not pad), and the pad must
+   actually FIRE at the site it claims to cover.  **A1** runs the `GET_ROWS` op oracle in both arms on
+   four shapes added for this (block 08: vec float `(1,1,256)`, plain float `(1,4,64)`, the sub-block
+   dequantizing path and the super-block k-quant path, the last two `(1,4,64)`) so every one of the four
+   `get_rows` launches is dispatched at a pad-able 256-block grid, and requires the CUDA backend to match
+   the **CPU** reference in both arms plus a `get_rows_*` pad line for each site in the pad arm and none
+   with `GGML_CUDA_GRID_STALL_PAD=0`.  **A2** runs `MUL_MAT_ID` (a MoE expert-cache remap gathers with
+   `grid.x = 16384`, so one extra y row would add 16384 blocks and stay a multiple) and requires the
+   refusal branch to be reached: the helper must DECLINE that pad instead of launching a block row that
+   cannot help.  **B** requires same-seed greedy text to be byte-identical between the pad arm and the
+   kill-switch arm on a dense 1-device arm, a `-sm tensor` 3-device arm and a MoE `-ncmoe` arm, with a
+   verbose 1-token probe of each arm proving the pad fired (pad arm) and never fired (kill-switch arm).
+   `GGML_CUDA_GRID_STALL_PAD_DEBUG=1` is the diagnostic all of that rests on.  Required for any change to
+   `ggml_cuda_grid_stall_pad()` or a call site of it, and every release (the site that was missing is what
+   issue #277 reported: `get_rows` was unpadded from r46 to r225).
 
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
@@ -444,6 +492,8 @@ on the tip.
 | 06 | **(r104) `mmf32`**: `test-backend-ops -o MUL_MAT` (F32 cases; with `LLAMA_TEST_OP_NMSE=1 LLAMA_TEST_SEED=1` the intercepted cases must be no worse than the rocBLAS path's NMSE) + fresh-start determinism (`llama-perplexity -c 512 --chunks 1`, 12 starts, 1 class; plus 2 GPU `-sm tensor`) + `llama-bench` A/B against `GGML_CUDA_MMF32=0` | 2444/2444 and 11x closer to the CPU reference than rocBLAS (6.1e-14 vs 6.9e-13, threshold 5e-4); 12/12 one class, 6/6 at 2 GPU; `+4.2 % pp512 / +4.1 % pp2048`, decode flat — `GREEDY-PURITY.md` §47.  **(r105) the same three legs on each arch the default is claimed for**; on gfx1151 (RDNA3_5, now default-on) 2444/2444, 12/12 one class, `+1.0 % pp512 / +1.6 % pp2048`, and the `--family-switch` judgement at the shipped confident point (0.013016 / 98.673 % vs a 0.019125 / 97.975 % same-kernel control) |
 | 06 | **(r171, `TODO` #115) the MMB stand-down predicates are the DISPATCH predicates, and the BF16-only activation mark may not be preempted**: source-inspection + behaviour, because the change is a *selection* rule, not a kernel.  (a) `ggml_cuda_mmb_dense_will_take()`/`_routed_will_take()` are gone and every stand-down asks `ggml_cuda_mmb_supported_mm()`/`_supported_mmid()`; (b) `classify_consumers()` refuses to elide a F32 activation when a **routed** `MUL_MAT_ID` reads it; (c) the predicates are null-safe and the pair matcher checks both nodes' sources; (d) the prefill-logit gate on a dense and a MoE model, and same-seed greedy text against the previous build on every arm the delivery runs | (a)+(b)+(c) reviewed and exercised (the r171 first cut segfaulted on gfx1151 Flash-Next `-ub 256` before the null checks); (d) 27B Q8_0 **0.000000 / 100.000 %**, 35B-A3B Q4_K_M **-0.000000 / 100.000 %**, text byte-identical on gfx1201 (27B Q8_0, 35B-A3B 1 and 3 GPU, LFM2 Q6_K) and on gfx1151 (`benchmarks/2026-10-29-mmb-pair-ownership.md`) |
 | 07 | `test-backend-ops -o MUL_MAT`/`MUL_MAT_ID` (K-quant cases); `llama-perplexity` before/after | pass; **PPL must be unchanged** (it is a numerics change, not a quality change) |
+| 08 | **(r226, issue #277) the four `get_rows` launches ask the grid-stall pad**: `scripts/gate-grid-stall-pad.sh` -- the four `GET_ROWS` shapes added by this block (`F32 512/8/1/be1=256` = the vec branch at `(1,1,256)`; `F32 1002/8/1/be1=64` = the plain float branch at `(1,4,64)`; `Q4_0 2048` and `IQ4_NL 1024`, `be1=64` = the two dequantizing branches at `(1,4,64)`) must pad in the pad arm and match the **CPU** reference in both arms, the `MUL_MAT_ID` refusal arm must be reached, and same-seed text must be identical with `GGML_CUDA_GRID_STALL_PAD=0` | 224/224 `GET_ROWS` and 931/931 `MUL_MAT_ID` cases pass in both arms; `get_rows_float_vec`/`_float`/`_q`/`_kq` each padded (`256 -> 257`); 12 launches refused as unpaddable at `(16384,1,1)`; text `147 b065f37593b3` (4B 1 and 3 GPU) and `150 4ac3a523160f` (35B-A3B `-ncmoe 40`) with the pad on and off -- `INVARIANTS.md` r226 |
+| 07 | **(r226, issue #277) the pad helper gains a site tag, a `pad_blocks` argument and a REFUSAL**: a site whose one-step pad would land on another multiple of 256 must DECLINE (the `NO pad possible` branch) rather than launch an empty block row, and every existing site (default `pad_blocks = 1`) must be byte-identical | `scripts/gate-grid-stall-pad.sh` A2 reaches the refusal 12x on `MUL_MAT_ID`; all pre-r226 sites pad as before (the same census the gate prints); text unchanged in every arm -- `INVARIANTS.md` r226 |
 | 08 | `test-backend-ops -o MUL_MAT_ID`; MoE decode + `llama-batched-bench -npl 1,4,8`; width probe on a MoE model | pass; one hash across the band; verify widths not slower than stock-relative |
 | 07 | **(r170, issue #228 follow-up) dense Q6_K VDR=2 is upstream's on every arch**: the flag-off default must be a behavioural no-op — same-seed greedy text against the previous release's build, on a payload with dense Q6_K weights — and **width purity** must hold on that payload (`plain` == `draft-mtp` at `--spec-draft-n-max 3` and `7`); the `-DGGML_HIP_Q6K_DENSE_VDR1` arm must (a) compile on the arch being judged, (b) reproduce the pre-#30517 VDR=1 association order, and (c) be measured against the default at the verify widths (`llama-batched-bench -npp 512 -ntg 128 -npl 1,4,8`, q8_0 KV), at `tg128` and at `tg128 @ d16384` | gfx1151, Qwen3.8 Flash-Next Q5_K (339 Q5_K/199 Q8_0/94 IQ3_S/44 IQ4_NL/2 IQ4_XS/13 Q6_K = lm_head + 12 attention outputs): default 128-token greedy `d47f08557f75` = the pre-change build (flag-off no-op) and `draft-mtp n_max 7` `115141867744` = `plain` at 200 tokens (width purity); the VDR=1 arm compiles (object 15 189 864 B vs 15 218 536 B) and reads `bf8ddd5271d1`, i.e. the pre-#30517 order. Perf, VDR=2 vs VDR=1, interleaved 2 reps: tg128 33.86 vs 33.83, B=1 33.50 vs 33.48, B=4 81.76 vs 81.75, **B=8 104.14 vs 102.94 (+1.2 % for the default)**, `tg128 @ d16384` 31.86 vs 31.86 — so VDR=2 stays the default and the flag is a reproducibility escape, not a perf switch.  `validate-set.sh` strict 15/15; `apply-all.sh` tip `30855de70` == `release.json.tip` — `GREEDY-PURITY.md` §68, `ENVIRONMENT.md` §14, `WORKLOG.md` 261028.012 |
 | 08 | **(r145) the rms_norm reduction-order selector (issue #229)**: the new default must reproduce the previous release **with the strided reduction**, i.e. it is compared against a reference binary of the previous tip by rebuilding that tip in the same build dir and running (a) the previous tip as-is vs the new build with `GGML_CUDA_RMS_NORM_VEC=1` (**byte-identical**, proving the opt-in arm did not drift) and (b) the new default's text against the recorded arm, plus the decode-width per-fusion KLD probe (`scripts/gate-prefill-logits.sh --ab "<fusion env>" --ub 1`) for the fold / GDN norm pair / `rms_norm_mul_rope` (must read 0.000000 / 100.000 %), the prefill-logit gate, `test-backend-ops -o RMS_NORM`, a qwen4exp `GGML_CUDA_DISABLE_HC_COMB=1` A/B, MTP Protocol A at `-n 3000` and the per-block build gate | (a) 4B 3-GPU tensor and 27B 1 GPU: text byte-identical (`1c5d32ac537d`, `d55055a5ec80`); (b) 27B plain n=256 `ab94eb7db4d4` = the strided arm, MTP `draft-mtp n3` acceptance 0.79204 = the strided arm; per-fusion KLD **−0.000000 / 100.000 %** (was 0.0005 / 99.2 % on the float4 default); prefill-logit KLD 0.000737 / 98.784 % vs the float4 base, then re-recorded to 0.000000 / 100.000 %; `test-backend-ops -o RMS_NORM` OK; Flash-Next `GGML_CUDA_DISABLE_HC_COMB=1` text identical; MTP Protocol A (27B Q4_K_XL, 1 GPU, `-n 3000`) prose 29.2 → 68.8 t/s and code 29.5 → 73.1 t/s with `plain == draft-mtp` byte-identical on both axes; `validate-set.sh` strict 15/15; per-block build 4/4 (`--fast --changed-from 438cbb3c7`) |
