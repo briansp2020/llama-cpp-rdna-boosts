@@ -2278,3 +2278,91 @@ Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM,
    non-vacuous arm for these sites.  `scripts/gate-grid-stall-pad.sh` is that arm: the padded launch must equal
    the **CPU** reference in both pad arms, each site must log its pad, the `MUL_MAT_ID` arm must reach the
    refusal, and the same-seed text must be identical with `GGML_CUDA_GRID_STALL_PAD=0`.
+
+## r227 -- the host pool's disk tier exists on Windows, the census belongs to the MODEL TEARDOWN, and the Windows pinned ceiling is not the RAM formula (issue #274)
+
+**Measured facts behind the #274 follow-up.  Do not re-derive; do not ship a Windows figure that was measured
+on Linux.**
+
+1. **A pool disk tier on Windows is `ReadFile`, not a stub, and the tight band needs it.**  From issue #130 to
+   r226 `pool_open_file` returned -1 on `_WIN32`, so a Windows pool always filled by `memcpy` out of the
+   read-only mapping.  The reporter measured what that costs when the expert set does not fit: ~250 MiB/s of
+   disk reads, ~65 k pages-input/s and the GPU computing **~2 %** of a 4,180-token prefill, with the whole
+   ~40 GiB set re-faulted per pass (`c`, default auto pool, 47 and 64 GiB).  A mapped view has no readahead to
+   speak of, so the fix is a real direct tier: `CreateFileA` + positional `ReadFile` + `_aligned_malloc`, with
+   `FILE_FLAG_NO_BUFFERING` for the DIO mode and `FILE_FLAG_OVERLAPPED` always.  It is the same five-helper
+   abstraction the POSIX `pread`/`O_DIRECT` path uses, so the fill, the mirror prepopulate and the coalesced
+   prefill span all reach it with no other change.  **Unmeasured here** (no Windows toolchain on this box): the
+   value is the reporter's to confirm, and `MOE_HOST_POOL_DIO=0` is the escape hatch.
+2. **The disk tier is best-effort on every platform, and a REFUSED pool allocation must say so.**  r219 already
+   made a fill fall back to the mapping; a failed `cudaHostAlloc` for the pool itself was still silent, which
+   is exactly the "the pool never appeared" shape the issue was opened for.  It now prints the real
+   `cudaGetErrorString` and the size once, and on Windows it latches the pinned tier off for the run (the same
+   policy the bounce ring's first refusal uses) instead of asking 141 more times for memory the driver will not
+   give.  No cap is derived from any formula -- see 4.
+3. **`moe_cache_report` cannot be the only printer on Windows.**  It is an `atexit` hook inside ggml-hip.dll, so
+   on Windows it runs after `main` has returned, when llama-server's async log is already gone: the reporter's
+   clean Ctrl+C printed `cleaning up before exit...`, the memory breakdown, `SLAB_STATS context-exit` and
+   `model teardown: dropped 141 ...` and **not one** `MoE expert cache:` / `pool fills:` / `host pool (L2)` line.
+   The census is now emitted from the **first `moe_cache_forget_all`**, under the same lock and before anything
+   is un-sized, and the atexit hook is the backstop for a run that never tore down; a flag keeps it to exactly
+   one report.  This also fixed a latent ordering bug: the teardown used to fold the heat delta into the
+   persisted prior *before* the report, so the "this session" coverage line read `0.00 %` at exit.  The gate
+   asserts the ordering (`host pool (L2)` before `model teardown: dropped`) and the single print.
+4. **The Windows pinned ceiling is the adapter's SHARED (aperture) budget, and the `(RAM/2)/visible GPUs` model
+   does not predict it.**  The reporter's own numbers: GPU shared usage tops out at **9.32-9.35 GiB** on a
+   47 GiB box and again on the same box at 64 GiB (one R9700, one visible adapter, ~60 GiB of commit headroom
+   left), with `-lme 4/8/auto` all landing on the same level and the first refusal arriving four minutes into a
+   prefill for a 0.5 MiB bounce entry.  So MemAvailable is not the budget, the RAM formula is not either, and
+   something already counts against it before the pool does.  What ships is measurement, not a guess: the
+   pinned tier's realized bytes in the census, and on Windows the aperture segments' `CommitLimit` and
+   `BytesResident` (all processes) from the same `D3DKMTQueryStatistics` call the WDDM free-memory path already
+   uses.  Do not add a ceiling derived from the formula; it would cap a healthy box.
+5. **Windows VRAM is charged to the process commit 1:1, and that is not the RAM the run is short of.**  The
+   reporter traced ~40 GB of private commit to device allocations (`ROCm0 model buffer` +4.7 GiB, KV/compute
+   +~2 GiB, the VMM slab +24.7 GiB at `SLAB_INIT`, the pinned pool +4.6-9.3 GiB) while the 70.6 GB of
+   read-only GGUF views stayed out of the commit charge.  What actually binds a 47 GiB box is the **working
+   set** (34-38 GB: resident mapping pages plus the pinned pool), which is why the small pinned pool (`l4`)
+   was the better configuration there and why adding 16 GB of RAM moved prefill 16 -> 94 t/s with nothing in
+   the delivery changing.
+- **The demote's cost and the pool's fill cost are properties of the HOST LINK, not of the delivery
+  (recorded 2026-11-06, before r225; `wip/host-expert-parity/`).**  r224's exchange rates — 9.6 µs per 679 762 B
+  D2H, 0.0140 ms/MiB, ~2/3 hidden behind compute, ~3 % break-even reuse on this box's NVMe — were measured on a
+  host whose link the same record's own naive-transport figure puts at **~26 GB/s** (26 µs per copy).  A host
+  that negotiates more (one R9700 on PCIe 5.0 x16 = `32.0 GT/s` x 16) moves both the demote's marginal cost and
+  the mirror-vs-partial gap, so a policy conclusion must not be carried across hosts without re-measuring the
+  `MOE_HOST_POOL_SINK=0/1` delta.  Corollary: W1's instrument (`MOE_HOST_POOL_SINK_TAX`) was **removed at r224
+  by design** — the shipped demote is the instrument now, and `SINK=0` is its control.
+- **The coalesced prefill read is O_DIRECT-only (r224, block 12; recorded 2026-11-06).**  `stage_span_fill()`
+  returns immediately unless `t.src_fd >= 0`, and that fd is opened only in O_DIRECT mode (`pool_open_file(t.src_path,
+  g_pool_dio)`), so the `+81 %` at `-lme` 12 / `+57 %` at 18 / `+14 %` at 36 describe the
+  **`MOE_HOST_POOL_DIO=1`** arm.  A buffered fill — the default whenever `--load-mode` is `mmap`, which r212
+  made the policy — reads the mapping per expert and does not coalesce.  Quote the arm with the number, and
+  never read a DIO-vs-buffered pair as a span A/B: the fill source changes with the mode, so that pair is two
+  changes at once.
+- **The demote's value is BUDGET-shaped, and it is positive up to a near-mirror budget (measured 2026-11-06;
+  `wip/host-expert-parity/RESULTS-2026-11-06.md`).**  One box, one model, `-n 64`, DIO, prose: `-lme` 36
+  (76.9 % coverage) **+8 %** generation (24.0 → 26.0 t/s), `-lme` 44 (93.7 %) **+21 %** (28.0 → 33.9), mirror
+  (100 %) **inert by construction** (0 demoted, 144 mirror tables).  This corrects `W1-SINK-TAX.md`'s inference
+  that "the cost is constant while the benefit falls as the pool grows": the copy count is roughly constant, but
+  a demoted victim at 94 % coverage is much more likely to be wanted again, and the pool's content (recency)
+  replaces a prior layout.  A 94 % tier is −11 % of a mirror for 3.0 GiB less pinned RAM; 76.9 % is −32 % for
+  11.1 GiB less.
+- **The demote is a DECODE-CLASS notion: its headroom is capped by the coverage gap, a prefill fill ignores it,
+  and a near-mirror pool disengages it (r228, block 12; found as `TODO` #281 on the r224 code).**  Three rules,
+  each measured on a 59 GiB field box (56 GiB cgroup + ballast, one R9700), first as a defect then as the fix:
+  1. `K = 4 %` of a table's slots (≈19 on a 500-slot table) exceeded `-lme auto`'s 12-expert gap, so the reserve
+     held free the slots the complement needed: every prefill fill was refused and each ubatch re-read the
+     missing experts through the bounce ring -- first-pass 50k prefill **1 837 t/s (`SINK=0`) against 867
+     (`SINK=1`)**, decode flat, the gather's "neither tier" volume 10.8 k → 46 k experts.  `K` is now capped
+     by the gap, and a PREFILL fill (`expert_host_src(..., prefill=true)`, `stage_span_fill`) ignores it.
+  2. **A near-mirror pool disengages the exchange entirely** (coverage gap < 4 % of the set).  At 97.7 % the
+     demote measured **no decode gain** (75.6 vs 76.2) and cost 43-53 % of the first prefill, because the
+     decode-band churn moves the pool's content away from the complement the next prefill must read.  With the
+     disengagement that cell is the `SINK=0` path to the counter (`sink near-mirror tables ... 144`, 0 demoted)
+     and prefill returns to 1 907-1 938 t/s.
+  3. Below that boundary the demote is a real win and the boundary is the **gap, not the budget**: `-lme 44`
+     (93.7 %, gap 32) measured **+19-21 %** generation and +10-48 % prompt, `-lme 36` (76.9 %) +8-9 %, and a
+     full mirror stays inert (0 demoted, 144 mirror tables).
+  Gates on the fixed tree: coherence `sha=880c932888f8` identical on both `SINK` arms, `gate-host-pool.sh`
+  **31/31** (the `sink`/`sinkfail` arms still prove a failed demote declines and never publishes).

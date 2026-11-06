@@ -25,7 +25,7 @@ The old numbers are **retired** — do not reuse them.
 > rather than done here.
 
 **Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v16-6050b467c-r225`** (read `.release` in `release.json` -- it is the
+(the 2026-10-25 re-base), release **`v16-6050b467c-r228`** (read `.release` in `release.json` -- it is the
 source of truth, not this line).  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
@@ -43,6 +43,11 @@ Accepted limitations that are deliberately **not** fixed are listed at the end �
 | **142** | The pool tier's **first** prefill pays ~3 s: `llama-batched-bench -npp 512 -npl 1` measures **pp 128** for the pool against **588** for a pinned master (3.97 s vs 0.87 s), and the same 3 s is amortised invisibly inside a 5246-token prompt (prefill 1318 t/s, fine).  The pool is built and prepopulated lazily and the arena is sized only on the first DECODE-band pass, so the first prompt batch runs the pre-sizing staging path with no arena at all | performance (block 09/12, `moe-expert-cache`) | **OPEN -- pre-existing (r210), not a r211 regression** (2026-11-04, `WORKLOG.md` 261104.002 §4).  `MOE_HOST_POOL_PREWARM=0` does not move it (122 vs 130), so it is the build/first-touch, not the prewarm order.  The lead from `archive/work/host-expert-eager-push/P6-POOL-REGION.md` §7d is to move the population into the preflight (before the first timed batch) -- it was scoped as worth only ~0.09 s at `-n 300`, but this row is the arm where it is worth 3 s |
 | **271** | On a **pinned** host-expert master, **54 of 144 expert tables decline the prefill staging path on every ubatch** (`prefill cache staging: ok=783 unusable=477`) and are served by per-tensor copies on the COMPUTE stream instead — a silent prefill cost on a tier `-lme auto` can select, with no log line naming the tables | performance / visibility (delivery — a decision line that does not exist) | **OPEN — measured 2026-11-05** (`archive/work/host-expert-mirror/RESOLUTION.md`, `LEAD-pool-staging-gap.md` §5.2).  The decline predicate is `t.host_pinned && (arena == nullptr \|\| slots <= 0 \|\| host_dev == nullptr \|\| !cold_safe)` and the pool tier reports `unusable=0` on the same config, so the 54 tables have no usable arena/alias.  Evidence: traced `__amd_rocclr_copyBuffer` 3383 calls / 2.20 s in the pinned staging arm against 1629 / 0.09 s in the gather arm; the arm still measures 1700-1827 t/s, i.e. the fallback is not catastrophic, which is why it went unnoticed.  First step is an INFO/WARN line naming the table, layer and reason |
 | **272** | The prefill expert-transport **engine/stream choice** is width- and device-count shaped, and the shipped switch combination is wrong on one shape: per-expert copy-engine staging (`GGML_SCHED_DEVGATHER=0 MOE_HOST_POOL_STAGE_BATCH=0`) measures **+12-13 %** over the default gather on one GPU at `-ub` 5120-7168, loses at `-ub 2048` and by `8192` (its pipeline stalls: kernel/wall 0.80), and the gather wins by **14 %** on a 3-device tensor split; the r114 single-launch `moe_cache_stage_kernel` is **last at every width and device count measured** because it starves the compute kernels (same-count kernels 3-41x slower) | performance (delivery — a default/selection rule) | **OPEN — measured 2026-11-05, no code change** (`archive/work/host-expert-mirror/RESOLUTION.md`).  Before any change: name the 8192 stall (ring depth `GGML_SCHED_STAGE_SLOTS` vs the split count is the suspect), then a sweep over 1/2/3 GPU x {`tensor`,`layer`} x {mirror, sub-complement} x `-ub` {2048,5120,6144,7168,8192,16384}, `gate-prefill-logits.sh --ab`, `gate-host-pool.sh`, `MUL_MAT_ID`, and `-sm layer`.  Greedy text is already byte-identical across all three transports (`68704e68…`); a pure-documentation outcome (`ENVIRONMENT.md` describes neither arm's effect on prefill) is legitimate and is what the campaign recommended |
+| **276** | The demote's D2H is a `cudaMemcpyAsync` on the compute stream; PR #267 uses custom **copy kernels** plus a drain on a failed event record, because a small pinned copy can leave later queued work unsubmitted on ROCm | performance / scheduling (block 12, the demote) | **OPEN — measure before coding** (2026-11-06, `wip/host-expert-parity/PLAN.md` P0.1/P1.1).  r224's +5.3 % was measured on a host link the record itself puts at ~26 GB/s; this box is PCIe 5.0 x16, so measure the `MOE_HOST_POOL_SINK=0/1` delta here first and A/B a copy-kernel form only if the copy costs >~1 % of the step.  W1's `MOE_HOST_POOL_SINK_TAX` instrument was removed at r224 — the real path is the instrument now. |
+| **277** | No **precopy**: the demote pays its D2H on the admission path instead of copying likely victims ahead into free headroom on a side stream (PR #267 0006/0007/0008) | performance (block 12, the demote) | **OPEN — conditional** (2026-11-06, `wip/host-expert-parity/PLAN.md` P1.2).  Only if #276 leaves a residual: W1 measured ~2/3 of the copy hidden behind compute, so the ceiling is small.  If a side stream is added, 0007's semantics are mandatory: a failed event record drains the stream, a failed wait fails the demote, and a demote is never published on failure. |
+| **278** | The slab does not keep the expert-cache arena across a **decode→prefill transition** (PR #267 0003's `GGML_CUDA_SLAB_RING_PREFILL`), so a pool tier may re-fill after every prompt | performance (blocks 10/12) | **OPEN — measure first** (2026-11-06, `wip/host-expert-parity/PLAN.md` P1.4).  No such variable exists in the tree.  Count whether arena tables are actually dropped at the transition on the field shape (the `-lv 4` census prints `evicted … re-armed …`) and what the re-fill costs as a share of the prompt, before writing anything. |
+| **279** | The **narrow-2** (draft compute) pin evicts arena tables once the `GGML_CUDA_SLAB_MIN_ARENA_MIB` floor is satisfied, where PR #267 keeps the draft on its `cudaMalloc` fallback whenever the region fits outside the slab | performance (block 10, slab) | **OPEN — an A/B** (2026-11-06, `wip/host-expert-parity/PLAN.md` P1.5).  `ggml_cuda_slab_narrow2_pin_locked` already refuses below the arena floor, prefers the unmapped spare and maps the VA above `mapped`; the delta is the preference rule only.  Gate: per-block build, coherence, faults. |
+| **280** | The demote regime's **parity/crossover against a mirror** is **unmeasured on a PCIe 5.0 host**: r224's exchange rates came from a ~26 GB/s link, and the 56 GiB field shape has never been run on r224 at all (pre-r224: `auto` 97.7 % = 75.6 t/s / 1443 prefill against a mirror's 78.5 / 1941) | performance / release evidence (the tier's headline) | **OPEN — the campaign's product** (2026-11-06, `wip/host-expert-parity/`).  **First pass measured:** 76.9 % = 26.0 t/s, 93.7 % = 33.9 (+21 % with the demote), 100 % mirror = 38.2 (CLI, PCIe 5.0 box) — so 94 % is −11 % of a mirror for 3.0 GiB less pinned RAM, and parity below a mirror is not reached.  On the 56 GiB field shape (`auto` 97.7 %) the mirror is 1 932 / 83.7 and `auto`+`SINK=0` is 1 837 / 76.6 (−5 % / −8 % for 2.2 GiB less), while `auto`+`SINK=1` measured **867** prefill before r228 disengaged the demote on a near-mirror pool (#281, fixed in r228 — that cell is now the `SINK=0` path).  Answering the crossover also closes PR #267 as integrated rather than merged. |
 
 ---
 
@@ -112,28 +117,22 @@ call.
   at npl 1/4/8 in the earlier campaign sweep).  Record: `WORKLOG.md` 261106.012 + the r224 entry,
   `archive/work/host-expert-split/HANDOVER.md` §4.3.
 
-* **The Windows pinned-host ceiling has no cap, only a latch — measure it before adding one** (r223, issue
-  #274 follow-up; **no `TODO` id** — waiting on Windows hardware we do not have, `TODO` #95).  `hipHostAlloc`
-  there is budgeted by WDDM against the adapter's shared segment once per visible adapter, so the usable figure
-  is about `(total RAM / 2) / visible HIP devices` (measured: ~13.4 GiB on a 27.6 GiB box with one adapter,
-  ~6.5 GiB with two — ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339), which is why a 26.6 GiB pool plan on
-  a 47 GB box is refused at the tail.  A ceiling derived from that model was implemented and then **deliberately
-  withdrawn**: it is a heuristic, it cannot be measured here, and it would cap a healthy box.  The shipped guard
-  is mechanism-independent — the first refused bounce-ring `cudaHostAlloc` logs once with the driver's error and
-  latches the pinned tier off (a Windows refusal surfaces as `hipErrorLaunchFailure`, which latches
-  process-wide), and the exit census repeats it.  **The work item is the measurement**: read the aperture
-  segment's `CommitLimit` via `D3DKMTQueryStatistics` (the call `wddm-mem.cu` already makes for the WDDM free
-  figure), compare it with the reporter's plan, then decide whether a cap is worth having.  Record:
-  `WORKLOG.md` 261105.012, `INVARIANTS.md` r223 fact 4.
-* **A reported ~40 GB of "process private" on a mapped `--host-experts pool` load is not explained by our code**
-  (r223, issue #274 follow-up @DanoPTT; **no `TODO` id** — waiting on the reporter).  A `PAGE_READONLY`
-  `MapViewOfFile` is file-backed and the delivery copies nothing at load (`ggml_backend_host_buffer_from_ptr`
-  over the mapping + `mark_mmap_used`), so the only calls that touch the range are the pool/bounce fill memcpys
-  (whose byte count the census prints as `pool fills: N mapping memcpys, X GiB total`) and the scheduler's
-  fallback copy.  A read-only file mapping should not be commit charge, so the first thing to check is which
-  column was read (Task Manager `Committed` / RAMMap mapped-file pages).  If it turns out to be real, it is a
-  loader or HIP-runtime issue on Windows, not the host-pool path.  Record: `INVARIANTS.md` r223 fact 5.
-
+* **The Windows pinned-host ceiling has no cap, only a measurement** (r223, issue #274 follow-up; **no `TODO`
+  id** — waiting on the reporter's r227 log, `TODO` #95).  `hipHostAlloc` there is budgeted by WDDM against the
+  adapter's shared (aperture) segment, and the published model for it, roughly `(total RAM / 2) / visible HIP
+  devices` (ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339), is **refuted as a predictor by the reporter's
+  own numbers**: GPU shared usage stops at 9.32-9.35 GiB on a 47 GB box and again on the same box at 64 GB, with
+  one visible adapter and ~60 GB of commit headroom (`WORKLOG.md` 261106.016).  A ceiling derived from the model
+  was implemented and **deliberately withdrawn**, and r227 ships the measurement instead: the exit census prints
+  the pinned tier's realized total, and on Windows the aperture segments' `CommitLimit`/`BytesResident` for all
+  processes (`ggml_hip_win_shared_mem_info`, the `D3DKMTQueryStatistics` call `wddm-mem.cu` already makes), plus
+  a loud, latching refusal for a pool allocation the driver will not give.  The shipped guard is
+  mechanism-independent: the first refused `cudaHostAlloc` logs once and latches the pinned tier off (a Windows
+  refusal surfaces as `hipErrorLaunchFailure`, which latches process-wide), and no new pool is attempted after
+  that.  **The open item is one line of the reporter's next log**: if the aperture `CommitLimit` is near the
+  ~9.3 GiB plateau, the cap is that segment and a ceiling is now defensible; if it is far larger, whatever else
+  counts against the budget has to be found first.  Record: `WORKLOG.md` 261105.012 + 261106.016,
+  `INVARIANTS.md` r223 fact 4 / r227 fact 4.
 * **A sub-complement host pool is never served by the device remap** (r221; **no `TODO` id** — the pool
   side of closed `#269`).  A `--host-experts pool` table whose budget does not cover its tensor has, for some
   experts, neither an arena slot nor a pool slot, and a device-side `expert -> slot` map is built once per
