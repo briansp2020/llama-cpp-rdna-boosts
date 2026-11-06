@@ -1,3 +1,427 @@
+## 261105.012 (r223) -- issue #274 follow-up: a call that fails a fill must decline, and a refused pinned allocation is a latch
+
+**Released as `v16-6050b467c-r223` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),
+canonical tip **`37148d118`**, tree **`680e043b3cbd9f3508061c5ccbfa355fd8f0a68a`**.  Blocks 00-11 and 13-15 keep
+identical deltas; the series was re-cut from `6050b467c` with `scripts/apply-all.sh` (strict `git am`, so the
+block-12 commit id changes while the block bodies are byte-identical).
+
+### What was reported (three findings on the closed issue, after r219/r220)
+
+* **@briansp2020** -- when fills start failing *after* earlier ones succeeded, the pool-mode output on stock
+  r220 is still wrong (`This` then `!` for the two long-prompt chats), and the fix on his own tree is a decline
+  right after `moe_cache_update_host`'s first pass.  His shape is not reachable from
+  `MOE_HOST_POOL_FILL_FAULT=1`, because a fault from the first call stands every table down before any
+  take-over question can be asked.
+* **@DanoPTT** (Windows, r220) -- the r219 correctness fix works (coherent text, the census line appears), but
+  (1) ~40 GB of "process private" that does not track the pool budget, (2) pinned allocations failing while
+  ~20 GB of RAM is free, and (3) `fill failed ...: invalid device function` naming the wrong cause.
+* **@briansp2020** again -- a correction that it IS specific to the take-over path, with the decline patch.
+
+### What was actually wrong (two defects, one misleading message, one platform ceiling)
+
+1. **A fill failure inside the call did not decline that call** (confirmed by reading the code, then measured):
+   `access_locked` rolls the failed admission back and sets `t.fill_failed`, but the guard in
+   `moe_cache_update_host` sits at the top of the function.  The failing call continued: pass 2 found a cold or
+   pool id for the failed expert (a pool HIT is rolled back as an arena admission but is still pool-resident),
+   `all` stayed true, and the hook returned TRUE -- the scheduler skipped `input_cpy`, while
+   `moe_cache_get_table`, which the consuming op calls a few lines later, saw the same flag and returned false.
+   The op read a buffer nobody filled.  Fix: re-check `t.fill_failed` right after pass 1, before anything is
+   remapped, and add `!t.fill_failed` to `devremap_ok_locked` so the one-call-late remap follows the same rule.
+2. **The failure message named a synthesized device error.**  `expert_host_src` failing is a host-side answer
+   (no pool slot, no pinned bounce, no mapping) yet the caller substituted `cudaErrorInvalidDeviceFunction`,
+   which printed `invalid device function`.  Replaced by a named `k_no_host_source` sentinel that is never
+   passed to `cudaGetErrorString`, plus a real reason per failure (`no pinned host source (<why>)`).
+3. **A refused pinned allocation was retried forever.**  On Windows a `hipHostMalloc` refusal surfaces as
+   `hipErrorLaunchFailure` and latches process-wide (`ROCM-33542` / rocm-systems#14578, relayed in
+   ROCm/TheRock#9339), so the per-table bounce `cudaHostAlloc` retry turned one refusal into thousands of
+   failures.  The first refusal now logs once with the driver's string and latches the pinned tier OFF.
+4. **The pool was sized against `MemAvailable` on a platform whose pin ceiling is not `MemAvailable`.**
+   WDDM charges pinned host pages against the adapter's shared segment once per visible adapter, so the ceiling
+   is ~`(total RAM / 2) / visible adapters`: ~23 GiB on the reporter's 47 GB box against the ~26.6 GiB pool
+   `MOE_HOST_POOL_RAM_PCT=75` planned -- the tail pools and then every bounce entry are refused and the tier
+   collapses to the pageable path.  A ceiling derived from that model was implemented, measured to be
+   unverifiable here, and **withdrawn on the maintainer's call** (a heuristic that cannot be measured would cap
+   a healthy box): the shipped guard is the latch in (3) plus a census line, and `TODO.md` carries "measure the
+   aperture segment's `CommitLimit` before adding a ceiling".
+5. **The 40 GB "private commit" is very likely the reported column, not commit.**  A `PAGE_READONLY`
+   `MapViewOfFile` is file-backed: the delivery copies nothing at load (host buffer over the mapping,
+   `mark_mmap_used` only), so the only touches are the pool/bounce fill memcpys and the scheduler fallback --
+   whose byte count the census already prints.  Asked the reporter to check Task Manager's `Committed` /
+   RAMMap's mapped-file pages; no code change (INVARIANTS r223 fact 5).
+
+### Verification (working tree, `~/bin/build-llama-rocm`, ROCm 10.1.0, 1 GPU, gfx1201)
+
+| gate | result |
+|---|---|
+| `gate-host-pool.sh` (five arms, new `late` arm and `takeover=0` checks) | **PASS 23/23**; all five texts `a99ccbd97ecb` (182 chars); a live pool in the three healthy arms (57105 / 56823 / 56964 slots, **31.6 / 31.5 / 31.6 GiB** pinned, buffered / **O_DIRECT** / buffered) with zero fill failures; `fail` 2790, `late` 2732 rolled-back fills, `the slot is NOT resident` per table |
+| pre-fix vs post-fix, the same two fault arms | pre-fix **`takeover=128` / `129`, `get_ok=0`** (the failing call handed the op over; the text happened to stay correct on this box because the stale `input_cpy` held the right experts) -- post-fix **`takeover=0`, `get_ok=0`**, text unchanged.  This is the case's real discriminator: the text half is box-dependent, the mechanism is not |
+| long-prompt reproduction (`prompts/prose-rdna-boosts.txt`, `-c 8192 -n 64`) | reference `bd6b7b26eac9` (334 chars); `MOE_HOST_POOL_FILL_FAULT=late` post-fix **same hash, twice** (deterministic); the process-wide `=2000` form is **not** reproducible across box states (two runs of one command gave two shas, because the box's sizing moves where the global fault lands) -- which is why `=late` exists and why only it is gateable |
+| `check-windows-portability.sh` | OK, 287 files (the new code is inside the `GGML_USE_HIP && _WIN32` region) |
+| build | clean (`~/bin/build-llama-rocm`) |
+| `fork-refresh.sh --build --gates` (the re-cut branch) | tree == `release.json.tree`; build ok; coherence PASS; **prefill-logit mean KLD 0.000000 / same-top-p 100.000 %** |
+| `validate-set.sh` | **GREEN** -- artifact checksums, strict **16/16** on a fresh tarball at `6050b467c`, applied tree == `release.json.tree`, Windows portability lint 287 files |
+| MTP four-axis (Protocol A, 27B UD-Q4_K_XL, 1 GPU, `-c 32768`, bf16 KV, `-n 2000`, adaptive, seed 42, the protocol's sampler set, `--reasoning on` for R) | text **bit-identical 4/4** to the r222/r219/r217 record: R `0ffad0c34953` (9243), P `4f0d1ea854e9` (5830), C `95603a6a89a4` (8966), K `a87c4318b649` (2174) |
+
+**Still not run:** the per-block build ladder (`gate-per-block-build.sh`) against the re-cut set, and a real
+Windows arm -- finding 4's mechanism and finding 5's attribution can only be confirmed there (`TODO` #95).
+
+### Docs changed with it
+
+`patches/README.md` (block 12 follow-up bullet), `MANIFESTS.md` (block-12 row), `INVARIANTS.md` (r223 facts
+1-5), `ENVIRONMENT.md` (`MOE_HOST_POOL_FILL_FAULT` forms), `scripts/README.md` and `scripts/gate-host-pool.sh`
+(the `late` arm + `takeover=0`).  No new environment variable.
+
+### Decisions (maintainer, same session)
+
+1. **Ship it as r223** -- the block-12 amend is committed and the set re-cut.
+2. **Do NOT ship a Windows pinned-ceiling formula.**  The latch (`g_pinned_off`) + the WARN + the census line are
+   the guard, because they cannot make a working box worse; the real figure is the aperture segment's
+   `CommitLimit`, and measuring it needs Windows hardware (`TODO` #95).  The withdrawn cap is recorded in
+   `INVARIANTS.md` r223 fact 4 so it is not re-proposed blind.
+3. **Reply to @DanoPTT** with the r223 answer and the `Committed` / RAMMap measurement correction for the 40 GB.
+
+## 261105.011 (r222 tooling, no delivery change) -- the container images name their RELEASE, not only the fork point (issue #272 follow-up)
+
+**No delivery change.**  `patches/`, `release.json` and the artefact hashes are untouched (the release stays
+`v16-6050b467c-r222`, tip `80bfb80be`, tree `d9495be3`); this is `scripts/build-containers.sh`, the Dockerfile's
+labels and `CONTAINERS.md`.
+
+### Why
+
+@hermeticvm confirmed the r218 fix for issue #272 on his RX 6700 XT (both DSpark replay arms pass, plus a real
+six-task agent run) and added the one thing he could not do: attribute the image he tested.  His words: "labels
+identify fork point `6050b467c` but not the patch release ... I cannot attest it is exactly r218 or r219".
+That was true and it was our defect, in two layers:
+
+* the GHCR tags were fork-point only (`server-rocm-10.1-6050b467c`), and the moving tags (`rocm-10.1`,
+  `latest`) are overwritten on every release, so the fork-point tag is the only stable handle -- and one fork
+  point serves every release on it;
+* `build-containers.sh` passed `APP_VERSION=base` and `APP_REVISION=base`, so even
+  `org.opencontainers.image.version` / `.revision` named the fork point twice, and nothing in the image
+  identified the release.
+
+### What changed
+
+* every target also gets a `<tag>-<release>` tag (`full|light|server-rocm-<line>-v<blocks>-<base>-r<N>`, and a
+  `rocm-<line>-<release>` alias for the server image).  The moving and fork-point tags stay for compatibility,
+  and they are what the GHCR retention keep-rule matches, so the prune is unaffected: one push is one manifest
+  version however many tags point at it;
+* new build args `RELEASE_TAG` / `RELEASE_TIP` / `RELEASE_BLOCKS` (read from `release.json`) feed the OCI
+  labels: `org.opencontainers.image.version` is now the release, `.revision` its canonical tip, and
+  `io.github.stew675.rdna-boosts.fork-point` / `.blocks` carry what those two used to name.  `APP_VERSION`
+  stays the fork point because the `web` stage uses it as `LLAMA_BUILD_NUMBER`, which must stay a build
+  number;
+* `CONTAINERS.md` documents the tag scheme, the `podman inspect --format '{{json .Labels}}'` one-liner a
+  reporter should quote, and the awkward fact that **the worker runs the script as it exists in the TAG it is
+  building**, so a script/Dockerfile fix never reaches an already-published release without a manual build
+  from `main` on the worker (hold `$HOME/.cache/rdna-containers/.lock`, then write the tag into `last-built`
+  so cron does not rebuild the unlabelled images).  That is exactly how r222's images were re-cut: the
+  watcher's own r222 build had not started yet, so the labelled build is the only one, and the 18:30 tick
+  logged `another watcher/build is running; skipping` as designed.
+
+### Result
+
+The r222 images are being re-cut on `radiance` from `main` with the new tags and labels (the watcher's own
+r222 build had not started, so this is the only r222 build; the watcher's `flock` was held by hand and the
+18:30 tick logged `another watcher/build is running; skipping` as designed).  The run was still pushing the
+10.1 line at hand-off, so **verify it rather than trusting this note**:
+
+```
+# on radiance: the marker is only written after a fully successful --push
+cat ~/.cache/rdna-containers/last-built            # want v16-6050b467c-r222
+tail -1 ~/.cache/rdna-containers/build-v16-6050b467c-r222-labelled.log   # want RELABEL-DONE
+# and from anywhere, the provenance the reporter needed:
+podman inspect --format '{{json .Labels}}' \
+  ghcr.io/stew675/llama-cpp-rdna-boosts:server-rocm-10.1-v16-6050b467c-r222 | python3 -m json.tool
+```
+
+If the build failed, the run leaves `last-built` at r221 and the next 10-minute watcher tick rebuilds r222 from
+its tag with the OLD labels; the fix above then applies to the next release tag instead (every tag cut after
+this commit carries the new script).
+
+Images built before r222 keep the fork point in `version`/`revision` and carry no release label; `CONTAINERS.md`
+says to treat their release as unknown rather than guess.
+
+## 261105.010 (r222 addendum, no delivery change) -- the r222 release's MTP four-axis and batched-bench arms, taken on the tagged tree
+
+**Docs only.**  `patches/`, `release.json`, `scripts/` and the artefact hashes are untouched; the tag
+`v16-6050b467c-r222` (tree `d9495be3`) predates this entry by its commit alone, which is a documentation
+delta and not a code one.  The release entry above (261105.009) recorded the gates the change *owes*; this
+records the two model-level arms the release flow asks for as well, so the r222 record is complete against
+`MANIFESTS.md` -> *Release gates* without moving a published tag.
+
+### MTP four-axis (Protocol A, adaptive, dense) -- bit-identical to r219 and r217
+
+27B `Qwen3.8-27B-UD-Q4_K_XL`, 1 GPU (`HIP_VISIBLE_DEVICES=0`), `-c 32768`, bf16 KV, `-n 2000`, seed 42,
+greedy, `--spec-type draft-mtp` (adaptive, no `--spec-draft-n-max`), `--reasoning on` for R and `off` for
+P/C/K, and the protocol's own sampler set (`--top-k 20 --top-p 0.95 --min-p 0.001 --presence-penalty 1.5
+--repeat-penalty 1.0`, `-b/-ub 1024`, `-fa on`, `--load-mode mlock`).
+
+| axis | text | chars | acceptance | mean len | t/s (r219) |
+|---|---|---|---|---|---|
+| R (reasoning) | `0ffad0c34953` | 9243 | **0.52690** (1224/2323) | 2.58 | 54.3 (54.6) |
+| P (prose) | `4f0d1ea854e9` | 5830 | **0.81305** (1383/1701) | 3.44 | 71.0 (71.2) |
+| C (code) | `95603a6a89a4` | 8966 | **0.86236** (1441/1671) | 3.59 | 74.8 (74.9) |
+| K (recall) | `a87c4318b649` | 2174 | **0.99200** (372/375) | 3.98 | 82.8 (82.8) |
+
+Every text hash, every acceptance count and every mean accepted length is **identical** to r219's r217-vs-r218
+record, i.e. this release changes no decode, verify or draft numerics -- which is what the change predicts (it
+touches only the region PROVIDER's capability answer and its device binding; no kernel, graph or scheduler
+line moves).
+
+**A sampler flag is part of the protocol, and its absence forges a false positive.**  The first cut of this
+run omitted the protocol's sampler set (it used only `-n 2000 --seed 42 --temp 0`): R read `d59a861ed03b`
+(8575 chars, acc 0.58349) and C `39b564382557` (8768, 0.91917) against the recorded `0ffad0c34953` /
+`95603a6a89a4` -- while K matched exactly (`a87c4318b649`, acc 0.99200).  `--presence-penalty 1.5` is a logit
+transform, so it changes greedy output: it is not a sampling-only knob.  Any MTP arm compared against a
+recorded hash must carry the recorded flags verbatim.
+
+### `llama-batched-bench -npl 1,4,8` (35B-A3B UD-Q4_K_M, `-ncmoe 40`, 2 GPU, `-npp 512 -ntg 128`)
+
+tg128 **65.56 / 209.03 / 307.56** t/s at B=1/4/8 (r219 on the same box: 69.18 / 210.08 / 306.59), pp512
+92.7 / 2993.9 / 3126.0 t/s.  B=4 and B=8 are within 1 % of the r219 record, B=1 is the single-token arm and
+moved 5 % -- the box-state noise `INVARIANTS.md` (r221 fact 7) describes for a one-rep decode arm, and not a
+signal for a change that alters no compute path.  Reported, not gated.
+
+## 261105.009 (r222) -- issue #275: the VMM capability probe ran in a FOREIGN driver context, which on Windows kills the first kernel launch of a plain 2-GPU `-sm tensor` run (block 15)
+
+**Released as `v16-6050b467c-r222` (16 blocks).**  Fork point unchanged (`6050b467c`), canonical tip
+**`80bfb80bed3e1752910aa82257404adb7b3894e8`**, tree **`d9495be3ba2fbfbd601e8740d1da2d759b9bc256`**.
+Block 15 amended; blocks 00-14 keep identical deltas (their `.patch` files change only in the `From <sha>`
+line, because the series was re-cut from this checkout).
+
+### The report
+
+`jagalves` (Windows 11/Server, 2 x R9700 gfx1201, ROCm 10.1 Windows dist): a PLAIN 2-GPU `-sm tensor` run dies
+at the first kernel launch with an access violation in `hipHccModuleLaunchKernel`, no stdout, both device
+orders; 1 GPU unaffected; bisected r203 PASS / r204 FAIL, i.e. the release that added the Meta
+`ggml_backend_meta_kv_region_buft` hook (`TODO` #124).  No window and no pool is asked for
+(`LLAMA_KV_RESIDENT_CELLS` unset, so `kv_resident_cells == 0`), and `LLAMA_KV_REGION=0` makes it pass -- which
+points at the one piece of driver traffic the plain path still does: the CAPABILITY PROBE.
+
+### Reproduced on Linux, and what the defect actually is
+
+The crash needs the Windows/HCC context handling, so Linux does not fault -- but the wrong context is
+reproducible and was measured directly.  With a temporary `cudaGetDevice()` print at the top of
+`ggml_cuda_vmm_region_available` (r221 tree, `HIP_VISIBLE_DEVICES=0,2 -sm tensor`):
+
+```
+VMMPROBE device=0 current_context=1 cross=1
+VMMPROBE device=1 current_context=1 cross=0
+```
+
+Device 0's probe -- `cuMemAddressReserve`, `cuMemCreate`/`Map`/`SetAccess`, `cuMemUnmap`,
+`cuMemAddressFree`, plus the quarantine `cudaMalloc`/`cudaFree` -- runs its whole round trip in **device 1's
+context**, because `llama_kv_cache` init asks each child of the Meta device in turn (via
+`ggml_backend_meta_kv_region_buft(kv_dev, 1)`) and nothing in the chain binds the device.  `alloc_buffer`
+does bind it; the probe was the one path that did not.  That is exactly the class of traffic the reporter
+identified, and the reason it is invisible on 1 GPU (there is only one context to be on).
+
+### The fix (block 15, three parts)
+
+1. **Device discipline in the provider.**  Every entry point that can reach the driver binds the region's
+   device first (`vmm_bind_device` -> `ggml_cuda_set_device`): `create`, `free`, `map_span`, `ensure_span`,
+   `clear`, `dump`, `available`, `selftest`, and the `cuMemGetAllocationGranularity` query.  Binding in the
+   module rather than at each call site is the invariant -- a new caller cannot forget it, and `free` (which
+   unmaps and releases VA from a context destructor) had the same latent defect.
+2. **A buffer type may not touch the driver while it is constructed.**  New
+   `ggml_cuda_vmm_region_capable(device)` answers from the two facts the backend latched at init
+   (`devices[].vmm` + its RECOMMENDED granularity) with no driver traffic, and
+   `ggml_backend_cuda_kv_region_buffer_type_split` now asks THAT.  This is the reporter's option 2, and it is
+   the part that fixes the crash: the plain `-sm tensor` path now performs **no VMM driver call at all** (the
+   `VMM region available` line is gone from the 2-GPU arm).
+3. **The real probe moved to allocation time.**  `alloc_buffer` (which already bound the device) runs
+   `ggml_cuda_vmm_region_available` once, before `create`, and still falls back to the plain device buffer
+   with the same warning -- so "reserves but refuses a one-unit map" is still caught BEFORE any KV byte is
+   committed, one step later than before and in the right context.  The reporter's objection to option 2
+   (the `LLAMA_LOG_INFO` line moves) is answered: the refusal now happens at alloc, the fallback is
+   unchanged.
+
+### Also fixed on the way (both in block 15's files)
+
+* **The selftest's verdict was invisible.**  `ENVIRONMENT.md` has said "must print PASS, and must print FAIL
+  with `LLAMA_KV_REGION_QUARANTINE=0`" since r178, but the verdict was a `GGML_LOG_INFO` line and
+  `common_log_get_verbosity()` maps INFO to TRACE -- so at every default BOTH verdicts were suppressed, and a
+  FAIL was as quiet as a PASS.  Two more layers hide it in `llama-cli`: its default verbosity is error-only,
+  and the `--fit` probe wraps the logger so anything below its own minimum becomes DEBUG.  The verdict is now
+  WARN (PASS) / ERROR (FAIL), so a failure can no longer pass a gate silently; a PASS is visible with `-v`
+  (which `scripts/gate-kv-residency.sh` passes) and `ENVIRONMENT.md` says so.
+* **`scripts/make-patches.sh` silently re-cut the PREVIOUS set.**  Its default tip comes from
+  `release.json`, so running it after amending a block (without updating `release.json` first) regenerated
+  the old patch series, printed "Regenerated 16 patches" and exited 0 while the amendment was nowhere in the
+  delivery -- this session hit it and only a `grep` of the patch found it.  It now refuses when the fork is
+  checked out at a tip that is not `release.json.tip` and no tip was passed explicitly.
+* **`scripts/gate-kv-residency.sh` now gates the provider's selftest**: `wselftest` must PASS and
+  `wselftest0` (`LLAMA_KV_REGION_QUARANTINE=0`, the known-bad state) must FAIL, so the oracle is proven
+  sensitive on every run instead of on trust.  The selftest was previously a documented-but-ungated
+  diagnostic.
+
+### Gates (this box, `soar`, 3 x R9700 gfx1201, ROCm 10.1.0)
+
+| gate | result |
+|---|---|
+| defect reproduction (instrumented r221 build) | `VMMPROBE device=0 current_context=1 cross=1`, i.e. the probe's whole VMM round trip in device 1's context |
+| same-seed greedy text, pre-fix vs post-fix build | identical: 1 GPU `1c5d32ac537d`, 2-GPU `-sm tensor` `1c5d32ac537d`, 3-GPU `1c5d32ac537d` (100 chars each) |
+| plain 2-GPU `-sm tensor` arm: VMM driver traffic | **none** (`VMM region`/`KVRegion` lines: 0; the pre-fix build printed two `VMM region available` lines) |
+| `GGML_CUDA_VMM_REGION_SELFTEST=1` | PASS (`-v`), and FAIL with `LLAMA_KV_REGION_QUARANTINE=0` at DEFAULT verbosity (the new ERROR verdict) |
+| `scripts/gate-kv-residency.sh` (full: window + pool + multi-device + the new selftest arms) | PASS, both placements byte-identical to their resident arms and provably leaving them (numbers in the gate's own output) |
+| `scripts/gate-prefill-logits.sh` | **PASS** -- mean KLD **0.000000**, same-top-p **100.000 %** (build `80bfb80be`) |
+| `scripts/gate-per-block-build.sh --changed-from 75059f1c --fast` | **1/1** (block 15; blocks 00-14 unchanged) |
+| `scripts/validate-set.sh` | green: 16 blocks, strict apply, tree `d9495be3`, checksums, Windows scan clean |
+| `scripts/check-gpu-faults.sh` | clean |
+
+**What is NOT claimed:** the Windows box was not available, so the crash itself is fixed by construction
+(no VMM driver call is left on that path, which is what the reporter's own verified option 2 did) and not by
+re-measuring it here.  The reporter's `LLAMA_KV_REGION=0` A/B and its 1-GPU/2-GPU text identity stand as the
+external evidence; this release removes the traffic AND binds the context, so either mechanism alone is
+covered.
+
+## 261105.008 (no release) -- `wip/host-expert-mirror` CLOSED: the mirror's prefill transport is the gather (serialised at the link's rate), the r114 single-launch staging kernel is the worst option, and the copy-engine path wins only in a 1-GPU width band
+
+**No delivery change.**  `patches/`, `release.json`, every block and `ENVIRONMENT.md` are untouched; the delivery
+stays `v16-6050b467c-r221` (16 blocks, tip `75059f1c4`, tree `01363a18`).  The campaign record moved to
+[`archive/work/host-expert-mirror/`](archive/work/host-expert-mirror/RESOLUTION.md), the `wip/CAMPAIGNS.md` row is
+deleted (no stub), and the forward-looking residue is `TODO` #271/#272.  The facts are appended to
+[`INVARIANTS.md`](INVARIANTS.md) ("no release, r221 tree").
+
+### What the campaign asked, and what measurement did to it
+
+It was opened to close the last ~8 % of prefill against `briansp2020`'s branch (1802 vs 1949 t/s, `-ub 6144`, one
+R9700, a mirror host tier) by **handing a covering pool's op the pool's device alias** instead of staging a copy
+(`MOE_HOST_POOL_ALIAS`).  Step 1 was a spike, and it refuted the premise rather than the target:
+
+* **the copy is the device GATHER, not the staging engine** -- `device gather: 1410 calls (1410 pool-backed), 0
+  routed experts from the neither-tier path`, the staging census absent, and `GGML_MOE_CACHE_STAGE=0` a no-op
+  (1616.2 vs 1618.8 t/s).  The campaign's "46.84 GiB per ubatch through the staged table" had the right bytes
+  and the wrong mechanism;
+* **it reads the pool's pinned alias in place at 33 GB/s** (329.19 GiB pool + 126.50 GiB arena per 52k pass,
+  250.7 MB per call in 7.52 ms) against this stack's 28.6 GB/s bulk-H2D calibration -- so an alias cannot move
+  the bytes faster, and an in-place prefill can only ever buy **overlap**;
+* **it is serialised** (kernel/wall 0.95) and costs **34.9 %** of the prefill's GPU time at `-ub 6144` (10.91 s
+  of 31.22 s; **55 %** at `-ub 2048`), which is where the money is -- not in the copy function.
+
+### The lead that was worth following, and its mechanism
+
+The contrast that opened it: the pool tier's staging ran 1241-1391 t/s while the *pinned* tier's staging ran
+1708 on the same config.  Traced (three transcripts, `rocprofv3`, durations only) and diffed per kernel at
+identical dispatch counts:
+
+| pool mirror, 1 GPU, `-ub 6144` | wall | total GPU kernel | kernel/wall | transport |
+|---|---|---|---|---|
+| gather (default) | 32.74 s | 31.22 s | 0.95 | gather 10.91 s, serialised |
+| staging, single kernel (`GGML_SCHED_DEVGATHER=0`) | 37.94 s | **43.55 s** | 1.15 | stage kernel 11.22 s, **compute kernels starved 3-41x** |
+| staging, per-expert copy engine (`... MOE_HOST_POOL_STAGE_BATCH=0`) | **29.75 s** | 27.57 s | 0.93 | 182 873 short blits under compute |
+
+The single-launch kernel monopolises the CUs: at identical counts `mm_ids_helper_512_10` goes 0.051 -> 2.081 s
+(41x), `quantize_mmq_q8_1` 0.336 -> 1.657, `mul_mat_q_routed_compact<20>` 1.291 -> 4.438.  **r114's +34 % for
+that kernel was real only against a pageable master that paid a host memcpy into a pinned bounce per copy**; with
+the pool alias readable in place (r215/r219) there is nothing to amortise, so it is now the worst option at every
+width and device count measured.  Interleaved ABAB, 1 GPU, `-ub` 2048 / 5120 / 6144 / 7168 / 8192 / 16384:
+gather 1016-1021 / 1511 / 1627-1629 / 1685 / **1748** / **1945**, kernel 872-875 / - / 1412-1425 / - / 1546 /
+1736, copy-engine 742-907 / **1694** / **1840-1845** / **1889** / 1696 / 1788.  On 3 GPUs `-sm tensor` the order
+reverses (gather **2359** > kernel 2075 > CE 2053) and no #131 collapse reproduced on a 46.84 GiB mirror.
+
+### Why it is not a delivery change
+
+* the only measurable win is a **two-env-var configuration** (`GGML_SCHED_DEVGATHER=0
+  MOE_HOST_POOL_STAGE_BATCH=0`) worth +12-13 % on **one** shape (1 GPU, `-ub` 5120-7168), which loses at `-ub
+  2048`, loses again above ~8k (the CE arm's overlap stalls: kernel/wall 0.80) and reverses on a tensor split.
+  Defaulting it would repeat r114's mistake in the other direction -- one cell, one width, one device count;
+* the alternative explanations were closed by measurement: the pool's alloc shape (`thp` vs `portable`) and the
+  copy kind (`MOE_HOST_POOL_H2D`) move **nothing**, `AnonHugePages` is 0 GiB in both, and the arena (`-c 65536`)
+  is nearly inert (+1.2 %) because only ~28 % of routed offers are served from it;
+* purity measured: same-seed greedy text is **byte-identical across all three transports** (`68704e68...`, 135
+  chars).  The logit gate A/B is *not* run here (no delivery change) and is listed as owed in `TODO` #272.
+
+### Retirement
+
+`wip/host-expert-mirror/` is deleted from the index and moved to `archive/work/host-expert-mirror/`
+(`RESOLUTION.md` = claim / rule / numbers / what would reopen it; `spike-261105/` = the step-1 evidence with its
+scripts, prompts and a `kernel-diff.py`; `LEAD-pool-staging-gap.md` = the three-transport comparison).  Paths in
+the moved documents and in `wip/bench-56gb/README.md` and `wip/host-expert-coverage/README.md` were repointed at
+the new location.  Two forward-looking items carry the residue: **#271** (a pinned master declines staging for 54
+of 144 tables every ubatch -- `ok=783 unusable=477`, served by compute-stream per-tensor copies, with no log line
+naming them) and **#272** (the transport should be chosen by width and device count; name the 8192 stall first).
+
+**Protocol, for the next session on this box:** a block-ordered set of "reps" produced a **16 % monotonic drift** in
+this session (staging kernel 1241 -> 1434, copy engine 1549 -> 1844) while the interleaved gather control stayed
+at 1616-1629; the pinned tier swung 36 % across identical censuses.  Only interleaved ABAB within a cycle is
+trustworthy -- `spike-261105/abba.sh` exists for that reason, and the earlier block-ordered rows in `SPIKE.md` are
+marked superseded.
+
+## 261105.007 (r221) -- TODO #269: the sync-free decode remap becomes tensor-split and covering-pool aware (block 09, plus one line each in blocks 12 and 15)
+
+**Released as `v16-6050b467c-r221` (16 blocks).**  Fork point unchanged (`6050b467c`), canonical tip
+**`75059f1c4efcaefa2cac911023645e5f457d412c`**, tree **`01363a187dd970cf2d93abd79e6ac41a28083324`**.
+Blocks 09, 12 and 15 amended; blocks 10/11/13/14 keep identical deltas.
+
+### What #269 actually was, once measured
+
+The item's title said "keep `GGML_MOE_DEVREMAP`, drop the rest of PR #266, and make the remap tensor-split
+aware before re-implementing it over pool slots".  The three questions behind it turned out to have three
+different answers:
+
+1. **Does the remap still pay?**  Yes -- but only under its own protocol.  Re-running r203's own cell
+   (`llama-batched-bench -npp 64 -ntg 512 -npl 1`, 35B-A3B UD-Q4_K_M, `-ncmoe 40`, `MOE_EXPERT_CACHE_MIB=8000`,
+   1 x R9700) reproduces **61.2 -> 67.6 t/s (+10.4 %)**.  A first pass with `llama-cli -n 300` and an
+   auto-sized arena read *negative* (-2.5 %) and sent this session hunting a phantom regression; the sign
+   flipped back on the same command minutes later, so the early cli numbers were a box state (prefill 1214 vs
+   2716 t/s at an identical arena -- never resolved, and no longer relevant because every number below was
+   taken ABBA, 2+ reps, with the disk-read delta and `MemAvailable`/VRAM recorded per run).  **Lesson, for the
+   record: a decode A/B on this box needs the ABBA protocol even for a 20-second arm, and a prefill rate that
+   halves is the tell that the run is not comparable.**
+2. **Where is it worth most?  On a tensor split**, because the eager path it replaces synchronizes the WHOLE
+   meta backend once per routed op.  35B-A3B Q8_0 `-ncmoe 40`, `MIB=8000`, `-sm tensor`: **+9.9 %** at 1 GPU
+   (57.6 -> 63.3), **+16.1 %** at 2 (64.0 -> 74.3), **+28.4 %** at 3 (59.4 -> 76.3).  So the maintainer's
+   acceptance condition was not a formality: the capability was inert there by construction and the
+   capability is worth an order of magnitude more on a split than on the single GPU r203 measured.
+3. **And over pool slots?**  Expressible only when the pool **covers** its tensor -- which is the *default*
+   `-lme auto` layout on a mapped load ("a pinned per-EXPERT pool of the whole host expert set (a MIRROR)"),
+   not a niche: **+9.9 %** (57.6 -> 63.3) on that config.  A sub-complement pool cannot be served by a
+   device-side map at all (the map would have a hole), so it declines every offer -- measured `0 of 3840
+   served` -- and keeps the eager path.  The item's "re-implement it over pool slots, per-device-slice aware"
+   is therefore done for the only regime where it is sound.
+
+### What shipped
+
+* **Block 09**: `ggml_backend_meta_moe_cache_remap` forwards the hook to each simple device with that
+  device's simple tensors (and the per-device routing view when the ids are a mirrored meta tensor), the
+  `check_only` pass answering for every device before any commit -- the same shape as `moe_cache_update` /
+  `take_over` / `gather`.  `devremap_cold_ok_locked` adds `dr_pool_ok`, latched once at sizing, and the map
+  builder emits `slots + pool slot` for a covering pool (`pool_live_slots`, `table_pool_peek_locked`,
+  `pool_covers_table_peek_locked`).  The exit report now prints `device remap: N tables served, M of K offers
+  declined`, which is the only way to tell "no gain" from "not engaged".
+* **Block 12**: a covering pool has nothing to re-rank, so `pool_rerank_from_heat_locked` reaps and then
+  returns before any bookkeeping -- the old code reached the same answer by coincidence, and the decode
+  remap's write-once cold map depends on it being stated.
+* **Block 15**: `keep_all` never retires a slot for a mirror (the surplus argument taken to its conclusion),
+  so a resident expert cannot lose its slot under the remap either.
+
+### Gates (all on this box, `soar`, 3 x R9700 / gfx1201, ROCm 10.1.0)
+
+| gate | result |
+|---|---|
+| same-seed greedy text, 300 and 1000 tokens | identical in every A/B: 1 GPU `4c3674469c52` (1000 tok), 2-GPU `-sm tensor` `c30a297f5bf4` (1000 tok) / `8d8dc18f9be3` (300 tok), 3-GPU `793df7eccea0`; sub-complement (`-lme 16`) and `MOE_HOST_POOL_COLD=0` arms identical |
+| MTP (`llama-server`, `--spec-type draft-mtp`, 122B 3-GPU `-sm tensor` and 35B 1-GPU) | acceptance bit-equal **0.74246 (689/928)** and **0.75655 (693/916)**, mean len 3.22 / 3.26, text sha equal; 35B decode 121.6 -> 128.1 t/s (+5.3 %) |
+| `llama-batched-bench -npp 64 -ntg 128 -npl 1/4/8`, 2-GPU `-sm tensor` | 63.3/180.1/281.6 -> 66.9/189.0/298.6 t/s (+5.8/+5.0/+6.0 %), prefill unchanged |
+| r203's own cell re-run | 61.2 -> 67.6 t/s (+10.4 %) |
+| `scripts/gate-prefill-logits.sh` | **PASS** -- mean KLD **0.000000**, same-top-p **100.000 %** |
+| `scripts/gate-host-pool.sh` | **18/18** (the four pool arms, sub-complement config) |
+| `test-backend-ops -o MUL_MAT_ID` | 931/931 |
+| `scripts/check-gpu-faults.sh` (journal + 7 logs, `--since "4 hours ago"`) | clean |
+| `scripts/validate-set.sh` | green: 16 blocks, strict apply, tree `01363a18`, no conflict markers, Windows scan clean |
+| `scripts/gate-per-block-build.sh --changed-from 4be5690b6 --fast` | **4/4** (blocks 09, 10, 12, 15 -- 10 is a rebase-only delta) |
+| `MOE_EXPERT_CACHE_MIB=0` control | identical on both arms (28.5 t/s), i.e. the whole effect is inside the cache path |
+
+### Retirement
+
+`TODO` #269 is closed.  Its two forward-looking clauses are answered: the tensor-split condition is met and
+measured, and the pool re-implementation is done where it is expressible (+9.9 %) and refuted as
+inexpressible where it is not (a sub-complement pool -- and `#141` already records that bound from the
+eager side).  `INVARIANTS.md` r221 carries the six facts a future extension has to respect, the important
+one being "is this answer constant for the shape once `g_sized`?" -- a captured graph bakes the take-over,
+so a decision that can flip is a wrong read, not a slow one.
+
 ## 261105.006 (r220) -- PR #268 assessed: the copy-event fix is promoted into block 12, the two-lane prefill becomes the first `optional/` artifact
 
 **Released as `v16-6050b467c-r220` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),

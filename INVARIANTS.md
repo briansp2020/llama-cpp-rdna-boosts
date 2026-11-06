@@ -1971,3 +1971,199 @@ path.**
    call breaks the CUDA build (PR #268 did, fixed in the optional artifact's rebase).  Related: do not
    switch every backend event to a **timing** event to serve one diagnostic -- create the timing event only
    on the debug path, or the cost lands on users who never set the knob.
+
+## r221 -- the sync-free decode remap is worth what the SYNC it replaces costs, so it grows with the device count; a covering pool is a legitimate cold source
+
+`TODO` #269's acceptance condition ("the remap must be tensor-split aware") is met by forwarding
+`moe_cache_remap` from the Meta backend to each simple device, exactly as `moe_cache_update` / `take_over` /
+`gather` already are.  The facts, all measured this session on 35B-A3B Q8_0 `-ncmoe 40`, byte-identical
+greedy text throughout:
+
+1. **The gain scales with the device count because the eager path synchronizes the WHOLE meta backend.**  The
+   remap replaces `ggml_backend_synchronize(input_backend)` + the ids readback (a full meta synchronize, i.e.
+   every child device) with a kernel plus a host-side policy one call late, so its value is that sync's cost:
+   **+9.9 %** at 1 GPU (57.6 -> 63.3 t/s, `-sm tensor` == `-sm layer`), **+16.1 %** at 2 (64.0 -> 74.3) and
+   **+28.4 %** at 3 (59.4 -> 76.3) at `MOE_EXPERT_CACHE_MIB=8000`.  The r203 single-device numbers (+8.4 %
+   pinned, +4.8 % pool-cold) still reproduce on their own protocol (`llama-batched-bench -npp 64 -ntg 512`,
+   Q4_K_M, `MIB=8000`: 61.2 -> 67.6 t/s).
+2. **Nothing in the remap is device-shared, which is why the forwarding is a delegation and not a redesign.**
+   The routing ids are global expert ids; each device maps them through its OWN expert -> slot map into its
+   OWN `remap_dev`, and the cold half of the map is expressed with THAT device's slot count -- `t.slots`
+   differs per device, so a single shared map would name different experts.  `check_only` must answer for all
+   devices before anything commits (the scheduler's skip-copy decision is all-or-nothing); a decline in the
+   committing pass falls through to the eager path, which resets `remap_n_used`, so a partial commit can only
+   cost a synchronize.
+3. **A host pool that COVERS its tensor is a cold source, so `dr_pool_ok` makes the cold id `slots + pool
+   slot`.**  That is the default `-lme auto` layout on a mapped load ("a pinned per-EXPERT pool of the whole
+   host expert set (a MIRROR)"), and it previously took the eager path for want of a cold encoding even
+   though every expert was pool-resident: +9.9 % on that config.  It is expressible ONLY under coverage: a
+   sub-complement pool declines every offer (measured `0 of 3840 served`), because a device-side map cannot
+   express a miss whose expert is neither in the arena nor in the pool.  Do not "fix" that by pointing the
+   unmapped expert at `slots + e` -- the kernel would resolve it against the pool base.
+4. **A covering pool's expert -> slot map is WRITE-ONCE after sizing, and that is the freshness answer.**
+   The demand path never evicts a resident (`pool_fill_empty_locked` only takes EMPTY slots), and the one
+   re-rank (`pool_rerank_from_heat_locked`) frees nothing and fills nothing when `want` is every expert -- so
+   r221 makes that early-return explicit, and `keep_all` in `expert_host_src` no longer retires a slot for a
+   mirror.  Coverage is therefore a property of the BUDGET, not of the run, which is what lets a one-call-late
+   map be safe without a synchronize (`TODO` #269's "layout epoch or freeze" -- this is the freeze, by
+   construction).  Count LIVE slots (`slot_state == 1`): a slot retiring into the arena still has an index
+   and cannot serve a cold read.
+5. **`dr_pool_ok` is latched once, at sizing, because a captured graph bakes the take-over.**  A decision that
+   could flip later would leave a replayed node reading a baked `remap` pointer while the host had taken the
+   eager path -- a wrong read, not a slow one.  Gate any future extension of the remap's scope on the same
+   question: "is this answer constant for the shape once `g_sized`?"
+6. **Two independent kill switches compose, and the counter is the oracle.**  `MOE_HOST_POOL_COLD=0` and
+   `MOE_HOST_POOL_COLD_MULTIDEV=0` both make `pool_cold_geometry_ok` false, so a covering pool's remap stands
+   down with them; `GGML_MOE_DEVREMAP=0` is the remap's own.  The exit report's `device remap: N tables
+   served, M of K offers declined` line is what tells "no gain" from "not engaged" -- read it before
+   concluding anything about this path.
+7. **A decode A/B on this box needs the ABBA protocol even for a 20-second arm, and a *prefill* rate that
+   halves is the tell that the run is not comparable.**  This session's first pass at the remap read
+   -2.5 % on `llama-cli -n 300` (three reps each, alternating, disk delta 0-29 MiB) and the same command
+   later read +8.9 %; the discriminating symptom was prefill 1214 vs 2716 t/s at an *identical* arena size,
+   i.e. a run in a degraded state that no counter in the decode rate shows.  Protocol that worked: 2+ ABBA
+   cycles per arm pair, `MemAvailable` and used VRAM recorded per run, the model page-cache-resident (a 74 GB
+   model against 91 GB of RAM re-reads itself every arm and is not measurable this way), and the
+   `device remap:` census read before drawing a conclusion -- "no gain" and "not engaged" look identical
+   without it.
+
+## (no release, r221 tree) -- the mirror's prefill transport is the GATHER, it is serialised at the link's rate, and the alternative transports rank by STREAM, not by bytes
+
+Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM, no cgroup), tree
+`75059f1c4` (r221), model `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S`, `-lme 47` + `MOE_HOST_POOL_RAM_PCT=0` (plan line:
+"the whole host expert set (a MIRROR)"), 52 512-token prompt, greedy.  Record:
+[`archive/work/host-expert-mirror/`](archive/work/host-expert-mirror/RESOLUTION.md) (the campaign closed here;
+`WORKLOG.md` 261105.008).  No delivery change.
+
+1. **On a mirror the prefill transport is the DEVICE GATHER, so no staging/miss-path number describes the
+   shipped default.**  `sched_input_gatherable` mode 1 requires `moe_cache_pool_backed()` (the pageable-master
+   `pool` tier) and a width above the cache band, so every pool-backed table above the band is gathered:
+   measured `device gather: 1410 calls (1410 pool-backed), 0 routed experts copied ... (neither tier)` and the
+   staging census **absent**; `GGML_MOE_CACHE_STAGE=0` changes nothing (1616.2 vs 1618.8 t/s).  Read the exit
+   census before attributing any prefill cost to `moe_cache_upload_pageable` or `moe_cache_stage_table`.
+2. **The gather moves the routed expert bytes at the link's ceiling, so it is not a bytes problem.**  Its kernel
+   is **34.9 %** of the prefill's GPU time at `-ub 6144` (10.91 s of 31.22 s; **55.0 %** at `-ub 2048`), and it
+   reads **329.19 GiB from the pool + 126.50 GiB from the arena** per 52k pass: 250.7 MB of pool reads per call
+   in 7.52 ms = **33 GB/s**, against this stack's **28.6 GB/s** bulk-H2D calibration.  An in-place alias moves
+   the same bytes at the same rate; the only thing it could buy is overlap.
+3. **The gather is SERIALISED (kernel/wall 0.95), which is where the recoverable loss is.**  Sum-of-kernels
+   ~= wall means it is a compute-stream node adding its full time to the prefill.  The transports rank by
+   *stream and engine*, and the ranking inverts with the shape: 1 GPU `-ub 6144` gather 1627 / r114 single-launch
+   staging kernel 1418 / per-expert copy-engine 1842; `-ub 2048` gather 1016-1021 / kernel 872-875 / CE 742-907;
+   `-ub 16384` gather 1945 / kernel 1736 / CE 1788; 3 GPU `-sm tensor` gather 2359 / kernel 2075 / CE 2053.  The
+   CE win is a **1-GPU width band (5120-7168)**; by 8192 its overlap stalls (kernel/wall **0.80** -- 20 % of the
+   wall idle with no kernel running).
+4. **A single-launch staging kernel that streams a whole 341 MiB table STARVES the compute kernels.**  At
+   identical dispatch counts the same compute kernels run **3-41x** slower in the arm where
+   `moe_cache_stage_kernel` (144 blocks x 256 threads) is concurrently resident: `mm_ids_helper_512_10` 0.051 ->
+   2.081 s, `quantize_mmq_q8_1` 0.336 -> 1.657 s, `mul_mat_q_routed_compact<20>` 1.291 -> 4.438 s; total GPU time
+   43.55 s vs 31.22 (gather) and 27.57 (many short copy-engine blits).  **r114's +34 % for that kernel was
+   measured against a pageable master that paid a host memcpy into a pinned bounce per copy**; with the pool
+   alias readable in place there is nothing to amortise, so the same kernel is now the *worst* option at every
+   width and device count measured.  Do not re-derive "+34 % for one launch" from the r114 record.
+5. **A pinned master's staging is one kernel launch on the COPY stream and genuinely overlaps** (kernel total
+   33.80 s > wall 31.17 s) -- it is the "already overlapped" control, and the pool mirror's whole gap to it is
+   ~5 % prefill for 46.84 GiB of duplicate RAM.  Its own engine preference is the opposite of the pool tier's
+   (kernel 1820-1825 > per-expert CE 1545-1547, interleaved), confounded by 54 of 144 tables declining staging
+   entirely (`ok=783 unusable=477`, `TODO` #271).
+6. **`-ub` is a bytes-per-token lever on a mirror, and the arena's SIZED residency overstates what it serves.**
+   Every prefill ubatch routes essentially the whole table, so bytes/token ∝ 1/ub while the ubatch count ∝ ub:
+   `-ub 2048 -> 16384` is 1019 -> 1942 t/s (gather), at the cost of the arena (21.5 -> 16.4 GiB).  Enlarging the
+   arena alone is nearly inert (`-c 65536`: pool 329 -> 312 GiB, +1.2 %) because only ~28 % of routed offers are
+   served from it -- the slots fill on demand during the pass (`hits=951 fills=2019`), so size it *and* seed it.
+7. **A block-ordered set of "reps" is not a measurement on this box** (this extends r221 fact 7).  Block-ordered
+   arms drifted monotonically by **16 %** over one session (staging kernel 1241 -> 1434, copy-engine 1549 ->
+   1844) while the interleaved gather control stayed at 1616-1629 (+-0.3 %), and the pinned tier swung 36 %
+   across identical censuses.  Only interleaved ABAB within one cycle is trustworthy; `AnonHugePages` was 0 GiB
+   in both pool alloc shapes and neither `MOE_HOST_POOL_ALLOC` nor `MOE_HOST_POOL_H2D` moved any arm.
+
+## r222 -- a buffer type may not touch the driver while it is CONSTRUCTED, and a gate's verdict level is part of the gate (issue #275)
+
+1. **A driver call made from a buffer-type CONSTRUCTOR runs in whatever context the calling thread is on, and
+   that is not the probed device (r222, block 15, issue #275).**  `llama_kv_cache` init asks every child of a
+   Meta (tensor-split) device for the region buffer type
+   (`ggml_backend_meta_kv_region_buft(kv_dev, 1)`); the construction-time capability probe then executed its
+   whole VMM round trip -- `cuMemAddressReserve` -> `cuMemCreate`/`Map`/`SetAccess` -> unmap ->
+   `cuMemAddressFree`, plus the quarantine `cudaMalloc` -- in the LAST device's context.  Measured directly on
+   Linux with a `cudaGetDevice()` print at the probe (`HIP_VISIBLE_DEVICES=0,2 -sm tensor`):
+   `VMMPROBE device=0 current_context=1 cross=1`.  Linux tolerates it; on Windows/HCC the first kernel launch
+   then dies with an access violation in `hipHccModuleLaunchKernel`, which is the reporter's crash and looks
+   like a kernel defect rather than a bookkeeping one.  The construction-time answer must therefore come from
+   facts already latched at init (`devices[].vmm` + granularity), and the real reserve/map validation belongs
+   at ALLOCATION time, where the device is bound and a refusal still falls back to the plain device buffer.
+   **The test of a fix here is the log**: a plain `-sm tensor` run must print no `VMM region` line at all.
+2. **Bind the device in the MODULE, at every entry point that can reach the driver -- not at the call sites.**
+   `alloc_buffer` bound it and the probe did not; `ggml_cuda_vmm_region_free` (reached from a buffer context's
+   destructor) did not either, so it unmapped and released VA in a foreign context on every multi-device
+   teardown.  A caller-by-caller audit does not survive the next caller; one `vmm_bind_device()` at the top of
+   `create`/`free`/`map_span`/`ensure_span`/`clear`/`dump`/`available`/`selftest` and the granularity query
+   does.  The numbers that prove nothing moved: same-seed text is identical to the pre-fix build on 1, 2 and 3
+   GPUs (`1c5d32ac537d` in all three arms).
+3. **A verdict that is logged at INFO does not exist, which makes a FAIL as quiet as a PASS (r222; this is r219
+   fact 3 taken to a release gate).**  `GGML_CUDA_VMM_REGION_SELFTEST`'s PASS/FAIL line was `GGML_LOG_INFO`,
+   and `common_log_get_verbosity()` maps INFO to TRACE -- so at every default neither verdict appeared, while
+   `ENVIRONMENT.md` had said since r178 that the gate "must print PASS ... and must print FAIL with
+   `LLAMA_KV_REGION_QUARANTINE=0`".  Two more layers hide a WARN in `llama-cli`: its default verbosity is
+   error-only (`tools/cli/cli.cpp` sets `params.verbosity = LOG_LEVEL_ERROR`), and the `--fit` probe wraps the
+   logger so anything below its own minimum is rewritten to DEBUG.  **A diagnostic that a gate asks for must
+   emit its failure at ERROR** (and its pass at WARN, with the run's `-v` named in `ENVIRONMENT.md`).
+   `scripts/gate-kv-residency.sh` now runs both arms (`wselftest` PASS, `wselftest0` with the quarantine off
+   must FAIL), so the oracle is proven sensitive on every run.
+4. **`release.json.tip` as a script default is a staleness trap after a block amendment (r222, tooling).**
+   `scripts/make-patches.sh` defaults its tip from `release.json`, so re-cutting the set after amending a block
+   -- without updating `release.json` first -- exported the PREVIOUS series, printed "Regenerated 16 patches"
+   and exited 0 while the amendment was nowhere in the delivery.  It now refuses when the fork is checked out
+   at a tip that is not `release.json.tip` unless the tip is passed explicitly (and the amended block's commit
+   id is still reproducible: the canonical re-cut of the new series prints `Applied tip: 80bfb80be`, matching
+   `release.json`).
+
+## r223 -- a fill failure inside the call must decline that call; a pinned-allocation refusal is a LATCH, not a retry (issue #274 follow-up)
+
+1. **The entry guard is not enough: a fill that fails DURING `moe_cache_update_host`'s pass 1 must decline THAT
+   call (r223, block 12, issue #274 follow-up @briansp2020).**  `access_locked` rolls the failed admission back
+   and sets `t.fill_failed`, but the hook's `fill_failed` guard sits at the TOP of the function, so the call that
+   actually failed kept going: pass 2 found a cold id (pinned master) or a pool id (`pool_cold_slot_locked`; a
+   pool HIT is rolled back as an arena admission but is still resident in the pool) for the failed expert, `all`
+   stayed true, and the hook returned TRUE.  The scheduler then skipped `input_cpy` -- and `moe_cache_get_table`,
+   which the consuming op calls a few lines later, sees the SAME flag and returns false, so the op read a buffer
+   nobody filled.  That is the reported mid-run corruption (`This` followed by `!`), and it is invisible to a
+   text gate whenever the stale `input_cpy` happens to hold the right experts (measured here: identical text on
+   the pre-fix build, so the gate asserts the MECHANISM: `takeover=0` under a fill fault, 128/129 pre-fix).  The
+   fix is one re-check after pass 1, plus `!t.fill_failed` in `devremap_ok_locked` so the one-call-late device
+   remap follows the same wholesale-stand-down rule.
+2. **`MOE_HOST_POOL_FILL_FAULT` needs a `late` shape to reach a mid-run failure (r223 diagnostic).**  A fault
+   from the first call (`=1`) stands every table down before any take-over question can be asked, which is why
+   the r219 arm did not find fact 1.  `=late` (each table's second call on) reproduces "fills that had already
+   succeeded, then a failing call" deterministically on any box; a process-wide `=N` start does not, because the
+   landing point moves with the box's arena/pool sizing (measured: two runs of the same command, different
+   sha).  `=0` is off -- and note the r219 form treated ANY value as "on", so `FOO=0` used to mean "fail
+   everything".
+3. **A refused pinned allocation is a one-way latch on Windows, and retrying it manufactures a cascade (r223,
+   block 12, issue #274 follow-up @DanoPTT).**  `hipHostMalloc`/`cudaHostAlloc` refusing a pinned range there
+   surfaces as `hipErrorLaunchFailure` (719), which latches process-wide: every later HIP call -- the fill
+   copies and even `hipHostFree` -- fails too (`ROCM-33542` / rocm-systems#14578, relaying ROCm/TheRock#9339).
+   The shipment used to retry the per-table bounce `cudaHostAlloc` on every later fill, so one refusal became
+   thousands of failures whose message named a different (synthesized) error.  The first refusal now logs once
+   with the driver's error string and latches `g_pinned_off`; every later source resolution takes the pageable
+   fallback or declines (slow, correct) instead of calling the driver again.
+4. **The Windows PINNED ceiling is not `MemAvailable`, and a formula for it must NOT ship unmeasured
+   (r223).**  WDDM budgets pinned host pages against the adapter's shared segment and the PAL maps them onto
+   EVERY visible adapter without deduplicating, so the usable figure is about `(total RAM / 2) / visible
+   adapters` -- measured by ROCm as ~13.4 GiB on a 27.6 GiB box with one adapter and ~6.5 GiB with two
+   (ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339).  A 47 GiB box therefore pins ~23 GiB while
+   `MOE_HOST_POOL_RAM_PCT` (a percentage of MemAvailable) planned ~26 GiB, which is why the reporter's tail
+   pools and then every bounce entry were refused.  **A cap derived from that model was implemented and then
+   deliberately withdrawn**: it is a heuristic, it cannot be measured here (no Windows box, `TODO` #95), and it
+   would cap a healthy box (an APU-only box, or a multi-GPU box where the adapter sum does not behave as the
+   model says).  The shipped guards do not guess: the first refused `cudaHostAlloc` latches the pinned tier off
+   with one WARN that names the platform cause (fact 3), and the exit census repeats the latch and its error.
+   The real figure is the aperture segment's `CommitLimit` (`D3DKMTQueryStatistics`, the same call
+   `wddm-mem.cu` already makes for the device free-memory query) -- measure it before adding a ceiling.
+5. **`Private Bytes` for a read-only file mapping is not commit charge, so a 40 GB figure there is a
+   measurement artifact until proven (r223, issue #274 follow-up @DanoPTT).**  `CreateFileMapping(PAGE_READONLY)`
+   + `MapViewOfFile(FILE_MAP_READ)` makes the GGUF page-cache-backed; the process's commit only grows for page
+   tables and for anything that COPIES the range.  On a mapped `--host-experts pool` load the delivery copies
+   nothing at load (`ggml_backend_host_buffer_from_ptr` over the mapping, `mark_mmap_used` only), so the only
+   calls that touch the range are the pool/bounce fill `memcpy`s and the scheduler's fallback copy -- the exit
+   census reports the bytes (`pool fills: N mapping memcpys, X GiB total`).  Attribute a large "private" figure
+   with Task Manager's `Committed` / RAMMap's mapped-file page count before chasing it as a leak.
