@@ -1,4 +1,4 @@
-From 78b57b30fe1936a620913874baf8e4ae54939f62 Mon Sep 17 00:00:00 2001
+From 073d9dcc3175c333a8f8484b1bde7a05dde43eb9 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 23 Oct 2026 17:30:24 +0000
 Subject: [PATCH 07/53] server: LLAMA_CKPT_USER_MERGE=K, no checkpoint break at

@@ -1,4 +1,4 @@
-From aa5f7740235353210c8b7de6e07256f3097b7076 Mon Sep 17 00:00:00 2001
+From 36624315c81ff0a5fcbc7887d1d8637f8a5f2625 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 22 Oct 2026 22:14:57 +0000
 Subject: [PATCH 02/53] our stack on r118 (squashed port of cand1 = try109 +
@@ -699,7 +699,7 @@ index 8d1dcd6f4..30898273c 100644
  
  static ggml_guid_t ggml_backend_cpu_guid(void) {
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 266ded19d..6fb774841 100644
+index 6512d3890..08257dfde 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1481,6 +1481,7 @@ struct ggml_cuda_graph {
@@ -710,7 +710,7 @@ index 266ded19d..6fb774841 100644
      // ggml_cuda_graph_mem_gen() of the graph's device when it was captured: a captured graph bakes in
      // the addresses of pool temporaries and per-context scratch buffers, so it is recaptured once any
      // of that memory has been freed (see ggml_cuda_graph_mem_freed)
-@@ -1801,6 +1802,15 @@ struct ggml_backend_cuda_context {
+@@ -1832,6 +1833,15 @@ struct ggml_backend_cuda_context {
      std::vector<splice_pin_slot> splice_pin_ring;
      int                          splice_pin_idx = 0;
  
@@ -726,7 +726,7 @@ index 266ded19d..6fb774841 100644
      cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
      cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
      void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
-@@ -1818,11 +1828,19 @@ struct ggml_backend_cuda_context {
+@@ -1849,11 +1859,19 @@ struct ggml_backend_cuda_context {
      std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
  
      int64_t last_graph_eviction_sweep = 0;
@@ -748,7 +748,7 @@ index 266ded19d..6fb774841 100644
          if (time_now - last_graph_eviction_sweep >= 5'000'000) {
              last_graph_eviction_sweep = time_now;
              for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-@@ -1947,6 +1965,9 @@ struct ggml_backend_cuda_context {
+@@ -1978,6 +1996,9 @@ struct ggml_backend_cuda_context {
      // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
      // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
      // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
@@ -758,7 +758,7 @@ index 266ded19d..6fb774841 100644
      const ggml_tensor * glu_q8_1_node = nullptr;
      // GDN output norm (RMS_NORM + MUL) skipped at its node; the gate -> Q8_1 kernel computes it (ggml_cuda_gdn_norm_gate_*)
      const ggml_tensor * gdn_norm_pending = nullptr;
-@@ -2766,6 +2787,8 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+@@ -2797,6 +2818,8 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
  struct ggml_cuda_mm_fusion_args_host {
      const ggml_tensor * x_bias = nullptr;
      const ggml_tensor * gate = nullptr;
@@ -767,7 +767,7 @@ index 266ded19d..6fb774841 100644
      const ggml_tensor * gate_bias = nullptr;
      const ggml_tensor * x_scale = nullptr;
      const ggml_tensor * gate_scale = nullptr;
-@@ -2796,6 +2819,8 @@ struct ggml_cuda_mm_fusion_args_host {
+@@ -2827,6 +2850,8 @@ struct ggml_cuda_mm_fusion_args_host {
  struct ggml_cuda_mm_fusion_args_device {
      const void * x_bias = nullptr;
      const void * gate = nullptr;
@@ -930,7 +930,7 @@ index 917e3c6e2..9a5165a82 100644
                  fused_mul_mat_vec = true;
                  fused_node_count  = 3;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a4bde09af..6e594fd57 100644
+index 6422766a7..53a737d44 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -68,6 +68,7 @@
@@ -1221,7 +1221,7 @@ index a4bde09af..6e594fd57 100644
      ggml_cuda_async_input_wait(cuda_ctx->device, cuda_ctx->stream());
      const ggml_cuda_async_input_done_guard async_input_done { cuda_ctx->device, cuda_ctx->stream() };
  
-@@ -8632,6 +8756,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8640,6 +8764,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -1233,7 +1233,7 @@ index a4bde09af..6e594fd57 100644
  static bool ggml_backend_cuda_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight);
  
  static const ggml_backend_i ggml_backend_cuda_interface = {
-@@ -8662,6 +8791,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -8670,6 +8799,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_take_over     = */ ggml_backend_cuda_moe_cache_take_over,
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
@@ -1241,7 +1241,7 @@ index a4bde09af..6e594fd57 100644
      /* .moe_cache_pool_backed   = */ ggml_backend_cuda_moe_cache_pool_backed,
      /* .cpy_tensor_async_nowait = */ ggml_backend_cuda_cpy_tensor_async_nowait,
  };
-@@ -9487,6 +9617,15 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
+@@ -9495,6 +9625,15 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
      // consumer can read the compact arena.  ONLY within the decode band: above it the cache is not
      // involved, and forcing offload there took the >8-token batched decode off its normal path
      // (measured: `llama-batched-bench -npl 16` 137 -> 52 t/s with the cache merely enabled).
@@ -1257,7 +1257,7 @@ index a4bde09af..6e594fd57 100644
      if (moe_cache_enabled() && op->op == GGML_OP_MUL_MAT_ID &&
          op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
          return true;
-@@ -9913,6 +10052,25 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_split_for_dev
+@@ -9921,6 +10060,25 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_split_for_dev
      return nullptr;
  }
  
@@ -1283,7 +1283,7 @@ index a4bde09af..6e594fd57 100644
  static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
      GGML_UNUSED(reg);
      if (strcmp(name, "ggml_backend_cuda_kv_pool_mirror_buft") == 0) {
-@@ -9944,6 +10102,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -9952,6 +10110,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_cuda_kv_region_spill_ram_reserve") == 0) {
          return (void *) ggml_backend_cuda_kv_region_spill_ram_reserve;
      }
@@ -1386,7 +1386,7 @@ index eef461c05..d6e2e2844 100644
          const int max_descriptors = (args.ncols_dst + J - 1) / J + args.nchannels_y;
          ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
-index 6a50d247c..5d0037d7d 100644
+index cbde50413..83ab94b4c 100644
 --- a/ggml/src/ggml-cuda/mmvq-moe.cu
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -8,6 +8,163 @@
@@ -1785,7 +1785,7 @@ index 6a50d247c..5d0037d7d 100644
      const auto launch_rpb = [&](auto rpb_c) {
          if (has_fusion) {
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 7af55bbdc..3139c303d 100644
+index fd3189670..7ca49c76b 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1805,6 +1805,13 @@ void ggml_cuda_mul_mat_vec_q(

@@ -1,4 +1,4 @@
-From ffbcf964531825882fe1a394a1d66e0abf8a03e2 Mon Sep 17 00:00:00 2001
+From 1cb5befa807e976343b9be4571ee30223733e704 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 17:45:27 +0000
 Subject: [PATCH 35/53] moe cache: GGML_MOE_VERIFY_AT / GGML_MOE_VERIFY_EVERY

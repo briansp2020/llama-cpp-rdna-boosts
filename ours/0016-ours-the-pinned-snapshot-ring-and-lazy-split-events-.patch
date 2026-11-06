@@ -1,4 +1,4 @@
-From 9503c93a3547eb598dc9699972d6b2329d919cfe Mon Sep 17 00:00:00 2001
+From 17ca642e94e84aa9acb27ed86cc41c2409e45311 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 21:37:18 +0000
 Subject: [PATCH 16/53] ours: the pinned snapshot ring and lazy split events by
@@ -72,7 +72,7 @@ index 349d66455..cdde102da 100644
      // initialize hash table
      // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 6e594fd57..191a1fab7 100644
+index 53a737d44..2f3191f70 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -6331,14 +6331,18 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens

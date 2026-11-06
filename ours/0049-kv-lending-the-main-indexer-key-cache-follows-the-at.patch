@@ -1,4 +1,4 @@
-From 1464233dfe220f91b7afbc1f26eba4293ad49f8c Mon Sep 17 00:00:00 2001
+From 1f7d724f9d749810b14b8fe2d96d6d25eddf3a79 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 14:56:21 +0000
 Subject: [PATCH 49/53] kv lending: the main indexer key cache follows the

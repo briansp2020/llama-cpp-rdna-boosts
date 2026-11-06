@@ -1,4 +1,4 @@
-From ac4dc2a2aae62e1f1fee6654f028a78b24014275 Mon Sep 17 00:00:00 2001
+From 0eb000ffbc4a4530b94a92e65ce93f2893b2486f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 05:55:46 +0000
 Subject: [PATCH 33/53] moe cache: GGML_MOE_ROUTE_LOG=<file> records the

@@ -1,4 +1,4 @@
-From 98aff7dfcd2de9435b9fe1ee855297fb0c9046a5 Mon Sep 17 00:00:00 2001
+From a61bfc2d3008b7888a96f852889912cd24ffbcf2 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 06:27:59 +0000
 Subject: [PATCH 47/53] cuda slab: GGML_CUDA_SLAB_WORK_MIN_MIB sizes the work

@@ -3,19 +3,19 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-6050b467c-r223` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
-`680e043b3cbd`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
+**Base:** `v16-6050b467c-r226` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree
+`a07a5f81e2ce`). The rest of this branch is that release as published; only `ours/` is added. r180 took #252's 0003 (the
 GDN small-projection gather), r182 took #253 (the 1-token router fold and its RDNA4 gate), r183 took #256 (the GDN
 decode folds), r187 took #258 (the quantized-KV rotations), r188 took #259 (the shared-expert GLU Q8_1), r198 took #260
 (the mixed K-quant x Q6_K row concat), r199 took #262 (the q4_0 KV write fold) and r203 took #266 (host-expert decode
-without the per-op routing sync), so they are no longer in this series. r205-r223 took none of it.
+without the per-op routing sync), so they are no longer in this series. r205-r226 took none of it.
 
 0000 keeps `moe-expert-cache.cu` at its r206 state: r207 rewrote the host pool path in that file (the pool-tier gather,
 per-table pool sizing, the `MOE_HOST_POOL_RAM_PCT` ceiling), and that code sits where this series replaces the release's
 remap and changes the bounce, gather and report paths for `--host-experts mmap`. So with this series `--host-experts pool`
 behaves as in r206, and `moe_cache_table_is_pool` answers false, so the scheduler's new default gathers nothing (r206's
-default). Everything else in r207-r223 (RDNA2 flash attention, Windows host memory, the scheduler and loader changes) is
-in, as released, and so are r210-r223, except r219's and r223's host pool changes in that file (r219's rollback rule is ported in 0050).
+default). Everything else in r207-r226 (RDNA2 flash attention, Windows host memory, the scheduler and loader changes) is
+in, as released, and so are r210-r226, except the host pool changes of r219, r223 and r224 in that file (r219's rollback rule is ported in 0050).
 
 0001 takes #266's device remap and pool cold read back out of the release: this series has carried its own variant of
 that remap since before #266 (in 0002, with the review fixes in 0021: freshness rounds, and the remap forwarded through
@@ -25,11 +25,11 @@ the Meta backend), and the two cannot both run. After 0001, `moe-expert-cache.cu
 
 ```
 git checkout 6050b467c
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r223 release, branch rdna-boosts
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r226 release, branch rdna-boosts
 git am <path-to-this-repo>/ours/*.patch              # 54 patches (0000-0053)
 ```
 
-Result: tree `d700a58e89b7`.
+Result: tree `d2e326bb7e79`.
 
 ## Patches
 
@@ -74,6 +74,18 @@ The work the release has taken keeps its switches there: `GGML_CUDA_QK_ROTATE=0`
 `GGML_CUDA_FUSE_GDN_CONV_DECODE=0`, `GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0`, #258's / #259's (`GGML_CUDA_QK_ROTATE_HADAMARD=0`,
 `GGML_CUDA_FUSE_V_FWHT=0`, `GGML_CUDA_FA_COMBINE_FWHT=0`, `GGML_CUDA_QK_PAIR_FWHT=0`, `GGML_CUDA_FUSE_ROPE_FWHT=0`,
 `GGML_CUDA_MOE_SHARED_GLU_Q8=0`), `GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0` (#260) and `GGML_CUDA_KV_FOLD_Q4_0=0` (#262).
+
+## Validation on r226 (2026-11-06, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
+
+r226 vs r226 + this series, built without ccache, same method as the r223 run below: greedy server replies byte-identical on all
+seven models, KLD 0, no faults; the varied-prompt test at four depths gives the same text as stock on Qwen3-30B-A3B and
+Qwen3.6-35B-A3B. test-backend-ops 21678/21680: the known `MUL_MAT` f16 case on `ROCBLAS_USE_HIPBLASLT=0`, and one
+`MUL_MAT_ID` q4_1 case (`m=512, n=1, k=256`, error 0.000605 against 0.0005). That second one did not repeat: `MUL_MAT_ID` passed
+931/931 in 3 more runs on stock r226 and 3 on this series. The test draws random data each run, so this is probably a borderline
+draw, not proven. On the production config against the r223 series, 2 interleaved loads per side: greedy 85.6 vs 84.9 t/s, longdec
+72.7 vs 72.1 t/s, midpf decode 93.8 vs 92.1 t/s, two concurrent streams 117.7 vs 112.2 t/s, the last with the r223 side low against
+its earlier runs today. Greedy, prompt-test and post-needle output identical, no faults or evictions,
+`GGML_MOE_VERIFY_AT=300000` 0 differing slots. Batch and fill fault arms as below: handled, same output.
 
 ## Validation on r223 (2026-11-06, Radeon AI PRO R9700, 1 GPU, ROCm 10.1)
 

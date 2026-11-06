@@ -1,4 +1,4 @@
-From e3b89722e457aab0c2e08d8f644527fa7eccf733 Mon Sep 17 00:00:00 2001
+From 5b9f66d70ee5f7627b86b662ed7677a84b9921c2 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 15:32:19 +0000
 Subject: [PATCH 18/53] MoE expert dedup: at most 2 pairs per owner warp, only
@@ -12,7 +12,7 @@ so a launch without groups costs +7 % instead of +16..+28 %.  Same per-pair arit
  1 file changed, 24 insertions(+), 14 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
-index 5d61a98a3..978eaf7d0 100644
+index cea28d411..f7527c2e0 100644
 --- a/ggml/src/ggml-cuda/mmvq-moe.cu
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -303,7 +303,11 @@ static __global__ void mul_mat_vec_q_moe(

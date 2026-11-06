@@ -1,4 +1,4 @@
-From 63a4fea8fa38bbe010371adbab2caef4e179733f Mon Sep 17 00:00:00 2001
+From c78d317767c83ef645e1e7aeefa6967e8609cd83 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 04:31:26 +0000
 Subject: [PATCH 46/53] moe cache: lend the prefill prefetch staging to KV

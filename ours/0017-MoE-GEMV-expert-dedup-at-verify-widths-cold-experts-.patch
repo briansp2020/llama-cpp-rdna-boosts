@@ -1,4 +1,4 @@
-From 9264613a05b216276b973efea40f243964011a1e Mon Sep 17 00:00:00 2001
+From 057e16880ed8988ef04ff97c0dc685c1800822ff Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 15:26:48 +0000
 Subject: [PATCH 17/53] MoE GEMV: expert dedup at verify widths (cold experts;
@@ -16,10 +16,10 @@ A/B; =0 off).  Not with the 1-token folds (down + weighted reduction, GLU -> Q8_
  2 files changed, 188 insertions(+), 7 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 6fb774841..bb42f6082 100644
+index 08257dfde..73c0c5202 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -2821,6 +2821,8 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -2852,6 +2852,8 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate = nullptr;
      const int32_t * gate_ids = nullptr;
      uint32_t gate_ids_stride = 0;
@@ -29,7 +29,7 @@ index 6fb774841..bb42f6082 100644
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
-index 5d0037d7d..5d61a98a3 100644
+index 83ab94b4c..cea28d411 100644
 --- a/ggml/src/ggml-cuda/mmvq-moe.cu
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -32,6 +32,16 @@ static __device__ __forceinline__ void moe_iq4nl_load(moe_iq4nl_raw & r, const v

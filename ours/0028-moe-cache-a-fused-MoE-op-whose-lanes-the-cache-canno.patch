@@ -1,4 +1,4 @@
-From 809eb0ced44b075a4a3fae347c8bfcf93d60a2a8 Mon Sep 17 00:00:00 2001
+From 3d8ed2894ca5ac990a861988c51e78395d68357d Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 06:07:22 +0000
 Subject: [PATCH 28/53] moe cache: a fused MoE op whose lanes the cache cannot
@@ -27,7 +27,7 @@ index b9f0e7551..da35ee1e2 100644
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                  }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index f1cdd80ac..efce21563 100644
+index 7a2cd9bb9..2fa95dfcd 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -3229,6 +3229,8 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml

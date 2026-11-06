@@ -1,4 +1,4 @@
-From 23ed7a67d56aa7ac43c2370f433f6daea118ffd8 Mon Sep 17 00:00:00 2001
+From 99cc6d15580347f72ffbc24da3f35842752d3448 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 17:58:08 -0800
 Subject: [PATCH 52/53] cuda: keep the GDN conv inputs alive to the end of its
@@ -90,7 +90,7 @@ index dcfad68c6..125789024 100644
  void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
  struct gdn_conv_norm_args;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index daeffd69f..28857ea97 100644
+index b09450431..631d0d99b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -8419,6 +8419,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph

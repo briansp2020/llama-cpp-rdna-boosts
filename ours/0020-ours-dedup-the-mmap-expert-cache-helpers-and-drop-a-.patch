@@ -1,4 +1,4 @@
-From adea6c41150d67440608dd1555219f29ed37d7ff Mon Sep 17 00:00:00 2001
+From 06ebb133e79ad4b49494aca58c5e0242cf4d1484 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 20:31:47 +0000
 Subject: [PATCH 20/53] ours: dedup the mmap expert-cache helpers and drop a
@@ -19,7 +19,7 @@ Prod model (1 R9700, prod config): greedy a266d1025664, 259.6k needle correct; q
  2 files changed, 122 insertions(+), 182 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 191a1fab7..16570a5b7 100644
+index 2f3191f70..5ed8eb503 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2034,6 +2034,30 @@ static char * ggml_cuda_pin_chunk(int device, std::unique_lock<std::mutex> & loc

@@ -1,4 +1,4 @@
-From 37d25f66d3f730a1d3e12c39f609fb5b5b0faab1 Mon Sep 17 00:00:00 2001
+From c8a8ac7798346ecfe9ec0a3a85f60304808c8894 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 17:11:33 +0000
 Subject: [PATCH 19/53] MoE fused gate/up+GLU: publish the Q8_1 at verify
@@ -15,10 +15,10 @@ skip their quantize_q8_1.  Same quantize arithmetic: bit-identical.  GGML_CUDA_M
  3 files changed, 57 insertions(+), 47 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index bb42f6082..e8ec35d62 100644
+index 73c0c5202..3122c54e8 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -2842,6 +2842,8 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -2873,6 +2873,8 @@ struct ggml_cuda_mm_fusion_args_device {
      block_q8_1 * glu_q8 = nullptr;
      int * glu_q8_cnt = nullptr;
      uint32_t glu_q8_stride_channel = 0;
@@ -28,7 +28,7 @@ index bb42f6082..e8ec35d62 100644
      // counters follow the routed lanes' (lane index = the number of routed lanes)
      block_q8_1 * shared_glu_q8 = nullptr;
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
-index 978eaf7d0..44dd9a1f9 100644
+index f7527c2e0..54495f669 100644
 --- a/ggml/src/ggml-cuda/mmvq-moe.cu
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -616,39 +616,8 @@ static __global__ void mul_mat_vec_q_moe(
@@ -161,7 +161,7 @@ index 978eaf7d0..44dd9a1f9 100644
          constexpr int  RPB   = decltype(rpb_c)::value;
          constexpr bool CFUSE = decltype(fusion_c)::value;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 3139c303d..f1cdd80ac 100644
+index 7ca49c76b..7a2cd9bb9 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1846,33 +1846,37 @@ void ggml_cuda_mul_mat_vec_q(

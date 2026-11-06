@@ -1,4 +1,4 @@
-From 950bdf9a1f4ff6c31d91b2910caa51dd1b0dddb1 Mon Sep 17 00:00:00 2001
+From fc704e3f2e01e8571b592885425d5083c23c2522 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 02:18:17 +0000
 Subject: [PATCH 01/53] ours base: stew r204 without the #266 device remap +
@@ -175,10 +175,10 @@ index 310a748ca..f67f584ee 100644
  size_t ggml_backend_cuda_fattn_stage_used(ggml_backend_t backend);
  size_t ggml_backend_cuda_h2d_stage_used(ggml_backend_t backend);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 0be84ea23..a4bde09af 100644
+index 4f299817f..6422766a7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -8662,7 +8662,6 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -8670,7 +8670,6 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_take_over     = */ ggml_backend_cuda_moe_cache_take_over,
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,

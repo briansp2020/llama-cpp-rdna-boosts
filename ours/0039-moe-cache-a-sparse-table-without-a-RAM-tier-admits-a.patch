@@ -1,4 +1,4 @@
-From 08e3c243fd8842881b1e88452b096204ec27b05f Mon Sep 17 00:00:00 2001
+From 48956606112d79dce383527d554c24fc108c6d76 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 00:48:00 +0000
 Subject: [PATCH 39/53] moe cache: a sparse table without a RAM tier admits a
