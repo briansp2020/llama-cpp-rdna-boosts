@@ -1,7 +1,7 @@
-From 31f1571c44be8ddb412b6f2eb8f92a5d177cee76 Mon Sep 17 00:00:00 2001
+From 71708a75372839de429ea7c042798720ac2b78d5 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 1 Nov 2026 16:15:27 +0000
-Subject: [PATCH 23/50] moe cache precopy: drain the side stream when an event
+Subject: [PATCH 23/53] moe cache precopy: drain the side stream when an event
  record fails after a launch; a failed wait fails the swap
 
 ---

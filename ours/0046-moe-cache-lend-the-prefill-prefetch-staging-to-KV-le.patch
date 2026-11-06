@@ -1,7 +1,7 @@
-From fc7da9ccbd0f30cd6d25c0eb9758b1cfbd278aaf Mon Sep 17 00:00:00 2001
+From 63a4fea8fa38bbe010371adbab2caef4e179733f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 04:31:26 +0000
-Subject: [PATCH 46/50] moe cache: lend the prefill prefetch staging to KV
+Subject: [PATCH 46/53] moe cache: lend the prefill prefetch staging to KV
  lending between prefills (GGML_MOE_PF_LEND)
 
 The two prefill-prefetch staging buffers (2 x ~957 MiB, kept for the whole run) join the KV-lending victim grid

@@ -1,7 +1,7 @@
-From 6c15c9ce37af707ed0f94bd6395e1caf7a5d9f69 Mon Sep 17 00:00:00 2001
+From db7f3bcd800439394e88880bd3582b5647f27f9c Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 4 Nov 2026 07:01:02 +0000
-Subject: [PATCH 45/50] cuda graphs: recapture when the MoE cache redirect
+Subject: [PATCH 45/53] cuda graphs: recapture when the MoE cache redirect
  choice of a node changed (FINDINGS 716)
 
 The per-op MoE consumer decides at dispatch whether a MUL_MAT_ID reads the expert-cache arena through
@@ -30,10 +30,10 @@ index e8ec35d62..a9306a581 100644
      // guards a replay is O(nodes) and runs on EVERY graph_compute (the scheduler mints a fresh
      // `cgraph->uid` per split, so the `uid` early-out in ggml_cuda_graph_update_required cannot fire),
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index b9c2d01a2..023a73ce0 100644
+index f63a62ee0..daeffd69f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -7738,8 +7738,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7757,8 +7757,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      // recapture a graph whose pool temporaries or scratch buffers were freed since its capture
                      // (GGML_CUDA_GRAPH_MEM_GEN=0 disables the check, A/B only)
                      static const bool mem_gen_check = [] { const char * e = getenv("GGML_CUDA_GRAPH_MEM_GEN"); return !e || atoi(e) != 0; }();
@@ -47,7 +47,7 @@ index b9c2d01a2..023a73ce0 100644
                  }
              }
  
-@@ -7789,6 +7793,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7808,6 +7812,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
          }
  
          graph->mem_gen = ggml_cuda_graph_mem_gen(cuda_ctx->device);

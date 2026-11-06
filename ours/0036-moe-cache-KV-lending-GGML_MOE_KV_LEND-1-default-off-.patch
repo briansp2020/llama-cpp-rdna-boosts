@@ -1,7 +1,7 @@
-From cf14adfdacc0e44ec5ca2c269cf78dbdb5aa7827 Mon Sep 17 00:00:00 2001
+From 3619ce892f9edaef2dba9a66d3341963800f1c43 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 02:41:53 +0000
-Subject: [PATCH 36/50] moe cache: KV lending (GGML_MOE_KV_LEND=1, default off)
+Subject: [PATCH 36/53] moe cache: KV lending (GGML_MOE_KV_LEND=1, default off)
  -- the KV cache rows past the context in use hold copies of evicted experts
 
 The main model's K/V tensors (one stream, V not transposed, no windowed KV / KV pool) are registered with the expert
@@ -23,10 +23,10 @@ slot holds that expert.  GGML_MOE_KV_LEND_LOG=1 logs each line move; moe_cache_r
  5 files changed, 510 insertions(+), 10 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index bb1ff9a34..b9c2d01a2 100644
+index 16570a5b7..f63a62ee0 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -10078,6 +10078,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -10097,6 +10097,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_cuda_kv_region_spill_ram_reserve") == 0) {
          return (void *) ggml_backend_cuda_kv_region_spill_ram_reserve;
      }

@@ -1,7 +1,7 @@
-From 2469b7bd7c122191660fabf95bf9e60ac84143df Mon Sep 17 00:00:00 2001
+From 88c2845d631ff181c7681f9868cbb98a46069252 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 04:23:15 +0000
-Subject: [PATCH 38/50] moe cache KV lending: keep a victim-held expert cold
+Subject: [PATCH 38/53] moe cache KV lending: keep a victim-held expert cold
  instead of evicting for it (GGML_MOE_KV_LEND_STAY, default on)
 
 With no free arena slot, a miss on an expert whose victim copy cold_ptrs already names is read from VRAM as it is: no

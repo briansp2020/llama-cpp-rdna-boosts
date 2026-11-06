@@ -1,7 +1,7 @@
-From d37a6fc603e0bd472237433a77f1d4e5d72996f5 Mon Sep 17 00:00:00 2001
+From c89ee2985dc94206fddea7a3c181f49f965f17cd Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 15:09:47 +0000
-Subject: [PATCH 42/50] moe cache RAM tier fill-through, review fixes: a spare
+Subject: [PATCH 42/53] moe cache RAM tier fill-through, review fixes: a spare
  slot takes a routed expert when every member is routed; the trim keeps a
  partial tier's registered non-member aliases; a fill waits for the last
  sparse staging on the device; GGML_MOE_TIER_FILL=0 turns the share off

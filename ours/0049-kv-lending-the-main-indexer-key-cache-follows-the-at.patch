@@ -1,7 +1,7 @@
-From 4fb12bcd9251dec25cbb2308728153714b3804b4 Mon Sep 17 00:00:00 2001
+From 1464233dfe220f91b7afbc1f26eba4293ad49f8c Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 5 Nov 2026 14:56:21 +0000
-Subject: [PATCH 49/50] kv lending: the main indexer key cache follows the
+Subject: [PATCH 49/53] kv lending: the main indexer key cache follows the
  attention cache lend line (GGML_MOE_KV_LEND_IDX)
 
 The keys-only indexer cache uses the attention cache slot layout, so rows past the attention line are idle in it too.

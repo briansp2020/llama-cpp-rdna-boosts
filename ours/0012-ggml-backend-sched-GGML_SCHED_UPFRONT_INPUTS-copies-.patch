@@ -1,7 +1,7 @@
-From bca75527ae0294b7d380e45c8e0655a2ecf7f627 Mon Sep 17 00:00:00 2001
+From bd717c4912e2cc58c50c594630fe05da4e61e946 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 26 Oct 2026 08:17:21 +0000
-Subject: [PATCH 12/50] ggml-backend sched: GGML_SCHED_UPFRONT_INPUTS copies
+Subject: [PATCH 12/53] ggml-backend sched: GGML_SCHED_UPFRONT_INPUTS copies
  user inputs once per graph (no per-split host wait)
 
 (cherry picked from commit ec358ad37c878d91518d5a88498977b8ef52ca5b)

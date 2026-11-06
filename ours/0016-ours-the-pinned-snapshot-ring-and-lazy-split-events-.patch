@@ -1,7 +1,7 @@
-From 78820bcd3ba2f9448a23038333a7ee5913f5c123 Mon Sep 17 00:00:00 2001
+From 9503c93a3547eb598dc9699972d6b2329d919cfe Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 21:37:18 +0000
-Subject: [PATCH 16/50] ours: the pinned snapshot ring and lazy split events by
+Subject: [PATCH 16/53] ours: the pinned snapshot ring and lazy split events by
  default only with more than one device
 
 On a single GPU both measured about -1 % decode each (FINDINGS 639); on 1x R9700 the gate gives tg128 +1.8 % on
@@ -72,10 +72,10 @@ index 349d66455..cdde102da 100644
      // initialize hash table
      // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 710c56071..6f50465e4 100644
+index 6e594fd57..191a1fab7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6312,14 +6312,18 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -6331,14 +6331,18 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
      // where it was before r90: one H2D on this backend's stream, already ordered after the scheduler's
      // wait.  (local: r90 queued the snapshot on the graph-input upload ring, whose batch kernel /
      // per-thread-stream copy with cross-stream event waits cost ~2.7 % decode here, at ~13 such small

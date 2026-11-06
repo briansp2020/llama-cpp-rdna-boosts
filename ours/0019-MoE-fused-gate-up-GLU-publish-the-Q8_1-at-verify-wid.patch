@@ -1,7 +1,7 @@
-From 71745ed44b9886f68081f4ac1afda49a9aee8129 Mon Sep 17 00:00:00 2001
+From 37d25f66d3f730a1d3e12c39f609fb5b5b0faab1 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 31 Oct 2026 17:11:33 +0000
-Subject: [PATCH 19/50] MoE fused gate/up+GLU: publish the Q8_1 at verify
+Subject: [PATCH 19/53] MoE fused gate/up+GLU: publish the Q8_1 at verify
  widths (2-8 tokens) too, per pair under the expert dedup
 
 Each token warp of the fused gate/up+GLU kernel publishes its own rows, routed and shared lanes, at the row index

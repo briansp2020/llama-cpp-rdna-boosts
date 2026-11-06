@@ -1,7 +1,7 @@
-From 30024f397ad6107e2b1ed7471dbf006589190711 Mon Sep 17 00:00:00 2001
+From 06f9856e2ea9e7d217aa7a03490a297ef6a265a1 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 03:15:53 +0000
-Subject: [PATCH 37/50] moe cache KV lending: the victims' stream is the lowest
+Subject: [PATCH 37/53] moe cache KV lending: the victims' stream is the lowest
  remapped layer's
 
 A fully resident layer 0 never records a remap stream, so on prod (-ncmoe 47) no victim was ever made.  Take the lowest

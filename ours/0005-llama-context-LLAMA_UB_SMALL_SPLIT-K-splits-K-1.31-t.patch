@@ -1,7 +1,7 @@
-From 88c21bc41b46a65ddf49aee340848b5dbb00f41f Mon Sep 17 00:00:00 2001
+From 648818ffdddcaaadf8aef2f372fe8a524a1182cf Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 23 Oct 2026 03:17:02 +0000
-Subject: [PATCH 05/50] llama-context: LLAMA_UB_SMALL_SPLIT=K splits
+Subject: [PATCH 05/53] llama-context: LLAMA_UB_SMALL_SPLIT=K splits
  K+1..31-token batches into K-token ubatches (short-turn chunks stay in the
  MoE decode band)
 

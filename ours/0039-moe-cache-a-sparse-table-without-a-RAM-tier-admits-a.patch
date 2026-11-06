@@ -1,7 +1,7 @@
-From 813ec19106cdd17c9a47757d36b5ca91ad6daa3a Mon Sep 17 00:00:00 2001
+From 08e3c243fd8842881b1e88452b096204ec27b05f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 3 Nov 2026 00:48:00 +0000
-Subject: [PATCH 39/50] moe cache: a sparse table without a RAM tier admits a
+Subject: [PATCH 39/53] moe cache: a sparse table without a RAM tier admits a
  routed expert it cannot register instead of declining
 
 With a pin budget that refuses registrations, the remap hook of a sparse (mmap) table without a RAM tier declined

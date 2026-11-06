@@ -1,7 +1,7 @@
-From 3e35d7d1e655327c013ff9d1f1fb466b9625e78e Mon Sep 17 00:00:00 2001
+From b10139907fa31ab8e8d0108afafd90fa9c869db6 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 30 Oct 2026 12:41:15 +0000
-Subject: [PATCH 15/50] ours fixes after review: restore the GLU -> Q8_1 mark
+Subject: [PATCH 15/53] ours fixes after review: restore the GLU -> Q8_1 mark
  call that the r176 rebase dropped from ggml_cuda_try_fuse (the publish was
  dead: Qwen3.6-35B-A3B tg128 +8.3 % vs r176 with it, R9700); the shared-expert
  gate fold admits only BF16 / F32 weights (F16 would take the half-accumulator

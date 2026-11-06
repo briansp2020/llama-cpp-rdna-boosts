@@ -1,7 +1,7 @@
-From 0cb8e635d47d2d6abe30c85c3d3aa403ede4ef84 Mon Sep 17 00:00:00 2001
+From 9ae1aa958c64197775dbfa864897b537757d6fbf Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 2 Nov 2026 12:16:32 +0000
-Subject: [PATCH 32/50] moe cache RAM tier: hybrid share by default
+Subject: [PATCH 32/53] moe cache RAM tier: hybrid share by default
  (GGML_MOE_TIER_SHARE_MIN_PCT=30; 0 = the equal share)
 
 ---

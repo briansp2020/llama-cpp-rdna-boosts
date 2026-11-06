@@ -1,0 +1,433 @@
+From fcb8e7a3ceacfc9079a7b62313653bfb1ae06bf9 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 6 Nov 2026 00:34:03 +0000
+Subject: [PATCH 51/53] moe cache: batched decode admissions, one layer step =
+ two kernels (GGML_MOE_FILL_BATCH)
+
+Inside one moe_cache_remap_dev call the victim saves, fills, cold pointer writes and map uploads of a layer are queued and
+launched just before the remap: phase 1 the saves, phase 2 the fills.  Same bytes and pointers, fewer dispatches.
+GGML_MOE_FILL_BATCH=0: one launch per copy and pointer as before.  GGML_MOE_FILL_BATCH_FAULT=n: the n-th flush fails.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 295 +++++++++++++++++++++++--
+ 1 file changed, 273 insertions(+), 22 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 6079383e3..e666d08fe 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1023,6 +1023,114 @@ static __global__ void moe_cache_copy_kernel(char * __restrict__ dst, const char
+     }
+ }
+ 
++// Batched decode admissions (GGML_MOE_FILL_BATCH, default on; =0: one launch per copy and pointer, as before).  Inside one
++// moe_cache_remap_dev call the victim saves and the fills of a layer's tables are queued and launched just before the remap:
++// phase 1 = every save (arena -> KV slot / spare RAM slot), phase 2 = every fill and map upload.  A job's copies run
++// concurrently with its phase, so no job may read or write what another job of its phase writes, and phase 1 runs first
++// because it reads the arena slots phase 2 overwrites.  KV slots a queued job touches are off limits to the CLOCK (fb_kv).
++#define MOE_FB_MAX_JOBS 16
++struct moe_fill_job {
++    char *       dst;
++    const char * src;
++    uintptr_t *  ptrs;   // optional: ptrs[e] = v, in the same kernel
++    size_t       n;
++    uintptr_t    v;
++    int32_t      e;
++    int32_t      pad;
++};
++struct moe_fill_jobs {
++    moe_fill_job j[MOE_FB_MAX_JOBS];
++};
++static_assert(sizeof(moe_fill_jobs) <= 1024, "kernel argument");
++static __global__ void moe_cache_fill_batch_kernel(const moe_fill_jobs jobs) {
++    const moe_fill_job & jb = jobs.j[blockIdx.y];
++    if (blockIdx.x == 0 && threadIdx.x == 0 && jb.ptrs != nullptr && jb.e >= 0) {
++        jb.ptrs[jb.e] = jb.v;
++    }
++    char * __restrict__       dst = jb.dst;
++    const char * __restrict__ src = jb.src;
++    const size_t n      = jb.n;
++    const size_t stride = (size_t) gridDim.x * blockDim.x;
++    size_t       i      = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if ((((uintptr_t) dst | (uintptr_t) src | n) & 15) == 0) {
++        uint4 *       d = (uint4 *) dst;
++        const uint4 * q = (const uint4 *) src;
++        for (; i < n / 16; i += stride) {
++            d[i] = q[i];
++        }
++        return;
++    }
++    for (; i < n; i += stride) {
++        dst[i] = src[i];
++    }
++}
++struct fill_batch_t {
++    int           device = -1;
++    cudaStream_t  stream = nullptr;
++    moe_fill_jobs save = {}, fill = {};
++    int           n_save = 0, n_fill = 0;
++    struct undo_t { int table, slot; int32_t expert; } undo[MOE_FB_MAX_JOBS];
++    int           n_undo = 0;
++    int           kv[2 * MOE_FB_MAX_JOBS + 2];   // KV slots a queued job reads or writes
++    int           n_kv = 0;
++};
++static fill_batch_t g_fb;
++static int64_t g_fb_flushes = 0, g_fb_jobs = 0, g_fb_late = 0, g_fb_failed = 0;
++static const bool g_fill_batch = [] { const char * e = getenv("GGML_MOE_FILL_BATCH"); return e == nullptr || atoi(e) != 0; }();
++static bool fb_flush_locked();   // launches what is queued; false: a launch failed, the tier is dropped
++static inline bool fb_on(const table_t & t) {
++    return g_fill_batch && g_defer_tab == &t;
++}
++static inline bool fb_kv_busy(int i) {
++    for (int k = 0; k < g_fb.n_kv; k++) {
++        if (g_fb.kv[k] == i) {
++            return true;
++        }
++    }
++    return false;
++}
++static inline void fb_kv_mark(int i) {
++    if (i >= 0 && !fb_kv_busy(i) && g_fb.n_kv < (int) (sizeof(g_fb.kv) / sizeof(g_fb.kv[0]))) {
++        g_fb.kv[g_fb.n_kv++] = i;
++    }
++}
++// Room for one job on (device, stream), flushing what is queued if not.  False: that flush failed.
++static bool fb_room_locked(int device, cudaStream_t s) {
++    if ((g_fb.n_save + g_fb.n_fill > 0 && (g_fb.device != device || g_fb.stream != s)) ||
++        g_fb.n_save >= MOE_FB_MAX_JOBS || g_fb.n_fill >= MOE_FB_MAX_JOBS || g_fb.n_kv + 2 > (int) (sizeof(g_fb.kv) / sizeof(g_fb.kv[0]))) {
++        if (!fb_flush_locked()) {
++            return false;
++        }
++    }
++    g_fb.device = device;
++    g_fb.stream = s;
++    return true;
++}
++static bool fb_push_save_locked(int device, cudaStream_t s, char * dst, const char * src, size_t n, uintptr_t * ptrs, int32_t e, uintptr_t v) {
++    if (!fb_room_locked(device, s)) {
++        return false;
++    }
++    for (int k = 0; k < g_fb.n_fill; k++) {
++        if (g_fb.fill.j[k].dst == src && !fb_flush_locked()) {   // reads a slot already queued for a fill: keep the order
++            return false;
++        }
++    }
++    g_fb.save.j[g_fb.n_save++] = { dst, src, ptrs, n, v, e, 0 };
++    return true;
++}
++static bool fb_push_fill_locked(int device, cudaStream_t s, char * dst, const char * src, size_t n, uintptr_t * ptrs, int32_t e, uintptr_t v) {
++    if (!fb_room_locked(device, s)) {
++        return false;
++    }
++    for (int k = 0; k < g_fb.n_fill; k++) {
++        if (g_fb.fill.j[k].dst == dst && !fb_flush_locked()) {   // the same slot twice: keep the order
++            return false;
++        }
++    }
++    g_fb.fill.j[g_fb.n_fill++] = { dst, src, ptrs, n, v, e, 0 };
++    return true;
++}
++
+ // The H2D of an admission with the victim's cold pointer write folded in (copy-back ahead: one launch per admission).
+ static __global__ void moe_cache_copy_set_kernel(char * __restrict__ dst, const char * __restrict__ src, size_t n,
+                                                  uintptr_t * ptrs, int32_t e, uintptr_t v) {
+@@ -1196,13 +1304,13 @@ static void kvl_release_locked(kvl_slot_t & sl, cudaStream_t s, std::vector<std:
+     g_kvl_drops++;
+ }
+ // CLOCK: a free slot, else one whose expert is resident again, else the first without its reference bit.
+-static int kvl_alloc_locked(cudaStream_t s) {
++static int kvl_alloc_locked(cudaStream_t s, std::vector<std::pair<uintptr_t *, uintptr_t>> * rel = nullptr) {
+     const size_t n = g_kvl_slots.size();
+     for (size_t k = 0; n > 0 && k < 2 * n + 1; k++) {
+         const size_t i  = g_kvl_hand;
+         g_kvl_hand      = (g_kvl_hand + 1) % n;
+         kvl_slot_t & sl = g_kvl_slots[i];
+-        if (!kvl_avail(sl) || (int) i == g_kvl_pin) {
++        if (!kvl_avail(sl) || (int) i == g_kvl_pin || fb_kv_busy((int) i)) {
+             continue;
+         }
+         if (sl.table < 0) {
+@@ -1213,7 +1321,7 @@ static int kvl_alloc_locked(cudaStream_t s) {
+             sl.ref = false;
+             continue;
+         }
+-        kvl_release_locked(sl, s, nullptr);
++        kvl_release_locked(sl, s, rel);
+         return (int) i;
+     }
+     return -1;
+@@ -1252,14 +1360,23 @@ static int kvl_keep_locked(table_t & t, int32_t victim, const char * src, cudaSt
+     if (i >= 0) {
+         return i;   // still holds it (kept while the expert was resident)
+     }
+-    i = kvl_alloc_locked(s);
++    std::vector<std::pair<uintptr_t *, uintptr_t>> rel;
++    i = kvl_alloc_locked(s, fb_on(t) ? &rel : nullptr);
+     if (i < 0) {
+         return -1;
+     }
+     kvl_slot_t & sl = g_kvl_slots[(size_t) i];
+-    moe_cache_copy_kernel<<<128, 256, 0, s>>>(kvl_ptr(sl), src, t.expert_bytes);
+-    if (cudaGetLastError() != cudaSuccess) {
+-        return -1;
++    if (fb_on(t)) {
++        // the release of the slot's previous expert (at most one) goes in this job
++        if (!fb_push_save_locked(t.device, s, (char *) kvl_ptr(sl), src, t.expert_bytes, rel.empty() ? nullptr : rel[0].first, rel.empty() ? -1 : 0,
++                                 rel.empty() ? 0 : rel[0].second)) {
++            return -1;
++        }
++    } else {
++        moe_cache_copy_kernel<<<128, 256, 0, s>>>(kvl_ptr(sl), src, t.expert_bytes);
++        if (cudaGetLastError() != cudaSuccess) {
++            return -1;
++        }
+     }
+     sl.table  = (int) (&t - g_tables.data());
+     sl.expert = victim;
+@@ -1303,6 +1420,7 @@ static void kvl_forget_all_locked() {
+ // Free every tier and point the cold reads back at the file alias (registering each table's cold set, as at sizing
+ // without a tier).  cold_ptrs stays allocated: a captured graph may hold it.
+ static void tier_drop_all_locked(const char * why) {
++    (void) fb_flush_locked();   // queued fills read ram_base
+     if (g_tier_off) {
+         return;
+     }
+@@ -1883,9 +2001,17 @@ static bool tier_fill_through_locked(table_t & t, const std::vector<int32_t> & u
+ }
+ 
+ // `vsrc`: a victim slot holding e (KV lending): the fill reads it instead of the RAM tier or the file (same bytes).
++// Is this admission's fill queued (fb_*) instead of launched?  Then the victim's final cold pointer travels with it.
++static inline bool fb_takes(const table_t & t, int32_t e) {
++    return fb_on(t) && !t.ram_incl && e >= 0 && e < (int32_t) t.ram_slot.size() && t.ram_slot[(size_t) e] >= 0;
++}
+ static cudaError_t tier_swap_locked(table_t & t, void * dst, int32_t e, int32_t victim, void * stream,
+-                                    const char * vsrc = nullptr) {
++                                    const char * vsrc = nullptr, uintptr_t victim_final = 0) {
+     const int32_t p  = e >= 0 && e < (int32_t) t.ram_slot.size() ? t.ram_slot[(size_t) e] : -1;
++    const bool    batch = fb_takes(t, e);
++    if (!batch && !fb_flush_locked()) {   // a launch below must not overtake a queued reader of the same slot
++        return cudaErrorInvalidValue;
++    }
+     if (t.ram_incl) {
+         // The victim's cold pointer already names its permanent RAM copy; the remap upload after this call stops the
+         // GPU reading its arena slot, and the copy below is ordered after every earlier reader on the compute stream.
+@@ -1939,18 +2065,47 @@ static cudaError_t tier_swap_locked(table_t & t, void * dst, int32_t e, int32_t
+         g_tier_swaps_d2h++;
+         const int32_t q  = t.ram_free.back();
+         char *        vr = t.ram_base + (size_t) q * eb;
+-        moe_cache_copy_kernel<<<128, 256, 0, s>>>(vr, (const char *) dst, eb);
+-        const cudaError_t err = cudaGetLastError();
+-        if (err != cudaSuccess) {
+-            return err;
++        if (batch) {
++            if (!fb_push_save_locked(t.device, s, vr, (const char *) dst, eb, nullptr, -1, 0)) {
++                return cudaErrorInvalidValue;
++            }
++            set_e = victim;
++            set_v = (uintptr_t) vr;
++        } else {
++            moe_cache_copy_kernel<<<128, 256, 0, s>>>(vr, (const char *) dst, eb);
++            const cudaError_t err = cudaGetLastError();
++            if (err != cudaSuccess) {
++                return err;
++            }
++            moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, victim, (uintptr_t) vr);
+         }
+-        moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, victim, (uintptr_t) vr);
+         t.ram_free.pop_back();
+         t.ram_slot[(size_t) victim] = q;
+     } else if (victim >= 0) {
+-        moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, victim, tier_file_ptr(t, victim));
++        if (batch) {
++            set_e = victim;
++            set_v = tier_file_ptr(t, victim);
++        } else {
++            moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, victim, tier_file_ptr(t, victim));
++        }
+         g_tier_file_victims++;
+     }
++    if (batch) {
++        if (victim_final != 0) {
++            set_e = victim;
++            set_v = victim_final;   // the victim's copy in VRAM wins over the RAM / file pointer
++        }
++        const int slot = (int) (((const char *) dst - (const char *) t.arena) / (ptrdiff_t) eb);
++        if (!fb_push_fill_locked(t.device, s, (char *) dst, vsrc ? vsrc : t.ram_base + (size_t) p * eb, eb, set_e >= 0 ? t.cold_ptrs : nullptr, set_e, set_v)) {
++            return cudaErrorInvalidValue;
++        }
++        g_fb.undo[g_fb.n_undo++] = { (int) (&t - g_tables.data()), slot, e };
++        t.ram_slot[(size_t) e] = -1;
++        t.ram_pending.push_back(p);
++        t.swap_defer = true; t.mark_stream = stream;
++        g_tier_swaps++;
++        return cudaSuccess;
++    }
+     if (p < 0) {
+         cudaError_t err = cudaSuccess;
+         if (vsrc != nullptr) {
+@@ -2018,8 +2173,57 @@ static void slot_seq_set_locked(table_t & t, int slot, int32_t v) {
+ static int32_t slot_seq_get_locked(const table_t & t, int slot) {
+     return slot >= 0 && (size_t) slot < t.slot_seq.size() ? t.slot_seq[(size_t) slot] : -1;
+ }
++static void fb_launch_locked(const moe_fill_jobs & jobs, int n, cudaStream_t s) {
++    dim3       grid(128, (unsigned) n);
++    const dim3 block(256);
++    if (ggml_cuda_grid_stall_pad(grid, block)) {
++        grid.x = 129;   // the kernel's stride loop takes any block count; 129 x n blocks stays off the stall for every n
++    }
++    moe_cache_fill_batch_kernel<<<grid, block, 0, s>>>(jobs);
++}
++static bool fb_flush_locked() {
++    if (g_fb.n_save == 0 && g_fb.n_fill == 0) {
++        return true;
++    }
++    // GGML_MOE_FILL_BATCH_FAULT=<n> (debug): the n-th flush fails without launching.
++    static const int64_t fault = [] { const char * e = getenv("GGML_MOE_FILL_BATCH_FAULT"); return e != nullptr ? (int64_t) atoll(e) : (int64_t) 0; }();
++    g_fb_flushes++;
++    g_fb_jobs += g_fb.n_save + g_fb.n_fill;
++    bool ok = !(fault > 0 && g_fb_flushes == fault);
++    if (ok) {
++        device_guard dg(g_fb.device);
++        if (g_fb.n_save > 0) {
++            fb_launch_locked(g_fb.save, g_fb.n_save, g_fb.stream);
++            ok = cudaGetLastError() == cudaSuccess;
++        }
++        if (ok && g_fb.n_fill > 0) {
++            fb_launch_locked(g_fb.fill, g_fb.n_fill, g_fb.stream);
++            ok = cudaGetLastError() == cudaSuccess;
++        }
++    }
++    g_fb.n_save = g_fb.n_fill = g_fb.n_kv = 0;
++    const int n_undo = g_fb.n_undo;
++    g_fb.n_undo = 0;
++    if (ok) {
++        return true;
++    }
++    // Every queued fill's slot still has its old bytes while expert_slot names it: same end state as a failed swap.
++    (void) cudaGetLastError();
++    g_fb_failed++;
++    GGML_LOG_WARN("%s: batched fill launch failed; dropping the RAM tier\n", __func__);
++    for (int k = 0; k < n_undo; k++) {
++        table_t & t = g_tables[(size_t) g_fb.undo[k].table];
++        t.expert_slot.erase(g_fb.undo[k].expert);
++        t.slot_expert[g_fb.undo[k].slot] = -1;
++        t.slot_dirty = true;
++        slot_seq_set_locked(t, g_fb.undo[k].slot, -1);
++    }
++    tier_drop_all_locked("batched fill failed");
++    return false;
++}
+ // Deferred swaps / map upload that no launch will cover: record their events now (on the stream they went to).
+ static void fence_flush_locked(table_t & t) {
++    (void) fb_flush_locked();   // the events must land after the batch kernels on mark_stream
+     for (int32_t sl : t.defer_slots) {
+         if (slot_seq_get_locked(t, sl) == -2) {
+             slot_seq_set_locked(t, sl, -1);   // its fill is covered by swap_ev only: the side stream waits on pol_ev
+@@ -3977,9 +4181,15 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+             g_kvl_pin = kv_src;
+             const int kv_keep = kvl_keep_locked(t, victim, dst, (cudaStream_t) stream);
+             g_kvl_pin = -1;
+-            err = tier_swap_locked(t, dst, expert, victim, stream, kv_src >= 0 ? kvl_ptr(g_kvl_slots[(size_t) kv_src]) : nullptr);
++            const bool fb = fb_takes(t, expert);
++            err = tier_swap_locked(t, dst, expert, victim, stream, kv_src >= 0 ? kvl_ptr(g_kvl_slots[(size_t) kv_src]) : nullptr,
++                                   fb && kv_keep >= 0 ? (uintptr_t) kvl_ptr(g_kvl_slots[(size_t) kv_keep]) : 0);
++            if (fb && err == cudaSuccess) {   // after the push: a flush inside it empties the list and launches the earlier jobs
++                fb_kv_mark(kv_src);
++                fb_kv_mark(kv_keep);
++            }
+             g_kvl_fills += err == cudaSuccess && kv_src >= 0;
+-            if (err == cudaSuccess && kv_keep >= 0) {
++            if (err == cudaSuccess && kv_keep >= 0 && !fb) {
+                 // after the swap's own cold-pointer write for the victim (RAM copy-back / file): serve it from VRAM
+                 moe_cache_set_ptr_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(t.cold_ptrs, victim,
+                                                                              (uintptr_t) kvl_ptr(g_kvl_slots[(size_t) kv_keep]));
+@@ -4895,6 +5105,9 @@ static __global__ void moe_cache_one_fill_kernel(char * __restrict__ dst, const
+ }
+ 
+ static cudaError_t sparse_fill_locked(const table_t & t, void * dst, int32_t e, void * stream) {
++    if (!fb_flush_locked()) {
++        return cudaErrorInvalidValue;
++    }
+     const bool    do2d = t.split_axis == 0 && t.host_pitch != 0;
+     const int64_t rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
+     if (do2d && rows <= 0) {
+@@ -8960,12 +9173,20 @@ static bool dr_map_refresh_locked(table_t & t, cudaStream_t s) {
+             t.dr_map_host[e] = sl;
+         }
+     }
+-    moe_cache_copy_kernel<<<4, 256, 0, s>>>((char *) t.dr_map_dev, (const char *) t.dr_map_hdev,
+-                                            (size_t) t.n_experts * sizeof(int32_t));
+-    if (cudaGetLastError() != cudaSuccess) {
+-        (void) cudaGetLastError();
+-        t.dr_map_ok = false;
+-        return false;
++    if (fb_on(t)) {
++        if (!fb_push_fill_locked(t.device, s, (char *) t.dr_map_dev, (const char *) t.dr_map_hdev,
++                                 (size_t) t.n_experts * sizeof(int32_t), nullptr, -1, 0)) {
++            t.dr_map_ok = false;
++            return false;
++        }
++    } else {
++        moe_cache_copy_kernel<<<4, 256, 0, s>>>((char *) t.dr_map_dev, (const char *) t.dr_map_hdev,
++                                                (size_t) t.n_experts * sizeof(int32_t));
++        if (cudaGetLastError() != cudaSuccess) {
++            (void) cudaGetLastError();
++            t.dr_map_ok = false;
++            return false;
++        }
+     }
+     if (g_defer_tab == &t) {
+         t.map_defer = true; t.mark_stream = s;
+@@ -9804,6 +10025,15 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+         return false;
+     }
+     std::lock_guard<std::mutex> lock(g_mutex);
++    // Nothing queued outlives this call (flushed before the remap below; this covers an early return).
++    struct fb_scope_end {
++        ~fb_scope_end() {
++            if (g_fb.n_save + g_fb.n_fill > 0) {
++                g_fb_late++;
++                (void) fb_flush_locked();
++            }
++        }
++    } fb_end;
+     const auto it = g_key_to_id.find({ (const void *) weight, device });
+     if (it == g_key_to_id.end() || it->second < 0 || it->second >= (int) g_tables.size()) {
+         return false;
+@@ -9889,6 +10119,23 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+         }
+     }
+ 
++    // The layer's queued saves, fills and map uploads, before the remap kernel that makes the op read them.
++    {
++        bool ok = fb_flush_locked();
++        for (int j = 0; ok && j < n_jobs; j++) {
++            ok = devremap_ok_locked(g_tables[job_id[j]], n_used, n_tok, device);
++        }
++        if (!ok) {
++            for (int j = 0; j < n_jobs; j++) {
++                table_t & u = g_tables[job_id[j]];
++                fence_flush_locked(u);
++                u.remap_n_used = 0;
++                u.dr_lag_n     = 0;
++            }
++            return decline();
++        }
++    }
++
+     // 3. Routing -> slot ids (the op's remap); the kernel also writes the routing straight into the mapped pinned lag
+     //    buffer for the next call's policy (no separate copy; the host reads it only after `dr_lag_ev`).
+     // The lag completion: a flag the kernel writes (one block per job), else an event per table.  Each event record is a
+@@ -10603,6 +10850,10 @@ void moe_cache_report() {
+     }
+     GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
+                   __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);
++    if (g_fb_flushes > 0) {
++        GGML_LOG_WARN("%s: fill batch: %lld flushes, %lld jobs, %lld late, %lld failed\n", __func__, (long long) g_fb_flushes,
++                      (long long) g_fb_jobs, (long long) g_fb_late, (long long) g_fb_failed);
++    }
+     if (g_fill_fail > 0) {
+         GGML_LOG_WARN("%s: FAILED fills: %lld, rolled back; those tables were served from the host master\n", __func__, (long long) g_fill_fail);
+     }
+-- 
+2.53.0
+
