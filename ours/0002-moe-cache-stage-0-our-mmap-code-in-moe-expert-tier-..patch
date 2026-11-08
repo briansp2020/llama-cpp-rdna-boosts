@@ -1,0 +1,3376 @@
+From 36ebc5b86a4f44e3cf535f486dcac48977f852e8 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 7 Nov 2026 03:54:06 +0000
+Subject: [PATCH 02/11] moe cache: stage 0: our mmap code in
+ moe-expert-tier*.inc, not yet hooked in
+
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu       |   15 +-
+ ggml/src/ggml-cuda/moe-expert-tier-state.inc |   72 +
+ ggml/src/ggml-cuda/moe-expert-tier.inc       | 3210 ++++++++++++++++++
+ src/llama-model-loader.cpp                   |    8 +-
+ 4 files changed, 3298 insertions(+), 7 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/moe-expert-tier-state.inc
+ create mode 100644 ggml/src/ggml-cuda/moe-expert-tier.inc
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 8bc727c72..a7d5015f3 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -98,7 +98,8 @@ struct bounce_t {
+     uint64_t    seq  = 0;   // acquisition order (the bounded ring waits on the oldest entry)
+ };
+ 
+-struct table_t {
++#include "moe-expert-tier-state.inc"
++struct table_t : moe_tier_fields {
+     int         layer       = -1;
+     std::string role;
+     int         n_experts   = 0;
+@@ -9279,7 +9280,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+ 
+ bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate,
+                               const ggml_tensor * ids, int device, void * stream,
+-                              ggml_tensor * src0_cpy, ggml_tensor * ids_cpy, ggml_tensor * gate_cpy) {
++                              ggml_tensor * src0_cpy, ggml_tensor * ids_cpy, ggml_tensor * gate_cpy,
++                              ggml_tensor * gate_ids_cpy) {
+     if (!g_enabled || ids == nullptr || src0 == nullptr) {
+         return false;
+     }
+@@ -9326,6 +9328,13 @@ bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0,
+         *gate_cpy = *gate;
+         gate_cpy->data   = gate_arena;
+         gate_cpy->buffer = nullptr;
++        // Our tier tables place experts independently per table: the gate lane reads through its own remap.
++        *gate_ids_cpy = *ids;
++        if (gr != nullptr) {
++            gate_ids_cpy->data  = gr;
++            gate_ids_cpy->nb[0] = sizeof(int32_t);
++            gate_ids_cpy->nb[1] = (size_t) gnu * sizeof(int32_t);
++        }
+     }
+     return true;
+ }
+@@ -9860,3 +9869,5 @@ void moe_cache_selftest() {
+         (void) cudaSetDevice(prev);
+     }
+ }
++
++#include "moe-expert-tier.inc"
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier-state.inc b/ggml/src/ggml-cuda/moe-expert-tier-state.inc
+new file mode 100644
+index 000000000..af315d4d7
+--- /dev/null
++++ b/ggml/src/ggml-cuda/moe-expert-tier-state.inc
+@@ -0,0 +1,72 @@
++// moe-expert-tier-state.inc: included near the top of moe-expert-cache.cu, inside its anonymous namespace.
++// The per-table fields of our mmap RAM tier (--host-experts mmap); table_t derives from this struct, so Stew's table layout stays as he wrote it.
++struct moe_tier_fields {
++    int                   bounce_rr = 0;   // next entry to wait for when the bounce ring is full
++    bool        host_sparse = false;    // pageable `host`: only the experts a GPU may read are registered (see sreg_*)
++    bool        sparse_all  = false;    // the whole table is registered since the last trim
++    bool        sparse_off  = false;    // pageable master that could not be registered: the cache declines this table
++    void *      stage_dev   = nullptr;  // prefill staging: per-expert source pointers + cold flags (device copy)
++    void *      route_dev   = nullptr;  // small-prefill routed fill: per-entry source, expert id, cold flag
++    std::vector<uint8_t> route_pack;
++    // Prefill in place (GGML_MOE_PREFILL_INPLACE): the hook packs the routed fill (staged entries first, then the
++    // arena-resident ones the routed-compact MMQ can read in place) but launches nothing; the consumer resolves it
++    // (moe_cache_prefill_resolve), copying only the staged entries when it reads the rest in place.
++    bool        pf_pending  = false;
++    void *      pf_dst      = nullptr;
++    int         pf_k_stage  = 0;
++    int         pf_k_in     = 0;
++    int         pf_k_pad    = 0;   // tail-pad neighbours of in-place experts, copied only for a full-table read
++    int64_t     pf_rows     = 0;
++    bool        pf_do2d     = false;
++    std::vector<uint8_t> stage_pack;    // ... and the host copy they are uploaded from
++    mutable std::vector<uint8_t> sreg_refused;   // experts whose registration the pin budget refused (cleared by a trim)
++    // RAM tier (sparse masters): an owned pinned copy of exactly the experts the arena does not hold, in the arena's
++    // compact layout.  An admission swaps arena <-> RAM, so nothing is read from the file after sizing.
++    char *      ram_base    = nullptr;
++    size_t      ram_bytes   = 0;
++    std::vector<int32_t> ram_slot;      // expert -> RAM slot, -1 while resident
++    bool        ram_partial = false;    // the tier holds only this layer's share (the hottest cold experts); an
++                                        // expert outside it is read and filled through the registered file alias
++    std::vector<int32_t> ram_free;      // free RAM slots (the spares: where an evicted expert lands)
++    std::vector<int32_t> ram_pending;   // RAM slots freed by a swap whose H2D may still be pending: reusable only after
++                                        // `swap_ev` (tier_release_pending_locked), never within the same call
++    uintptr_t * cold_ptrs   = nullptr;  // device, expert -> its cold bytes (low bit: host geometry); kept once set
++    cudaEvent_t swap_ev     = nullptr;  // after the last swap (prefill staging on the copy stream waits on it)
++    // GGML_MOE_FILL_FENCE: in a decode take-over the swaps and the map upload record no event; the remap kernel's lag
++    // flag (written after them on the same stream) marks them done.  *_defer: issued, not yet covered by a launch;
++    // *_mark_flag: the latest marker after them is the lag flag value *_mark_seq (else swap_ev / dr_map_ev).
++    bool        swap_defer     = false;
++    bool        swap_mark_flag = false;
++    int32_t     swap_mark_seq  = 0;
++    bool        map_defer      = false;
++    bool        map_mark_flag  = false;
++    int32_t     map_mark_seq   = 0;
++    void *      mark_stream    = nullptr;   // the stream the deferred work went to
++    // Per arena slot, when its last fill is known to have landed (copy-back ahead reads the slot on the side stream):
++    // 0 = complete (a synchronous fill), > 0 = once the lag flag reaches that value, -1 = unknown (the side stream
++    // waits on pol_ev, as before), -2 = filled in the open decode take-over (not yet committed).  Missing = -1.
++    std::vector<int32_t> slot_seq;
++    std::vector<int32_t> defer_slots;       // slots at -2: the commit gives them its seq, a flush makes them -1
++    // Copy-back ahead (GGML_MOE_TIER_PRECOPY): spare RAM slots that already hold a copy of a resident the policy is likely
++    // to evict next (D2H on the device's side stream, done when `ev` fires), so its admission needs no D2H on the compute
++    // stream.  The copy stays valid while the expert is resident (weights never change); an entry is consumed by the swap
++    // that evicts it, or reclaimed once its copy completed and the expert is no longer a candidate.
++    struct precopy_t { int32_t expert; int32_t ram; cudaEvent_t ev; };
++    std::vector<precopy_t>   precopy;
++    std::vector<cudaEvent_t> precopy_idle;   // recorded-and-done or never-recorded events, for reuse
++    cudaEvent_t pol_ev      = nullptr;  // compute stream, after a policy pass: the side stream waits it before a D2H
++    // wip/prefill-prefetch (GGML_MOE_PF_PREFETCH=1): this table's region in its device's per-layer staging (a mirror of
++    // its RAM tier, then the scratch slot's expert), and the expert -> location map the routed-compact MMQ reads.
++    int64_t     pf_off      = -1;
++    size_t      pf_ram_n    = 0;        // RAM-tier slots mirrored (ram_bytes / expert_bytes)
++    int32_t *   pf_map_dev  = nullptr;  // expert -> in-place slot (< slots - 1), or slots - 1 + staging index
++    int32_t *   pf_map_host = nullptr;  // pinned, mapped source of the map upload
++    int32_t *   pf_map_hdev = nullptr;  // device alias of pf_map_host: the copy kernel reads it
++    cudaEvent_t pf_map_ev   = nullptr;
++    std::vector<int32_t> pf_map_last;   // the map last uploaded
++    bool        pf_pref     = false;    // the pending prefill fill is a prefetched one
++    bool        pf_scratch  = false;    // the map sends an expert to the scratch slot's copy (copied at the op)
++    const char * pf_stage   = nullptr;  // this table's staging region for the pending fill
++    uint32_t    remap_round = 0;    // scheduler round the remap was published in (remap_round_locked)
++    int32_t *   dr_map_hdev = nullptr;  // device alias of dr_map_host: the copy kernel reads the staging through it
++};
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+new file mode 100644
+index 000000000..b4cc7cc8b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -0,0 +1,3210 @@
++// moe-expert-tier.inc: included at the end of moe-expert-cache.cu.  Our --host-experts mmap code.
++#include <thread>
++
++#if defined(GGML_USE_HIP) && !defined(cudaErrorInvalidValue)
++#define cudaErrorInvalidValue hipErrorInvalidValue
++#endif
++
++static bool g_sig_probe = false;   // moe_cache_redirect_sig lookups: not counted in the stats
++
++#ifndef MADV_POPULATE_READ
++#define MADV_POPULATE_READ 22
++#endif
++
++int64_t                             g_force_admits    = 0;  // routed experts of a sparse table without a tier filled through the bounce (see force_admit_locked)
++int64_t                             g_fill_fail       = 0;   // fills rolled back (GGML_MOE_FILL_ROLLBACK)
++// Resolve the pinned host master's device-accessible alias once.  `t.src_off` is folded in by
++// `moe_cache_get_cold`, so the alias is always the base of the host tensor.
++//
++// Only a host allocation the runtime can map for device access may be used as an in-place kernel-read
++// master, and `cudaHostGetDevicePointer` is the runtime's own answer.  A pageable model mapping
++// (`--host-experts mmap` -> `CPU_Mapped`) maps to no device address; on a GPU without XNACK (RDNA
++// under ROCm reports `XNACK enabled: NO`) a kernel read of it is a fatal "page not present" fault
++// (issue #116, `mul_mat_vec_q_moe`'s cold read).  Leave `host_dev` null in that case: the in-place
++// cold region requires it and stands down, while the
++// fill copies (which source `t.host` through cudaMemcpyAsync, pageable-safe) keep the cache correct.
++// ---- sparse registration of a pageable host master (--host-experts mmap) ---------------------------------------
++// RDNA has no XNACK, so a kernel cannot read a pageable host address (issue #116).  A pageable expert master is made
++// GPU-readable without pinning all of it: a second read-only MAP_SHARED mapping of the model file (the same page
++// cache, no extra RAM) is registered with hipHostRegister only where a GPU may read it - the experts not resident in
++// the arena of some table of that master - and a registered range is device-readable at its CPU address.
++// Invariant: every expert a GPU may read from the host (a cold read, or a fill from the alias) is registered when
++// the read is enqueued and stays registered until it has completed (the trim synchronizes every device first).
++static std::map<uintptr_t, size_t> g_sreg;              // registered runs: page-aligned start -> bytes (disjoint)
++static size_t  g_sreg_bytes = 0;
++static size_t  g_sreg_peak  = 0;
++static int64_t g_sreg_fail  = 0;                         // hipHostRegister refusals
++static int64_t g_sreg_calls = 0;                         // successful hipHostRegister calls (runs created)
++static int64_t g_sreg_keep  = 0;                         // admissions skipped because a registration failed
++static int64_t g_sreg_stay  = 0;                         // admissions skipped because the victim left the page cache
++static int64_t g_sreg_nolock = 0;                        // registered runs that could not be mlocked (reclaimable)
++static int64_t g_stage_tables = 0;                       // prefill tables staged from the arena + registered alias
++static int64_t g_route_fills  = 0;                       // small-prefill routed fills from the arena + registered alias
++static int64_t g_sreg_remaps = 0;                        // unregistered runs remapped (drops the driver's SVM range)
++struct sreg_alias_t { uintptr_t lo, hi; int fd; off_t off; };
++static std::vector<sreg_alias_t> g_sreg_alias;           // every alias mapping: [lo, hi) maps `fd` from `off`
++// Replace [a, a + len) of an alias with a fresh mapping of the same file pages.  hipHostUnregister leaves KFD's SVM
++// range behind: when the kernel later reclaims one of its pages the driver re-faults the WHOLE range from disk
++// (svm_range_restore_work).  Unmapping the range removes it.
++static void sreg_remap(uintptr_t a, size_t len) {
++    static const bool off = getenv("GGML_MOE_SREG_NOREMAP") != nullptr && atoi(getenv("GGML_MOE_SREG_NOREMAP")) != 0;
++    if (off) {
++        return;
++    }
++    for (const sreg_alias_t & m : g_sreg_alias) {
++        if (a >= m.lo && a + len <= m.hi) {
++            void * r = mmap((void *) a, len, PROT_READ, MAP_SHARED | MAP_FIXED, m.fd, m.off + (off_t) (a - m.lo));
++            if (r != MAP_FAILED) {
++                g_sreg_remaps++;
++            }
++            return;
++        }
++    }
++}
++static int64_t g_sreg_trims = 0;
++static std::atomic<bool> g_any_sparse{false};            // some table has a sparse (mmap) master
++static const size_t SREG_PAD = 8192;                     // > the MMQ K-tile over-read past an expert's last row
++static size_t sreg_page() {
++    static const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
++    return pg;
++}
++static size_t sreg_phys_bytes() {
++    const long pages = sysconf(_SC_PHYS_PAGES);
++    return pages > 0 ? (size_t) pages * sreg_page() : 0;
++}
++// Register every page of [lo, hi) that is not registered yet (as new disjoint runs).  False on a refusal.
++// One budget for the host memory this feature pins (mlock + GPU registration): the RAM tier of the mmap tables plus the
++// sparse registration of the tables without a tier.  GGML_MOE_PIN_BUDGET_MIB; default min(60 % of RAM, RAM - 8 GiB).
++// The tier is built hottest layer first (the sizing order) while it fits; the other tables register their cold experts
++// within what is left, and a read whose registration does not fit declines to the scheduler path.  The warm-up before the
++// sizing registers on demand within the same budget, and each table's tier then replaces its own registration, so the
++// pinned total stays within the budget (plus one table's tier during its build).
++static int64_t pin_budget_bytes() {
++    static const int64_t v = [] {
++        const char * e = getenv("GGML_MOE_PIN_BUDGET_MIB");
++        if (e != nullptr) {
++            return (int64_t) atoll(e) << 20;
++        }
++        const int64_t ram = (int64_t) sreg_phys_bytes();
++        return std::max<int64_t>(0, std::min<int64_t>(ram / 10 * 6, ram - ((int64_t) 8 << 30)));
++    }();
++    return v;
++}
++static int64_t g_tier_bytes  = 0;   // RAM tier bytes pinned (all tables)
++static int64_t g_sreg_capped       = 0;   // registrations refused by the pin budget
++static bool sreg_ensure(uintptr_t lo, uintptr_t hi) {
++    const size_t pg = sreg_page();
++    lo &= ~(uintptr_t) (pg - 1);
++    hi  = (hi + pg - 1) & ~(uintptr_t) (pg - 1);
++    uintptr_t cur = lo;
++    while (cur < hi) {
++        auto it = g_sreg.lower_bound(cur);
++        if (it != g_sreg.end() && it->first == cur) {
++            cur += it->second;
++            continue;
++        }
++        if (it != g_sreg.begin()) {
++            auto p = std::prev(it);
++            if (p->first + p->second > cur) {
++                cur = p->first + p->second;
++                continue;
++            }
++        }
++        const uintptr_t gap_end = (it == g_sreg.end()) ? hi : std::min<uintptr_t>(hi, it->first);
++        if (g_tier_bytes + (int64_t) (g_sreg_bytes + (gap_end - cur)) > pin_budget_bytes()) {
++            g_sreg_capped++;
++            return false;   // over the pin budget: the read declines (served by the scheduler path)
++        }
++        (void) madvise((void *) cur, gap_end - cur, MADV_WILLNEED);   // large readahead instead of 4 KiB faults
++        // hipHostRegister does not pin (HMM mirror): without the lock the kernel reclaims these GPU-only-read pages
++        // first and the KFD restore worker re-reads them from disk with the queues stopped.
++        if (mlock((void *) cur, gap_end - cur) != 0 && g_sreg_nolock++ < 2) {
++            GGML_LOG_WARN("moe_cache sparse registration: mlock %p + %zu failed: %s (registered pages stay reclaimable)\n",
++                          (void *) cur, (size_t) (gap_end - cur), strerror(errno));
++        }
++        const cudaError_t err = cudaHostRegister((void *) cur, gap_end - cur, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
++        if (err != cudaSuccess) {
++            (void) cudaGetLastError();
++            (void) munlock((void *) cur, gap_end - cur);
++            if (g_sreg_fail++ < 2) {
++                GGML_LOG_WARN("moe_cache sparse registration: register %p + %zu failed: %s\n", (void *) cur,
++                              (size_t) (gap_end - cur), cudaGetErrorString(err));
++            }
++            return false;
++        }
++        g_sreg[cur]   = gap_end - cur;
++        g_sreg_bytes += gap_end - cur;
++        g_sreg_peak   = std::max(g_sreg_peak, g_sreg_bytes);
++        g_sreg_calls++;
++        cur = gap_end;
++    }
++    return true;
++}
++// The bytes of expert `e` THIS table (device) reads in place: its own slice when the slice is contiguous (an axis-1
++// split: gate/up under -sm tensor), else the whole expert (an axis-0 slice interleaves with the other device row by row).
++static void sparse_span(const table_t & t, int32_t e, uintptr_t & lo, uintptr_t & hi) {
++    const bool strided = t.split_axis == 0 && t.host_pitch != 0;
++    lo = (uintptr_t) t.host_dev + (uintptr_t) e * t.host_bytes + (strided ? 0 : (uintptr_t) t.src_off);
++    hi = lo + (strided ? t.host_bytes : t.expert_bytes);
++}
++// Make expert `e` of a sparse table device-readable.  False when it cannot be (the caller must not let a GPU read it).
++// Registered bytes inside [lo, hi) (whole runs that start there).
++static size_t sreg_bytes_in(uintptr_t lo, uintptr_t hi) {
++    size_t n = 0;
++    for (auto it = g_sreg.lower_bound(lo & ~(uintptr_t) (sreg_page() - 1)); it != g_sreg.end() && it->first < hi; ++it) {
++        n += it->second;
++    }
++    return n;
++}
++static bool sparse_need_locked(const table_t & t, int32_t e) {
++    if (!t.host_sparse || t.host_dev == nullptr) {
++        return true;
++    }
++    if (t.ram_base != nullptr && (!t.ram_partial || (e >= 0 && e < (int32_t) t.ram_slot.size() && t.ram_slot[(size_t) e] >= 0))) {
++        return true;   // (a RAM-tier table reads its cold experts from the tier)
++    }
++    if (e < 0 || e >= t.n_experts) {
++        return false;
++    }
++    if ((size_t) e < t.sreg_refused.size() && t.sreg_refused[(size_t) e]) {
++        return false;   // refused by the pin budget since the last trim
++    }
++    uintptr_t lo, hi;
++    sparse_span(t, e, lo, hi);
++    const int64_t capped = g_sreg_capped;
++    if (sreg_ensure(lo, hi + SREG_PAD) || sreg_ensure(lo, hi)) {   // (the pad may run past the mapping)
++        return true;
++    }
++    // refused by the budget, or the registration itself failed: either way not retried until the next trim (a failed
++    // register already paid an mlock + munlock of the span, and every call would repeat it)
++    (void) capped;
++    {
++        if (t.sreg_refused.size() != (size_t) t.n_experts) {
++            t.sreg_refused.assign((size_t) t.n_experts, 0);
++        }
++        t.sreg_refused[(size_t) e] = 1;
++    }
++    return false;
++}
++// Read [lo, hi) of a pageable mapping into the page cache with several threads (one synchronous fault stream reads
++// the NVMe at a fraction of its bandwidth).
++static void sparse_populate(uintptr_t lo, uintptr_t hi) {
++#ifndef MADV_POPULATE_READ
++#define MADV_POPULATE_READ 22
++#endif
++    const size_t pg = sreg_page();
++    lo &= ~(uintptr_t) (pg - 1);
++    const int       n_thr = 8;
++    const uintptr_t step  = ((hi - lo) / n_thr + pg - 1) & ~(uintptr_t) (pg - 1);
++    std::vector<std::thread> thr;
++    for (int i = 0; i < n_thr; i++) {
++        const uintptr_t a = lo + (uintptr_t) i * step, b = std::min<uintptr_t>(hi, a + step);
++        if (a < b) {
++            thr.emplace_back([a, b] { (void) madvise((void *) a, b - a, MADV_POPULATE_READ); });
++        }
++    }
++    for (auto & th : thr) {
++        th.join();
++    }
++}
++// Copy this device's slice of expert `e` from the (populated) mapping to `dst` in the arena's compact layout.
++static void sparse_pack_expert(const table_t & t, int32_t e, char * dst) {
++    const char * src = (const char *) t.host_dev + (size_t) e * t.host_bytes + t.src_off;
++    if (t.split_axis == 0 && t.host_pitch != 0) {
++        const size_t rows = t.host_bytes / t.host_pitch, row_bytes = t.expert_bytes / rows;
++        for (size_t r = 0; r < rows; r++) {
++            memcpy(dst + r * row_bytes, src + r * t.host_pitch, row_bytes);
++        }
++    } else {
++        memcpy(dst, src, t.expert_bytes);
++    }
++}
++// Copy experts 0..k-1 of a sparse table into arena slots 0..k-1 through a pinned staging buffer: the master stays
++// unregistered (registering, then dropping, what the arena holds costs a register call per expert).
++static bool sparse_stage_fill_locked(const table_t & t, int k) {
++    static char *  stage     = nullptr;
++    static size_t  stage_cap = 0;
++    const bool     do2d = t.split_axis == 0 && t.host_pitch != 0;
++    const int64_t  rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 1;
++    if (rows <= 0 || t.expert_bytes % (size_t) rows != 0) {
++        return false;
++    }
++    const size_t need = std::max<size_t>(t.expert_bytes, 64u << 20);
++    if (stage_cap < need) {
++        if (stage != nullptr) {
++            (void) cudaFreeHost(stage);
++        }
++        stage = nullptr;
++        stage_cap = 0;
++        if (cudaMallocHost((void **) &stage, need) != cudaSuccess) {
++            (void) cudaGetLastError();
++            stage = nullptr;
++            return false;
++        }
++        stage_cap = need;
++    }
++    device_guard dg(t.device);
++    const int per = (int) (stage_cap / t.expert_bytes);
++    for (int e0 = 0; e0 < k; e0 += per) {
++        const int n = std::min(per, k - e0);
++        for (int j = 0; j < n; j++) {
++            sparse_pack_expert(t, e0 + j, stage + (size_t) j * t.expert_bytes);
++        }
++        if (cudaMemcpy((char *) t.arena + (size_t) e0 * t.expert_bytes, stage, (size_t) n * t.expert_bytes,
++                       cudaMemcpyHostToDevice) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
++        }
++    }
++    return true;
++}
++// ---- RAM tier.  On for every sparse table or for none: one budget decision, and a drop (budget, allocation failure,
++// stand-down, re-size) turns every table back to the file alias path at once.
++static bool    g_tier_off   = false;   // dropped: the file alias path
++static int64_t g_tier_swaps = 0;
++static int64_t g_tier_partial = 0;   // tables left without a tier by the pin budget
++static int64_t g_tier_share_tables = 0;   // tables given a partial tier (an equal per-layer share of the budget)
++static int64_t g_tier_file_fills   = 0;   // admissions of an expert outside a partial tier (filled from the alias)
++static int64_t g_tier_file_victims = 0;   // victims of a partial tier with no RAM slot (back to the file alias)
++static int64_t g_tier_thru = 0;
++static bool tier_fill_on() {
++    static const bool v = [] {
++        const char * e = getenv("GGML_MOE_TIER_FILL");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return v;
++}
++static int64_t g_tier_swaps_d2h = 0;   // swaps that copied the victim back on the compute stream
++static int64_t g_tier_nospare   = 0;   // misses served cold because no spare RAM slot (or precopy of the victim) was ready
++static int64_t g_pc_issued = 0, g_pc_used = 0, g_pc_reclaimed = 0;
++// GGML_MOE_FILL_FENCE (default on): a decode take-over's swaps and map upload are marked done by the remap kernel's lag
++// flag instead of an event record each (every record is a marker packet the GPU spends ~4-6 us on, FINDINGS 745).
++// =0: an event after every swap and map upload, as before.
++static const bool g_fill_fence = [] {
++    const char * e = getenv("GGML_MOE_FILL_FENCE");
++    return e == nullptr || atoi(e) != 0;
++}();
++static const void * g_defer_tab = nullptr;   // the table whose decode take-over defers its markers (else none)
++static int64_t g_fence_commits = 0, g_fence_flushes = 0;
++static int64_t g_pc_polev = 0;   // precopy plans that still waited on the compute stream (pol_ev)
++static bool    fence_done_locked(const table_t & t, int32_t seq);
++static int32_t slot_seq_get_locked(const table_t & t, int slot);
++static int64_t g_pc_waited = 0;   // admissions whose precopy had not completed yet (the GPU waited for it)
++// GGML_MOE_TIER_PRECOPY=0: no copy-back ahead (each swap copies its victim back on the compute stream, as before).
++static const bool g_precopy = [] {
++    const char * e = getenv("GGML_MOE_TIER_PRECOPY");
++    return e == nullptr || atoi(e) != 0;
++}();
++// GGML_MOE_TIER_SPARES=K: spare RAM slots per tier table (K - 1 can hold precopies, one stays free for the in-stream
++// fallback).  Default 8 with precopy, 1 without (the previous layout).
++static const int g_tier_spares = [] {
++    const char * e = getenv("GGML_MOE_TIER_SPARES");
++    return e != nullptr && atoi(e) > 0 ? atoi(e) : (g_precopy ? 8 : 1);
++}();
++// GGML_MOE_TIER_TOUCH=N: the `touch` admission threshold for RAM-tier tables (MOE_EXPERT_CACHE_TOUCH for the others).
++// With several spares a tier table can admit every re-touched expert, and a short detour of the routing then evicts the
++// hot set; admitting from the 3rd touch damps that churn.  Default 3 with precopy, else MOE_EXPERT_CACHE_TOUCH.
++static int64_t tier_touch() {
++    static const int64_t v = [] {
++        const char * e = getenv("GGML_MOE_TIER_TOUCH");
++        return e != nullptr && atoi(e) > 0 ? (int64_t) atoi(e) : (int64_t) (g_precopy ? 3 : 0);
++    }();
++    return v;
++}
++static __global__ void moe_cache_set_ptr_kernel(uintptr_t * ptrs, int32_t e, uintptr_t v) {
++    ptrs[e] = v;
++}
++// Copies between the arena and pinned host memory done by a kernel (the GPU reads / writes the host memory directly).
++// On ROCm a small hipMemcpyAsync to or from pinned memory can leave the device's later queued work unsubmitted until a
++// host synchronize; with the all-reduce pairing the two devices, that stalls the peer past its spin timeout (HANDOVER 303).
++static __global__ void moe_cache_copy_kernel(char * __restrict__ dst, const char * __restrict__ src, size_t n) {
++    const size_t stride = (size_t) gridDim.x * blockDim.x;
++    size_t       i      = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if ((((uintptr_t) dst | (uintptr_t) src | n) & 15) == 0) {
++        uint4 *       d = (uint4 *) dst;
++        const uint4 * q = (const uint4 *) src;
++        for (; i < n / 16; i += stride) {
++            d[i] = q[i];
++        }
++        return;
++    }
++    for (; i < n; i += stride) {
++        dst[i] = src[i];
++    }
++}
++#define MOE_FB_MAX_JOBS 16
++// Batched decode admissions (GGML_MOE_FILL_BATCH, default on; =0: one launch per copy and pointer, as before).  Inside one
++// moe_cache_remap_dev call the victim saves and the fills of a layer's tables are queued and launched just before the remap:
++// phase 1 = every save (arena -> KV slot / spare RAM slot), phase 2 = every fill and map upload.  A job's copies run
++// concurrently with its phase, so no job may read or write what another job of its phase writes, and phase 1 runs first
++// because it reads the arena slots phase 2 overwrites.  KV slots a queued job touches are off limits to the CLOCK (fb_kv).
++struct moe_fill_job {
++    char *       dst;
++    const char * src;
++    uintptr_t *  ptrs;   // optional: ptrs[e] = v, in the same kernel
++    size_t       n;
++    uintptr_t    v;
++    int32_t      e;
++    int32_t      pad;
++};
++struct moe_fill_jobs {
++    moe_fill_job j[MOE_FB_MAX_JOBS];
++};
++static_assert(sizeof(moe_fill_jobs) <= 1024, "kernel argument");
++static __global__ void moe_cache_fill_batch_kernel(const moe_fill_jobs jobs) {
++    const moe_fill_job & jb = jobs.j[blockIdx.y];
++    if (blockIdx.x == 0 && threadIdx.x == 0 && jb.ptrs != nullptr && jb.e >= 0) {
++        jb.ptrs[jb.e] = jb.v;
++    }
++    char * __restrict__       dst = jb.dst;
++    const char * __restrict__ src = jb.src;
++    const size_t n      = jb.n;
++    const size_t stride = (size_t) gridDim.x * blockDim.x;
++    size_t       i      = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if ((((uintptr_t) dst | (uintptr_t) src | n) & 15) == 0) {
++        uint4 *       d = (uint4 *) dst;
++        const uint4 * q = (const uint4 *) src;
++        for (; i < n / 16; i += stride) {
++            d[i] = q[i];
++        }
++        return;
++    }
++    for (; i < n; i += stride) {
++        dst[i] = src[i];
++    }
++}
++struct fill_batch_t {
++    int           device = -1;
++    cudaStream_t  stream = nullptr;
++    moe_fill_jobs save = {}, fill = {};
++    int           n_save = 0, n_fill = 0;
++    struct undo_t { int table, slot; int32_t expert; } undo[MOE_FB_MAX_JOBS];
++    int           n_undo = 0;
++    int           kv[2 * MOE_FB_MAX_JOBS + 2];   // KV slots a queued job reads or writes
++    int           n_kv = 0;
++};
++static fill_batch_t g_fb;
++static int64_t g_fb_flushes = 0, g_fb_jobs = 0, g_fb_late = 0, g_fb_failed = 0;
++static const bool g_fill_batch = [] { const char * e = getenv("GGML_MOE_FILL_BATCH"); return e == nullptr || atoi(e) != 0; }();
++static bool fb_flush_locked();   // launches what is queued; false: a launch failed, the tier is dropped
++static inline bool fb_on(const table_t & t) {
++    return g_fill_batch && g_defer_tab == &t;
++}
++static inline bool fb_kv_busy(int i) {
++    for (int k = 0; k < g_fb.n_kv; k++) {
++        if (g_fb.kv[k] == i) {
++            return true;
++        }
++    }
++    return false;
++}
++static inline void fb_kv_mark(int i) {
++    if (i >= 0 && !fb_kv_busy(i) && g_fb.n_kv < (int) (sizeof(g_fb.kv) / sizeof(g_fb.kv[0]))) {
++        g_fb.kv[g_fb.n_kv++] = i;
++    }
++}
++// Room for one job on (device, stream), flushing what is queued if not.  False: that flush failed.
++static bool fb_room_locked(int device, cudaStream_t s) {
++    if ((g_fb.n_save + g_fb.n_fill > 0 && (g_fb.device != device || g_fb.stream != s)) ||
++        g_fb.n_save >= MOE_FB_MAX_JOBS || g_fb.n_fill >= MOE_FB_MAX_JOBS || g_fb.n_kv + 2 > (int) (sizeof(g_fb.kv) / sizeof(g_fb.kv[0]))) {
++        if (!fb_flush_locked()) {
++            return false;
++        }
++    }
++    g_fb.device = device;
++    g_fb.stream = s;
++    return true;
++}
++static bool fb_push_save_locked(int device, cudaStream_t s, char * dst, const char * src, size_t n, uintptr_t * ptrs, int32_t e, uintptr_t v) {
++    if (!fb_room_locked(device, s)) {
++        return false;
++    }
++    for (int k = 0; k < g_fb.n_fill; k++) {
++        if (g_fb.fill.j[k].dst == src && !fb_flush_locked()) {   // reads a slot already queued for a fill: keep the order
++            return false;
++        }
++    }
++    g_fb.save.j[g_fb.n_save++] = { dst, src, ptrs, n, v, e, 0 };
++    return true;
++}
++static bool fb_push_fill_locked(int device, cudaStream_t s, char * dst, const char * src, size_t n, uintptr_t * ptrs, int32_t e, uintptr_t v) {
++    if (!fb_room_locked(device, s)) {
++        return false;
++    }
++    for (int k = 0; k < g_fb.n_fill; k++) {
++        if (g_fb.fill.j[k].dst == dst && !fb_flush_locked()) {   // the same slot twice: keep the order
++            return false;
++        }
++    }
++    g_fb.fill.j[g_fb.n_fill++] = { dst, src, ptrs, n, v, e, 0 };
++    return true;
++}
++// The H2D of an admission with the victim's cold pointer write folded in (copy-back ahead: one launch per admission).
++static __global__ void moe_cache_copy_set_kernel(char * __restrict__ dst, const char * __restrict__ src, size_t n,
++                                                 uintptr_t * ptrs, int32_t e, uintptr_t v) {
++    if (blockIdx.x == 0 && threadIdx.x == 0 && e >= 0) {
++        ptrs[e] = v;
++    }
++    const size_t stride = (size_t) gridDim.x * blockDim.x;
++    size_t       i      = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if ((((uintptr_t) dst | (uintptr_t) src | n) & 15) == 0) {
++        uint4 *       d = (uint4 *) dst;
++        const uint4 * q = (const uint4 *) src;
++        for (; i < n / 16; i += stride) {
++            d[i] = q[i];
++        }
++        return;
++    }
++    for (; i < n; i += stride) {
++        dst[i] = src[i];
++    }
++}
++static uintptr_t tier_file_ptr(const table_t & t, int32_t e) {
++    return ((uintptr_t) t.host_dev + (uintptr_t) e * t.host_bytes + t.src_off) | 1;   // low bit: host geometry
++}
++// KV lending (GGML_MOE_KV_LEND=1, default off): the KV cache's rows past the context in use hold copies of experts the
++// arena evicted ("victim slots").  The decode kernel reads a cold expert of a RAM-tier table through cold_ptrs, so
++// pointing cold_ptrs[e] at a victim slot serves it from VRAM.  The expert's RAM copy (or file alias) is still made as
++// without lending, so a victim slot is a disposable duplicate: dropping it points cold_ptrs[e] back at that fallback.
++// llama reports the rows a batch can read or write (moe_cache_kv_need); the rows below the lend line are the KV's.
++// Victims are made and dropped only on the decode policy's stream (the only reader of cold_ptrs); taking rows back
++// for the KV synchronises the device first.
++struct kvl_tensor_t {
++    char *  data;
++    size_t  bytes;
++    size_t  row_bytes;
++    bool    pf = false;   // a prefill-prefetch staging buffer (GGML_MOE_PF_LEND), lent while g_pf_lent
++};
++struct kvl_slot_t {
++    int     tensor;
++    size_t  off;
++    int     table  = -1;
++    int32_t expert = -1;
++    bool    ref    = false;   // CLOCK reference bit: read since the hand last passed
++};
++static std::vector<kvl_tensor_t> g_kvl_tensors;
++static std::vector<kvl_slot_t>   g_kvl_slots;           // a fixed grid over every tensor's lendable range
++static int64_t g_kvl_rows       = 0;                    // the KV's cells (every registered tensor has them)
++static int64_t g_kvl_line       = 0;                    // first lent row (g_kvl_rows: nothing lent)
++static int     g_kvl_device     = -1;
++static size_t  g_kvl_slot_bytes = 0;                    // the largest tier table's expert, set when the grid is built
++static size_t  g_kvl_hand       = 0;
++static bool    g_kvl_in_decode  = false;                // set around devremap_prep's policy loop
++static void *  g_kvl_stream     = nullptr;              // the main model's decode stream (its layer-0 tables'): the
++                                                        // only stream that makes or drops victims (the MTP draft is
++                                                        // another context with its own stream)
++static int     g_kvl_pin        = -1;                   // a slot the next fill reads: not reused meanwhile
++static int64_t g_kvl_fills = 0;
++static int64_t g_kvl_stays = 0;                         // misses served from a victim instead of evicting a resident                         // admissions filled from a victim slot (device to device)
++static int64_t g_kvl_inserts = 0, g_kvl_hits = 0, g_kvl_misses = 0, g_kvl_drops = 0, g_kvl_takes = 0, g_kvl_gives = 0;
++static double  g_kvl_ms = 0;
++// GGML_MOE_PF_LEND (default on with KV lending): between prefills the prefill prefetch's two staging buffers hold victim
++// slots too.  The first prefetched layer of a prefill takes them back (a device synchronize, as for KV rows); a few decode
++// policy steps without a prefetch lend them again.
++static bool    g_pf_lent  = false;
++static int64_t g_pf_lends = 0, g_pf_takes = 0;
++static double  g_pf_ms    = 0;
++// per table (by index in g_tables): expert -> the victim slot holding a copy of it (-1: none); kept outside table_t
++static std::vector<std::vector<int32_t>> g_kvl_kvv;
++static std::vector<int32_t> & kvl_kvv(const table_t & t) {
++    const size_t id = (size_t) (&t - g_tables.data());
++    if (g_kvl_kvv.size() <= id) {
++        g_kvl_kvv.resize(id + 1);
++    }
++    return g_kvl_kvv[id];
++}
++static bool kvl_on() {
++    static const bool v = getenv("GGML_MOE_KV_LEND") != nullptr && atoi(getenv("GGML_MOE_KV_LEND")) > 0;
++    return v;
++}
++// GGML_MOE_KV_LEND_STAY (default on with lending): a miss on an expert with a victim copy is served from it (a VRAM cold
++// read) when admitting it would evict a resident, instead of the eviction and fill
++static bool kvl_stay_on() {
++    static const bool v = !getenv("GGML_MOE_KV_LEND_STAY") || atoi(getenv("GGML_MOE_KV_LEND_STAY")) != 0;
++    return v;
++}
++static int64_t kvl_step() {
++    return 4096;   // rows; a multiple of every n_kv pad
++}
++static int64_t kvl_margin() {
++    static const int64_t v = getenv("GGML_MOE_KV_LEND_MARGIN") ? std::max<int64_t>(0, atoll(getenv("GGML_MOE_KV_LEND_MARGIN"))) : 16384;
++    return v;
++}
++static bool kvl_log() {
++    static const bool v = getenv("GGML_MOE_KV_LEND_LOG") != nullptr;
++    return v;
++}
++static char * kvl_ptr(const kvl_slot_t & sl) {
++    return g_kvl_tensors[(size_t) sl.tensor].data + sl.off;
++}
++static bool kvl_avail(const kvl_slot_t & sl) {
++    const kvl_tensor_t & kt = g_kvl_tensors[(size_t) sl.tensor];
++    if (kt.pf) {
++        return g_pf_lent;
++    }
++    return (int64_t) sl.off >= g_kvl_line * (int64_t) kt.row_bytes;
++}
++static bool kvl_eligible(const table_t & t) {
++    return kvl_on() && !g_kvl_tensors.empty() && t.device == g_kvl_device && t.cold_ptrs != nullptr && t.cold_safe &&
++           t.ram_base != nullptr && t.host_dev != nullptr && !t.identity && t.slots > 0 &&
++           (g_kvl_slot_bytes == 0 || t.expert_bytes <= g_kvl_slot_bytes);
++}
++// where cold_ptrs[e] points without a victim: the RAM copy, else the file alias (as the tier code sets it)
++static uintptr_t kvl_fallback(const table_t & t, int32_t e) {
++    const int32_t r = e < (int32_t) t.ram_slot.size() ? t.ram_slot[(size_t) e] : -1;
++    return r >= 0 ? (uintptr_t) (t.ram_base + (size_t) r * t.expert_bytes) : tier_file_ptr(t, e);
++}
++// The grid: slots of the largest tier table's expert (4 KiB aligned) from row 2 * step of each tensor to its end.
++static void kvl_build_locked() {
++    if (!g_kvl_slots.empty() || g_kvl_tensors.empty()) {
++        return;
++    }
++    size_t eb = 0;
++    for (const table_t & t : g_tables) {
++        if (t.device == g_kvl_device && t.cold_ptrs != nullptr && t.ram_base != nullptr) {
++            eb = std::max(eb, t.expert_bytes);
++        }
++    }
++    if (eb == 0) {
++        return;
++    }
++    g_kvl_slot_bytes = (eb + 4095) & ~(size_t) 4095;
++    for (int i = 0; i < (int) g_kvl_tensors.size(); i++) {
++        const kvl_tensor_t & kt = g_kvl_tensors[(size_t) i];
++        const uintptr_t lo = (uintptr_t) kt.data + (uintptr_t) (2 * kvl_step()) * kt.row_bytes;
++        size_t off = (size_t) (((lo + 4095) & ~(uintptr_t) 4095) - (uintptr_t) kt.data);
++        for (; off + g_kvl_slot_bytes <= kt.bytes; off += g_kvl_slot_bytes) {
++            kvl_slot_t sl;
++            sl.tensor = i;
++            sl.off    = off;
++            g_kvl_slots.push_back(sl);
++        }
++    }
++    GGML_LOG_WARN("moe_cache KV lending: %zu victim slots of %.2f MiB in %zu KV tensors (%.0f MiB at most)\n",
++                  g_kvl_slots.size(), g_kvl_slot_bytes / 1048576.0, g_kvl_tensors.size(),
++                  g_kvl_slots.size() * (double) g_kvl_slot_bytes / 1048576.0);
++}
++// Drop a slot's expert: its cold pointer back to the fallback, on `s` (ordered before the slot's reuse), or into
++// `sync_out` when the caller writes it after a device synchronize.
++static void kvl_release_locked(kvl_slot_t & sl, cudaStream_t s, std::vector<std::pair<uintptr_t *, uintptr_t>> * sync_out) {
++    if (sl.table < 0) {
++        return;
++    }
++    table_t & t = g_tables[(size_t) sl.table];
++    if (sl.expert < (int32_t) kvl_kvv(t).size()) {
++        kvl_kvv(t)[(size_t) sl.expert] = -1;
++    }
++    if (t.cold_ptrs != nullptr && t.ram_base != nullptr) {
++        const uintptr_t v = kvl_fallback(t, sl.expert);
++        if (sync_out != nullptr) {
++            sync_out->push_back({ t.cold_ptrs + sl.expert, v });
++        } else {
++            moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, sl.expert, v);
++        }
++    }
++    sl.table  = -1;
++    sl.expert = -1;
++    sl.ref    = false;
++    g_kvl_drops++;
++}
++// CLOCK: a free slot, else one whose expert is resident again, else the first without its reference bit.
++static int kvl_alloc_locked(cudaStream_t s, std::vector<std::pair<uintptr_t *, uintptr_t>> * rel = nullptr) {
++    const size_t n = g_kvl_slots.size();
++    for (size_t k = 0; n > 0 && k < 2 * n + 1; k++) {
++        const size_t i  = g_kvl_hand;
++        g_kvl_hand      = (g_kvl_hand + 1) % n;
++        kvl_slot_t & sl = g_kvl_slots[i];
++        if (!kvl_avail(sl) || (int) i == g_kvl_pin || fb_kv_busy((int) i)) {
++            continue;
++        }
++        if (sl.table < 0) {
++            return (int) i;
++        }
++        const table_t & o = g_tables[(size_t) sl.table];
++        if (sl.ref && o.expert_slot.find(sl.expert) == o.expert_slot.end()) {
++            sl.ref = false;
++            continue;
++        }
++        kvl_release_locked(sl, s, rel);
++        return (int) i;
++    }
++    return -1;
++}
++// The arena evicts `victim`, whose bytes are still at `src`: keep a copy in a victim slot (the copy is on `s`, before
++// the caller's fill overwrites `src`).  Returns the slot, or -1; the caller points cold_ptrs at it after the tier swap.
++static int kvl_keep_locked(table_t & t, int32_t victim, const char * src, cudaStream_t s) {
++    if (!g_kvl_in_decode || victim < 0 || victim >= t.n_experts || !kvl_eligible(t)) {
++        return -1;
++    }
++    if (g_kvl_stream == nullptr) {
++        // the lowest layer whose remap has run (fully resident layers never record one); never the highest layer, which
++        // is the MTP draft's own when it has MoE tables
++        int max_layer = -1, lo = 1 << 30;
++        for (const table_t & o : g_tables) {
++            max_layer = std::max(max_layer, o.layer);
++        }
++        for (const table_t & o : g_tables) {
++            if (o.dr_last_stream != nullptr && o.layer < lo && o.layer < max_layer) {
++                lo           = o.layer;
++                g_kvl_stream = o.dr_last_stream;
++            }
++        }
++    }
++    if (g_kvl_stream == nullptr || (void *) s != g_kvl_stream) {
++        return -1;
++    }
++    kvl_build_locked();
++    if (g_kvl_slots.empty() || t.expert_bytes > g_kvl_slot_bytes) {
++        return -1;
++    }
++    if ((int) kvl_kvv(t).size() != t.n_experts) {
++        kvl_kvv(t).assign((size_t) t.n_experts, -1);
++    }
++    int i = kvl_kvv(t)[(size_t) victim];
++    if (i >= 0) {
++        return i;   // still holds it (kept while the expert was resident)
++    }
++    std::vector<std::pair<uintptr_t *, uintptr_t>> rel;
++    i = kvl_alloc_locked(s, fb_on(t) ? &rel : nullptr);
++    if (i < 0) {
++        return -1;
++    }
++    kvl_slot_t & sl = g_kvl_slots[(size_t) i];
++    if (fb_on(t)) {
++        // the release of the slot's previous expert (at most one) goes in this job
++        if (!fb_push_save_locked(t.device, s, (char *) kvl_ptr(sl), src, t.expert_bytes, rel.empty() ? nullptr : rel[0].first, rel.empty() ? -1 : 0,
++                                 rel.empty() ? 0 : rel[0].second)) {
++            return -1;
++        }
++    } else {
++        moe_cache_copy_kernel<<<128, 256, 0, s>>>(kvl_ptr(sl), src, t.expert_bytes);
++        if (cudaGetLastError() != cudaSuccess) {
++            return -1;
++        }
++    }
++    sl.table  = (int) (&t - g_tables.data());
++    sl.expert = victim;
++    sl.ref    = false;
++    kvl_kvv(t)[(size_t) victim] = i;
++    g_kvl_inserts++;
++    return i;
++}
++// A miss served cold: a victim copy (if any) serves it from VRAM (reference bit for CLOCK) -- counted for the report.
++static void kvl_note_cold_locked(const table_t & t, int32_t expert) {
++    if (expert >= 0 && expert < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) expert] >= 0) {
++        g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) expert]].ref = true;
++        g_kvl_hits++;
++    } else if (kvl_eligible(t)) {
++        g_kvl_misses++;
++    }
++}
++// Forget one expert's victim: the caller re-points its cold pointer itself (on the victims' stream).
++static void kvl_forget_locked(table_t & t, int32_t e) {
++    if (e < 0 || e >= (int32_t) kvl_kvv(t).size() || kvl_kvv(t)[(size_t) e] < 0) {
++        return;
++    }
++    kvl_slot_t & sl = g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) e]];
++    sl.table  = -1;
++    sl.expert = -1;
++    sl.ref    = false;
++    kvl_kvv(t)[(size_t) e] = -1;
++}
++// Forget every victim (the caller rewrote or is about to rewrite the cold pointers it touched).
++static void kvl_forget_all_locked() {
++    for (kvl_slot_t & sl : g_kvl_slots) {
++        sl.table  = -1;
++        sl.expert = -1;
++        sl.ref    = false;
++    }
++    for (table_t & t : g_tables) {
++        kvl_kvv(t).clear();
++    }
++}
++// Free every tier and point the cold reads back at the file alias (registering each table's cold set, as at sizing
++// without a tier).  cold_ptrs stays allocated: a captured graph may hold it.
++static void tier_drop_all_locked(const char * why) {
++    (void) fb_flush_locked();   // queued fills read ram_base
++    if (g_tier_off) {
++        return;
++    }
++    g_tier_off = true;
++    bool any = false;
++    for (const table_t & t : g_tables) {
++        any = any || t.ram_base != nullptr;
++    }
++    if (!any) {
++        return;
++    }
++    int n_dev = 0;
++    (void) cudaGetDeviceCount(&n_dev);
++    for (int d = 0; d < n_dev; d++) {
++        device_guard dg(d);
++        (void) cudaDeviceSynchronize();   // no swap or cold read of a tier may still be in flight
++    }
++    kvl_forget_all_locked();   // the cold pointers are all rewritten below (to the file); no tier, no victims
++    for (table_t & t : g_tables) {
++        if (t.ram_base == nullptr) {
++            continue;
++        }
++        device_guard dg(t.device);
++        (void) munlock(t.ram_base, t.ram_bytes);
++        (void) cudaFreeHost(t.ram_base);
++        t.ram_base  = nullptr;
++        t.ram_bytes = 0;
++        t.ram_slot.clear();
++        t.ram_partial = false;
++        t.ram_free.clear();
++        t.ram_pending.clear();
++        t.swap_defer = false; t.swap_mark_flag = false;
++        for (const table_t::precopy_t & c : t.precopy) {
++            t.precopy_idle.push_back(c.ev);
++        }
++        t.precopy.clear();
++        std::vector<uintptr_t> ptrs((size_t) t.n_experts);
++        for (int32_t e = 0; e < t.n_experts; e++) {
++            ptrs[(size_t) e] = tier_file_ptr(t, e);
++        }
++        (void) cudaMemcpy(t.cold_ptrs, ptrs.data(), ptrs.size() * sizeof(uintptr_t), cudaMemcpyHostToDevice);
++        (void) cudaGetLastError();
++        if (t.arena != nullptr && t.slots > 0) {
++            for (int32_t e = 0; e < t.n_experts; e++) {
++                if (t.expert_slot.find(e) == t.expert_slot.end() && !sparse_need_locked(t, e)) {
++                    break;   // the rest registers on first touch, or the read declines
++                }
++            }
++        }
++    }
++    GGML_LOG_WARN("moe_cache RAM tier off (%s): %.0f MiB freed, cold experts are read from the file mapping\n", why,
++                  g_tier_bytes / 1048576.0);
++    g_tier_bytes = 0;
++}
++// Build the tier of a sized sparse table: copy every expert the arena does not hold from the (populated) mapping.
++static int64_t tier_kept_reg_bytes_locked(const table_t & t) {
++    int64_t n = (int64_t) g_sreg_bytes;
++    for (const table_t & o : g_tables) {
++        if (o.host_sparse && o.host_dev != nullptr && o.ram_base == nullptr && (&o == &t || !o.allocated)) {
++            n -= (int64_t) sreg_bytes_in((uintptr_t) o.host_dev, (uintptr_t) o.host_dev + (size_t) o.n_experts * o.host_bytes);
++        }
++    }
++    return std::max<int64_t>(0, n);
++}
++// Equal per-layer share of the pin budget when the full tier of every sparse table does not fit (GGML_MOE_TIER_SHARE,
++// default on): layer -> the number of cold experts each of its tables' tiers holds (the same for every table of the
++// layer).  Planned by tier_share_plan_locked before the layer loop of a sizing pass, from the planned slot counts; no
++// entry: the full tier.
++static std::map<int, int> g_tier_share;
++static int tier_share_experts_locked(const table_t & t) {
++    const auto it = g_tier_share.find(t.layer);
++    return it == g_tier_share.end() ? -1 : it->second;
++}
++static int64_t tier_budget_bytes();
++// Plan the shares for a sizing pass: full needs (cold experts + spares) x expert bytes per sparse table, with the cold
++// count from the layer's planned slots; over the budget, every layer with cold experts gets (budget - headroom) /
++// n_layers, as an expert count per table (GGML_MOE_TIER_REG_HEADROOM_MIB, default 10 % of the budget, is left for the
++// registrations of the non-members).
++static void tier_share_plan_locked(const std::map<int, std::vector<int>> & by_layer, const int * layer_slots,
++                                   const std::vector<int> & layer_order) {
++    static const bool on = [] {
++        const char * e = getenv("GGML_MOE_TIER_SHARE");
++        return (e == nullptr || atoi(e) != 0) && tier_fill_on();   // without the fill a partial tier can decline
++    }();
++    g_tier_share.clear();
++    if (!on) {
++        return;
++    }
++    const int64_t budget = tier_budget_bytes();
++    int64_t need = 0;
++    std::map<int, int64_t> layer_eb;   // one expert of every sparse table of the layer that has cold experts
++    std::map<int, int64_t> layer_need; // the layer's full tier
++    for (const auto & kv : by_layer) {
++        const int slots = (kv.first >= 0 && kv.first < 512 && layer_slots[kv.first] >= 0) ? layer_slots[kv.first] : 0;
++        for (int i : kv.second) {
++            const table_t & t = g_tables[(size_t) i];
++            const int n_cold = t.n_experts - slots;
++            if (!t.host_sparse || t.host_dev == nullptr || n_cold <= 0) {
++                continue;
++            }
++            need += (int64_t) (n_cold + g_tier_spares) * (int64_t) t.expert_bytes + SREG_PAD;
++            layer_need[kv.first] += (int64_t) (n_cold + g_tier_spares) * (int64_t) t.expert_bytes + SREG_PAD;
++            layer_eb[kv.first] += (int64_t) t.expert_bytes;
++        }
++    }
++    if (budget <= 0 || need <= budget || layer_eb.empty()) {
++        return;
++    }
++    const char *  hr        = getenv("GGML_MOE_TIER_REG_HEADROOM_MIB");
++    const int64_t headroom  = hr != nullptr ? (int64_t) atoll(hr) << 20 : budget / 10;
++    const int64_t avail = std::max<int64_t>(0, budget - headroom);
++    // GGML_MOE_TIER_SHARE_MIN_PCT=P (default 30; 0 = an equal share for every layer): the hottest layers keep their full tier (no share entry: the device remap) while
++    // every later layer can still get P % of its own full tier; those later layers share what is left.
++    static const int min_pct = [] {
++        const char * e = getenv("GGML_MOE_TIER_SHARE_MIN_PCT");
++        return e != nullptr ? std::max(0, std::min(100, atoi(e))) : 30;
++    }();
++    std::vector<int> order;   // the sizing order, layers with cold experts only
++    for (int l : layer_order) {
++        if (layer_eb.count(l)) {
++            order.push_back(l);
++        }
++    }
++    size_t n_full = 0;
++    if (min_pct > 0) {
++        int64_t full = 0, rest_min = 0;
++        for (int l : order) {
++            rest_min += layer_need[l] * min_pct / 100;
++        }
++        while (n_full < order.size()) {
++            const int     l      = order[n_full];
++            const int64_t f2     = full + layer_need[l];
++            const int64_t r2     = rest_min - layer_need[l] * min_pct / 100;
++            if (f2 + r2 > avail) {
++                break;
++            }
++            full     = f2;
++            rest_min = r2;
++            n_full++;
++        }
++        const int64_t left = avail - full;
++        if (n_full < order.size()) {
++            const int64_t per_layer = left / (int64_t) (order.size() - n_full);
++            for (size_t i = n_full; i < order.size(); i++) {
++                g_tier_share[order[i]] = (int) std::max<int64_t>(0, per_layer / layer_eb[order[i]] - g_tier_spares);
++            }
++            GGML_LOG_WARN("moe_cache RAM tier: the full tier (%.0f MiB) exceeds the pin budget (%.0f MiB): %zu layers keep "
++                          "a full tier (%.0f MiB), the other %zu get %.0f MiB each of their hottest cold experts (%.0f MiB "
++                          "kept for registrations)\n", need / 1048576.0, budget / 1048576.0, n_full, full / 1048576.0,
++                          order.size() - n_full, per_layer / 1048576.0, headroom / 1048576.0);
++        }
++        return;
++    }
++    const int64_t per_layer = avail / (int64_t) layer_eb.size();
++    for (const auto & kv : layer_eb) {
++        g_tier_share[kv.first] = (int) std::max<int64_t>(0, per_layer / kv.second - g_tier_spares);
++    }
++    GGML_LOG_WARN("moe_cache RAM tier: the full tier (%.0f MiB) exceeds the pin budget (%.0f MiB): each of %zu layers "
++                  "gets %.0f MiB of its hottest cold experts (%.0f MiB kept for registrations)\n", need / 1048576.0,
++                  budget / 1048576.0, layer_eb.size(), per_layer / 1048576.0, headroom / 1048576.0);
++}
++static int64_t tier_budget_bytes() {
++    static const int64_t v = [] {
++        const char * s = getenv("GGML_MOE_RAM_TIER_MIB");
++        const int64_t pb = pin_budget_bytes();
++        return s != nullptr ? std::min<int64_t>((int64_t) atoll(s) << 20, pb) : pb;
++    }();
++    return v;
++}
++static bool tier_build_locked(table_t & t) {
++    const int64_t budget = tier_budget_bytes();
++    static bool logged = false;
++    if (!logged) {
++        logged = true;
++        GGML_LOG_INFO("moe_cache RAM tier: pin budget %.0f MiB (GGML_MOE_PIN_BUDGET_MIB; RAM %.0f MiB)\n",
++                      budget / 1048576.0, sreg_phys_bytes() / 1048576.0);
++    }
++    if (g_tier_off || t.ram_base != nullptr) {
++        return false;
++    }
++    if (budget <= 0) {
++        tier_drop_all_locked("GGML_MOE_RAM_TIER_MIB=0");
++        return false;
++    }
++    const int n_cold = t.n_experts - (int) t.expert_slot.size();
++    if (n_cold <= 0) {
++        return false;   // wholly resident: no cold reads
++    }
++    if ((((uintptr_t) t.host_dev | t.host_bytes | t.src_off | t.expert_bytes) & 1) != 0) {
++        tier_drop_all_locked("odd geometry");
++        return false;
++    }
++    // + SREG_PAD: the decode kernels read a little past an expert's last row (the file path has the same pad), and the
++    // last RAM slot holds an expert too
++    int    n_spare = g_tier_spares;
++    const int n_share = tier_share_experts_locked(t);
++    const bool partial = n_share >= 0 && n_share < n_cold;
++    if (n_share == 0) {
++        g_tier_partial++;
++        return false;   // no share for this layer: the registered file alias
++    }
++    const int n_tier = partial ? n_share : n_cold;
++    size_t bytes   = (size_t) (n_tier + n_spare) * t.expert_bytes + SREG_PAD;
++    const int64_t kept_reg = tier_kept_reg_bytes_locked(t);
++    if (!partial && n_spare > 1 && g_tier_bytes + kept_reg + (int64_t) bytes > budget) {
++        n_spare = 1;   // the extra spares do not fit: the single-spare layout
++        bytes   = (size_t) (n_cold + 1) * t.expert_bytes + SREG_PAD;
++    }
++    // Registrations count only where they stay: the tables already left without a tier (a later, smaller table must not
++    // overshoot by them).  This table's own span and the not-yet-sized tables' warm-up registrations are replaced by
++    // their tiers (the sized trim after each build), so the pinned total stays within the budget plus one table.
++    if (!partial && g_tier_bytes + kept_reg + (int64_t) bytes > budget) {
++        g_tier_partial++;
++        if (g_tier_partial == 1) {
++            GGML_LOG_WARN("moe_cache RAM tier: the pin budget (%.0f MiB) is reached after %.0f MiB: this and the colder "
++                          "tables read their cold experts through the registered file mapping (slower)\n",
++                          budget / 1048576.0, g_tier_bytes / 1048576.0);
++        }
++        return false;   // partial tier: the hotter tables keep theirs
++    }
++    device_guard dg(t.device);
++    // a failure frees cold_ptrs again (built once, at sizing: no graph holds it yet), so the decode kernel never
++    // sees an unwritten table
++    const auto fail = [&](const char * why) {
++        (void) cudaGetLastError();
++        if (t.cold_ptrs != nullptr) {
++            (void) cudaFree(t.cold_ptrs);
++            t.cold_ptrs = nullptr;
++        }
++        (void) cudaGetLastError();
++        tier_drop_all_locked(why);
++        return false;
++    };
++    if (t.cold_ptrs == nullptr && cudaMalloc((void **) &t.cold_ptrs, (size_t) t.n_experts * sizeof(uintptr_t)) != cudaSuccess) {
++        t.cold_ptrs = nullptr;
++        return fail("cold pointer table");
++    }
++    if (t.swap_ev == nullptr && cudaEventCreateWithFlags(&t.swap_ev, cudaEventDisableTiming) != cudaSuccess) {
++        t.swap_ev = nullptr;
++        return fail("event");
++    }
++    char * base = nullptr;
++    if (cudaHostAlloc((void **) &base, bytes, cudaHostAllocPortable) != cudaSuccess) {
++        return fail("pinned allocation");
++    }
++    // hipHostMalloc is shmem on the normal LRU here (not a pin): the kernel swaps GPU-only-read pages out first and
++    // KFD faults them back in, so lock the tier like the registered master.
++    if (mlock(base, bytes) != 0 && g_sreg_nolock++ < 2) {
++        GGML_LOG_WARN("moe_cache RAM tier: mlock %zu bytes failed: %s (the tier may be swapped)\n", bytes, strerror(errno));
++    }
++    std::vector<uintptr_t> ptrs((size_t) t.n_experts);
++    t.ram_slot.assign((size_t) t.n_experts, -1);
++    // A partial tier holds the n_tier hottest cold experts (heat prior; ties by expert id, so the tables of a layer
++    // choose the same set from the same routing counts).
++    std::vector<uint8_t> member((size_t) t.n_experts, partial ? 0 : 1);
++    if (partial) {
++        const std::vector<uint32_t> & heat = heat_rank_vec(t);
++        std::vector<int32_t> cold;
++        for (int32_t e = 0; e < t.n_experts; e++) {
++            if (t.expert_slot.find(e) == t.expert_slot.end()) {
++                cold.push_back(e);
++            }
++        }
++        const auto h = [&](int32_t e) { return (size_t) e < heat.size() ? heat[(size_t) e] : 0u; };
++        std::stable_sort(cold.begin(), cold.end(), [&](int32_t a, int32_t b) { return h(a) > h(b); });
++        for (int k = 0; k < n_tier && k < (int) cold.size(); k++) {
++            member[(size_t) cold[(size_t) k]] = 1;
++        }
++    }
++    int32_t j = 0;
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        if (t.expert_slot.find(e) != t.expert_slot.end() || !member[(size_t) e]) {
++            ptrs[(size_t) e] = tier_file_ptr(t, e);
++            continue;
++        }
++        char * dst = base + (size_t) j * t.expert_bytes;
++        sparse_pack_expert(t, e, dst);
++        ptrs[(size_t) e]       = (uintptr_t) dst;
++        t.ram_slot[(size_t) e] = j++;
++    }
++    if (cudaMemcpy(t.cold_ptrs, ptrs.data(), ptrs.size() * sizeof(uintptr_t), cudaMemcpyHostToDevice) != cudaSuccess) {
++        (void) munlock(base, bytes);
++        (void) cudaFreeHost(base);
++        t.ram_slot.clear();
++        return fail("cold pointer upload");
++    }
++    t.ram_base    = base;
++    t.ram_bytes   = bytes;
++    t.ram_partial = partial;
++    g_tier_share_tables += partial ? 1 : 0;
++    t.ram_free.clear();
++    for (int k = 0; k < n_spare; k++) {
++        t.ram_free.push_back(j + k);   // the spares
++    }
++    g_tier_bytes += (int64_t) bytes;
++    return true;
++}
++// Once every table reading this master has its tier, the file pages are never read again: unmap them from the
++// aliases and drop them from the page cache, so the load does not push the rest of the process out to swap.
++static void tier_release_file_locked(const table_t & t) {
++    for (const table_t & o : g_tables) {
++        if (o.host == t.host && o.host_sparse && (o.ram_base == nullptr || o.ram_partial) &&
++            (!o.allocated || (o.slots > 0 && !o.identity))) {
++            return;   // another device's table still packs from these pages
++        }
++    }
++    const size_t pg = sreg_page();
++    for (const table_t & o : g_tables) {
++        if (o.host != t.host || o.host_dev == nullptr) {
++            continue;
++        }
++        const uintptr_t lo = (uintptr_t) o.host_dev & ~(uintptr_t) (pg - 1);
++        const uintptr_t hi = (uintptr_t) o.host_dev + (size_t) o.n_experts * o.host_bytes;
++        (void) madvise((void *) lo, hi - lo, MADV_DONTNEED);
++        for (const sreg_alias_t & m : g_sreg_alias) {
++            if (lo >= m.lo && hi <= m.hi) {
++                (void) posix_fadvise(m.fd, m.off + (off_t) (lo - m.lo), (off_t) (hi - lo), POSIX_FADV_DONTNEED);
++                break;
++            }
++        }
++    }
++}
++// Admit expert `e` (in the tier) into arena slot `dst`, moving `victim` (the slot's resident, or -1) into the tier:
++// victim -> the spare RAM slot (D2H), then e's RAM slot -> the arena (H2D); e's RAM slot becomes the spare.  All on
++// the admission stream, which every reader of this table's arena and tier (bar the prefill staging) shares.
++static std::vector<table_t::precopy_t>::iterator precopy_find(table_t & t, int32_t e) {
++    return std::find_if(t.precopy.begin(), t.precopy.end(), [e](const table_t::precopy_t & c) { return c.expert == e; });
++}
++// Copy-back ahead (GGML_MOE_TIER_PRECOPY): after a policy pass, copy the residents the policy would evict next (its own
++// order: smallest decaying count, then oldest use; this call's experts excluded) into free spare RAM slots on the
++// device's side stream, so their later eviction is only the H2D of the incoming expert.  One spare always stays free
++// for the in-stream fallback.  Nothing reads a spare, and an expert's arena bytes do not change while it is resident;
++// the side stream first waits for the compute stream's work so far (a recent fill of a candidate has landed).
++static cudaStream_t precopy_stream(int device) {
++    static std::map<int, cudaStream_t> streams;
++    const auto it = streams.find(device);
++    if (it != streams.end()) {
++        return it->second;
++    }
++    cudaStream_t ss = nullptr;
++    if (cudaStreamCreateWithFlags(&ss, cudaStreamNonBlocking) != cudaSuccess) {
++        (void) cudaGetLastError();
++        ss = nullptr;
++    }
++    streams[device] = ss;
++    return ss;
++}
++static void precopy_plan_locked(table_t & t, void * stream, const int32_t * protect, int n_protect) {
++    const int want = g_tier_spares - 1;
++    if (!g_precopy || want <= 0 || g_tier_off || t.ram_base == nullptr || stream == nullptr || t.arena == nullptr ||
++        t.slots <= 0 || t.device < 0) {
++        return;
++    }
++    device_guard dg(t.device);
++    std::vector<int32_t> cand;
++    cand.reserve((size_t) t.slots);
++    for (int sl = 0; sl < t.slots; sl++) {
++        const int32_t e = t.slot_expert[(size_t) sl];
++        if (e < 0 || std::find(protect, protect + n_protect, e) != protect + n_protect) {
++            continue;
++        }
++        cand.push_back(e);
++    }
++    const auto lower = [&](int32_t a, int32_t b) {
++        return t.count[a] < t.count[b] || (t.count[a] == t.count[b] && t.last[a] < t.last[b]);
++    };
++    const size_t n_cand = std::min(cand.size(), (size_t) want);
++    std::partial_sort(cand.begin(), cand.begin() + n_cand, cand.end(), lower);
++    cand.resize(n_cand);
++
++    // reclaim the precopies of residents that are no longer candidates (only once their copy is done)
++    for (auto it = t.precopy.begin(); it != t.precopy.end(); ) {
++        if (std::find(cand.begin(), cand.end(), it->expert) == cand.end() && cudaEventQuery(it->ev) == cudaSuccess) {
++            t.ram_free.push_back(it->ram);
++            t.precopy_idle.push_back(it->ev);
++            it = t.precopy.erase(it);
++            g_pc_reclaimed++;
++        } else {
++            (void) cudaGetLastError();
++            ++it;
++        }
++    }
++
++    cudaStream_t ss     = nullptr;
++    int          n_new  = 0;
++    bool         waited = false;
++    const bool   fenced = g_defer_tab == &t;   // only a decode take-over defers (GGML_MOE_FILL_FENCE)
++    for (const int32_t e : cand) {
++        if (n_new >= 2) {
++            break;   // bounds the hook's host time per call; later calls continue
++        }
++        if (t.ram_free.size() <= 1) {
++            break;   // keep one spare for the in-stream fallback
++        }
++        if (precopy_find(t, e) != t.precopy.end()) {
++            continue;
++        }
++        const auto rs = t.expert_slot.find(e);
++        if (rs == t.expert_slot.end() || rs->second < 0) {
++            continue;
++        }
++        // GGML_MOE_FILL_FENCE, decode take-over: a slot whose fill the lag flag shows landed needs no wait
++        bool need_wait = true;
++        if (fenced) {
++            const int32_t q = slot_seq_get_locked(t, rs->second);
++            if (q == -2 || (q > 0 && !fence_done_locked(t, q))) {
++                continue;   // filled in this take-over or not landed yet: a later call copies it
++            }
++            need_wait = q == -1;
++        }
++        if (ss == nullptr) {
++            ss = precopy_stream(t.device);
++            if (ss == nullptr) {
++                return;
++            }
++        }
++        if (need_wait && !waited) {
++            if ((t.pol_ev == nullptr && cudaEventCreateWithFlags(&t.pol_ev, cudaEventDisableTiming) != cudaSuccess) ||
++                cudaEventRecord(t.pol_ev, (cudaStream_t) stream) != cudaSuccess ||
++                cudaStreamWaitEvent(ss, t.pol_ev, 0) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return;
++            }
++            waited = true;
++            g_pc_polev++;
++        }
++        cudaEvent_t ev = nullptr;
++        if (!t.precopy_idle.empty()) {
++            ev = t.precopy_idle.back();
++            t.precopy_idle.pop_back();
++        } else if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return;
++        }
++        const int32_t q  = t.ram_free.back();
++        const size_t  eb = t.expert_bytes;
++        // the copy kernel, not hipMemcpyAsync (see moe_cache_copy_kernel); a small grid leaves the CUs to the op
++        moe_cache_copy_kernel<<<32, 256, 0, ss>>>(t.ram_base + (size_t) q * eb,
++                                                  (const char *) t.arena + (size_t) rs->second * eb, eb);
++        if (cudaGetLastError() != cudaSuccess || cudaEventRecord(ev, ss) != cudaSuccess) {
++            (void) cudaGetLastError();
++            (void) cudaStreamSynchronize(ss);   // a copy may be in flight into q: drain it before q is reused
++            (void) cudaGetLastError();
++            t.precopy_idle.push_back(ev);   // a failed record leaves it unrecorded; the slot stays free
++            return;
++        }
++        t.ram_free.pop_back();
++        t.precopy.push_back({ e, q, ev });
++        g_pc_issued++;
++        n_new++;
++    }
++}
++static cudaError_t sparse_fill_locked(const table_t & t, void * dst, int32_t e, void * stream);
++// Partial tier, eager call (GGML_MOE_TIER_FILL): copy every routed expert that is neither resident nor a member into the
++// tier, in the RAM slot of the member with the smallest decaying demand (ghost, then oldest use) that this call does not
++// route; its cold pointer is set on the compute stream before the op.  The GPU reads none of those slots now: the
++// scheduler synchronized for the routing readback, the slots of pending swaps (ram_pending) and copy-back targets
++// (t.precopy) belong to no member, and an expert outside the tier is never read (this runs before every read of it).
++// With every member routed a spare slot takes the expert; only with no spare either does it stay outside the tier (pass 2
++// registers it and reads it through the alias, which the trim keeps registered).
++// The last sparse staging launch per device (moe_cache_stage_table, on the copy stream): its kernel reads tier slots through
++// host-side source pointers taken at launch, so a fill waits for it before the CPU rewrites a slot.
++static cudaEvent_t g_stage_ev[GGML_CUDA_MAX_DEVICES] = {};
++static bool        g_stage_ev_live[GGML_CUDA_MAX_DEVICES] = {};
++static bool tier_fill_through_locked(table_t & t, const std::vector<int32_t> & used, void * stream) {
++    if (!t.ram_partial || t.ram_base == nullptr || stream == nullptr || !tier_fill_on()) {
++        return true;
++    }
++    std::vector<uint8_t> routed((size_t) t.n_experts, 0);
++    for (int32_t e : used) {
++        routed[(size_t) e] = 1;
++    }
++    device_guard       dg(t.device);
++    const cudaStream_t s  = (cudaStream_t) stream;
++    const size_t       eb = t.expert_bytes;
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        if (!routed[(size_t) e] || t.ram_slot[(size_t) e] >= 0 || t.expert_slot.find(e) != t.expert_slot.end()) {
++            continue;
++        }
++        int32_t v = -1;
++        for (int32_t c = 0; c < t.n_experts; c++) {
++            if (t.ram_slot[(size_t) c] < 0 || routed[(size_t) c]) {
++                continue;
++            }
++            if (v < 0 || t.ghost[(size_t) c] < t.ghost[(size_t) v] ||
++                (t.ghost[(size_t) c] == t.ghost[(size_t) v] && t.last[(size_t) c] < t.last[(size_t) v])) {
++                v = c;
++            }
++        }
++        if (v < 0 && t.ram_free.empty()) {
++            continue;
++        }
++        if (t.device >= 0 && t.device < GGML_CUDA_MAX_DEVICES && g_stage_ev_live[t.device]) {
++            if (cudaEventSynchronize(g_stage_ev[t.device]) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return false;
++            }
++            g_stage_ev_live[t.device] = false;
++        }
++        int32_t q;
++        if (v >= 0) {
++            q = t.ram_slot[(size_t) v];
++            t.ram_slot[(size_t) v] = -1;
++            moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, v, tier_file_ptr(t, v));   // q is e's from here on
++        } else {
++            q = t.ram_free.back();   // every member is routed: a spare (no cold pointer reads it) joins the tier
++            t.ram_free.pop_back();
++        }
++        char * d = t.ram_base + (size_t) q * eb;
++        sparse_pack_expert(t, e, d);
++        t.ram_slot[(size_t) e] = q;
++        moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, e, (uintptr_t) d);
++        // a victim copy of either is still exact: point back at it (VRAM) on the victims' stream, else forget it
++        for (const int32_t x : { v, e }) {
++            if (x >= 0 && x < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) x] >= 0) {   // v is -1 when a spare took e
++                if ((void *) s == g_kvl_stream) {
++                    moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, x, (uintptr_t) kvl_ptr(g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) x]]));
++                } else {
++                    kvl_forget_locked(t, x);
++                }
++            }
++        }
++        if (cudaGetLastError() != cudaSuccess) {
++            return false;
++        }
++        g_tier_thru++;
++    }
++    return true;
++}
++// `vsrc`: a victim slot holding e (KV lending): the fill reads it instead of the RAM tier or the file (same bytes).
++// Is this admission's fill queued (fb_*) instead of launched?  Then the victim's final cold pointer travels with it.
++static inline bool fb_takes(const table_t & t, int32_t e) {
++    return fb_on(t) && e >= 0 && e < (int32_t) t.ram_slot.size() && t.ram_slot[(size_t) e] >= 0;
++}
++static cudaError_t tier_swap_locked(table_t & t, void * dst, int32_t e, int32_t victim, void * stream,
++                                    const char * vsrc = nullptr, uintptr_t victim_final = 0) {
++    const int32_t p  = e >= 0 && e < (int32_t) t.ram_slot.size() ? t.ram_slot[(size_t) e] : -1;
++    const bool    batch = fb_takes(t, e);
++    if (!batch && !fb_flush_locked()) {   // a launch below must not overtake a queued reader of the same slot
++        return cudaErrorInvalidValue;
++    }
++    const auto    pc = victim >= 0 ? precopy_find(t, victim) : t.precopy.end();
++    // A partial tier: an incoming non-member (p < 0) fills from the registered alias, and a victim with no RAM slot
++    // goes back to the file (its cold pointer only; the caller checked that it is registered and cached).
++    if ((p < 0 && !t.ram_partial) || stream == nullptr ||
++        (victim >= 0 && pc == t.precopy.end() && t.ram_free.empty() && !t.ram_partial)) {
++        return cudaErrorInvalidValue;
++    }
++    device_guard       dg(t.device);
++    const cudaStream_t s  = (cudaStream_t) stream;
++    const size_t       eb = t.expert_bytes;
++    int32_t   set_e = -1;   // copy-back ahead: the victim's cold pointer, written by the H2D kernel
++    uintptr_t set_v = 0;
++    if (pc != t.precopy.end()) {
++        // The victim's bytes are already in RAM slot pc->ram (or will be once pc->ev fires): wait for that copy on the
++        // GPU before the H2D below overwrites the victim's arena slot; the H2D kernel points its cold reads at the copy.
++        const int32_t q = pc->ram;
++        if (cudaEventQuery(pc->ev) != cudaSuccess) {
++            (void) cudaGetLastError();
++            g_pc_waited++;
++        }
++        if (cudaStreamWaitEvent(s, pc->ev, 0) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return cudaErrorInvalidValue;
++        }
++        set_e = victim;
++        set_v = (uintptr_t) (t.ram_base + (size_t) q * eb);
++        t.precopy_idle.push_back(pc->ev);   // reusable: the wait above captured this record
++        t.precopy.erase(pc);
++        t.ram_slot[(size_t) victim] = q;
++        g_pc_used++;
++    } else if (victim >= 0 && !t.ram_free.empty()) {
++        g_tier_swaps_d2h++;
++        const int32_t q  = t.ram_free.back();
++        char *        vr = t.ram_base + (size_t) q * eb;
++        if (batch) {
++            if (!fb_push_save_locked(t.device, s, vr, (const char *) dst, eb, nullptr, -1, 0)) {
++                return cudaErrorInvalidValue;
++            }
++            set_e = victim;
++            set_v = (uintptr_t) vr;
++        } else {
++            moe_cache_copy_kernel<<<128, 256, 0, s>>>(vr, (const char *) dst, eb);
++            const cudaError_t err = cudaGetLastError();
++            if (err != cudaSuccess) {
++                return err;
++            }
++            moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, victim, (uintptr_t) vr);
++        }
++        t.ram_free.pop_back();
++        t.ram_slot[(size_t) victim] = q;
++    } else if (victim >= 0) {
++        if (batch) {
++            set_e = victim;
++            set_v = tier_file_ptr(t, victim);
++        } else {
++            moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, victim, tier_file_ptr(t, victim));
++        }
++        g_tier_file_victims++;
++    }
++    if (batch) {
++        if (victim_final != 0) {
++            set_e = victim;
++            set_v = victim_final;   // the victim's copy in VRAM wins over the RAM / file pointer
++        }
++        const int slot = (int) (((const char *) dst - (const char *) t.arena) / (ptrdiff_t) eb);
++        if (!fb_push_fill_locked(t.device, s, (char *) dst, vsrc ? vsrc : t.ram_base + (size_t) p * eb, eb, set_e >= 0 ? t.cold_ptrs : nullptr, set_e, set_v)) {
++            return cudaErrorInvalidValue;
++        }
++        g_fb.undo[g_fb.n_undo++] = { (int) (&t - g_tables.data()), slot, e };
++        t.ram_slot[(size_t) e] = -1;
++        t.ram_pending.push_back(p);
++        t.swap_defer = true; t.mark_stream = stream;
++        g_tier_swaps++;
++        return cudaSuccess;
++    }
++    if (p < 0) {
++        cudaError_t err = cudaSuccess;
++        if (vsrc != nullptr) {
++            moe_cache_copy_kernel<<<128, 256, 0, s>>>((char *) dst, vsrc, eb);
++            err = cudaGetLastError();
++        } else {
++            err = sparse_fill_locked(t, dst, e, stream);
++        }
++        if (err == cudaSuccess && set_e >= 0) {
++            moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, set_e, set_v);
++            err = cudaGetLastError();
++        }
++        if (err != cudaSuccess) {
++            return err;
++        }
++        if (g_defer_tab == &t) {
++            t.swap_defer = true; t.mark_stream = stream;
++        } else {
++            (void) cudaEventRecord(t.swap_ev, s);
++            t.swap_mark_flag = false;
++        }
++        g_tier_file_fills++;
++        g_tier_swaps++;
++        return cudaGetLastError();
++    }
++    if (set_e >= 0) {
++        moe_cache_copy_set_kernel<<<128, 256, 0, s>>>((char *) dst, vsrc ? vsrc : t.ram_base + (size_t) p * eb, eb, t.cold_ptrs,
++                                                      set_e, set_v);
++    } else {
++        moe_cache_copy_kernel<<<128, 256, 0, s>>>((char *) dst, vsrc ? vsrc : t.ram_base + (size_t) p * eb, eb);
++    }
++    const cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        return err;
++    }
++    t.ram_slot[(size_t) e] = -1;
++    t.ram_pending.push_back(p);   // its H2D is only enqueued: a D2H into it before that copy ran would corrupt the expert
++    if (g_defer_tab == &t) {
++        t.swap_defer = true; t.mark_stream = stream;
++    } else {
++        (void) cudaEventRecord(t.swap_ev, s);
++        t.swap_mark_flag = false;
++    }
++    g_tier_swaps++;
++    return cudaGetLastError();
++}
++// GGML_MOE_FILL_FENCE: the lag flag has reached `seq` (the remap launch that wrote it ran after the deferred work).
++static bool fence_done_locked(const table_t & t, int32_t seq) {
++    if (t.dr_lag_host == nullptr) {
++        return false;
++    }
++    const uint32_t v = (uint32_t) __atomic_load_n(&t.dr_lag_host[t.dr_cap], __ATOMIC_ACQUIRE);
++    return (int32_t) (v - (uint32_t) seq) >= 0;
++}
++static void slot_seq_set_locked(table_t & t, int slot, int32_t v) {
++    if (slot < 0) {
++        return;
++    }
++    if ((size_t) slot >= t.slot_seq.size()) {
++        t.slot_seq.resize((size_t) slot + 1, -1);
++    }
++    t.slot_seq[(size_t) slot] = v;
++}
++static int32_t slot_seq_get_locked(const table_t & t, int slot) {
++    return slot >= 0 && (size_t) slot < t.slot_seq.size() ? t.slot_seq[(size_t) slot] : -1;
++}
++static void fb_launch_locked(const moe_fill_jobs & jobs, int n, cudaStream_t s) {
++    dim3       grid(128, (unsigned) n);
++    const dim3 block(256);
++    if (ggml_cuda_grid_stall_pad(grid, block)) {
++        grid.x = 129;   // the kernel's stride loop takes any block count; 129 x n blocks stays off the stall for every n
++    }
++    moe_cache_fill_batch_kernel<<<grid, block, 0, s>>>(jobs);
++}
++static bool fb_flush_locked() {
++    if (g_fb.n_save == 0 && g_fb.n_fill == 0) {
++        return true;
++    }
++    // GGML_MOE_FILL_BATCH_FAULT=<n> (debug): the n-th flush fails without launching.
++    static const int64_t fault = [] { const char * e = getenv("GGML_MOE_FILL_BATCH_FAULT"); return e != nullptr ? (int64_t) atoll(e) : (int64_t) 0; }();
++    g_fb_flushes++;
++    g_fb_jobs += g_fb.n_save + g_fb.n_fill;
++    bool ok = !(fault > 0 && g_fb_flushes == fault);
++    if (ok) {
++        device_guard dg(g_fb.device);
++        if (g_fb.n_save > 0) {
++            fb_launch_locked(g_fb.save, g_fb.n_save, g_fb.stream);
++            ok = cudaGetLastError() == cudaSuccess;
++        }
++        if (ok && g_fb.n_fill > 0) {
++            fb_launch_locked(g_fb.fill, g_fb.n_fill, g_fb.stream);
++            ok = cudaGetLastError() == cudaSuccess;
++        }
++    }
++    g_fb.n_save = g_fb.n_fill = g_fb.n_kv = 0;
++    const int n_undo = g_fb.n_undo;
++    g_fb.n_undo = 0;
++    if (ok) {
++        return true;
++    }
++    // Every queued fill's slot still has its old bytes while expert_slot names it: same end state as a failed swap.
++    (void) cudaGetLastError();
++    g_fb_failed++;
++    GGML_LOG_WARN("%s: batched fill launch failed; dropping the RAM tier\n", __func__);
++    for (int k = 0; k < n_undo; k++) {
++        table_t & t = g_tables[(size_t) g_fb.undo[k].table];
++        t.expert_slot.erase(g_fb.undo[k].expert);
++        t.slot_expert[g_fb.undo[k].slot] = -1;
++        t.slot_dirty = true;
++        slot_seq_set_locked(t, g_fb.undo[k].slot, -1);
++    }
++    tier_drop_all_locked("batched fill failed");
++    return false;
++}
++// Deferred swaps / map upload that no launch will cover: record their events now (on the stream they went to).
++static void fence_flush_locked(table_t & t) {
++    (void) fb_flush_locked();   // the events must land after the batch kernels on mark_stream
++    for (int32_t sl : t.defer_slots) {
++        if (slot_seq_get_locked(t, sl) == -2) {
++            slot_seq_set_locked(t, sl, -1);   // its fill is covered by swap_ev only: the side stream waits on pol_ev
++        }
++    }
++    t.defer_slots.clear();
++    if (!t.swap_defer && !t.map_defer) {
++        return;
++    }
++    device_guard dg(t.device);
++    const cudaStream_t ms = (cudaStream_t) t.mark_stream;
++    if (t.swap_defer) {
++        (void) cudaEventRecord(t.swap_ev, ms);
++        t.swap_defer = false; t.swap_mark_flag = false;
++    }
++    if (t.map_defer) {
++        (void) cudaEventRecord(t.dr_map_ev, ms);
++        t.map_defer = false; t.map_mark_flag = false;
++    }
++    (void) cudaGetLastError();
++    g_fence_flushes++;
++}
++// The remap launch that writes lag flag value `seq` covers the deferred work.
++static void fence_commit_locked(table_t & t, int32_t seq) {
++    for (int32_t sl : t.defer_slots) {
++        if (slot_seq_get_locked(t, sl) == -2) {
++            slot_seq_set_locked(t, sl, seq);
++        }
++    }
++    t.defer_slots.clear();
++    g_fence_commits += t.swap_defer || t.map_defer;
++    if (t.swap_defer) {
++        t.swap_defer = false; t.swap_mark_flag = true; t.swap_mark_seq = seq;
++    }
++    if (t.map_defer) {
++        t.map_defer = false; t.map_mark_flag = true; t.map_mark_seq = seq;
++    }
++}
++// swap_ev made current again (a consumer that needs an event: a blocking wait, another stream's wait).
++static void swap_ev_materialize_locked(table_t & t) {
++    fence_flush_locked(t);
++    if (t.swap_mark_flag) {
++        device_guard dg(t.device);
++        (void) cudaEventRecord(t.swap_ev, (cudaStream_t) t.mark_stream);
++        (void) cudaGetLastError();
++        t.swap_mark_flag = false;
++    }
++}
++// Make the RAM slots freed by earlier swaps reusable, once every swap enqueued so far has completed.
++static void tier_release_pending_locked(table_t & t, bool block = true) {
++    if (t.ram_pending.empty()) {
++        return;
++    }
++    if (t.swap_defer || (t.swap_mark_flag && block)) {
++        swap_ev_materialize_locked(t);   // never spin on the flag: a blocking wait uses an event
++    }
++    if (t.swap_mark_flag) {
++        if (!fence_done_locked(t, t.swap_mark_seq)) {
++            return;   // not yet: the spare stays pending, misses are served cold meanwhile
++        }
++    } else if (t.swap_ev != nullptr) {
++        device_guard dg(t.device);
++        if (!block) {
++            if (cudaEventQuery(t.swap_ev) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return;   // not yet: the spare stays pending, misses are served cold meanwhile
++            }
++        } else {
++            (void) cudaEventSynchronize(t.swap_ev);
++        }
++    }
++    t.ram_free.insert(t.ram_free.end(), t.ram_pending.begin(), t.ram_pending.end());
++    t.ram_pending.clear();
++}
++// Expert `e` of a sparse table is entirely in the page cache (so registering it reads nothing from disk).
++static bool sparse_in_ram_locked(const table_t & t, int32_t e) {
++    const size_t    pg = sreg_page();
++    uintptr_t lo, hi;
++    sparse_span(t, e, lo, hi);
++    lo &= ~(uintptr_t) (pg - 1);
++    hi  = (hi + pg - 1) & ~(uintptr_t) (pg - 1);
++    static std::vector<unsigned char> vec;
++    vec.resize((hi - lo) / pg);
++    if (mincore((void *) lo, hi - lo, vec.data()) != 0) {
++        return false;
++    }
++    for (unsigned char v : vec) {
++        if (!(v & 1)) {
++            return false;
++        }
++    }
++    return true;
++}
++// Register the whole table.  On a refusal the table leaves the sparse path for r41's pageable copy path (no device
++// mapping: cold reads off, the gather declines, fills copy from the master), so nothing reads an unregistered byte.
++static bool sparse_need_all_locked(table_t & t) {
++    if (!t.host_sparse || t.host_dev == nullptr) {
++        return true;
++    }
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        if (!sparse_need_locked(t, e)) {
++            GGML_LOG_WARN("moe_cache sparse registration: layer=%d role=%s could not register its master; "
++                          "the cache declines this table (the scheduler serves it from the host)\n", t.layer, t.role.c_str());
++            t.sparse_all = false;
++            t.sparse_off = true;
++            return false;
++        }
++    }
++    t.sparse_all = true;
++    return true;
++}
++// Unregister every run no GPU read can reach: experts resident in every table of their master.  Synchronizes every
++// device first (a queued fill or cold read may still use a run).
++static void sparse_trim_locked(const char * why) {
++    for (const table_t & t : g_tables) {
++        t.sreg_refused.clear();   // the trim frees room: refused experts may register again
++    }
++    bool any = false;
++    std::vector<std::pair<uintptr_t, uintptr_t>> need;
++    for (table_t & t : g_tables) {
++        if (!t.host_sparse || t.host_dev == nullptr) {
++            continue;
++        }
++        any = true;
++        t.sparse_all = false;
++        if (t.ram_base != nullptr && !t.ram_partial) {
++            continue;   // RAM tier: nothing of this master is read in place
++        }
++        if (!t.allocated || t.sparse_off || t.arena == nullptr || t.slots <= 0) {
++            continue;   // no arena: nothing reads this master in place (update_host / get_cold decline the table)
++        }
++        const uintptr_t base = (uintptr_t) t.host_dev;
++        if (t.expert_slot.empty()) {
++            need.emplace_back(base, base + (uintptr_t) t.n_experts * t.host_bytes + SREG_PAD);
++            t.sparse_all = true;
++            continue;
++        }
++        std::vector<uint8_t> res((size_t) t.n_experts, 0);
++        for (const auto & kv : t.expert_slot) {
++            if (kv.first >= 0 && kv.first < t.n_experts) {
++                res[(size_t) kv.first] = 1;
++            }
++        }
++        for (int32_t e = 0; e < t.n_experts; e++) {
++            if (!res[(size_t) e] && !(t.ram_partial && t.ram_slot[(size_t) e] >= 0)) {
++                uintptr_t lo, hi;
++                sparse_span(t, e, lo, hi);
++                need.emplace_back(lo, hi + SREG_PAD);
++            }
++        }
++    }
++    if (!any) {
++        return;
++    }
++    int n_dev = 0;
++    (void) cudaGetDeviceCount(&n_dev);
++    for (int d = 0; d < n_dev; d++) {
++        device_guard dg(d);
++        (void) cudaDeviceSynchronize();
++    }
++    const size_t pg = sreg_page();
++    for (auto & iv : need) {
++        iv.first  &= ~(uintptr_t) (pg - 1);
++        iv.second  = (iv.second + pg - 1) & ~(uintptr_t) (pg - 1);
++    }
++    std::sort(need.begin(), need.end());
++    std::vector<std::pair<uintptr_t, uintptr_t>> merged;
++    for (const auto & iv : need) {
++        if (!merged.empty() && iv.first <= merged.back().second) {
++            merged.back().second = std::max(merged.back().second, iv.second);
++        } else {
++            merged.push_back(iv);
++        }
++    }
++    const size_t before = g_sreg_bytes;
++    size_t k = 0;
++    for (auto it = g_sreg.begin(); it != g_sreg.end();) {
++        const uintptr_t a = it->first, b = it->first + it->second;
++        while (k < merged.size() && merged[k].second <= a) {
++            k++;
++        }
++        const bool needed = k < merged.size() && merged[k].first < b;
++        if (!needed) {
++            (void) cudaHostUnregister((void *) a);
++            (void) cudaGetLastError();
++            (void) munlock((void *) a, it->second);
++            sreg_remap(a, it->second);
++            g_sreg_bytes -= it->second;
++            it = g_sreg.erase(it);
++        } else {
++            ++it;
++        }
++    }
++    g_sreg_trims++;
++    int64_t n_res = 0, n_all = 0;
++    for (const table_t & t : g_tables) {
++        n_res += (int64_t) t.expert_slot.size();
++        n_all += t.n_experts;
++    }
++    if (strcmp(why, "periodic") != 0 || before != g_sreg_bytes) {
++        GGML_LOG_INFO("moe_cache sparse registration (%s): %.0f -> %.0f MiB of the pageable expert master registered "
++                      "(%zu runs, %lld failed, %lld register calls); resident %lld / %lld\n", why, before / 1048576.0,
++                      g_sreg_bytes / 1048576.0, g_sreg.size(), (long long) g_sreg_fail, (long long) g_sreg_calls,
++                      (long long) n_res, (long long) n_all);
++    }
++}
++// A second read-only MAP_SHARED mapping of the file backing [p, p + len) (same page cache, no extra RAM), or nullptr.
++// Each new alias is probe-registered on its first page (and the registration dropped at once): an alias hipHostRegister
++// refuses is replaced by another mapping (r39, -sm layer).  Probing the whole range pinned - i.e. read from disk - the
++// entire tensor at load.
++static void * file_alias_locked(const void * p, size_t len) {
++    static std::map<const void *, void *> cache;
++    const auto c = cache.find(p);
++    if (c != cache.end()) {
++        return c->second;
++    }
++    FILE * f = fopen("/proc/self/maps", "r");
++    if (f == nullptr) {
++        return nullptr;
++    }
++    char line[4096];
++    void * out = nullptr;
++    const uintptr_t a = (uintptr_t) p;
++    while (fgets(line, sizeof(line), f) != nullptr) {
++        unsigned long lo = 0, hi = 0, off = 0, inode = 0;
++        char perms[8] = {}, dev[32] = {}, path[2048] = {};
++        if (sscanf(line, "%lx-%lx %7s %lx %31s %lu %2047[^\n]", &lo, &hi, perms, &off, dev, &inode, path) < 7) {
++            continue;
++        }
++        if (a < lo || a >= hi || path[0] != '/') {
++            continue;
++        }
++        const size_t pg       = sreg_page();
++        const size_t file_off = (size_t) off + (size_t) (a - lo);
++        const size_t al       = file_off & ~(pg - 1);
++        const size_t delta    = file_off - al;
++        struct stat st{};
++        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
++            break;   // not a regular file (a device mapping, a memfd): no alias
++        }
++        const int fd = open(path, O_RDONLY);
++        if (fd >= 0) {
++            std::vector<void *> refused;
++            for (int attempt = 0; attempt < 16 && out == nullptr; attempt++) {
++                void * m = mmap(nullptr, len + delta, PROT_READ, MAP_SHARED, fd, (off_t) al);
++                if (m == MAP_FAILED) {
++                    break;
++                }
++                if (cudaHostRegister(m, std::min(len + delta, pg), cudaHostRegisterPortable | cudaHostRegisterReadOnly) == cudaSuccess) {
++                    (void) cudaHostUnregister(m);
++                    out = (char *) m + delta;
++                    const int keep = dup(fd);
++                    if (keep >= 0) {
++                        g_sreg_alias.push_back({ (uintptr_t) m, (uintptr_t) m + len + delta, keep, (off_t) al });
++                        sreg_remap((uintptr_t) m, pg);   // the probe's own SVM range
++                    }
++                } else {
++                    (void) cudaGetLastError();
++                    refused.push_back(m);
++                }
++            }
++            for (void * r : refused) {
++                (void) munmap(r, len + delta);
++            }
++            close(fd);
++        }
++        break;
++    }
++    fclose(f);
++    cache[p] = out;
++    return out;
++}
++// One expert of a sparse table from the registered alias into `dst`, on the GPU (defined after the copy helper).
++// Never a host-API copy from the alias: with SREG_PAD every expert spans two registered runs, and a host copy across
++// runs fails.  The caller has registered `e`.
++static cudaError_t sparse_fill_locked(const table_t & t, void * dst, int32_t e, void * stream);
++// local: the r111 pool-backed staging / upload paths apply only in --host-experts pool.  Under --host-experts mmap a
++// master that is not pinned is either sparse-registered or declined by the cache, exactly as in r109.
++static inline bool table_pool_backed(const table_t & t) {
++    return g_pool_requested && table_master_pageable(t);
++}
++// Host-pool file I/O portability (issue #130).  The bounded host pool is a POSIX feature; every
++// file call goes through these five helpers so the Windows build compiles.  There `pool_open_file`
++// returns -1, the pool marks itself failed, and a miss is served from the pinned master exactly as
++// if the pool were disabled.  A real Windows pool (ReadFile with an OVERLAPPED offset,
++// FILE_FLAG_NO_BUFFERING for the DIO mode, _aligned_malloc) would be the proper fix if wanted.
++// A pinned per-table bounce entry for a copy out of a sparse (mmap) master: one whose copy has drained, else a new one,
++// at most 8 per table (a declined read can be a whole master, and an unbounded ring would pin a copy of it outside the
++// pin budget); a full ring waits for one copy and reuses its entry.  -1 when no entry can be allocated.
++static int bounce_acquire_capped(table_t & t) {
++    int idx = -1;
++    for (int i = 0; i < (int) t.bounce.size(); i++) {
++        if (t.bounce[(size_t) i].busy) {
++#if defined(GGML_USE_HIP)
++            const bool ready = hipEventQuery((hipEvent_t) t.bounce[(size_t) i].ev) != hipErrorNotReady;
++#else
++            const bool ready = cudaEventQuery(t.bounce[(size_t) i].ev) != cudaErrorNotReady;
++#endif
++            (void) cudaGetLastError();
++            if (!ready) {
++                continue;
++            }
++            t.bounce[(size_t) i].busy = false;
++        }
++        idx = i;
++        break;
++    }
++    if (idx < 0 && t.bounce.size() >= 8) {
++        idx         = t.bounce_rr % (int) t.bounce.size();
++        t.bounce_rr = idx + 1;
++        (void) cudaEventSynchronize(t.bounce[(size_t) idx].ev);
++        (void) cudaGetLastError();
++        t.bounce[(size_t) idx].busy = false;
++    }
++    if (idx < 0) {
++        device_guard dg(t.device);
++        void *      mem = nullptr;
++        cudaEvent_t ev  = nullptr;
++        if (cudaHostAlloc(&mem, t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
++            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            if (mem != nullptr) { (void) cudaFreeHost(mem); }
++            if (ev  != nullptr) { (void) cudaEventDestroy(ev); }
++            return -1;
++        }
++        bounce_t b;
++        b.host = (char *) mem;
++        b.ev   = ev;
++        b.busy = false;
++        t.bounce.push_back(b);
++        idx = (int) t.bounce.size() - 1;
++    }
++    return idx;
++}
++// One seed / sizing fill of expert `e` into `dst`, synchronous on the legacy stream: a sparse master copies from its
++// registered alias (registering it first), any other master through fill_slot_from_host.
++static cudaError_t seed_fill_slot_locked(table_t & t, void * dst, int32_t e) {
++    if (t.host_sparse && t.host_dev != nullptr) {
++        return sparse_need_locked(t, e) ? sparse_fill_locked(t, dst, e, nullptr) : cudaErrorInvalidValue;
++    }
++    return fill_slot_from_host(t, dst, (size_t) e, (cudaStream_t) 0);
++}
++// A routed expert of a sparse (mmap) table without a RAM tier that is neither resident nor registrable (the pin budget
++// refused it) has no read path, and declining the call for it would make the hook's outcome depend on the routing: a CUDA
++// graph captured on one outcome and replayed on the other reads the wrong source (wrong output for the whole load).  So
++// it is admitted regardless of the admission rule: into a free slot, else over the coldest resident this call does not
++// route, filled from the mapping through the pinned bounce (no registration).  The bytes are the file's, as on every
++// other path.  Returns the slot, or -1 (no slot, or a copy error: the admission is undone and the call declines).
++// GGML_MOE_FORCE_ADMIT=0: off (the call declines, as before).
++static bool g_force_admit = [] {
++    const char * e = getenv("GGML_MOE_FORCE_ADMIT");
++    return e == nullptr || atoi(e) != 0;
++}();
++// A victim of force_admit_locked leaving VRAM on a tier table: with a copy-back ahead the fill waited for, it keeps that
++// exact RAM copy (as tier_swap_locked does); otherwise (a partial tier, no tier_swap) its cold pointer, which may still
++// name the RAM slot it was admitted from, goes back to the file alias.  On the compute stream, before the op.
++static void victim_cold_locked(table_t & t, int32_t victim, std::vector<table_t::precopy_t>::iterator pc, void * stream) {
++    device_guard dg(t.device);   // the eager hook runs with whichever device computed last
++    if (pc != t.precopy.end()) {
++        const int32_t q = pc->ram;
++        moe_cache_set_ptr_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(t.cold_ptrs, victim,
++                                                                    (uintptr_t) (t.ram_base + (size_t) q * t.expert_bytes));
++        t.ram_slot[(size_t) victim] = q;
++        t.precopy_idle.push_back(pc->ev);
++        t.precopy.erase(pc);
++        g_pc_used++;
++    } else if (t.ram_base != nullptr && t.cold_ptrs != nullptr) {
++        moe_cache_set_ptr_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(t.cold_ptrs, victim, tier_file_ptr(t, victim));
++    }
++}
++static int force_admit_locked(table_t & t, int32_t expert, void * stream, const int32_t * protect, int n_protect) {
++    if (t.slots <= 0 || t.arena == nullptr || t.host == nullptr || stream == nullptr || expert < 0 ||
++        expert >= t.n_experts) {
++        return -1;
++    }
++    int     slot   = -1;
++    int32_t victim = -1;
++    if ((int) t.expert_slot.size() < t.slots) {
++        for (int s = 0; s < t.slots; s++) {
++            if (t.slot_expert[s] < 0) { slot = s; break; }
++        }
++    }
++    if (slot < 0) {
++        // the victim rule of access_locked: the smallest decaying count, tie -> oldest use, never this call's experts
++        for (int s = 0; s < t.slots; s++) {
++            const int32_t e = t.slot_expert[s];
++            bool prot = false;
++            for (int i = 0; i < n_protect && !prot; i++) {
++                prot = protect[i] == e;
++            }
++            if (e < 0 || prot) { continue; }
++            if (victim < 0 || t.count[e] < t.count[victim] ||
++                (t.count[e] == t.count[victim] && t.last[e] < t.last[victim])) {
++                victim = e;
++                slot   = s;
++            }
++        }
++    }
++    if (slot < 0) {
++        return -1;
++    }
++    const int idx = bounce_acquire_capped(t);
++    if (idx < 0) {
++        return -1;
++    }
++    char * buf = t.bounce[(size_t) idx].host;
++    memcpy(buf, (const char *) t.host + (size_t) expert * t.host_bytes, t.host_bytes);
++    expert_src_t src;
++    src.base   = buf;
++    src.kind   = cudaMemcpyHostToDevice;
++    src.bounce = idx;
++    char * dst = (char *) t.arena + (size_t) slot * t.expert_bytes;
++    // a partial tier: the victim may have a copy-back ahead in flight from this slot (precopy_plan_locked picks by the same
++    // rule): wait for it before the fill overwrites the slot (victim_cold_locked then keeps that RAM copy)
++    const auto pc = victim >= 0 && t.ram_base != nullptr ? precopy_find(t, victim) : t.precopy.end();
++    if (pc != t.precopy.end() && cudaStreamWaitEvent((cudaStream_t) stream, pc->ev, 0) != cudaSuccess) {
++        (void) cudaGetLastError();
++        expert_src_done(t, nullptr, src, stream, /*retire*/ false);
++        return -1;
++    }
++    if (copy_slot_from_src(t, dst, src, (cudaStream_t) stream) != cudaSuccess) {
++        GGML_LOG_WARN("%s: bounce fill failed table layer=%d role=%s expert=%d: %s\n", __func__, t.layer, t.role.c_str(),
++                      expert, cudaGetErrorString(cudaGetLastError()));
++        // a fused table issues one copy per slice: earlier slices may be in flight from the entry and in the slot, so the
++        // entry stays busy until they drain and the victim's slot is freed (its bytes may be partly overwritten)
++        expert_src_done(t, nullptr, src, stream, /*retire*/ false);
++        if (victim >= 0) {
++            t.expert_slot.erase(victim);
++            t.slot_expert[slot] = -1;
++            t.slot_dirty = true;
++            t.evictions++;
++            victim_cold_locked(t, victim, pc, stream);
++        }
++        return -1;
++    }
++    expert_src_done(t, nullptr, src, stream, /*retire*/ false);
++    if (victim >= 0) {
++        t.expert_slot.erase(victim);
++        t.slot_expert[slot] = -1;
++        t.evictions++;
++        victim_cold_locked(t, victim, pc, stream);
++    }
++    slot_seq_set_locked(t, slot, -1);   // filled on the stream outside a fence scope: copy-back ahead waits on pol_ev
++    t.slot_expert[slot]   = expert;
++    t.expert_slot[expert] = slot;
++    t.slot_dirty          = true;
++    if (slot < (int) t.slot_prov.size()) {
++        t.slot_prov[slot] = 0;
++    }
++    t.count[expert]++;
++    if (expert < (int32_t) t.ghost.size()) {
++        t.ghost[expert] = 0;
++    }
++    t.last[expert] = t.clock;
++    t.fills++;
++    g_acc_fills++;
++    g_fill_bytes += (int64_t) t.expert_bytes;
++    g_force_admits++;
++    return slot;
++}
++// Host-weight expert gather (B2, session 15): for an offloaded `MUL_MAT_ID` expert upload, copy only the
++// experts the routing selects, straight from the host master into the scheduler's device `input_cpy`,
++// ON DEVICE.  This replaces the non-staging path's host ids readback (`ggml_backend_tensor_get_async` +
++// a full device synchronize per op) plus its host-side `used_ids` scan and per-run `set_async` copies.
++// `blockIdx.x` is the expert; each block scans the routing once (n_used*n_tok, <= 16k) and, if the expert
++// is used, copies it via the same coalesced helper the seed/policy fills use (so a strided axis-0 slice
++// is a 2-D copy).  The expert lands at its ORIGINAL offset in `input_cpy`, so the op's raw routing ids
++// still index it and the output is bit-identical to the host path.
++// Grid is `n_experts * n_split` blocks; `blockIdx.x % n_experts` is the expert, `blockIdx.x /
++// n_experts` a byte/row chunk of it.  The split matters: a prefill ubatch uses only ~8 of the 256
++// experts, so one block per expert would copy with ~8 resident blocks (almost no memory-level
++// parallelism); n_split restores ~64-128 concurrent blocks.  The used-scan is thread-parallel (each
++// thread checks a strided slice of the routing) - a per-thread full scan cost 256 redundant loads per
++// thread and dominated the kernel.
++// One expert's bytes, by this block: a strided axis-0 slice row by row (`rows` rows of `row_bytes`, `host_pitch` apart
++// in the source), else 4 KiB chunks.  Grid-strided over blockIdx.x.  Shared by the one-fill, stage and route kernels.
++static __device__ __forceinline__ void moe_cache_expert_copy(char * __restrict__ d, const char * __restrict__ s,
++                                                             int64_t expert_bytes, int64_t rows, int64_t row_bytes,
++                                                             int64_t host_pitch, bool rowwise) {
++    if (rowwise) {
++        for (int64_t r = blockIdx.x; r < rows; r += gridDim.x) {
++            moe_cache_policy_copy(d + (size_t) r * (size_t) row_bytes, s + (size_t) r * (size_t) host_pitch,
++                                  (size_t) row_bytes, threadIdx.x, blockDim.x);
++        }
++        return;
++    }
++    const int64_t chunk = 4096;
++    for (int64_t o = (int64_t) blockIdx.x * chunk; o < expert_bytes; o += (int64_t) gridDim.x * chunk) {
++        const int64_t n = expert_bytes - o < chunk ? expert_bytes - o : chunk;
++        moe_cache_policy_copy(d + o, s + o, (size_t) n, threadIdx.x, blockDim.x);
++    }
++}
++static __global__ void moe_cache_one_fill_kernel(char * __restrict__ dst, const char * __restrict__ src,
++                                                 int64_t expert_bytes, int64_t rows, int64_t row_bytes,
++                                                 int64_t host_pitch, int do2d) {
++    moe_cache_expert_copy(dst, src, expert_bytes, rows, row_bytes, host_pitch, do2d != 0);
++}
++static cudaError_t sparse_fill_locked(const table_t & t, void * dst, int32_t e, void * stream) {
++    if (!fb_flush_locked()) {
++        return cudaErrorInvalidValue;
++    }
++    const bool    do2d = t.split_axis == 0 && t.host_pitch != 0;
++    const int64_t rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++    if (do2d && rows <= 0) {
++        return cudaErrorInvalidValue;
++    }
++    (void) cudaGetLastError();
++    device_guard dg(t.device);   // a kernel launch needs the stream's device current
++    moe_cache_one_fill_kernel<<<64, 256, 0, (cudaStream_t) stream>>>(
++        (char *) dst, (const char *) t.host_dev + (size_t) e * t.host_bytes + t.src_off,
++        (int64_t) t.expert_bytes, rows, rows > 0 ? (int64_t) (t.expert_bytes / (size_t) rows) : 0,
++        (int64_t) t.host_pitch, do2d ? 1 : 0);
++    return cudaGetLastError();
++}
++// One expert per blockIdx.y: a resident expert is a contiguous arena slot; a cold one is read from the registered
++// alias with the table's host geometry (a strided axis-0 slice row by row).  dst is the compacted device slice.
++static __global__ void moe_cache_stage_kernel(char * __restrict__ dst, const char * const * __restrict__ srcs,
++                                              const uint8_t * __restrict__ cold, int64_t expert_bytes, int64_t rows,
++                                              int64_t row_bytes, int64_t host_pitch, int do2d) {
++    const int e = blockIdx.y;
++    char *       d = dst + (size_t) e * (size_t) expert_bytes;
++    const char * s = srcs[e];
++    moe_cache_expert_copy(d, s, expert_bytes, rows, row_bytes, host_pitch, cold[e] && do2d);
++}
++// Routed fill: entry `blockIdx.y` copies expert ids[j] (a resident arena slot, or a cold expert from the registered
++// alias with the host geometry) to its ORIGINAL offset in the op's input, as the scheduler's host copy would.
++static __global__ void moe_cache_route_kernel(char * __restrict__ dst, const char * const * __restrict__ srcs,
++                                              const int32_t * __restrict__ eids, const uint8_t * __restrict__ cold,
++                                              int64_t expert_bytes, int64_t rows, int64_t row_bytes, int64_t host_pitch,
++                                              int do2d) {
++    const int    j = blockIdx.y;
++    char *       d = dst + (size_t) eids[j] * (size_t) expert_bytes;
++    const char * s = srcs[j];
++    moe_cache_expert_copy(d, s, expert_bytes, rows, row_bytes, host_pitch, cold[j] && do2d);
++}
++// Where a device-side copy reads expert `e`: its arena slot, its RAM-tier slot (both contiguous, cold 0), or the
++// registered alias of the sparse master with the host geometry (cold 1, registered here).  False: a RAM-tier table
++// without a slot for `e`, or an alias that cannot be registered.
++static bool expert_copy_src_locked(const table_t & t, int32_t e, const char ** src, uint8_t * cold) {
++    const auto it = t.expert_slot.find(e);
++    if (it != t.expert_slot.end() && t.arena != nullptr) {
++        *src  = (const char *) t.arena + (size_t) it->second * t.expert_bytes;
++        *cold = 0;
++    } else if (t.ram_base != nullptr && (!t.ram_partial || t.ram_slot[(size_t) e] >= 0)) {
++        if (t.ram_slot[(size_t) e] < 0) {
++            return false;
++        }
++        *src  = t.ram_base + (size_t) t.ram_slot[(size_t) e] * t.expert_bytes;
++        *cold = 0;
++    } else {
++        if (!sparse_need_locked(t, e)) {
++            return false;
++        }
++        *src  = (const char *) t.host_dev + (size_t) e * t.host_bytes + t.src_off;
++        *cold = 1;
++    }
++    return true;
++}
++// Fill the routed experts of a small prefill ubatch into `dst` (the op's device input).  Every used expert, plus the
++// expert after each run of used ones (the scheduler's host copy carries up to 512 bytes of it as the MMQ tail pad;
++// copying the whole neighbour keeps those bytes identical).  False: nothing usable was queued, the host path serves.
++static bool sparse_fill_routed_locked(table_t & t, void * dst, const int32_t * ids, int64_t n_used, int64_t n_tok,
++                                      size_t ids_nb0, size_t ids_nb1, void * stream) {
++    if (!t.host_sparse || t.sparse_off || t.host_dev == nullptr || dst == nullptr || n_used >= t.n_experts) {
++        return false;   // the warm-up pass (every expert) streams through the host path
++    }
++    const bool    do2d = t.split_axis == 0 && t.host_pitch != 0;
++    const int64_t rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++    if (do2d && rows <= 0) {
++        return false;
++    }
++    std::vector<uint8_t> want((size_t) t.n_experts, 0);
++    for (int64_t tok = 0; tok < n_tok; tok++) {
++        for (int64_t j = 0; j < n_used; j++) {
++            const int32_t e = *(const int32_t *) ((const char *) ids + (size_t) tok * ids_nb1 + (size_t) j * ids_nb0);
++            if (e < 0 || e >= t.n_experts) {
++                return false;
++            }
++            want[(size_t) e] = 1;
++        }
++    }
++    for (int32_t e = 0; e + 1 < t.n_experts; e++) {
++        if (want[(size_t) e] == 1 && want[(size_t) e + 1] == 0) {
++            want[(size_t) e + 1] = 2;   // tail pad
++        }
++    }
++    const size_t n = (size_t) t.n_experts;
++    t.route_pack.resize(n * (sizeof(void *) + sizeof(int32_t) + 1));
++    const char ** srcs = (const char **) t.route_pack.data();
++    int32_t *     eids = (int32_t *) (t.route_pack.data() + n * sizeof(void *));
++    uint8_t *     cold = t.route_pack.data() + n * (sizeof(void *) + sizeof(int32_t));
++    unsigned k = 0;
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        if (!want[(size_t) e]) {
++            continue;
++        }
++        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k])) {
++            return false;
++        }
++        eids[k] = e;
++        k++;
++    }
++    if (k == 0) {
++        return false;
++    }
++    device_guard dg(t.device);
++    if (t.route_dev == nullptr && cudaMalloc(&t.route_dev, t.route_pack.size()) != cudaSuccess) {
++        (void) cudaGetLastError();
++        t.route_dev = nullptr;
++        return false;
++    }
++    (void) cudaGetLastError();
++    if (cudaMemcpyAsync(t.route_dev, t.route_pack.data(), t.route_pack.size(), cudaMemcpyHostToDevice,
++                        (cudaStream_t) stream) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    const char * rd = (const char *) t.route_dev;
++    moe_cache_route_kernel<<<dim3(16, k), 256, 0, (cudaStream_t) stream>>>(
++        (char *) dst, (const char * const *) rd, (const int32_t *) (rd + n * sizeof(void *)),
++        (const uint8_t *) (rd + n * (sizeof(void *) + sizeof(int32_t))),
++        (int64_t) t.expert_bytes, rows, rows > 0 ? (int64_t) (t.expert_bytes / (size_t) rows) : 0,
++        (int64_t) t.host_pitch, do2d ? 1 : 0);
++    if (cudaGetLastError() != cudaSuccess) {
++        return false;
++    }
++    g_route_fills++;
++    return true;
++}
++bool moe_cache_stage_table(const void * src, size_t offset, size_t total, void * dst, int device, void * stream) {
++    if (!g_enabled || !g_any_sparse || src == nullptr) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    for (table_t & t : g_tables) {
++        if (t.host != src || t.device != device || !t.host_sparse || t.sparse_off || t.host_dev == nullptr ||
++                (size_t) t.src_off != offset || (size_t) t.n_experts * t.expert_bytes != total) {
++            continue;
++        }
++        const bool    do2d = t.split_axis == 0 && t.host_pitch != 0;
++        const int64_t rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++        if (do2d && rows <= 0) {
++            return false;
++        }
++        const size_t n = (size_t) t.n_experts;
++        t.stage_pack.resize(n * sizeof(void *) + n);
++        const char ** srcs = (const char **) t.stage_pack.data();
++        uint8_t *     cold = t.stage_pack.data() + n * sizeof(void *);
++        for (int32_t e = 0; e < t.n_experts; e++) {
++            if (!expert_copy_src_locked(t, e, &srcs[e], &cold[e])) {
++                return false;   // the caller copies the whole table from the master (correct, just slow)
++            }
++        }
++        device_guard dg(t.device);
++        if (t.stage_dev == nullptr && cudaMalloc(&t.stage_dev, t.stage_pack.size()) != cudaSuccess) {
++            (void) cudaGetLastError();
++            t.stage_dev = nullptr;
++            return false;
++        }
++        (void) cudaGetLastError();
++        if (cudaMemcpyAsync(t.stage_dev, t.stage_pack.data(), t.stage_pack.size(), cudaMemcpyHostToDevice,
++                            (cudaStream_t) stream) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
++        }
++        if (t.swap_ev != nullptr) {
++            swap_ev_materialize_locked(t);
++            (void) cudaStreamWaitEvent((cudaStream_t) stream, t.swap_ev, 0);   // the tier is written on the compute stream
++        }
++        moe_cache_stage_kernel<<<dim3(16, (unsigned) n), 256, 0, (cudaStream_t) stream>>>(
++            (char *) dst, (const char * const *) t.stage_dev, (const uint8_t *) t.stage_dev + n * sizeof(void *),
++            (int64_t) t.expert_bytes, rows, rows > 0 ? (int64_t) (t.expert_bytes / (size_t) rows) : 0,
++            (int64_t) t.host_pitch, do2d ? 1 : 0);
++        if (cudaGetLastError() != cudaSuccess) {
++            return false;
++        }
++        if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
++            if (g_stage_ev[device] == nullptr &&
++                cudaEventCreateWithFlags(&g_stage_ev[device], cudaEventDisableTiming) != cudaSuccess) {
++                (void) cudaGetLastError();
++                g_stage_ev[device] = nullptr;
++            }
++            if (g_stage_ev[device] != nullptr && cudaEventRecord(g_stage_ev[device], (cudaStream_t) stream) == cudaSuccess) {
++                g_stage_ev_live[device] = true;
++            } else {
++                (void) cudaGetLastError();
++                (void) cudaStreamSynchronize((cudaStream_t) stream);   // no event: the staging is done before any fill
++            }
++        }
++        // the host pack is per table and re-filled only by the next ubatch's staging of this table (the scheduler
++        // synchronizes between ubatches), so the async upload has consumed it by then
++        g_stage_tables++;
++        return true;
++    }
++    static int n_miss = 0;
++    if (n_miss++ < 4) {
++        GGML_LOG_INFO("moe_cache_stage_table: no sparse table for src=%p offset=%zu total=%zu device=%d\n", src, offset,
++                      total, device);
++    }
++    return false;
++}
++// wip/host-expert-dio-cache Phase 1 (plumbing, inert).  See the header for the contract.
++// The device that owns every cache table of `host` (-sm layer), or -1 (no table, or tables on several devices).
++int moe_cache_owner_device(const void * host) {
++    if (!g_enabled || host == nullptr || !g_any_sparse) {
++        return -1;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    int owner = -1;
++    for (const table_t & t : g_tables) {
++        if (t.host != host || t.device < 0) {
++            continue;
++        }
++        if (owner >= 0 && owner != t.device) {
++            return -1;
++        }
++        owner = t.device;
++    }
++    return owner;
++}
++static const bool g_pf_prefetch = [] {
++    const char * e = getenv("GGML_MOE_PF_PREFETCH");
++    return e != nullptr && atoi(e) != 0;
++}();
++// bumped by every decode-band policy call: residency (arena slots, RAM-tier slots) may have moved since a prefetch
++static std::atomic<uint64_t> g_pf_policy_seq{0};
++static bool g_prefill_inplace = [] {
++    const char * e = getenv("GGML_MOE_PREFILL_INPLACE");
++    return e != nullptr && atoi(e) != 0;
++}();
++// Remap freshness.  A published remap (remap_n_used > 0) is only valid for the split whose input hook published it:
++// a later split can consume the same table without any hook call (e.g. qwen4exp's last layer in a prompt chunk, where
++// the deferred MTP export gives the table two MUL_MAT_ID consumers and the scheduler copies the whole table), and the
++// consumer's shape check alone can match a stale remap.  A "round" starts with the first input hook on a device after a
++// graph compute there (moe_cache_hook_begin, called by every backend hook: the scheduler copies a split's inputs, then
++// computes it, possibly as several subgraphs); a consumer accepts only a remap published in the current round.  A remap
++// is therefore only stale-accepted if its table was published in the latest hook phase, i.e. by its own split.
++static std::atomic<bool>     g_dev_computed[GGML_CUDA_MAX_DEVICES];
++static std::atomic<uint32_t> g_dev_round[GGML_CUDA_MAX_DEVICES];
++void moe_cache_graph_begin(int device) {
++    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
++        g_dev_computed[device].store(true, std::memory_order_relaxed);
++    }
++}
++void moe_cache_hook_begin(int device) {
++    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES && g_dev_computed[device].exchange(false, std::memory_order_relaxed)) {
++        g_dev_round[device].fetch_add(1, std::memory_order_relaxed);
++    }
++}
++static uint32_t remap_round_locked(int device) {
++    return device >= 0 && device < GGML_CUDA_MAX_DEVICES ? g_dev_round[device].load(std::memory_order_relaxed) : 0;
++}
++static bool prefill_inplace_prepare_locked(table_t & t, const ggml_tensor * weight_cpy, const int32_t * ids,
++                                           int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, void * stream);
++// Sibling tables a layer's first remap call already served, per device: their own call (next, with the same routing)
++// only publishes the remap.  Any other remap call on the device drops what is left.
++// Steps 1 and 2 of a take-over for one table (allocation, the one-call-late policy, the map upload).  False: decline.
++// The device expert -> slot map (arena slot, or slots + e for a cold expert), re-uploaded only after a residency change.
++// False: the previous upload still reads the staging buffer (the caller declines instead of blocking; rare, the upload
++// is 2 KiB), or the copy launch failed.
++static bool dr_map_refresh_locked(table_t & t, cudaStream_t s) {
++    if (!t.slot_dirty && t.dr_map_ok) {
++        return true;
++    }
++    if (t.map_defer || (t.map_mark_flag ? !fence_done_locked(t, t.map_mark_seq) : cudaEventQuery(t.dr_map_ev) != cudaSuccess)) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    for (int e = 0; e < t.n_experts; e++) {
++        t.dr_map_host[e] = t.slots + e;
++    }
++    for (int sl = 0; sl < t.slots && sl < (int) t.slot_expert.size(); sl++) {
++        const int32_t e = t.slot_expert[sl];
++        if (e >= 0 && e < t.n_experts) {
++            t.dr_map_host[e] = sl;
++        }
++    }
++    if (fb_on(t)) {
++        if (!fb_push_fill_locked(t.device, s, (char *) t.dr_map_dev, (const char *) t.dr_map_hdev,
++                                 (size_t) t.n_experts * sizeof(int32_t), nullptr, -1, 0)) {
++            t.dr_map_ok = false;
++            return false;
++        }
++    } else {
++        moe_cache_copy_kernel<<<4, 256, 0, s>>>((char *) t.dr_map_dev, (const char *) t.dr_map_hdev,
++                                                (size_t) t.n_experts * sizeof(int32_t));
++        if (cudaGetLastError() != cudaSuccess) {
++            (void) cudaGetLastError();
++            t.dr_map_ok = false;
++            return false;
++        }
++    }
++    if (g_defer_tab == &t) {
++        t.map_defer = true; t.mark_stream = s;
++    } else {
++        (void) cudaEventRecord(t.dr_map_ev, s);
++        t.map_mark_flag = false;
++    }
++    t.slot_dirty = false;
++    t.dr_map_ok  = true;
++    return true;
++}
++// GGML_MOE_ROUTE_LOG=<file>: append the routing each decode policy call sees, for offline policy replay.  Off by
++// default; it only writes a file and never changes residency or output.  Records (little-endian):
++//   'S' table snapshot (first call, and after a gap > 200 ms: a prefill or an idle turn ran in between):
++//       u8 'S', i32 id, i32 layer, i32 role_len, role, i32 n_experts, i32 slots, i64 expert_bytes, i64 clock,
++//       i64 last_decay, i64 period, i64 touch, i32 admit, i32 prov_evict,
++//       i32 slot_expert[slots], u8 slot_prov[slots], i64 count[n], i64 ghost[n], i64 last[n]
++//   'C' policy call: u8 'C', i32 id, i64 t_ns, i64 hits, i64 misses, i64 fills (the table's totals before this call),
++//       i32 n, i32 ids[n]
++//   'K' routing skipped (not back yet): u8 'K', i32 id, i64 t_ns
++static FILE * route_log_file() {
++    static FILE * f = [] {
++        const char * p = getenv("GGML_MOE_ROUTE_LOG");
++        FILE * r = p != nullptr && *p != 0 ? fopen(p, "wb") : nullptr;
++        if (r != nullptr) {
++            setvbuf(r, nullptr, _IOFBF, 1 << 22);
++            fprintf(stderr, "moe cache: routing log -> %s\n", p);
++        }
++        return r;
++    }();
++    return f;
++}
++static void route_log_locked(const table_t & t, char kind, const int32_t * ids, int n) {
++    FILE * f = route_log_file();
++    if (f == nullptr) {
++        return;
++    }
++    static std::unordered_map<const table_t *, std::pair<int32_t, int64_t>> seen;   // id, last t_ns
++    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++    auto it = seen.find(&t);
++    const bool snap = it == seen.end() || now - it->second.second > 200000000;
++    if (it == seen.end()) {
++        it = seen.emplace(&t, std::make_pair((int32_t) seen.size(), now)).first;
++    }
++    const int32_t id = it->second.first;
++    it->second.second = now;
++    if (snap) {
++        const int32_t hdr[3] = { id, t.layer, (int32_t) t.role.size() };
++        fputc('S', f);
++        fwrite(hdr, sizeof(hdr), 1, f);
++        fwrite(t.role.data(), 1, t.role.size(), f);
++        const int32_t ns[2] = { t.n_experts, t.slots };
++        const int64_t cl[3] = { (int64_t) t.expert_bytes, t.clock, t.last_decay };
++        fwrite(ns, sizeof(ns), 1, f);
++        fwrite(cl, sizeof(cl), 1, f);
++        const int64_t pt[2] = { g_period, g_touch };
++        const int32_t pa[2] = { g_admit, g_prov_evict ? 1 : 0 };
++        fwrite(pt, sizeof(pt), 1, f);
++        fwrite(pa, sizeof(pa), 1, f);
++        for (int s = 0; s < t.slots; s++) {
++            const int32_t e = s < (int) t.slot_expert.size() ? t.slot_expert[s] : -1;
++            fwrite(&e, sizeof(e), 1, f);
++        }
++        for (int s = 0; s < t.slots; s++) {
++            const uint8_t v = s < (int) t.slot_prov.size() ? t.slot_prov[s] : 0;
++            fwrite(&v, 1, 1, f);
++        }
++        for (const std::vector<int64_t> * v : { &t.count, &t.ghost, &t.last }) {
++            for (int e = 0; e < t.n_experts; e++) {
++                const int64_t x = e < (int) v->size() ? (*v)[e] : 0;
++                fwrite(&x, sizeof(x), 1, f);
++            }
++        }
++        fflush(f);
++    }
++    fputc(kind, f);
++    fwrite(&id, sizeof(id), 1, f);
++    fwrite(&now, sizeof(now), 1, f);
++    if (kind == 'C') {
++        const int64_t tot[3] = { (int64_t) t.hits, (int64_t) t.misses, (int64_t) t.fills };
++        fwrite(tot, sizeof(tot), 1, f);
++        fwrite(&n, sizeof(n), 1, f);
++        fwrite(ids, sizeof(int32_t), (size_t) n, f);
++    }
++}
++// GGML_MOE_VERIFY_AT=<n> (debug, default off): at the n-th decode policy call, synchronize every device and compare each
++// arena slot and each RAM-tier slot of every table with a fresh pack of its expert from the file mapping; logs mismatches.
++// GGML_MOE_VERIFY_EVERY=<k>: every k-th call, check only the device maps and cold pointers against the host bookkeeping.
++static void verify_all_locked(bool data) {
++    (void) fb_flush_locked();   // a queued admission has already moved the host bookkeeping: land it before comparing
++    int n_dev = 0;
++    (void) cudaGetDeviceCount(&n_dev);
++    for (int d = 0; d < n_dev; d++) {
++        device_guard dg(d);
++        (void) cudaDeviceSynchronize();
++    }
++    std::vector<char> ref, got;
++    int64_t n_arena = 0, n_ram = 0, bad_arena = 0, bad_ram = 0;
++    int64_t n_map = 0, bad_map = 0, n_ptr = 0, bad_ptr = 0, n_kvv = 0, bad_kvv = 0;
++    for (int id = 0; id < (int) g_tables.size(); id++) {
++        const table_t & t = g_tables[id];
++        if (t.host_dev == nullptr || t.expert_bytes == 0) {
++            continue;
++        }
++        ref.resize(t.expert_bytes);
++        got.resize(t.expert_bytes);
++        const auto report = [&](const char * where, int32_t e, int slot, const char * a) {
++            size_t k = 0;
++            while (k < t.expert_bytes && a[k] == ref[k]) { k++; }
++            size_t nd = 0;
++            for (size_t j = k; j < t.expert_bytes; j++) { nd += a[j] != ref[j]; }
++            GGML_LOG_WARN("moe_cache VERIFY: table %d (layer %d %s) expert %d %s slot %d differs from byte %zu (%zu bytes differ of %zu)\n",
++                          id, t.layer, t.role.c_str(), e, where, slot, k, nd, t.expert_bytes);
++        };
++        if (data && t.arena != nullptr) {
++            device_guard dg(t.device);
++            for (int sl = 0; sl < t.slots && sl < (int) t.slot_expert.size(); sl++) {
++                const int32_t e = t.slot_expert[sl];
++                if (e < 0) {
++                    continue;
++                }
++                sparse_pack_expert(t, e, ref.data());
++                if (cudaMemcpy(got.data(), (const char *) t.arena + (size_t) sl * t.expert_bytes, t.expert_bytes,
++                               cudaMemcpyDeviceToHost) != cudaSuccess) {
++                    (void) cudaGetLastError();
++                    continue;
++                }
++                n_arena++;
++                if (memcmp(got.data(), ref.data(), t.expert_bytes) != 0) {
++                    if (bad_arena++ < 20) { report("arena", e, sl, got.data()); }
++                }
++            }
++        }
++        // the device map (when current) and the cold pointers against the host bookkeeping
++        if (t.dr_map_dev != nullptr && t.dr_map_ok && !t.slot_dirty && t.n_experts > 0) {
++            device_guard dg(t.device);
++            std::vector<int32_t> m((size_t) t.n_experts);
++            if (cudaMemcpy(m.data(), t.dr_map_dev, m.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess) {
++                for (int32_t e = 0; e < t.n_experts; e++) {
++                    const auto    it   = t.expert_slot.find(e);
++                    const int32_t want = it != t.expert_slot.end() ? it->second : t.slots + e;
++                    n_map++;
++                    if (m[(size_t) e] != want && bad_map++ < 20) {
++                        GGML_LOG_WARN("moe_cache VERIFY: table %d (layer %d %s) map[%d] = %d, expected %d\n",
++                                      id, t.layer, t.role.c_str(), e, m[(size_t) e], want);
++                    }
++                }
++            } else {
++                (void) cudaGetLastError();
++            }
++        }
++        if (t.cold_ptrs != nullptr && t.ram_base != nullptr && t.n_experts > 0) {
++            device_guard dg(t.device);
++            std::vector<uintptr_t> cp((size_t) t.n_experts);
++            if (cudaMemcpy(cp.data(), t.cold_ptrs, cp.size() * sizeof(uintptr_t), cudaMemcpyDeviceToHost) == cudaSuccess) {
++                for (int32_t e = 0; e < t.n_experts && e < (int32_t) t.ram_slot.size(); e++) {
++                    if (t.expert_slot.find(e) != t.expert_slot.end()) {
++                        continue;   // resident: the map routes it to its slot, the cold pointer is not read
++                    }
++                    const int32_t r = t.ram_slot[(size_t) e];
++                    const uintptr_t want = r >= 0 ? (uintptr_t) (t.ram_base + (size_t) r * t.expert_bytes) : tier_file_ptr(t, e);
++                    const int32_t   kv   = e < (int32_t) kvl_kvv(t).size() ? kvl_kvv(t)[(size_t) e] : -1;
++                    const bool      held = kv >= 0 && g_kvl_slots[(size_t) kv].table == id &&
++                                           g_kvl_slots[(size_t) kv].expert == e && kvl_avail(g_kvl_slots[(size_t) kv]);
++                    const uintptr_t vic  = held ? (uintptr_t) kvl_ptr(g_kvl_slots[(size_t) kv]) : 0;
++                    n_ptr++;
++                    if (cp[(size_t) e] != want && (vic == 0 || cp[(size_t) e] != vic) && bad_ptr++ < 20) {
++                        GGML_LOG_WARN("moe_cache VERIFY: table %d (layer %d %s) cold_ptrs[%d] = %#zx, expected %#zx (ram slot %d)\n",
++                                      id, t.layer, t.role.c_str(), e, (size_t) cp[(size_t) e], (size_t) want, r);
++                    }
++                }
++            } else {
++                (void) cudaGetLastError();
++            }
++        }
++        if (data && !kvl_kvv(t).empty()) {   // KV lending: each victim slot against the file
++            device_guard dg(t.device);
++            for (int32_t e = 0; e < t.n_experts && e < (int32_t) kvl_kvv(t).size(); e++) {
++                const int32_t kv = kvl_kvv(t)[(size_t) e];
++                if (kv < 0) {
++                    continue;
++                }
++                sparse_pack_expert(t, e, ref.data());
++                if (cudaMemcpy(got.data(), kvl_ptr(g_kvl_slots[(size_t) kv]), t.expert_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
++                    (void) cudaGetLastError();
++                    continue;
++                }
++                n_kvv++;
++                if (memcmp(got.data(), ref.data(), t.expert_bytes) != 0 && bad_kvv++ < 20) {
++                    report("kv victim", e, kv, got.data());
++                }
++            }
++        }
++        if (data && t.ram_base != nullptr) {
++            for (int32_t e = 0; e < t.n_experts && e < (int32_t) t.ram_slot.size(); e++) {
++                const int32_t r = t.ram_slot[(size_t) e];
++                if (r < 0) {
++                    continue;
++                }
++                sparse_pack_expert(t, e, ref.data());
++                n_ram++;
++                const char * a = t.ram_base + (size_t) r * t.expert_bytes;
++                if (memcmp(a, ref.data(), t.expert_bytes) != 0) {
++                    if (bad_ram++ < 20) { report("ram", e, r, a); }
++                }
++            }
++        }
++    }
++    GGML_LOG_WARN("moe_cache VERIFY: %lld arena slots (%lld differ), %lld RAM-tier slots (%lld differ), %lld map entries "
++                  "(%lld differ), %lld cold pointers (%lld differ), %lld KV victims (%lld differ)\n", (long long) n_arena, (long long) bad_arena,
++                  (long long) n_ram, (long long) bad_ram, (long long) n_map, (long long) bad_map, (long long) n_ptr,
++                  (long long) bad_ptr, (long long) n_kvv, (long long) bad_kvv);
++}
++static void pf_lend_maybe_locked(cudaStream_t s);
++// Prefill in place: see table_t::pf_pending.  The device expert -> slot map (the decode remap's) tells the routed-compact
++// MMQ which experts sit in the arena; the arena's last slot is excluded (a tile load may run a little past an expert)
++// and staged like a cold expert.  Every staged expert also stages its successor (the bytes a tile load can run into),
++// exactly as the plain routed fill does.  False: the plain routed fill serves the op.
++static bool prefill_inplace_prepare_locked(table_t & t, const ggml_tensor * weight_cpy, const int32_t * ids,
++                                           int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, void * stream) {
++    if (!t.host_sparse || t.sparse_off || t.host_dev == nullptr || t.arena == nullptr || t.slots < 2 ||
++        n_used >= t.n_experts || t.identity || t.dr_failed || weight_cpy == nullptr || weight_cpy->data == nullptr) {
++        return false;
++    }
++    if (t.dr_device < 0 && !devremap_alloc_locked(t)) {
++        return false;
++    }
++    const cudaStream_t s = (cudaStream_t) stream;
++    const bool    do2d = t.split_axis == 0 && t.host_pitch != 0;
++    const int64_t rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++    if (do2d && rows <= 0) {
++        return false;
++    }
++    const auto inplace_slot = [&](int32_t e) {
++        const auto it = t.expert_slot.find(e);
++        return it != t.expert_slot.end() && it->second >= 0 && it->second < t.slots - 1;
++    };
++    std::vector<uint8_t> used((size_t) t.n_experts, 0);
++    for (int64_t tok = 0; tok < n_tok; tok++) {
++        for (int64_t j = 0; j < n_used; j++) {
++            const int32_t e = *(const int32_t *) ((const char *) ids + (size_t) tok * ids_nb1 + (size_t) j * ids_nb0);
++            if (e < 0 || e >= t.n_experts) {
++                return false;
++            }
++            used[(size_t) e] = 1;
++        }
++    }
++    // stage: used experts not read in place, plus the successor of each; in place: the other used experts.
++    // pad: the unused successor of an in-place expert.  MMQ reads up to 512 bytes past an expert; the compact kernel
++    // reads an in-place expert (and so its tail) from the arena, but a consumer that reads the whole staged table
++    // (any non-compact path, after resolve copies the in-place bodies too) needs those bytes to be the neighbour's real
++    // (finite) data, as the plain fill provides, not whatever the compute buffer held before.  The pads are packed
++    // last and copied only by that full resolve.
++    std::vector<uint8_t> stage((size_t) t.n_experts, 0);
++    std::vector<uint8_t> pad((size_t) t.n_experts, 0);
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        if (used[(size_t) e] && !inplace_slot(e)) {
++            stage[(size_t) e] = 1;
++            if (e + 1 < t.n_experts) {
++                stage[(size_t) e + 1] = 1;
++            }
++        }
++    }
++    for (int32_t e = 0; e + 1 < t.n_experts; e++) {
++        if (used[(size_t) e] && !used[(size_t) e + 1] && !stage[(size_t) e + 1]) {
++            pad[(size_t) e + 1] = 1;
++        }
++    }
++    const size_t n = (size_t) t.n_experts;
++    t.route_pack.resize(n * (sizeof(void *) + sizeof(int32_t) + 1));
++    const char ** srcs = (const char **) t.route_pack.data();
++    int32_t *     eids = (int32_t *) (t.route_pack.data() + n * sizeof(void *));
++    uint8_t *     cold = t.route_pack.data() + n * (sizeof(void *) + sizeof(int32_t));
++    int k = 0;
++    const auto add = [&](int32_t e) -> bool {
++        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k])) {
++            return false;
++        }
++        eids[k++] = e;
++        return true;
++    };
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        if (stage[(size_t) e] && !add(e)) {
++            return false;
++        }
++    }
++    const int k_stage = k;
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        if (used[(size_t) e] && !stage[(size_t) e] && !add(e)) {
++            return false;
++        }
++    }
++    const int k_in = k - k_stage;
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        if (pad[(size_t) e] && !add(e)) {
++            return false;
++        }
++    }
++    const int k_pad = k - k_stage - k_in;
++
++    device_guard dg(t.device);
++    // the map the kernel reads: current residency (re-uploaded only after a change; decline while the previous upload
++    // still reads the staging buffer)
++    if (!dr_map_refresh_locked(t, s)) {
++        return false;
++    }
++    if (k > 0) {
++        if (t.route_dev == nullptr && cudaMalloc(&t.route_dev, t.route_pack.size()) != cudaSuccess) {
++            (void) cudaGetLastError();
++            t.route_dev = nullptr;
++            return false;
++        }
++        if (cudaMemcpyAsync(t.route_dev, t.route_pack.data(), t.route_pack.size(), cudaMemcpyHostToDevice, s) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
++        }
++    }
++    if (t.pf_pending) {
++        GGML_LOG_ERROR("%s: layer=%d role=%s device=%d: the previous prefill fill was never resolved by its consumer\n",
++                       __func__, t.layer, t.role.c_str(), t.device);
++    }
++    t.pf_pending = true;
++    t.pf_dst     = weight_cpy->data;
++    t.pf_k_stage = k_stage;
++    t.pf_k_in    = k_in;
++    t.pf_k_pad   = k_pad;
++    t.pf_rows    = rows;
++    t.pf_do2d    = do2d;
++    g_alias_to_id[weight_cpy] = (int) (&t - g_tables.data());
++    g_route_fills++;
++    return true;
++}
++// ---- wip/prefill-prefetch (GGML_MOE_PF_PREFETCH=1) ----
++static __global__ void moe_cache_pf_fill_kernel(char * __restrict__ dst, const char * __restrict__ arena,
++                                                const char * __restrict__ stage, const int32_t * __restrict__ map,
++                                                int inpl, int64_t expert_bytes) {
++    const int     e = blockIdx.y;
++    const int32_t m = map[e];
++    const char *  s = m < inpl ? arena + (int64_t) m * expert_bytes : stage + (int64_t) (m - inpl) * expert_bytes;
++    char *        d = dst + (int64_t) e * expert_bytes;
++    const int64_t chunk = 4096;
++    for (int64_t o = (int64_t) blockIdx.x * chunk; o < expert_bytes; o += (int64_t) gridDim.x * chunk) {
++        const int64_t n = expert_bytes - o < chunk ? expert_bytes - o : chunk;
++        moe_cache_policy_copy(d + o, s + o, (size_t) n, threadIdx.x, blockDim.x);
++    }
++}
++static __global__ void moe_cache_pf_copy1_kernel(char * __restrict__ dst, const char * __restrict__ src, int64_t bytes) {
++    const int64_t chunk = 4096;
++    for (int64_t o = (int64_t) blockIdx.x * chunk; o < bytes; o += (int64_t) gridDim.x * chunk) {
++        const int64_t n = bytes - o < chunk ? bytes - o : chunk;
++        moe_cache_policy_copy(dst + o, src + o, (size_t) n, threadIdx.x, blockDim.x);
++    }
++}
++struct pf_dev_t {
++    bool         tried = false;
++    bool         ok    = false;
++    cudaStream_t cs    = nullptr;                 // copy stream
++    char *       buf[2]      = { nullptr, nullptr };
++    size_t       buf_bytes   = 0;
++    cudaEvent_t  ev_free[2]  = { nullptr, nullptr };   // compute stream: the buffer's earlier readers are behind this
++    cudaEvent_t  ev_ready[2] = { nullptr, nullptr };   // copy stream: the buffer is filled
++    std::map<int, std::vector<int>> layer_tables;      // layer -> table ids laid out in the staging
++    int          cur_layer   = -1;
++    int          cur_buf     = -1;
++    int          ahead_layer = -1;
++    int          ahead_buf   = -1;
++    uint64_t     ahead_seq   = 0;
++    int64_t      n_hit = 0, n_miss = 0, n_map = 0, n_take = 0;
++    int          n_tab       = 0;
++    cudaStream_t last_s      = nullptr;               // the stream of the last prefetched op (the staging's readers)
++    cudaEvent_t  ev_lend[2]  = { nullptr, nullptr };   // GGML_MOE_PF_LEND: the copy stream / the readers, before lending
++    int64_t      lend_idle   = 0;                     // decode policy calls since the last prefetched op
++};
++pf_dev_t g_pf[16];
++static size_t pf_align(size_t x) { return (x + 255) & ~(size_t) 255; }
++static bool pf_lend_on() {
++    static const bool v = !getenv("GGML_MOE_PF_LEND") || atoi(getenv("GGML_MOE_PF_LEND")) != 0;
++    return v;
++}
++// Add the two staging buffers to the KV-lending grid (not lent until the first decode steps after this prefill).
++static void pf_lend_add_locked(pf_dev_t & P, int device) {
++    if (!kvl_on() || !pf_lend_on() || g_kvl_tensors.empty() || device != g_kvl_device) {
++        return;
++    }
++    for (const table_t & t : g_tables) {
++        if (t.device != device) {
++            // the take-back synchronises the device from the split-input hook: with a second device that could hold back
++            // its half of an all-reduce, so lending the staging is single-device only
++            return;
++        }
++    }
++    for (int b = 0; b < 2; b++) {
++        if (cudaEventCreateWithFlags(&P.ev_lend[b], cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return;
++        }
++    }
++    for (int b = 0; b < 2; b++) {
++        kvl_tensor_t kt = { P.buf[b], P.buf_bytes, 0 };
++        kt.pf = true;
++        g_kvl_tensors.push_back(kt);
++        if (!g_kvl_slots.empty()) {   // the grid exists already: this buffer's slots go after it
++            for (size_t off = 0; off + g_kvl_slot_bytes <= kt.bytes; off += g_kvl_slot_bytes) {
++                kvl_slot_t sl;
++                sl.tensor = (int) g_kvl_tensors.size() - 1;
++                sl.off    = off;
++                g_kvl_slots.push_back(sl);
++            }
++        }
++    }
++    GGML_LOG_WARN("moe_cache prefill prefetch: device %d: the 2 x %.1f MiB staging is lent to the KV-lending grid between "
++                  "prefills (GGML_MOE_PF_LEND=0: off)\n", device, P.buf_bytes / 1048576.0);
++}
++// The first prefetched layer of a prefill: point the victims in the staging back at their fallback before the copy stream
++// overwrites them.
++static void pf_take_back_locked() {
++    const auto t0 = std::chrono::steady_clock::now();
++    device_guard dg(g_kvl_device);
++    (void) cudaDeviceSynchronize();   // no reader of a victim may be in flight
++    g_pf_lent = false;
++    std::vector<std::pair<uintptr_t *, uintptr_t>> w;
++    for (kvl_slot_t & sl : g_kvl_slots) {
++        if (sl.table >= 0 && !kvl_avail(sl)) {
++            kvl_release_locked(sl, nullptr, &w);
++        }
++    }
++    for (const auto & pw : w) {
++        (void) cudaMemcpy(pw.first, &pw.second, sizeof(uintptr_t), cudaMemcpyHostToDevice);
++    }
++    (void) cudaDeviceSynchronize();
++    (void) cudaGetLastError();
++    g_pf_takes++;
++    g_pf_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++}
++// The decode policy, on the stream that makes victims: lend the staging after a few steps without a prefetch.  The
++// staging's last writer (the copy stream) and readers (the prefetched ops) are ordered before the victims' copies.
++static void pf_lend_maybe_locked(cudaStream_t s) {
++    if (g_pf_lent || !pf_lend_on() || g_kvl_device < 0 || g_kvl_stream == nullptr || (void *) s != g_kvl_stream) {
++        return;
++    }
++    pf_dev_t & P = g_pf[g_kvl_device];
++    if (!P.ok || P.ev_lend[0] == nullptr || P.ev_lend[1] == nullptr) {
++        return;
++    }
++    if (++P.lend_idle < 4 * (int64_t) P.n_tab) {
++        return;
++    }
++    (void) cudaEventRecord(P.ev_lend[0], P.cs);
++    (void) cudaStreamWaitEvent(s, P.ev_lend[0], 0);
++    if (P.last_s != nullptr && P.last_s != s) {
++        (void) cudaEventRecord(P.ev_lend[1], P.last_s);
++        (void) cudaStreamWaitEvent(s, P.ev_lend[1], 0);
++    }
++    (void) cudaGetLastError();
++    g_pf_lent = true;
++    g_pf_lends++;
++}
++static bool pf_table_ok(const table_t & t, int device) {
++    return g_sized && !g_tier_off && t.host_sparse && !t.sparse_off && t.arena != nullptr && t.slots >= 2 &&
++           !t.identity && t.device == device && t.ram_base != nullptr && t.ram_bytes > 0 && t.expert_bytes > 0 &&
++           t.n_experts > 0 && (int) t.slot_expert.size() == t.slots && (int) t.ram_slot.size() == t.n_experts;
++}
++static bool pf_init_locked(pf_dev_t & P, int device) {
++    if (P.tried) {
++        return P.ok;
++    }
++    P.tried = true;
++    size_t maxb = 0;
++    for (int id = 0; id < (int) g_tables.size(); id++) {
++        table_t & t = g_tables[id];
++        if (pf_table_ok(t, device) && t.ram_bytes >= t.expert_bytes) {
++            P.layer_tables[t.layer].push_back(id);
++        }
++    }
++    device_guard dg(device);
++    int n_tab = 0;
++    for (auto & kv : P.layer_tables) {
++        std::vector<int> & v = kv.second;
++        std::sort(v.begin(), v.end(), [](int a, int b) { return g_tables[a].role < g_tables[b].role; });
++        size_t off = 0;
++        for (int id : v) {
++            table_t & t = g_tables[id];
++            t.pf_ram_n = t.ram_bytes / t.expert_bytes;
++            t.pf_off   = (int64_t) off;
++            off += pf_align((t.pf_ram_n + 2) * t.expert_bytes);   // the mirror, the scratch slot, a zeroed pad slot
++            const size_t mb = (size_t) t.n_experts * sizeof(int32_t);
++            if (cudaMalloc((void **) &t.pf_map_dev, mb) != cudaSuccess ||
++                cudaHostAlloc((void **) &t.pf_map_host, mb, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
++                cudaHostGetDevicePointer((void **) &t.pf_map_hdev, t.pf_map_host, 0) != cudaSuccess ||
++                cudaEventCreateWithFlags(&t.pf_map_ev, cudaEventDisableTiming) != cudaSuccess) {
++                (void) cudaGetLastError();
++                GGML_LOG_WARN("%s: device %d: map allocation failed; prefill prefetch off\n", __func__, device);
++                return false;
++            }
++            t.pf_map_last.clear();
++            n_tab++;
++        }
++        maxb = std::max(maxb, off);
++    }
++    if (maxb == 0) {
++        GGML_LOG_WARN("%s: device %d: no table with a RAM tier; prefill prefetch off\n", __func__, device);
++        return false;
++    }
++    if (cudaStreamCreateWithFlags(&P.cs, cudaStreamNonBlocking) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    for (int b = 0; b < 2; b++) {
++        if (cudaMalloc((void **) &P.buf[b], maxb) != cudaSuccess ||
++            cudaEventCreateWithFlags(&P.ev_free[b], cudaEventDisableTiming) != cudaSuccess ||
++            cudaEventCreateWithFlags(&P.ev_ready[b], cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            GGML_LOG_WARN("%s: device %d: 2 x %.1f MiB staging allocation failed; prefill prefetch off\n", __func__,
++                          device, maxb / 1048576.0);
++            return false;
++        }
++        (void) cudaMemsetAsync(P.buf[b], 0, maxb, P.cs);   // finite pad bytes past the last staged expert
++    }
++    P.buf_bytes = maxb;
++    P.n_tab     = n_tab;
++    P.ok = true;
++    pf_lend_add_locked(P, device);
++    GGML_LOG_WARN("moe_cache prefill prefetch: device %d: %d tables in %zu layers, staging 2 x %.1f MiB\n", device,
++                  n_tab, P.layer_tables.size(), maxb / 1048576.0);
++    return true;
++}
++// expert -> in-place slot (< inpl) or inpl + staging index: RAM-tier slot r -> r, the scratch slot's expert -> pf_ram_n
++static bool pf_build_map_locked(const table_t & t, std::vector<int32_t> & m) {
++    const int32_t inpl = t.slots - 1;
++    m.assign((size_t) t.n_experts, -1);
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        const auto    it = t.expert_slot.find(e);
++        const int32_t sl = it != t.expert_slot.end() ? it->second : -1;
++        if (sl >= 0 && sl < inpl) {
++            m[(size_t) e] = sl;
++        } else if (sl == inpl) {
++            m[(size_t) e] = inpl + (int32_t) t.pf_ram_n;
++        } else {
++            const int32_t r = t.ram_slot[(size_t) e];
++            if (r < 0 || (size_t) r >= t.pf_ram_n) {
++                return false;   // a cold (file) expert: not in the mirror
++            }
++            m[(size_t) e] = inpl + r;
++        }
++    }
++    return true;
++}
++// Fill staging buffer b with layer L's tables on the copy stream, after everything enqueued on `s` so far.
++static void pf_issue_locked(pf_dev_t & P, int L, int b, cudaStream_t s) {
++    (void) cudaEventRecord(P.ev_free[b], s);
++    (void) cudaStreamWaitEvent(P.cs, P.ev_free[b], 0);
++    for (int id : P.layer_tables[L]) {
++        table_t & t   = g_tables[id];
++        char *    dst = P.buf[b] + t.pf_off;
++        (void) cudaMemcpyAsync(dst, t.ram_base, t.pf_ram_n * t.expert_bytes, cudaMemcpyHostToDevice, P.cs);
++        // Zero the scratch and pad slots on every fill: regions of different layers overlap in this buffer, so bytes zeroed
++        // once at init can hold another table's data, and MMQ reads past the last expert (a foreign quant type there can
++        // decode to inf / NaN scales).  The consumer copies the scratch expert, if any, over its slot.
++        (void) cudaMemsetAsync(dst + t.pf_ram_n * t.expert_bytes, 0, 2 * t.expert_bytes, P.cs);
++        // The scratch slot's expert is copied by the consumer (moe_cache_prefill_resolve): that slot is the cache's
++        // staging slot, so its bytes are settled only at the op, which is where the in-place path reads them too.
++    }
++    (void) cudaEventRecord(P.ev_ready[b], P.cs);
++    if (cudaGetLastError() != cudaSuccess) {
++        GGML_ABORT("moe_cache prefill prefetch: device copy enqueue failed (layer %d)", L);
++    }
++}
++static bool moe_cache_pf_take(const ggml_tensor * weight, const ggml_tensor * weight_cpy, void * stream, int device,
++                              bool check_only) {
++    if (!g_enabled || weight == nullptr || weight_cpy == nullptr || weight_cpy->data == nullptr || stream == nullptr ||
++        device < 0 || device >= 16) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const auto it = g_key_to_id.find({ (const void *) weight, device });
++    if (it == g_key_to_id.end() || it->second < 0 || it->second >= (int) g_tables.size()) {
++        return false;
++    }
++    const int  id = it->second;
++    table_t &  t  = g_tables[id];
++    pf_dev_t & P  = g_pf[device];
++    if (!pf_table_ok(t, device) || !pf_init_locked(P, device) || t.pf_off < 0) {
++        return false;
++    }
++    std::vector<int32_t> m;
++    if (!pf_build_map_locked(t, m)) {
++        return false;
++    }
++    const bool map_changed = m != t.pf_map_last;
++    if (map_changed && cudaEventQuery(t.pf_map_ev) != cudaSuccess) {
++        (void) cudaGetLastError();   // the previous map upload still reads the pinned source
++        return false;
++    }
++    if (check_only) {
++        return true;
++    }
++    const cudaStream_t s = (cudaStream_t) stream;
++    device_guard dg(device);
++    if (g_pf_lent && device == g_kvl_device) {
++        pf_take_back_locked();
++    }
++    P.lend_idle = 0;
++    P.last_s    = s;
++    if (map_changed) {
++        memcpy(t.pf_map_host, m.data(), m.size() * sizeof(int32_t));
++        moe_cache_copy_kernel<<<4, 256, 0, s>>>((char *) t.pf_map_dev, (const char *) t.pf_map_hdev, m.size() * sizeof(int32_t));
++        (void) cudaEventRecord(t.pf_map_ev, s);
++        t.pf_map_last = std::move(m);
++        P.n_map++;
++    }
++    const int L = t.layer;
++    if (L != P.cur_layer) {
++        const uint64_t seq = g_pf_policy_seq.load();
++        int b;
++        if (P.ahead_layer == L && P.ahead_seq == seq) {
++            b = P.ahead_buf;
++            P.n_hit++;
++        } else {
++            b = P.cur_buf < 0 ? 0 : (P.cur_buf ^ 1);
++            pf_issue_locked(P, L, b, s);
++            P.n_miss++;
++        }
++        (void) cudaStreamWaitEvent(s, P.ev_ready[b], 0);
++        P.cur_layer = L;
++        P.cur_buf   = b;
++        const auto nx = P.layer_tables.upper_bound(L);
++        if (nx != P.layer_tables.end()) {
++            pf_issue_locked(P, nx->first, b ^ 1, s);
++            P.ahead_layer = nx->first;
++            P.ahead_buf   = b ^ 1;
++            P.ahead_seq   = seq;
++        } else {
++            P.ahead_layer = -1;
++        }
++        if ((P.n_hit + P.n_miss) % 1000 == 0) {
++            GGML_LOG_WARN("moe_cache prefill prefetch: device %d: %lld layers (%lld ahead, %lld on demand), %lld map uploads, %lld tables\n",
++                          device, (long long) (P.n_hit + P.n_miss), (long long) P.n_hit, (long long) P.n_miss,
++                          (long long) P.n_map, (long long) P.n_take);
++        }
++    }
++    P.n_take++;
++    t.dr_lag_n     = 0;
++    t.remap_n_used = 0;
++    if (t.pf_pending) {
++        GGML_LOG_ERROR("%s: layer=%d role=%s device=%d: the previous prefill fill was never resolved by its consumer\n",
++                       __func__, t.layer, t.role.c_str(), t.device);
++    }
++    t.pf_pending = true;
++    t.pf_pref    = true;
++    t.pf_scratch = false;
++    for (int32_t v : t.pf_map_last) {
++        if (v == t.slots - 1 + (int32_t) t.pf_ram_n) {
++            t.pf_scratch = true;
++            break;
++        }
++    }
++    t.pf_stage   = P.buf[P.cur_buf] + t.pf_off;
++    t.pf_dst     = weight_cpy->data;
++    g_alias_to_id[weight_cpy] = id;
++    return true;
++}
++bool moe_cache_prefill_resolve(const ggml_tensor * weight_cpy, int device, void * stream, bool inplace,
++                               const char ** arena, const int32_t ** map, int64_t * arena_bytes, int * slots,
++                               const char ** stage) {
++    if (!g_enabled || !g_prefill_inplace || weight_cpy == nullptr) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    table_t * tp = nullptr;
++    const auto it = g_alias_to_id.find(weight_cpy);
++    if (it != g_alias_to_id.end() && it->second >= 0 && it->second < (int) g_tables.size()) {
++        tp = &g_tables[it->second];
++    }
++    if (tp == nullptr || !tp->pf_pending || tp->device != device || tp->pf_dst != weight_cpy->data) {
++        // a meta graph rebuild can hand the op a different tensor pointer than the hook saw: match the buffer
++        tp = nullptr;
++        for (table_t & c : g_tables) {
++            if (c.pf_pending && c.device == device && c.pf_dst == weight_cpy->data) {
++                tp = &c;
++                break;
++            }
++        }
++        if (tp == nullptr) {
++            return false;
++        }
++    }
++    table_t & t = *tp;
++    t.pf_pending = false;
++    if (t.pf_pref) {
++        t.pf_pref = false;
++        if (t.pf_scratch) {
++            moe_cache_pf_copy1_kernel<<<16, 256, 0, (cudaStream_t) stream>>>(
++                (char *) t.pf_stage + t.pf_ram_n * t.expert_bytes,
++                (const char *) t.arena + (size_t) (t.slots - 1) * t.expert_bytes, (int64_t) t.expert_bytes);
++        }
++        if (!inplace || stage == nullptr) {
++            // a consumer that reads the whole table: every expert from the arena or the staging
++            moe_cache_pf_fill_kernel<<<dim3(16, (unsigned) t.n_experts), 256, 0, (cudaStream_t) stream>>>(
++                (char *) t.pf_dst, (const char *) t.arena, t.pf_stage, t.pf_map_dev, t.slots - 1, (int64_t) t.expert_bytes);
++            const cudaError_t err = cudaGetLastError();
++            if (err != cudaSuccess) {
++                GGML_ABORT("%s: layer=%d role=%s: prefetched fill launch failed: %s", __func__, t.layer, t.role.c_str(),
++                           cudaGetErrorString(err));
++            }
++            return false;
++        }
++        if (arena)       *arena       = (const char *) t.arena;
++        if (map)         *map         = t.pf_map_dev;
++        if (arena_bytes) *arena_bytes = (int64_t) t.expert_bytes;
++        if (slots)       *slots       = t.slots - 1;
++        *stage = t.pf_stage;
++        return true;
++    }
++    const int k = inplace ? t.pf_k_stage : t.pf_k_stage + t.pf_k_in + t.pf_k_pad;
++    if (k > 0) {
++        const size_t n  = (size_t) t.n_experts;
++        const char * rd = (const char *) t.route_dev;
++        moe_cache_route_kernel<<<dim3(16, (unsigned) k), 256, 0, (cudaStream_t) stream>>>(
++            (char *) t.pf_dst, (const char * const *) rd, (const int32_t *) (rd + n * sizeof(void *)),
++            (const uint8_t *) (rd + n * (sizeof(void *) + sizeof(int32_t))),
++            (int64_t) t.expert_bytes, t.pf_rows, t.pf_rows > 0 ? (int64_t) (t.expert_bytes / (size_t) t.pf_rows) : 0,
++            (int64_t) t.host_pitch, t.pf_do2d ? 1 : 0);
++        const cudaError_t err = cudaGetLastError();
++        if (err != cudaSuccess) {
++            GGML_ABORT("%s: layer=%d role=%s: prefill fill launch failed: %s", __func__, t.layer, t.role.c_str(),
++                       cudaGetErrorString(err));
++        }
++    }
++    if (!inplace) {
++        return false;
++    }
++    if (arena)       *arena       = (const char *) t.arena;
++    if (map)         *map         = t.dr_map_dev;
++    if (arena_bytes) *arena_bytes = (int64_t) t.expert_bytes;
++    if (slots)       *slots       = t.slots - 1;   // the last slot is staged
++    return true;
++}
++const uintptr_t * moe_cache_get_cold_ptrs(const void * arena) {
++    if (!g_enabled || !g_cold_uva || arena == nullptr) {
++        return nullptr;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    for (const table_t & t : g_tables) {
++        if (t.arena == arena && t.slots > 0 && t.host_dev != nullptr && t.cold_safe) {
++            return t.cold_ptrs;
++        }
++    }
++    return nullptr;
++}
++static bool get_table_locked(const ggml_tensor * op, const ggml_tensor * weight_cpy, int device,
++                             void ** arena, int64_t * n_slots,
++                             size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok) {
++    int id = alias_find_checked(weight_cpy, device, op != nullptr ? name_layer(op) : -1);
++    // Fallback for `-sm tensor`: a meta graph rebuild can hand the op a different simple-tensor pointer
++    // than the one the hook saw, so resolve by the semantic (layer, role, device) key.  The buffer
++    // check skips our own re-dispatch copy (`src0c.buffer = nullptr` in the consumer), whose name
++    // pointer is inherited and which would otherwise recurse forever.
++    if (id < 0 && op != nullptr && weight_cpy->buffer != nullptr) {
++        const int layer = name_layer(op);
++        const auto sit = g_sem_to_id.find(std::make_tuple(layer, sem_role(weight_cpy), device));
++        if (sit != g_sem_to_id.end()) {
++            id = sit->second;
++        }
++    }
++    if (id < 0) {
++        return false;
++    }
++    // OPEN 2: per-table, like the other consumers.  Every branch below requires THIS table's arena and
++    // slots, and the caller re-checks the remap shape, so a partially-evicted cache still serves its
++    // residents.
++    table_t & t = g_tables[id];
++    if (t.fill_failed) {
++        return false;   // never hand out the arena of a table whose fills failed
++    }
++    // Identity fast path: slot == expert, the whole table is resident, so the arena is indexed by the
++    // raw routing ids and no remap (and no per-token host routing readback) is needed.  Restricted to
++    // the decode/verify band: prefill keeps the normal path (its MMQ fusions and the MMQ dispatch read
++    // the real copied buffer, and the shallow arena copy carries a null `buffer`).
++    if (t.identity && t.arena != nullptr && t.slots >= t.n_experts &&
++        op != nullptr && op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
++        g_get_ok += g_sig_probe ? 0 : 1;
++        if (arena)        *arena        = t.arena;
++        if (n_slots)      *n_slots      = t.slots;
++        if (expert_bytes) *expert_bytes = t.expert_bytes;
++        if (remap_dev)    *remap_dev    = nullptr;
++        if (n_used)       *n_used       = 0;
++        if (n_tok)        *n_tok        = 0;
++        return true;
++    }
++    if (t.arena == nullptr || t.slots <= 0 || t.remap_dev == nullptr || t.remap_n_used <= 0) {
++        return false;
++    }
++    if (t.remap_round != remap_round_locked(device)) {
++        return false;   // published for an earlier split (see remap_round_locked): the op reads the scheduler's copy
++    }
++    g_get_ok += g_sig_probe ? 0 : 1;
++    if (arena)        *arena        = t.arena;
++    if (n_slots)      *n_slots      = t.slots;
++    if (expert_bytes) *expert_bytes = t.expert_bytes;
++    if (remap_dev)    *remap_dev    = t.remap_dev;
++    if (n_used)       *n_used       = t.remap_n_used;
++    if (n_tok)        *n_tok        = t.remap_n_tok;
++    return true;
++}
++// Which MUL_MAT_ID nodes of `cgraph` the per-op consumer redirects onto an arena right now (the consumer's own test:
++// `moe_cache_get_table` plus the remap shape).  A captured CUDA graph bakes that choice in (the arena base and the
++// remap buffer, or the scheduler's `input_cpy`), so a replay is only valid while the signature is unchanged: a table
++// that declines after its capture would otherwise be read through a remap this call never wrote (FINDINGS 716).
++uint64_t moe_cache_redirect_sig(const ggml_cgraph * cgraph, int device) {
++    if (!g_enabled || cgraph == nullptr) {
++        return 0;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    g_sig_probe = true;
++    uint64_t h = 1469598103934665603ull;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * node = cgraph->nodes[i];
++        if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr || node->src[2] == nullptr) {
++            continue;
++        }
++        void *  remap = nullptr;
++        int64_t nu = 0, nt = 0;
++        const bool on = get_table_locked(node, node->src[0], device, nullptr, nullptr, nullptr, &remap, &nu, &nt) &&
++                        (remap == nullptr || (nu == node->src[2]->ne[0] && nt == node->src[2]->ne[1]));
++        h = (h ^ (uint64_t) (2 * i + (on ? 1 : 0))) * 1099511628211ull;
++    }
++    g_sig_probe = false;
++    return h;
++}
++// After a failed `moe_cache_redirect_fused`: true when the cache took over either lane anyway (one lane declined, or a
++// remap shape the fused kernel cannot take).  The scheduler skipped the copy of every taken-over input, so the original
++// tensors are stale for that lane: the caller must not fuse, and each op reads its own table through the per-op
++// consumer.
++bool moe_cache_fused_lane_taken(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate, int device) {
++    if (!g_enabled) {
++        return false;
++    }
++    static const bool on = [] {
++        const char * e = getenv("GGML_MOE_FUSED_LANE_GUARD");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    if (!on) {
++        return false;
++    }
++    void *  a = nullptr, * r = nullptr;
++    int64_t s = 0, nu = 0, nt = 0;
++    size_t  eb = 0;
++    const bool taken = moe_cache_get_table(op, src0, device, &a, &s, &eb, &r, &nu, &nt) ||
++                       (gate != nullptr && moe_cache_get_table(op, gate, device, &a, &s, &eb, &r, &nu, &nt));
++    if (taken) {
++        static std::atomic<int64_t> n{0};
++        if (n.fetch_add(1) == 0) {
++            GGML_LOG_WARN("moe_cache: a fused MoE op has a lane the cache took over but cannot redirect together: "
++                          "running it unfused (GGML_MOE_FUSED_LANE_GUARD=0 restores the fused read)\n");
++        }
++    }
++    return taken;
++}
++// KV lending: llama registers the KV tensors whose rows past the context in use may hold victims (all with `rows`
++// cells, on one device).  Refused once the grid exists.
++bool moe_cache_kv_register(void * data, size_t bytes, size_t row_bytes, int64_t rows) {
++    if (!kvl_on() || data == nullptr || row_bytes == 0 || rows <= 0 || bytes < (size_t) rows * row_bytes) {
++        return false;
++    }
++    cudaPointerAttributes attr = {};
++    if (cudaPointerGetAttributes(&attr, data) != cudaSuccess || attr.type != cudaMemoryTypeDevice) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (!g_kvl_slots.empty() || (g_kvl_device >= 0 && attr.device != g_kvl_device) || (g_kvl_rows != 0 && rows != g_kvl_rows)) {
++        return false;
++    }
++    g_kvl_tensors.push_back({ (char *) data, (size_t) rows * row_bytes, row_bytes });
++    g_kvl_device = attr.device;
++    g_kvl_rows   = rows;
++    g_kvl_line   = rows;   // nothing lent until the first batch says how much the KV uses
++    return true;
++}
++// Move the lend line: the next batch reads or writes rows [0, rows).  Taking rows back synchronises the device, points
++// the victims there back at their fallback and zeroes the rows (attention reads masked cells up to n_kv, and expert
++// bytes there could turn into NaN); giving rows back is bookkeeping.  A margin above the need, and a hysteresis of 4
++// steps before lending again, keep a growing context from taking rows back every batch.
++void moe_cache_kv_need(int64_t rows) {
++    if (!kvl_on()) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (g_kvl_tensors.empty()) {
++        return;
++    }
++    const int64_t step = kvl_step();
++    rows = std::max<int64_t>(0, std::min(rows, g_kvl_rows));
++    const int64_t want = std::min(g_kvl_rows, std::max(2 * step, (rows + kvl_margin() + step - 1) / step * step));
++    const int64_t old  = g_kvl_line;
++    if (rows > old) {
++        const auto t0 = std::chrono::steady_clock::now();
++        device_guard dg(g_kvl_device);
++        (void) cudaDeviceSynchronize();   // no reader of a victim and no KV writer may be in flight
++        g_kvl_line = want;
++        std::vector<std::pair<uintptr_t *, uintptr_t>> w;
++        int64_t n_drop = 0;
++        for (kvl_slot_t & sl : g_kvl_slots) {
++            if (sl.table >= 0 && !kvl_avail(sl)) {
++                kvl_release_locked(sl, nullptr, &w);
++                n_drop++;
++            }
++        }
++        for (const auto & pw : w) {
++            (void) cudaMemcpy(pw.first, &pw.second, sizeof(uintptr_t), cudaMemcpyHostToDevice);
++        }
++        for (const kvl_tensor_t & kt : g_kvl_tensors) {
++            const size_t a = (size_t) old * kt.row_bytes, b = std::min(kt.bytes, (size_t) want * kt.row_bytes);
++            if (b > a) {
++                (void) cudaMemset(kt.data + a, 0, b - a);
++            }
++        }
++        (void) cudaDeviceSynchronize();
++        (void) cudaGetLastError();
++        for (const kvl_slot_t & sl : g_kvl_slots) {
++            GGML_ASSERT(sl.table < 0 || kvl_avail(sl));   // no victim may stay in a row the KV now owns
++        }
++        g_kvl_takes++;
++        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        g_kvl_ms += ms;
++        if (kvl_log()) {
++            GGML_LOG_WARN("moe_cache KV lending: KV needs %lld rows, line %lld -> %lld: %lld victims dropped, %.1f ms\n",
++                          (long long) rows, (long long) old, (long long) want, (long long) n_drop, ms);
++        }
++    } else if (want + 4 * step <= old) {
++        g_kvl_line = want;
++        g_kvl_gives++;
++        if (kvl_log()) {
++            GGML_LOG_WARN("moe_cache KV lending: KV needs %lld rows, line %lld -> %lld (lent)\n", (long long) rows,
++                          (long long) old, (long long) want);
++        }
++    }
++}
++// The registered KV goes away (its context is freed): take every row back and forget the tensors.
++void moe_cache_kv_unregister() {
++    if (!kvl_on()) {
++        return;
++    }
++    moe_cache_kv_need(INT64_MAX);
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (g_pf_lent && g_kvl_device >= 0) {
++        pf_take_back_locked();   // the staging's victims go back to their fallback before the grid is forgotten
++    }
++    g_kvl_tensors.clear();
++    g_kvl_slots.clear();
++    for (table_t & t : g_tables) {
++        kvl_kvv(t).clear();
++    }
++    g_kvl_rows = g_kvl_line = 0;
++    g_kvl_device     = -1;
++    g_kvl_slot_bytes = 0;
++    g_kvl_hand       = 0;
++    g_kvl_stream     = nullptr;
++}
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 601918d4b..c8683cced 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -154,12 +154,10 @@ bool llama_model_loader::host_expert_selected(const std::string & name, int laye
+ }
+ 
+ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+-    // ours: moe-expert-cache.cu stays at r206, which has no pool budget or heat ranking for the loader: no plan, the
+-    // historical mode-keyed decision per tensor (-lme has no effect).
+-    if (host_experts_limit_gib > 0) {
+-        LLAMA_LOG_WARN("%s: --limit-host-experts is ignored in this tree\n", __func__);
++    // --host-experts mmap: no plan, every expert stays in the mapping (the cache registers what a GPU reads).
++    if (mmap_host_experts) {
++        return;
+     }
+-    return;
+     if (host_experts_plan_done) {
+         return;
+     }
+-- 
+2.53.0
+

@@ -1,0 +1,246 @@
+From 8f438c8da094eef5f04c77ef418ab1a0c2cf2b47 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 7 Nov 2026 23:32:10 +0000
+Subject: [PATCH 08/11] sched: let layer-split pipeline parallelism overlap the
+ devices on ROCm
+
+Layer split with pipeline parallelism (several devices, no -ot) ran the GPUs
+strictly in turn: every ubatch drained both devices on the host.
+
+- llama-context: with pipeline parallelism, prompt ubatches (> 64 tokens)
+  rebuild their graph instead of reusing it; reuse forces a full scheduler
+  sync. Decode keeps reuse. LLAMA_PP_PREFILL_NO_REUSE=0 restores reuse.
+- ggml-backend: with n_copies > 1, host inputs (user inputs and host-resident
+  split inputs) are copied into a pinned per-(backend, copy) ring and uploaded
+  with set_tensor_async on the split backend stream; a ring is reused only
+  after its own last upload event. The plain path waited on the per-copy
+  event and did a synchronous pageable H2D copy, which on ROCm waits for the
+  queued compute. GGML_SCHED_INPUT_STAGE=0 restores it.
+- ggml-alloc: GGML_GALLOC_FP_SHAPES=0 (opt-in) leaves shapes out of the
+  layout fingerprint, so a same-topology graph keeps the reserved layout when
+  every tensor fits (the upstream size check).
+- llama-kv-cache: LLAMA_KV_N_PAD_PREFILL_POW2=1 (opt-in) rounds prompt-ubatch
+  n_kv up to a power of two, so a long prompt re-reserves log2 times.
+
+Only pipelined configurations change: 1 GPU, tensor split and layer split
+with -ot keep n_copies == 1 and behave as before.
+
+Half-depth Flash-Next (24 layers), 2x R9700 Gen5 x8: llama-bench pp98304
+layer 6099 -> 7820 t/s (one GPU 4987); server prefill 31.5k 7030 -> 7779,
+159k 6265 -> 6923; greedy text identical; full-logit KLD vs non-pipelined
+layer split identical to the base-vs-base control at 8k and 32k. Full
+48-layer model: llama-bench pp98304 50/50 split 3026 -> 3273; with MTP at
+128K the pipelined server runs out of memory on device 1 (extra copies).
+---
+ ggml/src/ggml-alloc.c     | 14 ++++++-
+ ggml/src/ggml-backend.cpp | 82 ++++++++++++++++++++++++++++++++++++++-
+ src/llama-context.cpp     |  8 +++-
+ src/llama-kv-cache.cpp    | 13 +++++++
+ 4 files changed, 113 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 89b85fbce..37cefb222 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -677,8 +677,18 @@ static uint64_t ggml_gallocr_graph_fp(const struct ggml_cgraph * graph) {
+ 
+         uint64_t v = (uint64_t) t->op;
+         v = v*0x100000001b3ull ^ (uint64_t) t->type;
+-        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+-            v = v*0x100000001b3ull ^ (uint64_t) t->ne[d];
++        // GGML_GALLOC_FP_SHAPES=0: leave the shapes out of the fingerprint.  A graph with the same topology then keeps
++        // the reserved layout as long as every tensor fits its planned size (checked per tensor in needs_realloc, the
++        // upstream rule); a graph whose n_kv-sized tensors shrink no longer forces a re-reserve.  Default 1 (shapes in).
++        static int fp_shapes = -1;
++        if (fp_shapes < 0) {
++            const char * e = getenv("GGML_GALLOC_FP_SHAPES");
++            fp_shapes = e != NULL ? atoi(e) != 0 : 1;
++        }
++        if (fp_shapes) {
++            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++                v = v*0x100000001b3ull ^ (uint64_t) t->ne[d];
++            }
+         }
+         v = v*0x100000001b3ull ^ (uint64_t) (t->view_src != NULL);
+         v = v*0x100000001b3ull ^ (uint64_t) (t->flags & flags_mask);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index fa564cbe2..e242a5b29 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1207,6 +1207,15 @@ struct ggml_backend_sched_split {
+ #define GGML_SCHED_STAGE_SLOTS 16
+ #define GGML_SCHED_STAGE_SLOTS_DEFAULT 8
+ 
++// Pinned staging of host user inputs under pipeline parallelism (sched_input_stage): one ring per (backend, copy).
++struct ggml_backend_sched_in_stage {
++    ggml_backend_buffer_t buf;
++    size_t                used;
++    ggml_backend_event_t  done;      // recorded after the last upload from this ring
++    bool                  pending;
++    int                   gen;       // graph generation that last used the ring
++};
++
+ struct ggml_backend_sched {
+     bool upfront_on; // GGML_SCHED_UPFRONT_INPUTS for the graphs allocated from now on (ggml_backend_sched_set_upfront_inputs)
+     bool is_reset; // true if the scheduler has been reset since the last graph split
+@@ -1258,6 +1267,8 @@ struct ggml_backend_sched {
+     // the scheduler drives more than one device (a Meta backend or more than one non-CPU backend).
+     // GGML_SCHED_LAZY_EVENTS=0 / =1 forces them off / on.
+     bool events_pending[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
++    struct ggml_backend_sched_in_stage in_stage[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
++    int in_stage_gen;
+     bool lazy_events;
+     struct ggml_tensor ** graph_inputs;
+     int n_graph_inputs;
+@@ -2976,6 +2987,62 @@ static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sche
+     return ev;
+ }
+ 
++// Under pipeline parallelism (n_copies > 1) a host user input is memcpy'd into a pinned ring of its (backend, copy) and
++// uploaded with set_tensor_async on the split backend's stream, so the host never blocks on the device.  The plain path
++// waits on the split backend's per-copy event (re-recorded on the destination by the cross-device copy ordering, so it
++// covers the whole queued ubatch) and then does a synchronous pageable H2D copy, which on ROCm also waits for the queued
++// compute: with two GPUs each ubatch drained both (FINDINGS 821-823).  The ring of copy c is reused one graph generation
++// later only after its own last upload event; a full ring waits for that event and starts over.
++// GGML_SCHED_INPUT_STAGE=0 restores the plain path.
++static bool sched_input_stage(ggml_backend_sched_t sched, int b, ggml_backend_t be, ggml_tensor * input, ggml_tensor * input_cpy) {
++    static const bool on = [] { const char * e = getenv("GGML_SCHED_INPUT_STAGE"); return e == nullptr || atoi(e) != 0; }();
++    static const size_t cap = 96u << 20;
++    const size_t n = ggml_nbytes(input);
++    if (!on || sched->n_copies <= 1 || input->buffer == nullptr || !ggml_backend_buffer_is_host(input->buffer) ||
++        be->iface.set_tensor_async == nullptr || be->iface.event_record == nullptr || n > cap) {
++        return false;
++    }
++    ggml_backend_sched_in_stage & rs = sched->in_stage[b][sched->cur_copy];
++    if (rs.buf == nullptr) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(be);
++        ggml_backend_buffer_type_t ht = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
++        if (ht == nullptr) {
++            return false;
++        }
++        rs.done = ggml_backend_event_new(dev);
++        if (rs.done == nullptr) {
++            return false;
++        }
++        rs.buf = ggml_backend_buft_alloc_buffer(ht, cap);
++        if (rs.buf == nullptr) {
++            ggml_backend_event_free(rs.done);
++            rs.done = nullptr;
++            return false;
++        }
++        rs.used = 0;
++        rs.pending = false;
++        rs.gen = sched->in_stage_gen;
++    }
++    size_t off = (rs.used + 255) & ~(size_t) 255;
++    if (rs.gen != sched->in_stage_gen || off + n > cap) {
++        // a new graph on this ring, or the ring is full: its earlier uploads must be done before it is overwritten
++        if (rs.pending) {
++            ggml_backend_event_synchronize(rs.done);
++            rs.pending = false;
++        }
++        rs.used = 0;
++        rs.gen  = sched->in_stage_gen;
++        off     = 0;
++    }
++    char * dst = (char *) ggml_backend_buffer_get_base(rs.buf) + off;
++    memcpy(dst, input->data, n);
++    rs.used = off + n;
++    ggml_backend_tensor_set_async(be, input_cpy, dst, 0, n);
++    ggml_backend_event_record(rs.done, be);
++    rs.pending = true;
++    return true;
++}
++
+ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
+     const int split_backend_id = split->backend_id;
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
+@@ -2992,6 +3059,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     } else if ((input->flags & GGML_TENSOR_FLAG_INPUT) ||
+         (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(input) != nullptr)) {
+         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
++        if (sched_input_stage(sched, split_backend_id, split_backend, input, input_cpy)) {
++            return;
++        }
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_synchronize(sched_event_get(sched, split_backend_id));
+         } else {
+@@ -3302,7 +3372,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+                 input->buffer != NULL &&
+                 ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                 !sched_async_large_host_input();
+-            if (host_src && dev_dst && !host_large && split_backend->iface.set_tensor_async != NULL &&
++            if (host_src && dev_dst && sched_input_stage(sched, split_backend_id, split_backend, input, input_cpy)) {
++                // pipeline copies: snapshot through the pinned ring (any size up to the ring), uploaded on this stream
++            } else if (host_src && dev_dst && !host_large && split_backend->iface.set_tensor_async != NULL &&
+                 split_backend->iface.event_wait != NULL) {
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     sched_event_wait_self(sched, split_backend_id);
+@@ -3647,6 +3719,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+         for (int e = 0; e < GGML_SCHED_COPY_EVENTS; e++) {
+             ggml_backend_event_free(sched->copy_events[b][e]);
+         }
++        for (int c = 0; c < GGML_SCHED_MAX_COPIES; c++) {
++            if (sched->in_stage[b][c].pending) {
++                ggml_backend_event_synchronize(sched->in_stage[b][c].done);
++            }
++            ggml_backend_event_free(sched->in_stage[b][c].done);
++            ggml_backend_buffer_free(sched->in_stage[b][c].buf);
++        }
+         for (int s = 0; s < GGML_SCHED_STAGE_SLOTS; s++) {
+             ggml_backend_event_free(sched->stage_done_ev[b][s]);
+             ggml_backend_event_free(sched->stage_free_ev[b][s]);
+@@ -3733,6 +3812,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
+ 
+     sched->cur_copy = sched->next_copy;
+     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
++    sched->in_stage_gen++;
+ 
+     ggml_backend_sched_split_graph(sched, graph);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 64faff4da..0da2968d1 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2748,7 +2748,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
++    // With pipeline parallelism a reused graph needs the full scheduler sync below, which serializes the devices.
++    // Prompt-sized ubatches (> 64 tokens) rebuild their graph instead (a few ms against a ~200 ms ubatch); decode and
++    // verify batches keep reuse.  Only pipeline parallelism (layer split, more than one device, no -ot) is affected.
++    // LLAMA_PP_PREFILL_NO_REUSE=0 reuses as before (FINDINGS 823).
++    static const bool pp_prefill_no_reuse = [] { const char * e = getenv("LLAMA_PP_PREFILL_NO_REUSE"); return e == nullptr || atoi(e) != 0; }();
++    const bool skip_reuse_pp = pp_prefill_no_reuse && cparams.pipeline_parallel && ubatch.n_tokens > 64;
++    if (!graph_reuse_disable && !skip_reuse_pp && gf_res_prev_active == res && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 521db18d5..9cb18f6a9 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2726,6 +2726,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
+         const uint32_t used = parked.empty() ? cells.used_max_p1() : cells.used_max_p1_below(park_bound());
+         const uint32_t pad  = prefill && GGML_PAD(used, n_pad_cur) > n_pad_prefill_from ? n_pad_prefill : n_pad_cur;
+ 
++        // LLAMA_KV_N_PAD_PREFILL_POW2=1: prompt ubatches on the coarse prefill pad round n_kv up to a power of two
++        // (at least the prefill pad), so a long prompt grows the n_kv-sized tensors log2 times instead of once per pad
++        // step; each growth re-reserves the graph with a full multi-device sync.  Default off (FINDINGS 823).
++        static const bool pow2 = [] { const char * e = getenv("LLAMA_KV_N_PAD_PREFILL_POW2"); return e != nullptr && atoi(e) != 0; }();
++        if (pow2 && prefill && pad == n_pad_prefill) {
++            uint32_t p2 = n_pad_prefill;
++            while (p2 < used) {
++                p2 *= 2;
++            }
++            result = std::max(std::min(cells.size(), p2), result);
++            continue;
++        }
++
+         result = std::max(std::min(cells.size(), std::max(pad, GGML_PAD(used, pad))), result);
+     }
+ 
+-- 
+2.53.0
+

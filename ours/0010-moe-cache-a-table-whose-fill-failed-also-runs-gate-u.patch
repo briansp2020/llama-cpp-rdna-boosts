@@ -1,0 +1,48 @@
+From 6e6c9ff8104c9e993c390002e4772dd845702348 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 8 Nov 2026 04:08:22 +0000
+Subject: [PATCH 10/11] moe cache: a table whose fill failed also runs
+ gate+up+GLU unfused
+
+r235 declines a table in moe_cache_update_host once one of its fills fails
+(Stew's fix of the remap hole), so the consuming op reads the scheduler
+copies. The fused gate+up+GLU read of those copies is the same path that gave
+NaN for declined sparse tables (dfeefe434); on merge-r235 the pool fault arm
+MOE_HOST_POOL_FILL_FAULT=200 printed "!!!!" in 1 of 5 runs. The unfused
+fallback now covers any table with fill_failed, gated on the global fill
+failure counter so the normal path takes no lock. After a fill failure the
+text differs from the fault-free run (unfused is not bit-identical to fused;
+stock r235 under the same faults differs too); without failures nothing
+changes. GGML_MOE_FUSED_DECLINE_UNFUSE=0 turns the fallback off.
+---
+ ggml/src/ggml-cuda/moe-expert-tier.inc | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index 9bfb2fd08..fd1c59af6 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -3097,7 +3097,10 @@ bool moe_cache_fused_declined_sparse(const ggml_tensor * op, const ggml_tensor *
+         const char * e = getenv("GGML_MOE_FUSED_DECLINE_UNFUSE");
+         return e == nullptr || atoi(e) != 0;
+     }();
+-    if (!on || !g_enabled || !g_any_sparse || op == nullptr || op->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
++    // a table whose fill failed (any mode: r235 declines it in moe_cache_update_host) is read from the scheduler
++    // copies as well, so it takes the unfused path too.  g_fill_fail only grows; read without the lock as a gate.
++    if (!on || !g_enabled || (!g_any_sparse && __atomic_load_n(&g_fill_fail, __ATOMIC_RELAXED) == 0) ||
++        op == nullptr || op->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
+         return false;
+     }
+     std::lock_guard<std::mutex> lock(g_mutex);
+@@ -3106,7 +3109,7 @@ bool moe_cache_fused_declined_sparse(const ggml_tensor * op, const ggml_tensor *
+             continue;
+         }
+         const auto sit = g_sem_to_id.find(std::make_tuple(name_layer(op), sem_role(w), device));
+-        if (sit != g_sem_to_id.end() && g_tables[sit->second].host_sparse) {
++        if (sit != g_sem_to_id.end() && (g_tables[sit->second].host_sparse || g_tables[sit->second].fill_failed)) {
+             return true;
+         }
+     }
+-- 
+2.53.0
+

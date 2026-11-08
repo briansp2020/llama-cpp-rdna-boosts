@@ -1,0 +1,71 @@
+From da8b9f9e9501492a4b96c8b27593e17927cdc4d4 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 7 Nov 2026 14:24:54 +0000
+Subject: [PATCH 04/11] moe cache: device remap declines when a fill failed
+ during its policy pass
+
+The remap took the input over although the consumer then refuses a table with fill_failed: the op read an input_cpy nobody filled.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu |  4 ++--
+ ggml/src/ggml-cuda/moe-expert-tier.inc | 23 ++++++++++++++++++++++-
+ 2 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 1a24df3a2..e6a492562 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -8992,8 +8992,8 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+             bool cold = false;
+             (void) access_locked(t, t.dr_lag_host[i], stream, t.dr_lag_host, n, &cold);
+         }
+-        if (t.arena == nullptr || t.slots <= 0) {
+-            return false;
++        if (t.arena == nullptr || t.slots <= 0 || t.fill_failed) {
++            return false;   // a fill failed in this pass: taking the input over would leave input_cpy unfilled
+         }
+     }
+     // 2. The device map, re-uploaded only after a residency change.
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index 2455f3c3e..577e25eda 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -3091,6 +3091,27 @@ uint64_t moe_cache_redirect_sig(const ggml_cgraph * cgraph, int device) {
+ }
+ namespace {
+ } // namespace
++// GGML_MOE_FUSED_DECLINE_UNFUSE=0: the fused read of the copies, as before.
++bool moe_cache_fused_declined_sparse(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate, int device) {
++    static const bool on = [] {
++        const char * e = getenv("GGML_MOE_FUSED_DECLINE_UNFUSE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    if (!on || !g_enabled || !g_any_sparse || op == nullptr || op->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    for (const ggml_tensor * w : { src0, gate }) {
++        if (w == nullptr) {
++            continue;
++        }
++        const auto sit = g_sem_to_id.find(std::make_tuple(name_layer(op), sem_role(w), device));
++        if (sit != g_sem_to_id.end() && g_tables[sit->second].host_sparse) {
++            return true;
++        }
++    }
++    return false;
++}
+ // After a failed `moe_cache_redirect_fused`: true when the cache took over either lane anyway (one lane declined, or a
+ // remap shape the fused kernel cannot take).  The scheduler skipped the copy of every taken-over input, so the original
+ // tensors are stale for that lane: the caller must not fuse, and each op reads its own table through the per-op
+@@ -3662,7 +3683,7 @@ static bool tier_devremap_prep_locked(table_t & t, void * stream) {
+             (void) access_locked(t, t.dr_lag_host[i], stream, t.dr_lag_host, n, &cold);
+         }
+         g_kvl_in_decode = false;
+-        if (g_tier_off || t.ram_base == nullptr || t.arena == nullptr || t.slots <= 0) {
++        if (g_tier_off || t.ram_base == nullptr || t.arena == nullptr || t.slots <= 0 || t.fill_failed) {
+             return false;   // an admission failed and dropped the tier: the host path takes over from here
+         }
+         precopy_plan_locked(t, stream, t.dr_lag_host, n);
+-- 
+2.53.0
+

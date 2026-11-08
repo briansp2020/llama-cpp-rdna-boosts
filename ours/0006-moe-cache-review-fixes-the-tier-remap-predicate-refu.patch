@@ -1,0 +1,58 @@
+From 2772b93dea44287f5b9518ee14e6e5d02f3775e1 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 7 Nov 2026 14:41:12 +0000
+Subject: [PATCH 06/11] moe cache: review fixes: the tier remap predicate
+ refuses a fill_failed table; the down-fold also runs unfused for a declined
+ sparse table
+
+---
+ ggml/src/ggml-cuda/mmvq.cu             | 5 +++--
+ ggml/src/ggml-cuda/moe-expert-cache.h  | 2 +-
+ ggml/src/ggml-cuda/moe-expert-tier.inc | 2 +-
+ 3 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 2fa95dfcd..4f765ee75 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -3229,8 +3229,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+             if (moe_cache_redirect_fused(mm_node, mm_node->src[0], nullptr, mm_node->src[2],
+                                          ctx.device, ctx.stream(), &src0_c, &ids_c, nullptr, nullptr)) {
+                 ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
+-            } else if (moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device)) {
+-                return 0;   // taken over but not redirectable: the unfused consumer reads the arena
++            } else if (moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device) ||
++                       moe_cache_fused_declined_sparse(mm_node, mm_node->src[0], nullptr, ctx.device)) {
++                return 0;   // not redirected: the unfused consumer reads the arena or the scheduler copy
+             } else {
+                 ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
+             }
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index a091682c8..d8935bbcc 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -378,7 +378,7 @@ bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_te
+ bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
+                                 const struct ggml_tensor * gate, int device);
+ 
+-// A decode-band fused gate+up+GLU with a sparse (mmap) table that was not redirected: the fused read of the scheduler copies
++// A decode-band fused gate+up+GLU or down-fold with a sparse (mmap) table that was not redirected: the fused read of the scheduler copies
+ // gives wrong output (FINDINGS 817), so the caller runs the ops unfused.
+ bool moe_cache_fused_declined_sparse(const struct ggml_tensor * op, const struct ggml_tensor * src0,
+                                      const struct ggml_tensor * gate, int device);
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index 577e25eda..9bfb2fd08 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -3628,7 +3628,7 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+ }
+ 
+ static bool tier_devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
+-    return g_sized && !g_tier_off && g_cold_uva && !t.dr_failed && t.ram_base != nullptr && !t.ram_partial &&
++    return g_sized && !g_tier_off && g_cold_uva && !t.dr_failed && !t.fill_failed && t.ram_base != nullptr && !t.ram_partial &&
+            t.cold_ptrs != nullptr && t.cold_safe && t.host_dev != nullptr && !t.identity &&
+            t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
+            n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
+-- 
+2.53.0
+

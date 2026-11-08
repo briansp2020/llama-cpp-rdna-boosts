@@ -1,0 +1,25 @@
+From 5d902e154eaa38c28e84c98baee800a6add69d2f Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 7 Nov 2026 15:00:18 +0000
+Subject: [PATCH 07/11] moe cache: header comment
+
+---
+ ggml/src/ggml-cuda/moe-expert-cache.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index d8935bbcc..4bca6819e 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -379,7 +379,7 @@ bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml
+                                 const struct ggml_tensor * gate, int device);
+ 
+ // A decode-band fused gate+up+GLU or down-fold with a sparse (mmap) table that was not redirected: the fused read of the scheduler copies
+-// gives wrong output (FINDINGS 817), so the caller runs the ops unfused.
++// gives wrong output at tight pin budgets, so the caller runs the ops unfused.
+ bool moe_cache_fused_declined_sparse(const struct ggml_tensor * op, const struct ggml_tensor * src0,
+                                      const struct ggml_tensor * gate, int device);
+ 
+-- 
+2.53.0
+
