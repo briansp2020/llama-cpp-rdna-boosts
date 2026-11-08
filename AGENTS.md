@@ -33,8 +33,11 @@ touch.
 
 1. **Apply with `scripts/apply-all.sh`** (strict `git am`). Never `git apply` the concatenated series — it
    silently drops hunks.
-2. **`llama-cli` needs `--single-turn`** (plus `--no-display-prompt` for scripted output), and anything that
-   can block goes inside `timeout`.
+2. **`llama-cli` needs `--single-turn`** (plus `--no-display-prompt` for scripted output), anything that can
+   block goes inside `timeout`, and **`-lv` is picked by the arm, never by habit**: a **text/hash** arm takes
+   **no `-lv` at all** (the same stream carries the generated text), a **census/mechanism** arm takes
+   **`-lv 4`**.  `-lv 3` is the trap — it pollutes the text *and* still hides the ggml censuses.  Table under
+   *Verify* below.
 3. **Pin `HIP_VISIBLE_DEVICES` on every multi-device arm** — the iGPU is otherwise enumerated and the load
    aborts with `invalid kernel file`.
 4. **Throughput is not a correctness signal.** Verify with same-seed greedy text, then the gate the change
@@ -221,6 +224,7 @@ dated record (newest first); [`release.json`](release.json) is the single source
 | `beta/` | **promotion-candidate patches** staged for a beta test — **NOT part of the delivery**. Each candidate is `<name>/` with `README.md` (what/why/status), `BETA-TESTING.md` (the tester's apply + gate checklist) and `<name>.patch` cut against the current `release.json` tree. Nothing here is applied by default: `scripts/apply-all.sh --include-beta` applies `beta/*/*.patch` on top of the verified release tree for a tester. A confirmed or refuted candidate moves to `archive/work/` and is recorded in `WORKLOG.md` |
 | `optional/` | **opt-in artifacts that are NOT part of the delivery and not a beta.** Each is `<name>/` with `README.md` (what, sha256, applied tree, the layouts it reaches and cannot, what it measured) and `<name>.patch` cut against the current `release.json` tree, rebased onto every release. For a *finished* feature that has no validated win on the delivery's own configurations (it needs hardware this repo does not validate, or it is unreachable in the splits it validates). `scripts/apply-all.sh --include-optional` applies them strictly on the verified release tree; not covered by the delivery's gates. Promoted only on a validated win here |
 | `upstream/` | **upstream-PR candidates** (self-contained changes for unadulterated `ggml-org/llama.cpp`), one sub-directory per candidate (`README.md` + `UPSTREAM-PR-<name>.patch`); the index is its `README.md`. None is part of the delivery |
+| `utilities/` | **measurement/reporting tools, NOT part of the delivery** — nothing here is in `patches/`, nothing is applied by `scripts/apply-all.sh`, nothing is covered by a release gate; a tool measures, reports and changes nothing, needs no root, and says `UNKNOWN` rather than guess.  `storage-oracle/` takes a model file and reports which `--load-mode`/`--lazy-mode` to use for **that file on that device** (band map, cold per-read latency for `O_DIRECT`/buffered/`mmap`, sequential throughput, the idle-gap wake ladder, cold reads under a stream, page-cache residency, the `MemAvailable`/`RLIMIT_MEMLOCK` budget), with the measurement behind every verdict and an explicit avoid list; `--verify` checks the prediction against `llama-cli` head-to-head including a warm restart.  **Index: `utilities/README.md`** |
 | `archive/docs/` | moved-out historical records (validation/baseline history, the pre-cleanup AGENTS.md) — reference only |
 | `archive/work/` | closed experiments and campaigns, preserved for future re-evaluation (mmb/qsa3, moe-expert-cache, issues/PRs, …) — reference only |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
@@ -264,6 +268,27 @@ trap so easy to hit only on the 3-GPU arm.
 
 Diff against a known-good build: same-seed output must be IDENTICAL. `GGML_CUDA_ALLREDUCE=nccl` is not
 a bit-identical reference under `-sm tensor` (see `INVARIANTS.md`); treat it as a smoke comparison.
+
+**`-lv` is a threshold you pick per arm, and `llama-cli` starts at errors-only.**  One flag, two mappings:
+`common_log_get_verbosity()` sends ggml's `GGML_LOG_INFO` to **TRACE** while llama.cpp's own `LOG_INF` is
+**INFO**, and `llama-cli` sets `params.verbosity = LOG_LEVEL_ERROR` (the common default is INFO, which is why a
+`llama-server` arm differs — see below).  So:
+
+| `-lv` | what it adds | use it for |
+|---|---|---|
+| **none** (the `llama-cli` default) | errors only — the banner, generic output, the generated text | **every text/hash arm**: `scripts/extract-generated.py` needs the clean stream, and the rates come from the `[ Prompt: … \| Generation: … ]` footer |
+| `2` | ggml/gate WARN: the slab line, `narrow-2 … pinned at`, the pool/sink census WARNs | a quick mechanism spot-check |
+| `3` | llama-cli's own INFO, i.e. its **per-slot statistics block**, printed *between* streamed tokens | **nothing** — it corrupts a hash and still hides every ggml INFO census |
+| `4` | ggml INFO: `MoE expert cache:`, `expert access:`, `takeover=`, `cold admission=`, `sched_reserve`, the `draft acceptance`/spec lines | **every census/mechanism arm** |
+
+A hash and a census are therefore **two runs**: hash with no `-lv`, then repeat with `-lv 4` for the numbers
+(that is what `wip`-style arm harnesses do; `archive/work/host-expert-parity/touch-ab.sh` is an example, and its
+`VERBOSE=` is an explicit space, because `${VERBOSE:-default}` silently takes the default for an empty value).
+`llama-server` differs: its generated text comes back over **HTTP**, so `-lv 4` pollutes only the log — which is
+why `gate-ckpt-reuse.sh` hashes the API responses at `-lv 4` safely.  Every gate that hashes `llama-cli` text
+passes no `-lv` at all (`gate-host-pool.sh`, `gate-kv-residency.sh`, `gate-kv-window-split.sh`,
+`gate-grid-stall-pad.sh`, `gate-norm-rows-alias.sh`, `gate-hc-fusions.sh`).  Code paths and the measured
+consequences: `INVARIANTS.md` (2026-11-07).
 
 The coherence gate is a decode/greedy check and is **blind to a uniform prefill-logit shift**. For any
 change to a prefill kernel (GDN/SSM, FA, MMQ/MMVF/MMB, MoE prefill) or a default-on approximate path,

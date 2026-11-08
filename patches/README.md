@@ -36,7 +36,7 @@ only as a rough shape.
 
 | # | patch | subject | +/− | files |
 |---|---|---|---|---|
-| 00 | `0000-…-block-00-foundation-band-uniformity-Meta` | foundation: band uniformity, Meta wrapper, allocator | +1314 / −1000 | 54 |
+| 00 | `0000-…-block-00-foundation-band-uniformity-Meta` | foundation: band uniformity, Meta wrapper, allocator | +1366 / −909 | 56 |
 | 01 | `0001-…-block-01-hybrid-HIP-all-reduce-RDNA4-gat` | hybrid HIP all-reduce | +2365 / −44 | 4 |
 | 02 | `0002-…-block-02-adaptive-MTP-draft-depth` | adaptive MTP draft depth (+ r218: `spec_draft_align_cache()` realigns the drafter's KV with the batch it ingests, issue #272) | +1186 / −54 | 24 |
 | 03 | `0003-…-block-03-chunked-gated-delta-net-prefill` | chunked GDN prefill + rollback tracker | +3182 / −15 | 22 |
@@ -100,6 +100,19 @@ band rule it satisfies starts here.
   `-sm tensor` load: `--load-mode none --lazy-mode off` **32.2 s -> 13.6 s**, and
   `--load-mode mmap --lazy-mode off` keeps the 27 GiB PLE resident at 23.8 s (vs `mmap` + `auto` 18.9 s
   with the PLE lazy); same-seed greedy text is byte-identical on Gemma4-E4B and Flash-Next.
+* **`--lazy-mode mlock`: the PLE tables pinned in the page cache, with no copy** (r230): the `on` data
+  path (rows read from the mapping on demand) plus **one populate + `mlock`** of every `TENSOR_READ_LAZY`
+  table at load, so the bytes are never duplicated and can never be reclaimed or swapped.  The range is
+  deliberately NOT put in the lazy `ranges` set -- that set gets `POSIX_MADV_RANDOM`, and readahead is
+  exactly what the one bulk populate needs -- and there is no 4 GiB threshold (the mode pins the whole
+  marked set).  Flash-Next GSQ-IQ3_S, 3 GPU `-sm tensor`: `VmLck` **26.82 GiB = the whole 27,465 MiB
+  table**, `RssAnon` 1.3 GB where the `off` arm holds a 27 GiB anonymous copy; same-seed greedy text
+  identical to `auto` and `off` (125 chars, `7d898d3d3e58`), and `llama-bench` pp2048/tg32 at parity
+  (2570.4 / 77.41 vs `auto` 2549.1 / 77.55 and `off` 2574.8 / 76.27).  A warm page cache makes the pin a
+  page-table walk (**0.19 s** for 27 GiB); a cold populate costs ~7 s (the kernel's `__mm_populate` rate,
+  not I/O).  The pin is per process -- `Mlocked`/`Unevictable` return to 0 at exit and the pages are
+  ordinary reclaimable page cache again -- and a refused `mlock` (`RLIMIT_MEMLOCK`) warns and leaves the
+  table on the evictable page-cache path.
 * **`ggml-alloc`**: release view sources whose views are never consumed (a real leak), and fingerprint the
   graph layout by node order + output marking so a *different* graph cannot reuse a layout computed for
   another (issue #183).
@@ -903,6 +916,28 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r235 amendment (PR #283, `overdoingism`): a host split input above the pinned ring's snapshot limit is
+> copied synchronously.**  `ggml_backend_sched_copy_input`'s `host_src && dev_dst` branch hands the split backend
+> the caller's **live** host pointer via `set_tensor_async`; the CUDA backend snapshots that through its pinned
+> ring only up to `GGML_BACKEND_ASYNC_SNAPSHOT_MAX` (**1 MiB**, r90/block 10), and above it the `cudaMemcpyAsync`
+> reads the source when the stream reaches it.  The buffer that bites is a CPU split's output written **in place**
+> — the token embeddings when `token_embd` is on the CPU (`CPU_Mapped`: `model.input_embed` / `node_1`,
+> **41,943,040 B** per 2048-token ubatch, 10,485,760 B at `-ub 512`), rewritten by the next ubatch's CPU split —
+> so a queued copy could read the next ubatch's bytes, or a torn mix, and corrupt the prefill from layer 0 on.
+> The branch now takes the existing **synchronous fallback** for a non-weight host input above the limit, which is
+> what upstream ggml does for every host input; ≤1 MiB keeps the ring snapshot and a host **weight** (partial
+> offload, host expert master — never rewritten in place; where the delivery does rewrite one its own staging ring
+> owns the ordering) keeps the asynchronous copy at any size.  The limit is now one `#define` in
+> `ggml-backend-impl.h` (`GGML_BACKEND_ASYNC_SNAPSHOT_MAX`) used by the scheduler, with this block's
+> `GGML_CUDA_ASYNC_INPUT_MAX` (block 10) defined from it so the two cannot drift.  `GGML_SCHED_ASYNC_LARGE_HOST_INPUT=1`
+> is the kill-switch (A/B and bisection only).  **Cost, measured here** (same binary, kill-switch A/B, 27B
+> `pp2048`, 4 alternating starts/arm): 1 GPU `-ub 2048` **−0.17 %**, `-ub 512` **−0.30 %**, 3 GPU `-sm layer`
+> **+0.08 %** — inside the arm spread.  **No shipped CLI config was corrupting**: r234 and r235 prefill logits are
+> byte-identical (0 of 1,013,178,324 B at `-ub 512`), and so are the default and an `AMD_SERIALIZE_COPY=2` arm —
+> this closes a **latent** hole (the third instance of the r35/#87 / r90 bug class) that needs something queueing
+> large device-to-host work between prefill ubatches.  Records: [`../WORKLOG.md`](../WORKLOG.md) 261107.013,
+> `INVARIANTS.md` r235, `ENVIRONMENT.md` `GGML_SCHED_ASYNC_LARGE_HOST_INPUT`.
+>
 > **r215 amendment: the host pool's MIRROR fill and its pinned BACKING.**  Two costs in the pinned L2 pool
 > that only a **mapped** load pays, both found by asking why `--load-mode mmap` reaches `listening` 1.6x later than
 > `--load-mode none` on the same model (Flash-Next IQ3_S, `-ncmoe 48`, cold page cache, 1 device: 26.3 s against
@@ -2693,6 +2728,113 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
+> **r229 amendment: a latched pinned tier keeps what it owns, and an arena it cannot fill is not armed
+> (issue #278).**  Two fixes in `moe-expert-cache.cu`, both only reachable on a box whose pinned tier has
+> **latched off** (the first refused `cudaHostAlloc`, which is Windows-at-the-aperture-ceiling in the field and
+> is emulated on Linux by the new diagnostic `MOE_HOST_POOL_PIN_FAULT`):
+> 1. **`table_pool_locked` looks for an existing pool BEFORE the latch guard.**  The guard is now about the tier
+>    no longer GROWING, not about discarding ~9 GiB of pinned memory the run already owns.  `bounce_acquire` always
+>    drew that line (it reuses a drained ring entry before its own latch check); this lookup did not, so one late
+>    refusal made every pool built during the load unreachable and every expert copy after it pageable — the
+>    driver-staged path the pool exists to avoid, on the box where pin budget is the scarce resource.  Measured on
+>    `gate-host-pool.sh`'s new `pinlate` arm: **7 060 fills served from pre-latch pools with 110 failed fills**
+>    against **0 and 1 587** for the guard-first order, with identical text.  The census names it:
+>    `N expert fills were served from a host pool built BEFORE the refusal`.
+> 2. **`moe_cache_rearm` no longer arms a layer that cannot fill** (`table_has_fill_source_locked`, layer-uniform
+>    because a mixed-slot layer reads the wrong expert).  Arming such a layer costs the arena, a
+>    `cudaDeviceSynchronize` per table and one doomed seed fill per slot, and changes no downstream decision: the
+>    ops decline either way.  A source-less layer is stood down wholesale, named once
+>    (`left N stood-down expert-cache tables in M layer(s) DISARMED ...`) and its `g_rearm_slots` entry zeroed so
+>    the caller's second re-arm pass does not repeat it.  Measured on the reporter's config with the latch
+>    forced: the arena stays at **13 645 MiB instead of growing back to 19 225**, text byte-identical.
+>
+> Both are inert unless the tier latches (the shipped default path never does), so no default and no gate
+> criterion changed.  Gates: `gate-host-pool.sh` **37/37** (8 arms, all byte-identical `a99ccbd97ecb`, the new
+> `pinlate` arm included), coherence `1c5d32ac537d` at 1 GPU and 3 GPU `-sm tensor`, MTP four-axis at `-n 3000`
+> on the dense 27B, `validate-set.sh` green, per-block build 2/2.  Record: `WORKLOG.md` 261106.020.
+
+> **r231 amendment: the pool's re-layout fills are issued in FILE order, not heat order.**
+> `TODO` #280's crossover pass (`archive/work/host-expert-parity/RESULTS-2026-11-07-radix.md`) found that the biggest
+> single term in a non-mirror tier's field prefill is not bandwidth but the **band-transition tail**:
+> `pool_rerank_from_heat_locked` runs after the last prefill ubatch (the arena's slot count changed 179 -> 79, so
+> the pool's "arena complement + mirrored residents" layout is re-derived), it frees and re-fills 1 500-6 400
+> pool slots one 0.65 MiB expert copy at a time, and the client pays all of it before its first token (measured:
+> 13.5-18.6 s of a 50k first pass at `-lme 44`, 7.2 s at `auto`, 0.6 s on a mirror, which returns early).  The
+> loop walked `want` in **heat order**, i.e. random offsets in the GGUF, although one table's experts are
+> contiguous (`src_offs + e*host_bytes`).  It now collects the to-fill set and sorts it ascending when
+> `MOE_HOST_POOL_FILL_ORDER` is not `rank`.  The fill **set** is unchanged (a slot is interchangeable by
+> construction), so no decision moves: measured **tail 13.5-18.6 s -> 9.4-9.7 s**, prefill 769/780 -> 874/779 t/s,
+> fills 8 315 -> 7 352, `DIO` arm unchanged (1.6 -> 1.2 s), decode unchanged, greedy text byte-identical
+> (`sha=cf7f8b23f404`, five arms) and `gate-host-pool.sh` 37/37.  The rest of the tail is page-cache/reclaim
+> pressure under the memory cap -- the fill *source*'s business: `MOE_HOST_POOL_DIO=1` removes ~90 % of it
+> (`ENVIRONMENT.md`, the `MOE_HOST_POOL_DIO` row).
+
+> **r232 amendment (issue #281): the coalesced prefill read runs in BOTH fill modes.**
+> `scripts/gate-host-pool.sh`'s lineage aside, this was a one-predicate defect with a 2x cost.  `stage_span_fill()`
+> serves a run of >= 2 experts that are in NEITHER tier with one file read per 16-expert chunk (r224), but both
+> call sites' `span_geom` required `g_pool_dio` — so the arm r212 made the field default (`MOE_HOST_POOL_DIO=auto`
+> mirrors `--load-mode`, and `mmap` is buffered) could not coalesce at all and read each missing expert out of the
+> model MAPPING, one ~0.65 MiB demand fault at a time.  The change drops the two `g_pool_dio` terms and lets the
+> span read the file with the mode's own open: O_DIRECT when the disk tier is on, a plain buffered `pread`
+> otherwise (same page-cache pages as the mapping, so the fill *source* is unchanged — only the granularity, and on
+> Windows the fault behaviour: a mapped fill there is a demand fault per 4 KiB page at 715 MiB/s).  Measured on the
+> 56 GiB rig, Flash-Next + MTP, `-c 204800 -ub 6144`, cold cache, 50k prefill x2, two interleaved reps: `-lme 12`
+> (26 % coverage, the issue's shape) **513-545 -> 821-875 t/s** and 220-330 GiB -> 95 GiB of storage reads;
+> `-lme 36` (77 %) **985-1235 -> 1307-1446**; a near-mirror pool **inert** (1889 vs 1890); decode unchanged
+> (9.31 s vs 9.28 s for 600 tokens).  It also beats the issue's workaround (`MOE_HOST_POOL_DIO=1` + span:
+> 631-663 t/s) by 30 % with 2.4x better decode.  Gates: greedy text byte-identical to r231 on a dense and a
+> pool-engaged arm, `gate-prefill-logits.sh` mean KLD 0.000000 / same-top-p 100.000 %, `gate-host-pool.sh` 37/37.
+> The fill-source half of the investigation (`MOE_HOST_POOL_FILL_SRC`, reading the pool fill from the file too) is
+> **not** in this release: +38 % on top of this change but -41 % on its own, and exactly neutral when the pages are
+> cacheable, so it is a headroom bet — recorded in `wip/host-pool-fill-transport/` and `WORKLOG.md` 261107.006.
+
+> **r234 amendment (`TODO` #271/#272): name the prefill staging decline, and split the priming pass out of
+> the census.**  Two additions in `moe-expert-cache.cu`, both log/accounting only (no data path changes):
+> 1. **`stage_decline_note()` records, once per table, which predicate declined the prefill staging copy**, and
+>    `report_locked` prints **one WARN per run** with the count, the reason and up to 12 tables (the rest at
+>    INFO).  Before this, a pinned master's `ok=819 unusable=450` named nothing at any verbosity.  The reason
+>    it names is `arena == nullptr && slots == 0` — a table **stood down for the prefill only**, because the
+>    prefill's compute layout took the slab chunks its arena lived in (`moe_cache_evict_slab_range`, mostly
+>    `--cache-ram`'s context checkpoints); `moe_cache_rearm()` rebuilds it at the compute-buffer drop.  The
+>    eviction line now names the table count too, so the two halves of the story are in one place.
+> 2. **The census splits `unsized=` (the priming pass, which declines by design because the arena does not
+>    exist yet) from `unusable=`**, so `unusable` keeps meaning "a table that will never be staged".
+>
+> **Nothing else was changed, deliberately.**  Measured (1 GPU, locked config, balanced `A B B A`): declining
+> those 50 tables costs **nothing** (1826 t/s declined against 1824 t/s staged, ±0.1 %) because the scheduler's
+> own upload is one bulk async copy on the same copy stream; relaxing the predicate so they stage through this
+> block's one-launch kernel is **-10 %**, and staging them with one bulk copy each is ±0 %.  The transport
+> ranking itself (`TODO` #272) was re-measured and documented in `ENVIRONMENT.md` rather than defaulted: on one
+> GPU the gather wins at `-ub 2048` (+20 %), the copy-engine arm wins from 5120 up (+10-18 %, including 8192,
+> which the archived record said it lost) and ties at 16384, while on a **pinned** master
+> `GGML_MOE_CACHE_STAGE=0` is **+12.8 %** over this block's staging kernel.  Both winning arms are bimodal on
+> this box (identical runs 1873/2177/1865/2180 t/s), so no default was moved.  Gates: `gate-host-pool.sh`
+> **41/41**, coherence `d3d554954cba` across 4 host-expert arms, prefill-logit KLD **0.000000 / 100.000 %**,
+> `validate-set.sh` green, per-block build 2/2.  Records: `WORKLOG.md` 261107.011,
+> `archive/work/host-expert-transport/`, `INVARIANTS.md` (r234), `ENVIRONMENT.md` (the transport note).
+
+> **r233 amendment (issue #278): name the Windows HIP runtime, and make the pinned tier closable.**
+> The ~9.3 GiB pinned ceiling that r223/r227 recorded as "Windows/WDDM" is the **driver-shipped HIP runtime**,
+> not Windows.  Issue #278's box had `amdhip64_7.dll` from the Adrenalin driver in `System32`; with the
+> official TheRock ROCm 10.1 runtime beside the same r229 binary the tier pinned **16 004 / 40 078 MiB** with
+> **141/141** host tensors and 0 failed fills (and no hang), where the driver runtime latched at ~9.3 GiB.
+> Two additions, both inert on a box that does not hit the condition:
+> 1. **`wddm-mem.cu`: `ggml_hip_runtime_module_info()`** resolves the loaded `amdhip64_7.dll`, returns its
+>    path, whether it is the `GetSystemDirectoryA()` copy, and `hipRuntimeGetVersion()`.  `moe_cache_init`
+>    logs one INFO line (`HIP runtime 7.16.26385 from <path>`), and when the module is the system-directory
+>    driver copy it logs one WARN naming the measured ceiling/hang, the remedy (put the TheRock runtime DLLs
+>    beside the executable) and the kill switch below.
+> 2. **`MOE_HOST_POOL_PIN`** (default `1`, kill-switch): `0` closes the pinned tier from the start on ANY
+>    platform (`g_pinned_off` with a named reason), so no host pool is built and the bounce/coalesced-span
+>    rings never allocate; every fill takes the pageable model-mapping fallback (correct, slower).  The exit
+>    census names the switch instead of reporting a fictitious refused `cudaHostAlloc`.
+>
+> The r229 latch and re-arm rules are unchanged (the r229 report's remaining state is "pools exist, tier
+> latched"; with the TheRock runtime that state no longer occurs, and on the driver runtime the switch avoids
+> it).  Gates: `gate-host-pool.sh` **41/41** (9 arms: the new `pin0` arm proves no pool + the census line +
+> byte-identical `a99ccbd97ecb` text), coherence `1c5d32ac537d` at 1 GPU, `validate-set.sh` green.  Records:
+> `WORKLOG.md` 261107.008, `INVARIANTS.md` (r233), `ENVIRONMENT.md` (`MOE_HOST_POOL_PIN`).
+
 > **r228 amendment: the eviction demote is a DECODE-CLASS notion.**  `TODO` #281, found by measuring the r224
 > demote on a 59 GiB field box (56 GiB cgroup + ballast, one R9700, `auto` = 97.7 % coverage): the exchange
 > headroom (`K = 4 %` of a table's slots, ≈20) was larger than the pool's coverage gap (12 experts per
@@ -2716,7 +2858,7 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > prompt**, `-lme 36` (76.9 %) **+8-9 %**, a full mirror inert (0 demoted, 144 mirror tables).  Gates:
 > same-seed greedy text `sha=880c932888f8` identical on both `SINK` arms, `gate-host-pool.sh` **31/31**
 > (including `sink` / `sinkfail`), per-block build 2/2, `validate-set.sh` green.  Record:
-> `wip/host-expert-parity/RESULTS-2026-11-06.md`, `WORKLOG.md` 261106.019.
+> `archive/work/host-expert-parity/RESULTS-2026-11-06.md`, `WORKLOG.md` 261106.019.
 
 > **r224 amendment (the `host-expert-split` campaign): the pool LEARNS from evictions, is ranked by the
 > DECODE counter, and its prefill reads are coalesced — plus the heat-save truncation fix.**  Four things landed

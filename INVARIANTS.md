@@ -1952,8 +1952,12 @@ path.**
    because the scheduler's own pipeline parallelism is enabled there
    (`pipeline_parallel = n_devices > 1 && all layers on GPU && -sm layer && offload_kqv &&
    !has_tensor_overrides() && moe_cache_size == 0`), and a two-lane prefill declines when it is on.  The
-   reachable case is a layout where pipeline parallelism is *already* off -- `--override-tensor`, `-sm row`
-   -- which is exactly the layout the PR was measured in.  **Measure a scheduler feature's REACHABILITY
+   reachable case is a layout where pipeline parallelism is *already* off -- `--override-tensor` -- which is
+   exactly the layout the PR was measured in.  **`-sm row` is not a layout on this backend at all**: it fails
+   at model load (`llama_model_load: device ROCm0 does not support split buffers`), so the r220 artifact's
+   "`-sm row`, `-sm none` with 2+ GPU backends engage" line was an inference from the gate and is wrong for
+   ROCm -- `-sm none` is one GPU backend, i.e. the `-sm tensor` case.  **`-sm layer` plus any `-ot`, and
+   nothing else, is reachable here.**  **Measure a scheduler feature's REACHABILITY
    before its gain** (`optional/two-lane-prefill/README.md` carries the table).
 2. **A queued HIP stream wait binds to the LATEST record, so a shared copy event re-binds consumers.**
    The cross-backend split-input copy used to record the backend's shared per-device `copy_event` and make
@@ -1966,12 +1970,16 @@ path.**
    switch.  Bit-exact: same-seed greedy text identical on `-sm tensor`, `-sm layer` and `-sm layer -ncmoe`,
    and throughput-neutral (pp8192 3-GPU `-sm layer` 6311 vs 6317 t/s) -- the repair is a decoupling, not a
    speedup on a box where the copies were not actually contending.
-3. **An overlap technique buys nothing on devices of equal throughput.**  With identical cards every split
-   is already the critical path, so a second ubatch in flight adds queueing and no work: measured +0.03 %
-   (MoE 35B-A3B Q8_0) and nil (dense 27B Q6_K_XL) with the pair engaged (`pair decided: splits a=4 b=4,
-   interleaved=1`) on 3 x R9700.  The submitter's +34 %/+13 % are a 7900 XTX (gfx1100) + V620 (gfx1030)
-   pair, whose devices differ ~3x: the overlap hides an imbalance.  A device-heterogeneous layout is not
-   one of this delivery's validated configurations, which is why that feature is `optional/`, not a block.
+3. **An overlap technique buys nothing on devices of equal throughput -- when both ubatches are ALREADY wide.**
+   With identical cards every split of a wide ubatch is already the critical path, so a second *whole* ubatch
+   in flight adds queueing and no work: measured +0.03 % (MoE 35B-A3B Q8_0) and nil (dense 27B Q6_K_XL) with
+   the pair engaged (`pair decided: splits a=4 b=4, interleaved=1`) on 3 x R9700.  The submitter's +34 %/+13 %
+   are a 7900 XTX (gfx1100) + V620 (gfx1030) pair, whose devices differ ~3x: there the overlap hides an
+   imbalance.  A device-heterogeneous layout is not one of this delivery's validated configurations, which is
+   why that feature is `optional/`, not a block.  **The r229 cut qualifies this rather than overturning it**
+   (see *"no release, r229 tree"* below): pair two halves that were SPLIT out of one wide ubatch and balanced
+   devices gain +27 %/+41 %, because one unsplit ubatch serializes the layer-split pipeline and the split hands
+   the second lane work to do.  The pair *alone* is still worth nothing -- the split is what unlocks it.
 4. **A `hip*` spelling in `ggml-cuda.cu` needs the `#ifdef GGML_USE_HIP` form.**  `ggml-cuda.cu` still
    builds under nvcc for CUDA, and `hipEventDefault` / `hipEventElapsedTime` have no `cuda*` alias in this
    toolchain (using `cudaEventElapsedTime` in a HIP build fails with `use of undeclared identifier`).  The
@@ -2167,6 +2175,12 @@ Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM,
    with one WARN that names the platform cause (fact 3), and the exit census repeats the latch and its error.
    The real figure is the aperture segment's `CommitLimit` (`D3DKMTQueryStatistics`, the same call
    `wddm-mem.cu` already makes for the device free-memory query) -- measure it before adding a ceiling.
+   **r233 corrects the premise: the ~9.3 GiB stop is the loaded HIP RUNTIME, not Windows or WDDM.**  Issue
+   #278's box had `amdhip64_7.dll` from the Adrenalin driver in `System32`; with the ROCm/TheRock 10.1
+   runtime (a different DLL file version) beside the same r229 binary the tier pinned **16 004 / 40 078
+   MiB** with 141/141 host tensors and 0 failed fills, where the driver runtime stopped at ~9.3 GiB.  So
+   a Windows report's pinned ceiling is not interpretable until the loaded runtime module is named --
+   the delivery now logs it at startup (see the r233 entry at the end of this file).
 5. **`Private Bytes` for a read-only file mapping is not commit charge, so a 40 GB figure there is a
    measurement artifact until proven (r223, issue #274 follow-up @DanoPTT).**  `CreateFileMapping(PAGE_READONLY)`
    + `MapViewOfFile(FILE_MAP_READ)` makes the GGUF page-cache-backed; the process's commit only grows for page
@@ -2326,7 +2340,7 @@ on Linux.**
    was the better configuration there and why adding 16 GB of RAM moved prefill 16 -> 94 t/s with nothing in
    the delivery changing.
 - **The demote's cost and the pool's fill cost are properties of the HOST LINK, not of the delivery
-  (recorded 2026-11-06, before r225; `wip/host-expert-parity/`).**  r224's exchange rates — 9.6 µs per 679 762 B
+  (recorded 2026-11-06, before r225; `archive/work/host-expert-parity/`).**  r224's exchange rates — 9.6 µs per 679 762 B
   D2H, 0.0140 ms/MiB, ~2/3 hidden behind compute, ~3 % break-even reuse on this box's NVMe — were measured on a
   host whose link the same record's own naive-transport figure puts at **~26 GB/s** (26 µs per copy).  A host
   that negotiates more (one R9700 on PCIe 5.0 x16 = `32.0 GT/s` x 16) moves both the demote's marginal cost and
@@ -2340,8 +2354,17 @@ on Linux.**
   made the policy — reads the mapping per expert and does not coalesce.  Quote the arm with the number, and
   never read a DIO-vs-buffered pair as a span A/B: the fill source changes with the mode, so that pair is two
   changes at once.
+  **CORRECTED at r232 (issue #281): the span is no longer O_DIRECT-only.**  Both `span_geom` predicates dropped
+  their `g_pool_dio` term and `stage_span_fill` opens the file with the mode's own flag, so a buffered fill
+  coalesces too (a buffered `pread` reads the same page-cache pages as the mapping — the granularity is what
+  changed, not the source).  It is not a small correction: on the 56 GiB rig at `-lme 12` (26 % coverage, the
+  field shape) the buffered arm goes **513-545 -> 821-875 t/s** with 2.3-3.5x fewer storage reads, `-lme 36`
+  (77 %) **985-1235 -> 1307-1446**, near-mirror **inert**, decode unchanged — and it is **+30 % over the
+  `DIO=1` arm with the span**, whose decode is 2.4x worse (61 vs 26 t/s).  So the r224 percentages above are
+  the *direct-tier* numbers and the buffered arm now has its own; a DIO-vs-buffered pair is still two changes
+  at once, but it is no longer a coalescing pair.
 - **The demote's value is BUDGET-shaped, and it is positive up to a near-mirror budget (measured 2026-11-06;
-  `wip/host-expert-parity/RESULTS-2026-11-06.md`).**  One box, one model, `-n 64`, DIO, prose: `-lme` 36
+  `archive/work/host-expert-parity/RESULTS-2026-11-06.md`).**  One box, one model, `-n 64`, DIO, prose: `-lme` 36
   (76.9 % coverage) **+8 %** generation (24.0 → 26.0 t/s), `-lme` 44 (93.7 %) **+21 %** (28.0 → 33.9), mirror
   (100 %) **inert by construction** (0 demoted, 144 mirror tables).  This corrects `W1-SINK-TAX.md`'s inference
   that "the cost is constant while the benefit falls as the pool grows": the copy count is roughly constant, but
@@ -2366,3 +2389,433 @@ on Linux.**
      full mirror stays inert (0 demoted, 144 mirror tables).
   Gates on the fixed tree: coherence `sha=880c932888f8` identical on both `SINK` arms, `gate-host-pool.sh`
   **31/31** (the `sink`/`sinkfail` arms still prove a failed demote declines and never publishes).
+
+- **A latched pinned tier stops the tier GROWING; it does not throw away what the run already owns (r229, block
+  12; issue #278).**  `g_pinned_off` is set by the first refused `cudaHostAlloc` (on Windows a refusal also
+  latches a process-wide HIP error, which is why the tier is not retried) and `bounce_acquire` has always drawn
+  the right line: it reuses a drained ring ENTRY before its latch check.  `table_pool_locked` did not -- it
+  checked the latch before looking for an existing pool, so ONE refusal (the reporter's box hits its adapter
+  ceiling at ~9.3-9.5 GiB of shared usage during the load) made every pool the run had already built
+  unreachable, and every expert copy after that point went through the pageable model mapping: a driver-staged
+  copy, i.e. the exact cost the pool exists to remove, on the box where the pin budget is the scarce resource.
+  Measured on the `pinlate` arm of `gate-host-pool.sh` (a latched tier forced after the pools and the arena
+  exist): the lookup-first order serves **7 060 fills from pre-latch pools with 110 failed fills**, the
+  guard-first order (the pre-r229 code) serves **0** from them with **1 587 failed fills** -- text identical in
+  both, so only the counter can see it.  The same rule is what the census line `N expert fills were served from
+  a host pool built BEFORE the refusal` reports.
+- **An expert-cache arena it cannot fill must not be armed (r229, block 12; issue #278).**  `moe_cache_rearm`
+  (the post-prefill, compute-buffer-drop re-arm) used to re-take the arena for every layer with a stood-down
+  table.  When the pinned tier is latched off and a table has neither a pool nor a ring entry, there is no host
+  source at all, so every one of those slots is armed, seeded (one doomed fill per slot, a `cudaDeviceSynchronize`
+  per table) and then declined on use -- which is exactly what a STOOD-DOWN table does, at 5.5 GiB of VRAM and a
+  sync per table.  The re-arm now tests the LAYER (`table_has_fill_source_locked`; layer-uniform, because a
+  skipped table between armed ones is the mixed-slot layer that reads the wrong expert): a source-less layer is
+  stood down wholesale and named once (`left N stood-down expert-cache tables in M layer(s) DISARMED ...`), and
+  its `g_rearm_slots[layer]` is zeroed so the caller's second pass does not repeat it.  Measured on the
+  reporter's config with the latch forced: the arena stays at **13 645 MiB instead of growing back to 19 225**,
+  with the same declined-op behaviour and byte-identical text.
+- **The eviction demote can never run beside a paired all-reduce, by construction (r229, campaign; `TODO` #276
+  closed).**  `MOE_HOST_POOL_SINK`'s D2H declines when `t.n_slices != 0` (a tensor-split table has no single
+  contiguous pool image, so the copy would be a strided 2-D one -- the class r113 measured as a 2x decode loss).
+  A tensor split is the delivery's only layout with an intra-token all-reduce, so the two never coexist: 2 GPU
+  35B-A3B `-sm tensor -ncmoe 40 -lme 12` gives `0 demoted / 14 480 geometry (structural)` with the RCCL banner in
+  the log, and the same config under `-sm layer` gives **7 862** copies (4 771.4 MiB) with **no** all-reduce line.
+  This is why PR #267's 0004/0006/0007 rationale (`hipMemcpyAsync` leaving later queued work unsubmitted, which
+  stalls the *paired* peer past its spin timeout) has no reachable defect to fix here: do not re-open it without
+  first extending the demote to a split table.  Record: `archive/work/host-expert-parity/RESULTS-2026-11-06-soar.md` §2.
+- **The slab's arena eviction at a decode->prefill transition costs at most the evicted bytes, i.e. nothing you can
+  measure (r229, campaign; `TODO` #278 closed).**  `moe_cache_evict_slab_range` hands the work pool the LOWEST
+  arena chunks and `moe_cache_rearm` re-arms what fits afterwards, so a dropped table loses its slots and its
+  experts must be re-filled at the next prefill.  It fires only when the work region outgrows the reservation it
+  got at `ggml_cuda_slab_init_locked`: Flash-Next, one GPU, `-c 204800 -ub 6144` -> 3 events, **1 062 MiB**, one
+  `re-armed 12 stood-down` (37-56 ms, <=0.2-1.2 % of the prompt), and three identical 4 096-token rows measure the
+  post-transition row **+15.8 % over** its predecessor.  On the 3-GPU `-sm tensor` field shape the count is
+  **zero**, and the cheap reproduction is **Q8_0** 35B-A3B (2 events, 380 MiB, `re-armed 3 stood-down` twice, the
+  post-transition row +2.0 %) -- `Q4_K_M` cannot show it: its whole host set is 18 662 MiB (the arena clamps at
+  `n_experts`, so no `MOE_EXPERT_CACHE_MIB` forces it larger) and its priming pass reserves the work region at the
+  width the real prefills need.  So this is not the field prefill's residual -- that one is the near-mirror miss
+  path.  Record: `archive/work/host-expert-parity/RESULTS-2026-11-06-soar.md` §1.
+
+## (no release, r229 tree) -- the two-lane pair only pays when the SPLIT creates its partner; a declined pair must not still split
+
+PR #279 (@slavap) re-cut `optional/two-lane-prefill` onto r229 and added the sub-ubatch split, which turns
+r220's "nil on balanced devices" into a real win -- and a real regression that the same rule has to cover.
+
+1. **A single wide prefill ubatch serializes the layer-split pipeline; splitting it and running the halves on
+   two lanes is worth a quarter of the prefill.**  3 x R9700 gfx1201, the only reachable layout (`-sm layer
+   -ts 1/1/1 -ot`, which turns pipeline parallelism off), `-ub 2048`, ABBA x4: MoE 35B-A3B Q8_0 pp2048 **6621
+   -> 8436 t/s (+27.4 %)**, pp4096 6486 -> 8245 (+27.1 %), pp8192 with `-b 8192` (one decode call, 4 ubatches
+   paired 2x2) 6240 -> 9251 (+48.3 %); dense 27B Q6_K_XL pp2048 1293 -> **1823 (+41.0 %)**, pp8192 1488 ->
+   1745 (+17.3 %); tg nil.  The 2x2 says why it needs BOTH halves: **split alone** (lanes unset, `-ub 1152`,
+   the same two ubatch boundaries run serially) is a **loss** (-15.3 % MoE, -3.6 % dense) and **pair alone**
+   (`LLAMA_LANES_SPLIT_MIN=0`, one ubatch so nothing to pair) is nil (+1.2 % / -1.2 %).  That is r220 fact 3
+   qualified, not contradicted: the pair added nothing when both partners were already wide.
+2. **The pair itself is bit-exact; the split's divergence IS a ubatch-boundary change.**  lanes=2 vs lanes
+   unset at the same ubatching measures **exactly** the divergence of a plain `-ub 1152` vs `-ub 2048` change on
+   the same build (mean KLD `0.004088`, same-top-p `97.898 %`, identical to six digits -- the `GREEDY-PURITY.md`
+   §46 benign-reordering scale), and the default path stays bit-identical to the delivery (KLD `0.000000`,
+   same-top-p 100 %).  So "greedy text byte-identical between lanes" is true but it is the greedy path's luck:
+   judge this artifact on the KLD equality, not on the text.
+3. **A feature that declines a workload at one gate must decline it at EVERY gate.**  The split was gated on
+   `prefill_lanes >= 2 && sched_lane && cb_eval == nullptr` while the pair also requires
+   `!embeddings_nextn && !lf_layer_inp_dev`; a draft workload (MTP / DFlash) therefore declined the pair and was
+   still split, paying a narrower ubatch for nothing -- 35B-A3B Q8_0 + DFlash2 pp2048 **3981.8 -> 3427.4 t/s
+   (-13.9 %)** with diverging greedy text.  Mirroring the pair's fields in the split gate restores both (text
+   sha `f61214fad249` == lanes unset).  Residual: arming the lanes on a draft context still costs ~4 % prefill /
+   ~2 % decode (second compute-buffer set + one drain per ubatch) even though nothing pairs.
+4. **The reachable layout costs ~1.4 GiB and is not free at the edges.**  A second compute-buffer set per armed
+   context (441/430/430/65 MiB at `-ub 2048`); a **second context in one process is ~8 % slower** with the lanes
+   armed (pp8192 7976 -> 7347, lanes unset flat 7513-7519 over three contexts); `llama-batched-bench -npp 2048
+   -npl 1,4,8` gives **B=8 prefill -3.5 %** (8776 -> 8467) while B=1 gains +28.8 %.  Do not enable this on a
+   many-slot server; it is a single-long-prompt design.
+
+## r230 -- the PLE's residency is a *pin*, not a copy: `--lazy-mode mlock` keeps the lazy data path and mlocks the mapping (block 00)
+
+1. **The three lazy arms differ in residency only, and the copy is the odd one out.**  `auto`/`on` read the
+   rows from the mapping on demand (nothing resident); `off` reads the whole table into a private host buffer
+   (resident, 27 GiB of anonymous memory, swappable, nothing reused across restarts); `mlock` reads the rows
+   from the mapping on demand *and* pins that mapping in the page cache.  All three feed the same
+   `host_gather` path, so same-seed text is identical (`7d898d3d3e58`, 125 chars, Flash-Next GSQ-IQ3_S 3 GPU
+   `-sm tensor`) and `llama-bench` is at parity: pp2048 2570.4 / 2549.1 / 2574.8 and tg32 77.41 / 77.55 /
+   76.27 for mlock / auto / off.  The `off` copy buys nothing but an allocation -- register the copy as an
+   allocation, not as the residency mechanism.
+2. **"Resident" must be measured with `VmLck`, not RSS.**  With `--lazy-mode mlock` on the whole table,
+   `/proc/<pid>/status` reads `VmLck 28125136 kB` (26.82 GiB = the entire 27,465 MiB `per_layer_token_embd`,
+   which is the whole of shard 2 of that GGUF) with `RssAnon` 1.3 GB, and `/proc/meminfo` `Mlocked` ==
+   `Unevictable` == the same number.  RSS cannot tell a pinned page-cache table from a copied one.
+3. **The pin costs the kernel's populate rate, which is the same order as the copy it replaces.**  `mlock`
+   populates through `__mm_populate` (~4.2 GB/s here: 27.5 GiB in ~7 s cold), so `--load-mode mmap
+   --lazy-mode mlock` loads in 32.5 s against `off`'s 25.7 s (a 3.9 GB/s `read_raw` + copy) and `auto`'s
+   29.1 s (which reads nothing).  With the table already in page cache the pin is a page-table walk -- **0.19 s
+   for 27 GiB** -- which is why a warm-cache restart (`--load-mode none --lazy-mode mlock`) is ready to serve
+   in **8.26 s** (maintainer's box, 2026-11-07).
+4. **A pin is per process; the page cache is not.**  The kernel releases the lock at exit (verified:
+   `Mlocked`/`Unevictable` 28125136 kB -> 0 while `Cached` stays high) and the pages remain as ordinary
+   reclaimable page cache.  That is what makes the mode useful: the next start re-pins cached pages instead
+   of re-reading the table.
+5. **`mlock` is refused, not emulated.**  Under a small `RLIMIT_MEMLOCK` (tested at `ulimit -l 2048`) the one
+   `mlock` of the range fails, the loader warns and leaves the table on the evictable page-cache path (text
+   unchanged).  There is no partial pin: `llama_mlock::grow_to` locks the whole range or nothing.
+
+- **A non-mirror host tier's field prefill is dominated by the band-transition tail, and the tail is the pool
+  RE-LAYOUT (measured 2026-11-07, `radix`; `archive/work/host-expert-parity/RESULTS-2026-11-07-radix.md`; r231).**  When
+  the arena's slot count changes between the bands (179 -> 79 per table at `-ub 6144`, the prefill's work region
+  taking the slab), `pool_rerank_from_heat_locked` re-derives the pool's "arena complement + mirrored residents"
+  layout **after the last ubatch and inside the request**: 1 500-6 400 single-expert fills, all charged to the
+  first token.  Measured tails (feature-attributed, not estimated -- the window between the last
+  `progress = 1.00` row and `prompt eval time` is 100 % `pool_rerank_from_heat_locked`): **0.6 s on a mirror**
+  (a covering pool returns early), **1.2-1.3 s with `MOE_HOST_POOL_DIO=1`**, **7.2 s at `-lme auto` buffered**,
+  **13.5-18.6 s at `-lme 44` buffered** -- i.e. the tail, not the miss path, is what makes a buffered sub-mirror
+  tier's first prefill look 2-3x worse than its processing rate.  Two consequences: (a) a per-fill cost is
+  **0.45 ms warm (DIO) to 10.8 ms** on the same bytes, so never quote one rep -- the same arm moved 735 -> 1 191
+  t/s between reps as page-cache state changed (`A0` 1 810 vs `A0b` 1 329); (b) the lever is the fill **source**
+  (`MOE_HOST_POOL_DIO`, ~90 % of the tail) plus the fill **order** (r231: file order, ~30 % of it), not more
+  bandwidth.  A microbenchmark of the fill shape (40 cold 0.65 MiB slices, `drop_caches`) is 0.74-1.61 ms for a
+  mapping memcpy and 0.89-1.04 ms for a buffered `pread`, so the arm's 4.6-10.8 ms is the cgroup
+  (`MemoryMax` + `MemorySwapMax=0`) reclaiming for every new page, not read latency.
+- **On the field shape a low-coverage tier decodes at near-parity, and the demote is why (measured 2026-11-07,
+  `radix`, 56 GiB rig, Flash-Next + MTP drafting; `archive/work/host-expert-parity/RESULTS-2026-11-07-radix.md`).**
+  Decode (third 600-token pass, `-ub 6144`, one load per arm): **mirror 83.8 t/s; `auto` 97.9 % 75.6; `-lme 44`
+  93.8 % 76.2; `-lme 36` 76.8 % 76.1** -- flat from 98 % down to 77 % coverage, 10.8 GiB of pinned RAM saved for
+  ~9 %, and only the mirror is faster.  With `MOE_HOST_POOL_SINK=0` the same 77 % tier falls to **45.4 t/s**
+  (-46 %): its decode turn reads **19.0 GiB** from storage against 2.2 GiB with the demote, whose census there is
+  **50 793 demotions / 32.2 GiB / 67.6 % reuse** (the CLI cells measured 4.7-7.9 % reuse, because a spec-decode
+  step verifies four tokens at once and re-uses exactly the experts a demote captures).  Prefill is *not* flat:
+  mirror 1 895-1 939, `auto` 1 785-1 818 (`DIO`) / 1 431-1 810 (buffered), `-lme 44` 1 329-1 699 (`DIO`) / 735-1 191
+  (buffered), `-lme 36` 1 037 (`DIO`) -- so **decode-parity at 77 %, not prefill-parity**, and a sub-complement
+  budget should set `MOE_HOST_POOL_DIO=1` (`+43-81 %` prefill, decode neutral with the demote, 2.1x the bytes).
+
+## (no release, r231 tree) -- the narrow-2 pin's eviction branch needs a SHORT estimate, and a `cudaMalloc` preference cannot avoid it (PR #267 0003a / `TODO` #279)
+
+1. **The pin's VA spare is the draft's own reserve, minus the headroom, so the eviction branch is unreachable in
+   the shipping geometry.**  `ggml_cuda_slab_narrow2_pin_locked()` straddles `mapped` only when the compute region
+   exceeds `size - mapped`; at creation that spare is `reserve - headroom`, `reserve` is `headroom + draft-context
+   estimate` (kv + compute + slack), and the MoE preflight **skips** `ggml_cuda_slab_extend_all()` at the priming
+   sizing (`wip/first-prefill-latency`), so nothing has eaten it when the pin runs.  The estimate's `compute` term
+   is a floor over the same measured quantity, so only a SHORT estimate reaches the branch — that is r106's
+   deliberate fallback (the tensor-split drafter that used to abort in `graph_reserve`), never a routine path.
+   Measured on four probes (Flash-Next + MTP 1 GPU, 35B-A3B + DFlash2 1 GPU and 3 GPU `-sm tensor`, and a `-ub`
+   sweep to a 1.50 GiB region): all `unmapped VA spare`.  **Do not chase this branch as a performance item** —
+   `archive/work/host-expert-parity/RESULTS-2026-11-07-narrow2.md`.
+2. **When it is forced, its eviction is re-absorbed; the resident-set loss is not a loss.**  `GGML_CUDA_SLAB_RESERVE_MIB`
+   sets the reserve verbatim, i.e. `spare = value - headroom`, which is the only knob that reaches the branch (and
+   a >46k ubatch at a 64k context is the smallest natural shape that closes the gap).  Six interleaved arms: the
+   pin evicts 314-450 MiB and the next sizing/`re-arm` pass returns it — the final arena MiB and the decode hit
+   rate are identical to four decimals in both arms (`20 712.6 / 0.9471`, `21 418.6 / 0.9239`), at prefill +2.4 %
+   and decode -0.8 % (noise).  The cost is one re-fill of the evicted bytes (~15-20 ms) — the same bound #278
+   measured for the arena transition.
+3. **A "prefer the cudaMalloc fallback" rule is a CHURN, not an avoidance** (PR #267 0003a).  Two mechanisms:
+   (a) the fallback spends the free VRAM outside the slab, i.e. the very resource its own guard has to see, so it
+   can only fire while the eviction is <= free - cushion (a fraction of the headroom) and can never prevent a
+   *large* one — there is no free VRAM in that case, which is why the region did not fit; (b) `narrow2_floor`
+   latches only on a COMMITTED pin, so the declined attempt is re-made on the next compute allocation and evicts
+   anyway (measured: decline at `0.19.448` s, the same 314 MiB eviction at `0.19.465` s).  Latching the decision
+   would give up the evicted bytes of cushion permanently for one ~20 ms re-fill — the wrong trade, since that
+   cushion is what r206 raised to 1280 MiB/GPU to stop a hipBLASLt OOM.  Verdict: **do not implement**;
+   `TODO` #279 closed 2026-11-07.
+4. **`-lv` is TWO thresholds, and a census arm needs 4 while a text arm needs none.**  `common_log_get_verbosity()`
+   maps `GGML_LOG_LEVEL_INFO` to `LOG_LEVEL_TRACE` (4), so every **ggml** census line (`MoE expert cache:`,
+   `expert access:`, `takeover=`, `cold admission=`, the sink block's INFO) is `-lv 4`-only, while llama-cli's own
+   `LLAMA_LOG_INFO` is `LOG_LEVEL_INFO` (3) and its per-slot statistics block is what pollutes the generated text.
+   So `-lv 3` is the one setting that gives you the pollution WITHOUT the numbers: **census/mechanism arms take
+   `-lv 4`, text-identity arms take no `-lv` at all** (and read their rates from the `[ Prompt: … | Generation: … ]`
+   footer).  r231 blamed `-lv 4` for the pollution; the sharper rule is above.
+
+## (no release, r231 tree) -- `MOE_EXPERT_CACHE_TOUCH` is a churn damper with no decode win, and the tier's cold read is why PR #267's registration is not needed
+
+1. **`TOUCH=3` does damp churn, and the on-device outcome is a wash (measured 2026-11-07, `radix`).**  Flash-Next +
+   MTP, `-c 204800 -ub 6144 -ncmoe 48`, `MOE_HOST_POOL_DIO=1`, `-lme 36` and `-lme 44` (the two budgets where the
+   demote is live), 3 + 3 interleaved reps: demotions **-17.3 % / -18.3 %** (-17.2 % / -18.2 % of the bytes),
+   sink uses **-27 %**, arena hit **-0.78 / -0.81 pt**, cold-served misses **+35 %** (3.27 -> 4.43 %, 3.39 ->
+   4.58 %) at an unchanged fill count, and decode **+1.3 to +2.2 %** at 93.8 % coverage (inside the box's spread)
+   with prefill flat.  **The default stays 2**; the replay's prediction ("touch-3 shrinks the sink's advantage by a
+   third") was right about the mechanism and irrelevant to throughput.  `archive/work/host-expert-parity/RESULTS-2026-11-07-touch.md`.
+2. **A pool-backed table already serves a rejected miss in place, so PR #267's 0002 registration has nothing to
+   buy.**  With `admit=touch` live, `MOE_EXPERT_CACHE_COLD_UVA` (default on) served **3.27-4.58 %** of all reaches
+   (15 147-21 206 misses) with **zero** declines on those arms, from the tier's own pinned-RAM alias.  A "the GPU
+   cannot read the pageable master" premise was answered by the pool plus the per-table bounce ring; registering the
+   expert ranges would add a second mapping for a path that is already cheap.
+3. **The demote's break-even is not in doubt at these coverages.**  Sink reuse measured **13.6-15.8 %** at 77-94 %
+   coverage, against W1's ~3 % break-even on NVMe (~0.2 % on slow storage) -- so the r231 decode-parity result
+   holds, and `TOUCH=3`'s -18 % of copies changes the amount, not the verdict.
+
+- **A MID-RUN pinned-tier latch perturbs the logits by ~1e-5, and that is enough to flip a near-tie token
+  (measured 2026-11-07, `soar`, issue #281's gate run; `TODO` #282).**  `scripts/gate-host-pool.sh`'s `pinlate`
+  arm (`MOE_HOST_POOL_PIN_FAULT=late`) serves a MIXTURE — some ops from the arena, some stood down — and
+  reproduces the greedy text of neither end: 171 chars `b981e742aa13` against `ref`'s 182 / `a99ccbd97ecb`,
+  deterministic across two builds and two runs, one token at ~31 of 32.  **The two ends are bit-exact**, which is
+  what makes the mixture the whole story: `fail`/`late` (every table stood down, `get_ok=0`) match `ref`
+  exactly, so the fallback computes the same logits and the divergence is not a wrong-expert read.  The
+  delivery's own criterion on the same contrast reads **median KLD -0.000000, 99.9 % -0.000040, same-top-p
+  100.000 %** over 2 x 512 tokens — two orders inside the 0.005 tolerance — and `MOE_HOST_POOL_VERIFY=1` finds
+  **0** pool-read mismatches.  Ruled out by arm: the cold in-place read (`MOE_EXPERT_CACHE_COLD_UVA=0` still
+  diverges), the decode remap (`GGML_MOE_DEVREMAP=0` still diverges), the staging transport
+  (`MOE_HOST_POOL_STAGE_BATCH=0` still diverges), prewarm and the ranking.  **Narrowed to the demote**:
+  `MOE_HOST_POOL_SINK=0` + latch reproduces `ref` exactly.  Consequence for gates: a byte-identical *text*
+  assertion is the right instrument for a wholesale fault arm (bit-exact) and the wrong one for a mixed state —
+  a ~1e-5 arithmetic difference flips near-ties, so that arm's evidence has to be the logit criterion.
+
+## (no release, r232 tree) -- measuring a cold read here: eviction is FOLIO-granular, and an unverified arm will lie to you
+
+Established while building [`utilities/storage-oracle/`](utilities/storage-oracle/) (WORKLOG `261107.007`);
+the tool is the reproduction, and none of this is a delivery change.
+
+1. **`POSIX_FADV_DONTNEED` is a folio operation, not a page operation.**  On XFS with large folios, asking for a
+   4 KiB range that sits inside a larger cached folio **silently does nothing**: `fadvise64` returns 0, the folio
+   stays in the page cache, and the next read is a cache hit in **~0.2 us** instead of a device read.  The first
+   version of the probe reported exactly that as a p50 on a file with 39 GiB of hot page cache, and the number was
+   plausible enough to believe.  Two rules follow, and the second one is the one that matters: evict with
+   **folio-aligned windows** (2 MiB, escalating to 32/256 MiB), **verify with `mincore` on a bare mapping**, and
+   count and *skip* (never time) a sample that could not be made cold.  A page that our own `mmap` has already
+   faulted also pins its folio, so `madvise(map, MADV_DONTNEED)` has to come before the `fadvise`.  A cold-read
+   benchmark on this filesystem without a `mincore` check is measuring the page cache.
+2. **The corrected ordering at page granularity is `O_DIRECT` < the page-cache mechanisms, not parity.**  Verified
+   cold, 4 KiB, QD1, random, on `/llm` (the Lexar): `O_DIRECT` **74 us**, buffered `pread` **150 us**, `mmap`
+   fault **150 us**.  Both page-cache paths cost about **2x** `O_DIRECT` per page (a cold buffered read pulls a
+   folio; a fault pays the fault machinery), which is the opposite of the "buffered is free" default assumption and
+   is why `--load-mode dio` can win a *cold* load it looks like it should lose.  The unverified numbers from
+   before this check were optimistic by up to 2x on those two arms.
+3. **A `llama-cli` arm that failed to load reads ~10 MiB in under a second and looks like the fastest arm.**
+   Measured: `--verify` reported a 0.86 s "load" that had read 11 MiB, where the arm had actually OOMed
+   (`-sm layer -ngl 99` put 34.7 GiB on device 0).  Rule: an arm is only an arm if it exited 0 **and** printed a
+   prompt-eval line; otherwise it is FAILED with the **first** ` E ` log line (the last one is usually the generic
+   "server exited").  A load-time comparison also has to count **bytes the block device read** (`/sys/block/*/stat`
+   sector field), because a mapped load defers its reading into the first forward pass.
+4. **`--lazy-mode mlock` pins only `TENSOR_READ_LAZY` tables, and is INERT on a model without one** (the r230 mode,
+   qualified).  Qwen3.5-4B has no such table: `mmap --lazy-mode mlock` **5.17 s** against `mmap --lazy-mode off`
+   **5.18 s** cold, i.e. the flag did nothing, and only the ordinary page cache gave the 1.00 s restart.  Gemma4-E4B
+   has one and logs `pinned 1 table(s), 2856 MiB`.  So residency must be confirmed from the loader's
+   `pinned N table(s), X MiB` line (or `VmLck`, r230 §2), never inferred from the flag.  `--load-mode none` still
+   creates a mapping for exactly those tables (the loader keeps one for them), which is why `none + mlock` is a
+   valid composed arm -- and the form r230's fastest restart used.
+5. **`--load-mode dio` does NOT read the same number of bytes as `mmap`/`none`.**  r215 §1 holds for the mapped
+   arms, but O_DIRECT's alignment handling re-reads the unaligned prefix of a chunk: 4 921 MiB against 4 275 MiB
+   (+15 %) for the same model load here.  Any A/B that charges `dio` only its throughput advantage is understating
+   its cost -- read the device's byte counter per arm.
+
+
+6. **The Lexar's 16 ms idle wake is APST, and it is removable -- but only by re-probing the controller.**  `nvme
+   id-ctrl` shows APST enabled at `ITPT 100 ms -> PS3`; with APST off the same file measures **88 us** after a
+   5 ms gap and **50 us** after 50 ms, against **2 533 us / 4 743 us** at the default, and the 250 ms step falls
+   **16 313 -> 4 716 us**.  Nothing else moves: `O_DIRECT` bulk is 2.46 GB/s either way and every page-cache arm is
+   unchanged, so this is a power-policy effect and not a throughput one.  Three shortcuts do NOT work, each tried:
+   `nvme set-feature -f 0x0c -v 0` returns `EPERM` (the kernel driver owns the APST feature), `nvme reset` does not
+   re-read `nvme_core.default_ps_max_latency_us`, and a user-space admin passthrough of Set Features is refused
+   the same way.  What works is writing the parameter and **unbind/bind that PCI function** -- the parameter is
+   read at controller *creation* -- which also scopes the change to one drive (the SN850X keeps its APST and its
+   0.6 ms wake).  A ~5 ms firmware level survives any setting and is reached after roughly a second of idleness, so
+   "APST off" means 50-90 us in use and ~5 ms cold; never "instant".
+7. **Watts are NOT readable in band, so never quote one as a measurement.**  `id-ctrl`'s `mp` is a per-state
+   *ceiling* -- this drive declares 10 W while TechPowerUp measured 7.0 W reading, 8.5 W writing and 1.454 W idle
+   with ASPM disabled -- `IDLP`/`ACTP` are unpopulated on both drives here, NVMe SMART has no power field, the
+   `nvme` hwmon has temperature channels only, and RAPL/`powercap` is the CPU socket (`package-0`, `core`) while
+   the drive hangs off the 12 V rail.  Per-state watts need a shunt (Quarch/Monsoon, or an M.2 riser with an
+   INA228) or a wall meter and a delta method; and any idle figure quoted without its APST/ASPM state is useless.
+
+## (r233) -- the Windows pinned ceiling is the loaded HIP runtime, not Windows: name the module before believing a number
+
+Established from issue #278's reporter (Windows 11, one R9700, 64 GiB), same r229 binary, same command, only the
+HIP runtime swapped.  This is the missing half of the r223 fact 4 above and it changes what a Windows pinning
+report means.
+
+- **The ~9.3-9.4 GiB pinned stop belongs to the driver-shipped `amdhip64_7.dll` in `C:\Windows\System32`.**  That
+  box had been running with the Adrenalin driver's HIP runtime (file version 10.0.3661.0) while the ROCm tree
+  beside the binary supplied only rocBLAS/hipBLAS/hipBLASLt.  Putting the official TheRock ROCm 10.1.0 Windows
+  runtime (`amdhip64_7.dll` 10.0.3684.0, `amd_comgr.dll`, `hiprtc0716.dll`, `rocm_kpack.dll`) next to the
+  executable -- confirmed loaded from the binary's directory, not `System32` -- removed **both** symptoms:
+  the #278 hang (2/2 runs before, 0/2 after; prefill 16.1 and 40.2 t/s, decode 9.4 and 11.8 t/s, MTP 272/378)
+  and the ceiling (pinned tier **16 004 / 14 913 MiB** on the #278 arm, **40 078 MiB** on the disk-tier `c` arm
+  with **141/141** tensors, a full mirror `h=1.0000`, 0 failed fills, 5k prefill **370.7 t/s** against 39.8).
+  Text was byte-identical to the reference on the good runs and differed on the latched driver-runtime run.
+- **What this does NOT say.**  The two spinning threads were sampled inside the HIP runtime's own yield-wait
+  loop (`SwitchToThread` under `amdhip64_7.dll`, one started by the runtime, one under `ggml-hip.dll`'s
+  `hipGetDevice`); the hang is a runtime defect on that box, not something the block set can fix.  It also does
+  not license a WDDM/aperture formula: the driver runtime's ~9.3 GiB stop is still not derivable from RAM, the
+  commit limit, or the adapter count.  Do not cap a healthy box from any of them.
+- **What the delivery does about it (r233, block 12).**  `wddm-mem.cu` gains
+  `ggml_hip_runtime_module_info()`: it resolves the loaded `amdhip64_7.dll` by name, asks for its file path,
+  compares it case-insensitively with `GetSystemDirectoryA()`, and reads `hipRuntimeGetVersion()`; the MoE cache
+  logs one INFO line (`HIP runtime 7.16.26385 from <path>`) and, when the module came from the system directory,
+  one WARN that names the measured consequence and the remedy (put the TheRock DLLs beside the executable).  The
+  new kill switch `MOE_HOST_POOL_PIN=0` closes the pinned tier from the start on any platform, so a box stuck on
+  the driver runtime can still run the host-expert path (pageable mapping; correct, slower) without touching it.
+  Both are inert on a box that does not hit either condition; `gate-host-pool.sh`'s `pin0` arm proves the switch
+  builds no pool, says so in the census, and leaves the greedy text byte-identical to `ref`.
+
+
+## r234 — the prefill staging decline, and the transport ranking is a band, not a stall (2026-11-07)
+
+Facts from `TODO` #271/#272 (records: `archive/work/host-expert-transport/README.md` and `RESOLUTION.md`,
+`WORKLOG.md` 261107.011).
+
+- **A staging decline is a TRANSIENT stand-down, not a sizing bug.**  On a pinned master
+  (`--host-experts pinned`, 47 962.5 MiB `ROCm_Host`) 50 of 144 tables decline
+  (`prefill cache staging: ok=819 unusable=450`, 9 of 9 ubatches) and every one of them declines on
+  `arena == nullptr && slots == 0`; the other three predicates (`host_dev == nullptr`, `!cold_safe`) never
+  fire on an unfused table, and `host_pinned` implies `host_dev != nullptr` by construction.  The trigger is
+  the prefill's own compute layout taking the slab chunks those arenas lived in
+  (`moe_cache_evict_slab_range`, 7 536 MiB + 150 MiB here, mostly `--cache-ram`'s 32 context checkpoints);
+  `moe_cache_rearm()` rebuilds them at the compute-buffer drop, before any decode, so the state is
+  **prefill-only and designed**.  A 0-slot table is not a defect — do not "fix" it by relaxing the
+  predicate.
+- **The decline is FREE: the fallback is the same bytes on the same stream.**  The scheduler's own
+  whole-table upload is one bulk async copy on the **copy stream** the staging ring uses, so the archived
+  "per-tensor copies serialised on the compute stream" reading was a trace of a different arm.  Measured
+  (1 GPU, pinned, `-ub 6144`, ABBA): **1826 t/s declined against 1824 t/s staged** (±0.1 %), both engines
+  bulk.  Staging those tables through the pinned tier's one-launch kernel instead measures **-10 %**
+  (1572/1595 against 1757/1765): the r114 kernel is a *worse* engine than a bulk DMA for a whole-table
+  copy, on the pinned tier as well as the pool tier (`LEAD-pool-staging-gap.md` §2's CU monopolisation).
+  So: a fallback is not a defect until it is measured against the alternative — and here both alternatives
+  were equal or worse.
+- **The transport band's upper edge does not exist (refutes `LEAD-pool-staging-gap.md` §1's "loses by
+  8192").**  1 GPU, mirror pool, Flash-Next, ABBA × 4 runs per arm: the gather wins at `-ub 2048`
+  (1066 vs 891), the per-expert copy-engine arm wins from 5120 up (5120 **+18 %**, 6144 +17 %, **8192
+  +10 % — 4 of 4 runs**, 16384 a tie), and the gather is the only arm that is stable (±0.1 %).
+- **A "stall" that reproduces as a two-level oscillation is the box, not the pipeline.**  Identical
+  consecutive runs of ONE unchanged arm measured 1873 / 2177 / 1865 / 2180 t/s (period 2, amplitude 16 %;
+  17-32 % on the pool copy-engine arm; 0 % on the gather).  Cause unidentified: not paging (`pswpin`
+  +≤200 pages/run), not `MemAvailable`, not the arena/slot geometry (identical in every run), not THP
+  accounting (`AnonHugePages` 0 GiB after every teardown).  Consequences: the archived `kernel/wall 0.80 at
+  8192` was the low phase; `GGML_SCHED_STAGE_SLOTS` 8 vs 16 (the compile-time max) changes nothing, so ring
+  depth was the wrong suspect.  **Protocol:** an interleaved `A B A B` reads as a ~6 % win for the even
+  positions (measured: base 1757 at position 1 against base 1863 at position 2), so a transport A/B needs
+  `A B B A` and must report the spread — never a single run, never a block-ordered set of reps.
+- **The tier changes the ranking, so one default cannot serve both.**  On a pinned master at 1 GPU,
+  `GGML_MOE_CACHE_STAGE=0` (no cache staging, one bulk H2D per table) measures **2023** against the shipped
+  staging kernel's **1793** (+12.8 %) and forcing the gather measures 1493 (-16 %).  That is a *tuning* note
+  today, not a default: it is one shape on one box (x8 link), it trades the arena's bytes for PCIe traffic,
+  and the arm that would replace it (copy-engine staging) is bimodal.  A rule needs the 2048-5120 crossover
+  measured first.
+- **The prefill staging copy pays or loses depending on the TIER and the RESIDENCY, not the switch
+  (measured 2026-11-07, Flash-Next GSQ-RCO IQ3_S, 52 512-token prompt, balanced ABBA, 4 runs/arm).**
+  `GGML_MOE_CACHE_STAGE=0` (the plain whole-table upload) is 1 GPU / `-ub 6144`:
+  * **Pageable master** (`--host-experts pool`): **5-10x slower** (103-281 t/s against 1052-1556 with
+    `GGML_SCHED_DEVGATHER=0`).  The staging copy is the only fill that reads the arena (D2D); without it
+    every byte goes through `moe_cache_upload_pageable`, i.e. a host `memcpy` into a pinned bounce plus a
+    pinned H2D per expert.  **Never disable it on that tier** — this is the r83 case (+32-54 %) and the
+    reason the default exists.
+  * **Pinned master at 99.1 % residency, 2 devices `-sm layer`**: staging is **+4.0 %** (1961 against
+    1885) and is the stable arm; with the arena covering the host set the staged copy moves ~0 bytes over
+    PCIe (H2D 0.0 %) and the copy stream hides the rest.
+  * **Pinned master at 43.4 % residency, ONE device**: staging is **-12.8 %** (1793 against 2023) — the
+    one-launch fill kernel monopolises the CUs and there are too few arena bytes for the saving to pay.
+  So "is the switch worth it" is a tier-and-residency question, and the 1-GPU pinned answer is an *engine*
+  problem (a copy-engine or hybrid fill that keeps the arena source), not a reason to drop the feature.
+  A `-ncmoe 24` arm is NOT a way to reach high residency on a 32 GiB card: the resident layers plus the
+  auto arena over-commit and the context fails to initialise.
+- **A run-to-run transport "phase" on this box is the SDMA copy-engine path, and its cost scales with the
+  NUMBER of DMA operations (measured 2026-11-07, evening; record `archive/work/host-expert-transport/README.md`
+  §6c).**  With identical work (arena 20 796.2 MiB / 43.4 % residency, staged bytes 113 363.1 + 148 086.9 MiB,
+  the same evictions, the same 21 055 `copyBuffer` dispatches) consecutive runs alternate between a fast and a
+  slow level, and the amplitude is a property of the transport's DMA op count, not of its byte count:
+
+  | transport | DMA ops per table | low / high | amplitude |
+  |---|---|---|---|
+  | device gather (kernel read of the pool alias) | 0 | 1791 / 1793 / 1790 / 1788 | **±0.1 %** |
+  | staging kernel (1 launch per table) | 1 launch | 1761 / 1876 | 6.5 % |
+  | whole-table bulk upload (`GGML_MOE_CACHE_STAGE=0`) | 1 DMA | 1866 / 2180 | 17 % |
+  | per-expert copy engine | 512 DMA | 1624 / 2147 | 32 % |
+
+  **Ruled out, each by measurement**: PLE page cache (the oscillation is identical with `--lazy-mode auto`,
+  `off` and `mlock`; on this box `auto` is also the *fastest* of the three because a 47 962.5 MiB host-expert
+  tier leaves no room for a 26.8 GiB PLE pin), memory pressure (`MemAvailable` identical within a series),
+  the GPU clock (sclk max ~3220 MHz in both), the ring depth (`GGML_SCHED_STAGE_SLOTS` 16 vs 8: +1 %), and the
+  GPU slot (same on gpu0 x8 and gpu2).  **What it is**: a `rocprofv3` trace shows the low phase at 67 % GPU-busy
+  against 85 %, with the copy engine *less* busy (0.16 s vs 0.36 s) in a longer wall — the copies stall instead of
+  transferring and the GPU idles in many < 5 ms gaps — and `HSA_ENABLE_SDMA=0` removes the oscillation entirely
+  (1635/1557/1541/1566 t/s: stable, at the low level).  So it is a ROCm/SDMA dispatch-latency effect, not the
+  fill code, and it cannot be fixed here.
+- **Consequence for transport decisions.**  (1) A transport A/B on this box must report both phases or include a
+  gather control arm: the phase reverses the per-expert-copy-engine vs one-launch-kernel ranking
+  (low: kernel +8.4 %; high: CE +14.4 %), so a mean over an unbalanced sample is a phase measurement.
+  (2) A *default* should prefer the low-DMA-count engine — which is what ships (staging kernel on the pinned
+  tier, gather on the pool tier).  (3) The whole-table bulk upload is the only arm that beat the shipped
+  kernel in **both** phases (+6 % low, +16 % high, 1 GPU / 43 % residency), but it sends the arena-resident
+  bytes over PCIe as well, and on a 2-device 99 %-residency shape the staged kernel wins by 1-7 % — so it is
+  not a universal default either.
+- **`MOE_HOST_POOL_STAGE_BATCH` stays, and its two arms are not interchangeable.**  The engine merge
+  (per-expert copy engine for both tiers, kernel deleted) was built and measured: it wins the high phase and
+  loses the low one, and the pinned tier's copy-engine fill would be a coin flip.  The switch therefore still
+  describes a real choice: `1` = one launch (the low-variance default), `0` = one copy per expert (the A/B arm
+  that wins the high phase and on 1 GPU at `-ub 2048`).
+
+## (r235) — the scheduler's async host-input copy stops at the pinned ring's snapshot limit: above 1 MiB a non-weight host split input is copied synchronously
+
+**What is true.**  `ggml_backend_sched_copy_input`'s `host_src && dev_dst` branch (block 09) hands the split
+backend the **caller's live host pointer** via `set_tensor_async`.  The CUDA backend snapshots such an upload
+through its pinned ring **only up to `GGML_BACKEND_ASYNC_SNAPSHOT_MAX` (1 MiB, formerly the CUDA-local
+`GGML_CUDA_ASYNC_INPUT_MAX`); above it the `cudaMemcpyAsync` reads the source when the stream reaches the copy,
+not when it is issued.  The buffer that bites is a CPU split's output written **in place** — the token embeddings
+when `token_embd` is on the CPU (`CPU_Mapped`; `model.input_embed` / `node_1`, **41,943,040 B** per 2048-token
+ubatch, **10,485,760 B** at `-ub 512`), rewritten by the next ubatch's CPU split.  Since r235 the scheduler gates
+the async branch on the same constant and copies a non-weight host input above it **synchronously** — what
+upstream ggml does for every host input — leaving the ≤1 MiB ring snapshot (r90) and a host **weight** (never
+rewritten in place) on the async path.
+
+**How it was measured here (r234 tree; the PR's own config).**  Instrumented `ggml_backend_sched_copy_input` on
+`Qwen3.8-27B-UD-Q4_K_XL`, `-ngl 99`: `token_embd` in `CPU_Mapped` (682.03 MiB), the CPU split's output in a
+`ROCm_Host` compute buffer of **40.96 MiB**, and `node_1` / `model.input_embed` uploaded async at exactly
+10,485,760 B / 41,943,040 B per ubatch.  **No shipped CLI config corrupts prefill**: logits from the default arm
+and from an `AMD_SERIALIZE_COPY=2` (wait-after-every-copy) arm are **byte-identical** (0 differing bytes of
+1,013,178,324 at `-ub 512`; self-A/A also 0), and r234 vs r235 is 0.  So this is a **latent** hole here, not a live
+defect: it needs something that queues large device-to-host work between prefill ubatches (the reporter's
+layer-input exports — the delivery ships `llama_model_set_embeddings_layer_inp_preset` — and, in shipped opt-in
+features, the KV streaming and the host-expert sink do that class of work).  It is the **third instance** of one
+bug class this delivery has already fixed twice: r35 (issue #87, graph-input views) and r90 (block 10, the ≤1 MiB
+ring snapshot, `archive/work/async-input-graph-ordering/`).
+
+**Numbers of record (this box, 27B, `pp2048`, same binary, kill-switch A/B, 4 alternating starts/arm).**
+1 GPU `-ub 2048` **−0.17 %**, 1 GPU `-ub 512` **−0.30 %**, 3 GPU `-sm layer` `-ub 2048` **+0.08 %** — all inside
+the arm spread (old arm sd 12.7 t/s on a 1397 t/s mean).  The reporter's −0.4/−0.7 % (r220 fork, drift 1.2 %) is
+compatible but not reproduced.  Prefill logits, greedy text unchanged; `gate-prefill-logits.sh`, the coherence
+gate, `gate-host-pool.sh` and the per-block build ladder all green (r235).
+
+**The rule.**  A host-resident tensor handed to `set_tensor_async` must be stable for the whole life of the copy
+**or** snapshotted by the backend; a caller that cannot promise that (the scheduler, for a buffer another split
+rewrites) must use the synchronous copy.  `GGML_SCHED_ASYNC_LARGE_HOST_INPUT=1` restores the asynchronous copy
+(A/B and bisection only); the CUDA ring limit and the scheduler's gate are one `#define` so they cannot drift.
+**Not changed here:** the async-input ring's lazy done event is per host thread (`origins` keyed by
+`std::thread::id`), so a target and a draft context on one thread share one pending done event.  It is
+conservative today (every upload flushes `done_pending`, and `has_done` then waits on the *latest* graph on that
+origin), which is why it was left alone; it is noted so a future third context on one thread is checked, not
+assumed.
