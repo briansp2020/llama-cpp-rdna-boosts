@@ -2819,3 +2819,270 @@ rewrites) must use the synchronous copy.  `GGML_SCHED_ASYNC_LARGE_HOST_INPUT=1` 
 conservative today (every upload flushes `done_pending`, and `has_done` then waits on the *latest* graph on that
 origin), which is why it was left alone; it is noted so a future third context on one thread is checked, not
 assumed.
+
+## (no release, after r235) -- a fill chain is issued on ONE stream, and the link's first completion is what the pipeline waits on
+
+Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d-probe.cpp` + the pipeline arms;
+`WORKLOG.md` 261107.014).  No delivery change.
+
+- **A fill chain that feeds one consumer must be issued on ONE stream, so completion order matches NEED order.**
+  Extra copy streams do not add link bandwidth: eight 343 MiB H2D copies take **49.95 / 49.99 / 49.98 ms at 1 / 2 / 4
+  streams**, while the **first** copy lands at **6.26 / 10.94 / 10.93 ms**.  A link-bound fill therefore *loses* the
+  earliest-completion latency the 1-deep staging pipeline depends on (measured end-to-end: **-4.1 %** prefill on
+  Flash-Next `-ncmoe 46`, bulk, 48.2 % residency, in every arm including the one-copy-per-table control), while a
+  **dispatch-bound** fill gains strongly (**+33 %** fill bandwidth: 290 x 0.65 MiB copies 41.1 -> 54.8 GB/s;
+  **+32 %** end-to-end on a 35B pool mirror at 43 % arena).  Concurrency is legitimate only across independent
+  resources: copy engine vs compute engine, or one stream per device over its own link (`-sm tensor`'s
+  `stage_input`).  `copy_stream()` is `stream(device, 1)` and that is load-bearing, not incidental.
+- **`GGML_CUDA_GRAPH_OPT=1`'s branch streams collide with the staging copy stream's index.**  The fork/join mapping
+  is `stream_mapping[n] = branch_idx + 1`, i.e. branch 0 lands on `stream(device, 1)` -- the same stream
+  `copy_stream()` returns -- so enabling it queues the staging fills behind branch compute instead of beside it.
+  Dormant (the option is default-off); recorded so it is fixed before anyone enables it (`TODO` #283).
+- **A synchronous copy is not a benchmark for the async path, and one host allocation kind is a trap.**
+  `hipMemcpy` out of a `hipHostMalloc` buffer measures **40.7 GB/s** against the **55.8 GB/s** the same buffer does
+  asynchronously (registered mmap / write-combined / pageable are full speed both ways).  `stage_h2d_gbps()`
+  calibrates the staging width gate with a *synchronous* copy; it happens to use `malloc`, i.e. the fast path, so
+  the shipped gate is honest -- pointing that probe at a pinned buffer would move the gate by ~27 % with no warning.
+- **A host-resident table costs three VRAM copies, and they are three different BUDGET POOLS.**  Arena (duplicates
+  of the resident fraction; sized once from `free - reserve - aux`), the ring sub-region
+  (`GGML_CUDA_SLAB_RING_MIB`, a *work* sub-region), and `input_cpy` (the consumer's real `src0`, inside the narrow
+  work floor).  Measured: cutting the ring 6.00 -> 2.50 GiB leaves the arena **unchanged** (22269.8 MiB, 48.2 %)
+  and costs **-11 %** prefill while returning **+2.7 %** decode -- so transport VRAM is not convertible into
+  residency by shrinking it; that needs the arena *sizing policy*, and the ring's VRAM is buying prefill.
+- **Representing every expert is almost free; backing them is not.**  70 656 experts (Flash-Next: 138 x 512) cost
+  **276 KiB** as int32 residency ids and **~1.5 MiB** with per-expert {VA, host} offsets and the ids remap.  A
+  unified store is therefore a VA reservation with VRAM backing for a resident subset (block 15's pattern at expert
+  granularity) -- and it must stay **yieldable**: a raw `cudaMalloc` outside the slab is the pre-slab crash mode
+  (issue #136), because a wide prefill's transient work needs that VRAM (`TODO` #285).
+- **`--load-mode none` silently disables the `--host-experts pool`** (`a pool needs a mapped load`), so a
+  `runme` built on it runs the bulk/pageable path its own comments do not describe.  Read
+  `report_host_expert_placement` before attributing anything to the pool.
+- **A re-base that renames a kernel's field owes a re-derivation of the VALUE, not a carry-over (r236, re-base
+  R11).**  Two upstream renames in the `mmq` launch path changed the *meaning* of the value while keeping the
+  arithmetic around it identical, and both were carried across with the old meaning:
+  `mmq_args.ncols_max` (a column **count** the launcher divided by `J` itself) became `ntj` (the **J-tile
+  count**, consumed directly as `grid.x`), so `ggml_cuda_mul_mat_q_pair` launched `grid.x = ncols` instead of
+  `ncols/J` -- 512 instead of 4 on the 4B FFN -- and enumerated tiles past `src1_q8_1`/`dst`, which is a GPU
+  **page fault** at a large context and nothing at all at a small one (the grid scales with the context, so
+  `-c 2048` is in bounds); and `mul_mat_q_process_tile`'s `tile_y_max_j` (inclusive max index) became
+  `tile_y_j_sup` (exclusive count), so the routed-compact kernel's `col_diff - jt*J - 1` dropped the **last
+  column of every tile** (garbage text, no fault, no warning).  The discriminator for the first is a launch
+  dump compared against the single-node path (`ntj` must equal `ceil(ncols/J)`); for the second it is the
+  fused-vs-unfused text at a *prefill* width, which is the only width that kernel runs at.
+- **The routed (`ids`) convention in `mmq_args` puts the expert in `tile_spec`, not in `grid.z` (r236).**  For
+  `MUL_MAT_ID`, `nchannels_y` is **1**, `nchannels_x` carries `n_experts`, and `ntj = ceil(ne_get_rows/J) +
+  n_experts`; the kernel indexes `tile_spec[jt]` whenever `ids_dst` is set, so a routed launch that passes
+  `tile_spec = nullptr` is a null-deref on every path that is not the delivery's compact dispatch.  Every
+  gate that asks "how many experts" on the ids path must read `nchannels_x` -- the delivery's compact-MoE gate
+  read `nchannels_y` and was therefore **unreachable** from R09 until R11, which is how the off-by-one above
+  stayed invisible for three rungs.
+- **The fusion dispatcher exists once (`ggml_cuda_try_fuse.cu`), and a fallback copy of upstream's dispatcher
+  is only safe if it is upstream's text verbatim (r236, closes `TODO` #290).**  The interim two-copy merge
+  (`ggml_cuda_try_fuse_legacy()`) was ~490 lines larger than upstream's `ggml_cuda_try_fuse` because it had
+  been resolved *merged* with stale duplicates of delivery arms (`ssm_conv_in`,
+  `op_ssm_conv_l2_gatebeta`, `op_rms_norm_q8_1`, `add_softplus_mul`, `shexp_down_gate`, `l2_norm_pair`,
+  `gate_beta_verify`); the inline SSM conv-input fold then ran on qwen35moe decode where the delivery's
+  canonical arm declines, and it is not bit-identical to the unfused chain (a state-carrying path).  All
+  upstream arms are now reachable from the one dispatcher (delivery arms first, upstream's DSV4 HC post folded
+  in at upstream's position); the duplicates and the superseded `ggml_cuda_match_moe_weighted_reduction`
+  matcher are deleted.
+- **Fusion decisions on this tree are not deterministic run to run; the text is the oracle (r236).**  Identical
+  runs of one binary differ by a few fusions (4B: `CONCAT skip=1` 334/336, `CONT skip=2` 40/37) because several
+  arms are address-selected (`ggml_cuda_check_fusion_memory_ranges`).  A per-node fusion trace is therefore not
+  a valid A/B oracle for a merge -- compare per-arm *multisets* within that variance, or better, the text.
+- **A short decode run cannot compare all-reduce arms (r236).**  `Generation: t/s` over `-n 16` is dominated by
+  one-off setup (block 01's hybrid pipeline stages 32 MB per GPU), which made hybrid read 58.8 t/s against
+  rccl's 82.7 on the 3-GPU `-sm tensor` 35B-A3B; at `-n 64` the same arms read 100.2/105.6 (hybrid) vs
+  90.1/90.0 (rccl).  Judge an AR arm at >= 64 decode steps, or from a `llama-bench` tg run.
+- **The device pool is a STACK, so every pool buffer that outlives a statement must be released in reverse
+  allocation order -- through the context's `pool_stack`, never in place (r236, re-base R12).**
+  `ggml_cuda_pool_vmm::free()` asserts that the block being freed is the top of the pool
+  (`ggml-cuda.cu:1348`), and the non-VMM pool silently corrupts its accounting on an out-of-order free.  The
+  per-graph MMB/BF16 caches broke that four ways -- the yield freed the activation cache in vector order and
+  then the slots in ascending index order, `mmb_cache_insert()` evicted the *oldest* entry while newer ones
+  were live, and `mmb_slot_reserve()`/`bf16_src1_cache_put()` freed a grown/replaced block in place.  It was
+  invisible on the delivery's old NO_VMM builds and fatal on ours (the slab needs VMM): **every qwen3.8 run
+  aborted on the first compute step at `-ub 512`**, with three 17 MiB blocks live and the oldest freed first;
+  `-ub 128` stayed under the two-block threshold, which is why every gate and every other model passed.  The
+  fix is one per-context stack: register a block at allocation, `pool_stack_kill()` only MARKS it dead, and it
+  is really freed when it reaches the top; `graph_compute`'s per-graph yield drains what is left, top first.
+  Any *new* cache or scratch that keeps a `ggml_cuda_pool_alloc` across statements must join that stack --
+  and a VMM build is the only build where the mistake is loud.
+- **A feature input that was never registered with `res->add_input()` looks exactly like a bug in whatever
+  consumes it, and every env bisect you try will "move" it (r236, re-base R13).**  `src/models/dflash.cpp`
+  built the DFlash drafter's target-feature tensor (`build_inp_target_features()`) in two of its four
+  injection paths and never called `res->add_input(std::move(inp))`, so `llm_graph_input_embd::set_input()`
+  never ran: the host path uploaded nothing (all-zero features) and the device path consumed an
+  **uninitialized** row-index tensor.  Both still *ran*: the target text stayed coherent, the draft produced
+  tokens, and draft acceptance sat at 0.000-0.019 -- the signature of a silently dead drafter.  Because the
+  uninitialized content changed with whatever else the allocator/slab left in that buffer, the symptom moved
+  with unrelated switches (the delivery's prompt-ingest tail and `GGML_CUDA_SLAB=0` each "fixed" it), which is
+  what made it look like a slab bug.  **Rule: for any graph input that reads as garbage, check that the
+  building code registered it (`res->add_input`) before bisecting env switches** -- grep the `set_input`-ed
+  tensors of that graph against its `add_input` calls.  Detection for the draft case: acceptance ~0 while the
+  generated text is correct (`-lv 4`, the `draft acceptance =` line).
+- **The device pool's LIFO also forbids a plain *local* allocation that is created before a `pool_stack`
+  push in the same scope (r236, re-base R13).**  The `pool_stack` rule above fixes buffers that outlive a
+  statement, but the mirror case is just as fatal: `ggml_cuda_hc_combine_norm_try_fuse()` took its base-out
+  copy as a stack `ggml_cuda_pool_alloc<char>` and then called `set_bf16*()`, whose `bf16_src1_cache_put()`
+  pushes a block of its own -- the local's destructor then freed below a live block and the VMM pool asserted
+  (`ggml-cuda.cu:1360`).  It fired on **every `-sm layer` run of a qwen4exp model** (plain decode, no draft),
+  i.e. a configuration the campaign had never run, and it was pre-existing at R12.  Rule: in a fusion helper,
+  a pool block that must live until the kernel launch and is allocated before a cache `put()` joins the
+  stack too; only allocations made *after* the last push may be plain locals.
+- **Upstream's layer-input device buffer is allocated on `model.dev_output()`, and under `-sm tensor` that is
+  the Meta device -- `ggml_get_rows` over a Meta buffer GPU-faults (r236, re-base R13).**  The DFlash
+  drafter's target-feature gather (`ggml_get_rows(g.layer_inp_src, rows)`) faults in `k_get_rows_float_vec`
+  on the first injection (3x gfx1201, `-sm tensor`, reproducible).  `layer_inp_dev_alloc()` therefore keeps
+  the host-copies path when the output device is Meta -- the same refusal the delivery's F1 encoded
+  ("layer inputs are in a Meta buffer").  A Meta buffer has `set_tensor_n`/`get_tensor_n`/`cpy_tensor_n` all
+  NULL, so every batched state/device copy through one lands on the per-tensor pageable path; that is why the
+  delivery's pinned `state_stage` path exists for those shapes (`gate-state-pipe.sh`, `-sm tensor`).
+- **A prompt-cache checkpoint is shared, not owned: recycle its state buffers only when it is uniquely
+  referenced (r236, re-base R13).**  Upstream's `server_prompt::checkpoints` is `shared_ptr`, shared with a
+  `server_prompt_cache_state` entry; the delivery's r155 buffer-reuse fold *empties* a dropped checkpoint's
+  `data_tgt`/`data_dft` into a spare pool, so recycling a checkpoint the cache still references leaves the
+  cached copy state-less.  A later restore then matches it, `load_tgt()` is a no-op for it, the server
+  believes the slot holds its position, and the KV remove for the rest of the prefix fails:
+  `memory_seq_rm(0, 5242, -1)` -> `GGML_ABORT` in `common_memory::seq_rm`.  `ckpt_recycle()` now takes the
+  `shared_ptr` and returns early unless `use_count() == 1`; the "keep the checkpoint a task just restored"
+  fold moves the pointer to the back of the list instead of rewriting `id_task`/`pos` on the shared object.
+  `gate-state-pipe.sh`'s fresh-reference request is what caught it (R12 runs the same gate clean).
+- **A re-base's coherence oracles are per-build, not carried numbers (r236, re-base R13).**  The campaign's
+  recorded hashes were inherited from the pre-re-base tree: dense 4B `1472ebdadd46`, 30B-A3B `013d09f165a5`
+  and 3-GPU 35B-A3B `90decf558d96` do **not** reproduce on the a691b2345 base (the R12 tree gives
+  `1de99b7e6ee6`, `4b4d56191368`, `86b7f9b5aa80` for the same commands, and R13 gives the same three);
+  only Flash-Next GSQ `7a8734a9f1a6` reproduces.  A re-base moves numerics on purpose, so the oracle table
+  must be re-recorded from a known-good build of the *current* base and the comparison made same-session
+  (R12 vs R13), never against a number from the previous fork point.
+- **A re-based call into an extended parameter list must be named, and a re-derived helper carries its node
+  type (r236, re-base R16).**  Two defects of the same shape (compiles, prints nothing, fails at first use):
+  (a) upstream inserted `is_indexer` **before** `v_enabled` in `llama_kv_cache`'s ctor tail, and the delivery's
+  positional call in `llama-memory-hybrid.cpp` carried the old comment-labels, so `is_indexer = true` and
+  `v_enabled = kv_pool` (false) — the attention cache allocated **no V tensor** and `llama_kv_cache::cpy_v`
+  null-dereferenced at `+0x20` on the first graph build, i.e. every hybrid/GDN model segfaulted at load
+  (`Qwen3.5-4B-Q8_0` died in the *fit probe*'s `sched_reserve`).  Four adjacent bare `bool`s: nothing warns.
+  Name the arguments, and audit **every** call site of the symbol (the other sites were correct: `hybrid-idx`
+  named it, `model.cpp` stops at `share`, `dsa`/`dsa-iswa`/`msa`/`dsv4` are upstream's).
+  (b) `ggml_rope_get_truncate()` asserts `a->op == GGML_OP_ROPE || ROPE_BACK` since `#30206`; the delivery's
+  fused `GGML_OP_INDEXER_SCORE` kernel (`indexer-score.cu`, added at R12) had been re-derived to call it on its
+  own node, so **every sparse QSA decode arm** (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`, and every attendance-pool arm)
+  aborted after generating (`ggml.c:4648`), for four rungs, because every R12-R15 gate runs the *dense* arm.
+  The value is `/*truncate*/ true`: the graph's own `ggml_rope_multi` indexer-key node leaves `no_trunc` 0 and
+  nothing calls `ggml_rope_set_truncate` on it, and the pre-`#30206` 5-argument helper floor/ceil'd
+  unconditionally.  Rule: a fused kernel that borrows another node's parameter block owes a check of what each
+  borrowed helper *asserts on*, and each re-derived fused kernel owes a gate arm that **reaches** it
+  (`GREEDY-PURITY.md` §85, `TODO` #297).
+- **The r193 MTP draft window's reserve is derived in one place (r236, re-base R16).**  The reserve that makes
+  Goal C pay (the slab holds `headroom + aux` back *before* the draft context exists) is derived by
+  `common_draft_reserve_derive()`, which both `--fit` and the MoE preflight call; the `mtp_shared` branch
+  (embedded MTP head + an active draft window ⇒ estimate from the **target's** GGUF with the weights zeroed,
+  and pass `n_seq_max`/`kv_unified` into `llama_spec_draft_kv_cells()`) lives there and nowhere else.  When
+  upstream absorbed the fit plumbing into `common_fit_apply()`, the branch was the casualty: the flat
+  `LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT` came back.  Measured on 35B-A3B Q8_0, 1 GPU, `-ncmoe 48`,
+  `-c 262144`, `--spec-type draft-mtp`: with the branch, `draft CONTEXT 1102 MiB` → arena 20 527.5 MiB
+  (62.9 %); without it, the flat 3584 MiB → 17 977.5 MiB (55.1 %).  +2 550 MiB of arena.
+- **A shared host/device memory pool must not be split: `-ncmoe` is refused on an integrated GPU (r236, R16
+  cross-platform validation).**  On a UMA device (gfx1151) "host" and "device" are one physical pool, so a
+  host-resident expert set buys no capacity, and the tier that stages a host master is already denied there
+  (`moe-expert-cache.cu` refuses the arena on a shared pool).  The placement was not denied, so `-ncmoe N` put
+  the last N layers' expert banks in a `ROCm_Host` buffer nothing could stage and the consumer read a page the
+  GPU cannot address: Qwen3.8-Flash-Next GSQ-IQ3_XXS, `-ncmoe 48` (and `24`), `mul_mat_q<Q2_0,16>` at a host VA
+  -> `HSA_STATUS_ERROR_MEMORY_FAULT`; with a drafter + KV live the same arm died in the VMM pool's free-order
+  assert instead.  `-ncmoe 0` ran, and 35B-A3B `-ncmoe 48` ran (its expert GEMM never reads the master
+  in-kernel), which is what made it look model-specific.  The pre-re-base r235 binary faults identically, so it
+  is pre-existing.  `llama_model_loader::set_host_experts_umem()` (set once from `llama_model` when any device is
+  `GGML_BACKEND_DEVICE_TYPE_IGPU`) now drops `n_cpu_moe_from_end`, answers false from
+  `host_expert_selected()`, short-circuits `plan_host_expert_placement()` and skips a CPU expert
+  `--override-tensor`, with one WARN.  Inert on a discrete GPU (gfx1201: `35B-A3B -ncmoe 20` still pins
+  16 320 MiB of host experts).
+- **No plain device-pool allocation may be created before a `pool_stack` push in the same scope (r236, re-base R16
+  follow-up).**  `ggml_cuda_pool_vmm::free` asserts LIFO (and the non-VMM pool silently corrupts its accounting), so
+  a block that is *registered* on the context's `pool_stack` and released after the whole graph must be taken
+  **before** any plain temporary in that scope.  `ggml_cuda_mul_mat_id_mmb_glu` took the slot last, so on scope
+  exit it freed its five temporaries below a live slot -- `pool free OUT OF ORDER: freeing 2176 bytes ...`, with
+  `GGML_CUDA_POOL_TRACE=1` naming the allocator (gfx1151, Flash-Next + MTP drafter, every run, r235 and r236 alike).
+  Fixed by hoisting the slot; the same rule was already paid for by `hc_combine_norm` at R13 and by the MMB/BF16
+  pool blocks before R12.  Two consequences: (a) the violation is **layout/timing sensitive** -- the same source
+  gave 5/5 aborts on one build and 0/4 on the next -- so "it passed once" is not evidence, and the pool's free-order
+  assert always names sizes/offsets now (`GGML_CUDA_POOL_TRACE=1` adds the stacks); (b) the *class* is open: every
+  `pool_stack_push` site still owes a check that no plain allocation precedes it in its scope (`TODO` #298).
+- **The attendance pool is a distinct-memory design and is wrong on a shared host/device pool (r236, measured on
+  gfx1151).**  `LLAMA_KV_REGION_POOL` keeps the authoritative KV in a pinned host *mirror* and fills a compact
+  device pool from it by DMA, keyed by a page table with a MARK/CLAIM/MAP+FILL resolve.  On an integrated GPU the
+  mirror and the weights are the same physical memory, and on gfx1151 the resolve is **wrong**: with the WHOLE
+  cache resident (8192 pages) `LLAMA_KV_POOL_VERIFY=1` reports ~93 M byte mismatches (93 399 360; 95 173 888 on
+  the forced-miss arm) and three runs of the same arm give three different texts, while the sparse reference is
+  stable (`1e944569dbd6`).  So it is not a residency/thrash effect and not a text-noise effect -- the resolve
+  itself is wrong, at least partly racily.  The **window** (Goal A, one VA range, no mirror) and the sparse decode
+  arm are fine on the same box (`be904e86f248`, identical to gfx1201), which is what localises the defect to the
+  mirror/pool tier rather than to the KV placement.  Until fixed, do not claim the pool for gfx1151 (`TODO` #300).
+- **A single `rocprofv3 --kernel-trace` run cannot resolve a sub-1.5 % kernel delta — measure twice, and argue from
+  the arm (r236, `TODO` #303).**  Two consecutive traces of the **same** binary gave dense-`mul_mat_q` totals of
+  521.26 and 527.11 ms: a **±1.1 % run-to-run floor**, larger than the effect being chased.  Per-kernel numbers need
+  **2+ interleaved rounds** (interleave *builds* within a round, not rounds within a build — the second round of every
+  build was uniformly ~0.35 % slower, which interleaving cancels and sequential runs do not), and anything that has to
+  be argued should be quoted as the interleaved `llama-bench -r 5` wall-clock ratio.  A "VGPR count changed" signal is
+  not evidence of anything on its own: it tracks the *body*, so two builds with different bodies will always differ.
+- **The gfx1201 ISA is the exact, noise-free arbiter for "same template instantiation, different behaviour" (r236,
+  `TODO` #303).**  The whole device program is one `.hip_fatbin` section of `libggml-hip.so` holding one
+  `__CLANG_OFFLOAD_BUNDLE__` per TU (`llvm-objcopy --dump-section .hip_fatbin`, then parse the bundle header — note
+  the entry offsets are **bundle-relative**, not section-relative — then `llvm-objdump -d
+  --disassemble-symbols`; scripted in `archive/work/upstream-rebase-261108/isa-kernel-diff.py`).  Comparing the normalised instruction sequence answers in seconds what profiling cannot:
+  r236's dense MMQ came out **identical to unpatched `a691b2345`'s** (1436 instructions, 0 diff lines), which is what
+  closed `#303` as an inherited cost rather than a lost delivery win — and it refuted two candidate fixes (a `min()`
+  removal: 1436 → 1435 instructions; a type-gated NVFP4 prologue: byte-identical) before a single measurement was
+  spent.  Check the ISA *before* benchmarking a codegen hypothesis; the same dump also gives the static instruction
+  mix, which shows a "big" regression is usually four instructions and a scheduling change.
+- **`llama-bench`'s prompt has no routing locality, so it CANNOT measure the expert arena or the host-expert
+  transport (r236, `TODO` #296/#291).**  Its prompt is `std::rand() % n_vocab` (`tools/llama-bench/llama-bench.cpp`),
+  i.e. uniformly random token ids: every ubatch routes over all 256 experts of every layer.  On that shape the
+  arena is measurably **inert** — 35B-A3B Q8_0, 1 × R9700, `-ncmoe 48`, `-ub 512`, pp1450 = **414.1 / 414.5 /
+  414.5 / 414.5** t/s at `MOE_EXPERT_CACHE_MIB` 0 / 4096 / 8192 / auto — while the same arm driven with the
+  shipped prose prompt reads **401.6 → 583.6 → 676.9 → 1063.6**.  The delivery looks −15…−18 % behind unpatched
+  upstream on the random shape and **+181 % ahead** on real text (1064 vs 379 t/s), and the arena's prefill is
+  838 t/s there against 1442 on real text.  Any A/B of the pool/arena/host transport must be driven with real
+  text (`llama-cli -f prompts/prose-rdna-boosts.txt -n 0`, now gate step 5b); `llama-bench` remains valid for
+  **build-vs-build** regressions (both sides see the same degenerate prompt) and for kernels whose cost does not
+  depend on routing.
+- **`llama-batched-bench`'s npl=1 prefill row is a cold-first-pass artifact (r236; same trap as
+  `archive/work/host-expert-eager-push/HANDOVER-R210.md` §3.1).**  Three identical npl=1 rows in one process read
+  ours **0.824 / 0.207 / 0.197 s** (Flash-Next GSQ, 3 devices `-sm tensor`, 512-token prefill) and upstream
+  **0.255 / 0.244 / 0.237 s**, so the first row understates the steady state by ~4× and must be discarded (a
+  one-time ~0.6 s cost on the first prefill of a process is all that is real).  The **decode** column is sound.
+- **`llama-batched-bench -c 16384` on Flash-Next at `-ncmoe 48` segfaults silently (`TODO` #270); it is a flag-set
+  landmine, not a general unreliability.**  With `-c 32768` and no `-ncmoe` (or with `-c 8192`) the same binary
+  prints complete tables and produces no assert, so the arm is usable once that shape is avoided.
+- **A "numeric arm" is the anchor, not byte-identity (r236, `TODO` #292).**  The dsv4 `DSV4_HC_PRE/_POST` ops own
+  the HC16 bf16 producer slots by design: vs their own ggml chain they read **0.013217 / 96.392 %** and
+  **0.013198 / 96.186 %** mean KLD / same-top-p on the BF16-hc class (base PPL 2.8489), and they are
+  **deterministic per class** (r235 and r236 produce the same `6a102dbc62d6`).  So they are gated by their own
+  recorded text (`SOFT_EXPECT` in `scripts/gate-hc-fusions.sh`), never by chain identity — a stale "both arms
+  agree on BF16-hc" line in that gate's header sent `#292` after a re-base drift that did not exist (r235's chain
+  reads `d62340fbf566` too).
+- **Delivery-vs-unpatched-upstream prefill-logit KLD grows with the surface the delivery replaces, and is
+  insensitive to every kill switch it ships (r236, `TODO` #293).**  Measured against a base recorded from a
+  detached `a691b2345` (wikitext 512 × 40): dense 27B Q8_0 (`qwen35`) **0.000697 / 98.784 %**, MoE 35B-A3B Q8_0
+  **0.004980 / 97.127 %** (unchanged with MMB/pair/router-topk off, with `GGML_CUDA_DISABLE_MMQ=1`, and only
+  0.004483 with `GGML_CUDA_GDN_CHUNKED=0`), qwen4exp Flash-Next **0.013426 / 96.431 %** (0.013955 with every HC
+  op/fusion off, 0.013081 with the derived mask, QSA, GDN-bf16, rms-vec and all fusions off).  It is the
+  accumulated arithmetic order of our own MoE/attention/HC implementations, **not** the qwen4exp model file — and
+  delivery-vs-delivery is still exact (r235 == r236 text on the field config, `87 ac6445f74aa2`).
+  `Qwen3.8-27B` is arch `qwen35`, so no `qwen4exp.cpp` change can affect it.
+- **On qwen4exp the delivery's advantage grows with depth, and 160 K is the decisive arm (r236, `TODO` #293).**
+  Ours vs unpatched `a691b2345`, Flash-Next GSQ-RCO-IQ3_XXS, 3 devices `-sm tensor`, device-resident (no
+  `-ncmoe`): `pp512` **+16.6 / +28.8 / +173.4 %** at d 0 / 16 384 / **163 840**, `tg128` **+98.2 / +98.9 /
+  +68.2 %**, real-text prefill **+19.1 / +88.4 %** at ~16 K / ~160 K, and aggregate concurrency **+41.6 / +67.2 /
+  +53.7 %** at 1 / 2 / 4 slots.  A shallow single-stream arm is not a basis for judging the qwen4exp/indexer
+  work.
+- **`r235` cannot run `llama-perplexity` on Flash-Next (r236 fixed it).**  The shipped build aborts in
+  `ggml-cuda.cu:1375` (`GGML_ASSERT(ptr == pool_addr + pool_used)`, the pool-order class `TODO` #298 fixed) under
+  `-sm tensor` and core-dumps under `-sm layer`, so a delivery-vs-delivery KLD arm is not available on that model
+  — compare text/throughput instead, or use r236-vs-upstream.
+- **The release gate must not time the perf arms straight after the per-block build ladder, and it must not
+  inherit `LOGDIR` (r236, found running R17).**  (1) The ladder leaves the GPU hot/busy: the dense-27B arm read
+  **−3.44 % on round 1** against −1.68 / −1.59 after (verdict −2.24 %, spread 1.85) while the same A/B on a quiet
+  box reads −1.31 / −1.19 / −1.32 (**−1.28 %, spread 0.13**), so `gate-rebase-release.sh` now runs one
+  **discarded warm-up round** (`WARMUP=1`).  (2) `gate-prefill-logits.sh` uses the variable `LOGDIR` for its own
+  log dir and `rm -rf`s it on success, so an *exported* `LOGDIR` makes step 3 delete the orchestrator's log
+  directory mid-run and every later step fails on missing logs; the orchestrator now does `export -n LOGDIR`.

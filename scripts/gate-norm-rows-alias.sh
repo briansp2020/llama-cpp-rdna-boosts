@@ -46,7 +46,9 @@
 #        - it declined NOTHING (`declined=0`), i.e. the scheduler's alloc deps still hold x and w for
 #          the fused launch (this is the one assertion that catches a dropped/renumbered dep);
 #        - the fused and `GGML_CUDA_DISABLE_NORM_ROWS=1` arms generate byte-identical text;
-#        - the kill-switch arm logs no fusion line at all, and neither arm aborts or faults a GPU.
+#        - the kill-switch arm logs no fusion line at all, and neither arm aborts or faults a GPU
+#          (the kernel-journal scan is scoped to this run, so an earlier fault left in the boot's
+#          journal cannot fail the gate; issue #276 follow-up).
 #
 #   `MODEL_ARM=0` runs the driver only (no model needed); `A_ARM=0` / `B_ARM=0` skip one section.
 #
@@ -65,6 +67,7 @@
 #   EXTRA_ARGS   extra llama-cli args        (default: "-ngl 99")
 #   CXX          host compiler for the driver (default: g++)
 #   KEEPOUT      dir for the driver, logs    (default: mktemp -d)
+#   --no-faults  skip the kernel-journal fault check (a box with no readable kernel log)
 #   TIME_LIMIT   per llama-cli timeout        (default: 1200 s)
 set -uo pipefail
 
@@ -90,6 +93,21 @@ MODEL_ARM="${MODEL_ARM:-1}"
 fails=0
 fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
 note() { echo "    $*"; }
+
+# The kernel-journal fault scan must be scoped to THIS run: an unscoped scan fails on any
+# earlier fault left in the boot's journal (a crash while bisecting something else, a previous
+# gate arm) even though both of this gate's own arms are clean.  One second of slack for the
+# journal's timestamp granularity.
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
+
+FAULTS=1
+for a in "$@"; do
+    case "$a" in
+        --no-faults) FAULTS=0 ;;
+        -h|--help) sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+        *) echo "usage: $0 [--no-faults]" >&2; exit 2 ;;
+    esac
+done
 
 echo "==> norm-rows fusion aliasing gate (issue #276)"
 echo "    build=$BUILD_DIR"
@@ -212,13 +230,20 @@ if [ "$B_ARM" -eq 1 ] && [ "$MODEL_ARM" -eq 1 ] && [ "$fails" -eq 0 ]; then
             fail "fused and unfused text differ on the gated form"
         fi
 
-        if [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
-            echo
-            echo "==> GPU faults"
-            "$REPO_DIR/scripts/check-gpu-faults.sh" --log "$KEEPOUT/fused.log" --log "$KEEPOUT/chain.log" \
-                | sed 's/^/    /' || fail "a GPU fault was recorded during the model arms"
-        fi
     fi
+fi
+
+# the kernel journal, scoped to this gate's own window (#294).  This covers EVERY log this gate wrote --
+# section A's driver arms included, which the old placement (inside the model-arm block) never scanned.
+if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    echo
+    echo "==> GPU faults (since ${GATE_SINCE_TS:-the journal start})"
+    since_args=()
+    [ -n "${GATE_SINCE_TS:-}" ] && since_args=(--since "$GATE_SINCE_TS")
+    log_args=()
+    for f in "$KEEPOUT"/*.log; do [ -f "$f" ] && log_args+=(--log "$f"); done
+    "$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" |
+        sed 's/^/    /' || fail "a GPU fault was recorded during this gate's arms"
 fi
 
 echo

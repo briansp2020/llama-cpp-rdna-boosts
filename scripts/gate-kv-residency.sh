@@ -83,7 +83,7 @@
 #   (`context` MiB in this log), which the gate prints for the arm it matters on.
 #
 # Usage:
-#   ./scripts/gate-kv-residency.sh [--keep] [--window-only|--pool-only|--multi-only]
+#   ./scripts/gate-kv-residency.sh [--keep] [--no-faults] [--window-only|--pool-only|--multi-only]
 #
 # Environment:
 #   LLAMA_CLI    binary (default: ~/llama.cpp/build-rocm/bin/llama-cli)
@@ -103,6 +103,11 @@
 #                is a REGRESSION floor and not a target -- it is set below the measured cost so the known
 #                behaviour passes and a further regression fails.  Read from llama-cli's own perf line on the
 #                two arms that share the prompt, the binary and the device.
+#   SELFTEST_STRICT        1 = the quarantine control must FAIL on every arch (default 0: an arch in
+#                          SELFTEST_HOLD_VACUOUS_ARCHS may report the driver does not exhibit the hazard)
+#   SELFTEST_HOLD_VACUOUS_ARCHS  arches where the host-mapping hazard has been MEASURED not to reproduce,
+#                          space-separated (default `gfx1151`, measured 2026-11-08).  Add an arch only with a
+#                          measurement; the right answer for an unlisted arch is to investigate, not to list it
 #   KEEPOUT      log dir (default: mktemp -d)
 #   REUSE        1 = do not run anything; RE-GRADE the logs already in KEEPOUT (the pool arms cost ~5 min, so
 #                a threshold or message change should not need a re-run).  The arms must all be present.
@@ -129,12 +134,14 @@ MULTI_DEVICES="${MULTI_DEVICES:-0,1}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 REUSE="${REUSE:-0}"
 KEEP=0
+FAULTS=1
 DO_WINDOW=1
 DO_POOL=1
 DO_MULTI=1
 for arg in "$@"; do
     case "$arg" in
         --keep) KEEP=1 ;;
+        --no-faults) FAULTS=0 ;;
         --window-only) DO_POOL=0; DO_MULTI=0 ;;
         --pool-only) DO_WINDOW=0 ;;
         --multi-only) DO_WINDOW=0; DO_POOL=0 ;;
@@ -143,6 +150,8 @@ for arg in "$@"; do
     esac
 done
 mkdir -p "$KEEPOUT"
+# The kernel journal is shared between runs, so the fault window starts here, before the first arm (#294).
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 [ -x "$LLAMA_CLI" ]      || { echo "error: no llama-cli at $LLAMA_CLI" >&2; exit 2; }
 [ -f "$MODEL_WIN" ]      || { echo "error: no model at $MODEL_WIN" >&2; exit 2; }
@@ -248,11 +257,26 @@ info "logs         : $KEEPOUT"
 # HOST-backed span, aligned window flips with a straddling request REFUSED, the host-mapping hazard replayed
 # over a whole flip sequence, the watermark contract and clear-on-map).  TWO arms, because a diagnostic that
 # cannot fail is not a gate: the default arm must PASS, and the arm with the quarantine hold disabled
-# (`LLAMA_KV_REGION_QUARANTINE=0`, the known-bad state) must FAIL.  Neither arm asks for a window, so the KV is
-# the plain device buffer and the generated text is irrelevant -- the VERDICT line is what is graded.  That
-# line is WARN on PASS / ERROR on FAIL (r222: it used to be INFO, invisible at every default, so a FAIL read
-# exactly like a PASS); `run_arm` passes `-v`, which is what makes the PASS visible.
-echo "-- the provider's selftest (the primitive's oracle: PASS by default, FAIL without the quarantine hold)"
+# (`LLAMA_KV_REGION_QUARANTINE=0`, the known-bad state) is the sensitivity control.  Neither arm asks for a
+# window, so the KV is the plain device buffer and the generated text is irrelevant -- the VERDICT line is what
+# is graded.  That line is WARN on PASS / ERROR on FAIL (r222: it used to be INFO, invisible at every default,
+# so a FAIL read exactly like a PASS); `run_arm` passes `-v`, which is what makes the PASS visible.
+#
+# WHAT THE CONTROL CAN AND CANNOT ASSERT (r236, measured on gfx1151).  The hold is a DRIVER workaround: the
+# hazard (a `cuMemUnmap` -> `cuMemCreate` pair zeroing a different LIVE host-location mapping in the same
+# reservation) reproduces on gfx1201 + ROCm 10.1 from the 6th flip and NOT on gfx1151's driver, where the whole
+# hazard sequence verifies with the hold off.  So "hold off => FAIL" is a property of the DRIVER, never of the
+# delivery, and asserting it unconditionally makes the arm fail on a healthy platform (halo, 2026-11-08: the
+# arm read FAIL while the delivery was correct).  The arms therefore assert the MECHANISM everywhere and the
+# corruption only where it has been observed:
+#   * arm 1  -- a PASS verdict that NAMES `quarantine hold on`, plus the hazard case in the text.
+#   * arm 2  -- a verdict that names `quarantine hold off`, plus the hazard case.  Then either a FAIL verdict
+#               (the hazard reproduces on this driver: the oracle is sensitive) or a PASS verdict on an arch in
+#               SELFTEST_HOLD_VACUOUS_ARCHS (the driver does not exhibit it: recorded as INFO, not a failure).
+#               Any other arch PASSing is a FAIL of this gate -- either the driver changed or the hazard case
+#               stopped testing anything -- and `SELFTEST_STRICT=1` forces that verdict on every arch.
+# A missing hazard case (compiled out, skipped) is a FAIL on every arch: that is the "oracle lost" case.
+echo "-- the provider's selftest (the primitive's oracle: PASS with the hold, and the hold's sensitivity)"
 run_arm wselftest  "$MODEL_WIN" "$PROMPT_WIN" GGML_CUDA_VMM_REGION_SELFTEST=1 -- -c 2048 || exit 1
 run_arm wselftest0 "$MODEL_WIN" "$PROMPT_WIN" GGML_CUDA_VMM_REGION_SELFTEST=1 LLAMA_KV_REGION_QUARANTINE=0 -- -c 2048 || exit 1
 
@@ -262,11 +286,39 @@ run_arm wselftest0 "$MODEL_WIN" "$PROMPT_WIN" GGML_CUDA_VMM_REGION_SELFTEST=1 LL
 [ "$(count wselftest 'selftest: device 0: FAIL')" = 0 ] \
     && pass "wselftest reported no failed check" \
     || fail "wselftest FAILED: $(grep -m3 'selftest\|FAILED:' "$KEEPOUT/wselftest.err" 2>/dev/null | tr '\n' ' ')"
-# ... and the oracle must be SENSITIVE: without the hold the hazard case is a wrong answer, and the selftest
-# is the only thing that notices.  An arm that passes here too means the selftest stopped testing the hazard.
-[ "$(count wselftest0 'selftest: device 0: FAIL')" -ge 1 ] \
-    && pass "wselftest0 FAILED with the quarantine hold off (the selftest is sensitive, not a formality)" \
-    || fail "wselftest0 PASSED with LLAMA_KV_REGION_QUARANTINE=0 (the hazard arm is vacuous)"
+
+# the mechanism, on BOTH arms: the hazard case ran, and each arm really ran with the intended hold state
+for arm in wselftest wselftest0; do
+    [ "$(count $arm 'the host-mapping hazard')" -ge 1 ] \
+        && pass "$arm exercised the host-mapping hazard case" \
+        || fail "$arm never reported the host-mapping hazard case: the sensitivity control has nothing to grade (the case was skipped or compiled out)"
+done
+[ "$(count wselftest 'quarantine hold on')" -ge 1 ] \
+    && pass "wselftest ran with the quarantine hold ON (the shipped configuration)" \
+    || fail "wselftest did not report 'quarantine hold on' (LLAMA_KV_REGION_QUARANTINE is not being read, or the verdict line is stale)"
+[ "$(count wselftest0 'quarantine hold off')" -ge 1 ] \
+    && pass "wselftest0 ran with the quarantine hold OFF (the control arm)" \
+    || fail "wselftest0 did not report 'quarantine hold off' (the control arm did not take the state it is asserting)"
+
+# ... and the control must say something.  A FAIL verdict means the hazard reproduces on this driver and the
+# selftest notices (the sensitive case).  A PASS verdict is only acceptable on an arch where the hazard has
+# been measured NOT to reproduce -- recorded, with the arch named, never assumed.
+ST_ARCH="$(grep -oE 'gfx[0-9a-f]{4,}' "$KEEPOUT/wselftest0.err" 2>/dev/null | head -1)"
+[ -n "$ST_ARCH" ] || ST_ARCH="unknown"
+if [ "$(count wselftest0 'selftest: device 0: FAIL')" -ge 1 ]; then
+    pass "wselftest0 FAILED with the quarantine hold off (the selftest is sensitive on $ST_ARCH, not a formality)"
+elif [ "${SELFTEST_STRICT:-0}" = 1 ]; then
+    fail "wselftest0 PASSED with LLAMA_KV_REGION_QUARANTINE=0 on $ST_ARCH and SELFTEST_STRICT=1 is set (the hazard case is vacuous on this driver)"
+else
+    case " ${SELFTEST_HOLD_VACUOUS_ARCHS:-gfx1151} " in
+        *" $ST_ARCH "*)
+            pass "wselftest0 PASSED with the quarantine hold off on $ST_ARCH -- the hazard does not reproduce on this driver (measured 2026-11-08: halo, gfx1151, the whole flip sequence verifies without the hold).  The primitive is unaffected; the hold is inert here"
+            ;;
+        *)
+            fail "wselftest0 PASSED with LLAMA_KV_REGION_QUARANTINE=0 on $ST_ARCH: the hazard case no longer distinguishes the hold, so it is not testing anything.  Either the driver changed (verify by hand) or the case needs attention -- re-run with SELFTEST_STRICT=1 to fail this arm unconditionally, and add an arch to SELFTEST_HOLD_VACUOUS_ARCHS only with a measurement"
+            ;;
+    esac
+fi
 
 # ===== the window ========================================================================================
 if [ "$DO_WINDOW" = 1 ]; then
@@ -333,6 +385,28 @@ if [ "$DO_POOL" = 1 ]; then
 
     HPRE=$(hash_of pref); HPRES=$(hash_of pres); HPFLR=$(hash_of pfloor)
     info "pref text: $HPRE    pres: $HPRES    pfloor: $HPFLR"
+
+    # A shared host/device memory pool (an integrated GPU, e.g. RDNA3.5 / gfx1151) REJECTS the pool: the mirror
+    # is not a separate memory tier there and the page table is not correct on such a device yet (TODO #300).
+    # That decline is the designed behaviour, so on that platform the section asserts the DECLINE plus "nothing
+    # changed", instead of the placement's residency numbers -- the same treatment a declined park gets.
+    if [ "$(count pres 'SHARED host/device pool')" -ge 1 ]; then
+        info "the pool was DECLINED on this platform (shared host/device memory pool -- an integrated GPU;"
+        info "  the window and the sparse arm are the supported placements there, TODO #300):"
+        [ "$HPRE" = "$HPRES" ] && [ "$HPRE" = "$HPFLR" ] \
+            && pass "the declined pool changed no token (pref == pres == pfloor = $HPRE)" \
+            || fail "the pool DECLINED but the text changed: '$HPRE' / '$HPRES' / '$HPFLR'"
+        [ "$(count pres 'ATTENDANCE POOL ENABLED')" = 0 ] && [ "$(count pfloor 'ATTENDANCE POOL ENABLED')" = 0 ] \
+            && pass "no pool arm engaged the placement (nothing to verify, nothing to get wrong)" \
+            || fail "an arm reported 'ATTENDANCE POOL ENABLED' while another reported the decline: the guard and the placement disagree"
+        info "-- pool section: DECLINED BY DESIGN on this platform (not a pass of the placement's numbers)"
+    else
+    [ -n "$HPRE" ] && [ "$HPRE" = "$HPRES" ] \
+        && pass "pres == pref (the pool is byte-identical to the sparse arm it replaces)" \
+        || fail "pres != pref: '$HPRE' vs '$HPRES'"
+    [ -n "$HPRE" ] && [ "$HPRE" = "$HPFLR" ] \
+        && pass "pfloor == pref (a pool claimed out under pressure changes no token)" \
+        || fail "pfloor != pref: '$HPRE' vs '$HPFLR'"
     [ -n "$HPRE" ] && [ "$HPRE" = "$HPRES" ] \
         && pass "pres == pref (the pool is byte-identical to the sparse arm it replaces)" \
         || fail "pres != pref: '$HPRE' vs '$HPRES'"
@@ -420,6 +494,7 @@ resident pool"
     awk -v a="$H_FLR" -v b="$H_RES" 'BEGIN { exit !(a+0 < b+0) }' \
         && pass "pfloor's hit rate is lower ($H_FLR % vs $H_RES %)" \
         || fail "the two pool arms report the same hit rate ($H_FLR % vs $H_RES %)"
+    fi   # end: placement graded (discrete GPU) | decline graded (shared host/device pool)
 
 fi
 
@@ -513,6 +588,22 @@ if [ "$DO_POOL" = 1 ]; then
     done
     ctx=$(grep -m1 -oE 'context +[0-9]+' "$KEEPOUT/pres.err")
     [ -n "$ctx" ] && printf '  %-7s --fit sees: %s MiB of the memory table (the arena consequence)\n' "pres" "$ctx"
+fi
+
+# ---------------------------------------------------------------------------------------------------------
+echo
+# the kernel journal, scoped to this gate's own window (#294).  This gate runs 25-40 min and starts many
+# servers, so a fixed window would miss its own early arms; the start timestamp is the only correct window.
+if [ "$FAULTS" = 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    log_args=()
+    for f in "$KEEPOUT"/*.err "$KEEPOUT"/*.out; do [ -f "$f" ] && log_args+=(--log "$f"); done
+    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" 2>&1)"; then
+        pass "GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and every arm log clean"
+    else
+        fail "GPU faults:"; echo "$out" | sed 's/^/      /'
+    fi
 fi
 
 # ---------------------------------------------------------------------------------------------------------

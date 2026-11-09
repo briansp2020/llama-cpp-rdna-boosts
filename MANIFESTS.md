@@ -158,10 +158,18 @@ in CI.  The model-level gates are manual:
 7. **qwen4exp hyper-connection fusions** — `scripts/gate-hc-fusions.sh MODEL.gguf`: runs the **four**
    mix/combine arm combinations (`LLAMA_FUSED_HC_MIX` x `LLAMA_FUSED_HC_COMBINE`, selected independently)
    plus the CUDA-side chain fusions, and requires every hard arm to be **byte-identical to the unfused
-   chain**.  The DSV4 HC pre/post pair is **reported, not hard** (r156): those two ops own the HC16 bf16
-   producer slots and are a documented numeric re-baseline, so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps the producer
-   precision as well as the fusion (IQ4_NL class: mean KLD **0.021542 / 95.814 %** against the chain at the
-   standard 40-chunk point, the same order the combine+norm fusion always showed).  Required for any change to `build_hc_mix`, `build_hc_combine`,
+   chain**.  The DSV4 HC pre/post pair are **numeric arms, sha-anchored** (r236, `TODO` #292): those two ops own
+   the HC16 bf16 producer slots and are a documented numeric re-baseline, so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps
+   the producer precision as well as the fusion and byte-identity is **not** expected on any class.  Measured
+   on the BF16-hc class (3 devices `-sm layer`, wikitext 512 x 40, base PPL 2.8489): pre op **0.013217 /
+   96.392 %** and post op **0.013198 / 96.186 %** against their own chain.  Because each arm is deterministic
+   per class, its own text is the anchor instead: the gate defaults `SOFT_EXPECT` to the fused-mixer class's
+   recorded shas (`dsv4_pre_chain=dsv4_post_op=6a102dbc62d6`, 449 chars) and **FAILs when one moves**, which is
+   the regression signal a "reported" arm used to swallow.  (Historical, for scale only: the IQ4_NL class read
+   0.027936 / 96.471 % at base PPL 1.7888 in the gate's own r156 record and 0.021542 / 95.814 % in gate 11's
+   r148 row -- different points, neither is a target.  The r148 row's "BF16-hc 449 chars `6a102dbc62d6`" is
+   the *chain* of that date; the chain now reads `d62340fbf566`, which is what #292 mistook for drift.)
+   Required for any change to `build_hc_mix`, `build_hc_combine`,
    `GGML_OP_HC_MIX` / `GGML_OP_HC_COMBINE` (kernel, CPU reference or op definition) or a matcher that fuses
    either.  **Run it once per hc-down weight class** — Q8_0/BF16 `hc_attn_down` takes the fused mixer, any
    other quant takes the chain (`--types MODEL.gguf` prints the class).  The defect class it exists for only
@@ -469,6 +477,37 @@ in CI.  The model-level gates are manual:
    `GGML_CUDA_GRID_STALL_PAD_DEBUG=1` is the diagnostic all of that rests on.  Required for any change to
    `ggml_cuda_grid_stall_pad()` or a call site of it, and every release (the site that was missing is what
    issue #277 reported: `get_rows` was unpadded from r46 to r225).
+
+22. **The one-command verdict for a re-base (r236)** — `scripts/gate-rebase-release.sh`.  A re-base has to answer
+    "did we lose performance, and are the numerics still pure?" in one place; this orchestrates the gates that own
+    the rules (build per block, prefill-logit KLD, the `MUL_MAT_ID`/`MUL_MAT` op suites, the coherence texts, the
+    host-expert multi-slot DFlash acceptance arms (`scripts/gate-server-arms.sh`, below), the interleaved
+    performance A/B against the shipped build, and the GPU-fault scan scoped to the run's own start)
+    and prints a single PASS/FAIL with exit `0`/`1`.  It adds no thresholds of its own beyond `--tolerance`
+    (default 1.0 % per `llama-bench` arm) and `--text-tolerance` (default 3.0 % for the real-text prefill arm).
+    **It FAILS rather than skips**: a step that cannot run is a FAIL, so a missing build,
+    model or recorded hash cannot look like a pass.  **Step 5b (`--only textprefill`) is a real-text prompt-eval
+    against the shipped build, and it is not redundant with the `llama-bench` perf arm**: `llama-bench` builds its
+    prompt from `std::rand() % n_vocab` (uniformly random token ids), so every ubatch routes over every expert and
+    the expert arena is measurably inert there (pp1450 = 414.1 / 414.5 / 414.5 / 414.5 t/s at
+    `MOE_EXPERT_CACHE_MIB` 0 / 4096 / 8192 / auto) while the same arm on the shipped prose prompt reads
+    401.6 / 583.6 / 676.9 / 1063.6 t/s.  A `llama-bench`-only perf step therefore cannot see the arena or the
+    host-expert transport, which is where this repo's prefill risk lives (`TODO #273`, `#296`).  `--quick` drops the build ladder and the KLD gate while
+    iterating; `--perf-only` is the A/B alone and is also the answer to a `#279`-class "is this still worth
+    implementing on the new base?" question (the arm it guards is the decode arm).  Run it before a tag and paste
+    its verdict into the release's `WORKLOG.md` entry.
+
+    **Step 5c (`--only server`) delegates to `scripts/gate-server-arms.sh`** (`TODO` #295): three two-slot
+    `llama-server` arms with a DFlash drafter on host-resident experts (`-ncmoe` 24 and 10 on Flash-Next GSQ
+    + DFlash2, 10 on 35B-A3B Q8_0 + its DFlash2), `-sm layer`, greedy, the shipped prose prompt in both slots.
+    It exists because every other step in this ladder — and the MTP four-axis protocol — runs a SINGLE
+    sequence, so a draft regression on a `-ncmoe` multi-slot run is silent (acceptance -> ~0 while the text
+    stays correct); that is the guard R13 dropped, and this is its detector.  HARD: the server comes up, both
+    slots draft, per-slot acceptance is not a collapse (`ACC_FLOOR`, default 0.5 x baseline) and has not drifted
+    past `ACC_TOL` (default 0.10), and the two generated texts match the recorded hash set.  R13's own numbers
+    (0.53793/0.51678 etc.) are **not** the criterion: its invocation was never recorded and they do not
+    reproduce, so the baselines are measured at r236 and reproduce to the digit (0.72269/0.74359 on Flash-Next
+    at both `-ncmoe` levels, 0.44720/0.59124 on 35B-A3B).
 
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
