@@ -1,7 +1,7 @@
-From 922382251a6fae931ee70e18a53c455d1d251e59 Mon Sep 17 00:00:00 2001
+From b2fa0589f0f75e02ca3af39bf89fdc37d55eef47 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:24:54 +0000
-Subject: [PATCH 05/11] moe cache: run a declined decode-band sparse
+Subject: [PATCH 05/20] moe cache: run a declined decode-band sparse
  gate+up+GLU unfused (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 The fused read of the scheduler copies gave NaN output at tight pin budgets; the per-op path reads the same copies correctly.
@@ -11,10 +11,10 @@ The fused read of the scheduler copies gave NaN output at tight pin budgets; the
  2 files changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index da35ee1e2..c88eeda4c 100644
+index a56b6422d..5cd0bdc25 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2741,8 +2741,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2631,8 +2631,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                      fusion_local.gate_ids = &gate_ids_c;
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
                  } else if (ids != nullptr &&

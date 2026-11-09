@@ -1,0 +1,54 @@
+From a5f97642a072eb8f346d1493a0c34299b568339f Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 9 Nov 2026 00:15:11 +0000
+Subject: [PATCH 15/20] qwen4exp: write the host PLE rows straight into the
+ host input buffer (LLAMA_PLE_DIRECT)
+
+---
+ src/models/qwen4exp.cpp | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 3f4f36f2e..9ca6e0676 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -3062,7 +3062,15 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+         llama_prefetch_rows(tab, idx.data(), idx.size());
+ #endif
+ 
+-        emb_scratch.resize(idx.size() * (size_t) dim);
++        // the input sits in a host buffer: write the rows straight into it instead of copying ~200 MB per prompt ubatch
++        // from the scratch (same bytes).  LLAMA_PLE_DIRECT=0: through the scratch and ggml_backend_tensor_set.
++        static const bool direct_ok = [] { const char * e = getenv("LLAMA_PLE_DIRECT"); return e == nullptr || atoi(e) != 0; }();
++        const bool direct = direct_ok && emb->buffer != nullptr && ggml_backend_buffer_is_host(emb->buffer) &&
++                            ggml_nbytes(emb) == idx.size() * (size_t) dim * sizeof(float);
++        if (!direct) {
++            emb_scratch.resize(idx.size() * (size_t) dim);
++        }
++        float * const out = direct ? (float *) emb->data : emb_scratch.data();
+         // every row is dequantized on its own, so splitting the rows over threads gives the same bytes; a prompt ubatch
+         // of 4096 tokens has ~200k rows, ~30 ms on one thread between the GPU's ubatches.  LLAMA_PLE_THREADS=1: one thread.
+         static const int n_thr_max = [] {
+@@ -3072,7 +3080,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+         const auto gather_rows = [&](size_t k0, size_t k1) {
+             for (size_t k = k0; k < k1; ++k) {
+                 const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
+-                float *      dst = emb_scratch.data() + k * (size_t) dim;
++                float *      dst = out + k * (size_t) dim;
+                 if (tab->type == GGML_TYPE_F32) {
+                     memcpy(dst, src, dim * sizeof(float));
+                 } else {
+@@ -3097,7 +3105,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+                 w.join();
+             }
+         }
+-        ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
++        if (!direct) {
++            ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
++        }
+     } else {
+         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+     }
+-- 
+2.53.0
+

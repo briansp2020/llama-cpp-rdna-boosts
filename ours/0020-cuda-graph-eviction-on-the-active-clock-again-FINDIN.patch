@@ -1,0 +1,55 @@
+From 6e11b0f87391785caad023325091c71db5796277 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 9 Nov 2026 06:08:29 +0000
+Subject: [PATCH 20/20] cuda: graph eviction on the active clock again
+ (FINDINGS 519), on top of r236; keep upstream never-evicting the looked-up
+ key
+
+---
+ ggml/src/ggml-cuda/common.cuh | 30 +++++++++++++++++-------------
+ 1 file changed, 17 insertions(+), 13 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 5a70a167c..712c23b96 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1870,19 +1870,23 @@ struct ggml_backend_cuda_context {
+     // graph per decode/verify width.
+     std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
+ 
+-    int64_t next_graph_eviction_time = 0;
+-    int64_t last_graph_use_time = 0;
+-
+-    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key, int64_t time_now = ggml_time_us()) {
+-        // Give all cached graphs 10s to be reused after an idle period, without updating each graph.
+-        if (!cuda_graphs.empty() && time_now - last_graph_use_time >= 10'000'000) {
+-            next_graph_eviction_time = time_now + 10'000'000;
+-        }
+-        last_graph_use_time = time_now;
+-
+-        // Sweep every 5s during active use, evicting graphs unused for at least 10s.
+-        if (time_now >= next_graph_eviction_time) {
+-            next_graph_eviction_time = time_now + 5'000'000;
++    int64_t last_graph_eviction_sweep = 0;
++    int64_t graph_active_us  = 0;   // graph age clock: advances by at most 1 s per lookup, so idle gaps do not age graphs
++    int64_t graph_lookup_us  = 0;   // wall time of the previous lookup
++
++    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
++        const int64_t wall_now = ggml_time_us();
++        if (graph_lookup_us != 0) {
++            graph_active_us += std::min<int64_t>(wall_now - graph_lookup_us, 1'000'000);
++        }
++        graph_lookup_us = wall_now;
++        const int64_t time_now = graph_active_us;
++
++        // sweep every 5s, evicting cuda graphs unused for >=10s, both on the active clock: a pause between requests
++        // keeps the decode graphs (no re-instantiate on the next turn), while a long prefill still ages them out.
++        // The graph being looked up is never evicted (upstream).
++        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
++            last_graph_eviction_sweep = time_now;
+             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
+                 if (!(it->first == key) && time_now - it->second->last_used_time >= 10'000'000) {
+                     it = cuda_graphs.erase(it);
+-- 
+2.53.0
+

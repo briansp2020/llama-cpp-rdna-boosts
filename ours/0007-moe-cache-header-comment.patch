@@ -1,7 +1,7 @@
-From 5d902e154eaa38c28e84c98baee800a6add69d2f Mon Sep 17 00:00:00 2001
+From d62db299d797c119231f634671fd6baa87e54bd2 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 15:00:18 +0000
-Subject: [PATCH 07/11] moe cache: header comment
+Subject: [PATCH 07/20] moe cache: header comment
 
 ---
  ggml/src/ggml-cuda/moe-expert-cache.h | 2 +-

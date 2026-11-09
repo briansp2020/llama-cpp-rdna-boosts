@@ -3,7 +3,7 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-6050b467c-r235` (upstream llama.cpp `6050b467c` + this repo's release; resulting tree `ef5dcbcb0ae7`).
+**Base:** `v16-a691b2345-r236` (upstream llama.cpp `a691b2345` + this repo's release).
 The rest of this branch is that release as published; only `ours/` is added.
 
 **New layout (2026-11-08).** Up to r228 this was a 55-patch series (0000-0054) that replaced the release's
@@ -16,12 +16,12 @@ The old series is kept as the tag `ours-r228-series`; the mapping table below sh
 **Apply:**
 
 ```
-git checkout 6050b467c
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r235 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 11 patches (0001-0011)
+git checkout a691b2345
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r236 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 20 patches (0001-0020)
 ```
 
-Result: tree `0113783a8a1e`.
+Result: tree `78f1ba0e7498`. This is the production build from 2026-11-09 (2 GPUs, `-sm tensor`).
 
 ## Patches
 
@@ -38,9 +38,18 @@ Result: tree `0113783a8a1e`.
 | 0009 | `-sm tensor` prefill on qwen4exp: one kernel for DSV4_HC_POST -> RMS_NORM -> MUL (bit-identical; falls back on overlap) | `GGML_CUDA_HC_POST_RMS=0` |
 | 0010 | a table whose fill failed (r235 declines it itself) also runs gate+up+GLU unfused | - |
 | 0011 | the CUDA fusion overlap check no longer skips leaves that live in a compute buffer. A scheduler copy of a host expert weight (`-ncmoe` + op offload) is a leaf in the compute buffer, and the allocator can give its memory to a fused output once the last unfused consumer is done; the fused routed gate+up+GLU then wrote its output over the gate weights it was still reading (NaN, "!!!!" output) whenever a layer's experts were served from the scheduler copy: cache off, a declined or fill-failed table. The same check is in upstream ggml | `GGML_CUDA_FUSION_CHECK_LEAVES=0` |
+| 0012 | drops the 0005 workaround (`GGML_MOE_FUSED_DECLINE_UNFUSE`): 0011 fixes the cause | - |
+| 0013 | the dual-output mmvq fusion also skips weights that live in a compute buffer (same cause as 0011) | `GGML_CUDA_FUSION_CHECK_LEAVES=0` |
+| 0014 | qwen4exp: the host PLE rows are gathered on up to 8 threads (bit-identical) | `LLAMA_PLE_THREADS=1` |
+| 0015 | qwen4exp: the host PLE rows are written straight into a host input buffer (no scratch + `tensor_set`) | `LLAMA_PLE_DIRECT=0` |
+| 0016 | copy-engine all-reduce: one exchange for 2 ranks | `GGML_CUDA_AR_CE_SINGLE=0` |
+| 0017 | qwen4exp prefill: `dsv4_hc_post_rms` and `dsv4_hc_pre` also write the RNE BF16 copy of their output into `bf16_src1_cache`, so the cuBLAS BF16 GEMMs skip the conversion (bit-identical; `=2` re-converts every hit and compares) | `GGML_CUDA_BF16_PRODUCER=0` |
+| 0018 | review fixes: a PLE worker that cannot start falls back to the calling thread; the hc_post_rms fusion stands down under `GGML_CUDA_RMS_NORM_VEC=1` | - |
+| 0019 | r236 port: the checkpoint pool uses r236's `common_state_data` (no-init allocator); the pool thread still touches every page | - |
+| 0020 | r236 port: CUDA graph eviction counts active time only (idle gaps capped at 1 s), as before r236, and keeps r236's rule that the looked-up graph is never evicted | - |
 
-0005, 0006 (down-fold part) and 0010 were workarounds for the bug 0011 fixes at the source. They stay for now; they only run
-after a decline or a failed fill, and removing them needs its own A/B.
+0005, 0006 (down-fold part) and 0010 were workarounds for the bug 0011 fixes at the source; 0012 removes 0005. The others
+only run after a decline or a failed fill.
 
 ## Where the r228 series went
 
@@ -60,6 +69,20 @@ few lines differ where the merge renamed helpers or the release changed the surr
 | 0020, 0028, 0036, 0045 (cache file and other files) | in 0001 and 0002-0003 |
 | 0034 (`GGML_MOE_TIER_INCL`, inclusive tier, default off) | removed (debug-only, never used in production) |
 | 0050 (fill rollback) | in 0002-0003 for sparse tables; pool and pinned tables use the release's own rollback (r219 issue #274, r235) |
+
+## Validation on r236 (2026-11-08 night, Radeon AI PRO R9700 x 2, ROCm 10.1)
+
+The r235 series rebased (0001-0018), plus the two r236 ports (0019-0020). Built without ccache.
+
+- Against r236 itself, seven 1-GPU models (as below): greedy server replies identical (14/14), KLD 0 on all six checks.
+  test-backend-ops: only the known `MUL_MAT` f16 case fails, as on the release.
+- Production model on 1 GPU: greedy, prompt-set, long-decode hashes and the 259.6k needle the same as the r235 series.
+- 2 GPUs, `-sm tensor`: greedy identical, KLD 0, no faults. `GGML_CUDA_BF16_PRODUCER=2`: 0 mismatching BF16 elements.
+  Two one-hour stress sessions (all-VRAM IQ3_XXS, and the production config), rounds of MTP decode, 31.5k and 159k
+  prefills and the 259.6k needle: 38/38 rounds with the expected greedy hash, no faults. Production 31.5k prefill 3270-3300 t/s.
+- **Not passing yet:** 2-GPU layer split of the full production model (with and without pipeline parallelism) runs out of
+  memory on device 0 in a concurrent test (`ggml_cuda_mul_mat_q_pair` pool allocation); the r235 series passes the same
+  test. Use `-sm tensor` with this series until that is fixed.
 
 ## Validation on r235 (2026-11-07 and 2026-11-08, Radeon AI PRO R9700 x 2, ROCm 10.1)
 

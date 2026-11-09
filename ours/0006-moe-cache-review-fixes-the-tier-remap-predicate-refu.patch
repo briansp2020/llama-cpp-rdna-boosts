@@ -1,7 +1,7 @@
-From 2772b93dea44287f5b9518ee14e6e5d02f3775e1 Mon Sep 17 00:00:00 2001
+From 0103ff8853af2c8298fe025934ec6192c6917e6b Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:41:12 +0000
-Subject: [PATCH 06/11] moe cache: review fixes: the tier remap predicate
+Subject: [PATCH 06/20] moe cache: review fixes: the tier remap predicate
  refuses a fill_failed table; the down-fold also runs unfused for a declined
  sparse table
 
@@ -12,10 +12,10 @@ Subject: [PATCH 06/11] moe cache: review fixes: the tier remap predicate
  3 files changed, 5 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 2fa95dfcd..4f765ee75 100644
+index 35fbd2217..7f1c51a2f 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -3229,8 +3229,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+@@ -3240,8 +3240,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
              if (moe_cache_redirect_fused(mm_node, mm_node->src[0], nullptr, mm_node->src[2],
                                           ctx.device, ctx.stream(), &src0_c, &ids_c, nullptr, nullptr)) {
                  ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);

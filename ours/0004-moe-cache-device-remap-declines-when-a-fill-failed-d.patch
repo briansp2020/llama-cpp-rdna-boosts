@@ -1,7 +1,7 @@
-From da8b9f9e9501492a4b96c8b27593e17927cdc4d4 Mon Sep 17 00:00:00 2001
+From 112210217f14b02814f49959530c43c64041b18e Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:24:54 +0000
-Subject: [PATCH 04/11] moe cache: device remap declines when a fill failed
+Subject: [PATCH 04/20] moe cache: device remap declines when a fill failed
  during its policy pass
 
 The remap took the input over although the consumer then refuses a table with fill_failed: the op read an input_cpy nobody filled.

@@ -1,0 +1,66 @@
+From 3d36b6686e6c739e32dfdd3ae71abb7f6d70146c Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 9 Nov 2026 06:08:29 +0000
+Subject: [PATCH 19/20] common: checkpoint pool on r236 common_state_data
+ (no-init allocator), pages still touched by the pool thread
+
+---
+ common/common.cpp | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index 4f791b922..c72469748 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2805,7 +2805,7 @@ struct ckpt_pool {
+     static constexpr size_t K = 3;
+     std::mutex mtx;
+     std::condition_variable cv;
+-    std::vector<std::vector<uint8_t>> spares[2];
++    std::vector<common_state_data> spares[2];
+     size_t want[2] = { 0, 0 };
+     bool on = false;
+ 
+@@ -2817,7 +2817,7 @@ struct ckpt_pool {
+         }
+     }
+ 
+-    static void lock_pages(std::vector<uint8_t> & v, bool lock) {
++    static void lock_pages(common_state_data & v, bool lock) {
+ #if !defined(_WIN32)
+         if (!v.empty()) {
+             if (lock) { (void) mlock(v.data(), v.size()); } else { (void) munlock(v.data(), v.size()); }
+@@ -2827,9 +2827,9 @@ struct ckpt_pool {
+ #endif
+     }
+ 
+-    bool take(int kind, std::vector<uint8_t> & dst, size_t n) {
++    bool take(int kind, common_state_data & dst, size_t n) {
+         bool ok = false;
+-        std::vector<std::vector<uint8_t>> drop;
++        std::vector<common_state_data> drop;
+         {
+             std::lock_guard<std::mutex> lk(mtx);
+             if (want[kind] < n) {
+@@ -2876,7 +2876,8 @@ struct ckpt_pool {
+                 kind = want[0] && spares[0].size() < K ? 0 : 1;
+                 n = want[kind];
+             }
+-            std::vector<uint8_t> v(n);   // value-initialized: every page is touched here, off the critical path
++            common_state_data v(n);   // no-init allocator (upstream): touch every page here, off the critical path
++            std::memset(v.data(), 0, v.size());
+             lock_pages(v, true);
+             {
+                 std::lock_guard<std::mutex> lk(mtx);
+@@ -2892,7 +2893,7 @@ struct ckpt_pool {
+     }
+ };
+ 
+-static bool ckpt_pool_take(int kind, std::vector<uint8_t> & dst, size_t n) {
++static bool ckpt_pool_take(int kind, common_state_data & dst, size_t n) {
+     static ckpt_pool * pool = new ckpt_pool();
+     return pool->on && dst.empty() && pool->take(kind, dst, n);
+ }
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
-From c5581e3b9c35abbb60781466b6b4bc4189ce1317 Mon Sep 17 00:00:00 2001
+From 1b9d97baff64cb60827bb35c1d46aac7827ff10f Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 01:54:22 +0000
-Subject: [PATCH 09/11] cuda: fuse DSV4_HC_POST -> RMS_NORM -> MUL for qwen4exp
+Subject: [PATCH 09/20] cuda: fuse DSV4_HC_POST -> RMS_NORM -> MUL for qwen4exp
  tensor-split prefill
 
 Under -sm tensor each qwen4exp layer ends with the DSV4_HC_POST op (the
@@ -27,10 +27,10 @@ kernels equal to the base-vs-base control at 8k and 32k.
  4 files changed, 174 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index c88eeda4c..a96770490 100644
+index 5cd0bdc25..b5062fa9c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -3278,6 +3278,48 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -3168,6 +3168,48 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      if (const int n_hc_mix = ggml_cuda_hc_mix_try_fuse(*cuda_ctx, cgraph, i)) {
          return n_hc_mix;
      }
@@ -80,10 +80,10 @@ index c88eeda4c..a96770490 100644
      if (const int n_hc_comb = ggml_cuda_hc_combine_norm_try_fuse(*cuda_ctx, cgraph, i)) {
          return n_hc_comb;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index c9432c4ef..ef90f629d 100644
+index 953247ac4..4c55e06bb 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -8162,6 +8162,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8497,6 +8497,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  

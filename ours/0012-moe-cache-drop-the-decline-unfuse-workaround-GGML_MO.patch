@@ -1,0 +1,108 @@
+From 636698454d6c2237974ddb54bbcc8f7498ec3292 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 8 Nov 2026 18:31:51 +0000
+Subject: [PATCH 12/20] moe cache: drop the decline unfuse workaround
+ (GGML_MOE_FUSED_DECLINE_UNFUSE)
+
+A declined or fill-failed table ran its decode-band gate+up+GLU and down fold
+unfused because the fused read of the scheduler copies gave NaN.  The cause
+was the fusion overlap check skipping compute-buffer leaves (fixed in
+"cuda: fusion overlap check must not skip compute-buffer leaves"): the fused
+output was placed over the gate weight copy.  With that fix the fused path is
+correct here too: 8 GB pin budget greedy 3ae2e7418782 without the workaround
+("!!!!" with both off), and a pool fill-fault run gives the fault-free text,
+which the unfused fallback did not.  The tier remap keeps refusing a
+fill_failed table.
+---
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |  5 ++---
+ ggml/src/ggml-cuda/mmvq.cu               |  5 ++---
+ ggml/src/ggml-cuda/moe-expert-cache.h    |  5 -----
+ ggml/src/ggml-cuda/moe-expert-tier.inc   | 24 ------------------------
+ 4 files changed, 4 insertions(+), 35 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 9ab03f91d..7cbb35138 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -2645,9 +2645,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+                     fusion_local.gate_ids = &gate_ids_c;
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
+                 } else if (ids != nullptr &&
+-                           (moe_cache_fused_lane_taken(glu, src0, fusion_data.gate, cuda_ctx->device) ||
+-                            moe_cache_fused_declined_sparse(glu, src0, fusion_data.gate, cuda_ctx->device))) {
+-                    continue;   // no redirect: run gate, up and the GLU unfused
++                           moe_cache_fused_lane_taken(glu, src0, fusion_data.gate, cuda_ctx->device)) {
++                    continue;   // a taken-over lane has no full copy: run gate, up and the GLU unfused
+                 } else {
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 7f1c51a2f..35fbd2217 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -3240,9 +3240,8 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+             if (moe_cache_redirect_fused(mm_node, mm_node->src[0], nullptr, mm_node->src[2],
+                                          ctx.device, ctx.stream(), &src0_c, &ids_c, nullptr, nullptr)) {
+                 ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
+-            } else if (moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device) ||
+-                       moe_cache_fused_declined_sparse(mm_node, mm_node->src[0], nullptr, ctx.device)) {
+-                return 0;   // not redirected: the unfused consumer reads the arena or the scheduler copy
++            } else if (moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device)) {
++                return 0;   // taken over but not redirectable: the unfused consumer reads the arena
+             } else {
+                 ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
+             }
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 4bca6819e..08db04627 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -378,11 +378,6 @@ bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_te
+ bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
+                                 const struct ggml_tensor * gate, int device);
+ 
+-// A decode-band fused gate+up+GLU or down-fold with a sparse (mmap) table that was not redirected: the fused read of the scheduler copies
+-// gives wrong output at tight pin budgets, so the caller runs the ops unfused.
+-bool moe_cache_fused_declined_sparse(const struct ggml_tensor * op, const struct ggml_tensor * src0,
+-                                     const struct ggml_tensor * gate, int device);
+-
+ bool moe_cache_redirect_fused(const struct ggml_tensor * op,
+                               const struct ggml_tensor * src0,
+                               const struct ggml_tensor * gate,
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index fd1c59af6..e76055a96 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -3091,30 +3091,6 @@ uint64_t moe_cache_redirect_sig(const ggml_cgraph * cgraph, int device) {
+ }
+ namespace {
+ } // namespace
+-// GGML_MOE_FUSED_DECLINE_UNFUSE=0: the fused read of the copies, as before.
+-bool moe_cache_fused_declined_sparse(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate, int device) {
+-    static const bool on = [] {
+-        const char * e = getenv("GGML_MOE_FUSED_DECLINE_UNFUSE");
+-        return e == nullptr || atoi(e) != 0;
+-    }();
+-    // a table whose fill failed (any mode: r235 declines it in moe_cache_update_host) is read from the scheduler
+-    // copies as well, so it takes the unfused path too.  g_fill_fail only grows; read without the lock as a gate.
+-    if (!on || !g_enabled || (!g_any_sparse && __atomic_load_n(&g_fill_fail, __ATOMIC_RELAXED) == 0) ||
+-        op == nullptr || op->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
+-        return false;
+-    }
+-    std::lock_guard<std::mutex> lock(g_mutex);
+-    for (const ggml_tensor * w : { src0, gate }) {
+-        if (w == nullptr) {
+-            continue;
+-        }
+-        const auto sit = g_sem_to_id.find(std::make_tuple(name_layer(op), sem_role(w), device));
+-        if (sit != g_sem_to_id.end() && (g_tables[sit->second].host_sparse || g_tables[sit->second].fill_failed)) {
+-            return true;
+-        }
+-    }
+-    return false;
+-}
+ // After a failed `moe_cache_redirect_fused`: true when the cache took over either lane anyway (one lane declined, or a
+ // remap shape the fused kernel cannot take).  The scheduler skipped the copy of every taken-over input, so the original
+ // tensors are stale for that lane: the caller must not fuse, and each op reads its own table through the per-op
+-- 
+2.53.0
+

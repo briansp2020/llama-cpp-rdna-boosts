@@ -1,0 +1,43 @@
+From 73305d2cc4c7c12ffa407772b33aae502cb0f34c Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 8 Nov 2026 21:45:55 +0000
+Subject: [PATCH 13/20] cuda: dual-output mmvq fusion skips weights in a
+ compute buffer (GGML_CUDA_FUSION_CHECK_LEAVES)
+
+---
+ ggml/src/ggml-cuda/mmvq.cu | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 35fbd2217..5b2b94fd2 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -3048,7 +3048,15 @@ static int ggml_cuda_ssm_prescan_impl(ggml_backend_cuda_context * ctx, const ggm
+ // Dual-output mmvq fusion: two matmuls over the same activation with the same output shape (e.g. the
+ // K and V projections of an attention layer).  The first matmul computes both results; the gate
+ // result is written to the second matmul's destination.  Returns j - i when fused.
++// A weight in a compute buffer is a scheduler copy of a host weight: once the unfused first matmul is done the
++// allocator may give the copy's memory to the second destination, which the fused launch writes while it still reads
++// the weight (as in ggml_cuda_check_fusion_memory_ranges).  Such weights are not fused.
++// GGML_CUDA_FUSION_CHECK_LEAVES=0: no check (the old behaviour).
+ int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    static const bool check_leaves = [] { const char * e = getenv("GGML_CUDA_FUSION_CHECK_LEAVES"); return e == nullptr || atoi(e) != 0; }();
++    const auto compute_copy = [](const ggml_tensor * w) {
++        return w->buffer == nullptr || ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
++    };
+     if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
+         return 0;
+     }
+@@ -3065,7 +3073,8 @@ int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, cons
+                 mid->src[1] != mm_a->src[1] || mid->ne[0] != mm_a->ne[0] ||
+                 mid->ne[1] != mm_a->ne[1] || mid->ne[2] != mm_a->ne[2] ||
+                 mid->src[0] == mm_a->src[0] || mid->src[0]->type != mm_a->src[0]->type ||
+-                !ggml_cuda_should_fuse_mul_mat_vec_q(mid)) {
++                !ggml_cuda_should_fuse_mul_mat_vec_q(mid) ||
++                (check_leaves && (compute_copy(mm_a->src[0]) || compute_copy(mid->src[0])))) {
+             break;
+         }
+         ggml_cuda_mm_fusion_args_host fusion_data{};
+-- 
+2.53.0
+

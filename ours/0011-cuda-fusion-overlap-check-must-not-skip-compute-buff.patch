@@ -1,7 +1,7 @@
-From 1fb5cb3a4f9e613d88c237e2353717151890cb30 Mon Sep 17 00:00:00 2001
+From 1a4f17fad37a6ed4b81ea7b132c943a9a3167df7 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 16:15:37 +0000
-Subject: [PATCH 11/11] cuda: fusion overlap check must not skip compute-buffer
+Subject: [PATCH 11/20] cuda: fusion overlap check must not skip compute-buffer
  leaves
 
 ggml_cuda_check_fusion_memory_ranges skipped every GGML_OP_NONE source on the
@@ -22,7 +22,7 @@ coherent again.  GGML_CUDA_FUSION_CHECK_LEAVES=0 restores the old check.
  1 file changed, 15 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index a96770490..941af713b 100644
+index b5062fa9c..9ab03f91d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -788,6 +788,12 @@ bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx,

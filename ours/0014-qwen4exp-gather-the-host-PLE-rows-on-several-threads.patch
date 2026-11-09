@@ -1,0 +1,72 @@
+From b8ead67181ab66ab9ca4f37b8254a1d5623c1aec Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 8 Nov 2026 23:55:53 +0000
+Subject: [PATCH 14/20] qwen4exp: gather the host PLE rows on several threads
+ (LLAMA_PLE_THREADS)
+
+---
+ src/models/qwen4exp.cpp | 41 ++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 34 insertions(+), 7 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 4e4ff5805..3f4f36f2e 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -6,6 +6,8 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cstdlib>
++#include <thread>
++#include <vector>
+ #if defined(__linux__) || defined(__APPLE__)
+ #include <sys/mman.h>
+ #endif
+@@ -3061,13 +3063,38 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+ #endif
+ 
+         emb_scratch.resize(idx.size() * (size_t) dim);
+-        for (size_t k = 0; k < idx.size(); ++k) {
+-            const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
+-            float *      dst = emb_scratch.data() + k * (size_t) dim;
+-            if (tab->type == GGML_TYPE_F32) {
+-                memcpy(dst, src, dim * sizeof(float));
+-            } else {
+-                traits->to_float(src, dst, dim);
++        // every row is dequantized on its own, so splitting the rows over threads gives the same bytes; a prompt ubatch
++        // of 4096 tokens has ~200k rows, ~30 ms on one thread between the GPU's ubatches.  LLAMA_PLE_THREADS=1: one thread.
++        static const int n_thr_max = [] {
++            const char * e = getenv("LLAMA_PLE_THREADS");
++            return e != nullptr ? std::max(1, atoi(e)) : 8;
++        }();
++        const auto gather_rows = [&](size_t k0, size_t k1) {
++            for (size_t k = k0; k < k1; ++k) {
++                const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
++                float *      dst = emb_scratch.data() + k * (size_t) dim;
++                if (tab->type == GGML_TYPE_F32) {
++                    memcpy(dst, src, dim * sizeof(float));
++                } else {
++                    traits->to_float(src, dst, dim);
++                }
++            }
++        };
++        const size_t n_rows = idx.size();
++        const int    n_thr  = (int) std::min<size_t>((size_t) n_thr_max, std::max<size_t>(1, n_rows / 4096));
++        if (n_thr <= 1) {
++            gather_rows(0, n_rows);
++        } else {
++            std::vector<std::thread> workers;
++            workers.reserve(n_thr - 1);
++            const size_t chunk = (n_rows + n_thr - 1) / n_thr;
++            for (int t = 1; t < n_thr; ++t) {
++                const size_t k0 = std::min(n_rows, t * chunk), k1 = std::min(n_rows, k0 + chunk);
++                workers.emplace_back(gather_rows, k0, k1);
++            }
++            gather_rows(0, std::min(n_rows, chunk));
++            for (auto & w : workers) {
++                w.join();
+             }
+         }
+         ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
+-- 
+2.53.0
+
