@@ -15,7 +15,7 @@ It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp check
 assumes its predecessors), so the set is applied whole.  **Block 14 is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
 [block 14](patches/README.md#block-14--sm-relaxed-tensor-for-the-moe-amax-arches-temporary-expect-removal)
-and treat it as a stop-gap, not a feature.  The current release is **`v16-a691b2345-r236`**: the release
+and treat it as a stop-gap, not a feature.  The current release is **`v16-a691b2345-r251`**: the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
 [`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,
@@ -26,8 +26,9 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout a691b2345
 bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (16 commits)
 
-# OPT-IN, not part of the delivery: an optional artifact on top (NOT the release tree)
-bash <path-to-this-repo>/scripts/apply-all.sh --include-optional .   # 16 blocks + optional/*/*.patch
+# OPT-IN, not part of the delivery: optional artifacts on top (NOT the release tree)
+bash <path-to-this-repo>/scripts/apply-all.sh --include-optional .       # asks [y/N] per artifact
+bash <path-to-this-repo>/scripts/apply-all.sh --include-optional-all .   # every artifact, no prompt
 
 # OPT-IN, not part of the delivery: a beta candidate on top (NOT the release tree -- beta testing only)
 bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 16 blocks + beta/*/*.patch
@@ -45,7 +46,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 16 blocks + b
 ## Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-a691b2345-r236`**; the block
+(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-a691b2345-r243`**; the block
 count in the tag follows the set, so `v15-*` tags are the 15-block releases up to r177 and `v16-*` the
 16-block releases from r178 on.  `r1` is the
 re-base of the set onto that fork point and every later `rN` is a dated change recorded in
@@ -147,7 +148,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── beta/                  # promotion-candidate patches pending a beta test (NOT part of the delivery;
 │                          #   apply with `apply-all.sh --include-beta`; currently empty, see beta/README.md)
 ├── optional/              # opt-in features with no validated win here (NOT part of the delivery; apply with
-│                          #   `apply-all.sh --include-optional`; see optional/README.md)
+│                          #   `apply-all.sh --include-optional` and a [y/N] per artifact; see optional/README.md)
 ├── upstream/              # upstream-PR candidates: one sub-directory each (README.md + patch) + index
 └── archive/               # the rest: archive/work/ (closed experiments + the archived wip/ trees) + archive/docs/ (history)
 ```
@@ -177,7 +178,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 | `0011` | **qwen4exp** (model, hyper-connections, lazy reader, QSA/indexer) | old-14 + old-15 HC16/policy/QSA; the model graph, the QSA/indexer/HC ops and kernels, the managed lazy reader and the keys-only indexer cache, the qwen4exp tensor-split arch gate, and the qwen4exp fusion arms; split out of `0010` in r109 (tree-identical) |
 | `0012` | **campaign remainder** (CPU wins, DFlash, FA build grouping, mmap reclaim, batched state copy; **+ r207: host-pool-speed** — a POOL-backed table gathers in the prefill band by default, the `RAM_PCT` ceiling scales every table, `MOE_HOST_POOL_SIZING=1` (opt-in), the pool's diagnostics report the run, `MOE_HOST_POOL_PREFETCH` removed) | old-15 W1-W3 + old-06/15 mmap reclaim + old-16; + the expected `--fit` `ctx_other` probe failure logs as a warning, and the draft-context creation is gated on an enabled type that uses it (r101); + the batched state save/restore, the pipelined copy over it, and the threaded streaming host copy (r152, PR #235); + the DFlash draft's compute reserve split over its injection and noise-block graphs (r162, issue #239); + the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they stop being graph outputs and the host rows are reserved only when the host path runs (r163, issue #240) |
 | `0013` | **MTP draft vocabulary subset** (`--spec-draft-mtp-vocab N`, **opt-in**, default off) | the MTP draft scores only the LM-head rows for token ids < N (+ control/user ids) and scatters them into a full-vocab row of `-inf` — the target's verification is untouched, so the draft can only lose proposals; the `ggml-backend-meta` row-range read that makes it work under `-sm tensor` (r107) |
-| `0015` | **streamed KV** (**opt-in**: `LLAMA_KV_RESIDENT_CELLS` window / `LLAMA_KV_REGION_POOL` pool) | the KV's VRAM cost becomes a resident **window** of the newest `W` cells instead of `-c` cells: one VA reservation holds the cache, the window is VRAM and everything older is pinned system RAM, so a context that OOMed now runs (27B Q8_0 `-c 262144` = 128 MiB VRAM + 8576 MiB pinned host) and the VRAM the KV does not need *yet* goes to the expert-cache arena (+2.2…+2.9 GiB at `-c 262144`, `-n 2000`). A spilled KV is numerically transparent (prefill-logit KLD −0.000000 / 100.000 % on a spilling arm); unset = byte-identical to a build without it, including the OOM (r178, promoted from `archive/work/kv-residency`)  **The same block also carries the attendance pool** (r190, Goal B: `LLAMA_KV_REGION_POOL` — the KV's authoritative copy in a pinned host mirror plus a compact device pool of indexer-block pages the sparse decode resolves through, 204 MiB instead of 1.6-2.4 GiB of resident KV at 103k-180k, `--fit`-visible) and the streaming arm policy (a streamed cache takes the sparse decode arm, +34 %/+47 % on a spilled KV).  Both placements are **opt-in and default off**  + r204: the same **window across a `-sm tensor` split** (`TODO` #124): one VMM region per child device of the Meta wrapper, the grow fanned out to every child, `--fit` sizing it against the split's per-device budget (a MIRRORED dsv4/HRM cache still declines it); + r222: the provider binds the device at every driver-reaching entry point and a buffer type answers capability without touching the driver, so a **plain** 2-GPU `-sm tensor` run does no VMM driver call at all (issue #275: the construction-time probe ran cross-context, which crashed the first kernel launch on Windows) |
+| `0015` | **streamed KV** (**all three placements opt-in, default OFF since r247**: `--kv-window` / `--kv-attendance-pool` window and pool, and `--spec-draft-kv-window`, the MTP draft ring — see `ENVIRONMENT.md` §17 for why the draft ring's old default was a decode regression) | the KV's VRAM cost becomes a resident **window** of the newest `W` cells instead of `-c` cells: one VA reservation holds the cache, the window is VRAM and everything older is pinned system RAM, so a context that OOMed now runs (27B Q8_0 `-c 262144` = 128 MiB VRAM + 8576 MiB pinned host) and the VRAM the KV does not need *yet* goes to the expert-cache arena (+2.2…+2.9 GiB at `-c 262144`, `-n 2000`). A spilled KV is numerically transparent (prefill-logit KLD −0.000000 / 100.000 % on a spilling arm); unset = byte-identical to a build without it, including the OOM (r178, promoted from `archive/work/kv-residency`)  **The same block also carries the attendance pool** (r190, Goal B: `--kv-attendance-pool on\|off`, whose size is derived from the model since r247 — the KV's authoritative copy in a pinned host mirror plus a compact device pool of indexer-block pages the sparse decode resolves through, 204 MiB instead of 1.6-2.4 GiB of resident KV at 103k-180k, `--fit`-visible) and the streaming arm policy (a streamed cache takes the sparse decode arm, +34 %/+47 % on a spilled KV).  Both placements are **opt-in and default off**  + r204: the same **window across a `-sm tensor` split** (`TODO` #124): one VMM region per child device of the Meta wrapper, the grow fanned out to every child, `--fit` sizing it against the split's per-device budget (a MIRRORED dsv4/HRM cache still declines it); + r222: the provider binds the device at every driver-reaching entry point and a buffer type answers capability without touching the driver, so a **plain** 2-GPU `-sm tensor` run does no VMM driver call at all (issue #275: the construction-time probe ran cross-context, which crashed the first kernel launch on Windows); + r248: the MTP draft ring is a **true** ring, so a batch the position window cannot place (an M-RoPE image chunk) evicts the drafter's oldest cells instead of failing the request, and a drafter failure can no longer return a 500 (issue #297) |
 | `0014` | **`-sm relaxed-tensor`** (**TEMPORARY**, `flint`/`mellum`/`mistral4` only) | tensor split that also admits a replicated tensor whose values differ per GPU (the MoE amax row max, which no device can complete). Exact on RDNA/HIP, zero VRAM, and **not a supported feature**: it relaxes upstream #31081 and is expected to be dropped when upstream fixes the amax under a tensor split. Delete this patch to get back to the r136 tree |
 
 Phase-2 additionally moved each concern into a self-contained file: the `ggml_cuda_try_fuse` arms, the
@@ -277,13 +278,13 @@ any more**:
   `hc_gate_mix`, sparse MTP-draft attention, the sparse-QSA/derived-indexer defaults and the lazy reader
   (the old block 14 + the old block 15 remainder).
 
-Applying the 14 patches to the fork point in [`release.json`](release.json) therefore reproduces the
+Applying the 16 patches to the fork point in [`release.json`](release.json) therefore reproduces the
 **full campaign tree** in one pass:
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout a691b2345          # the base recorded in release.json
-bash <path-to-this-repo>/scripts/apply-all.sh .   # 15/15 strict, tree checked against release.json
+bash <path-to-this-repo>/scripts/apply-all.sh .   # 16/16 strict, tree checked against release.json
 ```
 
 The per-patch fold mapping and validation record are in
