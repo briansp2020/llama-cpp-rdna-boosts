@@ -1,7 +1,7 @@
-From 73305d2cc4c7c12ffa407772b33aae502cb0f34c Mon Sep 17 00:00:00 2001
+From a3ed6d509dcd23a1472c4fbba38263294a63bf65 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 21:45:55 +0000
-Subject: [PATCH 13/20] cuda: dual-output mmvq fusion skips weights in a
+Subject: [PATCH 11/23] cuda: dual-output mmvq fusion skips weights in a
  compute buffer (GGML_CUDA_FUSION_CHECK_LEAVES)
 
 ---
@@ -38,6 +38,3 @@ index 35fbd2217..5b2b94fd2 100644
              break;
          }
          ggml_cuda_mm_fusion_args_host fusion_data{};
--- 
-2.53.0
-

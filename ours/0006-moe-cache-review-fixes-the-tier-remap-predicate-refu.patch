@@ -1,7 +1,7 @@
-From 0103ff8853af2c8298fe025934ec6192c6917e6b Mon Sep 17 00:00:00 2001
+From 4967b53e5a37d824d0924d7ae0d22ee29a8fdfd4 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:41:12 +0000
-Subject: [PATCH 06/20] moe cache: review fixes: the tier remap predicate
+Subject: [PATCH 06/23] moe cache: review fixes: the tier remap predicate
  refuses a fill_failed table; the down-fold also runs unfused for a declined
  sparse table
 
@@ -28,10 +28,10 @@ index 35fbd2217..7f1c51a2f 100644
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index a091682c8..d8935bbcc 100644
+index d625782d5..f60ff5887 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -378,7 +378,7 @@ bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_te
+@@ -398,7 +398,7 @@ bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_te
  bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
                                  const struct ggml_tensor * gate, int device);
  
@@ -53,6 +53,3 @@ index 577e25eda..9bfb2fd08 100644
             t.cold_ptrs != nullptr && t.cold_safe && t.host_dev != nullptr && !t.identity &&
             t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
             n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
--- 
-2.53.0
-

@@ -1,0 +1,28 @@
+From aaacff5dd9916331351b5df18bdbe5b667feef67 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 10 Nov 2026 21:51:10 +0000
+Subject: [PATCH 21/23] llama-context: DeepSeek-V4.1 skips the derived-kq-mask
+ probe on its multi-stream dsv4 cache, like DeepSeek-V4
+ (LLAMA_DS41_MULTI_STREAM)
+
+---
+ src/llama-context.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0915f9e01..bc5d37d8b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1202,7 +1202,11 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+         // ties its query stream count to the cache K's ne[3] while its mask uses the plan's stream
+         // count, so mask->ne[1] != q->ne[2] and ggml_lightning_indexer asserts).  Derived is dead
+         // in that configuration anyway, so skipping the probe loses nothing.
+-        const bool multi_stream = n_seqs > 1 && (!cparams.kv_unified || model.arch == LLM_ARCH_DEEPSEEK4);
++        // deepseek41 uses the same dsv4 cache, so the same holds there (LLAMA_DS41_MULTI_STREAM=0 drops it from
++        // this check again, which aborts a deepseek41 load in the indexer at deepseek41.cpp:552).
++        const bool ds41_ms = model.arch == LLM_ARCH_DEEPSEEK41 &&
++            [] { const char * e = getenv("LLAMA_DS41_MULTI_STREAM"); return e == nullptr || atoi(e) != 0; }();
++        const bool multi_stream = n_seqs > 1 && (!cparams.kv_unified || model.arch == LLM_ARCH_DEEPSEEK4 || ds41_ms);
+ 
+         if (multi_stream) {
+             LLAMA_LOG_INFO("%s: derived kq mask disabled (multi-stream KV cache)\n", func);

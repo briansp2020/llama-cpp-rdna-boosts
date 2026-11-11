@@ -1,7 +1,7 @@
-From 112210217f14b02814f49959530c43c64041b18e Mon Sep 17 00:00:00 2001
+From f3042494429526c8fef42c4c8cc7c4c7694e755c Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:24:54 +0000
-Subject: [PATCH 04/20] moe cache: device remap declines when a fill failed
+Subject: [PATCH 04/23] moe cache: device remap declines when a fill failed
  during its policy pass
 
 The remap took the input over although the consumer then refuses a table with fill_failed: the op read an input_cpy nobody filled.
@@ -11,10 +11,10 @@ The remap took the input over although the consumer then refuses a table with fi
  2 files changed, 24 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 1a24df3a2..e6a492562 100644
+index c98afeee2..ac0464257 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -8992,8 +8992,8 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+@@ -9088,8 +9088,8 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
              bool cold = false;
              (void) access_locked(t, t.dr_lag_host[i], stream, t.dr_lag_host, n, &cold);
          }
@@ -66,6 +66,3 @@ index 2455f3c3e..577e25eda 100644
              return false;   // an admission failed and dropped the tier: the host path takes over from here
          }
          precopy_plan_locked(t, stream, t.dr_lag_host, n);
--- 
-2.53.0
-

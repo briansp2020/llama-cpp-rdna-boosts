@@ -1,0 +1,222 @@
+From 2fcbeb560cd125dd0a1dc64cc6038e9564a5f938 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Wed, 11 Nov 2026 02:48:30 +0000
+Subject: [PATCH 23/23] qwen4exp qsa3: the launcher packs straight from the
+ Q8_0 cache views, no F16 copies in the graph (LLAMA_QSA3_PACK_Q8)
+
+---
+ ggml/src/ggml-cuda/fattn-qsa3.cu | 90 ++++++++++++++++++++++++++++----
+ ggml/src/ggml.c                  | 10 ++--
+ src/models/qwen4exp.cpp          | 28 +++++++---
+ 3 files changed, 108 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-qsa3.cu b/ggml/src/ggml-cuda/fattn-qsa3.cu
+index 93fc0641f..ca8d03d01 100644
+--- a/ggml/src/ggml-cuda/fattn-qsa3.cu
++++ b/ggml/src/ggml-cuda/fattn-qsa3.cu
+@@ -1,5 +1,6 @@
+ #include "common.cuh"
+ #include "fattn-qsa.cuh"
++#include "convert.cuh"
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -12,7 +13,8 @@
+ // package of 4 key blocks (16 keys) at a time.
+ //
+ // It consumes the packed F16 layouts built by the launcher's fused pack kernels below from the natural
+-// contiguous F16 cache view (op src[7]/src[8], `ggml_flash_attn_qsa_set_packed`):
++// contiguous F16 cache view, or from the Q8_0 cache view itself (LLAMA_QSA3_PACK_Q8: dequantized while packing)
++// (op src[7]/src[8], `ggml_flash_attn_qsa_set_packed`):
+ //   pk  [16, 4, 16, n_kv/4*n_kvh]   F16   keys, 4-key blocks, (a, k, b, n) at a+16k+64b+1024n
+ //   pv  [ 4, 256, n_kv/4*n_kvh, 1]  F16   values, (k, d, n) at k+4d+1024n
+ // and derives the per-group block union here (rows/merge kernels), so the attention kernel
+@@ -330,6 +332,58 @@ __global__ __launch_bounds__(256) void qsa3_pack_values_kernel(
+     *reinterpret_cast<uint2 *>(o) = make_uint2((uint32_t) v[0] | ((uint32_t) v[1] << 16), (uint32_t) v[2] | ((uint32_t) v[3] << 16));
+ }
+ 
++// Q8_0 variants (LLAMA_QSA3_PACK_Q8): the same re-layout read straight from the Q8_0 cache view (src[7]/src[8]),
++// head stride nbh and cell stride nbc in bytes (the view may be non-contiguous, and under -sm tensor each device
++// sees its own head slice).  Each element is ggml_cuda_cast<half>(float(q) * float(d)) - the exact product and
++// rounding of cpy_blck_q8_0_f16 / dequantize_q8_0 - so pk16/pv16 hold the same bits as the F16-pack path.
++// Blocks are 34 B (half d + 32 int8), so the source is only 2-byte aligned: scalar loads, no vector casts.
++static __device__ __forceinline__ uint16_t qsa3_q8_elem(const char * blk, const int i) {
++    const float d = __half2float(*reinterpret_cast<const half *>(blk));
++    const float v = (float) reinterpret_cast<const int8_t *>(blk + 2)[i] * d;
++    return __half_as_ushort(ggml_cuda_cast<half>(v));
++}
++
++__global__ __launch_bounds__(256) void qsa3_pack_keys_q8_kernel(
++        const char * __restrict__ nat, uint16_t * __restrict__ pk, const int H, const int N,
++        const size_t nbh, const size_t nbc) {
++    const int q = N >> 2;
++    const int total = H * q * 64;
++    const int t = blockIdx.x * blockDim.x + threadIdx.x;
++    if (t >= total) return;
++    const int n0 = t & 3;
++    const int j  = (t >> 2) & 15;             // d = 16*j .. 16*j + 15: half of Q8_0 block j >> 1
++    const int r  = t >> 6;
++    const int qq = r % q;
++    const int h  = r / q;
++    const char * blk = nat + (size_t) h * nbh + (size_t) (4 * qq + n0) * nbc + (size_t) (j >> 1) * sizeof(block_q8_0);
++    const int i0 = 16 * (j & 1);
++    uint16_t v[16];
++#pragma unroll
++    for (int a = 0; a < 16; ++a) { v[a] = qsa3_q8_elem(blk, i0 + a); }
++    uint16_t * d = pk + (size_t) 16 * n0 + (size_t) 64 * j + (size_t) 1024 * ((size_t) qq + (size_t) q * h);
++    *reinterpret_cast<uint4 *>(d)     = *reinterpret_cast<const uint4 *>(v);
++    *reinterpret_cast<uint4 *>(d + 8) = *reinterpret_cast<const uint4 *>(v + 8);
++}
++
++__global__ __launch_bounds__(256) void qsa3_pack_values_q8_kernel(
++        const char * __restrict__ nat, uint16_t * __restrict__ pv, const int H, const int N,
++        const size_t nbh, const size_t nbc) {
++    const int q = N >> 2;
++    const int total = 256 * q * H;
++    const int t = blockIdx.x * blockDim.x + threadIdx.x;
++    if (t >= total) return;
++    const int d  = t & 255;
++    const int r  = t >> 8;
++    const int qq = r % q;
++    const int h  = r / q;
++    const char * row = nat + (size_t) h * nbh + (size_t) (4 * qq) * nbc + (size_t) (d >> 5) * sizeof(block_q8_0);
++    uint16_t * o = pv + (size_t) 4 * d + (size_t) 1024 * ((size_t) qq + (size_t) q * h);
++    uint16_t v[4];
++#pragma unroll
++    for (int k = 0; k < 4; ++k) { v[k] = qsa3_q8_elem(row + (size_t) k * nbc, d & 31); }
++    *reinterpret_cast<uint2 *>(o) = make_uint2((uint32_t) v[0] | ((uint32_t) v[1] << 16), (uint32_t) v[2] | ((uint32_t) v[3] << 16));
++}
++
+ struct qsa3_layout {
+     size_t q1, q2, o1, o2, m1;
+     int nk, n_q, gqa, cap;
+@@ -643,13 +697,24 @@ bool ggml_cuda_flash_attn_qsa3_supported(int device, const ggml_tensor * dst) {
+     // src[7]/src[8] are the NATURAL contiguous F16 views [D=256, n_head_kv, n_kv] the launcher packs
+     // into the block layouts itself (session 7 fused pack).  k (src[1]) is the permuted
+     // [D, n_kv, n_head_kv] view, so the natural one swaps its dims 1 and 2.
+-    if (pk->type != GGML_TYPE_F16 || !ggml_is_contiguous(pk) || pk->ne[0] != k->ne[0] ||
+-        pk->ne[1] != k->ne[2] || pk->ne[2] != k->ne[1] || pk->ne[3] != 1 || uintptr_t(pk->data) % 16) {
+-        return false;
+-    }
+-    if (pv->type != GGML_TYPE_F16 || !ggml_is_contiguous(pv) || pv->ne[0] != k->ne[0] ||
+-        pv->ne[1] != k->ne[2] || pv->ne[2] != k->ne[1] || pv->ne[3] != 1 || uintptr_t(pv->data) % 16) {
+-        return false;
++    // Q8_0 (LLAMA_QSA3_PACK_Q8): the KV cache views themselves, rows of 8 whole blocks, strides from nb.
++    for (const ggml_tensor * p : { pk, pv }) {
++        if (p->type != pk->type || p->ne[0] != k->ne[0] || p->ne[1] != k->ne[2] || p->ne[2] != k->ne[1] || p->ne[3] != 1) {
++            return false;
++        }
++        if (p->type == GGML_TYPE_F16) {
++            if (!ggml_is_contiguous(p) || uintptr_t(p->data) % 16) {
++                return false;
++            }
++        } else if (p->type == GGML_TYPE_Q8_0) {
++            const size_t row = (size_t) (256 / QK8_0) * sizeof(block_q8_0);
++            if (p->nb[0] != sizeof(block_q8_0) || p->nb[1] != row || p->nb[2] < row * (size_t) p->ne[1] ||
++                p->nb[2] % sizeof(block_q8_0) || uintptr_t(p->data) % 2) {
++                return false;
++            }
++        } else {
++            return false;
++        }
+     }
+     if (mask) {
+         if (mask->type != GGML_TYPE_F16 || mask->nb[0] != 2 || mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1] ||
+@@ -732,8 +797,13 @@ void ggml_cuda_flash_attn_qsa3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+         const int q4 = nk >> 2;
+         const int tk = nh_kv * q4 * 64;
+         const int tv = 256 * q4 * nh_kv;
+-        if (tk > 0) qsa3_pack_keys_kernel  <<<(tk + 255) / 256, 256, 0, ctx.stream()>>>((const uint16_t *) pk->data, pk16.get(), nh_kv, nk);
+-        if (tv > 0) qsa3_pack_values_kernel<<<(tv + 255) / 256, 256, 0, ctx.stream()>>>((const uint16_t *) pv->data, pv16.get(), nh_kv, nk);
++        if (pk->type == GGML_TYPE_Q8_0) {
++            if (tk > 0) qsa3_pack_keys_q8_kernel  <<<(tk + 255) / 256, 256, 0, ctx.stream()>>>((const char *) pk->data, pk16.get(), nh_kv, nk, pk->nb[1], pk->nb[2]);
++            if (tv > 0) qsa3_pack_values_q8_kernel<<<(tv + 255) / 256, 256, 0, ctx.stream()>>>((const char *) pv->data, pv16.get(), nh_kv, nk, pv->nb[1], pv->nb[2]);
++        } else {
++            if (tk > 0) qsa3_pack_keys_kernel  <<<(tk + 255) / 256, 256, 0, ctx.stream()>>>((const uint16_t *) pk->data, pk16.get(), nh_kv, nk);
++            if (tv > 0) qsa3_pack_values_kernel<<<(tv + 255) / 256, 256, 0, ctx.stream()>>>((const uint16_t *) pv->data, pv16.get(), nh_kv, nk);
++        }
+         CUDA_CHECK(cudaGetLastError());
+     }
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index b67a53bf3..779d2b839 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5861,9 +5861,13 @@ void ggml_flash_attn_qsa_set_packed(
+     }
+ 
+     const struct ggml_tensor * k = a->src[1];   // permuted [D, n_kv, n_head_kv]
+-    GGML_ASSERT(packed_keys->type   == GGML_TYPE_F16);
+-    GGML_ASSERT(packed_values->type == GGML_TYPE_F16);
+-    GGML_ASSERT(ggml_is_contiguous(packed_keys) && ggml_is_contiguous(packed_values));
++    // F16: the contiguous natural copy the graph materialises.  Q8_0: the KV cache view itself (the qsa3
++    // launcher dequantizes while packing, LLAMA_QSA3_PACK_Q8), strides taken from nb (may be non-contiguous).
++    GGML_ASSERT(packed_keys->type == packed_values->type);
++    GGML_ASSERT(packed_keys->type == GGML_TYPE_F16 || packed_keys->type == GGML_TYPE_Q8_0);
++    if (packed_keys->type == GGML_TYPE_F16) {
++        GGML_ASSERT(ggml_is_contiguous(packed_keys) && ggml_is_contiguous(packed_values));
++    }
+     // the natural view swaps k's dims 1 and 2: [D, n_head_kv, n_kv]
+     GGML_ASSERT(packed_keys->ne[0]   == k->ne[0] && packed_keys->ne[1]   == k->ne[2] && packed_keys->ne[2]   == k->ne[1] && packed_keys->ne[3]   == 1);
+     GGML_ASSERT(packed_values->ne[0] == k->ne[0] && packed_values->ne[1] == k->ne[2] && packed_values->ne[2] == k->ne[1] && packed_values->ne[3] == 1);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index fc3d3226d..bb1e75974 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -286,7 +286,8 @@ static bool qsa_derived_vis_supported(const llama_model & model, const llama_hpa
+ // will not read them is pure waste (issue #60's r17+qsa3-off headroom).  Under -sm tensor
+ // model.dev_layer() is the Meta device, whose supports_op() requires EVERY child to accept, so
+ // the probe is also the tensor-parallel safety condition.
+-static bool qsa3_op_supported(const llama_model & model, const llama_hparams & hparams, int il, ggml_type type_kv) {
++static bool qsa3_op_supported(const llama_model & model, const llama_hparams & hparams, int il, ggml_type type_kv,
++                               ggml_type type_pack = GGML_TYPE_F16) {
+     ggml_backend_dev_t dev = model.dev_layer(il);
+     if (dev == nullptr) {
+         return false;
+@@ -313,8 +314,9 @@ static bool qsa3_op_supported(const llama_model & model, const llama_hparams & h
+     ggml_tensor * v   = ggml_new_tensor_4d(ctx, type_kv,       D,       n_kv, 1,  1);
+     ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1,       128, 1,  1);
+     ggml_tensor * msk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv,    128, 1,  1);
+-    ggml_tensor * pk  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D,       1,   n_kv, 1);
+-    ggml_tensor * pv  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D,       1,   n_kv, 1);
++    // the packs in the form the graph will attach: F16 copies, or the Q8_0 cache views (LLAMA_QSA3_PACK_Q8)
++    ggml_tensor * pk  = ggml_new_tensor_4d(ctx, type_pack,     D,       1,   n_kv, 1);
++    ggml_tensor * pv  = ggml_new_tensor_4d(ctx, type_pack,     D,       1,   n_kv, 1);
+ 
+     ggml_tensor * op = ggml_flash_attn_qsa(ctx, q, k, v, idx, msk, 1.0f, 0.0f, nullptr, nullptr);
+     ggml_flash_attn_qsa_set_packed(op, pk, pv);
+@@ -2473,8 +2475,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+         // backend probe: never materialise the F16 packs when the acting device's qsa3 predicate
+         // will not read them (the runtime arch/env policy lives there; issue #59/#60).
+         constexpr bool qsa3_pack = LLAMA_QSA3_ENABLE != 0;
++        // LLAMA_QSA3_PACK_Q8 (default on): a Q8_0 cache is handed to the launcher as is - it dequantizes while it
++        // packs (same bits as the F16 copy) - so the graph builds no F16 copies of K and V at all.  Only on a
++        // non-CPU layer device (the CPU backend has no qsa3 launcher); =0 restores the F16 copies (A/B).
++        static const bool pack_q8_env = [] { const char * e = getenv("LLAMA_QSA3_PACK_Q8"); return e == nullptr || atoi(e) != 0; }();
++        ggml_backend_dev_t pack_dev = model.dev_layer(il);
++        const bool pack_q8 = pack_q8_env && k_raw->type == GGML_TYPE_Q8_0 && v_raw->type == GGML_TYPE_Q8_0 &&
++            pack_dev != nullptr && ggml_backend_dev_type(pack_dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+         if (qsa3_pack && n_stream == 1 && q_p->ne[1] >= 128 && k_raw->ne[0] == 256 && k_raw->ne[2] % 4 == 0 &&
+-            qwen4exp_qsa3_kv_type(k_raw->type) && qsa3_op_supported(model, hparams, il, k_raw->type)) {
++            qwen4exp_qsa3_kv_type(k_raw->type) &&
++            qsa3_op_supported(model, hparams, il, k_raw->type, pack_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16)) {
+             // The launcher packs these into the block layouts itself (one fused pass, session 7);
+             // the graph only materialises the natural contiguous F16 view [D, n_head_kv, n_kv].
+             // LLAMA_QSA3_DIRECT_F16=0: the Q8_0 cache goes through the F32 intermediate again (A/B)
+@@ -2482,9 +2492,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+             ggml_backend_dev_t layer_dev = model.dev_layer(il);
+             const bool direct_q8_0 = direct_env && layer_dev != nullptr &&
+                 ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+-            ggml_tensor * k16 = qsa3_f16_natural(ctx0, k_raw, direct_q8_0);
+-            ggml_tensor * v16 = qsa3_f16_natural(ctx0, v_raw, direct_q8_0);
+-            ggml_flash_attn_qsa_set_packed(cur, k16, v16);
++            if (pack_q8) {
++                ggml_flash_attn_qsa_set_packed(cur, k_raw, v_raw);
++            } else {
++                ggml_tensor * k16 = qsa3_f16_natural(ctx0, k_raw, direct_q8_0);
++                ggml_tensor * v16 = qsa3_f16_natural(ctx0, v_raw, direct_q8_0);
++                ggml_flash_attn_qsa_set_packed(cur, k16, v16);
++            }
+         }
+ 
+         ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);

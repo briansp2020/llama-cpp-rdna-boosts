@@ -1,7 +1,7 @@
-From 636698454d6c2237974ddb54bbcc8f7498ec3292 Mon Sep 17 00:00:00 2001
+From 1550eb7ca41ed29201ff1035ea5abed6f5fc85cc Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 18:31:51 +0000
-Subject: [PATCH 12/20] moe cache: drop the decline unfuse workaround
+Subject: [PATCH 10/23] moe cache: drop the decline unfuse workaround
  (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 A declined or fill-failed table ran its decode-band gate+up+GLU and down fold
@@ -21,10 +21,10 @@ fill_failed table.
  4 files changed, 4 insertions(+), 35 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 9ab03f91d..7cbb35138 100644
+index 8ef94ef1e..7115e505b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2645,9 +2645,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2675,9 +2675,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                      fusion_local.gate_ids = &gate_ids_c;
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
                  } else if (ids != nullptr &&
@@ -53,10 +53,10 @@ index 7f1c51a2f..35fbd2217 100644
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 4bca6819e..08db04627 100644
+index 5ed8e41ea..b652fe390 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -378,11 +378,6 @@ bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_te
+@@ -398,11 +398,6 @@ bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_te
  bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
                                  const struct ggml_tensor * gate, int device);
  
@@ -103,6 +103,3 @@ index fd1c59af6..e76055a96 100644
  // After a failed `moe_cache_redirect_fused`: true when the cache took over either lane anyway (one lane declined, or a
  // remap shape the fused kernel cannot take).  The scheduler skipped the copy of every taken-over input, so the original
  // tensors are stale for that lane: the caller must not fuse, and each op reads its own table through the per-op
--- 
-2.53.0
-

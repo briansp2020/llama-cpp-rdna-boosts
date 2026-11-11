@@ -1,0 +1,59 @@
+From bc8ff07c901fff109171e96d155c14e54fee9824 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 9 Nov 2026 17:56:22 +0000
+Subject: [PATCH 16/23] sched: on multi-device backends, skip the alloc_splits
+ drain when no buffer grows (GGML_SCHED_DEFER_ALLOC_SYNC)
+
+Every prompt ubatch re-reserves its graph (the KV views grow), and with more than one device (or a META
+backend) alloc_splits drained every backend first, even when no buffer grew.  Without growth the re-point only
+rewrites host-side tensor pointers, and the first input upload of the new graph still waits for the backend,
+so the drain only serialized the host preparation of ubatch N+1 behind the GPUs finishing N.
+Prod config (-sm tensor): prefill +0.3-0.6 %; -sm layer: +15 % (31.5k), +16 % (155k), device 0 starts N+1
+while device 1 finishes N; with pipeline parallelism +11 % / +4 %.  Outputs identical, 0 faults (FINDINGS 860).
+GGML_SCHED_DEFER_ALLOC_SYNC=0 restores the drain; 2 = drain right after the new layout (debug).
+---
+ ggml/src/ggml-backend.cpp | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index c17e8982e..95b6127c2 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2778,11 +2778,22 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+         // be using.
+         const bool buffers_grown = ggml_gallocr_reserve_n_probe(
+                 sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+-        if (buffers_grown || n_async_devices > 1 || multi_device) {
++        // GGML_SCHED_DEFER_ALLOC_SYNC (default 1): on more than one device, skip the drain when no buffer grows, as the
++        // single-device path does.  With no growth the re-point only rewrites host-side tensor->data; device memory a
++        // running graph reads is not touched, and the first input upload of the new graph still waits for the backend
++        // (copy_input), so the host prepares ubatch N+1 while the devices finish N.  Under -sm layer device 0 can then
++        // start N+1 while device 1 finishes N (FINDINGS 860).  0 = drain here as before; 2 = drain right after the
++        // new layout is applied (debug bisect).
++        static const int defer_alloc_sync = [] { const char * e = getenv("GGML_SCHED_DEFER_ALLOC_SYNC"); return e ? atoi(e) : 1; }();
++        const bool multi = n_async_devices > 1 || multi_device;
++        const bool drain_now = buffers_grown || (multi && defer_alloc_sync == 0);
++        if (buffers_grown || multi) {
+             // the re-allocation may cause the split inputs to be moved to a different address
+             // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+-            for (int i = 0; i < sched->n_backends; i++) {
+-                ggml_backend_synchronize(sched->backends[i]);
++            if (drain_now) {
++                for (int i = 0; i < sched->n_backends; i++) {
++                    ggml_backend_synchronize(sched->backends[i]);
++                }
+             }
+ 
+             if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+@@ -2794,6 +2805,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             return false;
+         }
++        if (!drain_now && multi && defer_alloc_sync == 2) {
++            for (int i = 0; i < sched->n_backends; i++) {
++                ggml_backend_synchronize(sched->backends[i]);
++            }
++        }
+     }
+ 
+     return true;

@@ -1,0 +1,85 @@
+From b57a125580bc1831fc5ea4c1cdfcc78a988d268e Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 9 Nov 2026 17:04:25 +0000
+Subject: [PATCH 15/23] qwen4exp: PLE page hints only when a mincore sample
+ says the table is cold (LLAMA_PLE_ADVISE)
+
+One MADV_WILLNEED per page costs ~13 ms per 4096-token ubatch (~60k pages on the main thread while the GPUs
+idle at the ubatch boundary) and only helps when the pages are not in the page cache.  Sample ~200 rows with
+mincore (~0.1 ms) and advise only when more than 2 of their pages are missing.  Batching the calls with
+process_madvise did not help (13 ms with 59 calls).  Prod config: 31.5k prefill +0.5-0.8 %, 101k +0.5 %;
+cold page cache = always-advise speed; outputs identical (FINDINGS 859).
+LLAMA_PLE_ADVISE=1: always advise (old), 0: never.
+---
+ src/models/qwen4exp.cpp | 48 +++++++++++++++++++++++++++++++++--------
+ 1 file changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 9d25e9a28..4c09931c7 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -3036,7 +3036,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+         // CPU get_rows would (same to_float dequant), so that no CPU get_rows node cuts
+         // the graph into GPU/CPU/GPU splits with a launch + sync per ubatch. The mmap
+         // pages are random-access, so queue every distinct page with one WILLNEED batch
+-        // instead of taking the faults one after another (~0.2 ms each from NVMe).
++        // instead of taking the faults one after another (~0.2 ms each from NVMe) -- when a sample says the table is cold.
+         const ggml_tensor * tab = pmodel.per_layer_tok_embd;
+         const size_t  row_size = ggml_row_size(tab->type, tab->ne[0]);
+         const int64_t dim      = tab->ne[0];
+@@ -3047,17 +3047,47 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+ 
+ #if defined(__linux__) || defined(__APPLE__)
+         {
++            // One WILLNEED per page costs ~13 ms per 4096-token ubatch (~60k pages, main thread, GPUs idle at the
++            // boundary) and only helps when the pages are not in the page cache.  So first sample ~200 of the rows
++            // with mincore (~0.1 ms) and advise only when more than 2 of their pages are missing (FINDINGS 858-859).
++            // LLAMA_PLE_ADVISE: 1 = always advise (old behaviour), 0 = never.  Note: since Linux 5.2 mincore reports every
++            // page of a file mapping as resident to a process that neither owns the file nor has CAP_FOWNER; there this
++            // never advises (measured about break-even when cold) -- set LLAMA_PLE_ADVISE=1 in that setup.
++            static const int advise_mode = [] {
++                const char * e = getenv("LLAMA_PLE_ADVISE");
++                return e != nullptr ? atoi(e) : 2;
++            }();
+             const long page = sysconf(_SC_PAGESIZE);
+-            if (page > 0) {
++            if (page > 0 && advise_mode != 0) {
+                 const uintptr_t base = (uintptr_t) tab->data;
+                 const uintptr_t mask = ~((uintptr_t) page - 1);
+-                uintptr_t prev_page = 0;
+-                for (const int32_t r : idx) {
+-                    const uintptr_t a0 = (base + (size_t) r * row_size) & mask;
+-                    const uintptr_t a1 = base + (size_t) r * row_size + row_size;
+-                    if (a0 != prev_page) {
+-                        madvise((void *) a0, a1 - a0, MADV_WILLNEED);
+-                        prev_page = a0;
++                bool advise = true;
++                if (advise_mode == 2) {
++                    const size_t step = std::max<size_t>(1, idx.size() / 200);
++                    int n_miss = 0;
++                    for (size_t k = 0; k < idx.size() && n_miss <= 2; k += step) {
++                        const uintptr_t a0 = (base + (size_t) idx[k] * row_size) & mask;
++#if defined(__APPLE__)
++                        char v = 0;
++#else
++                        unsigned char v = 0;
++#endif
++                        // a page mincore cannot report counts as missing, so the advise below still runs
++                        if (mincore((void *) a0, (size_t) page, &v) != 0 || (v & 1) == 0) {
++                            n_miss++;
++                        }
++                    }
++                    advise = n_miss > 2;
++                }
++                if (advise) {
++                    uintptr_t prev_page = 0;
++                    for (const int32_t r : idx) {
++                        const uintptr_t a0 = (base + (size_t) r * row_size) & mask;
++                        const uintptr_t a1 = base + (size_t) r * row_size + row_size;
++                        if (a0 != prev_page) {
++                            madvise((void *) a0, a1 - a0, MADV_WILLNEED);
++                            prev_page = a0;
++                        }
+                     }
+                 }
+             }

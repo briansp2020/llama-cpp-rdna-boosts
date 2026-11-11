@@ -1,0 +1,243 @@
+From 7add310b9165fb0ef2f4d19e3ca56c68f8bab0ee Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 9 Nov 2026 19:06:53 +0000
+Subject: [PATCH 17/23] sched/llama: pinned graph inputs under -sm tensor,
+ uploaded asynchronously per device; keep host compute buffers across the drop
+
+- llama-context: a tensor-split (meta) device has no single host buffer type when its GPUs report per-device
+  ones (ROCm/CUDA here: one per device, same device-agnostic pinned memory), so the graph inputs fell back to a
+  PAGEABLE CPU buffer and every input upload went through a host bounce copy, per GPU, serially.  Use the meta
+  device first child host buffer type, as a single-GPU context does (LLAMA_META_HOST_BUFT=0: as before).
+- sched: a user input (GGML_TENSOR_FLAG_INPUT) in a pinned host buffer ("*_Host") is uploaded with
+  set_tensor_async on the split backend stream, ordered by stream order, instead of a host wait for the
+  whole backend plus a synchronous copy; its completion is recorded per backend and
+  ggml_backend_sched_wait_input_uploads() (top of alloc_graph; llama calls it before set_inputs on a reused graph)
+  keeps the host from rewriting the inputs before the copy has read them.  CPU-split outputs keep the
+  synchronous copy (r235).  GGML_SCHED_ASYNC_USER_INPUT=0: as before.  Meta: its synchronous splice fallback
+  drains the device streams first.
+- gallocr: ggml_gallocr_drop_buffers keeps host buffers (no VRAM; re-pinning 200 MB cost the first ubatch after
+  every decode).  GGML_GALLOC_DROP_HOST=1: as before.
+Prod config (-sm tensor -ub 4096), x2: 31.5k 3452/3485, 3456/3489 vs 3363/3433, 3370/3431 (+1.6-2.6 %), midpf
++2.2 %, 101k 3274/3274 vs 3187/3197 (+2.5 %); outputs identical, 0 faults.  -sm layer unchanged.  Fable: design
+review (M1-M4 applied), code reviews no must-fix (FINDINGS 861).
+---
+ ggml/include/ggml-backend.h    |  3 ++
+ ggml/src/ggml-alloc.c          | 13 +++++++
+ ggml/src/ggml-backend-meta.cpp |  9 +++++
+ ggml/src/ggml-backend.cpp      | 69 ++++++++++++++++++++++++++++++++++
+ src/llama-context.cpp          | 11 ++++++
+ 5 files changed, 105 insertions(+)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 9016b7e44..d8d59d35d 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -497,6 +497,9 @@ extern "C" {
+     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
++    // wait until no asynchronous upload still reads a user input buffer (GGML_SCHED_ASYNC_USER_INPUT); call before
++    // writing the inputs of a reused graph (alloc_graph does it for a new one)
++    GGML_API void                 ggml_backend_sched_wait_input_uploads(ggml_backend_sched_t sched);
+ 
+     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
+     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 37cefb222..916d7018b 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -1148,10 +1148,23 @@ void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc) {
+     if (galloc == NULL || galloc->buffers == NULL) {
+         return;
+     }
++    // A host compute buffer (the graph inputs, pinned when a GPU backend provides the host buffer type) holds no VRAM,
++    // which is what the drop exists to release; freeing it only means re-pinning it on the next prefill (~200 MB at
++    // -ub 4096 on qwen4exp).  The buffers are grow-only, so a kept host buffer is simply reused by the next reserve.
++    // So a drop (llama_context_drop_compute_buffers) now returns VRAM but keeps this host RAM.
++    // GGML_GALLOC_DROP_HOST=1: drop it too, as before.
++    static int drop_host = -1;
++    if (drop_host < 0) {
++        const char * e = getenv("GGML_GALLOC_DROP_HOST");
++        drop_host = e != NULL && atoi(e) != 0;
++    }
+     for (int i = 0; i < galloc->n_buffers; i++) {
+         if (galloc->buffers[i] == NULL) {
+             continue;
+         }
++        if (!drop_host && ggml_backend_buft_is_host(galloc->bufts[i])) {
++            continue;
++        }
+         for (int j = i + 1; j < galloc->n_buffers; j++) {
+             if (galloc->buffers[j] == galloc->buffers[i]) {
+                 galloc->buffers[j] = NULL;
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 868ae5abb..e3c615826 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -3174,6 +3174,8 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
+     delete backend;
+ }
+ 
++static void ggml_backend_meta_synchronize(ggml_backend_t backend);
++
+ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+     GGML_ASSERT(ggml_is_contiguous(tensor));
+@@ -3290,6 +3292,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+             return;
+         }
+ 
++        // synchronous splice on another stream: callers order this write in-stream (scheduler async inputs), so drain
++        // the device streams first or the copy could overwrite data a queued kernel still reads
++        // (compute buffers only: a weight upload at load time has no queued readers, and draining there would
++        // serialize the loader for every partial chunk)
++        if (tensor->buffer != nullptr && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++            ggml_backend_meta_synchronize(backend);
++        }
+         ggml_backend_tensor_set(tensor, data, offset, size);
+         return;
+     }
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 95b6127c2..fc92bebac 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1583,6 +1583,10 @@ struct ggml_backend_sched {
+ 
+     // inputs of the next split read from the backend of the current split before it computes, see ggml_backend_sched_prefetch_inputs
+     ggml_backend_event_t prefetch_events[GGML_SCHED_MAX_BACKENDS]; // created on first use, NULL if the backend has no events
++    // GGML_SCHED_ASYNC_USER_INPUT: completion of the last asynchronous upload of a large (live-pointer) user input per
++    // backend; the host must not rewrite those input buffers until it has completed (ggml_backend_sched_wait_input_uploads)
++    ggml_backend_event_t input_up_ev[GGML_SCHED_MAX_BACKENDS];
++    bool                 input_up_pending[GGML_SCHED_MAX_BACKENDS];
+     bool                 prefetch_tried [GGML_SCHED_MAX_BACKENDS];
+     struct ggml_tensor * prefetched[GGML_SCHED_MAX_SPLIT_INPUTS];
+     int n_prefetched;
+@@ -3326,6 +3330,41 @@ static bool sched_input_stage(ggml_backend_sched_t sched, int b, ggml_backend_t
+     return true;
+ }
+ 
++// GGML_SCHED_ASYNC_USER_INPUT (default 1): a user input (GGML_TENSOR_FLAG_INPUT, written only by the application between
++// graphs) in a PINNED host buffer is uploaded with set_tensor_async on the split backend's stream, ordered after that
++// backend's previous work by stream order, instead of a host wait for the whole backend plus a synchronous copy (under
++// the meta backend: one copy per device, serially).  Small inputs are snapshotted by the backend; a large one is read
++// from the live pointer when the stream reaches it, so its completion is recorded and the host waits for it before the
++// next graph's inputs are written (ggml_backend_sched_wait_input_uploads: top of alloc_graph, and by the caller before
++// set_inputs on a reused graph).  CPU-split outputs and other graph inputs keep the synchronous copy (r235).
++static bool sched_async_user_input(void) {
++    static const bool on = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_ASYNC_USER_INPUT");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return on;
++}
++
++// pinned host memory: the GPU backends' host buffer type ("<backend>_Host"); a failed pinned allocation falls back to a
++// plain CPU buffer and a pageable live-pointer async copy can tear on ROCm, so anything else is not taken
++static bool sched_buffer_pinned_host(ggml_backend_buffer_t buf) {
++    if (buf == NULL || !ggml_backend_buffer_is_host(buf)) {
++        return false;
++    }
++    const char * name = ggml_backend_buft_name(ggml_backend_buffer_get_type(buf));
++    const size_t n = name != NULL ? strlen(name) : 0;
++    return n > 5 && strcmp(name + n - 5, "_Host") == 0;
++}
++
++void ggml_backend_sched_wait_input_uploads(ggml_backend_sched_t sched) {
++    for (int b = 0; b < sched->n_backends; b++) {
++        if (sched->input_up_pending[b]) {
++            ggml_backend_event_synchronize(sched->input_up_ev[b]);
++            sched->input_up_pending[b] = false;
++        }
++    }
++}
++
+ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
+     const int split_backend_id = split->backend_id;
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
+@@ -3354,6 +3393,32 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         if (sched_input_stage(sched, split_backend_id, split_backend, input, input_cpy)) {
+             return;
+         }
++        if (sched_async_user_input() && sched->n_copies == 1 && (input->flags & GGML_TENSOR_FLAG_INPUT) &&
++            input->data != NULL && ggml_is_contiguous(input) && ggml_nbytes(input) == ggml_nbytes(input_cpy) &&
++            sched_buffer_pinned_host(input->buffer) &&
++            input_cpy->buffer != NULL && !ggml_backend_buffer_is_host(input_cpy->buffer) &&
++            split_backend->iface.set_tensor_async != NULL && split_backend->iface.event_record != NULL &&
++            split_backend->iface.event_wait != NULL) {
++            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++                sched_event_wait_self(sched, split_backend_id);
++            } else {
++                ggml_backend_synchronize(split_backend);
++            }
++            const size_t nbytes = ggml_nbytes(input_cpy);
++            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, nbytes);
++            // every size: whether a backend snapshots small inputs is the backend's business (CUDA/HIP do below
++            // GGML_BACKEND_ASYNC_SNAPSHOT_MAX; others may read the live pointer at any size)
++            if (sched->input_up_ev[split_backend_id] == NULL) {
++                sched->input_up_ev[split_backend_id] = ggml_backend_event_new(split_backend->device);
++            }
++            if (sched->input_up_ev[split_backend_id] != NULL) {
++                ggml_backend_event_record(sched->input_up_ev[split_backend_id], split_backend);
++                sched->input_up_pending[split_backend_id] = true;
++            } else {
++                ggml_backend_synchronize(split_backend);   // no event: wait for the copy here (old ordering)
++            }
++            return;
++        }
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_synchronize(sched_event_get(sched, split_backend_id));
+         } else {
+@@ -4083,6 +4148,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+             ggml_backend_event_free(sched->events[b][c]);
+         }
+         ggml_backend_event_free(sched->prefetch_events[b]);
++        ggml_backend_event_free(sched->input_up_ev[b]);
+         for (int e = 0; e < GGML_SCHED_COPY_EVENTS; e++) {
+             ggml_backend_event_free(sched->copy_events[b][e]);
+         }
+@@ -4174,6 +4240,8 @@ void ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched) {
+ 
+ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+     GGML_ASSERT(sched);
++    // the new graph's host inputs (and host intermediates) may be placed over a buffer an async upload still reads
++    ggml_backend_sched_wait_input_uploads(sched);
+     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+     GGML_ASSERT(!sched->is_alloc);
+ 
+@@ -4219,6 +4287,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     for (int i = 0; i < sched->n_backends; i++) {
+         ggml_backend_synchronize(sched->backends[i]);
++        sched->input_up_pending[i] = false;   // the upload has completed too
+         // r220: every queued copy has completed, so no per-copy event can still be waited on.  Restarting
+         // the rings keeps them from synchronizing on the host at every wrap in a long prefill.
+         sched->copy_event_next[i] = 0;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8360cdd8d..14bd5fbba 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -855,6 +855,15 @@ llama_context::llama_context(
+                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
+                 const auto & dev = model.devices[0];
+                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
++                // A tensor-split (meta) device has no single host buffer type when its GPUs report per-device ones
++                // (ROCm/CUDA: one per device, the same device-agnostic pinned memory), so the graph inputs fell back
++                // to a pageable CPU buffer: every input upload went through a host bounce copy, per GPU, serially.
++                // Use the first GPU's pinned host buffer type, as a single-GPU context does.
++                // LLAMA_META_HOST_BUFT=0: the pageable CPU buffer as before.
++                static const bool meta_host_buft = [] { const char * e = getenv("LLAMA_META_HOST_BUFT"); return e == nullptr || atoi(e) != 0; }();
++                if (host_buft == nullptr && meta_host_buft && ggml_backend_dev_is_meta(dev.dev)) {
++                    host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_meta_dev_simple_dev(dev.dev, 0));
++                }
+                 if (host_buft) {
+                     buft = host_buft;
+                 }
+@@ -2950,6 +2959,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         if (cparams.pipeline_parallel) {
+             ggml_backend_sched_synchronize(sched.get());
+         }
++        // a large input of the previous graph may still be uploading from the buffers set_inputs rewrites below
++        ggml_backend_sched_wait_input_uploads(sched.get());
+ 
+         n_reused++;
+     } else {

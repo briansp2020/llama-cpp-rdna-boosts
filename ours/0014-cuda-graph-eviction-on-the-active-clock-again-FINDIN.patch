@@ -1,7 +1,7 @@
-From 6e11b0f87391785caad023325091c71db5796277 Mon Sep 17 00:00:00 2001
+From a16763cbd55f81d9473e9abeb1af0f0d6a738c69 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 06:08:29 +0000
-Subject: [PATCH 20/20] cuda: graph eviction on the active clock again
+Subject: [PATCH 14/23] cuda: graph eviction on the active clock again
  (FINDINGS 519), on top of r236; keep upstream never-evicting the looked-up
  key
 
@@ -10,10 +10,10 @@ Subject: [PATCH 20/20] cuda: graph eviction on the active clock again
  1 file changed, 17 insertions(+), 13 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 5a70a167c..712c23b96 100644
+index 21dc20aae..27407419f 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1870,19 +1870,23 @@ struct ggml_backend_cuda_context {
+@@ -1899,19 +1899,23 @@ struct ggml_backend_cuda_context {
      // graph per decode/verify width.
      std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
  
@@ -50,6 +50,3 @@ index 5a70a167c..712c23b96 100644
              for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                  if (!(it->first == key) && time_now - it->second->last_used_time >= 10'000'000) {
                      it = cuda_graphs.erase(it);
--- 
-2.53.0
-

@@ -1,0 +1,93 @@
+From b43e309d3f325e7982542edb227f22f67b286951 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 10 Nov 2026 05:46:38 +0000
+Subject: [PATCH 19/23] meta: size the split-input copy of a split weight at
+ the largest device slice
+
+Under -sm tensor the scheduler copy of a host-resident split weight
+(<backend>#<weight>#<n>) sits at the same offset in every device compute
+buffer, but each device holds only its slice. get_alloc_size returned
+the whole-tensor size, so every device reserved the full expert table
+per copy. Return the largest per-device slice size instead (same
+geometry as init_tensor_impl), memoised per buffer type, name and
+geometry since galloc asks again on every graph. Slice tensors, data
+offsets and kernels are unchanged. GGML_META_SLICE_ALLOC=0 restores the
+whole-tensor size.
+---
+ ggml/src/ggml-backend-meta.cpp | 61 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 61 insertions(+)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index e3c615826..cb7edbf83 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -526,8 +526,69 @@ static size_t ggml_backend_meta_buffer_type_get_compute_chunk_bytes(ggml_backend
+     return chunk;
+ }
+ 
++// GGML_META_SLICE_ALLOC=0: size a split weight copy at the whole tensor on every device (the previous behaviour).
++static bool ggml_backend_meta_slice_alloc() {
++    static const bool v = [] { const char * e = getenv("GGML_META_SLICE_ALLOC"); return e == nullptr || atoi(e) != 0; }();
++    return v;
++}
++
+ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
++    // The scheduler's split-input copy of a split weight (`<backend>#<weight>#<n>`, op NONE, no view source; see
++    // `ggml_backend_sched_alloc_splits`) lives at the same offset in every device's compute buffer, but each device
++    // only holds its slice of it (`ggml_backend_meta_buffer_init_tensor_impl`).  Sizing it at the whole tensor
++    // reserved the full expert table on every device; size it at the largest device slice instead.  The slice
++    // tensors, their data offsets and the kernels are unchanged.
++    if (ggml_backend_meta_slice_alloc() && tensor->op == GGML_OP_NONE && tensor->view_src == nullptr &&
++            strchr(tensor->name, '#') != nullptr) {
++        // galloc asks again for every split copy on every graph (`ggml_gallocr_needs_realloc`), and the policy is
++        // a chain of regex matches, so memoise the answer.  It depends only on the buffer type, the name and the
++        // geometry; 0 = not a split weight (use the whole-tensor size below).
++        static std::mutex memo_mutex;
++        static std::unordered_map<std::string, size_t> memo;
++        std::string key = std::to_string((uintptr_t) buft) + '|' + tensor->name + '|' + std::to_string((int) tensor->type);
++        for (int k = 0; k < GGML_MAX_DIMS; k++) {
++            key += '|' + std::to_string(tensor->ne[k]) + ',' + std::to_string(tensor->nb[k]);
++        }
++        size_t slice_size = 0;
++        bool known = false;
++        {
++            std::lock_guard<std::mutex> lock(memo_mutex);
++            const auto it = memo.find(key);
++            if (it != memo.end()) {
++                known = true;
++                slice_size = it->second;
++            }
++        }
++        if (!known) {
++            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++            const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
++            const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
++            if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS && tensor->ne[ss.axis] > 0) {
++                const int split_dim = ss.axis;
++                for (size_t i = 0; i < n_simple_bufts; i++) {
++                    ggml_tensor t_i = *tensor;   // same geometry as init_tensor_impl builds for device i
++                    int64_t ne_i = 0;
++                    for (size_t seg = 0; seg < ss.n_segments; seg++) {
++                        ne_i += ss.ne[seg*n_simple_bufts + i] * ss.nr[seg];
++                    }
++                    t_i.ne[split_dim] = ne_i;
++                    for (int k = 0; k < GGML_MAX_DIMS; k++) {
++                        if (tensor->nb[k] > tensor->nb[split_dim]) {
++                            t_i.nb[k] = tensor->nb[k] * ne_i/tensor->ne[split_dim];
++                        }
++                    }
++                    const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), &t_i);
++                    slice_size = std::max(slice_size, alloc_size);
++                }
++            }
++            std::lock_guard<std::mutex> lock(memo_mutex);
++            memo.emplace(std::move(key), slice_size);
++        }
++        if (slice_size > 0) {
++            return slice_size;
++        }
++    }
+     size_t max_alloc_size = 0;
+     for (size_t i = 0; i < n_simple_bufts; i++) {
+         const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), tensor);

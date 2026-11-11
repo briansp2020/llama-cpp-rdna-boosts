@@ -1,0 +1,139 @@
+From 451821a187d7679871b7cf44c68a2f383db21af9 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Wed, 11 Nov 2026 00:12:06 +0000
+Subject: [PATCH 22/23] qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy
+ (LLAMA_QSA3_DIRECT_F16); gate copy before attention on prefill-sized graphs
+ so Qcur_full dies early (LLAMA_GATE_EARLY)
+
+---
+ ggml/src/ggml-cuda/cpy.cu       | 29 +++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  3 +++
+ src/models/qwen4exp.cpp         | 28 +++++++++++++++++++++++-----
+ 3 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
+index dc0a19a50..a325854f9 100644
+--- a/ggml/src/ggml-cuda/cpy.cu
++++ b/ggml/src/ggml-cuda/cpy.cu
+@@ -130,6 +130,21 @@ static __device__ void cpy_blck_q8_0_f32(const char * cxi, char * cdsti) {
+     }
+ }
+ 
++// Q8_0 -> F16 in one pass: the same f32 product as cpy_blck_q8_0_f32, rounded with the same ggml_cuda_cast<half>
++// the F32 -> F16 copy uses, so the result is bit-identical to the two-step Q8_0 -> F32 -> F16 copy without its F32
++// intermediate (qwen4exp qsa3 packs, LLAMA_QSA3_DIRECT_F16).
++static __device__ void cpy_blck_q8_0_f16(const char * cxi, char * cdsti) {
++    half * cdsth = (half *)(cdsti);
++
++#pragma unroll
++    for (int j = 0; j < QK8_0; j += 2) {
++        float2 dq;
++        dequantize_q8_0(cxi, 0, j, dq);
++        *(cdsth + j)     = ggml_cuda_cast<half>(dq.x);
++        *(cdsth + j + 1) = ggml_cuda_cast<half>(dq.y);
++    }
++}
++
+ template<dequantize_kernel_t dequant, int qk>
+ static __device__ void cpy_blck_q_f32(const char * cxi, char * cdsti) {
+     float * cdstf = (float *)(cdsti);
+@@ -291,6 +306,17 @@ static void ggml_cpy_q8_0_f32_cuda(
+         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+ }
+ 
++static void ggml_cpy_q8_0_f16_cuda(
++    const char * cx, char * cdst, const int64_t ne,
++    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
++    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
++
++    const int64_t num_blocks = (ne/QK8_0 + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
++    GGML_ASSERT(num_blocks <= INT_MAX);
++    cpy_q_f32<cpy_blck_q8_0_f16, QK8_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
++        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
++}
++
+ static void ggml_cpy_f32_q4_0_cuda(
+     const char * cx, char * cdst, const int64_t ne,
+     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+@@ -574,6 +600,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+     } else if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32) {
+         ggml_cpy_q8_0_f32_cuda
+                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
++    } else if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F16) {
++        ggml_cpy_q8_0_f16_cuda
++                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q4_0) {
+         ggml_cpy_f32_q4_0_cuda
+                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b891e84c5..2c1682a9c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9813,6 +9813,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
+                     return true;
+                 }
++                if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F16) {
++                    return true;
++                }
+                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0) {
+                     return true;
+                 }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 4c09931c7..fc3d3226d 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -2319,14 +2319,18 @@ static bool qwen4exp_qsa3_kv_type(ggml_type type) {
+ // layout before any permute: a quantized tensor cannot be permuted, and the backend dup only
+ // dequantizes to F32, so those route through an F32 intermediate.  The permute/cont that follows
+ // is then a plain F16 copy.
+-static ggml_tensor * qsa3_f16_cast(ggml_context * ctx0, ggml_tensor * raw) {
++// direct_q8_0: the GPU backends dequantize Q8_0 straight to F16 (bit-identical to the two-step copy) and skip the
++// F32 intermediate, a full-context F32 copy of the cache view that set the -ub 4096 prefill peak.  The caller only
++// passes true for a non-CPU layer device: the CPU dup cannot write F16 from a quantized source.
++static ggml_tensor * qsa3_f16_cast(ggml_context * ctx0, ggml_tensor * raw, bool direct_q8_0) {
+     if (raw->type == GGML_TYPE_F16)  { return raw; }
+     if (raw->type == GGML_TYPE_BF16) { return ggml_cast(ctx0, raw, GGML_TYPE_F16); }
++    if (raw->type == GGML_TYPE_Q8_0 && direct_q8_0) { return ggml_cast(ctx0, raw, GGML_TYPE_F16); }
+     return ggml_cast(ctx0, ggml_cast(ctx0, raw, GGML_TYPE_F32), GGML_TYPE_F16);
+ }
+ 
+-static ggml_tensor * qsa3_f16_natural(ggml_context * ctx0, ggml_tensor * raw) {
+-    ggml_tensor * t = qsa3_f16_cast(ctx0, raw);
++static ggml_tensor * qsa3_f16_natural(ggml_context * ctx0, ggml_tensor * raw, bool direct_q8_0) {
++    ggml_tensor * t = qsa3_f16_cast(ctx0, raw, direct_q8_0);
+     if (!ggml_is_contiguous(t)) { t = ggml_cont(ctx0, t); }
+     return t;
+ }
+@@ -2473,8 +2477,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+             qwen4exp_qsa3_kv_type(k_raw->type) && qsa3_op_supported(model, hparams, il, k_raw->type)) {
+             // The launcher packs these into the block layouts itself (one fused pass, session 7);
+             // the graph only materialises the natural contiguous F16 view [D, n_head_kv, n_kv].
+-            ggml_tensor * k16 = qsa3_f16_natural(ctx0, k_raw);
+-            ggml_tensor * v16 = qsa3_f16_natural(ctx0, v_raw);
++            // LLAMA_QSA3_DIRECT_F16=0: the Q8_0 cache goes through the F32 intermediate again (A/B)
++            static const bool direct_env = [] { const char * e = getenv("LLAMA_QSA3_DIRECT_F16"); return e == nullptr || atoi(e) != 0; }();
++            ggml_backend_dev_t layer_dev = model.dev_layer(il);
++            const bool direct_q8_0 = direct_env && layer_dev != nullptr &&
++                ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
++            ggml_tensor * k16 = qsa3_f16_natural(ctx0, k_raw, direct_q8_0);
++            ggml_tensor * v16 = qsa3_f16_natural(ctx0, v_raw, direct_q8_0);
+             ggml_flash_attn_qsa_set_packed(cur, k16, v16);
+         }
+ 
+@@ -2676,6 +2685,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+         ggml_element_size(Qcur_full) * n_embd_head);
+     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+     cb(gate, "gate_reshaped", il);
++    // Materialize the gate copy now, so Qcur_full (n_tokens x 2 x n_embd_head x n_head f32) dies before the attention
++    // instead of staying live to the output gate (-192 MiB at the -ub 4096 prefill peak).  Node order only;
++    // LLAMA_GATE_EARLY=0 restores the old order (A/B).
++    static const bool gate_early = [] { const char * e = getenv("LLAMA_GATE_EARLY"); return e == nullptr || atoi(e) != 0; }();
++    // Prefill-sized graphs only: at decode/verify widths (<= 8 tokens, the mmvq band) the gate CONT must stay next to
++    // its SIGMOID -> MUL -> matmul consumers, which fuse and elide it (ggml_cuda_cont_gate_q8_1_try_fuse).
++    if (gate_early && n_tokens > 8) {
++        ggml_build_forward_expand(gf, gate);
++    }
+ 
+     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+ 
