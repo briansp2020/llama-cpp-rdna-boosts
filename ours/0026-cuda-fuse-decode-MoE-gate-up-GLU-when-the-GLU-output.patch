@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Wed, 11 Nov 2026 22:34:06 +0000
+Subject: [PATCH 26/31] cuda: fuse decode MoE gate+up+GLU when the GLU output
+ overlaps only the unfilled weight copy
+
+At decode the MoE expert cache takes the gate/up weight inputs over, so the
+scheduler never fills their compute-buffer copies and the allocator may place
+the GLU output inside one. The #287 overlap rule then rejected the fusion in
+41 of 47 layers. Accept the window when only src[0] weight leaves overlap the
+output, and only through the cache-redirected MMVQ kernel (arena reads); on a
+decline run gate, up and the GLU unfused as before.
+
+GGML_MOE_FUSE_COPY_ALIAS=0 disables it (default on).
+---
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 58 ++++++++++++++++++++++--
+ 1 file changed, 55 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index f6c46047a..244abcf23 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -2056,6 +2056,50 @@ static const ggml_tensor * ggml_cuda_get_mul_mat_id_scale(const ggml_tensor * re
+     return scale;
+ }
+ 
++// GGML_MOE_FUSE_COPY_ALIAS (FINDINGS 904): the routed gate+up+GLU check of ggml_cuda_can_fuse, except that the GLU
++// output may overlap the gate/up weight leaves.  In decode the MoE cache takes those inputs over, so the scheduler never
++// fills their compute-buffer copies and the allocator may place the GLU output inside one (the #287 rule then blocks
++// the fusion in 41 of 47 layers).  The caller may then only fire the cache-redirected kernel, which reads the arena,
++// never the copy; on a decline it runs the three nodes unfused.  Every other src is still checked against the output.
++static bool ggml_cuda_glu_alias_only_weight_copy(const ggml_cgraph * cgraph, int i) {
++    static const bool on = [] {
++        const char * e = getenv("GGML_MOE_FUSE_COPY_ALIAS");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    if (!on || i + 2 >= cgraph->n_nodes) {
++        return false;
++    }
++    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { i + 2 })) {
++        return false;
++    }
++    const ggml_tensor * a   = cgraph->nodes[i];
++    const ggml_tensor * b   = cgraph->nodes[i + 1];
++    const ggml_tensor * glu = cgraph->nodes[i + 2];
++    if (!ggml_cuda_should_fuse_mul_mat(b, a, glu)) {
++        return false;
++    }
++    if (a->src[0] == nullptr || b->src[0] == nullptr || a->src[0]->op != GGML_OP_NONE || b->src[0]->op != GGML_OP_NONE) {
++        return false;
++    }
++    auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
++        const int64_t xs = (int64_t) x->data, xe = xs + ggml_backend_buft_get_alloc_size(x->buffer->buft, x);
++        const int64_t ys = (int64_t) y->data, ye = ys + ggml_backend_buft_get_alloc_size(y->buffer->buft, y);
++        return (ys <= xs && xs < ye) || (xs <= ys && ys < xe);
++    };
++    for (const ggml_tensor * n : { a, b }) {
++        for (int s = 1; s < GGML_MAX_SRC; ++s) {
++            const ggml_tensor * src = n->src[s];
++            if (src == nullptr || (src->op == GGML_OP_NONE && ggml_cuda_leaf_is_immutable(src))) {
++                continue;
++            }
++            if (overlap(glu, src)) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
+ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     if (ggml_cuda_fusion_disabled()) {
+@@ -2650,7 +2694,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+                 fused_node_count  = 5;
+                 break;
+             }
+-        } else if (ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {})) {
++        } else if (bool copy_alias = false; ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {}) ||
++                   (op == GGML_OP_MUL_MAT_ID && (copy_alias = ggml_cuda_glu_alias_only_weight_copy(cgraph, i)))) {
+             ggml_tensor * glu  = cgraph->nodes[i + 2];
+             ggml_tensor * gate = glu->src[0];
+             ggml_tensor * up   = glu->src[1];
+@@ -2661,13 +2706,16 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+             if (!ok) {
+                 continue;
+             }
++            if (copy_alias && !ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
++                continue;   // copy-alias windows may only take the cache-redirected MMVQ kernel below
++            }
+ 
+             const ggml_tensor * src0 = up->src[0];
+             const ggml_tensor * src1 = up->src[1];
+             const ggml_tensor * ids  = up->src[2];
+ 
+             // MMB fused MoE gate+up+swiglu (pwilkin port). Prefill-only by the shared predicate.
+-            if (op == GGML_OP_MUL_MAT_ID && ids != nullptr &&
++            if (!copy_alias && op == GGML_OP_MUL_MAT_ID && ids != nullptr &&
+                     ggml_cuda_mmb_supported_glu(gate->src[0], up->src[0], src1, ids, glu)) {
+                 moe_cache_prefill_resolve(gate->src[0], cuda_ctx->device, cuda_ctx->stream(), false, nullptr, nullptr, nullptr, nullptr);
+                 moe_cache_prefill_resolve(up->src[0],   cuda_ctx->device, cuda_ctx->stream(), false, nullptr, nullptr, nullptr, nullptr);
+@@ -2676,7 +2724,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+                 fused_node_count  = 3;
+                 break;
+             }
+-            if (ggml_cuda_should_fuse_mul_mat_vec_f(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
++            if (!copy_alias && ggml_cuda_should_fuse_mul_mat_vec_f(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate->src[0];
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+@@ -2704,7 +2752,11 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+                                              &src0_c, &ids_c, &gate_c, &gate_ids_c)) {
+                     fusion_local.gate     = &gate_c;
+                     fusion_local.gate_ids = &gate_ids_c;
++                    // copy_alias: the GLU output may overlap the weight copies; the redirected lanes must read the arena only
++                    GGML_ASSERT(!copy_alias || (src0_c.buffer == nullptr && gate_c.buffer == nullptr));
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
++                } else if (copy_alias) {
++                    continue;   // the GLU output overlaps a weight copy: only the arena read is safe
+                 } else if (ids != nullptr &&
+                            moe_cache_fused_lane_taken(glu, src0, fusion_data.gate, cuda_ctx->device)) {
+                     continue;   // a taken-over lane has no full copy: run gate, up and the GLU unfused
+-- 
+2.53.0
+

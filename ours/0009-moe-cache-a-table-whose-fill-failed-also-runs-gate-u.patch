@@ -1,7 +1,7 @@
-From 5868bfaf86b0a0f09d06dc3a62a95bd55f0288d3 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 04:08:22 +0000
-Subject: [PATCH 09/23] moe cache: a table whose fill failed also runs
+Subject: [PATCH 09/31] moe cache: a table whose fill failed also runs
  gate+up+GLU unfused
 
 r235 declines a table in moe_cache_update_host once one of its fills fails
@@ -43,3 +43,6 @@ index 9bfb2fd08..fd1c59af6 100644
              return true;
          }
      }
+-- 
+2.53.0
+

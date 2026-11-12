@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 12 Nov 2026 03:28:17 +0000
+Subject: [PATCH 27/31] moe cache: serve identity tables in place above the
+ band in mmap mode too
+
+r258 (TODO #133) takes an identity (fully resident) table over at any
+width, so the scheduler skips staging the expert input copy, but the
+sparse/mmap lookup get_table_locked still served identity tables only up
+to MOE_EXPERT_CACHE_MAX_TOK. Above 16 tokens the redirect declined and
+MUL_MAT_ID read the unstaged copy: NaN logits whenever the cache reached
+full residency (e.g. -ub 512 -c 8192, 276 identity tables), and a server
+in that state stayed broken after one long prompt. Use the shared
+moe_cache_width_serves_in_place, as the non-sparse branch does
+(MOE_EXPERT_PREFILL_IN_PLACE=0 still stages everything).
+
+Adds a warn-once MOE_INPLACE_MISS tripwire when a declined above-band
+redirect aliases an identity table the take-over serves.
+
+Production model: -ub 512 PPL 2.2453 (was nan); KLD vs the staged path
+0.000000, 100 % same top (rounding control 0.014); production server
+config unchanged (0 identity tables, all hashes equal) (FINDINGS 910).
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 11 +++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 15 +++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.h  |  4 ++++
+ ggml/src/ggml-cuda/moe-expert-tier.inc |  9 +++++----
+ 4 files changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f83b72a06..1162eab69 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6813,6 +6813,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+             dst->src[2] = saved_s2;
+             return;
+         }
++        // FINDINGS 909 tripwire: above the band a declined redirect should not be an identity table the take-over
++        // serves (its input copy would be unstaged).  Logged once; validation greps for it.
++        if (dst->ne[2] > MOE_EXPERT_CACHE_MAX_TOK && src0->buffer != nullptr &&
++                moe_cache_inplace_miss(dst, src0, ctx.device)) {
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                GGML_LOG_ERROR("%s: MOE_INPLACE_MISS: %s reads an unstaged expert copy (%s, %lld tokens)\n",
++                               __func__, dst->name, src0->name, (long long) dst->ne[2]);
++            }
++        }
+     }
+ 
+     GGML_TENSOR_BINARY_OP_LOCALS
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 8593f198c..239b2a5a5 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -11001,6 +11001,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
+     return n_tok <= MOE_EXPERT_CACHE_MAX_TOK || moe_cache_prefill_in_place();
+ }
+ 
++// FINDINGS 909 tripwire: a declined redirect above the band aliases an identity table the take-over serves at this width
++// (width rules drifting apart, or identity + `fill_failed`); blind to whether the take-over ran: a signal, not a proof.
++bool moe_cache_inplace_miss(const ggml_tensor * op, const ggml_tensor * weight_cpy, int device) {
++    if (!g_enabled || op == nullptr || weight_cpy == nullptr || !moe_cache_width_serves_in_place(op->ne[2])) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const int id = alias_find_checked(weight_cpy, device, name_layer(op));
++    if (id < 0) {
++        return false;
++    }
++    const table_t & t = g_tables[id];
++    return t.identity && t.arena != nullptr && t.slots >= t.n_experts;
++}
++
+ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy, int device,
+                          void ** arena, int64_t * n_slots,
+                          size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok) {
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 5ad58b6c9..de8973dca 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -399,6 +399,10 @@ void moe_cache_graph_begin(int device);
+ // an input hook runs on `device` (starts a new round after a graph compute)
+ void moe_cache_hook_begin(int device);
+ 
++// FINDINGS 909 tripwire: true when a declined redirect above the band aliases an identity table the take-over serves
++// at this width (the op may read an unstaged input copy)
++bool moe_cache_inplace_miss(const struct ggml_tensor * op, const struct ggml_tensor * weight_cpy, int device);
++
+ bool moe_cache_get_table(const struct ggml_tensor * op, const struct ggml_tensor * weight_cpy, int device,
+                          void ** arena, int64_t * n_slots,
+                          size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok);
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index e76055a96..c3ac5880f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -3034,11 +3034,12 @@ static bool get_table_locked(const ggml_tensor * op, const ggml_tensor * weight_
+         return false;   // never hand out the arena of a table whose fills failed
+     }
+     // Identity fast path: slot == expert, the whole table is resident, so the arena is indexed by the
+-    // raw routing ids and no remap (and no per-token host routing readback) is needed.  Restricted to
+-    // the decode/verify band: prefill keeps the normal path (its MMQ fusions and the MMQ dispatch read
+-    // the real copied buffer, and the shallow arena copy carries a null `buffer`).
++    // raw routing ids and no remap (and no per-token host routing readback) is needed.  At the same widths
++    // as `moe_cache_take_over` (r258, TODO #133: any width unless MOE_EXPERT_PREFILL_IN_PLACE=0): above the
++    // band the take-over skips staging the input copy, so declining here read the unfilled copy (NaN
++    // logits, FINDINGS 909).  The prefill fusions stand down for such a table (`moe_cache_table_serves`).
+     if (t.identity && t.arena != nullptr && t.slots >= t.n_experts &&
+-        op != nullptr && op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
++        op != nullptr && moe_cache_width_serves_in_place(op->ne[2])) {
+         g_get_ok += g_sig_probe ? 0 : 1;
+         if (arena)        *arena        = t.arena;
+         if (n_slots)      *n_slots      = t.slots;
+-- 
+2.53.0
+

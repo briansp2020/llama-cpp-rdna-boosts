@@ -1,7 +1,7 @@
-From a16763cbd55f81d9473e9abeb1af0f0d6a738c69 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 06:08:29 +0000
-Subject: [PATCH 14/23] cuda: graph eviction on the active clock again
+Subject: [PATCH 14/31] cuda: graph eviction on the active clock again
  (FINDINGS 519), on top of r236; keep upstream never-evicting the looked-up
  key
 
@@ -50,3 +50,6 @@ index 21dc20aae..27407419f 100644
              for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                  if (!(it->first == key) && time_now - it->second->last_used_time >= 10'000'000) {
                      it = cuda_graphs.erase(it);
+-- 
+2.53.0
+

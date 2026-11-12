@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 12 Nov 2026 04:20:06 +0000
+Subject: [PATCH 30/31] moe cache: a table is pool-backed only when the pool
+ was requested
+
+moe_cache_table_is_pool now also requires g_pool_requested, as
+table_pool_backed does. r262 records host sources without the pool, so a
+declined (sparse_off) table of --host-experts mmap could otherwise be
+treated as pool-backed and sent to the gather path. Safe direction: false
+only means the staging path. Also returns false for a GTT/APU pageable
+master when the pool was not requested (not exercised on discrete GPUs).
+Kill switch GGML_MOE_POOL_TABLE_REQ=0 (the r265 predicate).
+
+Production model: KLD 0 vs the r261 candidate, server hashes unchanged
+(FINDINGS 912).
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 239b2a5a5..15c10c973 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -7939,7 +7939,12 @@ bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device) {
+     std::lock_guard<std::mutex> lock(g_mutex);
+     for (const table_t & t : g_tables) {
+         if (t.device == device && t.host == (const void *) weight->data) {
+-            return !t.host_pinned && !t.host_sparse && t.src_known;
++            // A table is pool-backed only when the pool was asked for (`--host-experts pool`), as `table_pool_backed`
++            // requires: a declined (`sparse_off`) table of `--host-experts mmap` must never take the pool gather path,
++            // even if its host source ever registers (r262 records sources without the pool).  Kill switch
++            // GGML_MOE_POOL_TABLE_REQ=0 (the r265 predicate).
++            static const bool req = [] { const char * e = getenv("GGML_MOE_POOL_TABLE_REQ"); return e == nullptr || atoi(e) != 0; }();
++            return (!req || g_pool_requested) && !t.host_pinned && !t.host_sparse && t.src_known;
+         }
+     }
+     return false;
+-- 
+2.53.0
+

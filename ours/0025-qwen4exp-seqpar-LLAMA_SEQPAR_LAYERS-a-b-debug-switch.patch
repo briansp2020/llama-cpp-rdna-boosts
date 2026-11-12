@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Wed, 11 Nov 2026 21:07:20 +0000
+Subject: [PATCH 25/31] qwen4exp seqpar: LLAMA_SEQPAR_LAYERS=a-b debug switch
+ (token-split only layers a..b; default all)
+
+Used to bisect the half-depth model KLD (FINDINGS 899/900): splitting a single layer is enough to move
+that model, and the KLD shrinks with the depth of the split layer (layer 22 only: 0.0013), the
+signature of a rounding change amplified by an ill-conditioned model, not of wrong rows.
+---
+ src/models/qwen4exp.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 56e1302cb..d4e01765d 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1142,7 +1142,16 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+ 
+         // sequence parallelism: the PLE conv mixes tokens and the last layer drops output rows, so those run
+         // on the gathered streams; every other layer keeps them token-split
+-        const bool sp_layer = seqpar && il < n_layer - 1;
++        // LLAMA_SEQPAR_LAYERS=a-b (debug): split only layers a..b
++        static const std::pair<int, int> sp_range = [] {
++            const char * e = getenv("LLAMA_SEQPAR_LAYERS");
++            int a = 0, b = 1 << 30;
++            if (e != nullptr) {
++                sscanf(e, "%d-%d", &a, &b);
++            }
++            return std::make_pair(a, b);
++        }();
++        const bool sp_layer = seqpar && il < n_layer - 1 && il >= sp_range.first && il <= sp_range.second;
+ 
+         if (hparams.is_ple(il)) {
+             if (res_split) {
+-- 
+2.53.0
+

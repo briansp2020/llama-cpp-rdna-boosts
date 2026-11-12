@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 12 Nov 2026 06:25:22 +0000
+Subject: [PATCH 31/31] mmq: RDNA4 IQ routed-compact experts with 65-96 rows
+ per expert use J=64
+
+At -ub 4096 with 10 of 512 experts (80 rows per expert) the IQ / Q2_0
+band picked the 128-wide token tile. On gfx1201 the 64-wide tile is
+faster: prefill +0.9..2.1 % (31.5k, midpf, 101k, 259.6k, two rounds),
+all output hashes identical (J only re-tiles the token columns). Only
+iq2_s / iq3_s / iq3_xxs / iq4_nl at 80 rows were measured; the rest of
+the band is extrapolated. Overrides mmq_rdna3_5_id_get_J's 128 band at
+the call site, so that table and its comment in mmq.cuh still read 128
+for RDNA4. Kill switch GGML_MMQ_IQ_J64_WIDE=0 (FINDINGS 914-915).
+---
+ ggml/src/ggml-cuda/mmq.cu | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index a95be7004..88e6b3182 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -227,6 +227,20 @@ static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, co
+             if (type == GGML_TYPE_Q6_K && q6_compact_j >= 0) {
+                 J_rdna3_5 = q6_compact_j;
+             }
++            // RDNA4, IQ / Q2_0 expert types: 65-96 rows per expert (e.g. -ub 4096 x 10 of 512 experts = 80) take the
++            // 64-wide tile instead of 128 (overrides get_J's band): prefill +0.9..2.1 % on gfx1201, bit-identical, measured at
++            // 80 rows for iq2_s/iq3_s/iq3_xxs/iq4_nl only (the rest of the band is extrapolated; FINDINGS 914-915).  Kill switch GGML_MMQ_IQ_J64_WIDE=0.
++            static const bool iq_j64_wide = [] {
++                const char * env = getenv("GGML_MMQ_IQ_J64_WIDE");
++                return env == nullptr || atoi(env) != 0;
++            }();
++            const bool iq_band_type = type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS ||
++                type == GGML_TYPE_IQ2_S || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL ||
++                type == GGML_TYPE_IQ4_XS;
++            if (iq_j64_wide && iq_band_type && GGML_CUDA_CC_IS_RDNA4(cc) && !use_j48_128e && J_rdna3_5 == 128 &&
++                    rows_per_expert > 64 && rows_per_expert <= 96) {
++                J_rdna3_5 = MMQ_IQ_ID_J_MID;
++            }
+             if (J_rdna3_5 != 0) {
+                 const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_rdna3_5, fallback, cc, prec_src1);
+                 if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+-- 
+2.53.0
+

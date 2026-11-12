@@ -1,7 +1,7 @@
-From 28b589d4deff2e3ec26e473a3927c6562b558089 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 01:35:28 +0000
-Subject: [PATCH 12/23] cuda: copy-engine all-reduce, single exchange for 2
+Subject: [PATCH 12/31] cuda: copy-engine all-reduce, single exchange for 2
  ranks (GGML_CUDA_AR_CE_SINGLE)
 
 ---
@@ -9,10 +9,10 @@ Subject: [PATCH 12/23] cuda: copy-engine all-reduce, single exchange for 2
  1 file changed, 43 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index c511e1c5c..b891e84c5 100644
+index 22f3855c2..3886f9cb2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3893,6 +3893,24 @@ static __global__ void ggml_cuda_ce_add_bf16(const nv_bfloat16 * __restrict__ a,
+@@ -4025,6 +4025,24 @@ static __global__ void ggml_cuda_ce_add_bf16(const nv_bfloat16 * __restrict__ a,
      }
  }
  
@@ -37,7 +37,7 @@ index c511e1c5c..b891e84c5 100644
  static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
      const int64_t ne = ggml_nelements(tensors[0]);
      if (ne == 0) {
-@@ -4011,6 +4029,31 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -4294,6 +4312,31 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
          }
      }
  
@@ -69,3 +69,6 @@ index c511e1c5c..b891e84c5 100644
      // phase 1a: dev i ships its chunk c to dev c, which owns the reduced chunk c.
      // tmp1 is reused across calls, so wait for the peer's previous phase-1b read -- that record is
      // from the previous call, so this wait does not stall.
+-- 
+2.53.0
+

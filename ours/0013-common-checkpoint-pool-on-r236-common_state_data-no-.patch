@@ -1,7 +1,7 @@
-From 731cda606a6e847681c3629d0e9a86825285c44a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 06:08:29 +0000
-Subject: [PATCH 13/23] common: checkpoint pool on r236 common_state_data
+Subject: [PATCH 13/31] common: checkpoint pool on r236 common_state_data
  (no-init allocator), pages still touched by the pool thread
 
 ---
@@ -61,3 +61,6 @@ index 567c6b588..66b21ff35 100644
      static ckpt_pool * pool = new ckpt_pool();
      return pool->on && dst.empty() && pool->take(kind, dst, n);
  }
+-- 
+2.53.0
+

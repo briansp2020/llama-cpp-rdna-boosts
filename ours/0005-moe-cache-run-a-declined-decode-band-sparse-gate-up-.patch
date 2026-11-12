@@ -1,7 +1,7 @@
-From bf69a0eff83b2a91a4bac291449b84d432096aa5 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:24:54 +0000
-Subject: [PATCH 05/23] moe cache: run a declined decode-band sparse
+Subject: [PATCH 05/31] moe cache: run a declined decode-band sparse
  gate+up+GLU unfused (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 The fused read of the scheduler copies gave NaN output at tight pin budgets; the per-op path reads the same copies correctly.
@@ -11,10 +11,10 @@ The fused read of the scheduler copies gave NaN output at tight pin budgets; the
  2 files changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 7115e505b..8ef94ef1e 100644
+index f6c46047a..7003dcb11 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2675,8 +2675,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2706,8 +2706,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                      fusion_local.gate_ids = &gate_ids_c;
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
                  } else if (ids != nullptr &&
@@ -27,10 +27,10 @@ index 7115e505b..8ef94ef1e 100644
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                  }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index b652fe390..d625782d5 100644
+index 5ad58b6c9..50bfb7d8a 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -398,6 +398,11 @@ bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_te
+@@ -444,6 +444,11 @@ bool moe_cache_prefill_in_place_enabled();
  bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
                                  const struct ggml_tensor * gate, int device);
  
@@ -42,3 +42,6 @@ index b652fe390..d625782d5 100644
  bool moe_cache_redirect_fused(const struct ggml_tensor * op,
                                const struct ggml_tensor * src0,
                                const struct ggml_tensor * gate,
+-- 
+2.53.0
+

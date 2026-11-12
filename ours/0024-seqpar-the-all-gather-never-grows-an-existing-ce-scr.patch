@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Wed, 11 Nov 2026 19:34:57 +0000
+Subject: [PATCH 24/31] seqpar: the all-gather never grows an existing ce
+ scratch (Fable review); GGML_SEQPAR_CE_GATHER=0 test switch
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9e10a1f4e..f83b72a06 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4539,7 +4539,9 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
+     }
+     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+     const int n = (int) comm_ctx->backends.size();
+-    if (n < 2 || !comm_ctx->ce_ready || comm_ctx->world_size > 0) {
++    // TEST (FINDINGS 896): GGML_SEQPAR_CE_GATHER=0 declines, so the meta backend takes its generic gather
++    static const bool ce_gather = [] { const char * e = getenv("GGML_SEQPAR_CE_GATHER"); return e == nullptr || atoi(e) != 0; }();
++    if (!ce_gather || n < 2 || !comm_ctx->ce_ready || comm_ctx->world_size > 0) {
+         return false;
+     }
+     const ggml_type type = dst[0]->type;
+@@ -4560,9 +4562,12 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
+     // all-reduce of a 2560-wide activation already takes 20 MiB) or what is already there; chunk anything
+     // larger rather than growing the three scratch buffers for it.
+     {
++        // Fable review (FINDINGS 895): never grow a scratch that already exists -- growth retires the old buffers
++        // until teardown (~72 MiB per GPU at -ub 4096).  Chunk through what is there; only an empty scratch is
++        // created (up to 24 MiB).
+         const size_t want = (size_t) (n - 1) * (size_t) n_max * esz;
+-        const size_t cap  = std::max(comm_ctx->ce_bytes, (size_t) 24 << 20);
+-        if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, std::min(want, cap))) {
++        const size_t need = comm_ctx->ce_bytes > 0 ? comm_ctx->ce_bytes : std::min(want, (size_t) 24 << 20);
++        if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need)) {
+             return false;
+         }
+     }
+-- 
+2.53.0
+

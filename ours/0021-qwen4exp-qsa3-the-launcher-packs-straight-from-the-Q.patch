@@ -1,7 +1,7 @@
-From 2fcbeb560cd125dd0a1dc64cc6038e9564a5f938 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 02:48:30 +0000
-Subject: [PATCH 23/23] qwen4exp qsa3: the launcher packs straight from the
+Subject: [PATCH 21/31] qwen4exp qsa3: the launcher packs straight from the
  Q8_0 cache views, no F16 copies in the graph (LLAMA_QSA3_PACK_Q8)
 
 ---
@@ -220,3 +220,6 @@ index fc3d3226d..bb1e75974 100644
          }
  
          ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
+-- 
+2.53.0
+

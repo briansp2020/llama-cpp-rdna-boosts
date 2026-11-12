@@ -1,7 +1,7 @@
-From bc8ff07c901fff109171e96d155c14e54fee9824 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 17:56:22 +0000
-Subject: [PATCH 16/23] sched: on multi-device backends, skip the alloc_splits
+Subject: [PATCH 16/31] sched: on multi-device backends, skip the alloc_splits
  drain when no buffer grows (GGML_SCHED_DEFER_ALLOC_SYNC)
 
 Every prompt ubatch re-reserves its graph (the KV views grow), and with more than one device (or a META
@@ -16,10 +16,10 @@ GGML_SCHED_DEFER_ALLOC_SYNC=0 restores the drain; 2 = drain right after the new 
  1 file changed, 19 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index c17e8982e..95b6127c2 100644
+index 0a9f24851..aa248c232 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -2778,11 +2778,22 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2824,11 +2824,22 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
          // be using.
          const bool buffers_grown = ggml_gallocr_reserve_n_probe(
                  sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
@@ -45,7 +45,7 @@ index c17e8982e..95b6127c2 100644
              }
  
              if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-@@ -2794,6 +2805,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2840,6 +2851,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
              GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              return false;
          }
@@ -57,3 +57,6 @@ index c17e8982e..95b6127c2 100644
      }
  
      return true;
+-- 
+2.53.0
+

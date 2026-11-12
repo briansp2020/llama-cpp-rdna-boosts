@@ -3,7 +3,7 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-a691b2345-r251` (upstream llama.cpp `a691b2345` + this repo's release).
+**Base:** `v17-a691b2345-r265` (upstream llama.cpp `a691b2345` + this repo's release).
 The rest of this branch is that release as published; only `ours/` is added.
 
 **New layout (2026-11-08).** Up to r228 this was a 55-patch series (0000-0054) that replaced the release's
@@ -17,17 +17,17 @@ The old series is kept as the tag `ours-r228-series`; the mapping table below sh
 
 ```
 git checkout a691b2345
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r251 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 23 patches (0001-0023)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r265 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 31 patches (0001-0031)
 ```
 
-Result: tree `ac37e5000f32`. This is the production build from 2026-11-11 (2 GPUs, `-sm tensor`).
+Result: tree `d6ece8b5f7be`. This is the production build from 2026-11-12 (2 GPUs, `-sm tensor`).
 
 ## Patches
 
-The release has taken the r236 series' 0009 (`DSV4_HC_POST` fusion), 0011 (fusion overlap check for compute-buffer
-leaves), 0014-0015 (PLE gather threads / direct), 0017 (BF16 producer copies) and 0018 (their review fixes); they are
-dropped here. The numbers below are the r251 series.
+The release has taken the r251 series' 0018 (DeepSeek-V4 cache size probes) and 0021 (DeepSeek-V4.1 kq-mask probe, issue
+#300, fixed in r254); they are dropped here. Earlier releases took the r236 series' 0009, 0011, 0014-0015, 0017 and 0018.
+The numbers below are the r265 series.
 
 | | what | env switch (off) |
 |---|---|---|
@@ -46,17 +46,40 @@ dropped here. The numbers below are the r251 series.
 | 0013 | the checkpoint pool uses `common_state_data` (no-init allocator); the pool thread still touches every page | - |
 | 0014 | CUDA graph eviction counts active time only (idle gaps capped at 1 s), and keeps the rule that the looked-up graph is never evicted | - |
 | 0015 | qwen4exp: PLE page hints (`MADV_WILLNEED`) only when a `mincore` sample says the table is cold (~13 ms per 4096-token ubatch saved) | `LLAMA_PLE_ADVISE=1` (always advise) |
-| 0016 | `-sm tensor`: graph inputs in pinned memory (the meta device's first child host buffer type) and uploaded asynchronously per device; host compute buffers kept across the drop | `LLAMA_META_HOST_BUFT=0`, `GGML_SCHED_ASYNC_USER_INPUT=0`, `GGML_GALLOC_DROP_HOST=1` |
-| 0017 | multi-device: `alloc_splits` skips the drain when no buffer grows | `GGML_SCHED_DEFER_ALLOC_SYNC=0` |
-| 0018 | DeepSeek-V4 cache size probes use a full-cache context (stops the `cpy_k` assert on the first DeepSeek-V4.1 decode with host experts) | - |
-| 0019 | meta: the split-input copy of a split host weight is sized at the largest device slice, not the whole tensor | `GGML_META_SLICE_ALLOC=0` |
-| 0020 | moe cache: a device-remap call does not re-batch a sibling already taken over in the same round | `GGML_MOE_DEVREMAP_REBATCH=1` |
-| 0021 | DeepSeek-V4.1 skips the derived-kq-mask probe on its multi-stream cache, like DeepSeek-V4 (issue #300; the release fixed it in r254) | `LLAMA_DS41_MULTI_STREAM=0` |
-| 0022 | qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy; the gate copy runs before attention on prefill-sized graphs | `LLAMA_QSA3_DIRECT_F16=0`, `LLAMA_GATE_EARLY=0` |
-| 0023 | qwen4exp qsa3: the packs read the Q8_0 cache views directly, no F16 copies in the graph | `LLAMA_QSA3_PACK_Q8=0` |
+| 0016 | multi-device: `alloc_splits` skips the drain when no buffer grows | `GGML_SCHED_DEFER_ALLOC_SYNC=0` |
+| 0017 | `-sm tensor`: graph inputs in pinned memory (the meta device's first child host buffer type) and uploaded asynchronously per device; host compute buffers kept across the drop | `LLAMA_META_HOST_BUFT=0`, `GGML_SCHED_ASYNC_USER_INPUT=0`, `GGML_GALLOC_DROP_HOST=1` |
+| 0018 | meta: the split-input copy of a split host weight is sized at the largest device slice, not the whole tensor | `GGML_META_SLICE_ALLOC=0` |
+| 0019 | moe cache: a device-remap call does not re-batch a sibling already taken over in the same round | `GGML_MOE_DEVREMAP_REBATCH=1` |
+| 0020 | qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy; the gate copy runs before attention on prefill-sized graphs | `LLAMA_QSA3_DIRECT_F16=0`, `LLAMA_GATE_EARLY=0` |
+| 0021 | qwen4exp qsa3: the packs read the Q8_0 cache views directly, no F16 copies in the graph | `LLAMA_QSA3_PACK_Q8=0` |
+| 0022 | `-sm tensor` ubatch overlap: asynchronous graph-input views, asynchronous CPU-split output upload, deferred input wait | `GGML_SCHED_ASYNC_INPUT_VIEWS=0`, `GGML_SCHED_ASYNC_CPU_OUT=0`, `LLAMA_DEFER_INPUT_WAIT=0` |
+| 0023 | qwen4exp sequence parallelism: in 2-GPU `-sm tensor` prefill the hyper-connection work (mixers, residual streams, norms) is split by token instead of computed on both GPUs; reduce-scatter + all-gather around attention and the FFN | opt-in `LLAMA_SEQPAR=1` (production sets it) |
+| 0024 | seqpar review fix: the all-gather never grows an existing copy-engine scratch | `GGML_SEQPAR_CE_GATHER=0` (generic gather) |
+| 0025 | seqpar debug switch: token-split only layers a..b | `LLAMA_SEQPAR_LAYERS=a-b` (default all) |
+| 0026 | decode MoE gate+up+GLU fusion when the GLU output overlaps only the unfilled weight copy (41 of 47 layers were blocked) | `GGML_MOE_FUSE_COPY_ALIAS=0` |
+| 0027 | moe cache: identity (fully resident) tables are served in place above the band in mmap mode too; fixes NaN at small ubatches since r258, with a warn-once `MOE_INPLACE_MISS` tripwire | `MOE_EXPERT_PREFILL_IN_PLACE=0` |
+| 0028 | seqpar: the two per-layer `hc_mixed` all-gathers send bf16 (rounding-level KLD, 0.013) | opt-in `LLAMA_SEQPAR_GATHER_BF16=1` (production sets it) |
+| 0029 | seqpar: odd token counts split ceil/floor | `LLAMA_SEQPAR_ODD=0` |
+| 0030 | moe cache: a table is pool-backed only when the pool was requested | `GGML_MOE_POOL_TABLE_REQ=0` |
+| 0031 | mmq: RDNA4 IQ routed-compact experts with 65-96 rows per expert use J=64 (+1-2 % prefill at `-ub 4096`, bit-identical) | `GGML_MMQ_IQ_J64_WIDE=0` |
 
 0005, 0006 (down-fold part) and 0009 were workarounds for the bug the release's fusion overlap check fixes at the source;
 0010 removes 0005. The others only run after a decline or a failed fill.
+
+Production also sets `MOE_HOST_POOL_TRANSPORT=map` (pins the host-read transport the r262 adaptive mode would otherwise pick).
+
+## Validation on r265 (2026-11-11 and 2026-11-12, Radeon AI PRO R9700 x 2, ROCm 10.1)
+
+- Rebase of the r261 series onto r265: two conflicts in the cache header / cache file, both resolved by keeping both sides.
+  KLD against the r261 series 0 (seqpar off and on); the bf16 gather 0.0138 against a rounding-only control of 0.0138.
+- 0027: `llama-perplexity` at `-ub 512 -c 8192` on the production config gave `nan` before the fix and 2.2453 after (= the
+  kill switch); KLD against the staged build 0. 0030, 0031: all output hashes identical.
+- Nightly on the final tree: the 7-model comparison and the gate passed (0 problems), test-backend-ops only the known
+  `MUL_MAT` f16 case; four stress sessions (1-GPU byte-verify, 2-GPU tensor, pipelined layer split, 2-GPU production
+  config): 56 rounds, 0 greedy mismatches, 0 faults, 0 byte differences in the expert cache.
+- Production (2-GPU tensor, `-ub 4096`, `--n-cpu-moe 47 --host-experts mmap`, MTP): 31.5k prefill 3926-3998 t/s, 101k
+  3808, 259.6k needle 3296 (correct); greedy decode 131-139 t/s. Against the r251 series: prefill +11-14 %, decode equal or
+  slightly up. 2-GPU layer split on the same build is 38-69 % slower than tensor (prefill 2040-2379 t/s).
 
 ## Validation on r251 (2026-11-10, Radeon AI PRO R9700 x 2, ROCm 10.1)
 
