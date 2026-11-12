@@ -1523,7 +1523,9 @@ change), and let `WORKLOG.md` carry the narrative.
   where the ceiling cannot cover one slot.  Same rule for a concentration fit: it must be fitted *to* the ceiling,
   because a uniform rescale of a fitted plan collapses it back to uniform.
 - **At `-ncmoe 48` on a three-device split the expert set is fully VRAM-resident, and the DEFAULT mode still
-  re-copies it out of the arena on every prefill ubatch (r207, `TODO` #133).**  The arena sizes to
+  re-copies it out of the arena on every prefill ubatch (r207, `TODO` #133 — FIXED in r258: an identity table is
+  served in place at any width, see the r258 section at the end of this file).**  Kept for the measurement:
+  the shape has to stay recognisable.  The arena sizes to
   `67110.0 MiB of 67110.0` (256/256 slots/table, identity), yet the prefill stages **61 GiB for a 3049-token
   prompt** with `arena=61031.5 MiB host=510.5 MiB` — 99.2 % of it read back out of VRAM into the op's per-split
   weight buffer, once per table per ubatch, serialised against the compute (copy table -> compute -> copy next) at
@@ -1699,7 +1701,8 @@ cost a session to learn; do not re-derive them.
 2. **The measured cost of getting this wrong is the POPULATION, not the steady state.**  On a 113 GB Flash-Next, 2 devices,
    `-ncmoe 48 -lme 60` (host expert set 71.7 GiB, pool 60 GiB, `per_layer_token_embd` 26.8 GiB host-resident): O_DIRECT fills read
    **97 692 × 1.0 MiB = 95.20 GiB at 2 785 MiB/s in 35.8 s** of drive time, all of it inside the load/first-prefill window
-   (`TODO` #142), which reads as "prefill is reading every weight from disk".  Buffered: the same 95.20 GiB at **4 062 MiB/s in
+   (`TODO` #142 — that row retired in r258; the window is the load/first-prefill one, not a per-ubatch disk read),
+   which reads as "prefill is reading every weight from disk".  Buffered: the same 95.20 GiB at **4 062 MiB/s in
    24.8 s**, and the pages stay reusable.  Nothing is evicted either way (`evictions=0`, `h=0.9073`).
 3. **`-lme N` is a byte budget, so N below the host expert set is a SUB-COVER pool, and the model's expert count decides the
    coverage.**  On a 512-expert/layer model, `-lme 60` against a 71.7 GiB set is 428 slots of 512 = **84 %**, not "it fits"; the
@@ -2870,7 +2873,8 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   **276 KiB** as int32 residency ids and **~1.5 MiB** with per-expert {VA, host} offsets and the ids remap.  A
   unified store is therefore a VA reservation with VRAM backing for a resident subset (block 15's pattern at expert
   granularity) -- and it must stay **yieldable**: a raw `cudaMalloc` outside the slab is the pre-slab crash mode
-  (issue #136), because a wide prefill's transient work needs that VRAM (`TODO` #285).
+  (issue #136), because a wide prefill's transient work needs that VRAM (`TODO` #285, **declined at r252**: see the
+  r252 section below for the stand-down census and the reopen conditions).
 - **`--load-mode none` silently disables the `--host-experts pool`** (`a pool needs a mapped load`), so a
   `runme` built on it runs the bulk/pageable path its own comments do not describe.  Read
   `report_host_expert_placement` before attributing anything to the pool.
@@ -3033,7 +3037,9 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   stable (`1e944569dbd6`).  So it is not a residency/thrash effect and not a text-noise effect -- the resolve
   itself is wrong, at least partly racily.  The **window** (Goal A, one VA range, no mirror) and the sparse decode
   arm are fine on the same box (`be904e86f248`, identical to gfx1201), which is what localises the defect to the
-  mirror/pool tier rather than to the KV placement.  Until fixed, do not claim the pool for gfx1151 (`TODO` #300).
+  mirror/pool tier rather than to the KV placement.  Do not claim the pool for gfx1151 -- it is **refused there by
+  design** since r264 (`TODO` #300 retired): see the r264 entry at the end of this file.  Do not "fix" the
+  resolve for UMA: the pool's premise (buy device memory back from a separate host tier) does not exist there.
 - **A single `rocprofv3 --kernel-trace` run cannot resolve a sub-1.5 % kernel delta — measure twice, and argue from
   the arm (r236, `TODO` #303).**  Two consecutive traces of the **same** binary gave dense-`mul_mat_q` totals of
   521.26 and 527.11 ms: a **±1.1 % run-to-run floor**, larger than the effect being chased.  Per-kernel numbers need
@@ -3060,7 +3066,7 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   for a `≤8`-token pass (which only a warmup provides) and the H2D staging ring stages the expert tables before the
   host path can register them, so the run reports `tables=0`, `arena 0.0 MiB`, `prefill cache staging: nomatch=<N>`.
   With the arena armed the same arm reads **1116-1202 t/s** against 438 unarmed and 529 for unpatched upstream
-  (`wip/prefill-arena-arm/`), and every ubatch it saves is a whole host-expert set that is not streamed
+  (`archive/work/prefill-arena-arm/`), and every ubatch it saves is a whole host-expert set that is not streamed
   (`host_bytes / H2D GB/s` per ubatch — the `-ub` sweep is exactly that law).  What remains true of the original
   entry: the random-token shape has no locality to exploit *within* one ubatch, so an A/B of the pool/arena/host
   transport must still be driven with real text (`llama-cli -f prompts/prose-rdna-boosts.txt -n 0`, gate step 5b) —
@@ -3131,7 +3137,8 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   is `moe_cache_register` (an iface hook, called for every split's routed host-expert inputs at the top of
   `ggml_backend_sched_compute_splits` while `moe_cache_pending`) plus arming at registration; measured **438 ->
   1209 t/s** (1 GPU), **799 -> 2457** (2 devices `-sm tensor`), with decode, real-text prefill and greedy text
-  inside noise/identical.  Feeds `TODO` #133 (the staged fill still assembles the whole table out of the arena).
+  inside noise/identical.  Fed `TODO` #133 (the staged fill still assembled the whole table out of the arena);
+that half is closed in r258 — an identity table is now served in place at any width.
 - **A `-sm tensor` table can only be discovered WITHOUT routing (r237).**  The Meta `moe_cache_update` declines
   every `n_tok > band`, by design (reading the routing back on every prefill op is the sync the band exists to
   avoid), so a prefill-only tensor-split run never observes its table set from the op path.  Any table-set
@@ -3762,3 +3769,381 @@ Two `TODO` handles closed in one release (`#283`, `#270`). Facts:
    reaches it (`Setting stream no to` appears in no log at `-lv 5`).  Proven non-vacuous by reintroducing
    `branch_idx + 1`: the mapping assert fires (`GGML_ASSERT(!ggml_cuda_is_copy_stream_index(branch_stream))
    failed`, exit 134) and `is_valid()`'s range assert fires on a model whose events pass the overlap check.
+
+## r252 -- `TODO` #287 closes (the `MUL_MAT_ID` duplicate-id candidate was a *helper* bug, not a kernel gap) and #285 closes as declined (the unified expert store is robustness for a free baseline)
+
+Docs/artifact only: the delivery tree is unchanged. Facts:
+
+1. **Upstream `#31047`'s `tile_spec` grid already supports a compact `MUL_MAT_ID` column list of *arbitrary*
+   width, so a duplicate-id re-cut needs no `mmq.*` change at all.**  `mmq.cu` already launches
+   `ntj = ceil(n_tokens*n_expert_used / J) + n_experts` blocks and passes `J` as the seam width to the helper;
+   `mmq.cuh` reads `tile_spec[jt]` per tile, reads `ids_dst` through shared memory and has a `tile_spec`-aware
+   stream-k fixup.  `mul_mat_f_ids` is **one block per `tile_spec` entry** (`blockIdx.y` is the tile), so its
+   store loop's `return` is correct there -- the `continue`/per-tile-`C` rule belongs to the pre-`#31047`
+   kernel.  The old campaign's "the MMQ/MMF ids kernels are still missing" was a **wrong diagnosis**: the
+   candidate failed because of (2), and the recorded page fault was a symptom, exactly as the original
+   `quantize_mmq_q8_1` fault was a symptom of the helper's dedup.
+2. **A per-occurrence ids compaction is only correct if `nex_prev` is warp-reduced *before* the write pass, and
+   `it_compact` is never reduced afterwards** (it is accumulated from already-warp-wide counts, so it is
+   warp-uniform by construction).  Get it wrong and every expert writes at a lane-local offset: the F16/MMF
+   cases are wrong at *every* width (ERR 0.4-1.8 against 5e-4) and the quantized/MMQ case page-faults inside
+   `mul_mat_q<…>` once a tile reads a garbage `tile_spec`/`ids_dst`.  The 2026-11-08 candidate had exactly this
+   bug and it is what the "missing kernel" was blamed for.
+3. **Removing the compact-MMF width gate requires pinning the column tile to the seam-grid width and
+   re-zeroing/re-storing per tile -- otherwise the narrow path silently drops the tail of every expert's
+   range.**  That is the delivery's `#304` signature (`f16`, `ncols_dst` 9: ERR 0.374, no fault): `mmf.cu`
+   builds the `tile_spec` grid with a 16-column stride while `mul_mat_f_switch_cols_per_block` picks
+   `cols_per_block = ncols_dst` (1..16), so one block processes only that many of its tile's 16 columns.  It is
+   a **base** bug that the old `> 16` gate happened to make unreachable; a patch that compacts every width must
+   carry the fix.  Upstream candidate: `upstream/mul-mat-id-dup/` (sha256 `a8060ef1…`), validated on a pristine
+   `a691b2345`: `dup=1` **16/16**, `MUL_MAT_ID` 947/947, `MUL_MAT` 2517/2517, no GPU fault, and a `tile_spec`
+   census proving coverage (launched tiles cover exactly `n_tokens*n_expert_used` compact columns, and one
+   expert's range is wider than the token count -- 60 columns for 9 tokens, 475 for 64 -- which only a repeated
+   id can produce).  The delivery already reads 16/16 at tree `5fbe6aff5` (its cases are enabled in block 08).
+4. **The transient expert-table stand-down still exists and is a *high-residency, prefill-only* phenomenon, not
+   a general prefill cost.**  Measured 2026-11-10 (gfx1201, r251 build, `-c 32768`, `-ub 8192`, a 16 k-token
+   prompt, `-lv 4`):
+   * Flash-Next GSQ-RCO IQ3_S, 1 GPU, `-ncmoe 48`: arena 23 992.5 MiB, 144 tables, **47.87 %** of the routed mass
+     resident -> `evicted 5698.0 + 228.0 MiB of arena tables ... 32 + 1 table(s) stood down`, then
+     `re-armed 33 ... after a compute-buffer drop`; prefill **901.5 t/s**, decode **42.1 t/s**.
+   * 35B-A3B Q4_K_M, 1 GPU, `-ncmoe 40`: arena 18 600 MiB, **100 %** coverage -> **no stand-down**; prefill
+     **4310.5**, decode **106.9**.  Same model, `MOE_EXPERT_CACHE_MIB=8000` (56.5 %): **no stand-down**;
+     prefill **2783.6**, decode **63.0** (lower for the residency reason, not the stand-down).  2 devices
+     `-sm tensor -ncmoe 48` (2 x 9300 MiB, 100 %): **no stand-down**; prefill **5387.3**, decode **84.2**.
+   So the stand-down fires only where the arena is squeezed against a wide prefill's compute buffer, it is
+   re-armed at the compute-buffer drop before decode, and r234 measured its fallback **free** (1826 t/s
+   declined vs 1824 staged, +-0.1 %; the pinned tier's staging kernel is -10 %).  A verdict on a stand-down
+   that reads rates without the `evicted/re-armed` lines is measuring residency, not the fallback.
+5. **`TODO` #285 (a unified expert store: one VA per device, expert-granular residency) is DECLINED, not
+   deferred for a rate.**  Its structural motivation is (4), and (4) is transient, prefill-only, re-armed and
+   free at the fallback; its byte claim is nil (every prefill ubatch routes essentially the whole table, and a
+   host-backed page read in place is 33 GB/s serialised against the copy engine's 55.8 GB/s overlapped).  What
+   is left is collapsing three representations (arena slots, ring slot, `input_cpy`) and three sizing rules
+   into one -- a large rewrite that must stay **yieldable** (backing outside the movable boundary is the
+   pre-slab crash mode, issue #136) and that must not be built on block 15's VMM region (whole-unit mapping,
+   refuses an idle-slot park on a region-backed cache).  Reopen conditions are in `WORKLOG.md`
+   261110.008: a stood-down table that is *not* re-armed for the rest of a run, a measured
+   prefill loss the bulk fallback cannot explain, or a new consumer that needs expert-granular residency to
+   survive a prefill without re-filling.
+
+## r253 — a cache hook that issues DEVICE copies must make its own device current (GitHub issue #294)
+
+* **The scheduler does not manage a device.**  `ggml_backend_sched` calls the MoE cache's backend hooks
+  (`moe_cache_update`, `register`, `gather`, `remap`, `take_over`) from `ggml-backend.cpp` between splits,
+  and nothing on that path makes that backend's device current: the device left current is whichever split
+  ran last.  Every *other* hook in `ggml-cuda-moe-cache-hooks.cu` opens with `ggml_cuda_set_device(...)`;
+  these four did not, so on a multi-device box the arena fill (`cudaMemcpyAsync`/`cudaMemcpy2DAsync` plus
+  the `cudaHostAlloc` bounce entry a pageable master needs) resolved against the wrong device.
+* **On one device the two always agree**, which is why the defect was invisible for 250 revisions and why a
+  single-GPU arm can never reproduce it.  Measured here first as a temporary print (r253 campaign): with
+  2 devices and `MOE_EXPERT_CACHE_MIB=2048`, every demand fill fired as
+  `layer=14 role=blk.14.ffn_gate_exps.weight dev=0 current=1`.
+* **A `hipEventQuery` error is not "drained".**  `bounce_acquire` treats everything except
+  `hipErrorNotReady` as ready.  A handle from another device's context (or any swallowable error) therefore
+  hands a pinned bounce entry back while its H2D may still be reading it, which tears the next expert's
+  bytes into an arena slot.  It is now reported on stderr (once) rather than reused in silence.
+* **The tripwire, and how to read a report.**  `moe_cache_update_host` now switches to the table's device and
+  prints one `fprintf(stderr)` line if its caller left a different one current.  Both lines are on stderr
+  because `llama-cli`'s default threshold is ERROR (the same reason the `DEGENERATE TENSOR SPLIT` line is);
+  a reporter's start-up log is the only place they can be seen.  `MOE_EXPERT_CACHE_VALIDATE=3` is *not*
+  the instrument for this class: the fill and the validator share `src_off`, so a wrong-device fill that
+  lands is consistent with the comparison and the byte compare stays silent.
+* **Inert where it matters, measured.**  gfx1201, r253 vs the r251 tree: coherence anchor
+  `1c5d32ac537d` (4B Q8_0, 1 GPU and 3-GPU `-sm tensor`, unchanged since r152) and the field arm
+  (Flash-Next GSQ-RCO IQ3_S, 2 devices, `-ts 24,16 -ncmoe 34 -lm none -c 65536`, `prompts/recall.txt`,
+  `-n 64`) `776 chars sha=d80ffbb6d77e` — byte-identical in `-sm tensor` **and** `-sm layer`, and identical
+  to the r245 record.
+
+## r254 — a DSV4 synthetic reserve probe needs a FULL-cache context, and a 2-D copy into a slab view is refused (GitHub issue #300)
+
+* **A dsv4 reserve probe must not be built against the live memory context.**  `llama_kv_cache_dsv4_raw_context`
+  sizes its write indices from its own applied ubatch (`build_input_k_idxs`: `ubatches_write[i_next].n_tokens`),
+  while both synthetic probes in `process_ubatch` reserve a `n_verify`-token graph.  Against the live context
+  those differ by construction (the live write ubatch is the pass in flight), so `k_cur->ne[2] != k_idxs->ne[0]`
+  and `cpy_k` takes its multi-stream branch with a one-stream `sinfo` and aborts
+  (`GGML_ASSERT(sinfo.n_stream() > 1)`).  `memory->init_full()` has no write ubatch (its `k_idxs` follows the
+  reserve) and its stream layout is the cache's persistent one -- `n_seq_max` for dsv4, whose caches pin unified
+  to false -- which is the shape `sched_reserve()` reserves with.  Probe with that context and
+  `cparams.n_seq_max`; every other arch keeps the live context and `ubatch.n_seqs_unq`.
+* **The probe is not arch-specific: `deepseek4` aborts on it too** (a real DeepSeek-V4-Flash Q8_K_XL at
+  `-sm layer -ot exps=CPU`, r253 tree).  The issue's second assert needed no new arch list to reproduce, only a
+  host-expert placement; what `LLM_ARCH_DEEPSEEK41` *does* need is to be in `dsv4_cache` so V4.1 takes the same
+  probe (and `cparams.n_seq_max`), and in `resolve_fused_ops`' `multi_stream` so the derived-kq-mask probe is
+  skipped on its always-per-sequence cache.
+* **The `multi_stream` arch entry only matters in unified mode.**  With the default `kv_unified = false`,
+  `!cparams.kv_unified` already makes every arch multi-stream, so an arm without `--kv-unified` cannot see the
+  missing `LLM_ARCH_DEEPSEEK41` entry at all.  The repro that does: `llama-server -np 4 --kv-unified` on the
+  `test-llama-archs -a deepseek41 -o <dir>` fixture → `deepseek41.cpp:552 GGML_ASSERT(ci.kq_mask->ne[1] == n_tok)`.
+* **A `cudaMemcpy2DAsync` into a movable-boundary-slab range is refused by the driver, asynchronously.**  The
+  refusal is the one `ggml_cuda_cpy_as_memcpy_2d` already guards the CPY path against, and it is not about the
+  pointers: `hipPointerGetAttributes` reports the current device and type-device for both, 1-D copies into the
+  same bytes succeed, and a 2-D copy `dst -> dst` fails.  It surfaces at the *next* `CUDA_CHECK` as
+  `ROCm error: invalid argument` naming whatever line checks first, which is how it was first misread as a
+  top-k sharding bug.  `top_k_argsort_cuda` was the second call site (`deepseek32` reproduces it on r253, so it
+  predates the probe fix); it now gathers with a kernel (`top_k_gather_rows`), which is bit-identical and
+  removes the driver dependency for every arch that builds `GGML_OP_TOP_K`.
+* **The `kv_lid` cache has no layers for V4.1, so the Hadamard list is inert for it.**  `filter_lid` is
+  `!is_v41 && filter_csa`, and V4.1's index K lives inside the compressed row
+  (`hparams_csa.n_embd_head_k_full = n_embd_head_k + indexer_head_size`), so the "always create rotation
+  tensors" condition (`n_embd_head_k_full == indexer_head_size`) cannot be true for any V4.1 cache; its
+  rotation comes from the generic quantized-KV rule.  Adding `LLM_ARCH_DEEPSEEK41` there would create tensors
+  in an empty cache -- do not.
+* **`test-llama-archs` needs one host-expert arch per process.**  A `Host experts` row arms the
+  movable-boundary slab, and a slab holds its VRAM for the rest of the process (ROCm cannot unmap a sub-range):
+  after `-a deepseek2`'s rows only ~1.2 GiB is free outside it, which is why r253 + `-a 'deepseek2|deepseek4'`
+  loads the (then tiny) deepseek4 fixture and the now 1.6-2.4 GiB dsv4 fixtures do not.  Pre-existing, not
+  caused by the hosting rows themselves; run `-a deepseek2`, `-a deepseek4`, `-a deepseek41` separately.
+
+## r258 — an identity expert table is served in place in the prefill band, and `buffer == nullptr` is a legal tensor (TODO #133)
+
+* **The band gate was the whole of `TODO` #133, not the transport.**  An identity (fully resident) table's
+  arena is byte-for-byte the table (`slot e` holds expert `e`, `expert_bytes` per slot, strides unchanged), so
+  the decode band has read it in place since session 7 — `moe_cache_get_table`'s identity branch and
+  `moe_cache_take_over` were both gated on `ne[2] <= band`, and above it the scheduler staged the whole table
+  into a ring slot (pinned master) or gathered it into the split input (host pool) *on every ubatch*.  At a
+  100 %-resident arena that is the whole table read back out of VRAM: 63 648 MiB re-copied for a 5246-token
+  prompt on three RDNA4 GPUs, serialised against the compute, which left 3-GPU prefill (1489.6 t/s) **slower
+  than 1-GPU** (1966.8 at 69.1 % residency).  Removing the gate is worth **+171 %** there and +13.5 % on the
+  default pool mirror, and the effect is confined to identity tables: a partly-resident table stages/gathers
+  exactly as before (1 GPU 2275.6 vs 2266.4 — inert).  Records: `benchmarks/2026-11-10-prefill-in-place.md`.
+* **A partly-resident in-place read is still the refuted mechanism; identity is not.**  r40 deleted a
+  device-side *policy* that read the resident half in place while fetching the complement (device map,
+  deferred promotion, device mirrors).  An identity table has no complement, so this path has no policy, no
+  map and no fetch — do not generalise it to a non-identity table by reintroducing that machinery.
+* **A fused MUL_MAT_ID kernel that reads the expert table directly bypasses the dispatch's redirect.**  The
+  redirect lives in `ggml_cuda_mul_mat_id` (via `moe_cache_get_table`); the MMB GLU, the fused MMQ gate+up and
+  the MMQ `mul_mat_q_swiglu` → down fold take `gate->src[0]`/`up->src[0]` and never re-enter it.  So whenever
+  the scheduler takes a prefill input over, `ggml_cuda_cache_blocks_fusion` must stand those down for that
+  table (the per-op chain then redirects).  Cost of standing them down: ~0-2 % at that shape, and the two
+  arithmetic paths are **bit-identical** there -- the prefill-logit gate run as
+  `--ab MOE_EXPERT_PREFILL_IN_PLACE=0` compares staged+**fused** against in-place+per-op and reads KLD
+  -0.000000 / same-top-p 100.000 %.  A new fused MUL_MAT_ID site above the band needs the same guard, and the
+  guard must honour the kill switch, or the A/B arm loses its fusions and stops being the pre-r258 path.
+* **`buffer == nullptr` is a legal tensor for a kernel.**  The cache's arena is a raw `cudaMalloc`, so the
+  redirect hands the op a shallow copy with `buffer = nullptr` (that is what keeps the compute-buffer padding
+  clears from offsetting by the full expert count).  It was safe only by accident while the redirect was
+  band-only: MMVQ guards its clear with `src0->buffer != nullptr`, but `ggml_cuda_mul_mat_q` (MMQ) and
+  `ggml_cuda_mul_mat_takes_mmq` read `t->buffer` unguarded, and the whole family is reached above the band.
+  `ggml_backend_buffer_get_usage(NULL)` therefore answers `GGML_BACKEND_BUFFER_USAGE_ANY` instead of asserting
+  — every caller's test is `== GGML_BACKEND_BUFFER_USAGE_COMPUTE`, and a null buffer is certainly not one.
+  The arena is already over-read-safe: it is allocated and memset with a `min(expert_bytes, 512)` tail pad.
+* **The pre-staging in-place query must not have the take-over's side effects.**  `moe_cache_take_over` bumps
+  `g_write_seq` (the staging snapshot's freshness key) and publishes the alias; a *query* that did the same
+  would force every other table in the pass to rebuild its two-tier map and to order the copy stream behind
+  the compute stream.  `moe_cache_serves_in_place` shares `moe_cache_identity_locked` with the take-over (so
+  the two cannot disagree) and touches nothing.
+* **`TODO` #142 is fixed by r237, and its premise is measurable.**  Both named causes were the *lazy
+  pre-sizing* path: the arena armed only on the first decode-band pass, and the pool was built and prepopulated
+  on first touch.  On r254 the arena sizes at registration and the pool at sizing — before the first ubatch of
+  the first pass (log timestamps: `alloc_all_locked` 1.59 s, pool fills 0.45-1.59 s, first batch 2.32 s).  The
+  residual first-batch constant is **not** pool-specific: on the same shape (3 GPUs `-sm tensor`, `-npp 128`
+  repeated) the pool pays ~0.12-0.15 s, a pinned master ~0.29 s and `MOE_EXPERT_CACHE_MIB=0` ~0.88 s, and
+  `MOE_HOST_POOL_PREWARM=0` moves it by ~0.03 s.  Re-check that ladder, not the pool, if a large box reports a
+  multi-second first prefill again.
+
+## r259 — a lossy all-reduce wire is an ALGORITHM, and its chunk boundaries must be whole quant blocks (contributor PR #298)
+
+* **A lossy wire cannot be a knob on a bit-identical arm.**  `GGML_CUDA_ALLREDUCE=q8ce` (the copy-engine chain
+  whose large-tensor payload is q8_0 blocks of Walsh-Hadamard-rotated values) reads mean KLD **0.000697 /
+  same-top-p 98.667 %** against the bf16 wire on the delivery's own 2-device `-sm tensor` point (27B Q8_0,
+  f16 KV, 40 chunks) and **0.000781 / 98.824 %** on 3 devices.  That *passes* the prefill-logit gate's limits,
+  and it is still not rounding level: the delivery's default arm must stay at 0.000000, so the wire is
+  selected only by its own algorithm name and **nothing else — not `auto` — sets it**.  The same reasoning
+  applies to any future 8-bit/4-bit payload on a delivery path: prove the default arm at 0.000000 first, then
+  quote the selected arm's own number (the contributor's run read 0.003321 / 97.706 % at a *different* point —
+  a q8_0 KV on a heterogeneous pair — which is why a lossy arm's number is only meaningful with its point).
+* **A per-block rotation forces block-aligned chunk boundaries.**  The rotation is a 32-point transform of a
+  q8_0 block, so a chunk that starts or ends mid-block would be rotated over *different* data on the two sides
+  and the reduced sum would be meaningless.  The contributed cut divided the element count by the rank count
+  (`off[c] = c*ne/n + min(c, ne%n)`) and gated on `ne % 64 == 0`, which happens to be block-aligned for two
+  ranks and is not for three; r259 distributes **whole q8_0 blocks** (`qblk[c] = nblk/n + (c < nblk%n)`) and
+  needs only `ne % 32 == 0`.
+* **"n == 2 only" is what made the feature unreachable here, not a hardware limit.**  The contributed cut
+  required exactly two ranks, so on this delivery's 3-device box it could not engage at all — and the 3-device
+  arm is where it pays most (+13.4 % prefill on 27B Q8_0, against +1.7 % on the 2-device x8 pair).  The
+  reduce-scatter/all-gather is rank-count agnostic; phase 1b sums `n-1` dequantized peer slices through one
+  pointer struct, which is the only change a third rank needs.
+* **The wire is MTP-neutral, and a layer-split arm measures nothing.**  Protocol A at a 2-GPU `-sm tensor`
+  split reads acceptance 0.99200 / 0.91041 -> 0.89967 / 0.82635 -> 0.82982 / 0.59628 -> 0.59333 and
+  `draft-mtp n3` 69.7-99.8 t/s against `ce`'s 100.1-69.9, i.e. inside the run-to-run spread apart from a
+  -1.2 % acceptance move on the code axis (a near-tie flipping one draft token in a thousand).  The
+  draft/verify band never enters the wire: a verify batch is decode-sized, so the dispatcher sends it to the
+  internal pipeline.  The same gate run by accident on the **default `layer` split** returned all 16
+  `ce`/`q8ce` numbers **identical to the decimal** — a layer split has no comm layer at all, so an all-reduce
+  arm judged on one measures a 0-launch path.  Always name the split.
+* **The wire's benefit is NOT confined to a slow link.**  The contributed writeup attributes the gain to a
+  chipset PCIe 3.0 x4 slot, and that is where the largest numbers came from (+17-21 %), but the halved payload
+  also pays on an all-x8 box at a 3-device split, because the exchange is a larger fraction of a prefill there:
+  3x R9700 `pp4096` 2130 -> 2404 t/s (+12.9 %) and 35B-A3B Q8_0 4400 -> 4819 (+9.5 %), against +2.5 %
+  on the 2-device x8 pair.  Decode is flat on every arm: the internal pipeline serves the decode/verify band
+  and never enters the wire.
+
+## r261 — the demand read is BYTES, not latency (and the host is never ahead of the device on the decode band)
+
+* **A demand-fill "overlap worker" has nothing to overlap with on the decode band.**  A decode graph is one split
+  per layer (50 on the 122B), and the scheduler copies a split's host-weight inputs — starting with
+  `ggml_backend_synchronize(input_backend)` + an ids readback + `ggml_backend_synchronize(ids_backend)`, a full
+  meta-backend synchronize — *before* it dispatches that split.  So at the instant the routing (and the miss set)
+  is known, the device has nothing in flight: measured 2026-11-11 on the 122B pair at `-lme 54` `DIO=1`
+  (58.6 ms/step), the readback is **24.0 ms/token** (48 calls, 0.499 ms each) and that time *is* the device's
+  compute, while `moe_cache_update_host` adds **33.2 ms/token** (145 calls, 0.229 ms) of strict device idle.  Of
+  that, the decode-band demand source is 31.7 ms (96 calls: 44.6 fallback reads at 0.531 ms plus ~60 pool fill
+  attempts).  Any "run the fills beside the previous ubatch's compute" design needs a host that runs ahead of the
+  device; this path does not have one, and the hook's single global `g_mutex` means a worker would have to read
+  outside the lock to run at all.  Do not re-derive this — read `benchmarks/2026-11-11-host-pool-slice-read.md` §1.
+* **On a `-sm tensor` split a fill is worth exactly ONE device's slice.**  Each device owns a slice of every host
+  expert and for `gate`/`up` it is contiguous (`CACHE_GEOM`: `expert_bytes 884736 host_bytes 1769472 src_off 0
+  host_pitch 0 split_axis 1`); the whole-expert read the fallback fill used to issue is 2x the bytes for 2 of the
+  3 roles.  `MOE_HOST_POOL_SLICE_READ` (r261) reads the slice and is worth **+6.0 % decode / +8.6 % prefill on
+  the pair, +24.8 % prefill at 3 GPUs**, identical at 1 GPU because there `expert_bytes == host_bytes`.  A
+  **strided** slice (`host_pitch > 0`) must keep the whole-expert read: `rows` strided preads are worse than one
+  sequential read.
+* **The cold tail has no reuse, so a small shared ring buys nothing.**  An expert that neither the arena nor the
+  pool holds was routed again within a 4-entry per-host-tensor ring window **0.5 % of the time** (20 860 reads,
+  96 hits, 122B pair), and a tensor split's two devices do **not** both miss the same expert in the same window
+  (the pool is one object per host tensor and already dedupes the policy path).  A "small extra tier for the
+  cold tail" is therefore a byte-for-byte re-read: do not build one without a trace that says otherwise.
+* **The one exact lookahead on the decode band is within a layer, and it is not worth using.**  A layer's six
+  host-weight visits (gate/up/down x each device) are consecutive and carry the SAME routing ids (measured
+  2026-11-11), so a prefetch needs no prediction -- but only **0.9 %** of the ids a sibling will route are in
+  neither the arena nor the pool (92.8 % arena, 6.3 % pool, 1 315 ids/token), and of what a prefetch stages
+  the pool's inline empty-slot fill claims most of it (0.131 ms against the fallback's 0.449 ms, and the
+  expert stays resident).  Built and measured end to end: **±1.5 %, noise**.  Do not rebuild it; if the
+  fallback reads are to be attacked, the lever is fewer of them (`TODO` #141) or a device-resolvable cold
+  source, not moving them earlier.  Record: `benchmarks/2026-11-11-host-pool-slice-read.md` §2b.
+* **The read is bandwidth-bound at single-queue depth, with ~1.8x available at depth 4.**  64 random 1.77 MiB
+  `O_DIRECT` reads of the real shard: depth 1 **3.3 GiB/s** (0.50 ms, matching the measured 0.531 ms fallback
+  fill), depth 2 4.9, depth 4 **5.8**, depth 8 6.0.  So a faster demand path exists in principle, but a depth
+  needs several misses known at once and the only *exact* lookahead is within one layer (gate/up/down share the
+  routing ids), which bounds it at ~2.  That is a scheduler change (cross-role prefetch + a lock-free fill
+  worker), recorded in `archive/work/host-pool-demand-overlap/`, not a pool knob.
+* **`gate-prefill-logits.sh --record` overwrites a base that a different `--ab` arm recorded.**  The base file is
+  keyed by model + shape + ubatch, not by the arm, so re-recording the `xncmoe-48-ub2048` point with a new `--ab`
+  destroys the previous arm's base (r261 did this to the r258 `MOE_EXPERT_PREFILL_IN_PLACE=0` base).  Re-record
+  before quoting that arm again.
+
+## Block 16 — the UMA GTT expert store (`archive/work/apu-expert-gtt`, promoted as r263)
+
+* **gfx1151 has no `xnack` target at all** (`gfx1151:xnack+` -> `invalid target ID`), `PageableMemoryAccess = 0`
+  and `HSA_XNACK=1` is inert, so there is **no fault-and-retry**: an unregistered page is not in the GPU's page
+  tables and a kernel read of it is a fatal `HSA_STATUS_ERROR_MEMORY_FAULT` + coredump, hot or cold.  Every byte
+  the GPU reads must be registered, and a pageable mapping may be a fill **source** and never a read target.
+* **An APU's "VRAM" IS the host pool** (`totalGlobalMem` reports the machine's memory: 124000 MiB on a 128 GiB
+  box), so `-lme` on an integrated device sizes a *registered host region*, not a separate VRAM budget, and
+  "spill" means the page cache.
+* **A registered READ-ONLY range reads at 230-233 GB/s; the same range registered writable at 60.**  A
+  `PROT_WRITE` buffer can be registered `ReadOnly` *after* it is filled, which is the shape the store uses
+  (`MOE_EXPERT_GTT_RO=0` is the 232-vs-60 A/B).
+* **`hipHostRegister` on an `mmap` region does NOT pin it — `mlock` does**, and `Unevictable` is the only thing
+  that reports the difference (`VmPin`/`VmLck` read 0; use `mincore()`).  A registered-only region loses 0-436 MiB
+  per 2 GiB under real pressure plus its huge pages, and the next GPU read stalls 12-37x.  Hence the extent is
+  clamped to `RLIMIT_MEMLOCK` and "cannot lock" is a startup decision (decline when the model fits, **refuse**
+  when it does not).
+* **`pread` into a registered region is legal and coherent** (buffered 15.7 GB/s, `O_DIRECT` 4.75 GB/s, and the GPU
+  sees the fresh bytes on the reuse/eviction arm too) — that is why the store is **anonymous**: `pread(O_DIRECT)`
+  into a `hipMalloc` GTT buffer is `EINVAL`, and choosing anon is what deletes the staging ring.
+* **A GGUF tensor offset is 32-byte aligned, not 4096**, so an `O_DIRECT` fill must round the read out and carry a
+  per-fill delta.  An unaligned `O_DIRECT` read copies **0 bytes**.
+* **`MADV_DONTNEED` on a registered region the GPU is reading is a silent zero-fill**, and `hipHostUnregister` does
+  not release the pinned pages while the VMA lives (with `iommu=off` the registration *is* the GPU's mapping, so
+  unregistering turns a read into a fatal fault).  Eviction is therefore a **table** operation only.
+* **The store's extent cannot be exceeded** — `ggml_cuda_gtt_store_reserve()` refuses — and a failed carve is
+  **FATAL** to the load (`unable to allocate ROCmGTTStore0 buffer`), not the fail-soft decline the code once
+  claimed.  A second model in the process must size against the store's FREE bytes and never takes the arena tier.
+* **The heat-map prior is an INPUT.**  `MOE_EXPERT_HEATMAP=load` (or a read-only sidecar — the file's mode IS the
+  freeze signal) loads and seeds but never writes; a writable prior is rewritten by every run, so arms contaminate
+  each other and run order becomes part of the result.  Measured: the `auto` transport ladder's latch rate looked
+  like 4/5 with a drifting prior and is **0/5** with a frozen one, which inverted a conclusion.  Every gate freezes
+  it per arm.
+* **A prefill fill is a bulk fill and the coalescing is a call-count win, not a byte win.**  One H2D per span
+  instead of one per expert is the dominant saving (12 031 -> 4 605 calls for the same bytes); the span ring must
+  be marked busy **at acquisition**, not at H2D issue (`span_buf_acquire` only refuses drained buffers, so the
+  latter hands every window in a call the SAME pinned buffer — measured as corrupt greedy text with a
+  verify-clean file read).
+* **A backend hook must take the scheduler's used-expert BITSET, never re-read the routing ids**: the ids buffer
+  the scheduler reads back is reused by the graph allocator, and a later read of it serves a stale routing.
+* **On an APU, `-lme` is a cap on NON-SWAPPABLE memory, and only the arena honours it.**  Placement keeps the
+  excess as anonymous device memory (measured: lowest `MemAvailable` 92 489 MiB at `-lme 4` on a 35B); the arena
+  keeps it as reclaimable page cache (106 064 MiB) — 13.6 GiB less non-reclaimable, at 2x the decode cost.  So the
+  shape follows the budget, and `-lme` is also the opt-in for **streaming** (a >RAM model without it is refused at
+  load, in 0.2 s, with the fix).
+* **The tier is inert on a discrete GPU, measured** (3x R9700 gfx1201): with `MOE_EXPERT_GTT_ARENA=1` forced on,
+  zero GTT census lines, `-lme` still means the host-expert budget, `gate-host-pool.sh` 42/42 with the same build,
+  and the pool path's throughput within noise.  Record: `archive/work/apu-expert-gtt/MEASUREMENTS.md` §27.
+* **A "97.5 % hit rate" is not a small miss traffic: the denominator is REACHES and a miss is a whole expert.**
+  On the 122B-A10B Q8_0 the unit is 9.5625 MiB (3 x `3072x1024` Q8_0) and a decode token makes 8 used experts x 48
+  MoE layers = **384 reaches**, so h = 0.975 is ~9.6 misses = **91.8 MiB/token** = **1.0 GB/s at 11 t/s** -- and
+  92 MiB/token over a ~1.2 GB/s drive is ~80 ms of the 91 ms a token takes, i.e. the miss traffic IS the decode
+  budget.  Each point of h is ~0.4 GB/s at 11 t/s.  Do not "explain" a 1 GB/s drive read as a defect without
+  doing this arithmetic first (WORKLOG.md 261111.034 has the table and the `-lv 4` census fields to confirm it).
+
+## r264 — the attendance pool is refused by DESIGN on a shared host/device pool, and `--fit` may only offer a placement the model+device can take (`TODO` #300 retired)
+
+**The refusal is the answer, not a workaround.**  `--kv-attendance-pool` buys *device* memory back by keeping the
+authoritative KV in a **pinned host mirror** and caching only the indexer pages the sparse decode selects.  That
+trade only exists where the host and the device are **separate tiers**.  On a shared host/device pool (an
+integrated GPU — gfx1151) they are one: the KV is already in the memory the GPU reads, so there is nothing to buy
+back, and the two-tier resolve (MARK/CLAIM/MAP+FILL, `kv_pool_invalidate()`, the dirty-refill protocol) has no
+second memory kind to be correct against.  The measured symptom (r236: a *fully resident* pool still verifies
+~93 M mismatched bytes against its own mirror, a different text every run) is what a design applied to the wrong
+memory model looks like, which is why r264 **retires** the item instead of chasing the resolve: the defect is the
+premise, so a "fixed" resolve on UMA would still be a placement that cannot help.  Rules:
+
+* The cache refuses the pool on any `GGML_BACKEND_DEVICE_TYPE_IGPU` device with **one** WARN and leaves the KV
+  exactly as it was; the message must contain `--kv-attendance-pool was declined` (the gate greps it) and must not
+  advertise the pool as a future fix.  The **window** (`--kv-window`) and the sparse decode arm are supported and
+  validated there — the two are ALTERNATIVES, and the window is the UMA answer.
+* **`--fit` must not offer a placement the code will refuse.**  A hint paragraph about a no-op is
+  indistinguishable, to a reader, from a supported suggestion, and on this box it printed as a wall of *red*:
+  measured on gfx1151 with `Qwen3.5-122B-A10B-Q8_0 -lme auto -c 102400`, the over-budget fit block ended with 8
+  `--kv-window`/`--kv-attendance-pool` lines at `ERROR` level, for a **qwen35moe** trunk (no sparse indexer, so the
+  pool never had anything to serve) on an **APU** (so it is refused anyway).  Two independent predicates:
+  the model needs the indexer geometry (`hparams.indexer_head_size > 0` — `llama_model_has_kv_indexer`), and no
+  device may be an IGPU or a Meta (a tensor split has no per-device mirror).  Neither eligible placement → no hint
+  at all.  The window paragraph is model- and device-agnostic, so it stays.
+* **Advice is a WARN, not an ERROR.**  The over-budget facts stay `ERROR` (they are errors); the "a placement can
+  buy the KV back" block is advice and prints at `WARN`, once per fit.
+* **`common_log_add`/`LOG_ERR` prefix the message they are handed, not each `\n`-separated line.**  A multi-line
+  call prints its continuation lines with **no level and no timestamp** (`common_params_fit_impl:   layers) or use a
+  smaller quant...` read as raw output, which is a large part of why the block read as a wall).  One call per line.
+* **Gate both directions.**  `scripts/gate-kv-residency.sh` now runs `hintwin` (a trunk with no indexer: the window
+  must be offered, the pool must NOT be) and `hintpool` (the pool model: absent on a shared pool, **present** on a
+  discrete GPU — an absence-only check passes on a build that advertises nothing).  It also asserts the decline is
+  reported **once**, and its UMA branch's "nothing changed" reference is a new no-pool arm on the **default**
+  decode arm (`pdecl`): comparing against `pref`, which also turns the *sparse* arm on (the arm the pool replaces),
+  could never pass — so the branch graded a text difference that was never the decline's.
+
+## r265 — a prefill read plan is built from the USED bitset, never from "not resident" alone (block 16, `TODO` #317 opened for the copy that remains)
+
+**`map[]` in `moe_cache_prefill_stream()` is not a residency map.**  It holds a slot only for an expert that is
+**both routed by this ubatch and resident** (everything else, including every expert the ubatch does not use, is
+`-1`).  A run of `map[e] < 0` is therefore *"not (used AND resident)"*, and reading it fetches the whole table
+minus the used residents.  The delivery's own host-pool tiers do not have this shape: `prs_host` (staging) and
+`gprs_host` (device gather) are COMPLETE two-tier maps (`>= 0` arena slot, `<= -2` pool slot, `-1` in neither),
+so there `-1` genuinely means "must come from storage" — that asymmetry is why the bug existed on exactly one
+tier.  Measured (122B-A10B Q5_K_XL, `-lme 75` arena 241/256 slots/table): a 38-token prompt planned **8550**
+spans / 10 031 ms of reads instead of **684** / 61 ms (prompt eval **3.2 -> 26.6-29.7 t/s**), and a 24 576-token
+prefill planned 23 985 instead of 10 353 (+9.6 % prefill: 499.9 -> 547.7 t/s), with the used/read/D2D census
+byte-identical in both arms.  Rules:
+
+* **A read plan's run set is `used[e] && missing(e)`**, and a run breaks at the first expert that is not used or
+  is resident (a span covers a contiguous file range either way).  `benchmarks/2026-11-11-gtt-prefill-span-set.md`.
+* **A wide prefill cannot validate this class**: used ~= all makes the wrong set nearly equal the right one, so
+  the arm that exposes it is a SHORT prompt (tens of tokens), whose used set is a small subset of a resident
+  table.  Every prefill-read change owes a short-prompt arm as well as a wide one.
+* **Census a span by the bytes it really reads, not by the bytes it served.**  `g_pf_span_bytes` was accumulated
+  from the used experts a span delivered, so wasted reads were invisible and `MiB/span` could print below the
+  smallest expert (1.02 MiB against a 2.06 MiB floor was the visible tell).  A per-span average under one expert
+  is now impossible, and an inconsistency there means a planner defect.
+* **The per-pass copy that remains is `O(used)` and is the next item** (`TODO` #317): with `-lme` below the set,
+  no table is identity, so the resident used set is D2D-copied into the scheduler's single `input_cpy` on every
+  pass (30 060.5 MiB for a 38-token prompt).  The identity tier already reads in place at any width (r258); the
+  ARENA tier's slot-remap path is still decode-band-only (`moe_cache_update_host` returns early, `moe_cache_get_table`
+  refuses `>MOE_EXPERT_CACHE_MAX_TOK`, `remap_cap` is `n_experts*8`).  Follow-up:
+  `wip/prefill-in-place-arena/`, which is NOT the in-place/remap direction `TODO` #273 refuted (that one
+  predicted the *complement* of a partly resident table; this one removes a copy of the *residents*).
+* **The discrete host-pool tier was checked and does not have it**: its map is complete, and its measured staged
+  reads track the per-table complement, not the prompt width (24 B prompt -> 1 146.6 MiB / 2 223 experts;
+  2 KB -> 1 858.3 MiB / 3 626 on `soar`).  Its residual, by-design difference is that the destination there is
+  the WHOLE split-input table, so the complement is prefetched whether routed or not; restricting it needs the
+  host routing readback that the gather path exists to avoid.  Do not re-open it as "the same bug".
