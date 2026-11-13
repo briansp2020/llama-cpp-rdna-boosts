@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 12 Nov 2026 18:02:50 +0000
+Subject: [PATCH 31/36] moe cache: the release in-place prefill (TODO #317)
+ stands down when a sparse table exists
+
+With any sparse (mmap) table, moe_cache_get_table answers from the tier code, which
+refuses a remap published without a freshness round; pf_in_place_locked sets none.
+Only reachable with a GTT arena (APU) and mixed tables; inert on discrete GPUs.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index c91a0a7bc..5f0b25de6 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -11140,7 +11140,10 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+         // and this arm is INERT (never wrong -- the seed and this path are otherwise independent).
+         t.remap_n_used  = 0;
+         t.remap_prefill = false;
+-        if (pf_in_place_locked(t, table, weight_cpy, device, ids, n_used, n_tok, ids_nb0, ids_nb1, stream)) {
++        // With any sparse (mmap) table, moe_cache_get_table answers from our tier, which refuses a remap without a
++        // freshness round (remap_round); this publish sets none, so stand the release's in-place prefill down.
++        if (!g_any_sparse &&
++            pf_in_place_locked(t, table, weight_cpy, device, ids, n_used, n_tok, ids_nb0, ids_nb1, stream)) {
+             return true;   // the op reads the arena; no copy of the used residents is made at all
+         }
+         return false;   // the arena's decode/verify band (and the prefill path when in place declined)
+-- 
+2.53.0
+

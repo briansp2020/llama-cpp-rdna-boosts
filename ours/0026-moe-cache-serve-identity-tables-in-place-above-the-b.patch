@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 03:28:17 +0000
-Subject: [PATCH 27/31] moe cache: serve identity tables in place above the
+Subject: [PATCH 26/36] moe cache: serve identity tables in place above the
  band in mmap mode too
 
 r258 (TODO #133) takes an identity (fully resident) table over at any
@@ -28,10 +28,10 @@ config unchanged (0 identity tables, all hashes equal) (FINDINGS 910).
  4 files changed, 35 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f83b72a06..1162eab69 100644
+index cac3c38de..742820eeb 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6813,6 +6813,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -6833,6 +6833,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
              dst->src[2] = saved_s2;
              return;
          }
@@ -50,10 +50,10 @@ index f83b72a06..1162eab69 100644
  
      GGML_TENSOR_BINARY_OP_LOCALS
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 8593f198c..239b2a5a5 100644
+index 288e7e4e0..f1564963c 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -11001,6 +11001,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
+@@ -11892,6 +11892,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
      return n_tok <= MOE_EXPERT_CACHE_MAX_TOK || moe_cache_prefill_in_place();
  }
  
@@ -76,10 +76,10 @@ index 8593f198c..239b2a5a5 100644
                           void ** arena, int64_t * n_slots,
                           size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 5ad58b6c9..de8973dca 100644
+index 88ee4f626..0ead02c0e 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -399,6 +399,10 @@ void moe_cache_graph_begin(int device);
+@@ -401,6 +401,10 @@ void moe_cache_graph_begin(int device);
  // an input hook runs on `device` (starts a new round after a graph compute)
  void moe_cache_hook_begin(int device);
  

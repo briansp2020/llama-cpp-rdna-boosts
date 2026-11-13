@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 22:34:06 +0000
-Subject: [PATCH 26/31] cuda: fuse decode MoE gate+up+GLU when the GLU output
+Subject: [PATCH 25/36] cuda: fuse decode MoE gate+up+GLU when the GLU output
  overlaps only the unfilled weight copy
 
 At decode the MoE expert cache takes the gate/up weight inputs over, so the

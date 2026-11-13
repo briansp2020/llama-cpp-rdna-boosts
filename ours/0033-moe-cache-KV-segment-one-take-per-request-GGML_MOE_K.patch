@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 13 Nov 2026 14:09:29 +0000
+Subject: [PATCH 33/36] moe cache: KV segment -- one take per request
+ (GGML_MOE_KV_SEG_TAKE1)
+
+With the KV segment the lend line follows the cells in use, so a long
+prompt takes rows back from the expert cache once per step of the line:
+each take synchronises every lending device, rewrites the cold pointers
+of the copies it drops and zeroes the rows (~45 ms a time).
+
+The server now tells the lending cache, before each batch, how many
+cells the prompts in progress still need (this batch plus what is left
+of every slot in PROCESSING_PROMPT): llama_kv_lend_hint().  The cache
+keeps that as a floor under lend_need(), so the first batch of a request
+takes everything the prompt will reach in one take.  The hint is sent
+every update_slots iteration, 0 when no prompt is in progress, so a
+cancelled request corrects itself.
+
+Only a hint: every per-ubatch lend_need() call stays as it was, so a low
+or missing hint degrades to the stepwise takes and a high one only drops
+copies early.  The copies are duplicates, so the output does not change.
+Parked slots still take every row.
+
+Default on with GGML_MOE_KV_LEND=1 and GGML_MOE_KV_SEG=1, inert
+otherwise; GGML_MOE_KV_SEG_TAKE1=0 restores the stepwise takes.
+
+The take log line (GGML_MOE_KV_LEND_LOG) also splits its time into the
+first synchronise, the pointer writes, the memset and the second
+synchronise, to show where a take spends it.
+---
+ ggml/src/ggml-cuda/moe-expert-tier.inc | 13 +++++++++++--
+ src/llama-ext.h                        |  8 ++++++++
+ src/llama-kv-cache.cpp                 | 24 +++++++++++++++++++++++-
+ src/llama-kv-cache.h                   |  1 +
+ tools/server/server-context.cpp        | 15 +++++++++++++++
+ 5 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index 4d9fcf6b8..c6b13c8c4 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -3607,6 +3607,7 @@ void moe_cache_kv_need(int64_t rows) {
+                 (void) cudaDeviceSynchronize();
+             }
+         }
++        const auto t1 = std::chrono::steady_clock::now();
+         g_kvl_line = want;
+         std::vector<std::pair<uintptr_t *, uintptr_t>> w;
+         int64_t n_drop = 0;
+@@ -3626,6 +3627,7 @@ void moe_cache_kv_need(int64_t rows) {
+             }
+         }
+         kvl_write_ptrs_locked(w);
++        const auto t2 = std::chrono::steady_clock::now();
+         for (const kvl_tensor_t & kt : g_kvl_tensors) {
+             const size_t a = (size_t) old * kt.row_bytes, b = std::min(kt.bytes, (size_t) want * kt.row_bytes);
+             if (b > a) {
+@@ -3633,12 +3635,14 @@ void moe_cache_kv_need(int64_t rows) {
+                 (void) cudaMemset(kt.data + a, 0, b - a);
+             }
+         }
++        const auto t3 = std::chrono::steady_clock::now();
+         for (int d = 0; d < 16; d++) {
+             if (kvl_dev_lends(d)) {
+                 device_guard dg(d);
+                 (void) cudaDeviceSynchronize();
+             }
+         }
++        const auto t4 = std::chrono::steady_clock::now();
+         (void) cudaGetLastError();
+         for (const kvl_slot_t & sl : g_kvl_slots) {
+             GGML_ASSERT(sl.table < 0 || kvl_avail(sl));   // no victim may stay in a row the KV now owns
+@@ -3648,8 +3652,13 @@ void moe_cache_kv_need(int64_t rows) {
+         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+         g_kvl_ms += ms;
+         if (kvl_log()) {
+-            GGML_LOG_WARN("moe_cache KV lending: KV needs %lld rows, line %lld -> %lld: %lld victims dropped, %.1f ms\n",
+-                          (long long) rows, (long long) old, (long long) want, (long long) n_drop, ms);
++            const auto dt = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
++                return std::chrono::duration<double, std::milli>(b - a).count();
++            };
++            GGML_LOG_WARN("moe_cache KV lending: KV needs %lld rows, line %lld -> %lld: %lld victims dropped, %.1f ms "
++                          "(sync %.1f, pointers %.1f, memset %.1f, sync %.1f)\n",
++                          (long long) rows, (long long) old, (long long) want, (long long) n_drop, ms, dt(t0, t1), dt(t1, t2),
++                          dt(t2, t3), dt(t3, t4));
+         }
+     } else if (want + 4 * step <= old) {
+         g_kvl_line = want;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 7c5753e8b..1ea51fac6 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -151,6 +151,14 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
+ // (the qwen4exp/glm5-next indexer) moves both, or neither.
+ LLAMA_API bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park);
+ 
++// KV segment, one take per request (GGML_MOE_KV_SEG_TAKE1, default on with GGML_MOE_KV_LEND=1 and GGML_MOE_KV_SEG=1; 0: a
++// take per step of the growing prompt).  n > 0: the prompts being processed will write about n more cells, so the cache
++// that lends its rows to the MoE expert cache takes the rows up to there back now, in one take, and keeps them until the
++// next hint.  n <= 0: no prompt in progress, the line follows the cells in use again.  Only a hint: every ubatch still
++// reports its own need, so a low one costs later takes and a high one drops expert copies early.  Call it between
++// decodes, from the thread that decodes; a no-op without a lending cache (whichever contexts exist).
++LLAMA_API void llama_kv_lend_hint(int32_t n);
++
+ // Whether the attention cache(s) of mem support parking at all (see llama_memory_seq_park): a unified cache whose cells
+ // no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
+ // attention cells, that cache as well.  A memory without an attention cache: true.
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 8995d5585..c095eb396 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -400,6 +400,7 @@ typedef void (*llama_kv_lend_unregister_t)();
+ static const llama_kv_cache *     g_kv_lend_owner      = nullptr;
+ static llama_kv_lend_need_t       g_kv_lend_need       = nullptr;
+ static llama_kv_lend_unregister_t g_kv_lend_unregister = nullptr;
++static uint32_t                   g_kv_lend_floor      = 0;   // llama_kv_lend_hint(): rows the prompts in progress will reach
+ 
+ //
+ // llama_kv_cache
+@@ -1283,13 +1284,33 @@ void llama_kv_cache::lend_need(uint32_t at_least) const {
+         return;
+     }
+     const auto & cells = v_cells[0];
+-    uint32_t rows = std::max(at_least, cells.used_max_p1());
++    uint32_t rows = std::max({ at_least, cells.used_max_p1(), g_kv_lend_floor });
+     if (!parked.empty()) {
+         rows = cells.size();   // parked sequences sit at the top of the cache
+     }
+     g_kv_lend_need((int64_t) std::min<uint64_t>(cells.size(), GGML_PAD((uint64_t) rows, 8192)));
+ }
+ 
++void llama_kv_cache::lend_hint(int32_t n) const {
++    const auto & cells = v_cells[0];
++    g_kv_lend_floor = n > 0 ? (uint32_t) std::min<uint64_t>(cells.size(), (uint64_t) cells.used_max_p1() + (uint64_t) n) : 0;
++    if (n > 0) {
++        lend_need(0);
++    }
++}
++
++void llama_kv_lend_hint(int32_t n) {
++    static const bool on = [] {
++        const char * l = getenv("GGML_MOE_KV_LEND");
++        const char * s = getenv("GGML_MOE_KV_SEG");
++        const char * e = getenv("GGML_MOE_KV_SEG_TAKE1");
++        return l != nullptr && atoi(l) > 0 && s != nullptr && atoi(s) > 0 && (e == nullptr || atoi(e) != 0);
++    }();
++    if (on && g_kv_lend_owner != nullptr) {   // only the lending cache counts, whichever contexts exist
++        g_kv_lend_owner->lend_hint(n);
++    }
++}
++
+ void llama_kv_cache::init_rotation(const char * name_tag) {
+     if (!(n_rot_k || n_rot_v) || layers.empty()) {
+         return;
+@@ -2685,6 +2706,7 @@ llama_kv_cache::~llama_kv_cache() {
+         g_kv_lend_owner      = nullptr;
+         g_kv_lend_need       = nullptr;
+         g_kv_lend_unregister = nullptr;
++        g_kv_lend_floor      = 0;
+     }
+     // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
+     // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c6793c711..a9bf31c35 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -303,6 +303,7 @@ public:
+     void lend_follow(const llama_kv_cache & owner);   // keys-only cache on owner's slot layout: lent by owner's line
+     bool lend_follower = false;
+     void lend_need(uint32_t at_least) const;   // the next write or read reaches up to row `at_least`
++    void lend_hint(int32_t n) const;           // see llama_kv_lend_hint()
+ 
+     //
+     // input API
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index fb52962ed..b2514a54c 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -23,6 +23,7 @@
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
+ #include "base64.hpp"
++#include "../../src/llama-ext.h" // staging API: llama_kv_lend_hint
+ 
+ #include <algorithm>
+ #include <cstddef>
+@@ -3970,6 +3971,20 @@ private:
+             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+         }
+ 
++        // KV lending: the cells the prompts in progress still need (this batch + what is left of them), every iteration,
++        // so the rows are taken back from the MoE expert cache once per request and a cancelled prompt corrects itself
++        {
++            int32_t n_prompt = 0;
++            bool    any      = false;
++            for (auto & slot : slots) {
++                if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task) {
++                    any       = true;
++                    n_prompt += std::max<int32_t>(0, slot.task->n_tokens() - slot.prompt.n_tokens());
++                }
++            }
++            llama_kv_lend_hint(any ? batch.size() + n_prompt : 0);
++        }
++
+         int32_t off_next = 0;
+         int32_t n_batch = llama_n_batch(ctx_tgt);
+         for (int32_t off = 0; off < batch.size(); off = off_next) {
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 18:31:51 +0000
-Subject: [PATCH 10/31] moe cache: drop the decline unfuse workaround
+Subject: [PATCH 10/36] moe cache: drop the decline unfuse workaround
  (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 A declined or fill-failed table ran its decode-band gate+up+GLU and down fold
@@ -53,10 +53,10 @@ index 7f1c51a2f..35fbd2217 100644
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index a269bc21b..5ad58b6c9 100644
+index 5d77ef989..88ee4f626 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -444,11 +444,6 @@ bool moe_cache_prefill_in_place_enabled();
+@@ -446,11 +446,6 @@ bool moe_cache_prefill_in_place_enabled();
  bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
                                  const struct ggml_tensor * gate, int device);
  

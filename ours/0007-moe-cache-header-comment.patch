@@ -1,17 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 15:00:18 +0000
-Subject: [PATCH 07/31] moe cache: header comment
+Subject: [PATCH 07/36] moe cache: header comment
 
 ---
  ggml/src/ggml-cuda/moe-expert-cache.h | 2 +-
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 530c4a2f5..a269bc21b 100644
+index 768ff0b5f..5d77ef989 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -445,7 +445,7 @@ bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml
+@@ -447,7 +447,7 @@ bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml
                                  const struct ggml_tensor * gate, int device);
  
  // A decode-band fused gate+up+GLU or down-fold with a sparse (mmap) table that was not redirected: the fused read of the scheduler copies

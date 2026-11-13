@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 19:34:57 +0000
-Subject: [PATCH 24/31] seqpar: the all-gather never grows an existing ce
+Subject: [PATCH 23/36] seqpar: the all-gather never grows an existing ce
  scratch (Fable review); GGML_SEQPAR_CE_GATHER=0 test switch
 
 ---
@@ -9,10 +9,10 @@ Subject: [PATCH 24/31] seqpar: the all-gather never grows an existing ce
  1 file changed, 8 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 9e10a1f4e..f83b72a06 100644
+index 4dbc47cb7..cac3c38de 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4539,7 +4539,9 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
+@@ -4548,7 +4548,9 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
      }
      auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
      const int n = (int) comm_ctx->backends.size();
@@ -23,7 +23,7 @@ index 9e10a1f4e..f83b72a06 100644
          return false;
      }
      const ggml_type type = dst[0]->type;
-@@ -4560,9 +4562,12 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
+@@ -4569,9 +4571,12 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
      // all-reduce of a 2560-wide activation already takes 20 MiB) or what is already there; chunk anything
      // larger rather than growing the three scratch buffers for it.
      {

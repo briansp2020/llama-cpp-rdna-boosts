@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 02:48:30 +0000
-Subject: [PATCH 21/31] qwen4exp qsa3: the launcher packs straight from the
+Subject: [PATCH 20/36] qwen4exp qsa3: the launcher packs straight from the
  Q8_0 cache views, no F16 copies in the graph (LLAMA_QSA3_PACK_Q8)
 
 ---
@@ -139,7 +139,7 @@ index 93fc0641f..ca8d03d01 100644
      }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index b67a53bf3..779d2b839 100644
+index ba41f8cd0..f80528261 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -5861,9 +5861,13 @@ void ggml_flash_attn_qsa_set_packed(

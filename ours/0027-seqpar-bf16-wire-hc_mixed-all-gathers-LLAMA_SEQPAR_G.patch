@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 00:56:05 +0000
-Subject: [PATCH 28/31] seqpar: bf16-wire hc_mixed all-gathers
+Subject: [PATCH 27/36] seqpar: bf16-wire hc_mixed all-gathers
  (LLAMA_SEQPAR_GATHER_BF16=1)
 
 ggml_all_gather_wire(ctx, a, wire) records the wire format in op_params[0]
@@ -27,7 +27,7 @@ Production-model KLD 0.0138, equal to the rounding-only control; prefill
  5 files changed, 140 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 01fdefc42..8a7330301 100644
+index 35bf3d086..6234a9bdf 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -934,6 +934,14 @@ extern "C" {
@@ -46,10 +46,10 @@ index 01fdefc42..8a7330301 100644
      // `a`, and on a single backend it is a plain copy.  On a Meta device it is split along the token axis
      // (the last dim of `a` with ne > 1, recorded in op_params[0]) into equal per-device halves:
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 9ca275346..fe9a10620 100644
+index e1e881785..7143069a1 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -4505,6 +4505,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -4548,6 +4548,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  backend_ctx->comm_all_gather(backend_ctx->comm_ctx, srcs.data(), dsts.data(), offs.data())) {
              return GGML_STATUS_SUCCESS;
          }
@@ -65,10 +65,10 @@ index 9ca275346..fe9a10620 100644
          // one copy per (source, destination) pair
          for (size_t j = 0; j < n_backends; j++) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1162eab69..be576c8ec 100644
+index 742820eeb..8a23ad11e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4528,6 +4528,86 @@ static bool ggml_backend_cuda_comm_reduce_scatter_tensor(void * comm_ctx_v, stru
+@@ -4537,6 +4537,86 @@ static bool ggml_backend_cuda_comm_reduce_scatter_tensor(void * comm_ctx_v, stru
      return true;
  }
  
@@ -155,7 +155,7 @@ index 1162eab69..be576c8ec 100644
  // src[i]: rank i's slice (contiguous).  dst[i]: rank i's whole tensor (contiguous); rank r's slice lands at
  // element off[r].  Plain copies, no conversion (any non-quantized type).  The peer slices go through ce_tmp2 in
  // chunks of the scratch size, so a gather larger than the all-reduce scratch does not grow it.  false = no
-@@ -4571,6 +4651,18 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
+@@ -4580,6 +4660,18 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
              return false;
          }
      }
@@ -174,7 +174,7 @@ index 1162eab69..be576c8ec 100644
      const int64_t chunk = (int64_t) (comm_ctx->ce_bytes / ((size_t) (n - 1) * esz));
      GGML_ASSERT(chunk > 0);
      const size_t region = (size_t) chunk * esz;
-@@ -4633,6 +4725,21 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
+@@ -4642,6 +4734,21 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
              CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_out[d], s));
          }
      }
@@ -197,7 +197,7 @@ index 1162eab69..be576c8ec 100644
  }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 6d5107a6f..81f0765f7 100644
+index 1857d93df..16c00017f 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -2123,6 +2123,16 @@ struct ggml_tensor * ggml_all_gather(

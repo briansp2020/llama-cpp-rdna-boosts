@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 13 Nov 2026 14:10:35 +0000
+Subject: [PATCH 34/36] moe cache: KV segment -- small prefill ubatches read
+ the KV copies (GGML_MOE_KV_SEG_PF)
+
+A prefill ubatch between the decode band and the prefetch band stages
+its routed experts with one device kernel whose sources come from
+expert_copy_src_locked(): the arena for a resident, else the RAM tier or
+the registered file alias, both host memory read over the link.  An
+expert held in the KV segment has the same bytes in VRAM already.
+
+expert_copy_src_locked() takes an optional stream and, between the arena
+and the RAM tier, returns the expert's KV copy.  Only the two prefill
+callers pass the stream (the in-place prepare and the plain routed
+fill); moe_cache_stage_table does not.  A copy is used only when
+
+- the stream is the device's KV stream, the one every write, reuse and
+  release of a lent slot is queued on, so the read is ordered with them
+  (a take synchronises the devices first);
+- no queued fill-batch job still reads or writes the slot (fb_kv_busy);
+- the slot is not pinned as a fill source (g_kvl_pin);
+- the slot is still lent (kvl_avail).
+
+ref, last, ghost and count are not touched, so the arena and the segment
+evolve exactly as before, and a copy is a duplicate of the RAM / file
+bytes, so the output does not change.
+
+Default off for now: GGML_MOE_KV_SEG_PF=1 turns it on, and only with
+GGML_MOE_KV_LEND=1 and GGML_MOE_KV_SEG=1.
+
+The tier report gains the experts these ubatches read by source (arena,
+KV copy, RAM tier, file), counted whether the switch is on or not.
+---
+ ggml/src/ggml-cuda/moe-expert-tier.inc | 28 +++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index c6b13c8c4..e67e89518 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -2355,23 +2355,41 @@ static __global__ void moe_cache_route_kernel(char * __restrict__ dst, const cha
+ // Where a device-side copy reads expert `e`: its arena slot, its RAM-tier slot (both contiguous, cold 0), or the
+ // registered alias of the sparse master with the host geometry (cold 1, registered here).  False: a RAM-tier table
+ // without a slot for `e`, or an alias that cannot be registered.
+-static bool expert_copy_src_locked(const table_t & t, int32_t e, const char ** src, uint8_t * cold) {
++// GGML_MOE_KV_SEG_PF=1 (default off; needs the KV segment): a small prefill ubatch, which passes the `stream` its copy
++// runs on, reads an expert's KV-segment copy (contiguous, cold 0, the same bytes) before the RAM tier or the file: a
++// device-to-device copy.  Only on the stream that writes and reuses those slots, so the read is ordered against them,
++// and not a slot a queued fill job still writes or a fill has pinned.  Nothing of the policy's state is touched.
++static bool kvl_seg_pf_on() {
++    static const bool v = kvl_seg_on() && getenv("GGML_MOE_KV_SEG_PF") != nullptr && atoi(getenv("GGML_MOE_KV_SEG_PF")) > 0;
++    return v;
++}
++static int64_t g_pf_src_n[4] = {};   // small prefill ubatches: experts read from the arena, a KV copy, the RAM tier, the file
++static bool expert_copy_src_locked(const table_t & t, int32_t e, const char ** src, uint8_t * cold, void * stream = nullptr) {
+     const auto it = t.expert_slot.find(e);
++    const int  kv = stream != nullptr && kvl_seg_pf_on() && stream == kvl_stream(t.device) && e < (int32_t) kvl_kvv(t).size() ?
++                    kvl_kvv(t)[(size_t) e] : -1;
+     if (it != t.expert_slot.end() && t.arena != nullptr) {
+         *src  = (const char *) t.arena + (size_t) it->second * t.expert_bytes;
+         *cold = 0;
++        g_pf_src_n[0] += stream != nullptr;
++    } else if (kv >= 0 && kv != g_kvl_pin && !fb_kv_busy(kv) && kvl_avail(g_kvl_slots[(size_t) kv])) {
++        *src  = kvl_ptr(g_kvl_slots[(size_t) kv]);
++        *cold = 0;
++        g_pf_src_n[1]++;
+     } else if (t.ram_base != nullptr && (!t.ram_partial || t.ram_slot[(size_t) e] >= 0)) {
+         if (t.ram_slot[(size_t) e] < 0) {
+             return false;
+         }
+         *src  = t.ram_base + (size_t) t.ram_slot[(size_t) e] * t.expert_bytes;
+         *cold = 0;
++        g_pf_src_n[2] += stream != nullptr;
+     } else {
+         if (!sparse_need_locked(t, e)) {
+             return false;
+         }
+         *src  = (const char *) t.host_dev + (size_t) e * t.host_bytes + t.src_off;
+         *cold = 1;
++        g_pf_src_n[3] += stream != nullptr;
+     }
+     return true;
+ }
+@@ -2413,7 +2431,7 @@ static bool sparse_fill_routed_locked(table_t & t, void * dst, const int32_t * i
+         if (!want[(size_t) e]) {
+             continue;
+         }
+-        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k])) {
++        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k], stream)) {
+             return false;
+         }
+         eids[k] = e;
+@@ -2891,7 +2909,7 @@ static bool prefill_inplace_prepare_locked(table_t & t, const ggml_tensor * weig
+     uint8_t *     cold = t.route_pack.data() + n * (sizeof(void *) + sizeof(int32_t));
+     int k = 0;
+     const auto add = [&](int32_t e) -> bool {
+-        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k])) {
++        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k], stream)) {
+             return false;
+         }
+         eids[k++] = e;
+@@ -4338,6 +4356,10 @@ static void tier_report_locked() {
+                 GGML_LOG_WARN("%s: KV segment: %lld seeds, %lld demand fills (%lld replacing), %lld held, %lld policy reads of held experts; quota %d / %d per table\n", __func__,
+                               (long long) g_kvl_seeds, (long long) g_kvl_seg_fills, (long long) g_kvl_seg_repl, (long long) held,
+                               (long long) g_kvl_seg_hits, g_kvl_quota[0], g_kvl_quota[1]);
++                GGML_LOG_WARN("%s: KV segment: small prefill ubatches read %lld experts from the arena, %lld from KV copies%s, "
++                              "%lld from the RAM tier, %lld from the file\n", __func__, (long long) g_pf_src_n[0],
++                              (long long) g_pf_src_n[1], kvl_seg_pf_on() ? "" : " (GGML_MOE_KV_SEG_PF off)",
++                              (long long) g_pf_src_n[2], (long long) g_pf_src_n[3]);
+             }
+             if (g_pf_lends > 0 || g_pf_takes > 0) {
+                 int64_t pf_held = 0;
+-- 
+2.53.0
+

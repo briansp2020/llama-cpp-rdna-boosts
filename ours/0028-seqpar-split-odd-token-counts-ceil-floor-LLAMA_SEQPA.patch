@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 01:29:39 +0000
-Subject: [PATCH 29/31] seqpar: split odd token counts ceil/floor
+Subject: [PATCH 28/36] seqpar: split odd token counts ceil/floor
  (LLAMA_SEQPAR_ODD=0: even only)
 
 The TOKEN_SCATTER split rule gives the first T % n devices one token more
@@ -20,7 +20,7 @@ identical). pf31k +2.2 % on top of the bf16 gather (FINDINGS 908).
  2 files changed, 19 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index fe9a10620..ce496e016 100644
+index 7143069a1..8f74b9ac2 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1746,7 +1746,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(

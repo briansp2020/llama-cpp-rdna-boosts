@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 21:07:20 +0000
-Subject: [PATCH 25/31] qwen4exp seqpar: LLAMA_SEQPAR_LAYERS=a-b debug switch
+Subject: [PATCH 24/36] qwen4exp seqpar: LLAMA_SEQPAR_LAYERS=a-b debug switch
  (token-split only layers a..b; default all)
 
 Used to bisect the half-depth model KLD (FINDINGS 899/900): splitting a single layer is enough to move

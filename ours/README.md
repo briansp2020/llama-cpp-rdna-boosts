@@ -3,7 +3,7 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v17-a691b2345-r265` (upstream llama.cpp `a691b2345` + this repo's release).
+**Base:** `v17-a691b2345-r273` (upstream llama.cpp `a691b2345` + this repo's release).
 The rest of this branch is that release as published; only `ours/` is added.
 
 **New layout (2026-11-08).** Up to r228 this was a 55-patch series (0000-0054) that replaced the release's
@@ -17,17 +17,17 @@ The old series is kept as the tag `ours-r228-series`; the mapping table below sh
 
 ```
 git checkout a691b2345
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r265 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 31 patches (0001-0031)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r273 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 36 patches (0001-0036)
 ```
 
-Result: tree `d6ece8b5f7be`. This is the production build from 2026-11-12 (2 GPUs, `-sm tensor`).
+Result: tree `d09c5322b148`. This is the production build from 2026-11-13 (2 GPUs, `-sm tensor`).
 
 ## Patches
 
 The release has taken the r251 series' 0018 (DeepSeek-V4 cache size probes) and 0021 (DeepSeek-V4.1 kq-mask probe, issue
 #300, fixed in r254); they are dropped here. Earlier releases took the r236 series' 0009, 0011, 0014-0015, 0017 and 0018.
-The numbers below are the r265 series.
+r272 took our copy-engine all-reduce single exchange (PR #304, r265 0012); it is dropped here. The numbers below are the r273 series.
 
 | | what | env switch (off) |
 |---|---|---|
@@ -42,31 +42,50 @@ The numbers below are the r265 series.
 | 0009 | a table whose fill failed also runs gate+up+GLU unfused | - |
 | 0010 | drops the 0005 workaround (`GGML_MOE_FUSED_DECLINE_UNFUSE`): the release's fusion overlap check fixes the cause | - |
 | 0011 | the dual-output mmvq fusion skips weights that live in a compute buffer | `GGML_CUDA_FUSION_CHECK_LEAVES=0` |
-| 0012 | copy-engine all-reduce: one exchange for 2 ranks | `GGML_CUDA_AR_CE_SINGLE=0` |
-| 0013 | the checkpoint pool uses `common_state_data` (no-init allocator); the pool thread still touches every page | - |
-| 0014 | CUDA graph eviction counts active time only (idle gaps capped at 1 s), and keeps the rule that the looked-up graph is never evicted | - |
-| 0015 | qwen4exp: PLE page hints (`MADV_WILLNEED`) only when a `mincore` sample says the table is cold (~13 ms per 4096-token ubatch saved) | `LLAMA_PLE_ADVISE=1` (always advise) |
-| 0016 | multi-device: `alloc_splits` skips the drain when no buffer grows | `GGML_SCHED_DEFER_ALLOC_SYNC=0` |
-| 0017 | `-sm tensor`: graph inputs in pinned memory (the meta device's first child host buffer type) and uploaded asynchronously per device; host compute buffers kept across the drop | `LLAMA_META_HOST_BUFT=0`, `GGML_SCHED_ASYNC_USER_INPUT=0`, `GGML_GALLOC_DROP_HOST=1` |
-| 0018 | meta: the split-input copy of a split host weight is sized at the largest device slice, not the whole tensor | `GGML_META_SLICE_ALLOC=0` |
-| 0019 | moe cache: a device-remap call does not re-batch a sibling already taken over in the same round | `GGML_MOE_DEVREMAP_REBATCH=1` |
-| 0020 | qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy; the gate copy runs before attention on prefill-sized graphs | `LLAMA_QSA3_DIRECT_F16=0`, `LLAMA_GATE_EARLY=0` |
-| 0021 | qwen4exp qsa3: the packs read the Q8_0 cache views directly, no F16 copies in the graph | `LLAMA_QSA3_PACK_Q8=0` |
-| 0022 | `-sm tensor` ubatch overlap: asynchronous graph-input views, asynchronous CPU-split output upload, deferred input wait | `GGML_SCHED_ASYNC_INPUT_VIEWS=0`, `GGML_SCHED_ASYNC_CPU_OUT=0`, `LLAMA_DEFER_INPUT_WAIT=0` |
-| 0023 | qwen4exp sequence parallelism: in 2-GPU `-sm tensor` prefill the hyper-connection work (mixers, residual streams, norms) is split by token instead of computed on both GPUs; reduce-scatter + all-gather around attention and the FFN | opt-in `LLAMA_SEQPAR=1` (production sets it) |
-| 0024 | seqpar review fix: the all-gather never grows an existing copy-engine scratch | `GGML_SEQPAR_CE_GATHER=0` (generic gather) |
-| 0025 | seqpar debug switch: token-split only layers a..b | `LLAMA_SEQPAR_LAYERS=a-b` (default all) |
-| 0026 | decode MoE gate+up+GLU fusion when the GLU output overlaps only the unfilled weight copy (41 of 47 layers were blocked) | `GGML_MOE_FUSE_COPY_ALIAS=0` |
-| 0027 | moe cache: identity (fully resident) tables are served in place above the band in mmap mode too; fixes NaN at small ubatches since r258, with a warn-once `MOE_INPLACE_MISS` tripwire | `MOE_EXPERT_PREFILL_IN_PLACE=0` |
-| 0028 | seqpar: the two per-layer `hc_mixed` all-gathers send bf16 (rounding-level KLD, 0.013) | opt-in `LLAMA_SEQPAR_GATHER_BF16=1` (production sets it) |
-| 0029 | seqpar: odd token counts split ceil/floor | `LLAMA_SEQPAR_ODD=0` |
-| 0030 | moe cache: a table is pool-backed only when the pool was requested | `GGML_MOE_POOL_TABLE_REQ=0` |
-| 0031 | mmq: RDNA4 IQ routed-compact experts with 65-96 rows per expert use J=64 (+1-2 % prefill at `-ub 4096`, bit-identical) | `GGML_MMQ_IQ_J64_WIDE=0` |
+| 0012 | the checkpoint pool uses `common_state_data` (no-init allocator); the pool thread still touches every page | - |
+| 0013 | CUDA graph eviction counts active time only (idle gaps capped at 1 s), and keeps the rule that the looked-up graph is never evicted | - |
+| 0014 | qwen4exp: PLE page hints (`MADV_WILLNEED`) only when a `mincore` sample says the table is cold (~13 ms per 4096-token ubatch saved) | `LLAMA_PLE_ADVISE=1` (always advise) |
+| 0015 | multi-device: `alloc_splits` skips the drain when no buffer grows | `GGML_SCHED_DEFER_ALLOC_SYNC=0` |
+| 0016 | `-sm tensor`: graph inputs in pinned memory (the meta device's first child host buffer type) and uploaded asynchronously per device; host compute buffers kept across the drop | `LLAMA_META_HOST_BUFT=0`, `GGML_SCHED_ASYNC_USER_INPUT=0`, `GGML_GALLOC_DROP_HOST=1` |
+| 0017 | meta: the split-input copy of a split host weight is sized at the largest device slice, not the whole tensor | `GGML_META_SLICE_ALLOC=0` |
+| 0018 | moe cache: a device-remap call does not re-batch a sibling already taken over in the same round | `GGML_MOE_DEVREMAP_REBATCH=1` |
+| 0019 | qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy; the gate copy runs before attention on prefill-sized graphs | `LLAMA_QSA3_DIRECT_F16=0`, `LLAMA_GATE_EARLY=0` |
+| 0020 | qwen4exp qsa3: the packs read the Q8_0 cache views directly, no F16 copies in the graph | `LLAMA_QSA3_PACK_Q8=0` |
+| 0021 | `-sm tensor` ubatch overlap: asynchronous graph-input views, asynchronous CPU-split output upload, deferred input wait | `GGML_SCHED_ASYNC_INPUT_VIEWS=0`, `GGML_SCHED_ASYNC_CPU_OUT=0`, `LLAMA_DEFER_INPUT_WAIT=0` |
+| 0022 | qwen4exp sequence parallelism: in 2-GPU `-sm tensor` prefill the hyper-connection work (mixers, residual streams, norms) is split by token instead of computed on both GPUs; reduce-scatter + all-gather around attention and the FFN | opt-in `LLAMA_SEQPAR=1` (production sets it) |
+| 0023 | seqpar review fix: the all-gather never grows an existing copy-engine scratch | `GGML_SEQPAR_CE_GATHER=0` (generic gather) |
+| 0024 | seqpar debug switch: token-split only layers a..b | `LLAMA_SEQPAR_LAYERS=a-b` (default all) |
+| 0025 | decode MoE gate+up+GLU fusion when the GLU output overlaps only the unfilled weight copy (41 of 47 layers were blocked) | `GGML_MOE_FUSE_COPY_ALIAS=0` |
+| 0026 | moe cache: identity (fully resident) tables are served in place above the band in mmap mode too; fixes NaN at small ubatches since r258, with a warn-once `MOE_INPLACE_MISS` tripwire | `MOE_EXPERT_PREFILL_IN_PLACE=0` |
+| 0027 | seqpar: the two per-layer `hc_mixed` all-gathers send bf16 (rounding-level KLD, 0.013) | opt-in `LLAMA_SEQPAR_GATHER_BF16=1` (production sets it) |
+| 0028 | seqpar: odd token counts split ceil/floor | `LLAMA_SEQPAR_ODD=0` |
+| 0029 | moe cache: a table is pool-backed only when the pool was requested | `GGML_MOE_POOL_TABLE_REQ=0` |
+| 0030 | mmq: RDNA4 IQ routed-compact experts with 65-96 rows per expert use J=64 (+1-2 % prefill at `-ub 4096`, bit-identical) | `GGML_MMQ_IQ_J64_WIDE=0` |
+| 0031 | moe cache: the release's in-place prefill stands down when a sparse table exists (only reachable with a GTT arena and mixed tables; inert on discrete GPUs) | - |
+| 0032 | moe cache: KV segment -- under `GGML_MOE_KV_LEND=1`, the lent KV rows past the context in use are an expert-cache tier below the arena (heat-seeded, then demand-filled from the RAM tier; the arena evolves as without it); every device lends its own K/V slices under `-sm tensor` | opt-in `GGML_MOE_KV_SEG=1` (production sets it) |
+| 0033 | KV segment: one take-back per request (the server hints the prompt length) instead of stepwise takes during long prefills | `GGML_MOE_KV_SEG_TAKE1=0` |
+| 0034 | KV segment: small prefill ubatches (decode band < n < 512) read non-resident experts from their KV copies | `GGML_MOE_KV_SEG_PF=0` |
+| 0035 | KV segment: review fixes (source counters, the hint returns to 0 when idle) | - |
+| 0036 | KV segment: 0034 on by default with the segment | `GGML_MOE_KV_SEG_PF=0` |
 
 0005, 0006 (down-fold part) and 0009 were workarounds for the bug the release's fusion overlap check fixes at the source;
 0010 removes 0005. The others only run after a decline or a failed fill.
 
 Production also sets `MOE_HOST_POOL_TRANSPORT=map` (pins the host-read transport the r262 adaptive mode would otherwise pick).
+
+## Validation on r273 (2026-11-12 and 2026-11-13, Radeon AI PRO R9700 x 2, ROCm 10.1)
+
+- Rebase of the r269 series onto r273 without conflicts after dropping r265 0012 (= PR #304, in r272); production outputs
+  identical to the r269 series (greedy, prompt-set, mid-length prompts, depth texts, 259.6k needle).
+- KV segment (0032): decode +1.4-2.5 % at 4.2k / 101k context and on mid-length prompts, prefill equal. 0033-0036, same
+  binary on and off: all output hashes identical, byte checks (`GGML_MOE_VERIFY`) 0 differences; small-prompt prefill
+  +3-4 %, 31.5k prefill and the needle +0.3-0.6 %, decode flat.
+- Nightly on the final tree: the 7-model comparison passed (KLD 0 on 6 of 6, test-backend-ops only the known `MUL_MAT` f16
+  case); one arm of the 2-GPU tensor comparison (all-VRAM IQ3_XXS with `GGML_CUDA_HC_POST_RMS=0`, segment off) gave a
+  different greedy hash once and matched on a re-run. Three stress sessions (2-GPU production config with the segment,
+  2-GPU tensor, pipelined layer split): 57 rounds, 0 greedy mismatches, 0 faults.
+- Production (2-GPU tensor, `-ub 4096`, `--n-cpu-moe 47 --host-experts mmap`, MTP, `GGML_MOE_KV_LEND=1 GGML_MOE_KV_SEG=1`):
+  31.5k prefill 3880-3925 t/s, 159k 3578, 259.6k needle 3272 t/s (correct); greedy decode 126-138 t/s.
 
 ## Validation on r265 (2026-11-11 and 2026-11-12, Radeon AI PRO R9700 x 2, ROCm 10.1)
 

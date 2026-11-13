@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:24:54 +0000
-Subject: [PATCH 05/31] moe cache: run a declined decode-band sparse
+Subject: [PATCH 05/36] moe cache: run a declined decode-band sparse
  gate+up+GLU unfused (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 The fused read of the scheduler copies gave NaN output at tight pin budgets; the per-op path reads the same copies correctly.
@@ -27,10 +27,10 @@ index f6c46047a..7003dcb11 100644
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                  }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 5ad58b6c9..50bfb7d8a 100644
+index 88ee4f626..aafd2978e 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -444,6 +444,11 @@ bool moe_cache_prefill_in_place_enabled();
+@@ -446,6 +446,11 @@ bool moe_cache_prefill_in_place_enabled();
  bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
                                  const struct ggml_tensor * gate, int device);
  

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 23:32:10 +0000
-Subject: [PATCH 08/31] sched: let layer-split pipeline parallelism overlap the
+Subject: [PATCH 08/36] sched: let layer-split pipeline parallelism overlap the
  devices on ROCm
 
 Layer split with pipeline parallelism (several devices, no -ot) ran the GPUs
@@ -64,7 +64,7 @@ index 89b85fbce..37cefb222 100644
          v = v*0x100000001b3ull ^ (uint64_t) (t->view_src != NULL);
          v = v*0x100000001b3ull ^ (uint64_t) (t->flags & flags_mask);
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 8c65cef2a..0a9f24851 100644
+index 6712e4395..1558cd883 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1514,6 +1514,15 @@ struct ggml_backend_sched_split {
@@ -199,10 +199,10 @@ index 8c65cef2a..0a9f24851 100644
      ggml_backend_sched_split_graph(sched, graph);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index e89d3b5a8..a624efe78 100644
+index 2d524732d..4014d5a59 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -2963,7 +2963,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2969,7 +2969,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
      const auto gparams = graph_params(res, ubatch, mctx, gtype);
  
@@ -218,7 +218,7 @@ index e89d3b5a8..a624efe78 100644
  
          // with pipeline parallelism, the previous graph_compute_async may still be running
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 09a254f2b..43f9b05f8 100644
+index 4ebf6ea67..079f65a64 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -2911,6 +2911,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co

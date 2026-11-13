@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 00:12:06 +0000
-Subject: [PATCH 20/31] qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy
+Subject: [PATCH 19/36] qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy
  (LLAMA_QSA3_DIRECT_F16); gate copy before attention on prefill-sized graphs
  so Qcur_full dies early (LLAMA_GATE_EARLY)
 
@@ -66,10 +66,10 @@ index dc0a19a50..a325854f9 100644
          ggml_cpy_f32_q4_0_cuda
                  (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3886f9cb2..1b7166a73 100644
+index 35a1df0b8..6ba131944 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -10288,6 +10288,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -10308,6 +10308,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                  if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
                      return true;
                  }

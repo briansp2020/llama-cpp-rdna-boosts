@@ -1,0 +1,995 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 13 Nov 2026 02:28:14 +0000
+Subject: [PATCH 32/36] moe cache: KV segment -- lent KV rows as an
+ expert-cache tier below the arena
+
+GGML_MOE_KV_LEND=1 + GGML_MOE_KV_SEG=1 (default off; unset GGML_MOE_KV_SEG = off).
+Under -sm tensor every device lends the rows of its own K/V slices past the
+context in use (ggml_backend_meta_tensor_simple; GGML_MOE_KV_LEND_META=0 off,
+=1 device 0 only).  Each table that seeds gets an equal share of its device's
+lent slots, filled after its decode policy with its next-hottest non-resident
+experts (heat rank) and then by demand (a cold miss with ghost >= 2 takes a free
+slot or replaces the share's least recently used copy), copied from the RAM
+tier with cold_ptrs[e] written in the same fill job.  The copy serves the cold
+read; the arena policy sees the same miss as without the segment and an
+admission fills from the copy, so the arena evolves as without it
+(GGML_MOE_KV_SEG_TIER=0: copies count as hits and are never admitted).
+Take-backs (moe_cache_kv_need) flush the fill batch, synchronise, point the
+copies back at RAM and zero the rows.  GGML_MOE_PF_LEND defaults off with the
+segment.  Also carried from the parked lending / borrowing work: per-device
+lending with batched pointer scatter on take-back (direct write when the
+device lookup fails), fill-batch jobs that read a queued fill's slot flush
+first, GGML_MOE_KV_BORROW (default off).
+
+Fable design + logic reviews (no open must-fix).  Production config,
+-c 262144, two rounds (FINDINGS 935): decode +2.5 % at 4.2k, +1.7..2.5 % at
+101k, midpf +1.4..2.5 %; prefill equal except -0.6 % on a 260k prompt
+(stepwise take-backs); output identical.
+---
+ ggml/include/ggml-backend.h            |   3 +
+ ggml/src/ggml-backend-meta.cpp         |   8 +
+ ggml/src/ggml-cuda/moe-expert-tier.inc | 573 +++++++++++++++++++++++--
+ src/llama-kv-cache.cpp                 |  54 ++-
+ 4 files changed, 587 insertions(+), 51 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 0e197525d..cc3890393 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -659,6 +659,9 @@ extern "C" {
+ 
+     // the index-th "simple" device wrapped by a meta device
+     GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t dev, size_t index);
++    // the per-device simple tensor of a tensor allocated in a meta buffer (nullptr if the buffer is not a meta buffer,
++    // the index is out of range, or the tensor has no simple tensor there)
++    GGML_API struct ggml_tensor * ggml_backend_meta_tensor_simple(const struct ggml_tensor * tensor, size_t index);
+ 
+     // issue #164: the byte size of device `dev`'s slice of `tensor` under `split_state`.  This is the
+     // single definition of the meta split size -- `ggml_backend_meta_stage_input` sizes the H2D ring slot
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 8f74b9ac2..323026d76 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1012,6 +1012,14 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct
+     return it->second[index];
+ }
+ 
++struct ggml_tensor * ggml_backend_meta_tensor_simple(const struct ggml_tensor * tensor, size_t index) {
++    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer) ||
++        index >= ggml_backend_meta_buffer_n_bufs(tensor->buffer)) {
++        return nullptr;
++    }
++    return ggml_backend_meta_buffer_simple_tensor(tensor, index);
++}
++
+ // bytes spanned by all dims except skip_dim
+ static size_t ggml_backend_meta_inner_extent(const struct ggml_tensor * tensor, int skip_dim) {
+     size_t extent = 0;
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index c3ac5880f..4d9fcf6b8 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -310,6 +310,12 @@ static int64_t tier_touch() {
+     }();
+     return v;
+ }
++// pairs[2k] = address of a cold pointer, pairs[2k+1] = its new value (the KV-lending take-back, one launch per device)
++static __global__ void moe_cache_scatter_ptrs_kernel(const uintptr_t * pairs, int n) {
++    for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x) {
++        *(uintptr_t *) pairs[2 * k] = pairs[2 * k + 1];
++    }
++}
+ static __global__ void moe_cache_set_ptr_kernel(uintptr_t * ptrs, int32_t e, uintptr_t v) {
+     ptrs[e] = v;
+ }
+@@ -431,8 +437,8 @@ static bool fb_push_fill_locked(int device, cudaStream_t s, char * dst, const ch
+         return false;
+     }
+     for (int k = 0; k < g_fb.n_fill; k++) {
+-        if (g_fb.fill.j[k].dst == dst && !fb_flush_locked()) {   // the same slot twice: keep the order
+-            return false;
++        if ((g_fb.fill.j[k].dst == dst || g_fb.fill.j[k].dst == src) && !fb_flush_locked()) {   // the same slot twice, or
++            return false;                                                                         // reads a queued fill's slot
+         }
+     }
+     g_fb.fill.j[g_fb.n_fill++] = { dst, src, ptrs, n, v, e, 0 };
+@@ -473,6 +479,7 @@ struct kvl_tensor_t {
+     size_t  bytes;
+     size_t  row_bytes;
+     bool    pf = false;   // a prefill-prefetch staging buffer (GGML_MOE_PF_LEND), lent while g_pf_lent
++    int     device = -1;  // the device the rows live on (under -sm tensor each device lends its own K/V slices)
+ };
+ struct kvl_slot_t {
+     int     tensor;
+@@ -485,13 +492,20 @@ static std::vector<kvl_tensor_t> g_kvl_tensors;
+ static std::vector<kvl_slot_t>   g_kvl_slots;           // a fixed grid over every tensor's lendable range
+ static int64_t g_kvl_rows       = 0;                    // the KV's cells (every registered tensor has them)
+ static int64_t g_kvl_line       = 0;                    // first lent row (g_kvl_rows: nothing lent)
+-static int     g_kvl_device     = -1;
++static int     g_kvl_device     = -1;                   // the first registered device (the staging lend's; single-device)
++static uint32_t g_kvl_devs      = 0;                    // bit d: device d lends (registered K/V rows there)
+ static size_t  g_kvl_slot_bytes = 0;                    // the largest tier table's expert, set when the grid is built
+ static size_t  g_kvl_hand       = 0;
+ static bool    g_kvl_in_decode  = false;                // set around devremap_prep's policy loop
+-static void *  g_kvl_stream     = nullptr;              // the main model's decode stream (its layer-0 tables'): the
+-                                                        // only stream that makes or drops victims (the MTP draft is
+-                                                        // another context with its own stream)
++static void *  g_kvl_stream_d[16] = {};                 // per device: the main model's decode stream on it (its
++                                                        // lowest layer's tables'): the only stream that makes or drops
++                                                        // victims there (the MTP draft is another context, own stream)
++static void * kvl_stream(int device) {
++    return device >= 0 && device < 16 ? g_kvl_stream_d[device] : nullptr;
++}
++static bool kvl_dev_lends(int device) {
++    return device >= 0 && device < 32 && ((g_kvl_devs >> device) & 1u) != 0;
++}
+ static int     g_kvl_pin        = -1;                   // a slot the next fill reads: not reused meanwhile
+ static int64_t g_kvl_fills = 0;
+ static int64_t g_kvl_stays = 0;                         // misses served from a victim instead of evicting a resident                         // admissions filled from a victim slot (device to device)
+@@ -544,7 +558,7 @@ static bool kvl_avail(const kvl_slot_t & sl) {
+     return (int64_t) sl.off >= g_kvl_line * (int64_t) kt.row_bytes;
+ }
+ static bool kvl_eligible(const table_t & t) {
+-    return kvl_on() && !g_kvl_tensors.empty() && t.device == g_kvl_device && t.cold_ptrs != nullptr && t.cold_safe &&
++    return kvl_on() && !g_kvl_tensors.empty() && kvl_dev_lends(t.device) && t.cold_ptrs != nullptr && t.cold_safe &&
+            t.ram_base != nullptr && t.host_dev != nullptr && !t.identity && t.slots > 0 &&
+            (g_kvl_slot_bytes == 0 || t.expert_bytes <= g_kvl_slot_bytes);
+ }
+@@ -560,7 +574,7 @@ static void kvl_build_locked() {
+     }
+     size_t eb = 0;
+     for (const table_t & t : g_tables) {
+-        if (t.device == g_kvl_device && t.cold_ptrs != nullptr && t.ram_base != nullptr) {
++        if (kvl_dev_lends(t.device) && t.cold_ptrs != nullptr && t.ram_base != nullptr) {
+             eb = std::max(eb, t.expert_bytes);
+         }
+     }
+@@ -583,6 +597,33 @@ static void kvl_build_locked() {
+                   g_kvl_slots.size(), g_kvl_slot_bytes / 1048576.0, g_kvl_tensors.size(),
+                   g_kvl_slots.size() * (double) g_kvl_slot_bytes / 1048576.0);
+ }
++// KV segment (GGML_MOE_KV_SEG=1, needs GGML_MOE_KV_LEND=1; default off): the lent KV rows are extra arena capacity.
++// Each eligible table gets an equal share of its device's lent slots and fills it with its next-hottest non-resident
++// experts by the heat rank (as apply_heat_seed_locked seeds the arena), copied from their RAM-tier copies; cold_ptrs[e]
++// names the copy (read like any cold expert).  The decode policy counts a read of a
++// KV-segment expert as a hit (no admission, no swap).  Take-backs drop them (their RAM copy stays the fallback) and the
++// share is re-seeded after a give.  No victims and no demand borrows with it (this segment owns the grid).
++static bool kvl_seg_on() {
++    static const bool v = kvl_on() && getenv("GGML_MOE_KV_SEG") != nullptr && atoi(getenv("GGML_MOE_KV_SEG")) > 0;
++    return v;
++}
++static int kvl_seg_rate() {   // GGML_MOE_KV_SEG_RATE: seed copies per table per decode policy call
++    static const int v = getenv("GGML_MOE_KV_SEG_RATE") ? std::max(1, atoi(getenv("GGML_MOE_KV_SEG_RATE"))) : 16;
++    return v;
++}
++static std::vector<int>                  g_kvl_held;          // per table: KV-segment slots held
++static std::vector<std::vector<int32_t>> g_kvl_rank;          // per table: experts by heat, hottest first
++static int     g_kvl_quota[16]  = {};                         // per device: slots per eligible table
++static bool    g_kvl_quota_str[16] = {};                      // per device: its decode stream was known when the quota was set
++static bool    g_kvl_quota_dirty = true;
++static size_t  g_kvl_seg_cur[16] = {};
++static int64_t g_kvl_seg_hits = 0, g_kvl_seeds = 0, g_kvl_seg_fills = 0, g_kvl_seg_repl = 0;
++static std::vector<char>                 g_kvl_seg_done;      // per table: nothing more to seed until the line moves
++static void kvl_seg_held_dec(int table) {
++    if (table >= 0 && table < (int) g_kvl_held.size() && g_kvl_held[(size_t) table] > 0) {
++        g_kvl_held[(size_t) table]--;
++    }
++}
+ // Drop a slot's expert: its cold pointer back to the fallback, on `s` (ordered before the slot's reuse), or into
+ // `sync_out` when the caller writes it after a device synchronize.
+ static void kvl_release_locked(kvl_slot_t & sl, cudaStream_t s, std::vector<std::pair<uintptr_t *, uintptr_t>> * sync_out) {
+@@ -601,18 +642,24 @@ static void kvl_release_locked(kvl_slot_t & sl, cudaStream_t s, std::vector<std:
+             moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, sl.expert, v);
+         }
+     }
++    kvl_seg_held_dec(sl.table);
+     sl.table  = -1;
+     sl.expert = -1;
+     sl.ref    = false;
+     g_kvl_drops++;
+ }
+ // CLOCK: a free slot, else one whose expert is resident again, else the first without its reference bit.
+-static int kvl_alloc_locked(cudaStream_t s, std::vector<std::pair<uintptr_t *, uintptr_t>> * rel = nullptr) {
++static int kvl_alloc_locked(int device, cudaStream_t s, std::vector<std::pair<uintptr_t *, uintptr_t>> * rel = nullptr) {
+     const size_t n = g_kvl_slots.size();
+     for (size_t k = 0; n > 0 && k < 2 * n + 1; k++) {
+         const size_t i  = g_kvl_hand;
+         g_kvl_hand      = (g_kvl_hand + 1) % n;
+         kvl_slot_t & sl = g_kvl_slots[i];
++        // a slot on another device: never (its cold pointer would name the other device's memory, and the release of
++        // its previous expert would be written on this device's stream)
++        if (g_kvl_tensors[(size_t) sl.tensor].device != device) {
++            continue;
++        }
+         if (!kvl_avail(sl) || (int) i == g_kvl_pin || fb_kv_busy((int) i)) {
+             continue;
+         }
+@@ -631,25 +678,39 @@ static int kvl_alloc_locked(cudaStream_t s, std::vector<std::pair<uintptr_t *, u
+ }
+ // The arena evicts `victim`, whose bytes are still at `src`: keep a copy in a victim slot (the copy is on `s`, before
+ // the caller's fill overwrites `src`).  Returns the slot, or -1; the caller points cold_ptrs at it after the tier swap.
+-static int kvl_keep_locked(table_t & t, int32_t victim, const char * src, cudaStream_t s) {
+-    if (!g_kvl_in_decode || victim < 0 || victim >= t.n_experts || !kvl_eligible(t)) {
+-        return -1;
+-    }
+-    if (g_kvl_stream == nullptr) {
+-        // the lowest layer whose remap has run (fully resident layers never record one); never the highest layer, which
+-        // is the MTP draft's own when it has MoE tables
++static void kvl_stream_init_locked(const table_t & t) {
++    if (kvl_stream(t.device) == nullptr && t.device >= 0 && t.device < 16) {
++        // the lowest layer whose remap has run on this device (fully resident layers never record one); never the
++        // highest layer, which is the MTP draft's own when it has MoE tables
+         int max_layer = -1, lo = 1 << 30;
+         for (const table_t & o : g_tables) {
+             max_layer = std::max(max_layer, o.layer);
+         }
+         for (const table_t & o : g_tables) {
+-            if (o.dr_last_stream != nullptr && o.layer < lo && o.layer < max_layer) {
+-                lo           = o.layer;
+-                g_kvl_stream = o.dr_last_stream;
++            if (o.dr_last_stream != nullptr && o.device == t.device && o.layer < lo && o.layer < max_layer) {
++                lo                         = o.layer;
++                g_kvl_stream_d[t.device]   = o.dr_last_stream;
+             }
+         }
+     }
+-    if (g_kvl_stream == nullptr || (void *) s != g_kvl_stream) {
++}
++static void kvl_forget_locked(table_t & t, int32_t e);
++static int kvl_keep_locked(table_t & t, int32_t victim, const char * src, cudaStream_t s) {
++    if (kvl_seg_on()) {
++        // no victims; but an arena resident that also has a KV-segment copy (admitted outside the decode policy) keeps
++        // it, and the caller points cold_ptrs back at it (else the policy would count RAM reads as KV hits)
++        const bool has = victim >= 0 && victim < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) victim] >= 0;
++        const bool ok  = g_kvl_in_decode && kvl_stream(t.device) != nullptr && (void *) s == kvl_stream(t.device);
++        if (has && !ok) {
++            kvl_forget_locked(t, victim);   // the swap points cold_ptrs at RAM: the copy is no longer read, free its slot
++        }
++        return has && ok ? kvl_kvv(t)[(size_t) victim] : -1;
++    }
++    if (!g_kvl_in_decode || victim < 0 || victim >= t.n_experts || !kvl_eligible(t)) {
++        return -1;
++    }
++    kvl_stream_init_locked(t);
++    if (kvl_stream(t.device) == nullptr || (void *) s != kvl_stream(t.device)) {
+         return -1;
+     }
+     kvl_build_locked();
+@@ -664,7 +725,7 @@ static int kvl_keep_locked(table_t & t, int32_t victim, const char * src, cudaSt
+         return i;   // still holds it (kept while the expert was resident)
+     }
+     std::vector<std::pair<uintptr_t *, uintptr_t>> rel;
+-    i = kvl_alloc_locked(s, fb_on(t) ? &rel : nullptr);
++    i = kvl_alloc_locked(t.device, s, fb_on(t) ? &rel : nullptr);
+     if (i < 0) {
+         return -1;
+     }
+@@ -697,12 +758,311 @@ static void kvl_note_cold_locked(const table_t & t, int32_t expert) {
+         g_kvl_misses++;
+     }
+ }
++// KV borrowing (GGML_MOE_KV_BORROW=1, needs GGML_MOE_KV_LEND=1; default off): a decode miss served cold, whose expert
++// has no copy in a KV slot yet, is copied there from its RAM copy, and cold_ptrs[e] names the copy (one batched
++// job: the pointer write and the copy are one kernel, ahead of this layer's readers on the decode stream).  So the
++// lent KV rows hold the experts decode actually misses, not only what the arena evicted: extra cache capacity that
++// the KV takes back as the context grows (moe_cache_kv_need; the copy is a duplicate, dropping it is a pointer write).
++// GGML_MOE_KV_BORROW_TOUCH (default 2): the cold touches an expert needs since it was last resident before it is
++// copied (a doorkeeper against one-off experts churning the slots).
++static bool kvl_borrow_on() {
++    static const bool v = kvl_on() && getenv("GGML_MOE_KV_BORROW") != nullptr && atoi(getenv("GGML_MOE_KV_BORROW")) > 0;
++    return v;
++}
++static int64_t kvl_borrow_touch() {
++    static const int64_t v = getenv("GGML_MOE_KV_BORROW_TOUCH") ? std::max<int64_t>(1, atoll(getenv("GGML_MOE_KV_BORROW_TOUCH"))) : 2;
++    return v;
++}
++static int64_t g_kvl_borrows = 0;
++static void kvl_borrow_locked(table_t & t, int32_t e, void * stream) {
++    if (kvl_seg_on() || !kvl_borrow_on() || !g_kvl_in_decode || e < 0 || e >= t.n_experts || !kvl_eligible(t)) {
++        return;
++    }
++    // the RAM copy only: it has the arena's geometry (the file alias has the host's, see tier_file_ptr)
++    if (e >= (int32_t) t.ram_slot.size() || t.ram_slot[(size_t) e] < 0) {
++        return;
++    }
++    if (e < (int32_t) t.ghost.size() && (int64_t) t.ghost[(size_t) e] < kvl_borrow_touch()) {
++        return;
++    }
++    kvl_stream_init_locked(t);
++    if (kvl_stream(t.device) == nullptr || stream != kvl_stream(t.device)) {
++        return;
++    }
++    kvl_build_locked();
++    if (g_kvl_slots.empty() || t.expert_bytes > g_kvl_slot_bytes) {
++        return;
++    }
++    if ((int) kvl_kvv(t).size() != t.n_experts) {
++        kvl_kvv(t).assign((size_t) t.n_experts, -1);
++    }
++    if (kvl_kvv(t)[(size_t) e] >= 0) {
++        return;
++    }
++    cudaStream_t s = (cudaStream_t) stream;
++    // a slot's previous expert is released on s now: its pointer write is ordered before the copy below (a slot that a
++    // queued job touches is never chosen)
++    const int i = kvl_alloc_locked(t.device, s, nullptr);
++    if (i < 0) {
++        return;
++    }
++    kvl_slot_t & sl  = g_kvl_slots[(size_t) i];
++    char *       dst = kvl_ptr(sl);
++    const char * src = t.ram_base + (size_t) t.ram_slot[(size_t) e] * t.expert_bytes;
++    if (fb_on(t)) {
++        // a queued save into this RAM slot runs first (saves are phase 1 of the batch), so the copy reads its bytes
++        if (!fb_push_fill_locked(t.device, s, dst, src, t.expert_bytes, t.cold_ptrs, e, (uintptr_t) dst)) {
++            return;
++        }
++        fb_kv_mark(i);
++    } else {
++        if (!fb_flush_locked()) {
++            return;
++        }
++        moe_cache_copy_set_kernel<<<128, 256, 0, s>>>(dst, src, t.expert_bytes, t.cold_ptrs, e, (uintptr_t) dst);
++        if (cudaGetLastError() != cudaSuccess) {
++            return;   // the pointer still names the fallback (the kernel never ran); the slot stays free
++        }
++    }
++    sl.table  = (int) (&t - g_tables.data());
++    sl.expert = e;
++    sl.ref    = true;
++    kvl_kvv(t)[(size_t) e] = i;
++    g_kvl_borrows++;
++}
++static void kvl_seg_quota_locked() {
++    int n_tab[16] = {}, n_free[16] = {};
++    for (const table_t & o : g_tables) {
++        if (kvl_eligible(o) && o.device >= 0 && o.device < 16 && o.expert_bytes <= g_kvl_slot_bytes &&
++            (int) heat_rank_vec(o).size() == o.n_experts && kvl_stream(o.device) != nullptr && o.dr_last_stream == kvl_stream(o.device)) {
++            n_tab[o.device]++;
++        }
++    }
++    for (const kvl_slot_t & sl : g_kvl_slots) {
++        const kvl_tensor_t & kt = g_kvl_tensors[(size_t) sl.tensor];
++        if (!kt.pf && kt.device >= 0 && kt.device < 16 && kvl_avail(sl)) {
++            n_free[kt.device]++;
++        }
++    }
++    for (int d = 0; d < 16; d++) {
++        g_kvl_quota[d]     = n_tab[d] > 0 ? n_free[d] / n_tab[d] : 0;
++        g_kvl_quota_str[d] = kvl_stream(d) != nullptr;
++    }
++    g_kvl_quota_dirty = false;
++    g_kvl_seg_done.assign(g_tables.size(), 0);
++    if (kvl_log()) {
++        GGML_LOG_WARN("moe_cache KV segment: line %lld, quota %d / %d slots per table (devices 0 / 1)\n", (long long) g_kvl_line,
++                      g_kvl_quota[0], g_kvl_quota[1]);
++    }
++}
++// a free lent slot on `device` (never a prefill-staging slot, never one a queued job touches), or -1
++static int kvl_seg_free_locked(int device) {
++    const size_t n = g_kvl_slots.size();
++    size_t & cur = g_kvl_seg_cur[device];
++    for (size_t k = 0; k < n; k++) {
++        const size_t i = (cur + k) % n;
++        const kvl_slot_t &   sl = g_kvl_slots[i];
++        const kvl_tensor_t & kt = g_kvl_tensors[(size_t) sl.tensor];
++        if (sl.table < 0 && !kt.pf && kt.device == device && kvl_avail(sl) && (int) i != g_kvl_pin && !fb_kv_busy((int) i)) {
++            cur = (i + 1) % n;
++            return (int) i;
++        }
++    }
++    return -1;
++}
++// After this table's decode policy: fill its share of the KV segment, at most kvl_seg_rate() copies per call.
++static void kvl_seg_seed_locked(table_t & t, void * stream) {
++    if (!kvl_seg_on() || !g_kvl_in_decode || !kvl_eligible(t) || t.device < 0 || t.device >= 16) {
++        return;
++    }
++    kvl_stream_init_locked(t);
++    if (kvl_stream(t.device) == nullptr || stream != kvl_stream(t.device)) {
++        return;
++    }
++    kvl_build_locked();
++    if (g_kvl_slots.empty() || t.expert_bytes > g_kvl_slot_bytes) {
++        return;
++    }
++    if ((int) kvl_kvv(t).size() != t.n_experts) {
++        kvl_kvv(t).assign((size_t) t.n_experts, -1);
++    }
++    const size_t id = (size_t) (&t - g_tables.data());
++    if (g_kvl_held.size() < g_tables.size()) {
++        g_kvl_held.resize(g_tables.size(), 0);
++        g_kvl_rank.resize(g_tables.size());
++    }
++    if (g_kvl_quota_dirty || !g_kvl_quota_str[t.device]) {   // also once this device's stream is known
++        kvl_seg_quota_locked();
++    }
++    if (g_kvl_held[id] >= g_kvl_quota[t.device] || (id < g_kvl_seg_done.size() && g_kvl_seg_done[id])) {
++        return;
++    }
++    std::vector<int32_t> & rank = g_kvl_rank[id];
++    if (rank.empty()) {
++        const std::vector<uint32_t> & hv = heat_rank_vec(t);
++        if ((int) hv.size() != t.n_experts) {
++            return;
++        }
++        rank.resize((size_t) t.n_experts);
++        for (int e = 0; e < t.n_experts; e++) {
++            rank[(size_t) e] = e;
++        }
++        std::stable_sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) { return hv[(size_t) a] > hv[(size_t) b]; });
++    }
++    cudaStream_t s = (cudaStream_t) stream;
++    int budget = kvl_seg_rate();
++    for (const int32_t e : rank) {
++        if (budget <= 0 || g_kvl_held[id] >= g_kvl_quota[t.device]) {
++            break;
++        }
++        if (t.expert_slot.find(e) != t.expert_slot.end() || kvl_kvv(t)[(size_t) e] >= 0 ||
++            e >= (int32_t) t.ram_slot.size() || t.ram_slot[(size_t) e] < 0) {
++            continue;
++        }
++        const int i = kvl_seg_free_locked(t.device);
++        if (i < 0) {
++            if (id < g_kvl_seg_done.size()) {
++                g_kvl_seg_done[id] = 1;   // the device has no free slot left: wait for the next give / take
++            }
++            budget = -1;
++            break;
++        }
++        kvl_slot_t &    sl  = g_kvl_slots[(size_t) i];
++        char *          dst = kvl_ptr(sl);
++        const char *    src = t.ram_base + (size_t) t.ram_slot[(size_t) e] * t.expert_bytes;
++        const uintptr_t v   = (uintptr_t) dst;
++        if (fb_on(t)) {
++            if (!fb_push_fill_locked(t.device, s, dst, src, t.expert_bytes, t.cold_ptrs, e, v)) {
++                break;
++            }
++            fb_kv_mark(i);
++        } else {
++            if (!fb_flush_locked()) {
++                break;
++            }
++            moe_cache_copy_set_kernel<<<128, 256, 0, s>>>(dst, src, t.expert_bytes, t.cold_ptrs, e, v);
++            if (cudaGetLastError() != cudaSuccess) {
++                break;
++            }
++        }
++        sl.table  = (int) id;
++        sl.expert = e;
++        sl.ref    = true;
++        kvl_kvv(t)[(size_t) e] = i;
++        g_kvl_held[id]++;
++        g_kvl_seeds++;
++        budget--;
++    }
++    if (budget > 0 && g_kvl_held[id] < g_kvl_quota[t.device] && id < g_kvl_seg_done.size()) {
++        g_kvl_seg_done[id] = 1;   // the rank is exhausted (every candidate resident or held)
++    }
++}
++// Phase 1: a decode miss served cold (no arena admission) enters this table's share: a free lent slot while the share
++// is not full, else it displaces the share's least-used resident (decaying count, then oldest use) when its demand since
++// it was last resident (ghost) exceeds that resident's count.  GGML_MOE_KV_SEG_TOUCH (default 2): touches needed first.
++static bool seg_tier_on() {
++    static const bool v = !getenv("GGML_MOE_KV_SEG_TIER") || atoi(getenv("GGML_MOE_KV_SEG_TIER")) != 0;
++    return v;
++}
++static int g_kvl_seg_call_fills = 0;   // demand fills in the current policy call (reset by the caller)
++static void kvl_seg_admit_locked(table_t & t, int32_t e, void * stream, const int32_t * protect, int n_protect) {
++    if (!kvl_seg_on() || !g_kvl_in_decode || g_kvl_seg_call_fills >= kvl_seg_rate() || e < 0 || e >= t.n_experts || !kvl_eligible(t) || t.device < 0 || t.device >= 16) {
++        return;
++    }
++    static const int64_t touch = getenv("GGML_MOE_KV_SEG_TOUCH") ? std::max<int64_t>(1, atoll(getenv("GGML_MOE_KV_SEG_TOUCH"))) : 2;
++    if (e >= (int32_t) t.ram_slot.size() || t.ram_slot[(size_t) e] < 0 || e >= (int32_t) t.ghost.size() || t.ghost[(size_t) e] < touch) {
++        return;
++    }
++    if (kvl_stream(t.device) == nullptr || stream != kvl_stream(t.device) || g_kvl_slots.empty() || t.expert_bytes > g_kvl_slot_bytes) {
++        return;
++    }
++    const size_t id = (size_t) (&t - g_tables.data());
++    if ((int) kvl_kvv(t).size() != t.n_experts || id >= g_kvl_held.size() || g_kvl_quota_dirty || !g_kvl_quota_str[t.device] ||
++        g_kvl_quota[t.device] <= 0) {
++        return;   // the seeding sets these up first
++    }
++    std::vector<int32_t> & kvv = kvl_kvv(t);
++    if (kvv[(size_t) e] >= 0) {
++        return;
++    }
++    cudaStream_t s = (cudaStream_t) stream;
++    int i = -1;
++    if (g_kvl_held[id] < g_kvl_quota[t.device]) {
++        i = kvl_seg_free_locked(t.device);
++    }
++    bool repl = false;
++    if (i < 0) {
++        // the least-used resident of the share, never one this batch routes; a copy of an arena resident goes first
++        int32_t worst = -1;
++        bool    worst_dup = false;
++        for (int32_t x = 0; x < t.n_experts; x++) {
++            const int32_t k = kvv[(size_t) x];
++            if (k < 0 || (int) k == g_kvl_pin || fb_kv_busy(k) || !kvl_avail(g_kvl_slots[(size_t) k])) {
++                continue;
++            }
++            bool routed = false;
++            for (int j = 0; j < n_protect && !routed; j++) {
++                routed = protect[j] == x;
++            }
++            if (routed) {
++                continue;
++            }
++            const bool dup = t.expert_slot.find(x) != t.expert_slot.end();
++            const bool lru = seg_tier_on();   // tier mode: least recently used (count is the arena policy's)
++            if (worst < 0 || (dup && !worst_dup) ||
++                (dup == worst_dup && (lru ? t.last[(size_t) x] < t.last[(size_t) worst]
++                                          : (t.count[(size_t) x] < t.count[(size_t) worst] ||
++                                             (t.count[(size_t) x] == t.count[(size_t) worst] && t.last[(size_t) x] < t.last[(size_t) worst]))))) {
++                worst     = x;
++                worst_dup = dup;
++            }
++        }
++        if (worst < 0 || (!worst_dup && !seg_tier_on() && t.ghost[(size_t) e] <= t.count[(size_t) worst])) {
++            return;
++        }
++        i = kvv[(size_t) worst];
++        // its pointer back to the RAM copy on s now: ordered before the copy below overwrites the slot
++        kvl_release_locked(g_kvl_slots[(size_t) i], s, nullptr);
++        repl = true;
++    }
++    kvl_slot_t &    sl  = g_kvl_slots[(size_t) i];
++    char *          dst = kvl_ptr(sl);
++    const char *    src = t.ram_base + (size_t) t.ram_slot[(size_t) e] * t.expert_bytes;
++    if (fb_on(t)) {
++        if (!fb_push_fill_locked(t.device, s, dst, src, t.expert_bytes, t.cold_ptrs, e, (uintptr_t) dst)) {
++            return;   // released (if replacing): the slot stays free
++        }
++        fb_kv_mark(i);
++    } else {
++        if (!fb_flush_locked()) {
++            return;
++        }
++        moe_cache_copy_set_kernel<<<128, 256, 0, s>>>(dst, src, t.expert_bytes, t.cold_ptrs, e, (uintptr_t) dst);
++        if (cudaGetLastError() != cudaSuccess) {
++            return;
++        }
++    }
++    sl.table  = (int) id;
++    sl.expert = e;
++    sl.ref    = true;
++    kvv[(size_t) e] = i;
++    g_kvl_held[id]++;
++    if (!seg_tier_on()) {
++        t.ghost[(size_t) e] = 0;   // resident now (as an arena admission resets it)
++        t.count[(size_t) e]++;
++    }   // tier mode: the arena policy keeps its own view (ghost, count) of this expert
++    t.last[(size_t) e]  = t.clock;
++    g_kvl_seg_fills++;
++    g_kvl_seg_call_fills++;
++    g_kvl_seg_repl += repl;
++}
+ // Forget one expert's victim: the caller re-points its cold pointer itself (on the victims' stream).
+ static void kvl_forget_locked(table_t & t, int32_t e) {
+     if (e < 0 || e >= (int32_t) kvl_kvv(t).size() || kvl_kvv(t)[(size_t) e] < 0) {
+         return;
+     }
+     kvl_slot_t & sl = g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) e]];
++    kvl_seg_held_dec(sl.table);
+     sl.table  = -1;
+     sl.expert = -1;
+     sl.ref    = false;
+@@ -710,6 +1070,7 @@ static void kvl_forget_locked(table_t & t, int32_t e) {
+ }
+ // Forget every victim (the caller rewrote or is about to rewrite the cold pointers it touched).
+ static void kvl_forget_all_locked() {
++    g_kvl_held.assign(g_kvl_held.size(), 0);
+     for (kvl_slot_t & sl : g_kvl_slots) {
+         sl.table  = -1;
+         sl.expert = -1;
+@@ -1238,7 +1599,7 @@ static bool tier_fill_through_locked(table_t & t, const std::vector<int32_t> & u
+         // a victim copy of either is still exact: point back at it (VRAM) on the victims' stream, else forget it
+         for (const int32_t x : { v, e }) {
+             if (x >= 0 && x < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) x] >= 0) {   // v is -1 when a spare took e
+-                if ((void *) s == g_kvl_stream) {
++                if ((void *) s == kvl_stream(t.device)) {
+                     moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, x, (uintptr_t) kvl_ptr(g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) x]]));
+                 } else {
+                     kvl_forget_locked(t, x);
+@@ -2631,7 +2992,8 @@ struct pf_dev_t {
+ pf_dev_t g_pf[16];
+ static size_t pf_align(size_t x) { return (x + 255) & ~(size_t) 255; }
+ static bool pf_lend_on() {
+-    static const bool v = !getenv("GGML_MOE_PF_LEND") || atoi(getenv("GGML_MOE_PF_LEND")) != 0;
++    // default off with the KV segment (it never uses the staging slots; their take-back syncs every prefill)
++    static const bool v = getenv("GGML_MOE_PF_LEND") ? atoi(getenv("GGML_MOE_PF_LEND")) != 0 : !kvl_seg_on();
+     return v;
+ }
+ // Add the two staging buffers to the KV-lending grid (not lent until the first decode steps after this prefill).
+@@ -2654,7 +3016,8 @@ static void pf_lend_add_locked(pf_dev_t & P, int device) {
+     }
+     for (int b = 0; b < 2; b++) {
+         kvl_tensor_t kt = { P.buf[b], P.buf_bytes, 0 };
+-        kt.pf = true;
++        kt.pf     = true;
++        kt.device = device;   // the slot allocation only hands out slots on the table's own device
+         g_kvl_tensors.push_back(kt);
+         if (!g_kvl_slots.empty()) {   // the grid exists already: this buffer's slots go after it
+             for (size_t off = 0; off + g_kvl_slot_bytes <= kt.bytes; off += g_kvl_slot_bytes) {
+@@ -2692,7 +3055,7 @@ static void pf_take_back_locked() {
+ // The decode policy, on the stream that makes victims: lend the staging after a few steps without a prefetch.  The
+ // staging's last writer (the copy stream) and readers (the prefetched ops) are ordered before the victims' copies.
+ static void pf_lend_maybe_locked(cudaStream_t s) {
+-    if (g_pf_lent || !pf_lend_on() || g_kvl_device < 0 || g_kvl_stream == nullptr || (void *) s != g_kvl_stream) {
++    if (g_pf_lent || !pf_lend_on() || g_kvl_device < 0 || kvl_stream(g_kvl_device) == nullptr || (void *) s != kvl_stream(g_kvl_device)) {
+         return;
+     }
+     pf_dev_t & P = g_pf[g_kvl_device];
+@@ -3135,17 +3498,82 @@ bool moe_cache_kv_register(void * data, size_t bytes, size_t row_bytes, int64_t
+         return false;
+     }
+     std::lock_guard<std::mutex> lock(g_mutex);
+-    if (!g_kvl_slots.empty() || (g_kvl_device >= 0 && attr.device != g_kvl_device) || (g_kvl_rows != 0 && rows != g_kvl_rows)) {
++    if (!g_kvl_slots.empty() || attr.device < 0 || attr.device >= 16 || (g_kvl_rows != 0 && rows != g_kvl_rows)) {
+         return false;
+     }
+-    g_kvl_tensors.push_back({ (char *) data, (size_t) rows * row_bytes, row_bytes });
+-    g_kvl_device = attr.device;
++    kvl_tensor_t kt = { (char *) data, (size_t) rows * row_bytes, row_bytes };
++    kt.device = attr.device;
++    g_kvl_tensors.push_back(kt);
++    if (g_kvl_device < 0) {
++        g_kvl_device = attr.device;
++    }
++    g_kvl_devs |= 1u << attr.device;
+     g_kvl_rows   = rows;
+     g_kvl_line   = rows;   // nothing lent until the first batch says how much the KV uses
+     return true;
+ }
+ namespace {
+ } // namespace
++// The take-back's cold-pointer writes (after the devices were synchronised): GGML_MOE_KV_LEND_BATCH=0 writes each with a
++// cudaMemcpy (the original ~0.2 ms each); by default one upload + one scatter kernel per device holding the pointers.
++static bool kvl_batch_on() {
++    static const bool v = !getenv("GGML_MOE_KV_LEND_BATCH") || atoi(getenv("GGML_MOE_KV_LEND_BATCH")) != 0;
++    return v;
++}
++static void kvl_write_ptrs_locked(const std::vector<std::pair<uintptr_t *, uintptr_t>> & w) {
++    if (!kvl_batch_on()) {
++        for (const auto & pw : w) {
++            (void) cudaMemcpy(pw.first, &pw.second, sizeof(uintptr_t), cudaMemcpyHostToDevice);
++        }
++        return;
++    }
++    static uintptr_t * scratch[16] = {};
++    static size_t      cap[16]     = {};
++    std::vector<int> dev(w.size(), -1);
++    for (size_t k = 0; k < w.size(); k++) {
++        cudaPointerAttributes attr = {};
++        if (cudaPointerGetAttributes(&attr, w[k].first) == cudaSuccess && attr.device >= 0 && attr.device < 16) {
++            dev[k] = attr.device;
++        } else {
++            (void) cudaGetLastError();
++            (void) cudaMemcpy(w[k].first, &w[k].second, sizeof(uintptr_t), cudaMemcpyHostToDevice);   // device unknown: one write
++        }
++    }
++    for (int d = 0; d < 16; d++) {
++        std::vector<uintptr_t> pairs;
++        for (size_t k = 0; k < w.size(); k++) {
++            if (dev[k] == d) {
++                pairs.push_back((uintptr_t) w[k].first);
++                pairs.push_back(w[k].second);
++            }
++        }
++        if (pairs.empty()) {
++            continue;
++        }
++        device_guard dg(d);
++        const size_t bytes = pairs.size() * sizeof(uintptr_t);
++        if (cap[d] < bytes) {
++            if (scratch[d] != nullptr) {
++                (void) cudaFree(scratch[d]);
++            }
++            scratch[d] = nullptr;
++            cap[d]     = 0;
++            if (cudaMalloc((void **) &scratch[d], bytes) != cudaSuccess) {
++                (void) cudaGetLastError();
++                scratch[d] = nullptr;
++                for (size_t k = 0; k < pairs.size(); k += 2) {   // fallback: one write each
++                    (void) cudaMemcpy((void *) pairs[k], &pairs[k + 1], sizeof(uintptr_t), cudaMemcpyHostToDevice);
++                }
++                continue;
++            }
++            cap[d] = bytes;
++        }
++        (void) cudaMemcpy(scratch[d], pairs.data(), bytes, cudaMemcpyHostToDevice);
++        const int n = (int) (pairs.size() / 2);
++        moe_cache_scatter_ptrs_kernel<<<std::min(256, (n + 255) / 256), 256>>>(scratch[d], n);
++        (void) cudaDeviceSynchronize();   // the scratch is reused by the next take-back
++    }
++}
+ // Move the lend line: the next batch reads or writes rows [0, rows).  Taking rows back synchronises the device, points
+ // the victims there back at their fallback and zeroes the rows (attention reads masked cells up to n_kv, and expert
+ // bytes there could turn into NaN); giving rows back is bookkeeping.  A margin above the need, and a hysteresis of 4
+@@ -3160,36 +3588,63 @@ void moe_cache_kv_need(int64_t rows) {
+     }
+     const int64_t step = kvl_step();
+     rows = std::max<int64_t>(0, std::min(rows, g_kvl_rows));
+-    const int64_t want = std::min(g_kvl_rows, std::max(2 * step, (rows + kvl_margin() + step - 1) / step * step));
++    int64_t want = std::min(g_kvl_rows, std::max(2 * step, (rows + kvl_margin() + step - 1) / step * step));
+     const int64_t old  = g_kvl_line;
++    if (kvl_borrow_on()) {
++        // GGML_MOE_KV_BORROW_GROW (default 2): the line sits at GROW x the need, so a long prompt takes O(log) times
++        // (the give test below uses the same line, or the next call would give the growth back)
++        static const int64_t grow = getenv("GGML_MOE_KV_BORROW_GROW") ? std::max<int64_t>(1, atoll(getenv("GGML_MOE_KV_BORROW_GROW"))) : 2;
++        want = std::min(g_kvl_rows, std::max(want, (grow * rows + step - 1) / step * step));
++    }
+     if (rows > old) {
+         const auto t0 = std::chrono::steady_clock::now();
+-        device_guard dg(g_kvl_device);
+-        (void) cudaDeviceSynchronize();   // no reader of a victim and no KV writer may be in flight
++        (void) fb_flush_locked();   // defensive: no queued copy into a lent slot may land after the take
++        // every lending device: no reader of a victim and no KV writer may be in flight.  Called from the host between
++        // graphs (batch init, park, shift, clear, state read), so both devices' halves of a collective are queued already.
++        for (int d = 0; d < 16; d++) {
++            if (kvl_dev_lends(d)) {
++                device_guard dg(d);
++                (void) cudaDeviceSynchronize();
++            }
++        }
+         g_kvl_line = want;
+         std::vector<std::pair<uintptr_t *, uintptr_t>> w;
+         int64_t n_drop = 0;
+         for (kvl_slot_t & sl : g_kvl_slots) {
+             if (sl.table >= 0 && !kvl_avail(sl)) {
++                if (kvl_seg_on() && !seg_tier_on() && sl.expert >= 0) {
++                    // phase 1 rule only (GGML_MOE_KV_SEG_TIER=0): a KV-segment resident leaves VRAM: past the arena
++                    // doorkeeper, so its next miss is admitted (it never was, its reads counted as hits).  Tier mode needs
++                    // none: the arena policy already saw every miss.
++                    table_t & ot = g_tables[(size_t) sl.table];
++                    if (sl.expert < (int32_t) ot.ghost.size()) {
++                        ot.ghost[(size_t) sl.expert] = std::max<int64_t>(ot.ghost[(size_t) sl.expert], std::max<int64_t>(tier_touch(), g_touch));
++                    }
++                }
+                 kvl_release_locked(sl, nullptr, &w);
+                 n_drop++;
+             }
+         }
+-        for (const auto & pw : w) {
+-            (void) cudaMemcpy(pw.first, &pw.second, sizeof(uintptr_t), cudaMemcpyHostToDevice);
+-        }
++        kvl_write_ptrs_locked(w);
+         for (const kvl_tensor_t & kt : g_kvl_tensors) {
+             const size_t a = (size_t) old * kt.row_bytes, b = std::min(kt.bytes, (size_t) want * kt.row_bytes);
+             if (b > a) {
++                device_guard dg(kt.device >= 0 ? kt.device : g_kvl_device);
+                 (void) cudaMemset(kt.data + a, 0, b - a);
+             }
+         }
+-        (void) cudaDeviceSynchronize();
++        for (int d = 0; d < 16; d++) {
++            if (kvl_dev_lends(d)) {
++                device_guard dg(d);
++                (void) cudaDeviceSynchronize();
++            }
++        }
+         (void) cudaGetLastError();
+         for (const kvl_slot_t & sl : g_kvl_slots) {
+             GGML_ASSERT(sl.table < 0 || kvl_avail(sl));   // no victim may stay in a row the KV now owns
+         }
+         g_kvl_takes++;
++        g_kvl_quota_dirty = true;
+         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+         g_kvl_ms += ms;
+         if (kvl_log()) {
+@@ -3199,6 +3654,7 @@ void moe_cache_kv_need(int64_t rows) {
+     } else if (want + 4 * step <= old) {
+         g_kvl_line = want;
+         g_kvl_gives++;
++        g_kvl_quota_dirty = true;
+         if (kvl_log()) {
+             GGML_LOG_WARN("moe_cache KV lending: KV needs %lld rows, line %lld -> %lld (lent)\n", (long long) rows,
+                           (long long) old, (long long) want);
+@@ -3224,9 +3680,12 @@ void moe_cache_kv_unregister() {
+     }
+     g_kvl_rows = g_kvl_line = 0;
+     g_kvl_device     = -1;
++    g_kvl_devs       = 0;
+     g_kvl_slot_bytes = 0;
+     g_kvl_hand       = 0;
+-    g_kvl_stream     = nullptr;
++    for (void *& st : g_kvl_stream_d) {
++        st = nullptr;
++    }
+ }
+ namespace {
+ 
+@@ -3342,6 +3801,23 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+         g_acc_hits++;
+         return { (char *) t.arena + (size_t) hit_it->second * t.expert_bytes, true };
+     }
++    // KV segment: a tier below the arena.  A read of an expert held there is served from that VRAM copy when it stays
++    // cold, but the arena policy below sees it as the miss it would be without the segment (ghost, admission, eviction
++    // unchanged; an admission fills from the copy), so the arena evolves exactly as without the segment and a take-back
++    // that drops the copies leaves it as it would be.  GGML_MOE_KV_SEG_TIER=0: the phase 1 rule (a hit, never admitted).
++    if (kvl_seg_on() && g_kvl_in_decode && cold_ok && out_cold != nullptr && stream == kvl_stream(t.device) &&
++        expert >= 0 && expert < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) expert] >= 0) {
++        g_kvl_seg_hits++;
++        if (!seg_tier_on()) {
++            t.hits++;
++            t.count[expert]++;
++            t.last[expert] = t.clock;
++            g_kvl_hits++;
++            *out_cold = true;
++            return { nullptr, false };
++        }
++        t.last[expert] = t.clock;   // the share replaces its least recently used copy (count stays the arena policy's)
++    }
+ 
+     t.misses++;
+     // Every miss is a touch of an expert we do NOT hold, i.e. demand we are not serving.  The
+@@ -3372,7 +3848,7 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+     }
+     // KV lending: with no free slot, an expert whose victim copy cold_ptrs already names is read from VRAM as it is
+     // (no eviction, no fill); the victims' stream only, so its cold pointer is ordered with this call's kernel.
+-    if (slot < 0 && cold_ok && out_cold != nullptr && kvl_on() && kvl_stay_on() && g_kvl_in_decode && stream == g_kvl_stream &&
++    if (slot < 0 && cold_ok && out_cold != nullptr && kvl_on() && kvl_stay_on() && !kvl_seg_on() && g_kvl_in_decode && stream == kvl_stream(t.device) &&
+         expert >= 0 && expert < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) expert] >= 0) {
+         g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) expert]].ref = true;
+         g_kvl_hits++;
+@@ -3430,6 +3906,8 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+             g_cold_bytes += (int64_t) t.expert_bytes;
+             *out_cold = true;
+             kvl_note_cold_locked(t, expert);
++            kvl_borrow_locked(t, expert, stream);
++            kvl_seg_admit_locked(t, expert, stream, protect, n_protect);
+             return { nullptr, false };
+         }
+         if (slot >= 0) {
+@@ -3475,6 +3953,8 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+             g_acc_colds++;
+             g_cold_bytes += (int64_t) t.expert_bytes;
+             kvl_note_cold_locked(t, expert);
++            kvl_borrow_locked(t, expert, stream);
++            kvl_seg_admit_locked(t, expert, stream, protect, n_protect);
+         }
+         return { nullptr, false };
+     }
+@@ -3521,7 +4001,7 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+             local_src = true;
+             // the incoming expert's victim copy (if any) is the fill source: pinned so keeping the outgoing one cannot
+             // take its slot first
+-            const int kv_src = expert >= 0 && expert < (int32_t) kvl_kvv(t).size() && stream == g_kvl_stream ? kvl_kvv(t)[(size_t) expert] : -1;
++            const int kv_src = expert >= 0 && expert < (int32_t) kvl_kvv(t).size() && stream == kvl_stream(t.device) ? kvl_kvv(t)[(size_t) expert] : -1;
+             g_kvl_pin = kv_src;
+             const int kv_keep = kvl_keep_locked(t, victim, dst, (cudaStream_t) stream);
+             g_kvl_pin = -1;
+@@ -3658,10 +4138,14 @@ static bool tier_devremap_prep_locked(table_t & t, void * stream) {
+         route_log_locked(t, 'C', t.dr_lag_host, n);
+         pf_lend_maybe_locked(s);
+         g_kvl_in_decode = true;   // victims only from the decode policy, on the stream that reads cold_ptrs
++        g_kvl_seg_call_fills = 0;
+         for (int i = 0; i < n && !g_tier_off; i++) {
+             bool cold = false;
+             (void) access_locked(t, t.dr_lag_host[i], stream, t.dr_lag_host, n, &cold);
+         }
++        if (!g_tier_off) {
++            kvl_seg_seed_locked(t, stream);
++        }
+         g_kvl_in_decode = false;
+         if (g_tier_off || t.ram_base == nullptr || t.arena == nullptr || t.slots <= 0 || t.fill_failed) {
+             return false;   // an admission failed and dropped the tier: the host path takes over from here
+@@ -3833,10 +4317,19 @@ static void tier_report_locked() {
+                 held += sl.table >= 0;
+             }
+             GGML_LOG_WARN("%s: KV lending: %zu victim slots (%lld held), line %lld of %lld rows; %lld kept, %lld cold reads served "
+-                          "from VRAM (%lld kept cold), %lld not, %lld dropped, %lld fills from a victim; %lld takes (%.1f ms), %lld gives\n", __func__, g_kvl_slots.size(),
++                          "from VRAM (%lld kept cold), %lld not, %lld dropped, %lld fills from a victim, %lld borrowed; %lld takes (%.1f ms), %lld gives\n", __func__, g_kvl_slots.size(),
+                           (long long) held, (long long) g_kvl_line, (long long) g_kvl_rows, (long long) g_kvl_inserts,
+-                          (long long) g_kvl_hits, (long long) g_kvl_stays, (long long) g_kvl_misses, (long long) g_kvl_drops, (long long) g_kvl_fills, (long long) g_kvl_takes,
++                          (long long) g_kvl_hits, (long long) g_kvl_stays, (long long) g_kvl_misses, (long long) g_kvl_drops, (long long) g_kvl_fills, (long long) g_kvl_borrows, (long long) g_kvl_takes,
+                           g_kvl_ms, (long long) g_kvl_gives);
++            if (kvl_seg_on()) {
++                int64_t held = 0;
++                for (int h : g_kvl_held) {
++                    held += h;
++                }
++                GGML_LOG_WARN("%s: KV segment: %lld seeds, %lld demand fills (%lld replacing), %lld held, %lld policy reads of held experts; quota %d / %d per table\n", __func__,
++                              (long long) g_kvl_seeds, (long long) g_kvl_seg_fills, (long long) g_kvl_seg_repl, (long long) held,
++                              (long long) g_kvl_seg_hits, g_kvl_quota[0], g_kvl_quota[1]);
++            }
+             if (g_pf_lends > 0 || g_pf_takes > 0) {
+                 int64_t pf_held = 0;
+                 for (const kvl_slot_t & sl : g_kvl_slots) {
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 079f65a64..8995d5585 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1179,16 +1179,45 @@ void llama_kv_cache::lend_attach() {
+         has_kv_pool() || layers.empty()) {
+         return;
+     }
++    // Under -sm tensor the K/V live in a meta buffer (each device holds a head slice of every layer, one row per cell):
++    // every device lends from its own slices (each device's expert cache only takes slots on its own device), asking
++    // device 0's backend reg (the meta device has none; every child is the same backend).  GGML_MOE_KV_LEND_META=0: no
++    // lending under a meta device (the state before this existed); =1: device 0's slices only.
++    ggml_backend_dev_t dev = layers.empty() || layers[0].k == nullptr || layers[0].k->buffer == nullptr ? nullptr :
++        ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layers[0].k->buffer));
++    const bool meta = dev != nullptr && ggml_backend_dev_is_meta(dev);
++    size_t n_lend_devs = 1;
++    if (meta) {
++        const char * em = getenv("GGML_MOE_KV_LEND_META");
++        if ((em != nullptr && atoi(em) == 0) || ggml_backend_meta_dev_n_devs(dev) == 0) {
++            return;
++        }
++        n_lend_devs = em != nullptr && atoi(em) == 1 ? 1 : ggml_backend_meta_dev_n_devs(dev);
++        dev = ggml_backend_meta_dev_simple_dev(dev, 0);
++    }
++    std::vector<ggml_tensor *> lend;   // the K and V (or their device-0 slices) to register
+     for (const auto & layer : layers) {   // one K and one V per layer, one row per cell (not the indexer's cache)
+-        if (layer.k == nullptr || layer.v == nullptr || layer.k->buffer == nullptr || layer.v->buffer == nullptr ||
+-            !ggml_is_contiguous(layer.k) || !ggml_is_contiguous(layer.v) || layer.k->ne[1] != (int64_t) get_size() ||
+-            layer.v->ne[1] != (int64_t) get_size() || layer.k->ne[2] != 1 || layer.v->ne[2] != 1) {
++        if (layer.k == nullptr || layer.v == nullptr || layer.k->buffer == nullptr || layer.v->buffer == nullptr) {
+             return;
+         }
++        for (ggml_tensor * t0 : { layer.k, layer.v }) {
++            for (size_t j = 0; j < n_lend_devs; j++) {
++                ggml_tensor * t = meta ? ggml_backend_meta_tensor_simple(t0, j) : t0;
++                if (t == nullptr) {
++                    return;   // a meta tensor without its simple tensor: not the layout this expects
++                }
++                if (meta && ggml_nbytes(t) == 0) {
++                    continue;   // this layer's heads all live on another device
++                }
++                if (t->data == nullptr || !ggml_is_contiguous(t) || t->ne[1] != (int64_t) get_size() || t->ne[2] != 1) {
++                    return;
++                }
++                lend.push_back(t);
++            }
++        }
+     }
+-    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layers[0].k->buffer));
+     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+-    if (reg == nullptr) {
++    if (reg == nullptr || lend.empty()) {
+         return;
+     }
+     auto reg_fn   = (llama_kv_lend_register_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_kv_register");
+@@ -1198,10 +1227,8 @@ void llama_kv_cache::lend_attach() {
+         return;
+     }
+     int n = 0;
+-    for (const auto & layer : layers) {
+-        for (ggml_tensor * t : { layer.k, layer.v }) {
+-            n += reg_fn(t->data, ggml_nbytes(t), t->nb[1], (int64_t) get_size()) ? 1 : 0;
+-        }
++    for (ggml_tensor * t : lend) {
++        n += reg_fn(t->data, ggml_nbytes(t), t->nb[1], (int64_t) get_size()) ? 1 : 0;
+     }
+     if (n == 0) {
+         return;
+@@ -1209,8 +1236,8 @@ void llama_kv_cache::lend_attach() {
+     g_kv_lend_owner      = this;
+     g_kv_lend_need       = need_fn;
+     g_kv_lend_unregister = unreg_fn;
+-    LLAMA_LOG_WARN("%s: KV lending: %d of %d K/V tensors (%u cells) lent to the MoE expert cache past the context in use\n",
+-                   __func__, n, (int) (2 * layers.size()), get_size());
++    LLAMA_LOG_WARN("%s: KV lending: %d of %d K/V tensors (%u cells%s) lent to the MoE expert cache past the context in use\n",
++                   __func__, n, (int) lend.size(), get_size(), !meta ? "" : n_lend_devs == 1 ? ", device 0 slices of a tensor split" : ", every device's slices of a tensor split");
+ }
+ 
+ // The indexer's keys-only cache uses the attention cache's slot layout, so the attention cache's lend line covers its
+@@ -1221,6 +1248,11 @@ void llama_kv_cache::lend_follow(const llama_kv_cache & owner) {
+         has_kv_pool() || layers.empty() || get_size() != owner.get_size()) {
+         return;
+     }
++    // a tensor-split (meta) indexer cache is not lent: its tensors' data are meta placeholders, not device memory
++    if (layers[0].k != nullptr && layers[0].k->buffer != nullptr &&
++        ggml_backend_dev_is_meta(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layers[0].k->buffer)))) {
++        return;
++    }
+     for (const auto & layer : layers) {
+         if (layer.v != nullptr || layer.k == nullptr || layer.k->buffer == nullptr || !ggml_is_contiguous(layer.k) ||
+             layer.k->ne[1] != (int64_t) get_size() || layer.k->ne[2] != 1) {
+-- 
+2.53.0
+

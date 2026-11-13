@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 10 Nov 2026 15:28:45 +0000
-Subject: [PATCH 19/31] moe cache: a device-remap call does not re-batch a
+Subject: [PATCH 18/36] moe cache: a device-remap call does not re-batch a
  sibling already taken over in this round (GGML_MOE_DEVREMAP_REBATCH)
 
 A layer whose down (or up) table was not served by the first remap call of
@@ -21,10 +21,10 @@ GGML_MOE_DEVREMAP_REBATCH=1 restores the old re-batch.
  1 file changed, 13 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 77b690d50..8593f198c 100644
+index 15a06ba51..288e7e4e0 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -10780,6 +10780,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+@@ -11669,6 +11669,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
      return true;
  }
  
@@ -37,7 +37,7 @@ index 77b690d50..8593f198c 100644
  bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids,
                           void * stream, int device, bool check_only) {
      bool pf_ret = false;
-@@ -10874,6 +10880,13 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -11764,6 +11770,13 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
                  !devremap_ok_locked(u, n_used, n_tok, device)) {
                  continue;
              }
@@ -50,7 +50,7 @@ index 77b690d50..8593f198c 100644
 +            }
              if (!devremap_prep_locked(u, stream)) {
                  fence_flush_locked(u);
-                 u.remap_n_used = 0;
+                 u.remap_n_used  = 0;
 -- 
 2.53.0
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 17:56:22 +0000
-Subject: [PATCH 16/31] sched: on multi-device backends, skip the alloc_splits
+Subject: [PATCH 15/36] sched: on multi-device backends, skip the alloc_splits
  drain when no buffer grows (GGML_SCHED_DEFER_ALLOC_SYNC)
 
 Every prompt ubatch re-reserves its graph (the KV views grow), and with more than one device (or a META
@@ -16,7 +16,7 @@ GGML_SCHED_DEFER_ALLOC_SYNC=0 restores the drain; 2 = drain right after the new 
  1 file changed, 19 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 0a9f24851..aa248c232 100644
+index 1558cd883..8d7a171b8 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -2824,11 +2824,22 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {

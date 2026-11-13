@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 13 Nov 2026 14:16:22 +0000
+Subject: [PATCH 35/36] moe cache: KV segment phase 2 -- review fixes (source
+ counters, idle hint)
+
+Three small fixes from the logic review of the two phase 2 commits.  None
+changes which bytes are read.
+
+- The KV-copy candidate of a small prefill ubatch is now looked up
+  whether or not GGML_MOE_KV_SEG_PF is set (still only with the KV
+  segment on), and only its use is gated on the switch.  With the switch
+  off the expert is read from the RAM tier / file exactly as before but
+  counted under "with a KV copy", so the off-state report sizes what the
+  switch would move, as the previous commit message said it did.
+
+- The by-source counters count each staged expert once.  The callers
+  collect them locally and add them only when the fill is accepted, so
+  an in-place prepare that declines after building its list and falls
+  through to the plain routed fill is no longer counted twice, and the
+  in-place and pad entries of the in-place prepare, which that fill does
+  not copy, are no longer counted as arena reads.
+
+- The server sends llama_kv_lend_hint(0) on the all-idle return of
+  update_slots, so the floor of a finished or cancelled prompt does not
+  outlive it until the next request; the comment at the hint now says
+  what is sent and when.
+---
+ ggml/src/ggml-cuda/moe-expert-tier.inc | 44 +++++++++++++++++++-------
+ tools/server/server-context.cpp        |  8 +++--
+ 2 files changed, 38 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index e67e89518..ac1f4f4b7 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -2359,37 +2359,46 @@ static __global__ void moe_cache_route_kernel(char * __restrict__ dst, const cha
+ // runs on, reads an expert's KV-segment copy (contiguous, cold 0, the same bytes) before the RAM tier or the file: a
+ // device-to-device copy.  Only on the stream that writes and reuses those slots, so the read is ordered against them,
+ // and not a slot a queued fill job still writes or a fill has pinned.  Nothing of the policy's state is touched.
++// n_src (optional) counts the expert by source: arena, KV copy, RAM tier, file.  A usable KV copy counts as one with
++// the switch off too (the source is then the RAM tier / file as before), so the report sizes what the switch would move.
+ static bool kvl_seg_pf_on() {
+     static const bool v = kvl_seg_on() && getenv("GGML_MOE_KV_SEG_PF") != nullptr && atoi(getenv("GGML_MOE_KV_SEG_PF")) > 0;
+     return v;
+ }
+-static int64_t g_pf_src_n[4] = {};   // small prefill ubatches: experts read from the arena, a KV copy, the RAM tier, the file
+-static bool expert_copy_src_locked(const table_t & t, int32_t e, const char ** src, uint8_t * cold, void * stream = nullptr) {
++static int64_t g_pf_src_n[4] = {};   // small prefill ubatches: experts staged from the arena, a KV copy, the RAM tier, the file
++static bool expert_copy_src_locked(const table_t & t, int32_t e, const char ** src, uint8_t * cold, void * stream = nullptr,
++                                   int64_t * n_src = nullptr) {
+     const auto it = t.expert_slot.find(e);
+-    const int  kv = stream != nullptr && kvl_seg_pf_on() && stream == kvl_stream(t.device) && e < (int32_t) kvl_kvv(t).size() ?
++    int        kv = stream != nullptr && kvl_seg_on() && stream == kvl_stream(t.device) && e < (int32_t) kvl_kvv(t).size() ?
+                     kvl_kvv(t)[(size_t) e] : -1;
++    if (kv >= 0 && (kv == g_kvl_pin || fb_kv_busy(kv) || !kvl_avail(g_kvl_slots[(size_t) kv]))) {
++        kv = -1;
++    }
++    int from = 0;
+     if (it != t.expert_slot.end() && t.arena != nullptr) {
+         *src  = (const char *) t.arena + (size_t) it->second * t.expert_bytes;
+         *cold = 0;
+-        g_pf_src_n[0] += stream != nullptr;
+-    } else if (kv >= 0 && kv != g_kvl_pin && !fb_kv_busy(kv) && kvl_avail(g_kvl_slots[(size_t) kv])) {
++    } else if (kv >= 0 && kvl_seg_pf_on()) {
+         *src  = kvl_ptr(g_kvl_slots[(size_t) kv]);
+         *cold = 0;
+-        g_pf_src_n[1]++;
++        from  = 1;
+     } else if (t.ram_base != nullptr && (!t.ram_partial || t.ram_slot[(size_t) e] >= 0)) {
+         if (t.ram_slot[(size_t) e] < 0) {
+             return false;
+         }
+         *src  = t.ram_base + (size_t) t.ram_slot[(size_t) e] * t.expert_bytes;
+         *cold = 0;
+-        g_pf_src_n[2] += stream != nullptr;
++        from  = kv >= 0 ? 1 : 2;
+     } else {
+         if (!sparse_need_locked(t, e)) {
+             return false;
+         }
+         *src  = (const char *) t.host_dev + (size_t) e * t.host_bytes + t.src_off;
+         *cold = 1;
+-        g_pf_src_n[3] += stream != nullptr;
++        from  = kv >= 0 ? 1 : 3;
++    }
++    if (n_src != nullptr) {
++        n_src[from]++;
+     }
+     return true;
+ }
+@@ -2427,11 +2436,12 @@ static bool sparse_fill_routed_locked(table_t & t, void * dst, const int32_t * i
+     int32_t *     eids = (int32_t *) (t.route_pack.data() + n * sizeof(void *));
+     uint8_t *     cold = t.route_pack.data() + n * (sizeof(void *) + sizeof(int32_t));
+     unsigned k = 0;
++    int64_t  n_src[4] = {};
+     for (int32_t e = 0; e < t.n_experts; e++) {
+         if (!want[(size_t) e]) {
+             continue;
+         }
+-        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k], stream)) {
++        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k], stream, n_src)) {
+             return false;
+         }
+         eids[k] = e;
+@@ -2462,6 +2472,9 @@ static bool sparse_fill_routed_locked(table_t & t, void * dst, const int32_t * i
+         return false;
+     }
+     g_route_fills++;
++    for (int i = 0; i < 4; i++) {
++        g_pf_src_n[i] += n_src[i];
++    }
+     return true;
+ }
+ } // namespace
+@@ -2908,8 +2921,10 @@ static bool prefill_inplace_prepare_locked(table_t & t, const ggml_tensor * weig
+     int32_t *     eids = (int32_t *) (t.route_pack.data() + n * sizeof(void *));
+     uint8_t *     cold = t.route_pack.data() + n * (sizeof(void *) + sizeof(int32_t));
+     int k = 0;
++    int64_t   n_src[4] = {};
++    int64_t * cnt      = n_src;   // the staged entries only: the in-place and pad ones are not read by the in-place fill
+     const auto add = [&](int32_t e) -> bool {
+-        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k], stream)) {
++        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k], stream, cnt)) {
+             return false;
+         }
+         eids[k++] = e;
+@@ -2921,6 +2936,7 @@ static bool prefill_inplace_prepare_locked(table_t & t, const ggml_tensor * weig
+         }
+     }
+     const int k_stage = k;
++    cnt = nullptr;
+     for (int32_t e = 0; e < t.n_experts; e++) {
+         if (used[(size_t) e] && !stage[(size_t) e] && !add(e)) {
+             return false;
+@@ -2964,6 +2980,9 @@ static bool prefill_inplace_prepare_locked(table_t & t, const ggml_tensor * weig
+     t.pf_do2d    = do2d;
+     g_alias_to_id[weight_cpy] = (int) (&t - g_tables.data());
+     g_route_fills++;
++    for (int i = 0; i < 4; i++) {
++        g_pf_src_n[i] += n_src[i];
++    }
+     return true;
+ }
+ // ---- wip/prefill-prefetch (GGML_MOE_PF_PREFETCH=1) ----
+@@ -4356,9 +4375,10 @@ static void tier_report_locked() {
+                 GGML_LOG_WARN("%s: KV segment: %lld seeds, %lld demand fills (%lld replacing), %lld held, %lld policy reads of held experts; quota %d / %d per table\n", __func__,
+                               (long long) g_kvl_seeds, (long long) g_kvl_seg_fills, (long long) g_kvl_seg_repl, (long long) held,
+                               (long long) g_kvl_seg_hits, g_kvl_quota[0], g_kvl_quota[1]);
+-                GGML_LOG_WARN("%s: KV segment: small prefill ubatches read %lld experts from the arena, %lld from KV copies%s, "
++                GGML_LOG_WARN("%s: KV segment: small prefill ubatches staged %lld experts from the arena, %lld %s, "
+                               "%lld from the RAM tier, %lld from the file\n", __func__, (long long) g_pf_src_n[0],
+-                              (long long) g_pf_src_n[1], kvl_seg_pf_on() ? "" : " (GGML_MOE_KV_SEG_PF off)",
++                              (long long) g_pf_src_n[1], kvl_seg_pf_on() ? "from KV copies" :
++                              "with a KV copy (GGML_MOE_KV_SEG_PF off: read from the RAM tier / file)",
+                               (long long) g_pf_src_n[2], (long long) g_pf_src_n[3]);
+             }
+             if (g_pf_lends > 0 || g_pf_takes > 0) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b2514a54c..ada91a05b 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3912,6 +3912,8 @@ private:
+ 
+                 metrics_flush_idle();
+ 
++                llama_kv_lend_hint(0); // no prompt in progress: the KV lend line follows the cells in use again
++
+                 return; // skip further processing
+ 
+             } else {
+@@ -3971,8 +3973,10 @@ private:
+             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+         }
+ 
+-        // KV lending: the cells the prompts in progress still need (this batch + what is left of them), every iteration,
+-        // so the rows are taken back from the MoE expert cache once per request and a cancelled prompt corrects itself
++        // KV lending: the cells the prompts in progress still need (this batch + what is left of every slot still in
++        // PROCESSING_PROMPT), sent every iteration, so a long prompt takes its rows back from the MoE expert cache in one
++        // take and a cancelled one stops holding them (0 here or on the all-idle return above).  A prompt that fits one
++        // batch is DONE_PROMPT already and sends 0: its ubatches report their own need, as without the hint.
+         {
+             int32_t n_prompt = 0;
+             bool    any      = false;
+-- 
+2.53.0
+

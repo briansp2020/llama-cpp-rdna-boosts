@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 19:06:53 +0000
-Subject: [PATCH 17/31] sched/llama: pinned graph inputs under -sm tensor,
+Subject: [PATCH 16/36] sched/llama: pinned graph inputs under -sm tensor,
  uploaded asynchronously per device; keep host compute buffers across the drop
 
 - llama-context: a tensor-split (meta) device has no single host buffer type when its GPUs report per-device
@@ -29,10 +29,10 @@ review (M1-M4 applied), code reviews no must-fix (FINDINGS 861).
  5 files changed, 105 insertions(+)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 9f6a55952..a436a2311 100644
+index aab28b0ab..22df9d928 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -524,6 +524,9 @@ extern "C" {
+@@ -527,6 +527,9 @@ extern "C" {
      GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
      GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
      GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
@@ -71,10 +71,10 @@ index 37cefb222..916d7018b 100644
              if (galloc->buffers[j] == galloc->buffers[i]) {
                  galloc->buffers[j] = NULL;
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index c6fa0150d..0690cd219 100644
+index cd03622a7..47b13b690 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -3174,6 +3174,8 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
+@@ -3183,6 +3183,8 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
      delete backend;
  }
  
@@ -83,7 +83,7 @@ index c6fa0150d..0690cd219 100644
  static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
      GGML_ASSERT(ggml_is_contiguous(tensor));
-@@ -3290,6 +3292,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -3310,6 +3312,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
              return;
          }
  
@@ -98,7 +98,7 @@ index c6fa0150d..0690cd219 100644
          return;
      }
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index aa248c232..a010c8a34 100644
+index 8d7a171b8..8fcf2e4bb 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1629,6 +1629,10 @@ struct ggml_backend_sched {
@@ -213,7 +213,7 @@ index aa248c232..a010c8a34 100644
          // the rings keeps them from synchronizing on the host at every wrap in a long prefill.
          sched->copy_event_next[i] = 0;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index a624efe78..3c80f2209 100644
+index 4014d5a59..8cd396d77 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -855,6 +855,15 @@ llama_context::llama_context(
@@ -232,7 +232,7 @@ index a624efe78..3c80f2209 100644
                  if (host_buft) {
                      buft = host_buft;
                  }
-@@ -2978,6 +2987,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2984,6 +2993,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          if (cparams.pipeline_parallel) {
              ggml_backend_sched_synchronize(sched.get());
          }

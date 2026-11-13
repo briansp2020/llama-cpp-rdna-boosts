@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 06:25:22 +0000
-Subject: [PATCH 31/31] mmq: RDNA4 IQ routed-compact experts with 65-96 rows
+Subject: [PATCH 30/36] mmq: RDNA4 IQ routed-compact experts with 65-96 rows
  per expert use J=64
 
 At -ub 4096 with 10 of 512 experts (80 rows per expert) the IQ / Q2_0
