@@ -154,12 +154,15 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§82** | a synchronized readback that a fast path removes must be replaced by a device-side map whose **freshness is the only thing that can make it wrong**: the decode band's slot-remap map is keyed on `slot_dirty` (set by every slot mutation -- fill/eviction/stand-down/slab eviction/shrink/migration/re-arm) and its cold encoding (`slots + e`) also depends on the slot COUNT, so a count change without a rebuild reads the **wrong expert / past the master** while a *stale policy* can only admit the wrong expert, never move a read address.  Keep the policy on the host, keep the lag policy-only, and prove it with byte-identical text plus identical MTP acceptance (r203, PR #266, block 09: 0.76089 = 1397/1836 both arms, prefill KLD 0.000000, +8.4 % TG) | doctrine + fix (r203, PR #266; `benchmarks/2026-11-01-host-expert-device-remap.md`, `archive/work/pinned-decode-remap/`) |
 | **§84** | a re-base owes a re-derivation of the **value** behind a renamed field, never a carry-over: `mmq_args.ncols_max` (count) -> `ntj` (J-tile count, consumed as `grid.x`) made the pair fusion's grid `ncols` instead of `ncols/J` (page fault at a large context, clean at a small one), and `tile_y_max_j` (max index) -> `tile_y_j_sup` (exclusive count) dropped a column per tile in the routed-compact kernel; the ids convention also moved the expert into `tile_spec` (`nchannels_y = 1`, `n_experts` in `nchannels_x`), which had silently turned that dispatch OFF since R09 and hidden the off-by-one behind it.  A re-based dispatch is proved by a census that it FIRES, and a fallback copy of upstream's dispatcher must be upstream's text verbatim (a merged copy re-enabled stale delivery duplicates, one of them not bit-identical in a state-carrying path) | doctrine + fix (r236, re-base R11) |
 | **§85** | a re-derived call into a new API owes the **node type** that API is valid for, and a positional call into an extended parameter list is a silent mis-assignment: the fused `GGML_OP_INDEXER_SCORE` kernel took `ggml_rope_get_truncate(dst)` after `#30206` added an op-type assert (every sparse QSA decode arm aborted since R12, and no gate ran that arm), and `llama_kv_cache`'s ctor gained `is_indexer` **before** `v_enabled`, so the delivery's positional hybrid call put `kv_pool` into `v_enabled` — no V tensor, `cpy_v` null-deref, every GDN model segfaulted at load.  Name the arguments, audit every call site of the symbol, and give each re-derived fused kernel an arm that REACHES it | doctrine + fix (r236, re-base R16) |
+| **§86** | an optimization may not change which kernel **variant** an op takes: "does this op have a mask" is ONE predicate asked by the chooser, the MMA `ncols2` dispatch, the RDNA band predicate and the tile `ncols2` dispatch, never a launcher-side `src[x] != nullptr` copy — after #29510 took `src[5]` for `kv_rows` and moved the derived form to `src[6..8]`, the two copies read `nullptr` on a derived op and took `ncols2 = 1` where the packed form took 4/8, on every layout whose chooser picks the TILE kernel (RDNA3_5/RDNA3_0 heads above their WMMA cap, RDNA2, `GGML_CUDA_FA_WMMA_256=0`); the band site is inert by construction (derived implies `n_tokens > 8`, the band requires `<= 8`) and is carried so the sites cannot drift.  The arm must reach the code: the op suite's only derived tile case has an unaligned `n_kv` and saw nothing (6978/6978 either way), so the aligned head-512 derived case + a forced-tile suite run are part of the fix | doctrine + fix (r268, contributor PR #303) |
+| **§87** | a residency tier's fill **issue ORDER** and its fill **SET** are different things, and only the set is part of the answer: the slot an expert lands in is arbitrary (`pool_fill_empty_locked` takes the first free slot, `apply_heat_seed_locked` fills `0..k`), so a fill may be re-ordered for the file's benefit with no change to any expert byte — but the *set* is policy and may not move, and any mechanism that makes a **covering** tier incomplete (a lazy seed, a lazier prewarm) silently costs the sync-free decode remap rather than a few bytes.  Two orders of the same ranked set measured on the bounded pool: 12 546 ms against 7 774 ms for 42.7 GiB (3.67 -> 6.25 GB/s), text byte-identical both ways | doctrine + fix (r270, `TODO` #318; `benchmarks/2026-11-12-expert-seed-policy.md`) |
 ---
 
 **How to read an entry.**  Every `§` has a row above.  `doctrine` = read before shipping · `current` = live
 behaviour · `fix` = a closed finding, kept because the *rule* it produced still binds.  The entries exist in
 three shapes: `§§1-10` are the **Background** block below (the k-quant rounding-order doctrine they all rest
-on), `§§11-76`, `§82`, `§84` and `§85` are full entries, and `§§77-81` are **row-only** -- their whole record is the row plus
+on), `§§11-76`, `§82`, `§84`, `§85`, `§86` and `§87` are full entries, and `§§77-81` are **row-only** -- their whole
+record is the row plus
 the `WORKLOG.md` entry it names.  A fact that changes is corrected in place, tagged with the revision that
 changed it; the dated narrative is always `WORKLOG.md` or the `benchmarks/` record.
 
@@ -2395,3 +2398,104 @@ family (`1de99b7e6ee6` / `4b4d56191368` / `86b7f9b5aa80` / `7a8734a9f1a6`).
 
 **Record.**  This entry; `INVARIANTS.md` (the ctor-order entry); `archive/work/upstream-rebase-261108/RUNGS.md` R16;
 `TODO.md` #297 (the sparse arm's missing gate); `WORKLOG.md` at R17.
+
+## 86. An optimization may not change which kernel VARIANT an op takes: "does this op have a mask" is one predicate, asked by every launcher (r268, contributor PR #303)
+
+**Claim.**  The delivery's derived kq mask is an optimization that must be indistinguishable from the packed mask
+at the logits, and that contract is only structural if *kernel selection* sees both forms.  `has_mask()` was
+written for exactly that, in `fattn.cu`, as a `static` — so the two `.cuh` launchers kept hand-copies of an older
+form of it (`mask != nullptr || src[5] != nullptr`) and asked upstream's `kv_rows` slot alone.  Since #29510 took
+`src[5]` for `kv_rows` and moved the derived form to `src[6..8]`, a derived op read `nullptr` at both copies and
+took the `ncols2 = 1` tile variants where the same op with a packed mask took `ncols2 = 4`/`8`: a kernel choice
+that depended on which mask form the graph happened to use.
+
+**Rule.**  *(1) One predicate per question.*  "Does this op have a mask" is asked by the kernel chooser
+(`ggml_cuda_get_best_fattn_kernel`), the MMA `ncols2` dispatch, the RDNA band predicate and the tile `ncols2`
+dispatch — four sites, one answer (`ggml_cuda_flash_attn_ext_has_mask()`, now in `fattn-common.cuh` ahead of the
+`fattn-rdna.cuh` include).  A launcher-side copy of the test is the defect, not the fix, even when the copy is
+correct today: the copies were correct for two of the three forms and drifted on the third.  *(2) Check the arm
+before believing the effect.*  The report's own configuration (dense 27B, head 256, gfx1201) cannot execute either
+changed line — a derived op with `n_kv % 256 == 0` and `n_q > 8` takes the WMMA route to `MMA_F16`, which was
+already derived-aware — so a "within noise" measurement there says nothing about the change.  The live layouts are
+the ones whose chooser picks the **tile** kernel: RDNA3_5/RDNA3_0 heads above their `GGML_CUDA_FA_WMMA_MAX_HEAD`
+cap, RDNA2, and the `GGML_CUDA_FA_WMMA_256=0` escape hatch (which is how the arms below force it on gfx1201).
+*(3) An inert site is recorded as inert.*  The band predicate can never see a derived op (`kq_mask_derivable()`
+requires `n_tokens > 8` and one KV stream, so `Q->ne[1] > 8`; the band ends with `Q->ne[1] <= 8`) — it asks the
+predicate anyway so the four sites cannot drift, and the record says so instead of claiming a fixed divergence.
+*(4) Fix the oracle in the same change.*  `test-backend-ops -o FLASH_ATTN_EXT` had exactly one derived case that
+reached the tile launcher and its `n_kv` (4090) is not `FATTN_KQ_STRIDE`-aligned, so `use_gqa_opt` stayed false
+even with the fix: **6978/6978 either way**, i.e. the suite could not see the dispatch at all.  The aligned head-512
+derived case added here, plus a second suite run with `GGML_CUDA_FA_WMMA_MAX_HEAD=128`, is the arm that reaches it.
+
+**Numbers.**  gfx1201, 1x R9700, ROCm 10.1.0, `ROCBLAS_USE_HIPBLASLT=0`, fresh process per arm, tile launcher forced
+with `GGML_CUDA_FA_WMMA_MAX_HEAD`.  **Numerics unchanged:** all-logits dumps (1.01 GB, `--save-all-logits`) are
+byte-identical across derived / packed / pre-r268 on head 256-gqa 4 (`ncols2` 4 vs 1, md5
+`ae3b6835dd0d8077bb14eb7cbeaae931`) and head 128-gqa 8 (`ncols2` 8 vs 1, md5 `dc4ef6213c8fb6a5f7bf709be7db4b56`);
+`gate-prefill-logits.sh --ab "LLAMA_KQ_MASK_DERIVED=0"` with the launcher forced **0.000000 / 100.000 %** (base PPL
+5.9326), and the canonical gates are unchanged (27B Q8_0 f16 and `--kv q8_0` both 0.000000 / 100.000 %; coherence
+`d45e2221805a` / `1c5d32ac537d` / `a1b7eb2ee7a6`).  **Speed:** pp512 `-r 3`, interleaved: 4B 7853 → 7899-7928 t/s
+(+0.6-1.0 %), 30B-A3B 3824 → 3873 t/s (+1.3 %), i.e. ~1 % inside the run-to-run spread — recorded as a consistency
+fix that is slightly faster, not a win.  **The abort it closes:** the DKQ 320 and DKQ 576 tile instances have no
+non-GQA arm (`GGML_ABORT`), so a derived op that reached them died; not observed (it needs a non-MLA head-320/576
+model on a tile-selected layout — MLA builders pass `allow_derived = false`), so this is a closed class, not a
+repro.  `test-backend-ops -o FLASH_ATTN_EXT`: **6979/6979** on both the default and the forced-tile arm.
+
+**Record.**  This entry; `INVARIANTS.md` r268; `benchmarks/2026-11-12-fa-derived-tile-gqa.md`; `WORKLOG.md`
+261112.004; contributor PR #303 (`overdoingism`).
+
+## 87. A split expert upload's MMQ guard is per device: one contiguous source tail leaves the last device's slot uninitialised (r269, Qwen3.8-Flash-Next UD-Q4_K_XL)
+
+**Claim.**  `copy_experts` guards the quantized `MUL_MAT_ID` MMQ's tail over-read with `min(expert_size, 512)` bytes
+of the next expert.  Under `-sm tensor` the Meta splitter distributes that **source** range across the devices; the
+guard a device needs is the first bytes of *its own* next-expert slot.  When a device's slice starts beyond the
+512-byte source tail, the rest of that device's guard is uninitialised (normally NaN), and the over-read poisons the
+tile — the repeated-`/` corruption.
+
+**Rule.**  In the Meta setter's **partial-tail** path, after copying the bytes the source actually provides, zero the
+remainder of the first 512 bytes of every device's next-expert **device slot** (contiguous across device rows; an
+axis-0 slice narrower than 512 B is filled across rows).  Do not zero a head partial row — its prefix belongs to a
+previous chunk — and apply the same fill to the segmented async and synchronous setters.  The guard bytes are not
+real data, so zero is a legal value; the real expert bytes must not move.
+
+**Numbers.**  Q8_0 `ffn_down_exps`: 640-element row = **680 B**; 3-device shares 128/256/256 elements =
+**136/272/272 B**; the 512-byte tail writes 136 + 272 + **104**, leaving **168 B** of the last device's slice
+uninitialised.  Pre-fix the reporter's config returns 512 `/` (and a simple prompt `3333...`); post-fix the same
+config returns 2208 chars `53882027cf15`, max `/` run 1, three builds.  Cache off pre-fix 96 `/`, post-fix 388 chars;
+`-sm layer` and cache-off `GGML_META_SPLIT_COPY=0` are coherent controls.  Q4_K_M (Q5_1 down, 400 B rows) is
+byte-identical pre/post (**436 chars `21f493f3ab52`**); `gate-qwen4exp-quant-coherence.sh` on Q4_K_XL + Q4_K_M
+(3 GPU, `-ncmoe 44`, `-c 32768`, 96 tokens) passes with gather ON == OFF (`b1af8904a110` / `7160cb056885`) and no
+faults; prefill-logit KLD **0.000000 / 100.000 %**.
+
+**Record.**  `WORKLOG.md` 261112.005; `benchmarks/2026-11-12-meta-split-tail-guard.md`; `INVARIANTS.md` r269;
+`patches/README.md` blocks 09/10.
+
+## 87. A residency tier's fill ORDER and its fill SET are different things, and only the set is part of the answer (r270, `TODO` #318)
+
+**Claim.**  Both expert tiers start with a bulk fill at sizing, and the fill was being read as a cost to remove: the
+item proposed making it lazy, since r266 serves the prefill band out of residency.  Measured on both tiers it is not
+a cost, it is the *prefetch* — and the thing that actually was wrong with it is its **issue order**, which is
+performance-only because the slot an expert lands in is arbitrary.
+
+**Rule.**  *(1) The SET is policy, the ORDER is the file's business.*  `pool_fill_empty_locked` hands out the first
+free slot and `apply_heat_seed_locked` fills `0..k`, so nothing may depend on which slot an expert holds; a fill may
+therefore be re-ordered to walk the GGUF forwards (ascending expert id == ascending file offset, one table's experts
+being contiguous) with no change to any expert byte.  The *set* may not move, and an ordering change must be proven
+by the same text hash on both arms plus a census that the fill count is unchanged — `MOE_HOST_POOL_FILL_ORDER` is
+the kill switch on both call sites.  *(2) A covering tier may not be made incomplete.*  The device remap resolves a
+cold expert to `slots + pool slot` and refuses a map with a hole, so a lazy seed, a lazier prewarm or anything else
+that leaves a mirror pool partly filled silently stands the sync-free decode path down (measured -18.6 % decode for
+byte-identical text).  A mechanism that defers a fill must therefore test the covering case separately from the
+subset one.  *(3) A deferred seed is not free even where it is cheap.*  Storage reads do not fall when the seed is
+deferred (45-46 GiB in every arm at the delivered budgets): the bytes are the workload's, and what changes is
+whether they are read up front at 6.25 GB/s or inline at ~1 GB/s.
+
+**Numbers.**  Bounded pool (`soar`, Flash-Next GSQ-IQ3_XXS `-ncmoe 47`, `-lme 32` = 419/512 slots, cold page cache):
+prewarm **12 546 -> 7 774 ms** for the same 42.7 GiB and set (3.67 -> 6.25 GB/s), TTFT **19.1-20.4 -> 15.5-16.1 s**,
+whole run 30.7 -> 26.6-27.5 s, decode 40.80-40.93 -> 40.91-40.94 t/s, text `6e6d241acc25` in both orders.
+Deferred seed on the same config: prompt eval **0.88 -> 7.24 s**, decode flat.  Mirror pool (`lazy`; `auto` is
+inert there -- 13.30 s TTFT / 49.44 t/s against 13.58 / 49.17): remap 70 779 ops -> 0 and decode **49.17 -> 40.01 t/s**.  APU (`halo`, 122B-A10B Q5_K_XL, `-lme 70` of 79 GiB): TTFT 47.77 -> 28.99 s,
+decode **11.73 -> 4.83 t/s**, reads 166 -> 236 GiB; the r269 binary against `MOE_EXPERT_SEED=eager` on this build is
+byte-identical (`960bdbc9e2dc`) with an identical arena hit rate.
+
+**Record.**  `WORKLOG.md` 261112.006; `benchmarks/2026-11-12-expert-seed-policy.md`;
+`archive/work/expert-seed-policy/`; `INVARIANTS.md` r270; `patches/README.md` block 16.

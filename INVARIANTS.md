@@ -4140,10 +4140,290 @@ byte-identical in both arms.  Rules:
   pass (30 060.5 MiB for a 38-token prompt).  The identity tier already reads in place at any width (r258); the
   ARENA tier's slot-remap path is still decode-band-only (`moe_cache_update_host` returns early, `moe_cache_get_table`
   refuses `>MOE_EXPERT_CACHE_MAX_TOK`, `remap_cap` is `n_experts*8`).  Follow-up:
-  `wip/prefill-in-place-arena/`, which is NOT the in-place/remap direction `TODO` #273 refuted (that one
+  `archive/work/prefill-in-place-arena/`, which is NOT the in-place/remap direction `TODO` #273 refuted (that one
   predicted the *complement* of a partly resident table; this one removes a copy of the *residents*).
 * **The discrete host-pool tier was checked and does not have it**: its map is complete, and its measured staged
   reads track the per-table complement, not the prompt width (24 B prompt -> 1 146.6 MiB / 2 223 experts;
   2 KB -> 1 858.3 MiB / 3 626 on `soar`).  Its residual, by-design difference is that the destination there is
   the WHOLE split-input table, so the complement is prefetched whether routed or not; restricting it needs the
   host routing readback that the gather path exists to avoid.  Do not re-open it as "the same bug".
+
+## r266 — the arena tier's prefill band is served in place, and the admission ladder's rule is "never reclaim a slot the pass ROUTES" (block 16, `TODO` #317)
+
+**The prefill band used to copy `O(used)` and now copies nothing.**  With `-lme` below the set, no table is identity,
+so every prefill ubatch staged its used set into the scheduler's `input_cpy`; measured 30 060.5 MiB of D2D against
+1 578.6 MiB really read (38-token prompt, 122B Q5_K_XL `-lme 75`).  r266 admits the used-and-missing experts and
+publishes the slot-remapped routing, so `MUL_MAT_ID` reads the arena: 0 copies + the miss fills.  Facts to keep:
+
+* **A prefill pass may only serve a table in place when `|used| <= slots`.**  That is arithmetic, not tuning: every
+  used expert needs a slot, and a slot the pass routes cannot be reclaimed (the op is about to read it).  So a
+  4 096-token ubatch -- which routes all 256 experts of a trunk table -- is servable only on a fully covering arena;
+  on the 78 %-resident Q8 config it declines 123 of 144 tables and is exactly inert (3 paired runs, 0 difference).
+  A wide prefill CANNOT validate this arm; the exposing arms are short and medium prompts (34 and 250 tokens).
+* **The ladder is: empty slot -> the table's landing slots -> the coldest NON-routed resident, ranked by the decode
+  heat prior (then LFRU `count`/`last`).**  The landing set is the coldest `slots/16` seeded slots: a SOFT reserve
+  (seeded like any other), so a cold start pays no extra read and decode keeps them until prefill needs them; a
+  landing occupant decode hits is promoted and never reusable.  A landing reserve ALONE cannot hold this: at
+  `-lme 90` it declines 57-138 of 147 tables and is neutral-to-negative (measured), because a streaming pass's miss
+  set scales as `|used| x (1 - resident/n_experts)`.
+* **Rung 2 owes the same rule as rung 3, and getting it wrong is invisible to text.**  The first cut let a prefill
+  pass recycle a landing slot whose occupant it ROUTED: prefill-logit KLD **0.1157 / same-top-p 87.3 %** (PPL
+  5.82 -> 6.30) on 35B-A3B `-lme 16` while EVERY greedy-text arm stayed byte-identical.  With the rule applied to
+  every rung: KLD -0.000000 / 99.990 %.  A prefill-path change owes `gate-prefill-logits.sh --ab`, always.
+* **Admission on prefill HELPS the following decode, does not hurt it** (the opposite of the intuitive worry).
+  Replay (Q8_0 `-lme 90`, 538-token prompt, 200-token follow-up): -447..-1101 of 11 559 decode misses for 200-538
+  token prompts, `h` 0.9515 -> 0.9534-0.9561, because the admitted set IS the continuation's routing and the reclaim
+  ranking only gives up the coldest non-routed expert.  Real two-slot server traffic agrees (A's decode 4.03 vs
+  3.78 t/s, longest gap 414 vs 623 ms while B prefills).
+* **The reserve costs no arena memory; the remap staging costs `n_used x -ub` per table.**  `arena=` is byte-identical
+  in both arms; the staging grows from 8 KiB to 128 KiB/table at `-ub 4096` (**+34 MiB** over 147 tables) because the
+  buffer must stay per table -- the scheduler issues every table's input work before the split's graph runs, so a
+  shared buffer would be overwritten under a live op.
+* **`preadv`-straight-into-the-slot is a wash against the coalesced ring** (601 vs 603 ms of hook, same text) and costs
+  a per-table stream drain for ordering.  The ring serves both prefill arms, and the `O_DIRECT` offset round-out
+  (`aoff`/`skip`/`blen`) lives there -- that defect (short spans silently falling back per-expert) is FIXED.
+* **A gate can be blind to its own box.**  `gate-fusion-alias-copy.sh` fails identically on the unmodified r265 build
+  (its arms do not reach the shape on gfx1151), so it is NOT evidence about this change either way; run the
+  unmodified build when attributing a gate failure.
+
+## r267 — the node budget is a per-tensor HEURISTIC, and a quantized KV cache's Hadamard rotation spends ~14 entries per layer of it (block 12, GitHub issue #302)
+
+`graph_max_nodes()` sizes the scheduler's hash table and its node/leaf id arrays, both indexed over **nodes + leafs**;
+its default branch is `max(1024, 8 * n_tensors)`.  Every fact below was re-derived while chasing a `phi3` abort, and
+they are what a future "the scheduler's hash set is full" report must be read against:
+
+* **The KV Hadamard rotation is part of the graph, and it scales with LAYERS, not with tensors.**  With a quantized
+  K or V cache (`ggml_is_quantized(type)` and `n_embd_head_%64 == 0`, or a DeepSeek/GLM-DSA lightning indexer), every
+  layer inserts four `llama_mul_mat_hadamard` chains -- Q and K for the k rotation, V and the attention result for the
+  v rotation, 3 nodes each (cont/reshape + mul_mat + reshape) -- plus **one rotation constant per rotated tensor per
+  layer as a graph leaf**.  That is **12 nodes + 2 leafs per layer**, i.e. 14 hash entries/layer.  A `phi3` model
+  declares 4 matmuls/layer (fused QKV + out + ffn_up + ffn_out), so 8x per tensor is not enough margin for it: phi-4
+  (40 layers, 243 tensors) needs **2064** entries (1649 nodes + 415 leafs) against a **1944** budget (hash table
+  2053).  #31073 (`kv-cache: keep rotation constants on the GPU`) is what made the constants per layer -- before it
+  there were 2 shared leaves per graph and the same model fit, which is exactly why r235 loaded and r244 did not.
+* **`ggml_backend_sched_new(graph_size)` is what fixes the hash table, and the `split_only` path has NO size assert.**
+  `ggml_backend_sched_reserve`/`alloc_graph` assert `hash_set.size >= n_nodes + n_leafs`; `graph_reserve(...,
+  split_only=true)` calls `ggml_backend_sched_split_graph` directly, so an oversized **probe** graph aborts at
+  `ggml_hash_find_or_insert` ("visited all hash table entries", `ggml-impl.h:337`) with no llama-level message at all
+  -- which is the trace a reporter sees (`#3 ggml_backend_sched_split_graph`, `#5 resolve_fused_ops(...)::{lambda}`).
+  Do not read that abort as "ggml's hash table is buggy": it is the budget.
+* **It reproduces on unadulterated upstream, with the same bare abort.**  `a691b2345` alone dies at
+  `ggml_hash_find_or_insert` in its own `kv_rows` probe (1 token, `split_only`, 1649 nodes + 413 leafs against the
+  same 2053-entry table).  **A `split_only` probe graph never reaches the `hash_set.size >= n_nodes + n_leafs`
+  assert** -- `graph_reserve(split_only=true)` calls `ggml_backend_sched_split_graph` directly -- so "the budget
+  assert will tell us" is wrong for every probe-based check, ours included.  Which probe dies is only a matter of
+  when each is enabled (upstream's `kv_rows` runs unconditionally, the delivery's derived-kq-mask probe runs on a
+  non-unified single-stream cache).  A report that says "unmodified build" is still our bug to make diagnosable.
+* **Budget from the cache's own tensors, never from a copied predicate.**  `llama_memory_i::graph_extra_entries()`
+  walks the rotation tensors `init_rotation()` actually created (7 entries each: 6 nodes + 1 leaf), and the compound
+  memory types (`llama_kv_cache_iswa`, `llama_memory_hybrid`, `llama_memory_hybrid_iswa`) sum their attention caches --
+  gemma-4-12B's two iSWA caches read 6016, not 1944.  A duplicated `attn_rot_v` predicate in `llama-context.cpp`
+  would drift the moment the ctor's conditions change; the tensors cannot.
+* **A budget bump costs host memory only, and it is proportional.**  `ggml_backend_sched_new` mallocs
+  `graph_size * GGML_SCHED_MAX_SPLIT_INPUTS(30) * 2 * sizeof(ggml_tensor)` for its context buffer (phi-4: 60 MB at
+  2504, 47 MB at 1944), plus the id arrays; nothing on the device changes.  Note the hash-size ladder jumps
+  2053 -> 4099, so *any* bump past 2053 doubles the table -- budget the entries you need, not "one more".
+* **Two failure paths must stay named and non-fatal.**  `graph_reserve()` returns `nullptr` and logs "needs N entries
+  (X nodes + Y leafs) but the scheduler was reserved for M" rather than aborting inside ggml, and
+  `resolve_fused_ops()` treats an unreservable **probe** graph as "cannot verify -> disable" (throwing there turns an
+  unverifiable optimization into a load failure).  The reserve that follows still fails hard, with the numbers.
+
+## r268 — a kernel CHOICE must not depend on which mask form the graph uses: one predicate, asked by every launcher (block 05, contributor PR #303)
+
+The delivery's derived kq mask is an *optimization*: `LLAMA_KQ_MASK_DERIVED` must be bit-identical to the packed
+mask, which means the kernel chooser and every `ncols2` dispatch have to see both forms.  `has_mask()` was written
+for that, but it lived as a `static` in `fattn.cu`, so the two `.cuh` launchers kept hand-copies of an older form of
+it and asked `src[5]` (upstream's `kv_rows` slot since #29510) alone.  The facts:
+
+* **The derived form is `src[6..8]`, the packed mask `src[3]`, and `kv_rows` `src[5]`; a derived op carries neither
+  of the first two.**  The `src[5]` copies therefore read `nullptr` for a derived op and returned the
+  `ncols2 = 1` variants where the same op with a packed mask took `ncols2 = 4`/`8`/`16`.  One predicate,
+  `ggml_cuda_flash_attn_ext_has_mask()`, now lives in `fattn-common.cuh` (ahead of the `fattn-rdna.cuh` include) and
+  is asked by the chooser, the MMA dispatch, the RDNA band predicate and the tile dispatch.  A fifth site that
+  needs "does this op have a mask" owes a call to it, never a local `src[x] != nullptr` test.
+* **The RDNA band predicate can never see a derived op, by construction.**  `llama_kv_cache::kq_mask_derivable()`
+  refuses `n_tokens <= 8` and requires one KV stream, so `Q->ne[1] > 8` on every derived op; the band predicate
+  ends with `Q->ne[1] <= 8`.  A report that names the band as a divergent site is describing future-proofing, not a
+  live defect -- say so rather than "fixing" it.
+* **On gfx1201 the divergence is unreachable at the default settings**, which is why an arm measured there proves
+  nothing: a derived op with `K->ne[1] % 256 == 0` and `n_q > 8` takes the WMMA route (`Q->ne[1] > 8`) and
+  `BEST_FATTN_KERNEL_MMA_F16`.  The live layouts are RDNA3_5/RDNA3_0 heads above their `GGML_CUDA_FA_WMMA_MAX_HEAD`
+  cap, RDNA2 (no WMMA), and any arch with `GGML_CUDA_FA_WMMA_256=0` or a lowered cap -- the way to force the code
+  path on gfx1201 for a gate.
+* **The two tile `ncols2` variants are bit-identical for a derived op** (all-logits dumps, 1.01 GB, equal md5, head
+  256/gqa 4 and head 128/gqa 8), so the divergence cost a *choice*, not numerics: +0.6-1.0 % and +1.3 % pp512 on the
+  forced-launcher arms.  A "kernel selection differs" report is still worth acting on -- the next derived extension
+  (decode widths) would not be bit-identical by luck.
+* **The DKQ 320 and DKQ 576 tile instances have no non-GQA arm** (`GGML_ABORT`), so a derived op that reaches them
+  died before r268.  Not observed: it needs a non-MLA head-320/576 model on a layout whose chooser picks the tile
+  kernel (MLA builders pass `allow_derived = false`, so they never form a derived op).  The one predicate closes the
+  class; do not re-open it by special-casing a head size.
+* **A gate that cannot reach the dispatch is not a gate.**  `test-backend-ops -o FLASH_ATTN_EXT` had exactly one
+  derived case that reached the tile launcher (`hsk` 128, gqa 4, `n_kv` 4090, `n_tps` 33) and its `n_kv` is not
+  `FATTN_KQ_STRIDE`-aligned, so `use_gqa_opt` stayed false even after the fix: 6978/6978 either way.  The aligned
+  head-512 derived case added in r268 is the tile GQA arm on any cap <= 320 layout and the MMA arm on gfx1201; the
+  second `test-backend-ops` run with `GGML_CUDA_FA_WMMA_MAX_HEAD=128` is what makes it an oracle here.
+
+## r269 — a split expert upload's guard is PER DEVICE, not one contiguous 512-byte source tail (block 09/10, Qwen3.8-Flash-Next UD-Q4_K_XL `////`)
+
+`copy_experts` appends `min(expert_size, 512)` bytes of the next expert after a used-expert group so the quantized
+`MUL_MAT_ID` MMQ's tail over-read is finite.  Under `-sm tensor` that **source** range is split across devices, and
+the guard a device needs is the first bytes of *its own* next-expert slot, not its share of one contiguous source
+tail.  The facts:
+
+* **Q8_0's down-expert row is 680 B, and a 3-device split makes the last device start past the 512-byte guard.**  A
+  `ffn_down_exps` row is `n_embd / blck_size * type_size`: Q8_0 at 640 elements is 680 B (Q5_1 is 400 B, Q4_K 1440 B).
+  The granularity-rounded shares on 3 devices are 128/256/256 elements = 136/272/272 B.  The 512-byte source tail is
+  distributed 136 + 272 + 104: the last device's slice starts at byte 408 and only 104 of its 272 bytes are written.
+  The other 168 bytes are uninitialised (normally NaN), and the MMQ over-read poisons the tile — the repeated-`/`
+  (or `3`) corruption.  A Q5_1/Q4_K row is wide enough that the 512-byte tail covers a full device row, which is why
+  the defect is quant-specific and not a general tensor-split failure.
+* **It is the copy, not the cache or the scheduler.**  `MOE_EXPERT_CACHE_MIB=0` still corrupts; `-sm layer` is clean
+  (no per-device row split); `GGML_META_SPLIT_COPY=0` (mirrored copies) is clean.  The failure is in
+  `ggml_backend_meta_set_tensor_async`'s partial-tail path, not in the expert cache's residency.
+* **The guard fill is a TAIL operation, and it is per device.**  After the available source bytes are copied, zero
+  the rest of the first 512 bytes of each device's next-expert **device slot**; the slot is contiguous across device
+  rows, so an axis-0 slice narrower than 512 B is filled across rows, not just one row.  A head partial row must not
+  be zeroed — its prefix belongs to a previous chunk — and the segmented (fused-table) async/sync setters need the
+  same fill because a fused table can carry the same Q8_0 segment.
+* **Only Q4_K_XL UD reproduces it because only it has Q8_0 down experts here** (layers 4/30/46/47; layer 2 is Q5_K
+  gate/up and is not host-resident at `-ncmoe 44`).  Q4_K_M's down experts are Q5_1, so its text is byte-identical
+  across the fix (436 chars `21f493f3ab52`); IQ4_NL is clean.  A future quant with a down row whose device slice
+  starts after the source guard will hit the same class.
+* **The diagnostic `GGML_META_SPLIT_COPY=0` + cache-on arm is not a valid oracle**: it aborts in
+  `ggml_backend_cuda_get_tensor_2d_async` on this model.  Use the cache-off mirrored arm (or `-sm layer`) as the
+  control, and do not read the kill-switch's abort as part of this fix.
+
+## r270 — the expert seed is the PREFETCH, not a fixed cost, and it does not port from the APU to the discrete tier (`TODO` #318)
+
+Both expert tiers fill at sizing (the arena from the heat prior + prompt tally, the discrete host pool from the
+prewarm and then the re-layout).  r266's in-place prefill band suggested the fill could be lazy.  The facts:
+
+* **A tier's sizing fill is a PREFETCH of the working set, and deferring it does not save the bytes.**  Measured
+  with a deterministic pool (`-lme 32`, `MOE_HOST_POOL_RAM_PCT=0`) on `soar`, Flash-Next GSQ-IQ3_XXS `-ncmoe 47`,
+  cold page cache: total storage reads are **45-46 GiB in the eager arm and in the deferred arm**; a 500-token
+  decode's byte range is the whole host set either way.  So the question is only *where* the cost lands.
+* **The APU premise does not hold on the discrete pool tier, because that tier has no in-place prefill band.**  Its
+  prefill stages the whole expert table into the op's `input_cpy` and prefetches the **complement** whether the pass
+  routes it or not (a routing-aware staging needs the host ids readback the gather design exists to avoid, r265).
+  Deferring the seed therefore moves the whole complement read into the prompt, one cold per-expert read at a time:
+  **prompt eval 0.88 s -> 7.24 s** on a 57-token prompt, **7.63 s -> 17.18 s** on a 5 246-token one (694 -> 308 t/s),
+  decode flat.  Do not reason about the discrete tier from the APU tier's in-place band; the band is `g_gtt_arena`
+  only (`pf_in_place_locked`).
+* **A COVERING pool with holes loses the device remap, and that is a decode regression, not a slow path.**  The
+  sync-free decode remap resolves a cold expert to `slots + pool slot`, so `devremap_prep_locked` refuses a map with
+  any hole and every table stands down.  Measured on the `-lme auto` mirror pool (the whole 40 012 MiB set):
+  remap served 70 779 ops eagerly, 0 lazily, and **decode 49.17 -> 40.01 t/s (-18.6 %)** for byte-identical text.
+  Anything that makes a covering pool incomplete mid-run (a lazy seed, a lazier prewarm) costs this class.
+  (r271) **`auto` is inert there** -- 13.30 s TTFT / 49.44 t/s / remap served against `eager`'s 13.58 / 49.17 /
+  served, because it PLACES a covering tier and only defers the arena seed, which the prefill re-earns within
+  noise.  The loss is `lazy`'s alone.
+* **On an APU the deferred seed is a real window and not a default**: `halo`, 122B-A10B Q5_K_XL on a `-lme 70` store
+  (225 of 256 slots/table): TTFT **47.8 -> 29.0 s (-39 %)** and a 32-token answer 50.3 -> 44.5 s, but decode
+  **11.73 -> 4.83 t/s** and **+70 GiB** of storage reads over a 250-token answer (236 vs 166 GiB).  The mechanism is
+  residency, not warm-up: the lazy arm's arena `h` is 0.906 against 0.9796, and every miss on that tier is a
+  `pread` (the mapping is not a GPU-readable cold source, `MOE_EXPERT_CACHE_TOUCH` is a no-op there).
+* **The seed's cost is its TRANSPORT, and the bounded-pool prewarm's was the issue ORDER.**  `pool_prepopulate_locked`
+  walked the GGUF in *rank* order -- a random walk over 40 GiB under a page cache that cannot hold it -- which is the
+  r231 defect left unfixed in the load-time path.  Filling the SAME set in ascending expert id (ascending file
+  offset; the slot an expert lands in is arbitrary by construction) is **12 546 -> 7 774 ms** for 42.7 GiB
+  (3.67 -> 6.25 GB/s), **TTFT -20 %**, whole run -13 %, decode unchanged, text identical.  `MOE_HOST_POOL_FILL_ORDER`
+  now covers both call sites; `MOE_HOST_POOL_DIO=1` is the wrong answer here (**21.3 s** for the same bytes -- a
+  ~0.55 MiB `O_DIRECT` read at depth 1 is latency-bound).
+* **The AUTO pool budget depends on WHEN the pool is built, so an A/B against it must pin the budget.**  In the
+  not-fitting band the budget is `MOE_HOST_LIMIT_FRAC` % of `MemAvailable` *at the first pool build*, and the
+  RAM ceiling (`MOE_HOST_POOL_RAM_PCT` of `MemAvailable` at the same moment) rescales every table.  An arm that has
+  already faulted the model into the page cache therefore sizes a SMALLER pool than the arm it is compared with --
+  measured 33.6 GiB against 40.0 GiB (a subset against a mirror, which then differ in the device remap too).  Pin it
+  (`-lme N` + `MOE_HOST_POOL_RAM_PCT=0`) for any pool A/B, and drop the page cache before every run.
+
+### r272 — the copy-engine 2-rank arm exchanges once, and `GGML_CUDA_ALLREDUCE=auto` is a value
+
+* **The two-phase reduce-scatter + all-gather and the single exchange cannot disagree, and that is why the
+  arm ships on by default.**  For `n == 2` both forms compute `bf16(fp32(own) + fp32(peer))` from the same two
+  staged bf16 partials — the two-phase one on the chunk's owner in `ggml_cuda_ce_add_bf16`, then gathered as
+  bf16 and widened by `to_fp32`; the single-exchange one in `ggml_cuda_ce_add_bf16_to_f32` with the same
+  `__float2bfloat16` cast — and fp32 addition is commutative, so every element is bit-identical and every rank
+  agrees.  The measurement that settles it: a **5 065 891 540 B** per-position log-prob dump of a 40x512
+  prefill is **byte-identical** across the arms (`cmp`), and same-seed greedy text is `10a82b5559a9` in all
+  four arms (2 devices either form, 3 devices, previous binary).  Worth +1.0-1.4 % prefill on the 2-device pair,
+  decode flat.  Do not "verify" this class with text alone — dump and `cmp` the log-probs.
+* **A `-sm tensor` arm's `n` is what makes a large-tensor arm reachable or not, and the CE arm is reachable at
+  BATCHED decode widths too.**  A single-token all-reduce (20 KB on 27B) is under `GGML_CUDA_AR_SMALL_BYTES`
+  and takes the internal pipeline, but `tg64` (1.3 MB) and a speculator's 4-8-row verify batch (163-327 KB) take
+  the CE arm at `n == 2`.  That is why a 2-rank-only change can still touch a decode arm, and why the
+  `gate-prefill-logits.sh --device 0,2 --sm tensor` arm — not the documented `--device 0,1,2` one — is the gate
+  that reaches it.
+* **`gate-prefill-logits.sh`'s base file name does not carry the device list or the split mode; the meta does
+  now (r272).**  A 1-device `layer` base and a 2-device `tensor` base were the same file name, so the wrong-arm
+  compare was silent (it reads as a gate result and is not one).  `device=` and `sm=` are recorded and checked,
+  and a legacy base without them is left alone.
+* **`GGML_CUDA_ALLREDUCE=auto` selected the BUTTERFLY until r272.**  The dispatcher accepted
+  `hybrid|nccl|internal|ce|q8ce|none` and treated anything else as unknown -> `init_none` (the butterfly), so
+  the literal string `auto` — the name `ENVIRONMENT.md` documents the default under — silently cost the whole
+  comm layer: **2041.7 / 2051.3 t/s against 2164.0 / 2159.3** for the unset default on a 2-device host-expert
+  prefill (Flash-Next IQ3_S, `-ncmoe 47 -lme 47`, 5 246-token prompt, warm).  `auto` is now the unset default by
+  name; `none`/`meta` are the butterfly by name; an unrecognised value WARNs and takes it.
+* **A host-expert prefill on this box cannot resolve an all-reduce arm choice.**  The `ce` arm measured
+  2083.6 / 2241.8 / 2234.4 / 2238.3 t/s on four identical warm runs of one config, i.e. a 4-6 % spread wider
+  than any arm-to-arm difference; only the *presence* of the comm layer (5 % over the butterfly) is stable.
+  Also: `--load-mode dio` makes `-lme`'s pinned pool **NOT APPLIED** (`a pool needs a mapped load`), so a
+  "host-pool" arm measured with `dio` is a file-read arm — check the placement line before quoting one as a
+  pool result.
+
+## r273 -- the placement page-cache amplification, the pool exchange's missing guard, and where the budget ceiling belongs
+
+1. **A buffered per-expert placement doubles the footprint, and the second copy CANNOT be reclaimed.**  The pinned
+   pool is not the read buffer: a buffered `pread` materialises the file's pages in the page cache (they are the
+   block layer's DMA target) and only then copies them into the pool, so filling a covering pool adds the whole set
+   to the page cache *on top of* the pinned bytes.  Measured 35B-A3B Q8_0 (`-ncmoe 40 -lme 40` = a 32 640 MiB
+   mirror, cold cache): page-cache high-water **+3.9 GiB with an O_DIRECT placement against +33.7 GiB buffered**
+   — i.e. the whole set, twice over — for 6.8 s against 4.9 s of fill time.  On the reporter's box (91.4 GiB RAM,
+   `-lme 70` against a 54 750 MiB set, plus a 26.8 GiB lazy PLE and `--cache-ram 8192`) that is ~150 GiB of demand:
+   the kernel reclaims anonymous pages to make room and the box swaps/freezes.  Unlike an uploaded tensor, the
+   expert pages stay **mapped** (they ARE the pool-backed master), so `posix_fadvise(DONTNEED)` skips them and the
+   copy is not reclaimable on demand.  The placement read is therefore **O_DIRECT whatever `--load-mode` says**
+   (`pool_mirror_bulk_fill_locked`, `MOE_HOST_POOL_BULK_DIO=0` = the buffered A/B).  r215 built that path for
+   O_DIRECT and r262's transport mirror silently re-enabled the amplification for `buffered`/`mmap` loads; the
+   transport knob is a DEMAND-read policy.
+2. **The complement of (1): a released upload's pages must be DROPPED, not merely unmapped.**  Device-bound
+   weights are read once and never again, and `LLAMA_LOAD_RELEASE_MMAP` unmaps their range after the H2D — which is
+   also what makes a `posix_fadvise(POSIX_FADV_DONTNEED)` legal (fadvise skips mapped pages, so before the unmap it
+   was a no-op and the pages were left to reclaim).  Measured on a 4.3 GiB model: peak `Cached` during load
+   **5.15 GiB with the release off against 1.99 GiB with it**.  This needs no read-transport change (and must not
+   be implemented by forcing DIO on the upload: a non-mapped load stages through `LLAMA_LOAD_STAGE_MB` slots and
+   loses readahead, and the upload is H2D-bound anyway).
+3. **An exchange whose demote cannot be expressed must be INERT, and `retire` must ask.**  The arena->pool demote
+   is one contiguous D2H of a WHOLE expert, so a `-sm tensor` split (each device owns a slice) can never perform
+   it: **766 758 geometry declines out of 766 758 attempts**.  `pool_sink_active()` nevertheless asked only "is the
+   sink on and the pool a sub-mirror?", so the exchange (a) reserved ~4 % of the slots for a demote that could never
+   land and (b) **retired the pool's copy of every expert it promoted to VRAM** — "the vacancy is taken by a
+   just-evicted expert" — with nothing ever parked in it.  Measured on the 2-device split: **792 321 retirements
+   against 52 704 slots, 701 706 refills, h=0.3473, 0 evictions**, sustained 1-1.2 GB/s of disk reads during
+   decode, at half the pinned-master rate.  The greedy TEXT was identical throughout (the pool computes the same
+   answer, slowly), which is why the census — not the answer — is the instrument.  `host_pool_t::demote_ok` (set
+   once from the table geometry at build) now gates the whole exchange; the same cell reports `0 demoted, 0
+   geometry, 0 retirements`.  `g_sink_need_slot` was declared to make this demand-driven and was written three
+   times and never read.
+4. **The budget's PROVENANCE decides the ceiling, and the resolver must run before anything reports.**  An
+   explicit absolute budget (`-lme N`, `MOE_HOST_POOL_MIB`) is a reservation: it is honoured in full and
+   `MOE_HOST_POOL_RAM_PCT` may not scale it.  A derived one (`-lme auto`'s resolution, FRAC/COV) keeps the
+   ceiling.  Consequences that bit: (a) the ceiling used to shave an explicit `-lme 70` to 95.3 % **silently**,
+   which is the band where the exchange is engaged and (on a tensor split) cannot demote; (b) the mirror/
+   near-mirror classification ran BEFORE the clamp, so the census printed "108 mirror tables, exchange INERT"
+   for a pool that was 95.3 %; (c) the `-lme` refusal compared `n` against 90 % of MemAvailable while printing
+   the allowance rounded to whole GiB, so `-lme 75` was refused with a message claiming 80 was allowed — it now
+   refuses only at **or above 100 % of MemAvailable**, with exact units.  Report the RESOLVED layout (coverage,
+   shape, exchange state, budget class) once, after the number is final.
+5. **A single-GPU gate cannot cover a split geometry.**  `gate-host-pool.sh` ran one device, where
+   `expert_bytes == host_bytes`, so the demote always succeeds and the annihilator in (3) is unreachable — the
+   gate was green (`41/41`) through the whole defect.  Its `tsplit`/`tsplitnosink` arms (2 devices, `-sm tensor`,
+   same pool) now assert the exchange is inert and that `SINK=1` changes no byte there; the pair is what makes
+   the arm non-vacuous, because the single-GPU `sink` arm still proves the demote is exercised where it can be.
+6. **Pinning is not reversible, so the prewarm needs a headroom gate.**  `MOE_EXPERT_SEED=eager` places the whole
+   budget at build; a pool that does not fit cannot be un-pinned, so it must not be placed.  A pool whose
+   placement would leave less than `MOE_HOST_POOL_PREWARM_RESERVE_MIB` (default 1024) of MemAvailable is
+   DEFERRED — its slots exist and the experts arrive on demand (`h` still converges to 1.0000 on a run whose
+   whole prewarm was deferred).  Same rule for `--lazy-mode mlock`/`mlockr`, which populate a multi-GiB table at
+   the END of the load: `LLAMA_LAZY_MLOCK_RESERVE_MIB` (default 1024), and a table that does not fit is declined
+   with one WARN and stays on the on-demand path (identical to `--lazy-mode auto`).

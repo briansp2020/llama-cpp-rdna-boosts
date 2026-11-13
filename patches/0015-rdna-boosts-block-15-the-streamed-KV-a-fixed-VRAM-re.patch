@@ -1,4 +1,4 @@
-From 585725146b1a792efba7a382f2acf4635fb67868 Mon Sep 17 00:00:00 2001
+From 52da659d31f07c032dda21db8ddba61d1fce6680 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 15/16] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -7,7 +7,6 @@ Subject: [PATCH 15/16] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
 Re-based onto a691b2345 (r236)
 
 The rung collided with everything the streamed KV binds to: the memory instances (#31141 no_alloc,
-#31200 n_pad removed, #31142), the KV cache internals (#30541 on-device state copy sizes, #31073 the
 rotation constants moved into a per-cache buffer, #31570 kv_rows), the Meta (tensor-split) device
 (#31447) and the qwen4exp rewrite.  8 files conflicted / 12 hunks (9 expected: src/models/qwen4exp.cpp
 auto-merged, the D3 residue did not conflict this time and its 59/-7 lines all landed).  A
@@ -1459,7 +1458,7 @@ index 692aaf7ff..60d3ff428 100644
  
  #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 3cc9cfd93..5815706ac 100644
+index e7e01dc62..5822e523c 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -591,6 +591,7 @@ extern "C" {
@@ -1519,7 +1518,7 @@ index 3cc9cfd93..5815706ac 100644
      // src0: block scores [n_blocks, n_tps, n_stream] F32
      // src1: cell -> block map [n_kv, n_stream] I32
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index ada90dcef..1feb98406 100644
+index 85d1e5b84..fdc0db4a5 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -15,6 +15,7 @@
@@ -1681,7 +1680,7 @@ index ada90dcef..1feb98406 100644
  static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
  
  // [TAG_META_UNALLOC_ALIAS]
-@@ -3538,8 +3676,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3581,8 +3719,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  // `////` x1 and MTP acc 1.00; this copy -> coherent, acc 3.88, and it keeps the
                  // staging win (IQ4_XS 16k: ppN 1000 vs 875 with staging off, decode 43.6 vs 48.0).
                  // `GGML_STAGE_META_REDIRECT=1` restores the redirect for A/B only -- it is not a
@@ -3305,7 +3304,7 @@ index 000000000..5f47fce87
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index ef0b85ab4..bf574ecf9 100644
+index eaf557683..8a797d911 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -30,6 +30,7 @@
@@ -4284,7 +4283,7 @@ index ef0b85ab4..bf574ecf9 100644
  // Communication context for multi-GPU AllReduce during tensor parallelism.
  //
  // Created once per meta backend instance.  Resources for the selected mode
-@@ -3989,6 +4880,395 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -4052,6 +4943,395 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -4680,7 +4679,7 @@ index ef0b85ab4..bf574ecf9 100644
  // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
  //
  // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
-@@ -4155,7 +5435,7 @@ static bool    g_cgc_reg = false;
+@@ -4218,7 +5498,7 @@ static bool    g_cgc_reg = false;
  static const bool g_cgc_on       = getenv("GGML_CUDA_GCDBG") != nullptr;
  static const bool g_op_timing_on = getenv("GGML_CUDA_OP_TIMING") != nullptr;
  static const bool g_stream_dbg_on = getenv("GGML_STREAMDBG") != nullptr;
@@ -4689,7 +4688,7 @@ index ef0b85ab4..bf574ecf9 100644
  // Meta/op-offload A/B switch.  This sits on the per-copy staging path (thousands of calls per pass
  // under -sm tensor), so it is resolved once instead of per call.
  static const bool g_cuda_splice_env_on = [] {
-@@ -5538,6 +6818,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5601,6 +6881,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_FLASH_ATTN_QSA:
              ggml_cuda_flash_attn_qsa(ctx, dst);
              break;
@@ -4699,7 +4698,7 @@ index ef0b85ab4..bf574ecf9 100644
          case GGML_OP_INDEXER_TOPK:
              ggml_cuda_indexer_top_k(ctx, dst);
              break;
-@@ -5632,11 +6915,48 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+@@ -5695,11 +6978,48 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
      delete backend;
  }
  
@@ -4749,7 +4748,7 @@ index ef0b85ab4..bf574ecf9 100644
  
      // A pinned-source cudaMemcpyAsync is read by the copy engine when the stream reaches it, not when it is
      // issued, so the caller must not modify `data` until the copy has completed -- and this path's caller
-@@ -5682,7 +7002,30 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+@@ -5745,7 +7065,30 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -4781,7 +4780,7 @@ index ef0b85ab4..bf574ecf9 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
-@@ -5693,7 +7036,37 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+@@ -5756,7 +7099,37 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -4820,7 +4819,7 @@ index ef0b85ab4..bf574ecf9 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      ggml_cuda_set_device(cuda_ctx->device);
-@@ -5787,11 +7160,55 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+@@ -5850,11 +7223,55 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -4879,7 +4878,7 @@ index ef0b85ab4..bf574ecf9 100644
  }
  
  // Staged cross-device copy (pinned host bounce).
-@@ -6519,13 +7936,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -6582,13 +7999,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
              }
  
              if (t_ev) { g_ev_pre_us += ggml_time_us() - t_ev; g_loop_start = ggml_time_us(); }
@@ -4902,7 +4901,7 @@ index ef0b85ab4..bf574ecf9 100644
              ggml_cuda_gdn_gather_index gdn_gather_index;
              cuda_ctx->gdn_deferred_gathers.clear();
              for (int i = 0; i < cgraph->n_nodes; i++) {
-@@ -6909,7 +8330,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6972,7 +8393,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      use_cuda_graph = true;
                      // recapture a graph whose pool temporaries or scratch buffers were freed since its capture
                      // (GGML_CUDA_GRAPH_MEM_GEN=0 disables the check, A/B only)
@@ -4911,7 +4910,7 @@ index ef0b85ab4..bf574ecf9 100644
                      cuda_graph_update_required = graph->instances.empty() ||
                          (mem_gen_check && graph->mem_gen != ggml_cuda_graph_mem_gen(cuda_ctx->device));
                  }
-@@ -7053,7 +8474,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7116,7 +8537,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
      // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
      {
@@ -4920,7 +4919,7 @@ index ef0b85ab4..bf574ecf9 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
-@@ -7084,7 +8505,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7147,7 +8568,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  if (ok && nread > 0 && elide_f32) {
                      ggml_cuda_mmb_mark_bf16_only(gr);
@@ -4929,7 +4928,7 @@ index ef0b85ab4..bf574ecf9 100644
                      if (lg) { static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
                              gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3])); }
                  }
-@@ -7099,7 +8520,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7162,7 +8583,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // copy is RNE-rounded exactly as mmb_cvt_f32_bf16, so the GEMM arithmetic is bit-identical.
      // Dense MUL_MAT only; F32-weight GEMMs read the activation directly (tiny-M / f32split).
      {
@@ -4938,7 +4937,7 @@ index ef0b85ab4..bf574ecf9 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto rootof = [](const ggml_tensor * t) { while (t->view_src) t = t->view_src; return t; };
-@@ -7213,7 +8634,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7276,7 +8697,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
              ggml_cuda_hc_combine_norm_args ca;
              if (ggml_cuda_hc_combine_norm_identify(cgraph, i, ca)) comb.push_back(ca);
          }
@@ -4947,7 +4946,7 @@ index ef0b85ab4..bf574ecf9 100644
          if (blk_dbg) fprintf(stderr, "HC_BLK16 comb=%zu\n", comb.size());
          if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
              std::vector<const ggml_tensor *> blks;
-@@ -7345,7 +8766,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7408,7 +8829,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -4956,7 +4955,7 @@ index ef0b85ab4..bf574ecf9 100644
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
  
-@@ -7367,14 +8788,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7430,14 +8851,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // projections (MUL_MAT + RESHAPE / VIEW, which read none of the Q nodes) in front of the Q projection: the same
          // nodes, one stream, so the results are bit-identical.  Structural only (no data pointers yet), every ubatch
          // size.  GGML_CUDA_QK_ROTATE=0: off.
@@ -4973,7 +4972,7 @@ index ef0b85ab4..bf574ecf9 100644
          const auto is_had = [](const ggml_tensor * t) {
              return t->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD;
          };
-@@ -7494,7 +8915,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7557,7 +8978,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // (the ssm_conv_in fusion skips the nodes up to its CONCAT, e.g. attn_qkv), not Q8_0 (the GDN prescan matches
          // positions).  Only nodes reading that activation and a weight move earlier: bit-identical.  Structural only, every
          // ubatch size, idempotent.  GGML_CUDA_MMVQ_CONCAT_REORDER=0: off.
@@ -4982,7 +4981,7 @@ index ef0b85ab4..bf574ecf9 100644
          const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
          if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
              ggml_tensor ** n = cgraph->nodes;
-@@ -8792,6 +10213,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8855,6 +10276,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FLASH_ATTN_QSA:
              return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
@@ -4997,7 +4996,7 @@ index ef0b85ab4..bf574ecf9 100644
          case GGML_OP_INDEXER_TOPK:
              return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
          case GGML_OP_INDEXER_SCORE:
-@@ -8821,7 +10250,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8884,7 +10313,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -5007,7 +5006,7 @@ index ef0b85ab4..bf574ecf9 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -9250,8 +10680,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -9313,8 +10743,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -5068,7 +5067,7 @@ index ef0b85ab4..bf574ecf9 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -9368,6 +10850,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -9431,6 +10913,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  
@@ -5707,7 +5706,7 @@ index 247755382..6a342e60a 100644
  #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
  #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 74250c6ed..b67a53bf3 100644
+index 08a936554..ba41f8cd0 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1101,6 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -5884,7 +5883,7 @@ index 6e334e34b..e1fe25b84 100644
  
      struct llama_model_tensor_override {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index afb40a430..a8f4579c6 100644
+index 340a6c539..f88bfbe3b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -664,6 +664,14 @@ llama_context::llama_context(
@@ -5911,7 +5910,7 @@ index afb40a430..a8f4579c6 100644
          };
          // the graph builders that choose between quantized-aware attention arms need the same
          // types the memory module was given (see qwen4exp_qsa_sparse)
-@@ -6100,6 +6110,9 @@ llama_context_params llama_context_default_params() {
+@@ -6128,6 +6138,9 @@ llama_context_params llama_context_default_params() {
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
@@ -5921,7 +5920,7 @@ index afb40a430..a8f4579c6 100644
      };
  
      return result;
-@@ -6881,6 +6894,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+@@ -6909,6 +6922,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
      return ctx->memory_breakdown();
  }
  
@@ -6091,7 +6090,7 @@ index 7811dc049..7c5753e8b 100644
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
 +LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index e938d95c0..0128e297c 100644
+index 42ab1f782..65b43d7d4 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -18,6 +18,335 @@ static bool ggml_is_power_of_2(int n) {
@@ -7466,7 +7465,7 @@ index e938d95c0..0128e297c 100644
  uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
      uint32_t result = 0;
  
-@@ -2011,6 +3130,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -2030,6 +3149,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -7476,7 +7475,7 @@ index e938d95c0..0128e297c 100644
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      int32_t * data = (int32_t *) dst->data;
-@@ -3456,6 +4578,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -3475,6 +4597,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -7486,7 +7485,7 @@ index e938d95c0..0128e297c 100644
      return true;
  }
  
-@@ -3633,6 +4758,11 @@ bool llama_kv_cache_context::apply() {
+@@ -3652,6 +4777,11 @@ bool llama_kv_cache_context::apply() {
      n_kv      = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
      n_kv_rows = kv->get_n_kv_rows(ubatches[i_cur]);
  
@@ -7499,7 +7498,7 @@ index e938d95c0..0128e297c 100644
  }
  
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 053f80219..b92a5695b 100644
+index 4015728cb..b5177c63c 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -120,9 +120,23 @@ public:
@@ -7588,7 +7587,7 @@ index 053f80219..b92a5695b 100644
      bool get_has_shift() const;
  
      ggml_type type_k() const;
-@@ -323,6 +375,15 @@ private:
+@@ -326,6 +378,15 @@ private:
      // SWA
      const uint32_t n_swa = 0;
  
@@ -7604,7 +7603,7 @@ index 053f80219..b92a5695b 100644
      const bool is_indexer = false;
  
      // env: LLAMA_ATTN_ROT_DISABLE
-@@ -351,6 +412,45 @@ private:
+@@ -354,6 +415,45 @@ private:
      // ggml contexts for the KV cache along with the allocated backend buffers:
      llama_memory_bufs ctxs_bufs;
  
@@ -7650,7 +7649,7 @@ index 053f80219..b92a5695b 100644
      // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
      // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
      std::vector<uint32_t> v_heads;
-@@ -467,6 +567,20 @@ public:
+@@ -470,6 +570,20 @@ public:
      uint32_t get_n_kv() const;
      uint32_t get_n_kv_rows() const;
  
@@ -7722,7 +7721,7 @@ index 9d9592843..561393967 100644
      // Defined out of line because kpool_layout is incomplete here.
      ~llama_memory_hybrid_idx();
 diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
-index 0f5c766dd..2080fb76f 100644
+index 8c097012a..1ff00d5f9 100644
 --- a/src/llama-memory-hybrid.cpp
 +++ b/src/llama-memory-hybrid.cpp
 @@ -30,7 +30,9 @@ llama_memory_hybrid::llama_memory_hybrid(
@@ -7758,11 +7757,11 @@ index 0f5c766dd..2080fb76f 100644
 +    mem_attn->kv_pool_bytes(vram, ram);
 +}
 +
- void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-     mem_attn->state_write(io, seq_id, flags);
-     mem_recr->state_write(io, seq_id, flags);
+ uint32_t llama_memory_hybrid::graph_extra_entries() const {
+     // only the attention cache rotates; the recurrent memory has no K/V rotation
+     return mem_attn->graph_extra_entries();
 diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
-index fd77ebbc2..ddc7c64a0 100644
+index f1301678e..371203648 100644
 --- a/src/llama-memory-hybrid.h
 +++ b/src/llama-memory-hybrid.h
 @@ -40,7 +40,10 @@ public:
@@ -7784,11 +7783,11 @@ index fd77ebbc2..ddc7c64a0 100644
 +    // wip/kv-residency (TODO #118) B-A: the attendance pool lives on the attention cache
 +    void kv_pool_bytes(size_t & vram, size_t & ram) const override;
 +
-     // state write/load
+     // llama_memory_i: the attention cache's Hadamard rotation entries
+     uint32_t graph_extra_entries() const override;
  
-     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
 diff --git a/src/llama-memory.h b/src/llama-memory.h
-index 37d01ed11..fd5a50cb1 100644
+index bd1e900ab..395c0a5c2 100644
 --- a/src/llama-memory.h
 +++ b/src/llama-memory.h
 @@ -29,6 +29,15 @@ struct llama_memory_params {
@@ -7821,9 +7820,9 @@ index 37d01ed11..fd5a50cb1 100644
 +        ram  = 0;
 +    }
 +
-     //
-     // state write/read
-     //
+     // the graph entries (nodes + leafs) this memory module's graph builders add to EVERY graph, on top of
+     // what the model's own builder produces.  Today that is the KV Hadamard rotation: a rotated cache
+     // inserts two `llama_mul_mat_hadamard` chains (cont/reshape + mul_mat + reshape = 3 nodes each) per
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
 index 6b434d7ed..80de01396 100644
 --- a/src/llama-model-loader.cpp
