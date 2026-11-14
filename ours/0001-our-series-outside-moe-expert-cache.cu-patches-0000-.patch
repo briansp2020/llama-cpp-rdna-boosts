@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 02:13:28 +0000
-Subject: [PATCH 01/36] our series outside moe-expert-cache.cu (patches
+Subject: [PATCH 01/38] our series outside moe-expert-cache.cu (patches
  0000-0054 of stack-r228, squashed for the merge)
 
 ---
@@ -396,10 +396,10 @@ index 89d09a2a8..34def8669 100644
          // wip/host-pool-speed (#131): is this routed expert table served by the bounded pinned host POOL
          // (`--host-experts pool`) rather than by a pinned master?  A pool-backed table's whole-table
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index fdc0db4a5..cd03622a7 100644
+index 43c63fb24..139d6d5e0 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -806,6 +806,10 @@ void ggml_backend_meta_set_scratch_views(bool on) {
+@@ -818,6 +818,10 @@ void ggml_backend_meta_set_scratch_views(bool on) {
      g_meta_scratch_views = on;
  }
  
@@ -410,7 +410,7 @@ index fdc0db4a5..cd03622a7 100644
  struct ggml_backend_meta_buffer_context {
      // FIXME
      // Most tensors can simply be stored statically in their own buffer.
-@@ -848,7 +852,10 @@ struct ggml_backend_meta_buffer_context {
+@@ -860,7 +864,10 @@ struct ggml_backend_meta_buffer_context {
              ne.assign(ss.ne, ss.ne + std::max<size_t>(n_segments, 1)*n_bufs);
          }
          ggml_backend_meta_split_state get() const {
@@ -422,7 +422,7 @@ index fdc0db4a5..cd03622a7 100644
              ss.axis       = axis;
              ss.n_segments = n_segments;
              memcpy(ss.nr, nr, sizeof(nr));
-@@ -2587,6 +2594,64 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+@@ -2600,6 +2607,64 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
      }
  }
  
@@ -487,7 +487,7 @@ index fdc0db4a5..cd03622a7 100644
  static void ggml_backend_meta_get_2d_any(ggml_backend_t backend, size_t j, const ggml_tensor * simple_tensor, void * data,
          size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
      if (backend != nullptr) {
-@@ -4404,7 +4469,9 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
+@@ -4417,7 +4482,9 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
      GGML_UNUSED(n_slices_in);
      // Only a routed expert table (a `MUL_MAT_ID` weight with an expert axis) is cacheable, and only the
      // decode/verify band (the narrowest band of the simple backends, see ggml_backend_meta_moe_cache_band).
@@ -498,7 +498,7 @@ index fdc0db4a5..cd03622a7 100644
          return false;
      }
      if (!ggml_backend_buffer_is_meta(weight_cpy->buffer)) {
-@@ -4691,19 +4758,31 @@ static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const str
+@@ -4704,19 +4771,31 @@ static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const str
      return all;
  }
  
@@ -543,7 +543,7 @@ index fdc0db4a5..cd03622a7 100644
  static bool ggml_backend_meta_moe_cache_remap(ggml_backend_t backend, const struct ggml_tensor * weight,
          const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, bool check_only) {
      if (weight == nullptr || weight_cpy == nullptr || ids == nullptr || weight->ne[2] < 2) {
-@@ -4715,11 +4794,11 @@ static bool ggml_backend_meta_moe_cache_remap(ggml_backend_t backend, const stru
+@@ -4728,11 +4807,11 @@ static bool ggml_backend_meta_moe_cache_remap(ggml_backend_t backend, const stru
      const size_t              n_backends = ggml_backend_meta_n_backends(backend);
      const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(weight_cpy, /*assume_sync =*/ false);
      if (ss.n_segments != 1 || ss.nr[0] != 1 || ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
@@ -557,7 +557,7 @@ index fdc0db4a5..cd03622a7 100644
      }
      bool all = true;
      for (size_t j = 0; j < n_backends; j++) {
-@@ -4736,39 +4815,14 @@ static bool ggml_backend_meta_moe_cache_remap(ggml_backend_t backend, const stru
+@@ -4749,39 +4828,14 @@ static bool ggml_backend_meta_moe_cache_remap(ggml_backend_t backend, const stru
              }
              ids_j = si;
          }
@@ -935,10 +935,10 @@ index 6ff219ebd..6712e4395 100644
      GGML_ASSERT(sched);
      sched->callback_eval = callback;
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 46e08a77c..64594dc5c 100644
+index c3325c49c..05998a0f2 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2299,6 +2299,19 @@ static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
+@@ -2300,6 +2300,19 @@ static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
  static void clear_numa_thread_affinity(void) {}
  #endif
  
@@ -958,7 +958,7 @@ index 46e08a77c..64594dc5c 100644
  static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
      int n_tasks = 0;
  
-@@ -2427,7 +2440,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2428,7 +2441,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                  // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                  // decreases performance with GPU offloading
                  //n_tasks = n_threads;
@@ -3734,7 +3734,7 @@ index 3641e2017..29334eac7 100644
  
      // The MTP draft context alternates a no-output ingest graph and a 1-token draft-step graph every cycle; with
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 65b43d7d4..4ebf6ea67 100644
+index aa660d06a..bf61fc8da 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -387,6 +387,20 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -3895,7 +3895,7 @@ index 65b43d7d4..4ebf6ea67 100644
  }
  
  bool llama_kv_cache::get_can_shift() const {
-@@ -2537,6 +2646,14 @@ bool llama_kv_cache_context::is_streaming(uint32_t n_kv) const {
+@@ -2537,6 +2646,14 @@ bool llama_kv_cache_context::is_streaming(uint32_t n_kv_asked) const {
  }
  
  llama_kv_cache::~llama_kv_cache() {
@@ -3922,7 +3922,7 @@ index 65b43d7d4..4ebf6ea67 100644
      // from inclusive, to exclusive - same convention as cell_ranges_t
      // contiguous cells yield a single run covering the whole block
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index b5177c63c..c6793c711 100644
+index 2976a0837..2b2b4244c 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -298,6 +298,12 @@ public:

@@ -3,7 +3,7 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v17-a691b2345-r273` (upstream llama.cpp `a691b2345` + this repo's release).
+**Base:** `v17-a691b2345-r277` (upstream llama.cpp `a691b2345` + this repo's release).
 The rest of this branch is that release as published; only `ours/` is added.
 
 **New layout (2026-11-08).** Up to r228 this was a 55-patch series (0000-0054) that replaced the release's
@@ -17,17 +17,19 @@ The old series is kept as the tag `ours-r228-series`; the mapping table below sh
 
 ```
 git checkout a691b2345
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r273 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 36 patches (0001-0036)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r277 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 38 patches (0001-0038)
 ```
 
-Result: tree `d09c5322b148`. This is the production build from 2026-11-13 (2 GPUs, `-sm tensor`).
+Result: tree `86830ddea600`. This is the production build from 2026-11-14 (2 GPUs, `-sm tensor`).
 
 ## Patches
 
 The release has taken the r251 series' 0018 (DeepSeek-V4 cache size probes) and 0021 (DeepSeek-V4.1 kq-mask probe, issue
 #300, fixed in r254); they are dropped here. Earlier releases took the r236 series' 0009, 0011, 0014-0015, 0017 and 0018.
-r272 took our copy-engine all-reduce single exchange (PR #304, r265 0012); it is dropped here. The numbers below are the r273 series.
+r272 took our copy-engine all-reduce single exchange (PR #304, r265 0012); it is dropped here. The numbers below are the
+r277 series: the r273 series rebased (one conflict, in 0003: r277's batched arena seed, which only runs with a GTT arena;
+kept his batched structure with our serial arm for sparse tables), plus 0037-0038.
 
 | | what | env switch (off) |
 |---|---|---|
@@ -67,11 +69,31 @@ r272 took our copy-engine all-reduce single exchange (PR #304, r265 0012); it is
 | 0034 | KV segment: small prefill ubatches (decode band < n < 512) read non-resident experts from their KV copies | `GGML_MOE_KV_SEG_PF=0` |
 | 0035 | KV segment: review fixes (source counters, the hint returns to 0 when idle) | - |
 | 0036 | KV segment: 0034 on by default with the segment | `GGML_MOE_KV_SEG_PF=0` |
+| 0037 | meta: drain the device streams before the synchronous splice after a segmented async write to a weight buffer (fixes the random per-load weights under `-sm tensor --load-mode none`, issue #308) | `GGML_META_SEG_LOAD_DRAIN=0` |
+| 0038 | hc mixer: Q8_0 path (models whose hyper-connection weights are Q8_0, e.g. unsloth UD-IQ4_XS): persistent down-done counters, planar mixer output, Q8_1 epilogue in collapse+inject, combine+RMS-norm+gamma fused; bit-identical, BF16 kernels byte-identical | `GGML_CUDA_HC_DONE_PERSIST=0`, `LLAMA_HC_MIX_PLANAR_Q8=0`, `GGML_CUDA_HC_Q8_EPI=0`, `GGML_CUDA_FUSE_HC_COMBINE_MIX_Q8=0` |
 
 0005, 0006 (down-fold part) and 0009 were workarounds for the bug the release's fusion overlap check fixes at the source;
 0010 removes 0005. The others only run after a decline or a failed fill.
 
 Production also sets `MOE_HOST_POOL_TRANSPORT=map` (pins the host-read transport the r262 adaptive mode would otherwise pick).
+
+## Validation on r277 (2026-11-13 and 2026-11-14, Radeon AI PRO R9700 x 2, ROCm 10.1)
+
+- r273 series on r277 (0001-0037): production outputs identical to the r273 series (greedy, prompt-set, mid-length
+  prompts, depth texts, 259.6k needle), byte checks (`GGML_MOE_VERIFY`) 0 differences; speed equal within noise
+  (31.5k prefill 3939-3957 t/s, greedy decode 129-137 t/s on the IQ3_S production model). 0037: 0 of 6 loads off the
+  clean state (stock r277 shows the race about 1 load in 24).
+- 0038, same binary with its four switches on and off: greedy, prompt-set, mid-length and depth hashes identical on
+  UD-IQ4_XS and IQ3_S; 51 of 55 compared kernels byte-identical, including every BF16 one. UD-IQ4_XS decode +3.5-7.5 %
+  (greedy 107.7 -> 112.4 t/s, two concurrent requests 162 -> 174 t/s).
+- Nightly on the final tree: the 7-model comparison passed (KLD 0 on 6 of 6, test-backend-ops only the known cases),
+  the 1-GPU production arms (5) 0 faults, the 2-GPU layer and tensor comparisons clean; gate 0 problems. Stress: only
+  the 2-GPU production session ran (30 min, 10 rounds, 0 greedy mismatches, 0 faults); the tensor and layer-split
+  stress sessions did not run this time.
+- Production moved to unsloth `Qwen3.8-Flash-Next-UD-IQ4_XS` (UD 3.1) with `--n-cpu-moe 48`, the expert-Q4_K MTP
+  head and `--n-predict 32768` (2-GPU tensor, `-ub 4096`, `--host-experts mmap`, `GGML_MOE_KV_LEND=1 GGML_MOE_KV_SEG=1`):
+  perplexity 2.98 vs 3.14 for IQ3_S, no repetition loops on a prompt where IQ3_S looped on 7 of 24 seeds; 31.5k prefill
+  3386-3431 t/s, 159k 3169-3178, 259.6k needle correct; greedy decode 110-112 t/s (IQ3_S: 129-137).
 
 ## Validation on r273 (2026-11-12 and 2026-11-13, Radeon AI PRO R9700 x 2, ROCm 10.1)
 

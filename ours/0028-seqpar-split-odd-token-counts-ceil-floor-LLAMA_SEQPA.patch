@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 01:29:39 +0000
-Subject: [PATCH 28/36] seqpar: split odd token counts ceil/floor
+Subject: [PATCH 28/38] seqpar: split odd token counts ceil/floor
  (LLAMA_SEQPAR_ODD=0: even only)
 
 The TOKEN_SCATTER split rule gives the first T % n devices one token more
@@ -20,10 +20,10 @@ identical). pf31k +2.2 % on top of the bf16 gather (FINDINGS 908).
  2 files changed, 19 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 7143069a1..8f74b9ac2 100644
+index 320b7a6e2..d86610a37 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -1746,7 +1746,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1758,7 +1758,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
          }
  
@@ -33,7 +33,7 @@ index 7143069a1..8f74b9ac2 100644
          // whose all-reduce graph_compute turns into a reduce-scatter (assume_sync sees that one as mirrored
          // too).  Returned here: no source is split, so the ratio bookkeeping below has nothing to take over.
          if (tensor->op == GGML_OP_TOKEN_SCATTER) {
-@@ -1757,10 +1758,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1769,10 +1770,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              for (int k = axis + 1; k < GGML_MAX_DIMS; k++) {
                  GGML_ASSERT(tensor->ne[k] == 1 && "token_scatter: the token axis must be the slowest dim");
              }
@@ -47,7 +47,7 @@ index 7143069a1..8f74b9ac2 100644
              }
              return ret;
          }
-@@ -2361,6 +2363,16 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+@@ -2374,6 +2376,16 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                      }
                  }
                  if (!split_internal_offset) {

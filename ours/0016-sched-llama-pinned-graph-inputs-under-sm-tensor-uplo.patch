@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 19:06:53 +0000
-Subject: [PATCH 16/36] sched/llama: pinned graph inputs under -sm tensor,
+Subject: [PATCH 16/38] sched/llama: pinned graph inputs under -sm tensor,
  uploaded asynchronously per device; keep host compute buffers across the drop
 
 - llama-context: a tensor-split (meta) device has no single host buffer type when its GPUs report per-device
@@ -71,10 +71,10 @@ index 37cefb222..916d7018b 100644
              if (galloc->buffers[j] == galloc->buffers[i]) {
                  galloc->buffers[j] = NULL;
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index cd03622a7..47b13b690 100644
+index 139d6d5e0..74188afe5 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -3183,6 +3183,8 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
+@@ -3196,6 +3196,8 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
      delete backend;
  }
  
@@ -83,7 +83,7 @@ index cd03622a7..47b13b690 100644
  static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
      GGML_ASSERT(ggml_is_contiguous(tensor));
-@@ -3310,6 +3312,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -3323,6 +3325,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
              return;
          }
  

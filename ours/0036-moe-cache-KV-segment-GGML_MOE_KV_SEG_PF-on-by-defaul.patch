@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:46:49 +0000
-Subject: [PATCH 36/36] moe cache: KV segment -- GGML_MOE_KV_SEG_PF on by
+Subject: [PATCH 36/38] moe cache: KV segment -- GGML_MOE_KV_SEG_PF on by
  default with the segment
 
 The A/B on the production config (FINDINGS 943) gave small-prompt prefill

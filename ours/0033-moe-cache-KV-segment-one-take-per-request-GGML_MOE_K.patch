@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:09:29 +0000
-Subject: [PATCH 33/36] moe cache: KV segment -- one take per request
+Subject: [PATCH 33/38] moe cache: KV segment -- one take per request
  (GGML_MOE_KV_SEG_TAKE1)
 
 With the KV segment the lend line follows the cells in use, so a long
@@ -107,7 +107,7 @@ index 7c5753e8b..1ea51fac6 100644
  // no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
  // attention cells, that cache as well.  A memory without an attention cache: true.
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 8995d5585..c095eb396 100644
+index df1643186..55d87fcfd 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -400,6 +400,7 @@ typedef void (*llama_kv_lend_unregister_t)();
@@ -162,7 +162,7 @@ index 8995d5585..c095eb396 100644
      // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
      // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index c6793c711..a9bf31c35 100644
+index 2b2b4244c..4f0a633bb 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -303,6 +303,7 @@ public:

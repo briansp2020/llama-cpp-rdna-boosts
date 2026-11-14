@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:24:54 +0000
-Subject: [PATCH 05/36] moe cache: run a declined decode-band sparse
+Subject: [PATCH 05/38] moe cache: run a declined decode-band sparse
  gate+up+GLU unfused (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 The fused read of the scheduler copies gave NaN output at tight pin budgets; the per-op path reads the same copies correctly.
