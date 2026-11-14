@@ -1,3 +1,306 @@
+## 261113.003 (r277, RELEASE v17-a691b2345-r277) -- the placement read queue: startup placement at drive depth, and `--load-mode` becomes a DEMAND-only decision
+
+**Release:** `v17-a691b2345-r277` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip
+**`9d7c0502c`**, tree **`0104361a095f7463d52376a408b8a7863d83f2d7`**.  **Block 16 amended** (the only block whose
+patch body changes); one new environment variable (`MOE_EXPERT_FILL_QD`, default `8`), and `MOE_HOST_POOL_BULK_DIO`'s
+reach now covers every placement fill instead of the mirror alone.  **No numerics move: every arm byte-identical**
+(`a99ccbd97ecb` / `8c39335bbceb` on the pool gate's configs, `4ac3a523160f` on the placement arms), prefill-logit
+KLD **0.000000 / 100.000 %**.
+
+### The problem, and why it is one question and not two
+
+r273 (correctly) made the *placement* read O_DIRECT so a bulk load stops over-committing the page cache, and that is
+what ended the startup thrashing.  It left two things on the table.  One: every placement read is still issued at
+**depth 1**, which on an NVMe is a latency wall -- a 576 KiB O_DIRECT read runs at **2 219 MiB/s** at depth 1,
+3 896 at 2, 5 307 at 3, 6 348 at 4 and **6 937** at 8, against a drive plateau of ~6.8 GiB/s (SN7100) / ~14 GB/s
+(SN8100).  Two: only the *mirror* got that O_DIRECT rule; the per-slot **prewarm** and the one-shot **band
+re-layout** still followed the demand transport, i.e. they filled through the model mapping / page cache -- the exact
+over-commit r273 removed, measured cold at **1 183 MiB/s**.  Both are startup-placement questions, so they are
+answered together: **a placement fill never uses the page cache, and it runs at depth.**
+
+### What shipped
+
+1. **The placement read queue.**  A job is `{off, len, dst}`; the workers are the persistent reader threads block 16
+   already built for the GTT prefill span stream (`pf_read_pool`/`pf_read_submit`/`pf_read_wait` -- deliberately
+   leaked, parked between fills), so nothing creates a thread per fill and one run has one story about how many
+   readers it has.  Placement fills only: the workers `pread`, and **every** counter, slot reservation and publish
+   stays on the calling thread, so a failed job releases its reservation and the existing serial loop retries it with
+   all its fallbacks.  Wired into the covering mirror, the prewarm, the band re-layout and block 16's GTT arena
+   sizing seeds.  `MOE_EXPERT_FILL_QD=1` is the depth-1 arm and the A/B -- the same code path, not a fork of it.
+2. **The placement transport is O_DIRECT, unconditionally** (`MOE_HOST_POOL_BULK_DIO=0` = the buffered A/B).  The
+   placement read opens its own handle and closes it again, because the O_DIRECT bit lives in the open flags and
+   leaving it behind would make the demand path's unaligned `pread` fail.  `--load-mode` / `MOE_HOST_POOL_DIO` keep
+   their whole meaning for the **demand** transport -- the per-miss reads during prefill/decode, where a warm
+   page-cache hit for an evicted expert is a genuine win (r212's measurement stands).  The once-per-run line now
+   says which question the answer is about, so an operator cannot read one as the other.
+3. **The pool-base alignment shift, and the mirror's aligned window.**  A GGUF tensor offset is 32-byte aligned, not
+   4096, so every O_DIRECT placement read used to round out through a bounce buffer and then **memcpy the whole
+   expert** -- one extra pass over the placement bytes, serialized with that worker's own I/O.  Each pool now
+   reserves one alignment unit of slack at both ends and shifts its base by `file_offs % POOL_PLACE_ALIGN`, which
+   makes `base` congruent to the tensor offset; the covering mirror then maps `[base_alloc, base_alloc+total)` onto
+   `[file_offs - pad, ...)` and is **one aligned window** -- no bounce, no memcpy (**8 751 vs 5 674 MiB/s at depth
+   1** on the PCIe-5 box, i.e. the copy was half the wall time at low depth).  Per-slot fills keep the bounce, and
+   that is measured, not assumed: splitting a request into "bounce the head, read the aligned body straight in,
+   bounce the tail" LOSES at every size a pool fill uses (576 KiB 5.21 vs 6.64 GiB/s, 1 MiB 5.79 vs 6.35, 8 MiB 6.58
+   vs 6.73) because a 4 KiB unbuffered read is pure device latency.  Recorded so nobody "optimises" it back in.
+4. **A dead-code/warning cleanup** of block 09/12/16 leftovers found while auditing the file for Windows
+   portability: 6 unreachable static functions (`check_invariant`, `pool_resident_locked`, `table_arena_bytes`,
+   `pool_slot_locked`, and the `pool_slot_sync` drain that lost its only caller with it), 6 write-only census
+   counters, one dead local and one sign-compare.  No behaviour change; the two load-bearing notes were moved, not
+   dropped (the slot-map occupancy invariant onto `pool_slot_assign_locked`, the "nothing evicts, so no per-slot
+   drain" rationale onto the `TODO` #87 note).  The pool census therefore reads `evictions=0` **by construction**.
+
+### Measurements (all cold, all same-seed text byte-identical)
+
+| arm | depth 1 | default (8) | note |
+|---|---|---|---|
+| prewarm, default config (mapping arm before) | 2 694 | **6 103** | 91 GiB box, SN7100; was **1 183** on the shipped default before this change |
+| covering mirror, 32 640 MiB | 4 471 | **6 640** | same box; window removes the memcpy |
+| mirror (PCIe-5 SN8100) | 5 674 | **13 555** | whole run 9.11 -> 5.50 s (-40 %) |
+| prewarm (PCIe-5) | 3 296 | **11 185** | whole run 10.74 -> 7.61 s (-29 %) |
+| GTT arena sizing seeds (`halo`, gfx1151) | 17 152 | **33 189** | page-cache-served -> fault/latency parallelism |
+
+### The gates caught what the text could not, and that is now permanent
+
+Every arm is byte-identical **with the queue inert**, so a text-only gate would pass a queue nothing reaches.
+`gate-host-pool.sh` therefore grew a `qd1` arm (`MOE_EXPERT_FILL_QD=1`) and a `bulkbuf` arm
+(`MOE_HOST_POOL_BULK_DIO=0`), plus census checks that ref's placement reads are **O_DIRECT**, that the placement
+queue **really ran** (batch count and reads > 0, 8 readers), that `QD=1` really reports 1 reader, and that
+`BULK_DIO=0` really flips the transport.  `gate-uma-experts.sh` asserts the same for the GTT sizing seeds
+(`heat-seeded ... placement queue`, and no line falls back to `serial fills`).
+
+### Gates
+
+`gate-host-pool.sh` **54/54** (13 arms) · `gate-uma-experts.sh --quick --no-ram` on `halo` **38/0** ·
+`gate-per-block-build.sh --fast --changed-from 378256be4` green (block 16 is the only delta) · `fork-refresh.sh
+--build --gates` green, canonical tip `9d7c0502c`, applied tree `0104361a0` · prefill-logit **KLD 0.000000,
+same-top-p 100.000 %** · `validate-set.sh` green (17 blocks, base tree + applied tree + Windows portability scan) ·
+coherence: every pool-gate arm byte-identical, `check-gpu-faults.sh` clean over every arm log.
+
+**Windows:** no toolchain here, so the posture is r275's -- `check-windows-portability.sh` clean (291 added files,
+no unguarded POSIX call, no `windows.h` macro collision), and the change adds **zero** warnings under
+`-Wall -Wextra -Wformat=2 -Wmissing-field-initializers` (verified against the r275 baseline file: identical warning
+sets).  Two things are *better* there rather than merely unbroken: `cudaHostRegister` wants a page-aligned start,
+which is why the pin registers `base_alloc` and not the shifted `base`; and `FILE_FLAG_NO_BUFFERING` wants offset,
+length and buffer as sector multiples, which is exactly what the mirror's aligned window is (the 32-byte-aligned
+GGUF offset used to force the `_aligned_malloc` bounce on every table).
+
+**Not run:** MTP Protocol A (`benchmarks/mtp-adaptive-methodology.md`) and `llama-batched-bench -npl 1,4,8` -- this
+is a load-time/placement change and every arm is byte-identical, but the policy's decode gate is owed rather than
+assumed (the same note r273 carries).  **Not changed:** the demand path (a miss is still one depth-1 read; the
+batching it needs is the recorded scheduler item), and the GTT store's *whole-set* placement, which is the loader's
+per-tensor fill (one 142 MiB `pread` per table -- already saturated at depth 1, and its loss is mlock/registration,
+not queue depth).
+
+## 261113.002 (r276, docs + tooling, NO delivery change) -- `TODO` #316 closes both halves: the APU device-pool probe and the owed gfx1201 fusion-alias run; `TODO` #282's detail restored, block 16's carried-forward list dissolved into rows
+
+**No patch changes, no `release.json` change** (`validate-set.sh`/`re-cut` untouched): this is the tracker repair
+plus the two gate defects `TODO` #316 carried since r264, and both are now closed on evidence rather than on an
+argument.
+
+**#316 half (a) -- `gate-prefill-logits.sh` could not select a model on an APU.**  `vram_gib()` read
+`/sys/class/drm/card*/device/mem_info_vram_total`, and an integrated GPU reports its VRAM **carve-out** there
+(`halo`: **2 GiB** against a 123.5 GiB machine pool), so the gate died with `no auto model found (set MODEL);
+biggest single card = 2 GiB` and `fork-refresh.sh --gates` could not run it -- the r264/r266 releases were gated by
+running the A/B by hand.  It is now `device_pool_gib()`: a card with a real VRAM figure (>= 8 GiB) is sized by that
+figure, a carve-out is sized by **`mem_info_gtt_total`** (the pool the device actually reads), and **a discrete card
+wins over a co-resident iGPU** so a model the card cannot hold is never chosen.  The integrated test is the PAIR
+(small VRAM *and* `gtt > 4 x vram`), because a discrete R9700 exposes a 45 GiB GTT window of its own -- `gtt > vram`
+alone would have mis-classified every card on `soar`.  Measured: `soar` **31 GiB** (unchanged -> still the 27B
+Q8_0), `halo` **121 GiB** (was the 2 GiB carve-out).  Verified end to end on `halo`: `--record --chunks 2
+--base-dir /tmp/ppl-base-smoke` auto-selected `Qwen3.8-27B-Q8_0`, base PPL **6.0676**, candidate **mean KLD
+0.000000 / same top p 100.000 %**, PASS.
+
+**#316 half (b) -- the gfx1201 run `gate-fusion-alias-copy.sh` was owed is done, and it PASSES.**
+`scripts/gate-fusion-alias-copy.sh` on `soar` against the r275 release tree (`378256be4`): all 7 arms, every text arm
+**`3fab4da87774`** (A fused == A chain == A `GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1` == B `MOE_HOST_POOL_FILL_FAULT=200`
+== C production anchor), A's trace logs `GLU<-NONE/copy@268435456` (the arm really reaches a compute-buffer leaf
+overlap, so the comparison is not vacuous), C logs 1 distinct declined alias class, `check-gpu-faults.sh` clean on
+kernel and on all 7 logs.  So the r266 prefill-in-place change's "every fusion stands down for a remap-served table"
+now rests on an **executed gate on gfx1201**, not only on `moe_cache_table_serves()` being identity-only.  The gate
+stays INERT on `halo` (gfx1151): `-ub 14` is outside that arch's MMVQ MoE band and the arms fail identically on an
+unmodified build, which is why the run was owed on this box.
+
+**Docs repaired (`TODO.md`, and the tracker is now internally consistent).**  Three defects, all from the **r266**
+commit `b99223b5`, whose single hunk `@@ -211,356 +211,23 @@` deleted 356 lines to add 20:
+
+1. **`TODO` #282's detail section was deleted while the item stayed OPEN.**  Its table row is still `OPEN` and the
+   newest `gate-host-pool.sh` runs still call it "the known `pinlate` WARN, unchanged", so the section is restored
+   **verbatim** from `575dde3c:TODO.md` and the row's `-- §282` resolves again.  (`#282` is unchanged otherwise: a
+   ~1e-5 mixture path difference, two orders inside the tolerance.)
+2. **The whole `## Documented, deliberately NOT fixed` block went with it** (attendance pool on an APU `#300`; the
+   `MOE_HOST_POOL_RANK=decode` `-npl 4/8` regression `#275`; the Windows pinned-host ceiling, which never had a
+   handle).  Only `#141` came back, at r274.  All three are restored as accepted limitations with their numbers and
+   their `ARCHIVE`/`ENVIRONMENT.md` pointers.
+3. **`### Block 16 ... carried forward` sat ABOVE the index table** in bullet form, with a struck-through DONE item,
+   two open `TODO` #316 defects (now closed above), and five unnumbered carried-forward items.  It is gone: `#316`
+   closes, `#319` opens for the lock-policy band (the refusal is the SAFE branch -- the load throws before a byte
+   is read, so the "arena declines, placement over-commits" combination is not reachable; relaxing it needs arms on
+   a >RAM APU model with `ulimit -l` inside `[shortfall, arena_min)`, which no box here is configured for), `#320`
+   is the parked drafter-head sizing, and the rest lands in accepted limitations: multi-device is untested
+   (**re-entry: a multi-APU host**), Windows declines by design, and block 16's owed `llama-batched-bench -npl
+   1,4,8` width arm is **not owed for this tier** (the store/arena is inert on a discrete GPU by measurement --
+   zero `GTT` lines with the envs forced on -- so that arm cannot witness it; the width arm belongs to blocks
+   12/15 and the MTP protocol).
+4. Also: **probe 15 closes on the campaign's own simulator** (the Nth-touch admission the delivery ships is
+   predicted *worse* on this tier at every slot count -- -1.9 pts at S=56, -3.8 at S=133 -- and the tier already
+   implements the predicted-best policy, so the probe has nothing left to set); the `## Handle numbering` note is
+   compressed to "append after `#320`, never reuse" plus the two allocation mistakes; and `## 273` now leads with
+   what is OPEN (the state was buried under two history paragraphs, which is what made a live row look closed).
+
+**One operational consequence, and it is deliberate.**  `halo`'s recorded gfx1151 bases are for the **9B** lineage
+(`prefill-logit-gfx1151-Qwen3.5-9B-{Q6_K,Q8_0}.kld`, 2026-10), and the auto path now selects the 27B Q8_0 on that box
+because the pool can hold it, so the FIRST `fork-refresh.sh --gates` run there stops at
+`ERROR: base not found: .../prefill-logit-gfx1151-Qwen3.8-27B-Q8_0.kld` with the `--record` command printed (it no
+longer stops earlier at the 2 GiB carve-out).  That is the gate behaving correctly: record a base from a known-good
+build, or pass `MODEL=` to keep the 9B point.  Nothing changes on `soar` (31 GiB, same model, same base).
+
+**Files:** `TODO.md`, `scripts/gate-prefill-logits.sh` (`device_pool_gib()`, header + failure message),
+`scripts/README.md` (both gate rows), `INVARIANTS.md` (two entries), `WORKLOG.md`.  No `patches/`, no
+`release.json`, no gate re-run owed beyond what is recorded here.
+
+## 261113.001 (r275, RELEASE v17-a691b2345-r275) -- the Windows `near` build break (issue #306), the portability lint learns windows.h macros, and a compiler-warning sweep
+
+**Release:** `v17-a691b2345-r275` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip
+**`378256be4`**, tree **`accca310c35a0b846be1e1f645ce26f5fa829236`**.  Blocks 00, 09, 12, 15 and 16 amended.  **No
+numerics move** (every change is a rename, a diagnostic string, a zero-valued initializer entry, a switch case for an
+op the CPU never computes, or a compile flag): same-seed greed text unchanged, prefill-logit KLD **0.000000 /
+100.000 %**.
+
+### The Windows build break (issue #306, reproduced in discussion #305)
+
+`ggml/src/ggml-cuda/moe-expert-cache.cu:2716-2721` declared `const bool near = ...` inside
+`pool_report_layout_once_locked`.  `<windows.h>` (via `<minwindef.h>`) defines `near` (and `far`) as **empty macros**,
+so the line preprocessed to `const bool = ...`: three hard errors on the Windows HIP toolchain --
+`moe-expert-cache.cu:2716:25: expected unqualified-id` and `:2718:34` / `:2721:40: expected expression` -- at the
+exact columns the reporter named.  The file already defines `NOMINMAX` before its `<windows.h>` include; `near` had no
+equivalent guard.  Renamed to `near_mirror` at the three sites (block 16).  A no-op on every other platform.
+
+**The detector, not just the fix.**  `scripts/check-windows-portability.sh` (issue #231's POSIX-call lint) now also
+rejects a local, parameter or member named `near`, `far`, `pascal` or `cdecl` on a line compiled on Windows, using the
+same `_WIN32`-pinned preprocessor walk and comment/literal stripping.  `min`/`max` are deliberately excluded (NOMINMAX
+is defined before every windows.h include here and upstream calls them as functions).  **Negative control:** a
+worktree at r273's tip `6245ba844` reports exactly the three sites and exits 1; the fixed tree scans 291 added files
+clean.  It still runs from `validate-set.sh`, so there is no longer a Windows-only class that depends on a reporter's
+build log.
+
+### The compiler-warning sweep (real warnings first)
+
+All delivery-owned, all behaviour-neutral:
+* **2 `-Wformat` in `moe-expert-cache.cu`** -- a literal `-41 %)` in the transport-coupling WARN (block 12) and
+  `used_experts=%d` against an `int64_t` in the GTT prefill-stream debug line (block 16, now `%lld` + cast).
+* **1 `-Wswitch` in `ggml-cpu.c`** -- `GGML_OP_KV_POOL` joins the GPU-only `GGML_OP_INDEXER_{SCORE,FILL}` abort group
+  (`ggml-cpu.cpp`'s `supports_op` already refuses it, block 15).
+* **1 `-Wunused-parameter`** -- the cold split-state helper ignores `assume_sync`; `GGML_UNUSED` (block 00).
+* **7 `-Wmissing-field-initializers`** -- the `moe_host_master_buft`/`moe_cache_pool_backed`/`moe_cache_prefill_stream`/
+  `gtt_store_*` fields the delivery appended to the backend/device ifaces were left implicit in the meta, CPU and RPC
+  positional initializers (and `tests/test-backend-tensor.cpp`'s buffer-type mock).  They are now listed as
+  `nullptr`/`NULL`, i.e. the value they already had (blocks 09 and 16).
+
+### `-Wshadow`: the flag is scoped on clang, upstream identifiers stay
+
+The sweep found **103** `-Wshadow` hits.  A blame of every site: **102 are upstream code** -- the documented
+"local or parameter named after the field it belongs to" idiom (`mctx`, `params`, `n_embd`, `n_kv`, ...) plus
+`llama_model_loader * ml`, the case the delivery deliberately does not rename because it re-skins every re-base
+conflict (TODO #101).  The 103rd was delivery code (`llama_kv_cache_context::is_streaming(uint32_t n_kv)`, block 15)
+and its parameter is now `n_kv_asked`.
+
+`clang` has no `-Wshadow=local`, so plain `-Wshadow` reports the upstream idiom wholesale.  **Maintainer's decision: do
+not touch upstream's code -- the weekly re-base will pick up their fixes.**  `src/CMakeLists.txt` (block 00) now keeps
+GCC's `-Wshadow=local` over the whole target (the container/CI arm), and on clang uses `-Wno-shadow` for the target with
+`-Wshadow` re-enabled on the file this delivery adds (`llama-lazy-reader.cpp`), where a new shadow is a defect.  A clean
+clang build is now warning-free.
+
+**Left alone on purpose:** the ~9 762 `ld.lld: warning: <unknown>:0:0: loop not unrolled` lines from the HIP
+**device-link LTO**.  They are upstream's runtime-bounded `#pragma unroll` hints in `fattn-mma-f16.cuh` (line 516
+dominates), the existing `-Wno-pass-failed` reaches only the frontend, and the only lld-level silencer is
+`-Xoffload-linker --no-warnings`, which would hide every device-link warning.  The hints are advisory and already
+fail, so the code is unaffected (a `-Rpass-missed=loop-unroll` run localized them on 2026-11-13).
+
+### Verification
+
+* `scripts/validate-set.sh`: 17/17 strict `git am` on a fresh `a691b2345` tarball, base tree
+  `9d7b9a02f0...` OK, applied tree **`accca310c3...`** OK, per-block conflict-marker/subject scan clean, Windows lint
+  **291 files clean** (negative control above).
+* `scripts/gate-per-block-build.sh --fast --changed-from 6245ba844`: **5/5** changed blocks build (00, 09, 12, 15,
+  16), **717 s**, 0 failures.  The other 12 blocks' deltas are unchanged (patch-id) and were skipped; the tip was
+  built.
+* `scripts/fork-refresh.sh --build --gates` (re-cut from `a691b2345`): tree/tip reproduce **`accca310c3...` /
+  `378256be4`**; coherence gate ran; prefill-logit mean KLD **0.000000** (limit 0.005), same-top-p **100.000 %**
+  (floor 98 %); `check-gpu-faults.sh` clean in the gate logs.
+* MTP Protocol A was not run: no decode/attention/fusion numerics changed in this release.
+
+Docs touched: `release.json` (regenerated), `patches/README.md` (the five block notes), `INVARIANTS.md` (the r275
+facts), `AGENTS.md` / `scripts/README.md` (the lint's new check).  The fork branch is refreshed by
+`scripts/fork-refresh.sh --push`; the container images are built off-host by the worker watcher from the tag.
+
+## 261112.010 (r274, docs only -- NO delivery change) -- `TODO` #141 retires: the take-over's bound is a CAPPED ARENA x a sub-complement pool, and the default arena never enters it
+
+**No code, no `patches/`, no `release.json` change** -- the release stays `v17-a691b2345-r273` and the fork is
+untouched.  `#141` asked what to do about "a genuine sub-complement host-expert budget declines the eager take-over
+at wide decode".  Re-measured on r273 before touching anything, the answer is that **the row blamed the wrong
+knob**, the cliff is real but needs a second one, and the cell is an accepted limitation (maintainer's call: a
+purpose-built cold source for an artificially capped arena is not a good use of development time when the pragmatic
+answers -- cache off, or block 15's streaming KV to recover the VRAM -- already exist).
+
+**The measurements** (r273 tip `6245ba844`, 2 x R9700 `HIP_VISIBLE_DEVICES=0,2`, `-sm layer -fa on -t 12`,
+35B-A3B Q4_K_M `-ncmoe 40`, `-lme 8` = 8192 MiB = **43.8 %** pool coverage; full tables in
+[`benchmarks/2026-11-12-eager-takeover-arena-bound.md`](benchmarks/2026-11-12-eager-takeover-arena-bound.md)):
+
+| `MOE_EXPERT_CACHE_MIB` | slots/table | tg `-npl 8` | tg `-npl 16` | `decline_all` |
+|---|---:|---:|---:|---:|
+| unset (auto) | 256 (`n_experts` clamp) | **298.7** | **384.0** | **0** |
+| 5120 | 134 | -- | 289.9 | 0 |
+| 2560 | 67 | 134.2 | 66.2 | 117 / 30 837 |
+| 2048 | 53 | **46.1** | -- | 122 997 |
+| 0 (cache off) | -- | **102.8** | **149.0** | -- |
+
+**1. The sub-complement budget alone does NOT enter the band.**  At the delivery's default arena the item's own
+arm is the *fastest* measured (`298.7 / 384.0`, `takeover=0 decline_all=0`), because auto sizing clamps every table
+at `n_experts` (256 here) and the guard is `t.slots < n_used * n_tok` (8 x 8 = 64 at `-npl 8`).  What crosses it is
+an **explicitly capped** `MOE_EXPERT_CACHE_MIB` -- and the cap's requirement scales with the widest batch served
+(8 x 16 = 128 slots/table at the band top), so `2560` fixes `-npl 8` and leaves `-npl 16` at 66.2 against 149.0
+for the cache off.  Cross-checked on the field model (Flash-Next IQ3_S, 512 experts, `-lme 20`, default arena):
+470-483 slots/table, `decline_all=0`, 106.0 tg -- nowhere near this bound; the `device remap: 27 651 of 27 651
+declined` there is r221's cold-id limit, a different line and a different ~9.9 %, and the record says so.
+
+**2. The heat map is not the variable** (the maintainer's fair challenge, `-ntg 128` being 128 generated tokens per
+slot but a short run for a heat-driven cache anyway): re-run at `-ntg 1024` with a converged map (`h=0.8359`,
+82.3 % of the routed mass) the cliff reads **46.13** against **46.40** at 128 tokens, and the fixed arm 134.17
+against 143.31.  The take-over's success is a per-shape constant by construction (r221 fact 5, the reason the bound
+exists), so it cannot warm up out of the band.
+
+**3. The candidates in the row were scored, not guessed.**  (a) "size it, do not decline it" works and costs the
+operator's cap (+512 MiB/device for `-npl 8`, +3 GiB for the band top) -- a floor on an explicit cap would override
+the knob whose whole purpose is reserving VRAM for KV, i.e. the opposite of r273's "an explicit budget is
+authoritative"; (b) a ring cold source for a neither-tier expert is the same order of bytes (the ring must hold a
+pass's distinct uncovered experts) and is really the `#273`/gather campaign; (c) let the graph re-capture is already
+refuted (graph-less batched decode 137 -> 52 t/s).
+
+**Purity:** the decline is a performance path only.  Same-seed greedy text (`llama-cli -n 20 --seed 42 --temp 0
+--no-display-prompt --single-turn`, no `-lv`) is **`627b2ebd7792` / 89 chars** at `MOE_EXPERT_CACHE_MIB=2048`
+(every routed op declined) == `auto` == `0`, i.e. the fallback reads the same values from the pageable mapping.
+
+**Retirement.**  `#141` leaves the open list for a new **accepted limitations** section in `TODO.md`, with its
+numbers, the answers in order (`MOE_EXPERT_CACHE_MIB=0` is 2.2x the declining arm; `-lme auto` / `--host-experts
+pinned` are exempt by construction; the streaming KV window/pool is how the memory comes back) and a re-entry
+condition (a real report on a supported configuration, or a campaign that lowers the band's need for its own
+reasons).  **No WARN was shipped on purpose**: it is code plus a gate for a configuration the delivery does not
+validate, and `decline_all` / `takeover=` already name the cell at `-lv 4`.
+
+**Docs touched** (all current-state headers, no dated record edited in place): `TODO.md` (row + section removed,
+accepted-limitations entry added), `ENVIRONMENT.md` (`MOE_EXPERT_CACHE_MIB`: the band, the measured cliff and the
+answers), `INVARIANTS.md` (new `r274` -- five facts, and the r261 entry's `TODO` #141 pointer now names the
+retirement), `benchmarks/2026-11-12-eager-takeover-arena-bound.md` (the record + the reproduce command).
+`patches/README.md`'s dated r210/r262 amendment notes keep their `TODO` #141 citation -- the handle is permanent
+and resolves to the accepted-limitations entry.  **`benchmarks/README.md`'s dated index was deliberately not touched**:
+it has been stale since 2026-10-29 (none of the 2026-11 records are listed), so adding this one alone would
+misrepresent it as current -- `WORKLOG.md` is the current state, and rebuilding that index is its own task if it is
+wanted.  Raw arm logs are not kept (repo convention): the record carries the commands, the censuses and the numbers.
+The record also states how to read a `llama-batched-bench` table (`B` = `-npl`, `TG` = `-ntg` per slot, `S_TG`
+aggregate), because misreading `B` as the generation length is what prompted the heat-map re-run.  No gate run is owed (nothing executable changed); the arms above
+are the measurement and `scripts/check-gpu-faults.sh` was clean on the session's runs.
+
 ## 261112.009 (r273, RELEASE v17-a691b2345-r273) -- the page-cache amplification, the pool exchange's missing guard, and `-lme N` finally meaning N
 
 **Release:** `v17-a691b2345-r273` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip

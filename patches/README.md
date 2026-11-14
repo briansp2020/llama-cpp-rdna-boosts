@@ -236,6 +236,12 @@ split, tree-identical.
 
 ## Block 00 — foundation: band uniformity, the Meta wrapper, the allocator
 
+> **r275 amendment (issue #306 cleanup):** the `-Wshadow` arm is now scoped on clang.  Plain clang `-Wshadow` also
+> reports upstream's "local/parameter named after the field" idiom (102 sites, deliberately not renamed -- TODO #101),
+> so clang gets `-Wno-shadow` for the `llama` target with `-Wshadow` re-enabled on the file this delivery adds
+> (`llama-lazy-reader.cpp`); GCC keeps `-Wshadow=local` over the whole target.  The cold split-state helper also marks
+> its unused `assume_sync` (`GGML_UNUSED`).  No codegen change.
+
 > **r237 amendment: `--lazy-mode mlockr` — use mlock as a POPULATE, not as a residency guarantee.**  The
 > existing `mlock` mode pulls every row of a marked table (the 26.8 GiB PLE table on Qwen3.8-Flash-Next) into
 > the page cache and **pins** it for the process lifetime.  On a box where the expert arena auto-sizes into
@@ -1204,6 +1210,10 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 ---
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
+
+> **r275 amendment:** `tests/test-backend-tensor.cpp`'s buffer-type mock lists the appended
+> `get_compute_margin_pct`/`alloc_buffer_usage`/`get_compute_chunk_bytes` entries (`NULL`, i.e. the value they already
+> had) -- the `-Wmissing-field-initializers` cleanup for the field this block adds.
 
 > **r273 amendment: a released upload's pages are DROPPED, not merely unmapped.**  `LLAMA_LOAD_RELEASE_MMAP`
 > already unmapped a device-bound tensor's range after its H2D; it now also issues
@@ -3113,6 +3123,9 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
+> **r275 amendment:** the transport-coupling WARN in `moe-expert-cache.cu` escapes its literal percent (`-41 %%`); it
+> printed `invalid conversion specifier ')'`.  Diagnostic text only.
+
 > **r258 amendment (`TODO` #133, closed): an identity expert table is served IN PLACE in the prefill band.**
 > `moe_cache_get_table`'s identity fast path and `moe_cache_take_over` were both gated on `ne[2] <= band`, so
 > above the band the scheduler staged the whole expert table into a ring slot (pinned master) or gathered it
@@ -4293,6 +4306,10 @@ Purity notes: `GREEDY-PURITY.md` §58.
 
 ## Block 15 — the streamed KV: the resident WINDOW (`--kv-window`), the attendance POOL (`--kv-attendance-pool`) and the MTP draft WINDOW (`--spec-draft-kv-window`, **default `0`**)
 
+
+> **r275 amendment:** `GGML_OP_KV_POOL` joins the GPU-only abort group in `ggml-cpu.c`'s compute dispatch (its
+> `supports_op` already refuses it), and `llama_kv_cache_context::is_streaming`'s parameter is `n_kv_asked` (it shadowed
+> the field; the one delivery-owned `-Wshadow` hit).  No behaviour change.
 > **r248 amendment (issue #297): the MTP draft window is a TRUE ring, a drafter failure no longer fails a request,
 > and the two sizing paths agree on the draft ubatch.**  The window reclaims a cell by its POSITION
 > (`find_slot`'s `n_swa` test), which only works while positions advance one per token.  An M-RoPE multimodal
@@ -4784,6 +4801,11 @@ Concurrent 2-slot decode with the window active also passes (2 x 64 tokens), and
 
 ## Block 16 — the UMA GTT expert store: an APU's MoE expert set served from ONE registered region (`-lme` sizes it)
 
+> **r275 amendment (issue #306):** the RESOLVED-layout census's local was named `near`, which `<windows.h>` defines as
+> an empty macro -- a hard Windows HIP compile error at `moe-expert-cache.cu:2716/2718/2721`.  Renamed `near_mirror`
+> (no-op elsewhere).  The GTT prefill-stream debug line's `used_experts` is now `%lld` with an `int64_t` cast, and the
+> meta/CPU/RPC backend and device initializers list the fields appended through this block (all `nullptr`/`NULL`).
+
 > **r273 amendment: the DISCRETE host pool's placement, exchange guard and budget provenance live here too**, because
 > `moe-expert-cache.cu` is the one file both tiers share (so this is also where the per-block note belongs).
 > Four changes, all measured (`WORKLOG.md` 261112.009):
@@ -4931,6 +4953,32 @@ well: **12 546 -> 7 774 ms** for the same 42.7 GiB and the same set (3.67 -> 6.2
 `MOE_EXPERT_SEED=eager` on this build is byte-identical text / identical hit rate / 1.1 % decode, i.e. the shipped
 default moves nothing on gfx1151).  Record: `benchmarks/2026-11-12-expert-seed-policy.md`, `archive/work/expert-seed-policy/`,
 `WORKLOG.md` 261112.006.
+
+**r277 amendment to block 16 -- the PLACEMENT READ QUEUE (and the pool-base alignment shift it exposed).**  Every
+placement fill is a work queue drained by the reader pool block 16 already had: the host pool's load-time prewarm
+(`pool_prepopulate_locked`), its one-shot band re-layout (`pool_rerank_from_heat_locked`), a covering mirror
+(`pool_mirror_bulk_fill_locked`) and this block's own GTT arena SIZING seeds (`apply_heat_seed_locked`,
+`apply_prefill_seed_locked`).  A placement fill has no decode latency to lose and its whole work list is known
+before the first read, so it runs at depth; a DEMAND miss cannot (its next read is not known until the routing
+arrives), and that stays the scheduler item in `archive/work/host-pool-demand-overlap/`.  r273's transport rule is
+extended with it: **the placement read is O_DIRECT whatever `--load-mode` says, and `--load-mode` /
+`MOE_HOST_POOL_DIO` decide only the DEMAND transport** -- the prewarm had been left on the demand transport, i.e.
+filling through the model mapping, measured **1 183 MiB/s** cold against **6 103** for the same bytes read from
+the file.  Numbers (cold, same-seed text byte-identical in every arm): O_DIRECT depth 1 -> 8 on a 576 KiB read
+**2 219 -> 6 937 MiB/s** (the drives plateau at ~6.8 GiB/s SN7100 / ~14 GB/s SN8100), host-pool prewarm
+**2 694 -> 6 103** and mirror **4 471 -> 6 640** on the 91 GiB box, mirror **5 674 -> 13 555** and prewarm
+**3 296 -> 11 185** on the PCIe-5 box (whole run -29 % / -40 %), GTT arena seeds on `halo` **17 152 -> 33 189**
+MiB/s (page-cache-served there, so a latency/fault-parallelism win).  The block also carries the pool-base
+alignment shift that makes the mirror ONE aligned window instead of an aligned-bounce plus a full memcpy
+(`base_alloc`/`POOL_PLACE_ALIGN`: `base` is congruent to the GGUF tensor offset; 8 751 vs 5 674 MiB/s at depth 1),
+and a dead-code/warning cleanup of block 09/12/16 leftovers (6 unused functions, 6 write-only census counters, one
+sign-compare; no behaviour change -- the slot-map occupancy invariant moved onto `pool_slot_assign_locked` and the
+"nothing evicts, so no per-slot drain" rationale onto the `TODO` #87 note).  One new env var, `MOE_EXPERT_FILL_QD`
+(tuning, default `8`; `1` is the depth-1 A/B).  Gates: `gate-host-pool.sh` **54/54** with a new `qd1` arm
+(`MOE_EXPERT_FILL_QD=1`) and a new `bulkbuf` arm (`MOE_HOST_POOL_BULK_DIO=0`), plus census checks that the queue
+really ran (the mechanism must be LIVE, not merely benign -- the text is identical either way), `gate-uma-experts.sh`
+**38/0** with the seed-queue census asserted, prefill-logit **0.000000 / 100.000 %**.  Record: `WORKLOG.md`
+261113.003, `INVARIANTS.md` (r277).
 
 ## Dated history
 
