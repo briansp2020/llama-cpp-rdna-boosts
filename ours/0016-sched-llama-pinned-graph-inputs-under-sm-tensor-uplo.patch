@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 19:06:53 +0000
-Subject: [PATCH 16/38] sched/llama: pinned graph inputs under -sm tensor,
+Subject: [PATCH 16/42] sched/llama: pinned graph inputs under -sm tensor,
  uploaded asynchronously per device; keep host compute buffers across the drop
 
 - llama-context: a tensor-split (meta) device has no single host buffer type when its GPUs report per-device
@@ -23,16 +23,16 @@ review (M1-M4 applied), code reviews no must-fix (FINDINGS 861).
 ---
  ggml/include/ggml-backend.h    |  3 ++
  ggml/src/ggml-alloc.c          | 13 +++++++
- ggml/src/ggml-backend-meta.cpp |  9 +++++
+ ggml/src/ggml-backend-meta.cpp |  7 ++++
  ggml/src/ggml-backend.cpp      | 69 ++++++++++++++++++++++++++++++++++
  src/llama-context.cpp          | 11 ++++++
- 5 files changed, 105 insertions(+)
+ 5 files changed, 103 insertions(+)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index aab28b0ab..22df9d928 100644
+index ded4c81a5..46988501f 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -527,6 +527,9 @@ extern "C" {
+@@ -533,6 +533,9 @@ extern "C" {
      GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
      GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
      GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
@@ -43,10 +43,10 @@ index aab28b0ab..22df9d928 100644
      // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
      // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 37cefb222..916d7018b 100644
+index 84896dc2f..adc0031c8 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -1148,10 +1148,23 @@ void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc) {
+@@ -1145,10 +1145,23 @@ void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc) {
      if (galloc == NULL || galloc->buffers == NULL) {
          return;
      }
@@ -71,22 +71,13 @@ index 37cefb222..916d7018b 100644
              if (galloc->buffers[j] == galloc->buffers[i]) {
                  galloc->buffers[j] = NULL;
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 139d6d5e0..74188afe5 100644
+index b8235bbba..ad8ab3f95 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -3196,6 +3196,8 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
-     delete backend;
- }
- 
-+static void ggml_backend_meta_synchronize(ggml_backend_t backend);
-+
- static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-     GGML_ASSERT(ggml_is_contiguous(tensor));
-@@ -3323,6 +3325,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
-             return;
+@@ -3383,6 +3383,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+             }
+             backend_ctx->seg_upload_async_pending = false;
          }
- 
 +        // synchronous splice on another stream: callers order this write in-stream (scheduler async inputs), so drain
 +        // the device streams first or the copy could overwrite data a queued kernel still reads
 +        // (compute buffers only: a weight upload at load time has no queued readers, and draining there would
@@ -98,10 +89,10 @@ index 139d6d5e0..74188afe5 100644
          return;
      }
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 8d7a171b8..8fcf2e4bb 100644
+index 5c6677e6c..a28fb94c2 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1629,6 +1629,10 @@ struct ggml_backend_sched {
+@@ -1637,6 +1637,10 @@ struct ggml_backend_sched {
  
      // inputs of the next split read from the backend of the current split before it computes, see ggml_backend_sched_prefetch_inputs
      ggml_backend_event_t prefetch_events[GGML_SCHED_MAX_BACKENDS]; // created on first use, NULL if the backend has no events
@@ -112,7 +103,7 @@ index 8d7a171b8..8fcf2e4bb 100644
      bool                 prefetch_tried [GGML_SCHED_MAX_BACKENDS];
      struct ggml_tensor * prefetched[GGML_SCHED_MAX_SPLIT_INPUTS];
      int n_prefetched;
-@@ -3385,6 +3389,41 @@ static bool sched_input_stage(ggml_backend_sched_t sched, int b, ggml_backend_t
+@@ -3398,6 +3402,41 @@ static bool sched_input_stage(ggml_backend_sched_t sched, int b, ggml_backend_t
      return true;
  }
  
@@ -154,7 +145,7 @@ index 8d7a171b8..8fcf2e4bb 100644
  static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
      const int split_backend_id = split->backend_id;
      ggml_backend_t split_backend = sched->backends[split_backend_id];
-@@ -3413,6 +3452,32 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3426,6 +3465,32 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
          if (sched_input_stage(sched, split_backend_id, split_backend, input, input_cpy)) {
              return;
          }
@@ -187,7 +178,7 @@ index 8d7a171b8..8fcf2e4bb 100644
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched_event_get(sched, split_backend_id));
          } else {
-@@ -4161,6 +4226,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -4184,6 +4249,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
              ggml_backend_event_free(sched->events[b][c]);
          }
          ggml_backend_event_free(sched->prefetch_events[b]);
@@ -195,7 +186,7 @@ index 8d7a171b8..8fcf2e4bb 100644
          for (int e = 0; e < GGML_SCHED_COPY_EVENTS; e++) {
              ggml_backend_event_free(sched->copy_events[b][e]);
          }
-@@ -4252,6 +4318,8 @@ void ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched) {
+@@ -4277,6 +4343,8 @@ void ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched) {
  
  bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      GGML_ASSERT(sched);
@@ -204,7 +195,7 @@ index 8d7a171b8..8fcf2e4bb 100644
      GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
      GGML_ASSERT(!sched->is_alloc);
  
-@@ -4297,6 +4365,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+@@ -4322,6 +4390,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      for (int i = 0; i < sched->n_backends; i++) {
          ggml_backend_synchronize(sched->backends[i]);
@@ -213,10 +204,10 @@ index 8d7a171b8..8fcf2e4bb 100644
          // the rings keeps them from synchronizing on the host at every wrap in a long prefill.
          sched->copy_event_next[i] = 0;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 4014d5a59..8cd396d77 100644
+index 68ada5263..76def8da3 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -855,6 +855,15 @@ llama_context::llama_context(
+@@ -850,6 +850,15 @@ llama_context::llama_context(
                  // use the host buffer of the first device CPU for faster transfer of the intermediate state
                  const auto & dev = model.devices[0];
                  auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
@@ -232,7 +223,7 @@ index 4014d5a59..8cd396d77 100644
                  if (host_buft) {
                      buft = host_buft;
                  }
-@@ -2984,6 +2993,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3128,6 +3137,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          if (cparams.pipeline_parallel) {
              ggml_backend_sched_synchronize(sched.get());
          }

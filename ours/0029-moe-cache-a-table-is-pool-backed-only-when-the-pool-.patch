@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 04:20:06 +0000
-Subject: [PATCH 29/38] moe cache: a table is pool-backed only when the pool
+Subject: [PATCH 29/42] moe cache: a table is pool-backed only when the pool
  was requested
 
 moe_cache_table_is_pool now also requires g_pool_requested, as
@@ -19,10 +19,10 @@ Production model: KLD 0 vs the r261 candidate, server hashes unchanged
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 393206625..cd4db68ef 100644
+index dcefb6789..81e5c092b 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -8526,7 +8526,12 @@ bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device) {
+@@ -8554,7 +8554,12 @@ bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device) {
      std::lock_guard<std::mutex> lock(g_mutex);
      for (const table_t & t : g_tables) {
          if (t.device == device && t.host == (const void *) weight->data) {

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 07:02:17 +0000
-Subject: [PATCH 38/38] hc-mix: Q8_0 mixer path - persistent down counters,
+Subject: [PATCH 37/42] hc-mix: Q8_0 mixer path - persistent down counters,
  planar output, Q8_1 epilogue, combine+norm fusion
 
 Fewer launches per hc site for models whose hc weights are Q8_0/F32 (unsloth
@@ -23,10 +23,10 @@ UD quants), bit-identical to the current Q8_0 path, BF16 path unchanged:
  5 files changed, 198 insertions(+), 21 deletions(-)
 
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 91a1fbde6..eb2a4db6d 100644
+index 2a68f252d..72e823847 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -12735,7 +12735,7 @@ void ggml_compute_forward_lightning_indexer(
+@@ -12669,7 +12669,7 @@ void ggml_compute_forward_lightning_indexer(
  static void ggml_compute_forward_hc_mix_f32(
          const ggml_compute_params * params,
          ggml_tensor * dst) {
@@ -36,10 +36,10 @@ index 91a1fbde6..eb2a4db6d 100644
      const ggml_tensor * x         = dst->src[0];
      const ggml_tensor * w_norm    = dst->src[1];
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 27407419f..3ba3ebdc8 100644
+index 834402ad9..917063612 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1852,6 +1852,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+@@ -1725,6 +1725,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
  bool ggml_cuda_fusion_disabled();
  
  #define GGML_CUDA_HC_Q8_CNT 1024
@@ -47,7 +47,7 @@ index 27407419f..3ba3ebdc8 100644
  #define GGML_CUDA_MOE_GLU_Q8_CNT 4096
  #define GGML_CUDA_MOE_RED_CNT 4096
  
-@@ -1993,6 +1994,9 @@ struct ggml_backend_cuda_context {
+@@ -1826,6 +1827,9 @@ struct ggml_backend_cuda_context {
      // hc_mix_bf16_up_collapse2 Q8_1 epilogue: per-group row counters, one slice per stream (zeroed once, the
      // kernel resets every counter it completes)
      int * hc_q8_cnt = nullptr;
@@ -57,7 +57,7 @@ index 27407419f..3ba3ebdc8 100644
      int * moe_glu_q8_cnt = nullptr;
      int * moe_red_cnt = nullptr;
      // MoE down + weighted reduction fold (ggml_cuda_mwr_fold_mark): armed at the down MUL_MAT_ID for its mmvq launch, which
-@@ -2035,6 +2039,15 @@ struct ggml_backend_cuda_context {
+@@ -1868,6 +1872,15 @@ struct ggml_backend_cuda_context {
          return hc_q8_cnt + curr_stream_no*GGML_CUDA_HC_Q8_CNT;
      }
  
@@ -74,10 +74,10 @@ index 27407419f..3ba3ebdc8 100644
      // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
      // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 8a23ad11e..114a70c52 100644
+index 08e3d236d..afb4d8b13 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1482,6 +1482,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -1648,6 +1648,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      if (hc_q8_cnt != nullptr) {
          CUDA_CHECK(cudaFree(hc_q8_cnt));
      }
@@ -406,7 +406,7 @@ index 4a615ee7c..265797f05 100644
  
  void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 20e78c50e..d77dadb35 100644
+index 67387c22e..6e5b9b753 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -871,7 +871,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(

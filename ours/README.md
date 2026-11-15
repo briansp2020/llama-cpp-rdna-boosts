@@ -3,7 +3,7 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v17-a691b2345-r277` (upstream llama.cpp `a691b2345` + this repo's release).
+**Base:** `v18-4f9dfa0e3-r287` (upstream llama.cpp `4f9dfa0e3` + this repo's release).
 The rest of this branch is that release as published; only `ours/` is added.
 
 **New layout (2026-11-08).** Up to r228 this was a 55-patch series (0000-0054) that replaced the release's
@@ -16,20 +16,23 @@ The old series is kept as the tag `ours-r228-series`; the mapping table below sh
 **Apply:**
 
 ```
-git checkout a691b2345
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r277 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 38 patches (0001-0038)
+git checkout 4f9dfa0e3
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r287 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 42 patches (0001-0042)
 ```
 
-Result: tree `86830ddea600`. This is the production build from 2026-11-14 (2 GPUs, `-sm tensor`).
+Result: tree `9508a54d274f`. This is the candidate production build from 2026-11-14 (2 GPUs, `-sm tensor`).
 
 ## Patches
 
 The release has taken the r251 series' 0018 (DeepSeek-V4 cache size probes) and 0021 (DeepSeek-V4.1 kq-mask probe, issue
 #300, fixed in r254); they are dropped here. Earlier releases took the r236 series' 0009, 0011, 0014-0015, 0017 and 0018.
-r272 took our copy-engine all-reduce single exchange (PR #304, r265 0012); it is dropped here. The numbers below are the
-r277 series: the r273 series rebased (one conflict, in 0003: r277's batched arena seed, which only runs with a GTT arena;
-kept his batched structure with our serial arm for sparse tables), plus 0037-0038.
+r272 took our copy-engine all-reduce single exchange (PR #304, r265 0012); it is dropped here. r279 fixed the
+`-sm tensor --load-mode none` load race (issue #308, `GGML_META_SEG_DRAIN`), so our drain (r277 0037) is dropped too.
+The numbers below are the r287 series: the r277 series rebased onto r283 (r278 moved the upstream base to `4f9dfa0e3`;
+conflicts in 0001, 0013, 0016 and 0022, all mechanical) and then onto r287 (one conflict, in 0001: r287's mixed K/V
+`type_V` and our q8_0 tile dequant `c_perm` both kept; the q8_0/q8_0 path is unchanged, mixed types run r287's code),
+plus 0038-0042.
 
 | | what | env switch (off) |
 |---|---|---|
@@ -69,13 +72,34 @@ kept his batched structure with our serial arm for sparse tables), plus 0037-003
 | 0034 | KV segment: small prefill ubatches (decode band < n < 512) read non-resident experts from their KV copies | `GGML_MOE_KV_SEG_PF=0` |
 | 0035 | KV segment: review fixes (source counters, the hint returns to 0 when idle) | - |
 | 0036 | KV segment: 0034 on by default with the segment | `GGML_MOE_KV_SEG_PF=0` |
-| 0037 | meta: drain the device streams before the synchronous splice after a segmented async write to a weight buffer (fixes the random per-load weights under `-sm tensor --load-mode none`, issue #308) | `GGML_META_SEG_LOAD_DRAIN=0` |
-| 0038 | hc mixer: Q8_0 path (models whose hyper-connection weights are Q8_0, e.g. unsloth UD-IQ4_XS): persistent down-done counters, planar mixer output, Q8_1 epilogue in collapse+inject, combine+RMS-norm+gamma fused; bit-identical, BF16 kernels byte-identical | `GGML_CUDA_HC_DONE_PERSIST=0`, `LLAMA_HC_MIX_PLANAR_Q8=0`, `GGML_CUDA_HC_Q8_EPI=0`, `GGML_CUDA_FUSE_HC_COMBINE_MIX_Q8=0` |
+| 0037 | hc mixer: Q8_0 path (models whose hyper-connection weights are Q8_0, e.g. unsloth UD-IQ4_XS): persistent down-done counters, planar mixer output, Q8_1 epilogue in collapse+inject, combine+RMS-norm+gamma fused; bit-identical, BF16 kernels byte-identical | `GGML_CUDA_HC_DONE_PERSIST=0`, `LLAMA_HC_MIX_PLANAR_Q8=0`, `GGML_CUDA_HC_Q8_EPI=0`, `GGML_CUDA_FUSE_HC_COMBINE_MIX_Q8=0` |
+| 0038 | loader: open the MoE heat map in `--host-experts mmap` mode (the map was never loaded or saved there: the only opener ran after mmap mode had returned) | `LLAMA_MMAP_HEAT_OPEN=0` |
+| 0039 | expert cache: the persisted-heat seed of a sparse (mmap) table fills through the tier code (it used a pageable copy from the mapping; a warm start took more than 15 min) | - |
+| 0040 | expert cache: a sparse table's staged fill at sizing takes the heat map's hottest experts; the per-expert heat seed leaves sparse tables to it | `GGML_MOE_STAGE_HEAT_RANK=0` |
+| 0041 | hc mixer: the Q8_0 up band kernel loads its weights before the prologue barrier (compile-time blocks per row, 3 items per thread); bit-identical | `GGML_CUDA_HC_UP_PRELOAD=0` |
+| 0042 | hc mixer: Q8_0 up dots and collapse in one launch (each block replays the 8 up blocks of its 32 columns and collapses them, Q8_1 epilogue included); the F32 inject rows move to the front of the down-dots grid; bit-identical | `GGML_CUDA_HC_UP_FUSE=0`, `GGML_CUDA_HC_INJECT_DOWN=0` |
 
 0005, 0006 (down-fold part) and 0009 were workarounds for the bug the release's fusion overlap check fixes at the source;
 0010 removes 0005. The others only run after a decline or a failed fill.
 
 Production also sets `MOE_HOST_POOL_TRANSPORT=map` (pins the host-read transport the r262 adaptive mode would otherwise pick).
+
+## Validation on r283 and r287 (2026-11-14, Radeon AI PRO R9700 x 2, ROCm 10.1)
+
+All on the production configuration (unsloth `Qwen3.8-Flash-Next-UD-IQ4_XS`, `--n-cpu-moe 48`, expert-Q4_K MTP head,
+2-GPU tensor, `-ub 4096`, `--host-experts mmap`, `GGML_MOE_KV_LEND=1 GGML_MOE_KV_SEG=1`).
+
+- r277 series on r283 (0001-0037): outputs identical to the r277 series (greedy, prompt-set, mid-length prompts, depth
+  texts, 259.6k needle), byte checks (`GGML_MOE_VERIFY`) 0 differences, speed equal; 6 of 6 loads clean under
+  `-sm tensor --load-mode none` with the async arm on (r279's fix).
+- 0038-0040, warm start from a saved heat map: ready in 26 s (cold 29 s; the first version of 0039 hung for more than
+  15 min), all hashes identical to the cold start, byte checks 0 differences.
+- 0041: up kernel 20.9 -> 18.4 us per call. 0042: per 4-token hc site 36.1 -> 31.9 us (hc kernels -11.6 % per call,
+  about 1.7 % of GPU busy time). Both with their switches on and off: greedy, prompt-set, mid-length and depth hashes
+  identical.
+- r287 (0001-0042, tree above): outputs identical to the same series on r283 (all hashes above, 259.6k needle
+  correct), byte checks 0 differences, 6 of 6 loads clean; 31.5k prefill 3447-3470 t/s, greedy decode 117-125 t/s.
+- Not yet: the nightly comparison and stress on this tree.
 
 ## Validation on r277 (2026-11-13 and 2026-11-14, Radeon AI PRO R9700 x 2, ROCm 10.1)
 

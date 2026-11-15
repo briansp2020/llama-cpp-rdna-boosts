@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 18:45:18 +0000
-Subject: [PATCH 22/38] qwen4exp seqpar prototype: token-split hyper-connection
+Subject: [PATCH 22/42] qwen4exp seqpar prototype: token-split hyper-connection
  work in 2-GPU -sm tensor prefill (LLAMA_SEQPAR=1, default off)
 
 New op GGML_OP_TOKEN_SCATTER (ggml_token_scatter): on a single backend a copy; on the meta backend its
@@ -28,10 +28,10 @@ Off: graph unchanged.
  8 files changed, 720 insertions(+), 47 deletions(-)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 122ba06b0..0e197525d 100644
+index 7c1749fb2..1ae474887 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -369,6 +369,15 @@ extern "C" {
+@@ -375,6 +375,15 @@ extern "C" {
  
      typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
      typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
@@ -48,10 +48,10 @@ index 122ba06b0..0e197525d 100644
      // Split buffer type for tensor parallelism (old)
      typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 5822e523c..35bf3d086 100644
+index 9c7daf95c..013c9e41e 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -614,6 +614,7 @@ extern "C" {
+@@ -437,6 +437,7 @@ extern "C" {
          GGML_OP_GLU,
  
          GGML_OP_ALL_GATHER,
@@ -59,7 +59,7 @@ index 5822e523c..35bf3d086 100644
  
          GGML_OP_COUNT,
      };
-@@ -933,6 +934,19 @@ extern "C" {
+@@ -752,6 +753,19 @@ extern "C" {
              struct ggml_context * ctx,
              struct ggml_tensor  * a);
  
@@ -80,7 +80,7 @@ index 5822e523c..35bf3d086 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * a,
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index a07fb5b88..1e3cee98a 100644
+index e6d3cf1b2..0e02bd845 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1670,6 +1670,47 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -157,7 +157,7 @@ index a07fb5b88..1e3cee98a 100644
          ggml_backend_meta_split_state split_state;
          switch (tensor->op) {
              case GGML_OP_NONE: {
-@@ -1939,9 +1999,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1936,9 +1996,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_LIGHTNING_INDEXER: {
                  split_state = handle_lightning_indexer(src_ss);
              } break;
@@ -171,7 +171,7 @@ index a07fb5b88..1e3cee98a 100644
              case GGML_OP_TOP_K_MASK: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
-@@ -2281,6 +2343,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+@@ -2278,6 +2340,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
          }
          t_ij->flags = tensor->flags;
          memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
@@ -187,7 +187,7 @@ index a07fb5b88..1e3cee98a 100644
          ggml_set_name(t_ij, tensor->name);
          t_ij->buffer = simple_buf;
          t_ij->view_src = tensor->view_src;
-@@ -3172,6 +3243,13 @@ struct ggml_backend_meta_context {
+@@ -3180,6 +3251,13 @@ struct ggml_backend_meta_context {
  
      void *                               comm_ctx       = nullptr;
      ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -201,7 +201,7 @@ index a07fb5b88..1e3cee98a 100644
  
      ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
          const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
-@@ -3225,6 +3303,12 @@ struct ggml_backend_meta_context {
+@@ -3233,6 +3311,12 @@ struct ggml_backend_meta_context {
                  ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                      ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
              GGML_ASSERT(comm_allreduce != nullptr);
@@ -214,7 +214,7 @@ index a07fb5b88..1e3cee98a 100644
          }
      }
  
-@@ -4062,6 +4146,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -4120,6 +4204,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  
              int i_start = 0;
              std::vector<int> gather_nodes_new;
@@ -224,7 +224,7 @@ index a07fb5b88..1e3cee98a 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
                  if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-@@ -4102,16 +4189,60 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -4160,16 +4247,60 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  
                  i = i_delayed;
  
@@ -286,7 +286,7 @@ index a07fb5b88..1e3cee98a 100644
          }
  
          backend_ctx->uid         = cgraph->uid;
-@@ -4174,9 +4305,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -4232,9 +4363,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  cgraph_ij->n_nodes = 0;
                  ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                  for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
@@ -299,7 +299,7 @@ index a07fb5b88..1e3cee98a 100644
                          continue;
                      }
                      ggml_tensor * node_ij = bcj.nodes[i_node];
-@@ -4369,6 +4501,86 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -4427,6 +4559,86 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      };
  
  
@@ -386,7 +386,7 @@ index a07fb5b88..1e3cee98a 100644
      // The ALL_GATHER collective: every device ends up holding the WHOLE input tensor.
      //
      // On a Meta device an op that reduces along an axis-0 split (the DFlash2 selector's `ggml_top_k`
-@@ -4380,7 +4592,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -4438,7 +4650,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      // vocabulary index produced by one device meaningful on the others.
      //
      // Only a plain axis-0 split (one segment, no repeats: each device holds a contiguous run of rows) is
@@ -396,7 +396,7 @@ index a07fb5b88..1e3cee98a 100644
      auto all_gather = [&](const int i_node) -> ggml_status {
          ggml_tensor * node = cgraph->nodes[i_node];
          ggml_tensor * src  = node->src[0];
-@@ -4397,6 +4610,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -4455,6 +4668,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  
          const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ false);
          const bool split = ss.axis >= 0 && ss.axis < GGML_MAX_DIMS;
@@ -406,7 +406,7 @@ index a07fb5b88..1e3cee98a 100644
          if (split) {
              GGML_ASSERT(ss.axis == GGML_BACKEND_SPLIT_AXIS_0);
              GGML_ASSERT(ss.n_segments == 1 && ss.nr[0] == 1);
-@@ -4465,6 +4681,48 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -4523,6 +4739,48 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
          return GGML_STATUS_SUCCESS;
      };
  
@@ -455,7 +455,7 @@ index a07fb5b88..1e3cee98a 100644
      for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
          for (size_t j = 0; j < n_backends; j++) {
              auto & bcj = backend_ctx->backend_configs[j];
-@@ -4482,6 +4740,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -4540,6 +4798,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              continue;
          }
  
@@ -471,10 +471,10 @@ index a07fb5b88..1e3cee98a 100644
              bool backend_allreduce_success = false;
              if (backend_ctx->comm_ctx) {
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 05998a0f2..9c310e048 100644
+index 6482ff633..9fc532d75 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2086,6 +2086,20 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2074,6 +2074,20 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                  // single backend: the result is a plain copy of the input
                  ggml_compute_forward_dup(params, tensor);
              } break;
@@ -495,7 +495,7 @@ index 05998a0f2..9c310e048 100644
          case GGML_OP_GLU:
              {
                  ggml_compute_forward_glu(params, tensor);
-@@ -2323,6 +2337,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2311,6 +2325,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
      }
  
      switch (node->op) {
@@ -507,10 +507,10 @@ index 05998a0f2..9c310e048 100644
          case GGML_OP_DUP:
          case GGML_OP_CONT:
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 6ba131944..4dbc47cb7 100644
+index 32f42424f..d66670b06 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4044,42 +4044,11 @@ static bool ggml_cuda_ar_ce_single() {
+@@ -4488,42 +4488,11 @@ static bool ggml_cuda_ar_ce_single() {
      return on;
  }
  
@@ -557,7 +557,7 @@ index 6ba131944..4dbc47cb7 100644
      if (comm_ctx->ce_bytes < need) {
          // Optional scratch budget (`GGML_CUDA_AR_CE_SCRATCH_MIB`; 0 = unlimited, the default): an
          // oversized prefill degrades to the internal pipeline instead of eating the slab reserve.  CE is
-@@ -4147,6 +4116,48 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -4591,6 +4560,48 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
          }
          comm_ctx->ce_bytes = need;
      }
@@ -606,7 +606,7 @@ index 6ba131944..4dbc47cb7 100644
  
      to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
      to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-@@ -4439,6 +4450,196 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -4883,6 +4894,196 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
      return true;
  }
  
@@ -803,7 +803,7 @@ index 6ba131944..4dbc47cb7 100644
  static bool ggml_backend_cuda_comm_init_ce(ggml_backend_cuda_comm_context * ret) {
      const size_t nb = ret->backends.size();
      if (nb < 2) {
-@@ -6824,6 +7025,17 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -7297,6 +7498,17 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
              // single backend: the collective degenerates to a copy of the input
              ggml_cuda_dup(ctx, dst);
              break;
@@ -821,7 +821,7 @@ index 6ba131944..4dbc47cb7 100644
          case GGML_OP_CPY:
              ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
              break;
-@@ -10356,6 +10568,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -10888,6 +11100,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                  return true;
          case GGML_OP_ALL_GATHER:
                  return ggml_is_contiguous(op->src[0]);
@@ -830,7 +830,7 @@ index 6ba131944..4dbc47cb7 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -11271,6 +11485,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -11828,6 +12042,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
          return (void *)ggml_backend_cuda_comm_allreduce_tensor;
      }
@@ -844,34 +844,34 @@ index 6ba131944..4dbc47cb7 100644
      if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {
          return (void *)ggml_backend_cuda_comm_init_rank;
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index f80528261..1857d93df 100644
+index c41f0f360..1a478e373 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -1124,9 +1124,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1121,9 +1121,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "GLU",
  
      "ALL_GATHER",
 +    "TOKEN_SCATTER",
  };
  
--static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
-+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1249,9 +1250,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1243,9 +1244,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "glu(x)",
  
      "all_gather(x)",
 +    "token_scatter(x)",
  };
  
--static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
-+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -2121,6 +2123,26 @@ struct ggml_tensor * ggml_all_gather(
+@@ -2109,6 +2111,26 @@ struct ggml_tensor * ggml_all_gather(
      return result;
  }
  
@@ -899,10 +899,10 @@ index f80528261..1857d93df 100644
  
  static struct ggml_tensor * ggml_add_impl(
 diff --git a/src/models/models.h b/src/models/models.h
-index 51ba47aef..bcce17913 100644
+index 379a2f1dc..ec8a8cd58 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -2819,9 +2819,13 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2788,9 +2788,13 @@ struct llama_model_qwen4exp : public llama_model_base {
                      ggml_tensor * cur,
                              int   il);
  
@@ -918,7 +918,7 @@ index 51ba47aef..bcce17913 100644
          ggml_tensor * build_norm_gated(
                      ggml_tensor * input,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index bb1e75974..56e1302cb 100644
+index f6e12192b..6f503a941 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -127,6 +127,54 @@ static bool qwen4exp_qsa_off() {
@@ -1088,7 +1088,7 @@ index bb1e75974..56e1302cb 100644
      // The MTP head consumes the wide residual before the head mixer collapses it. Export the
      // combine result itself rather than a reshape of it: a pure view gets no backend
      // assignment from the scheduler, and the readback in llama_context looks one up. It is
-@@ -2890,7 +3002,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+@@ -2880,7 +2992,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
      return cur;
  }
  
@@ -1098,7 +1098,7 @@ index bb1e75974..56e1302cb 100644
      GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
  
      // The shared expert is mirrored under -sm tensor while the MoE output is a partial sum: expanding the shared
-@@ -2914,7 +3027,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -2904,7 +3017,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
      }
  
      ggml_tensor * moe_out =
@@ -1107,7 +1107,7 @@ index bb1e75974..56e1302cb 100644
              model.layers[il].ffn_gate_inp,
              model.layers[il].ffn_up_exps,
              model.layers[il].ffn_gate_exps,
-@@ -2930,6 +3043,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -2920,6 +3033,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
              model.layers[il].ffn_down_exps_s);
      cb(moe_out, "ffn_moe_out", il);
  

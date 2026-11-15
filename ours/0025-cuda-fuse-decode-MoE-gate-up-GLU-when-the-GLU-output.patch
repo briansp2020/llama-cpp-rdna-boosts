@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 22:34:06 +0000
-Subject: [PATCH 25/38] cuda: fuse decode MoE gate+up+GLU when the GLU output
+Subject: [PATCH 25/42] cuda: fuse decode MoE gate+up+GLU when the GLU output
  overlaps only the unfilled weight copy
 
 At decode the MoE expert cache takes the gate/up weight inputs over, so the
@@ -17,7 +17,7 @@ GGML_MOE_FUSE_COPY_ALIAS=0 disables it (default on).
  1 file changed, 55 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index f6c46047a..244abcf23 100644
+index a3ad074de..b1583732a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -2056,6 +2056,50 @@ static const ggml_tensor * ggml_cuda_get_mul_mat_id_scale(const ggml_tensor * re

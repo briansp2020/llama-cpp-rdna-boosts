@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 14 Nov 2026 15:57:29 +0000
+Subject: [PATCH 38/42] loader: open the MoE heat map in --host-experts mmap
+ mode (LLAMA_MMAP_HEAT_OPEN=0: off)
+
+The mmap mode returned from plan_host_expert_placement before the heat-map open, the only call site, so
+the persisted heat map was never loaded or saved with --host-experts mmap (last write by a run on Flash-Next:
+2026-11-08, the r235 layout).  Open it on every GPU device before that return; tables adopt the prior at
+registration and the session tallies are saved on the debounce and at exit.
+---
+ src/llama-model-loader.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 339ac9e92..46520c26f 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -194,7 +194,22 @@ bool llama_model_loader::host_expert_selected(const std::string & name, int laye
+ 
+ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+     // --host-experts mmap: no plan, every expert stays in the mapping (the cache registers what a GPU reads).
++    // The heat map is still opened here (the plan below opens it on its other paths), so the mmap tier's tables
++    // adopt the persisted prior at registration and the session's tallies are saved; without it the map was
++    // never read or written in mmap mode.  LLAMA_MMAP_HEAT_OPEN=0: the previous behaviour.
+     if (mmap_host_experts) {
++        static const bool heat_open = [] {
++            const char * e = getenv("LLAMA_MMAP_HEAT_OPEN");
++            return e == nullptr || atoi(e) != 0;
++        }();
++        if (heat_open && !files.empty()) {
++            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++                ggml_backend_dev_t d = ggml_backend_dev_get(i);
++                if (d != nullptr && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    ggml_backend_dev_moe_heat_open(d, files.front()->path().c_str());
++                }
++            }
++        }
+         return;
+     }
+     if (host_experts_plan_done) {
+-- 
+2.53.0
+

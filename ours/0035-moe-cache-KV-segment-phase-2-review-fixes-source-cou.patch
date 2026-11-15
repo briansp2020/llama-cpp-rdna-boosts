@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:16:22 +0000
-Subject: [PATCH 35/38] moe cache: KV segment phase 2 -- review fixes (source
+Subject: [PATCH 35/42] moe cache: KV segment phase 2 -- review fixes (source
  counters, idle hint)
 
 Three small fixes from the logic review of the two phase 2 commits.  None
@@ -157,10 +157,10 @@ index e67e89518..ac1f4f4b7 100644
              }
              if (g_pf_lends > 0 || g_pf_takes > 0) {
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index b2514a54c..ada91a05b 100644
+index 9563d74b1..f64faa103 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -3912,6 +3912,8 @@ private:
+@@ -3913,6 +3913,8 @@ private:
  
                  metrics_flush_idle();
  
@@ -169,7 +169,7 @@ index b2514a54c..ada91a05b 100644
                  return; // skip further processing
  
              } else {
-@@ -3971,8 +3973,10 @@ private:
+@@ -3972,8 +3974,10 @@ private:
              llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
          }
  

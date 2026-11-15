@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 02:48:30 +0000
-Subject: [PATCH 20/38] qwen4exp qsa3: the launcher packs straight from the
+Subject: [PATCH 20/42] qwen4exp qsa3: the launcher packs straight from the
  Q8_0 cache views, no F16 copies in the graph (LLAMA_QSA3_PACK_Q8)
 
 ---
@@ -139,10 +139,10 @@ index 93fc0641f..ca8d03d01 100644
      }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index ba41f8cd0..f80528261 100644
+index 09e63295a..c41f0f360 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -5861,9 +5861,13 @@ void ggml_flash_attn_qsa_set_packed(
+@@ -5683,9 +5683,13 @@ void ggml_flash_attn_qsa_set_packed(
      }
  
      const struct ggml_tensor * k = a->src[1];   // permuted [D, n_kv, n_head_kv]
@@ -160,7 +160,7 @@ index ba41f8cd0..f80528261 100644
      GGML_ASSERT(packed_keys->ne[0]   == k->ne[0] && packed_keys->ne[1]   == k->ne[2] && packed_keys->ne[2]   == k->ne[1] && packed_keys->ne[3]   == 1);
      GGML_ASSERT(packed_values->ne[0] == k->ne[0] && packed_values->ne[1] == k->ne[2] && packed_values->ne[2] == k->ne[1] && packed_values->ne[3] == 1);
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index fc3d3226d..bb1e75974 100644
+index 76057c919..f6e12192b 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -286,7 +286,8 @@ static bool qsa_derived_vis_supported(const llama_model & model, const llama_hpa
@@ -185,7 +185,7 @@ index fc3d3226d..bb1e75974 100644
  
      ggml_tensor * op = ggml_flash_attn_qsa(ctx, q, k, v, idx, msk, 1.0f, 0.0f, nullptr, nullptr);
      ggml_flash_attn_qsa_set_packed(op, pk, pv);
-@@ -2473,8 +2475,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2470,8 +2472,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          // backend probe: never materialise the F16 packs when the acting device's qsa3 predicate
          // will not read them (the runtime arch/env policy lives there; issue #59/#60).
          constexpr bool qsa3_pack = LLAMA_QSA3_ENABLE != 0;
@@ -203,7 +203,7 @@ index fc3d3226d..bb1e75974 100644
              // The launcher packs these into the block layouts itself (one fused pass, session 7);
              // the graph only materialises the natural contiguous F16 view [D, n_head_kv, n_kv].
              // LLAMA_QSA3_DIRECT_F16=0: the Q8_0 cache goes through the F32 intermediate again (A/B)
-@@ -2482,9 +2492,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2479,9 +2489,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
              ggml_backend_dev_t layer_dev = model.dev_layer(il);
              const bool direct_q8_0 = direct_env && layer_dev != nullptr &&
                  ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
