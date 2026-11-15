@@ -18,14 +18,18 @@ campaign records.
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **17-block V2.1 set** (block 00 + blocks 01-16) at fork point **`a691b2345`**
-(the 2026-10-25 re-base); read `.release` in `release.json` for the release id -- it is the source of
+**Current state:** the **18-block V2.1 set** (block 00 + blocks 01-17) at fork point **`4f9dfa0e3`**
+(the 2026-11-13 r278 re-base); read `.release` in `release.json` for the release id -- it is the source of
 truth, not this line.  Block 15 is the **streamed KV** (the resident window, the attendance pool and the MTP
-draft window -- all three opt-in, default off).  `release.json` is the source of truth for the
+draft window -- all three opt-in, default off).  Block 17 is the **mixed K/V cache types** (r287, PR #312; the one native pair, head 256 only).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
-The r236 re-base (`archive/work/upstream-rebase-261108/`, base `a691b2345`) is **cut**: its 17 blocks are climbed,
-every re-base-derived row is closed, and `patches/`/`release.json` carry the re-cut set
-(the base is unchanged since; the release id is `release.json.release`).
+The r278 re-base (`archive/work/upstream-rebase-261113/`, base `4f9dfa0e3`) is **cut and released into
+`patches/`**: its 17 blocks are replayed, both rung-repairs are squashed into their owning blocks, and the gates
+are recorded in `WORKLOG.md` 261113.015.  What it left open -- #322 (a stale `gate-server-arms` baseline), #323 (the
+prefill-logit base file name), #324 (both `optional/` artifacts stale), #325 (the APU-only gate set) and #326 (the
+loader's async-upload lifetime) -- closed at **r285** (`WORKLOG.md` 261114.006), which is why nothing about them is
+left in this file.  The r236 re-base
+(`archive/work/upstream-rebase-261108/`) is superseded and closed.
 
 ## The open list
 
@@ -34,12 +38,11 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
-| **319** | block 16's lock policy refuses a >RAM model on a clamp too small for one expert table | capability (block 16, the UMA tier) | **OPEN** (2026-11-13) — the refusal is the safe branch; relaxing it needs the band's own arms — §319 |
-| **320** | sizing the GTT store for a separate drafter's head | parked (block 16; a `common`/`--fit` term) | **PARKED** (maintainer, r263) — the target sizes the region before the drafter loads — §320 |
+| **327** | a table served in place loses the prefill MoE fusions, so residency selects the kernel set — teach the fusions the in-place contract | purity / architecture (blocks 06/08/09/12) | **OPEN** (2026-11-14) — the maintainer's chosen answer to `GREEDY-PURITY.md` §89; deferred, not urgent — §327 |
 
 ## Handle numbering
 
-**New handles append after `#320`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
+**New handles append after `#327`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
 that cites `TODO #74` still means the same subject after that item has closed and left this file.
 
 **Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
@@ -157,20 +160,79 @@ table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2
 
 **OPEN — found 2026-11-07 on `soar` while gating issue #281.**  `scripts/gate-host-pool.sh` is **36/37 on a clean r231 checkout** (`a19aab55e`) with this one check red: `pinlate` 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and two runs, a one-token divergence at ~31 of 32 greedy tokens.  **Narrowed, four arms, all byte-identical controls:** the cold in-place read is NOT the cause (`MOE_EXPERT_CACHE_COLD_UVA=0` in both arms still diverges); the compute path is NOT the cause (`fail`/`late` stand every table down — `get_ok=0 decline_all=4929` — and still match `ref`, so the fallback computes the same logits); the decode device remap is NOT the cause (`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the mixture itself (`pinlate`: `get_ok=552 decline_all=1711`, 119 rolled-back fills), i.e. a table serving some ops from the arena and others from the fallback inside one run.  `gate-host-pool.sh` now proves the fallback's byte-identity in the same run and reports this as a WARN instead of passing it blindly (a wholesale arm that diverges still FAILS).  **Next:** one instrumented run (the per-table `hits/misses/fills` line) to name the table whose op differs, and check the prefill-staging snapshot (`gprs_dev`/`prs_dev`) that is built before a rolled-back admission — the r219 class one layer deeper.  **MAGNITUDE MEASURED (2026-11-07, same session):** the delivery's own criterion on the gate's config (`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000, 99.9 % -0.000040 worst, Same top p 100.000 %** -- ~1e-5, two orders of magnitude inside the 0.005 tolerance. So the mixture is a *path* difference (a ~1e-5 arithmetic difference, most likely a different kernel instantiation for the ops that fall back), **not wrong bytes**: `MOE_HOST_POOL_VERIFY=1` reports 0 pool-read mismatches in the latched arm, and a demoted-slot drain-before-serve diagnostic changed nothing.  The byte-identical *text* assertion was therefore the wrong instrument for this arm (it is the right one for the wholesale arms, which remain bit-exact); the gate now uses it there and reports the mixture as a WARN.  Re-entry: a latched box whose *logits* move outside the tolerance, or one that produces a wrong answer rather than a different near-tie.  Record: `WORKLOG.md` 261107.* (`pinlate`), `benchmarks/` issue-#281 campaign; the gate's own `pinlate` arm.
 
-## 319. Block 16's lock policy refuses a >RAM model on a clamp too small for one expert table
+## 327. A table served in place loses the prefill MoE fusions, so residency selects the kernel set — teach the fusions the in-place contract
 
-**A clamp that covers the RAM shortfall but cannot fund one slot per expert table REFUSES the load** instead of running it: `plan_gtt_expert_store()` (`src/llama-model-loader.cpp`, the `extent > lockable` branch) takes the clamp only when `clamp_useful && honour >= shortfall && honour >= arena_min && gtt_store_can_stream` (`gtt_store_can_stream` is `-lme` given), and otherwise throws **before a byte is read**, printing weights / MemAvailable / shortfall / `RLIMIT_MEMLOCK` / what it could honour and the fix.  So the combination this item used to worry about — the arena declining while placement over-commits — is **not reachable**: the load refuses instead.
+**`MOE_EXPERT_PREFILL_IN_PLACE` (r258/r266) buys its prefill win by skipping the staged copy, and the three prefill
+MoE fusions are attached to that copy: so a table served in place runs the per-op chain instead.  Residency therefore
+selects the kernel set, and the two sets are not bit-identical in every configuration (measured r284), which makes a
+run's greedy text a function of the persisted heat prior.  The chosen fix is to give each fusion the in-place
+contract so residency stops mattering.**
 
-**What is still owed is whether the refusal is NECESSARY in that band.**  A store below one slot per table can place nothing, so every table keeps its layer's device buffer, and on an APU those bytes come out of the same DRAM the store wanted — which is why refusing is the honest answer today and why a relaxation must be measured, not argued.  The arms need a >RAM model on an APU (`Qwen3.5-122B-A10B Q8_0`, ~130 GiB against `halo`'s 123 GiB — the r266 arm already ran it at `-lme 90`) with `ulimit -l` set INSIDE the band `[shortfall, arena_min)`: one arm recording the refusal, one on a relaxed policy, and the coherence + prefill-logit gates on the relaxed arm.
+**Kind:** purity / architecture (blocks 06, 08, 09/12; `GREEDY-PURITY.md` §89).
 
-**Re-entry:** an operator who owns a clamp in that band, or a relaxation proposal with those arms attached.
-Record: `archive/work/apu-expert-gtt/README.md` §5 and §7 (`-lme` as the streaming opt-in), `WORKLOG.md` 261111.031, and the policy comments in `llama-model-loader.cpp`.
+**The coupling, from the code.**  Above the decode/verify band (`n_tok > MOE_EXPERT_CACHE_MAX_TOK` = one band,
+`n_used × 16`) `sched_stage_split` (`ggml/src/ggml-backend.cpp`) asks `iface.moe_cache_in_place` →
+`moe_cache_serves_in_place` (`t.identity && t.arena && t.slots >= n_experts`, i.e. a table at its FULL slot count)
+and, when it answers yes, **skips staging entirely**: the op is handed the raw routing ids and `MUL_MAT_ID` reads the
+table out of its own arena region by base-pointer swap.  There is no `input_cpy`, and the fusions that own the
+gate/up/down chain — MMB's fused GLU (`GGML_CUDA_MMB_GLU`), the fused MMQ `gate+up` pair, and the MMQ
+`swiglu→down` fold — match the *staged* contract, so they **stand down** for such a table and the per-op chain
+redirects.  Which tables are identity is a placement decision ranked by the `.moe-heatmap` prior.
 
-## 320. Sizing the GTT store for a separate drafter's head — PARKED
+**Measured consequence (r284, `benchmarks/2026-11-14-residency-reproducibility.md`).**  Flash-Next GSQ-IQ3_XXS + its
+MTP sidecar, 2 devices `-sm layer`, `-ncmoe 48 -c 32768`, 64 tokens, same build/seed: one prior state `7ca535e1da91`
+(×4), another `7a3474cbe5f1` (×4), `MOE_EXPERT_HEATMAP=load` `7ca535e1da91` (×6); `MOE_EXPERT_PREFILL_IN_PLACE=0`
+gives `7a3474cbe5f1` for **both** priors; `GGML_CUDA_MMB=0` changes the prior-absent arm's text and leaves the
+prior-set arm's alone (the proof the two arms run different kernel sets); `GGML_MOE_DEVREMAP=0` and
+`MOE_EXPERT_CACHE_IDENTITY_PREF=0` reproduce the default texts exactly (inert here).  The flip lands ~60 tokens into
+the generation: a near-tie under a ≲1e-6 difference, not a mis-read expert.  **The magnitude is unmeasured** -- see
+owed item 2.
 
-**The store's extent is decided by the TARGET's loader, before a drafter loads**, so a store sized to also hold the MTP head's expert tables would have to be a `common`/`--fit` term — a placement decision made once both models are known — not a loader change.  **Parked by the maintainer (r263):** no measurement is owed and nothing depends on it, because the head is pinned **outside** the `-lme` budget today (`plan_gtt_expert_store()`'s `head_cands`, r263), so the current shape is correct, just not budget-visible.  Record: `archive/work/apu-expert-gtt/README.md` §5.
+**The decision (maintainer, 2026-11-14).**  Three ways out were put up: (1) serve in place only when the whole
+ubatch can be, i.e. give up the arm's coverage; (2) teach the fusions the in-place contract; (3) declare the
+difference in-band.  **Chosen: (2)** -- residency must be **value-neutral**, and both the copy-skip (r258: prefill
+1489.6 -> 4033.9 t/s on the pinned tier; r266: +6.3 % prompt / +5 % decode on the APU 122B) and the fusions must
+apply regardless of what is resident.  Harder, and deliberately so.  **Deferred, not urgent:** the coupling is
+deterministic per cache state, every text gate now pins the cache state (`MOE_EXPERT_HEATMAP=load`, r284), and no
+default is at risk.  Note what the APU gate currently shows: `gate-uma-experts.sh`'s `inplace` arm reads the same
+text as every other arm on `halo` (`4f29f1e4a4d6`, 108 table calls in place, r285), so either the two chains agree
+in that geometry or that text has no near-tie -- it does not contradict the discrete 2-device differential.
 
----
+**What "teaching them" means, per fusion.**  The in-place contract offers `moe_cache_get_table()`'s identity fast
+path (`arena`, `n_slots`, `expert_bytes`, `remap_dev`, `n_used`, `n_tok`; identity ⇒ the raw ids need no remap) and
+the table's own arena region addressed by expert id -- but **no `input_cpy`**.  So each fusion needs (a) a second
+matcher for an arena-backed table instead of the staged one, (b) its own `src0` derivation (arena base + `expert *
+stride_expert`, keeping the SAME dot-product order and J tile as its staged twin, §69/§87), (c) the same epilogue
+arithmetic, and (d) the guard turned from "stand down" into "take the in-place arm".  Suggested order, by
+value/risk: **the MMQ `swiglu→down` fold** first (its epilogue is arithmetic on the gate/up result and the down
+matmul's `src0` simply becomes the arena table); **the fused MMQ `gate+up` pair** second (`GGML_PAIR_ROUTED_OFF` is
+its A/B and it is documented bit-identical to the triple, §69); **MMB's fused GLU last** -- MMB is a different GEMM
+(block 06) and it is the kernel the r284 differential shows being removed.
+
+**Owed before it ships.**
+1. **The acceptance test is the r284 differential, with the feature ON:** the same command on the same build must
+   give the same text for two *different* `.moe-heatmap` states (restore/copy the file before each run, or delete
+   it), 2/2 each way.  It belongs in a gate, not in a scratch harness -- the natural home is
+   `gate-uma-experts.sh`'s `inplace` arm on a config whose residency is forced partial, plus a discrete arm.
+2. **KLD across the two residency states must read `0.000000`.**  That is what value-neutral means; a nonzero
+   reading is the bug, not a tolerance question.  It is unmeasurable today: `llama-perplexity` cannot load a drafter
+   and the discrete partial-residency state needs one (r284: without `-md`, residency is 99.65 % and both priors
+   read 0.000000 / top-p 100 %).  So either `llama-perplexity` gains `-md`, or the arm forces partial residency
+   without a drafter (`MOE_EXPERT_CACHE_MIB=N` on a discrete box; `-lme 16` on the APU arm the gate already runs).
+3. **A `-lv 4` launch census** over the two residency states proving the same fusion fires in both (r284's evidence
+   for "different kernel sets" is the MMB switch differential, not a census).
+4. **The delivery's normal arm set for a fusion change:** coherence 1/2/3 devices, the MTP four-axis protocol,
+   `gate-prefill-logits.sh` on both residency states, `gate-host-pool.sh` (the discrete tier must stay inert), and
+   the per-block ladder for the blocks touched.
+
+**Where it lands.**  Blocks **06** (MMB), **08** (the old-08 fusions), **09/12** (the cache and scheduler contracts:
+`sched_stage_split`, `moe-expert-cache.{cu,h}`); blocks 15/16 untouched.  **No new environment variable** --
+`MOE_EXPERT_PREFILL_IN_PLACE` stays a kill switch, and the per-fusion bisect arms already exist
+(`GGML_CUDA_MMB_GLU`, `GGML_PAIR_ROUTED_OFF`, `GGML_CUDA_DISABLE_FUSION`).
+
+**Re-entry:** fold it into the next block 06/08 pass over these fusions, or sooner on a reported residency-dependent
+answer.  Record: [`benchmarks/2026-11-14-residency-reproducibility.md`](benchmarks/2026-11-14-residency-reproducibility.md),
+`GREEDY-PURITY.md` §89, `INVARIANTS.md` (r284), `ENVIRONMENT.md` (`MOE_EXPERT_PREFILL_IN_PLACE`, `MOE_EXPERT_HEATMAP`).
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
@@ -200,6 +262,40 @@ validate, when `decline_all`/`takeover=` already name it at `-lv 4`).
 need on its own merits (a legal cold source for a neither-tier expert — the `#273`/gather side of the same
 population).  Record: [`benchmarks/2026-11-12-eager-takeover-arena-bound.md`](benchmarks/2026-11-12-eager-takeover-arena-bound.md);
 `WORKLOG.md` 261112.010; `ENVIRONMENT.md` (`MOE_EXPERT_CACHE_MIB`); `INVARIANTS.md` r274.
+
+### #319 / #320 / #321 — the APU store's refusal band, the drafter's head budget, and "the MTP draft is not reproducible" (retired r284)
+
+**#319 (the lock policy's refusal).**  The band it named -- a clamp that covers the RAM shortfall but not one slot
+per expert table -- turns out to be **unreachable for any model more than one slot-set over RAM**, and the real
+tier minimum is `max(one slot per expert table, the cache's own floor)`; the loader tested the first alone, so a
+clamp in between let the arena decline and then reported *"the arena is unavailable on this device"*.  The loader
+now asks the backend for the floor (`ggml_backend_dev_gtt_store_arena_min`) and refuses with the number to raise;
+the four measured arms on `halo` (refusal at `-lme 1`, refusal under a 1 GiB clamp, and `-lme 3` **running**) are in
+`INVARIANTS.md` r284.  Refusing inside the band is **necessary**, and an operator whose clamp is below it has two
+documented escapes (raise `ulimit -l`, or `MOE_EXPERT_GTT_MLOCK=0`, which bypasses the lock policy so the arena is
+reclaimable rather than reserved).  Nothing is owed.
+
+**#320 (sizing the store for a separate drafter's head).**  Parked by the maintainer (r263) and **retired
+unimplemented**: the head is pinned *outside* the `-lme` budget on purpose, its bytes are metadata overhead read on
+every draft step, so a store sized to include it would trade that away; making it budget-visible is a `common`/
+`--fit` term with no measurement behind it and nothing depending on it.  No course of action, so no item.
+
+**#321 ("an MTP draft over 2 devices is not reproducible").**  The attribution was wrong: it is **not** the draft
+path and not a race.  A run's greedy text depends on the **expert cache's residency**, i.e. on the persisted
+`.moe-heatmap` prior: with the drafter model *loaded* (not used) on a 2-device `-sm layer` split, one prior state
+gives `7ca535e1da91` and another `7a3474cbe5f1`, each reproducible within its own state, and
+`MOE_EXPERT_PREFILL_IN_PLACE=0` collapses the two (the r258/r266 in-place arm serves a fully resident table from the
+arena and stands its fusions down, so residency selects the kernel set).  The consequence is a *comparison* rule, not
+a driver fix: a text comparison across processes pins the cache state, exactly as it pins
+`ROCBLAS_USE_HIPBLASLT=0`.  `scripts/gate-kv-residency.sh` now forces `MOE_EXPERT_HEATMAP=load` and its multi-device
+section is green on the same assertions (`b08d3dbcb1e9` x3, per-device counters intact).  **Still open on the record,
+and deliberately not an item:** the two arms are documented as reading the same bytes, so their *magnitude* is
+unmeasured (`llama-perplexity` cannot load a drafter, which is the state that produces the partial residency);
+re-entry is a prefill-logit arm that can, and a measurement above the 0.005 tolerance.  The chosen way to remove the
+coupling altogether (teach the prefill fusions the in-place contract, so residency stops selecting the kernel set)
+is **`TODO` #327**, deferred and not urgent.  Record:
+[`benchmarks/2026-11-14-residency-reproducibility.md`](benchmarks/2026-11-14-residency-reproducibility.md),
+`INVARIANTS.md` r284, `GREEDY-PURITY.md` §89.
 
 ### #300 — the attendance pool is NOT supported on a shared host/device pool (an APU) (retired r264)
 

@@ -14,9 +14,10 @@ pre-r100 narratives (`§§1-42`) **and** the verbatim pre-compression text of ev
 -- so they are never renumbered; a new finding appends and takes the next number, and an entry whose evidence
 is worth keeping moves it to that archive under its own number rather than growing the rulebook.
 
-> **Numbering.**  This document uses the **V2.1 block** numbering for new text (16 blocks, `00`-`15`; r109
+> **Numbering.**  This document uses the **V2.1 block** numbering for new text (18 blocks, `00`-`17`; r109
 > split the old block 10 into block 10 = infrastructure and block 11 = qwen4exp, and moved the campaign
-> remainder to block 12 and the MTP-vocab trim to block 13).  Entries written
+> remainder to block 12 and the MTP-vocab trim to block 13; block 16 is the UMA GTT expert store, block 17
+> the mixed K/V cache types).  Entries written
 > before 2026-10-13 use the **pre-V2.0 16-block** numbering ("block 10" = the k-quant/VDR umbrella, now
 > **block 07**; "block 13" = fused MoE/`mmvq`, now **block 08**; "block 14" = qwen4exp, now **block 11**;
 > "block 15" = the campaign remainder, now **block 12**).  §39/§40 appear twice in the original numbering;
@@ -155,7 +156,9 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§84** | a re-base owes a re-derivation of the **value** behind a renamed field, never a carry-over: `mmq_args.ncols_max` (count) -> `ntj` (J-tile count, consumed as `grid.x`) made the pair fusion's grid `ncols` instead of `ncols/J` (page fault at a large context, clean at a small one), and `tile_y_max_j` (max index) -> `tile_y_j_sup` (exclusive count) dropped a column per tile in the routed-compact kernel; the ids convention also moved the expert into `tile_spec` (`nchannels_y = 1`, `n_experts` in `nchannels_x`), which had silently turned that dispatch OFF since R09 and hidden the off-by-one behind it.  A re-based dispatch is proved by a census that it FIRES, and a fallback copy of upstream's dispatcher must be upstream's text verbatim (a merged copy re-enabled stale delivery duplicates, one of them not bit-identical in a state-carrying path) | doctrine + fix (r236, re-base R11) |
 | **§85** | a re-derived call into a new API owes the **node type** that API is valid for, and a positional call into an extended parameter list is a silent mis-assignment: the fused `GGML_OP_INDEXER_SCORE` kernel took `ggml_rope_get_truncate(dst)` after `#30206` added an op-type assert (every sparse QSA decode arm aborted since R12, and no gate ran that arm), and `llama_kv_cache`'s ctor gained `is_indexer` **before** `v_enabled`, so the delivery's positional hybrid call put `kv_pool` into `v_enabled` — no V tensor, `cpy_v` null-deref, every GDN model segfaulted at load.  Name the arguments, audit every call site of the symbol, and give each re-derived fused kernel an arm that REACHES it | doctrine + fix (r236, re-base R16) |
 | **§86** | an optimization may not change which kernel **variant** an op takes: "does this op have a mask" is ONE predicate asked by the chooser, the MMA `ncols2` dispatch, the RDNA band predicate and the tile `ncols2` dispatch, never a launcher-side `src[x] != nullptr` copy — after #29510 took `src[5]` for `kv_rows` and moved the derived form to `src[6..8]`, the two copies read `nullptr` on a derived op and took `ncols2 = 1` where the packed form took 4/8, on every layout whose chooser picks the TILE kernel (RDNA3_5/RDNA3_0 heads above their WMMA cap, RDNA2, `GGML_CUDA_FA_WMMA_256=0`); the band site is inert by construction (derived implies `n_tokens > 8`, the band requires `<= 8`) and is carried so the sites cannot drift.  The arm must reach the code: the op suite's only derived tile case has an unaligned `n_kv` and saw nothing (6978/6978 either way), so the aligned head-512 derived case + a forced-tile suite run are part of the fix | doctrine + fix (r268, contributor PR #303) |
-| **§87** | a residency tier's fill **issue ORDER** and its fill **SET** are different things, and only the set is part of the answer: the slot an expert lands in is arbitrary (`pool_fill_empty_locked` takes the first free slot, `apply_heat_seed_locked` fills `0..k`), so a fill may be re-ordered for the file's benefit with no change to any expert byte — but the *set* is policy and may not move, and any mechanism that makes a **covering** tier incomplete (a lazy seed, a lazier prewarm) silently costs the sync-free decode remap rather than a few bytes.  Two orders of the same ranked set measured on the bounded pool: 12 546 ms against 7 774 ms for 42.7 GiB (3.67 -> 6.25 GB/s), text byte-identical both ways | doctrine + fix (r270, `TODO` #318; `benchmarks/2026-11-12-expert-seed-policy.md`) |
+| **§87** | a residency tier's fill **issue ORDER** and its fill **SET** are different things, and only the set is part of the answer: the slot an expert lands in is arbitrary (`pool_fill_empty_locked` takes the first free slot, `apply_heat_seed_locked` fills `0..k`), so a fill may be re-ordered for the file's benefit with no change to any expert byte — but the *set* is policy and may not move, and any mechanism that makes a **covering** tier incomplete (a lazy seed, a lazier prewarm) silently costs the sync-free decode remap rather than a few bytes.  Two orders of the same ranked set measured on the bounded pool: 12 546 ms against 7 774 ms for 42.7 GiB (3.67 -> 6.25 GB/s), text byte-identical both ways | doctrine + fix (r270, `TODO` #318; `benchmarks/2026-11-12-expert-seed-policy.md`) || **§89** | **the expert cache's residency state is an INPUT to greedy text**, so every text comparison across processes must pin it: with the drafter model loaded on a 2-device `-sm layer` split (Flash-Next GSQ-IQ3_XXS + its `mtp-...-shared` sidecar, `-ncmoe 48`, `-c 32768`, 64 tokens), one `<model>.moe-heatmap` state yields `7ca535e1da91` and another `7a3474cbe5f1`, each reproducible within its own state (2/2 + 2/2, and 6/6 frozen), and `MOE_EXPERT_HEATMAP=load` freezes it.  The prior is documented as a *placement* prior whose output is bit-identical; residency does move which **kernel set** serves a MoE op (a fully resident table is served in place and its prefill fusions stand down -- `MOE_EXPERT_PREFILL_IN_PLACE`, r258/r266), and the two sets are not bit-identical here: `MOE_EXPERT_PREFILL_IN_PLACE=0` collapses the two priors to one text while `GGML_MOE_DEVREMAP=0`, `MOE_EXPERT_CACHE_IDENTITY_PREF=0` and `GGML_CUDA_MMB=0` do not.  The flip lands ~60 tokens into the generation (a near-tie), not at the first token.  So: `scripts/gate-kv-residency.sh` (and any fresh-process text arm) forces `MOE_EXPERT_HEATMAP=load`, which took the multi-device pool section from three texts in three arms to `b08d3dbcb1e9` ×3 without weakening an assertion; **the magnitude is unmeasured** (`llama-perplexity` cannot load a drafter, and without one both priors read KLD 0.000000 / same-top-p 100 % at 74->99.65 % residency) | doctrine + finding (r284, `TODO` #321 retired; `benchmarks/2026-11-14-residency-reproducibility.md`).  The fix that removes the coupling -- giving the three prefill MoE fusions the in-place contract so residency stops selecting the kernel set -- is `TODO` #327 (deferred, not urgent) |
+| **§90** | a mixed K/V pair is a new kernel family, and the tile instantiation, the F16-scratch allocator and the RDNA4 band must read **one** V-type function, or a native read and a staged scratch disagree: block 17 gives `flash_attn_tile` a second type parameter (`type_V`) and instantiates head 256 only (K `q8_0` with V `q4_0` / `q5_0` / `q5_1`), and `ggml_cuda_fattn_tile_type_V()` is the function the launcher's `need_f16_V`, `ggml_cuda_flash_attn_ext_get_alloc_size` and the tile dispatch all ask, so a pair cannot be read natively while its F16 scratch is still reserved (the three earlier drifts: the missing q4_0 arm, the mixed-K/V NaNs that read raw q4_0 as F16, the missing RDNA2 bf16 scratch).  The pair is reachable only through two different `--cache-type-*` values; same-type caches are bit-identical, and `GGML_CUDA_FA_KV_MIXED=0` restores the staged path (11-12 % behind at 32768 cells, 25 % at 100000 on a 2-GPU tensor split).  A new pair owes the whole W=1..8 sweep, and the RDNA4 band and the tile are different families: gate **both** (`GGML_HIP_FA_BAND_WMMA=0` / `GGML_CUDA_FA_WMMA_256=0` for the tile) | doctrine + fix (r287, block 17, PR #312; `scripts/gate-mixed-kv.sh`; `WORKLOG.md` r287) |
+
 ---
 
 **How to read an entry.**  Every `§` has a row above.  `doctrine` = read before shipping · `current` = live
@@ -216,10 +219,27 @@ one deliberate:
   keeping the guarantee would mean giving up WMMA for 9..N-token batches.  There is **no corruption** in
   1..15 (deterministic recurrent-state sweep).
 
+**The last pure width is 8 rows, and the notice threshold is exact, not conservative (r283).**  There is no
+"the batcher corrects the offending row" margin to spend: every row of a verify batch is sampled by the
+target (`common_sampler_sample_and_accept_n()` walks `idxs[0..draft.size()]`, one `common_sampler_sample()`
+per row, and the token at the first mismatch **is** the row's token, emitted as-is).  So a flip at any row
+changes the text, and the first width that can flip is the first width on the other kernel family.  Measured:
+`W = 1..8` is one logits class and `W = 9..16` another (27B UD-Q4_K_XL, 2026-09-13, with FA disabled too, so
+it is not only the FA chooser), i.e. `n_max 7` is pure and `n_max 8` is the first impure depth.  The
+`--spec-draft-n-max > 7` notice therefore starts exactly where the guarantee ends.  Two caveats worth
+keeping: the FA chooser divides by `ncols2` (`Q->ne[1] <= 16/ncols2` and friends in `fattn.cu`) and the
+per-type MMVQ caps differ (NVIDIA's Ada/Blackwell tables return less than `MMVQ_MAX_BATCH_SIZE`), so "8 rows"
+is a measurement on the validated head shapes, not a shape-independent theorem; and do not reason "the next
+token is re-sampled at W=1 so depth+1 is safe", because the mismatch row's token is emitted before any
+re-sample happens.
+
 **Rules.**  Establish a boundary with the **raw-logit probe, not the text gate** -- text equality is
 evidence *for* purity, never *against* divergence, because near-ties are rare.  Above the range, gate on
 acceptance + MTP-vs-plain throughput; adaptive MTP's `n_max = 12` is deliberately outside it (and upstream
-is worse: `9cf3bf256` diverges at the first width step on CPU).
+is worse: `9cf3bf256` diverges at the first width step on CPU).  **Say it out loud when a speculator puts
+the user there by default** (r283): the draftless n-gram family has no clamp into the band and
+`--spec-ngram-mod-n-max` defaults to 64, so `common_init_from_params` prints the same trade there, naming
+the knob that narrows it.
 
 **RDNA3_0 joins the band (r95).**  The boundary is about the *kernels* a width selects, not about an
 architecture, so RDNA3_0 (gfx1100-1102) gets the same verify-band fusions RDNA4 has had since r78: the
@@ -476,6 +496,12 @@ long drafts, so the bound now comes from the widest speculator draft:
 `n_rs_batch = common_speculative_n_max() + 1`, consumed as
 `GDN_CHUNKED_MIN_TOKENS = max(K > 16 ? K : 16, n_rs_batch)`.  A whole-batch rollback also needs a
 **pre-batch plane** (`0 < n_tokens < K`), which the graph copies into slot `n_tokens`.
+
+**Superseded in part by §88 (r282, issue #309).**  The `n_rs_batch` floor on the *kernel-selection*
+threshold is gone: it was redundant once the fixed-`D` tail existed, and it made the speculator SET choose the
+prefill split (so `ngram-mod`'s default width changed the model's own text).  What survives from this entry,
+unchanged: `n_rs_batch` as the `seq_rm` guard and the slab's verify-band width, the pre-batch plane, the
+tail, and the rule below.  Read §88 for the current threshold.
 
 **Current state (r91, 2026-10-19).**  The bound is **enforced, not observed**: `common` sets
 `cparams.n_rs_batch = common_speculative_n_max() + 1` over **every** speculator type (draft
@@ -2499,3 +2525,45 @@ byte-identical (`960bdbc9e2dc`) with an identical arena hit rate.
 
 **Record.**  `WORKLOG.md` 261112.006; `benchmarks/2026-11-12-expert-seed-policy.md`;
 `archive/work/expert-seed-policy/`; `INVARIANTS.md` r270; `patches/README.md` block 16.
+
+## 88. A speculator set must not choose the prefill split: the chunked-GDN threshold is the snapshot set, never the draft width (r282, issue #309)
+
+**Claim.** `plain`, `draft-mtp` and `draft-mtp-adaptive,ngram-mod` must emit the model's OWN greedy text.  They
+did not: adding `ngram-mod` to `--spec-type` moved the chunked-GDN prefill tail from 16 to 65 tokens and
+changed the text, with no draft even being used, and independent of the model FILE (Bartowski and Unsloth
+Q8_0 of qwen35 27B both do it).
+
+**Rule.** A numeric kernel-selection input may depend on the MODEL (`n_rs_seq`, hence `K`, hence the tail), and
+on nothing the user turned on for throughput.  The chunked-GDN threshold is
+`GDN_CHUNKED_MIN_TOKENS = K > 16 ? K : 16`, i.e. the snapshot set; the rollback bound `n_rs_batch` is a GUARD
+(`llama_memory_recurrent::seq_rm`) and a reserve width (`verify_batch_width()`), never a selection input.  A
+change that wants to push a verify batch onto the sequential kernel for numerical identity must say that it
+costs the prefill split, and the tools' own bound is `n_rs_seq` anyway (a draft deeper than that already takes
+a full state checkpoint).
+
+**Why the threshold alone is sufficient.**  Upstream bounds the rollback per cell:
+`cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0`.  A batch with more than `K` per-seq tokens
+cannot be rolled back at all, so the chunked path is safe for it; a batch that can be is `<= K <= D` and is
+therefore sequential, which writes every slot it may read.  The fixed-`D` tail (r91) is what makes the second
+half true for a batch above `D` — which is why the 2026-09-12 floor was needed when it was written (no tail
+then) and redundant after r91.
+
+**Numbers** (`benchmarks/2026-11-14-spec-gdn-split.md`, qwen35 27B Q8_0, `-sm tensor` 3 devices, seed 42,
+`--temp 0`, `prompts/prose-rdna-boosts.txt -n 600`).
+
+| arm | `n_rs_batch` | prefill tail, pre-fix | pre-fix text | prefill tail, post-fix | post-fix text |
+|---|---:|---:|---|---:|---|
+| `none` | 0 | 16 | `fffe3d3d88fe` | 16 | `fffe3d3d88fe` |
+| `draft-mtp n4` | 5 | 16 | `fffe3d3d88fe` | 16 | `fffe3d3d88fe` |
+| `draft-mtp-adaptive,ngram-mod`, `n_max 15` | 16 | 16 | `fffe3d3d88fe` | 16 | `fffe3d3d88fe` |
+| `draft-mtp-adaptive,ngram-mod`, default 64 | 65 | **65** | **`5c381ee010d7`** | 16 | `fffe3d3d88fe` |
+
+The same split shows on the reporter's file: Bartowski Q8_0 (F32 `ssm_alpha/beta`, so it is the only
+arrangement that also exercises the F32 GEMM) reads `fa09a6c3519d` in all four arms after the fix.
+`GGML_CUDA_GDN_CHUNKED=0` collapsed the pre-fix difference, which is what identified the mechanism.  The
+wide-draft win is untouched: verbatim-copy decode 528.2 t/s against 36.5 plain (the 15-token clamp cost it
+480 -> 252 t/s, which is why the clamp was the wrong fix).  Ordinary prose: 96.3 vs 96.1, i.e. flat.
+
+**Record.** `benchmarks/2026-11-14-spec-gdn-split.md`; gate `scripts/gate-spec-gdn-split.sh` (FAIL on the
+pre-fix build: tail `65` and divergent text; PASS after); `WORKLOG.md` 261114.003; `patches/README.md`
+block 10; `INVARIANTS.md` r282.
