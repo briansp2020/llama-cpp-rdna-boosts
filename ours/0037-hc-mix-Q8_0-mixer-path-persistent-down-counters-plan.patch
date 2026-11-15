@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 07:02:17 +0000
-Subject: [PATCH 37/42] hc-mix: Q8_0 mixer path - persistent down counters,
+Subject: [PATCH 37/43] hc-mix: Q8_0 mixer path - persistent down counters,
  planar output, Q8_1 epilogue, combine+norm fusion
 
 Fewer launches per hc site for models whose hc weights are Q8_0/F32 (unsloth

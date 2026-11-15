@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 21:54:23 +0000
-Subject: [PATCH 42/42] hc-mix: Q8_0 up + collapse in one launch, F32 inject
+Subject: [PATCH 42/43] hc-mix: Q8_0 up + collapse in one launch, F32 inject
  rows first on the down grid (GGML_CUDA_HC_UP_FUSE=0: off)
 
 hc_mix_up_collapse_q8 replays 8 hc_mix_up_silu_dot_band<8,16,NT,3,10,true,true> blocks per

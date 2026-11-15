@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 18:45:18 +0000
-Subject: [PATCH 22/42] qwen4exp seqpar prototype: token-split hyper-connection
+Subject: [PATCH 22/43] qwen4exp seqpar prototype: token-split hyper-connection
  work in 2-GPU -sm tensor prefill (LLAMA_SEQPAR=1, default off)
 
 New op GGML_OP_TOKEN_SCATTER (ggml_token_scatter): on a single backend a copy; on the meta backend its
