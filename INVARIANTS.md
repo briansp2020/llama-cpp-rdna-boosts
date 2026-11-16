@@ -22,23 +22,34 @@ change), and let `WORKLOG.md` carry the narrative.
 > "the `AGENTS.md` fact about <Y>" — those now live here.  `AGENTS.md` keeps the policy and a short
 > "rules you must know before changing anything" list that points at this file.
 
+> **Block numbering changed in r288 (the block-number re-org).**  The default set is now the 16 official
+> blocks `0000`-`0015` plus the temporary `0300`; the mixed K/V types are optional `0101` and two-lane
+> prefill optional `0100`.  Mapping from the r287 numbering: old `0014` (relaxed-tensor) -> **`0300`**,
+> old `0015` (streamed KV) -> **`0014`**, old `0016` (UMA GTT) -> **`0015`**, old `0017` (mixed K/V) ->
+> **optional `0101`**.  **Dated entries below keep the block number they were written with** (an `rNN`
+> entry that says "block 15" means the streamed KV, i.e. today's block 14; a note from before V2.0 may use
+> the old pre-2026-10 numbering instead — see the mapping at the top of `GREEDY-PURITY.md` and
+> `WORKLOG.md` r288).  Only the current-state bullets and section titles are updated in place.
+
 ---
 
 - **`llama-cli` MUST be run with `--single-turn`** (plus `--no-display-prompt` for scripted output).
   Without it, the interactive chat loop blocks forever. Wrap potentially blocking commands in `timeout`.
-- **Apply method:** all 18 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
-  `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
-- **Naming (V2.1):** the current set is **18 blocks, 00-17** (block 15 is the **streamed KV** — both Goals
-  A and B of `TODO` #118; block 14 is the temporary `-sm relaxed-tensor` block, see `patches/README.md`;
-  the release tag lives in `release.json` — read `.release` there, it is never restated here).  **15**
-  carries **two opt-in placements of the same cache**, mutually exclusive by construction: the **window**
+- **Apply method:** the **17 default patches** with **`git am`** (`00xx` then `03xx`); `scripts/apply-all.sh`
+  is the tested path. Plain `git apply` of the concatenated series **silently drops hunks**. Every block is a
+  normal commit.  The optional `01xx` blocks are applied only with `--include-optional[-all]`.
+- **Naming (r288):** the current default set is **16 official blocks, 00-15**, plus the temporary **`0300`**
+  (block 14 is the **streamed KV** — both Goals A and B of `TODO` #118; `0300` is the temporary
+  `-sm relaxed-tensor` block, see `patches/README.md`; the release tag lives in `release.json` — read
+  `.release` there, it is never restated here).  **14** carries **two opt-in placements of the same cache**,
+  mutually exclusive by construction: the **window**
   (r178; `--kv-window`, formerly `LLAMA_KV_RESIDENT_CELLS` — an opt-in fixed-VRAM resident window with the
   tail in pinned system RAM, one VA range, no kernel change) and the **attendance pool** (r190;
   `--kv-attendance-pool`, formerly `--kv-region-pool` — the
   authoritative copy in a pinned host mirror plus a compact device pool the sparse decode arm resolves its
   top-k through), plus the streaming arm policy that makes either take the sparse decode (r190).  Both are
   **default OFF** — fittability features, and on a config whose KV fits they cost the sparse-vs-dense gap.
-  Since **r246 block 15's own knobs are first-class command-line options, not environment variables**; since
+  Since **r246 block 14's own knobs are first-class command-line options, not environment variables**; since
   **r247 all three placements default to OFF** with the same semantics (`auto` = the system picks the size,
   `N` = explicit, default = neither): `--kv-window [auto|N]` (the resident window, promoted from
   `LLAMA_KV_RESIDENT_CELLS`, which remains as its deprecated alias), `--kv-attendance-pool [on|off]` (renamed
@@ -52,18 +63,20 @@ change), and let `WORKLOG.md` carry the narrative.
   `!offload`, and the window now declines on `!offload` too — with `-nkvo` the cache is pageable host RAM end to
   end, so there is nothing to window (before r197 it announced a VRAM window and then built a plain `CPU KV
   buffer`, and `is_streaming()` took qwen4exp's sparse arm off that plan).  `is_streaming()` therefore keys on
-  `kv_region`, the placement actually taken, not on `kv_resident_cells`, the plan.  **15 also carries Goal C** (r193,
+  `kv_region`, the placement actually taken, not on `kv_resident_cells`, the plan.  **14 also carries Goal C** (r193,
   `--spec-draft-kv-window`): the MTP draft context's KV is a *window* instead of `-c` cells, **default `0`**
   since r247 (a full `-c` draft cache; `auto` = THE CAP OR NOTHING and `N` = cells are a conscious opt-in — the
   earlier "measures non-negative" claim is corrected by the r247 entry below), and **when a window is active** an
   embedded MTP head's slab draft reserve is derived with it (aux 3.50 -> 0.76 GiB, arena +2.8 GiB).  MTP only, embedded-head only; a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full
   cache.  The ring is `find_slot`'s `n_swa` reclaim, so no allocator and no mask change — and `kq_mask_derivable`
   needs **no** exclusion, because its predicate compares each cell's *position*.
-- **Block 16 is the UMA GTT expert store and block 17 is the mixed K/V cache types (r263 / r287).**  Block 16
-  (an APU's MoE expert set in one registered region, `-lme`-sized) has its own section below.  Block 17 adds
-  the one mixed K/V pair the delivery reads natively (K `q8_0` with V `q4_0` / `q5_0` / `q5_1`, 256-wide heads
-  only, qwen4exp refused; default on, `GGML_CUDA_FA_KV_MIXED=0` restores the staged path); every other mixed
-  pair is still refused.  See the mixed-K/V bullet above and `scripts/gate-mixed-kv.sh`.
+- **Block 15 is the UMA GTT expert store and optional block `0101` is the mixed K/V cache types (r263 / r287,
+  optional since r288).**  Block 15 (an APU's MoE expert set in one registered region, `-lme`-sized) has its
+  own section below.  Optional `0101` (formerly block 17, moved out of the default set by the r288 re-org) adds
+  the one mixed K/V pair the delivery can read natively (K `q8_0` with V `q4_0` / `q5_0` / `q5_1`, 256-wide heads
+  only, qwen4exp refused; default on when the artifact is applied, `GGML_CUDA_FA_KV_MIXED=0` restores the staged
+  path); every other mixed pair is still refused, and the default build does not contain the code at all.  See
+  the mixed-K/V bullet above, `optional/mixed-kv/README.md` and `scripts/gate-mixed-kv.sh`.
 - **The MTP draft window is PER SEQUENCE, and the cache is sized per sequence when the KV is unified (r200,
   issue #264).**  Under `--kv-unified` the one draft cache holds every sequence, so its cell count is
   `(win + one batch) x n_seq_max` (capped at the context) — the r193-r199 `win + n_ubatch` shape was shared by
@@ -4889,3 +4902,219 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   gfx1100 and gfx1151: `FLASH_ATTN_EXT` 7021/7021 default / `MIXED=0` / `NATIVE=0`; W=1..8 width purity
   maxdiff 0 for q8_0/q8_0 and all three pairs on 1 GPU, `-sm layer` and `-sm tensor`; plain == draft-mtp at
   n_max 1/3/7.  Gate: `scripts/gate-mixed-kv.sh`.
+
+* **A tensor split shards the KV row, so one cache can hold tensors with DIFFERENT cell strides — and the
+  windowed KV's spill boundary is a CELL COUNT, not a byte offset (r289, issue #314 F1/F2/F7).**  `-sm tensor`
+  splits every tensor by the `-ts` ratio and rounds each shard to its own head grid, so an uneven ratio gives
+  the K and V tensors of one cache different `nb1` (measured on a 27B with `-ts 24/16`: 1024 B and 1536 B in
+  the same VMM region on device 0).  The window kept ONE byte boundary (`vmm_tensors[0].nb1`-derived) for
+  every tensor, which is wrong in both directions: for the shorter tensors the shared VRAM watermark (a max
+  over the region) already sat past their whole extent, so the resident tail was never mapped and the first
+  ubatch that wrote it FAULTED the GPU (`rms_norm_mul_rope_f32`, grid `[256, 2048, 1]`, "Page not present",
+  `-ts 24/16` 2-device 27B — reproduce on 3 identical R9700: an EVEN split is clean, so the gate's even arms
+  missed it); and on the last tensor it asked for a span past the end of the reservation (the field
+  "region 868 MiB, wanted 864..868 MiB" refusal).  The boundary is now computed per tensor in cells, floored
+  to the map unit in THAT tensor's `nb1`, with per-tensor `lead`/`dev` watermarks; `grow_regions()` passes the
+  PADDED n_kv (what the graph reads, so what is mapped) **and** the used extent (what exists), and the spill
+  boundary follows the **used** extent: with the padded one a coarse `LLAMA_KV_N_PAD_PREFILL` step (8192 on a
+  multi-device split) spilled cells that do not exist and pushed real used cells out of the resident window,
+  so fewer than `W` used cells stayed in VRAM (F7).  Consequence for anyone reading the map: a windowed split's
+  VRAM is `W + (padded - used)` cells, i.e. at most `W + LLAMA_KV_N_PAD_PREFILL`, and the spilled bytes are
+  `used - W` cells.
+* **A refusal log must name the reason that failed, and a debug verify belongs on the CHANGE, not on the call
+  (r289, issue #314 F2).**  `ggml_backend_cuda_kv_region_log()` printed `LLAMA_KV_REGION_MAP_MAX_MIB` as
+  "cap" unconditionally, and that knob is 0 when unset — so a pinned-host mapping failure, a VRAM exhaustion
+  and a real cap hit all read "cap 0 MiB" and pointed at a knob that was already unlimited.  It takes a
+  reason now and prints the cap clause only when a cap is configured; `ggml_cuda_kv_spill_allow()`'s refusal
+  already logged its arithmetic and the grow site now says which path stopped.  Same class, same file: the
+  `LLAMA_KV_REGION_DEBUG` host re-read (an O(mapped extent) verification) ran on EVERY `grow_regions()` call
+  — and that is every batch, not every change — which turned a 22 t/s decode into **1.3 t/s** with the knob
+  on and made three separate debug runs look like a regression.  Verify on `mapped_after != mapped_before`.
+* **A split's spill cost is a per-device PARALLEL read, so it is `max_i(share_i x bytes / rate_i)`, and the
+  per-device rates are not the link's (r289, issue #314 F4/F6).**  Every child reads its own slice of the
+  spill at the same time, so one card's rate for the whole spill is wrong in both directions: it over-charges
+  an even split by up to 2x (measured 2026-11-14 on 2x R9700: 768 MiB spilled per token at 37 GB/s effective,
+  against 27.8 and 14.2 GB/s calibrated) and it never measures the second card.  `llama_kv_cache`'s window
+  line and `--fit` now calibrate **every** child and quote each one's share and its wait.  Two more measured
+  facts from the same arms: a window at or above the run depth costs **nothing** on a split (2x R9700, 27B, a
+  5996-token request: 43.07 t/s without a window, 43.16 with `W=8192`, 43.15 with `W=65536`, i.e. the 29 %
+  the field report saw on the mixed gfx1100+gfx1201 x8 pair is that box, not the split path), and the
+  calibrated in-place rate is a *cold burst* number — at 65536 cells the sustained aggregate is ~10 GB/s per
+  device, so treat the quoted ms as a floor (the line already says a card that reads its aperture below its
+  DMA link scales up from there).
+* **A HOMOGENEOUS deployment keeps `-sm tensor`; a mixed, imbalanced or feature-stacked set starts on `-sm layer`
+  (r289, guided by the r16 measurement).**  Tensor split interleaves every layer across all the cards, so they
+  work in parallel, and on a homogeneous set it is measured well ahead: 2x R9700 on PCIe 5.0 x8 root ports,
+  Flash-Next IQ4_NL, `-ncmoe 48`, a 2000-token decode, **35.5 t/s (`tensor`) vs 25.7 (`layer`) at the same
+  expert hit rate** (`COMMUNITY-CONFIG.md`, r16) -- a layer split runs one card's layers at a time, so every
+  layer boundary is a handoff with the other card idle.  Note the r16 arm is **homogeneous** (two identical
+  R9700, equal VRAM and links), which is the condition the comparison is a measurement of.  On a *mixed* set the
+  same mechanism turns against it:
+  the cross-device all-reduce sits on every layer's critical path (block 01's reason for existing), so the
+  slowest card and the slowest link set every token's pace, and an imbalanced `-ts` ratio produces the uneven
+  shards above.  A layer split keeps whole layers per device: no all-reduce, no sharded tensors, one device's
+  KV per layer, and every feature stacked on top inherits one device's geometry instead of a shard of every
+  device's.  It is a fully supported split (the streamed KV, the pool and every fused path work on both), not a
+  fallback; report a tensor-split problem against the layer arm too.
+
+* **Block 07's WMMA `iu8` verify family covers widths 2..8, never 9..16, on a dense model (r290, PR #317).**
+  Two independent gates close the wider band: `ggml_cuda_mul_mat` sends `ne11 > MMVQ_MAX_BATCH_SIZE` (= 8)
+  to MMQ, and the RDNA4/RDNA3_5 "dense band" promotion that can lift 9..16 back onto `mmvq` requires
+  `src0->ne[1] % 128 != 0`, which a 27B's every matrix fails (`n_embd 5120`, `n_ff 17408`, `6144`, `1024`
+  -- all multiples of 128).  Measured on the tree that ships the family: **0.0 difference at widths 9, 13
+  and 16** for Q4_K against the same process with the family enabled, so those widths are not part of the
+  feature and a claim that spans them is measuring something else.  The practical consequence is that an
+  adaptive MTP `n_max 12` arm -- whose deep rounds verify 9-13 columns -- is **neutral** (recall cycle
+  +0.8 %), and the feature's footprint is a *fixed deep draft* (DFlash2 `n_max 5..7`).
+* **The WMMA verify family's win is width-shaped, and the shape is the design constraint (r290).**  It
+  amortizes *dequantization* over the verified columns, so it only wins where the K-split kernel is
+  instruction bound.  Content-fixed (`llama-batched-bench -npp 512 -ntg 64 -npl 1..8`, TG t/s, ON vs OFF):
+  1 GPU 27B UD-Q4_K_M `-8.5 / -4.8 / -3.4 / -1.6 / +1.9 / +5.8 / +9.4` % at widths `2 / 3 / 4 / 5 / 6 / 7 /
+  8`; 2-GPU `tensor` `-5.7 / -4.7 / -5.3 / -4.7 / -4.4 / +7.1 / +10.6` %.  The crossover moves *up* on a
+  split, which is why the shipped floor (`--wmma-verify auto`) is **7** and not 2: at 6 columns a 2-GPU
+  split still loses 4.4 %.  End to end it is a cycle-time win at every acceptance level (DFlash2 n7 recall
+  36.5 -> 33.9 ms; four-axis R/P/C/K cycles -0.6/-2.3/-5.7/-3.5 %) -- tokens/s follow acceptance, which
+  moves because the text moves.
+* **Q8_0 is the strongest case for a tensor-core verify kernel and the weakest payoff, because its K-split
+  kernel has no dequantization to amortize (r290).**  `block_q8_0` is `{half d; int8 qs[32]}` -- the stored
+  int8 *is* the MMA operand -- so at 8 columns the existing kernel already reaches **74 %** of the perfect
+  weight-reuse ideal where a K-quant reaches **59 %** (same instrument).  The WMMA case is therefore worth
+  only **+3.7..+4.2 %** at 8 columns (vs +9.4..+10.6 % for the K-quants) and it loses almost nothing at
+  2..5 columns (-0.5..-1.0 %, against -3.4..-8.5 % for Q4_K).  Extension cost is ~40 lines: no min term, no
+  table, no dequantization.
+* **A quant type whose block is 32 elements cannot borrow a 256-element format's per-stride unit (r290).**
+  The verify kernel's row stride is `stride_row_x * BB` for the K-quants, where `stride_row_x`
+  (`src0->nb[1] / ts_src0`) counts the type's **own** blocks -- 256 elements for a K-quant, 32 for Q8_0 --
+  so Q8_0 needs its own unit (`RB = 34`).  With the K-quant unit the kernel walks past the row and the
+  launch aborts; the format structs each carry `RB` for this reason.  The same trap applies to any future
+  type added to the family.
+
+## r291 — sequence parallelism is a batch-width change, and its thresholds are measured (block 12, PR #315)
+
+* **The per-token chain is what moves, not the collective (`GREEDY-PURITY.md` §92).**  Keeping the qwen4exp
+  residual streams token-split makes the hyper-connection mixers, gated norms, shared expert and their GEMMs
+  run at `T/n` per device, so the logits move at rounding level exactly as a `-ub` change does: on the
+  delivery's family-switch point the ON arm reads **0.014184 / 96.373 %** against a same-kernel `-ub 256`
+  control of **0.013587 / 96.225 %**, and `LLAMA_SEQPAR_RS=0` (all-reduce + local slice instead of the
+  reduce-scatter, the identical values) reads the **same** 0.014184 / 96.373 %.  The reduce-scatter is
+  therefore provably not the source; any claim that it is, or that seqpar alone is `0.000000`, is wrong.
+  `LLAMA_SEQPAR=0` is bit-inert: prefill-logit **0.000000 / 99.990 %** against the previous release's binary,
+  and greedy text identical at 2 devices, 3 devices and `-sm layer`.
+* **The gather wire is a throughput trade with a logit cost, and the cheaper wire is the slower arm (r291).**
+  (`LLAMA_SEQPAR_GATHER_BF16`, default 1.)  The bf16 wire is exactly its own round-only control
+  (`GGML_SEQPAR_GATHER_ROUND=1`, both 0.014372) but is 4 % above the ubatch control on KLD; the F32 wire is
+  **better than the control on both metrics** (0.010644 / 96.833 %) and yet measures **-2.1 %** against seqpar
+  OFF on the default RCCL-ring chain (2634.9 -> 2578.6 t/s at 31.5k, 2 rounds), because there the gather bytes
+  are the whole cost.  So "safer wire" is not "shippable default": the bf16 wire ships and `=0` is the
+  documented kill-switch.  `ROCBLAS_USE_HIPBLASLT=0` is mandatory for every hash/PPL arm here (§44).
+* **`T/2` work is only a win above a measured ubatch (r291).**  `LLAMA_SEQPAR_MIN` is **512** and that is a
+  measurement, not the ubatch that happened to be tested: `llama-bench -p 8192` on 2 x R9700 gives **-1.0 %
+  at 128** and **-0.8 % at 256** (no win), **+6.4 % at 512** (copy-engine chain) / **+3.0 %** (default chain),
+  **+8.3 % at 1024**, and at the delivery's shapes **+7.3/+7.0 %** ce and **+2.2/+2.1 %** default at 31.5k.
+  (The contributor's sweep reported a win at every T on a box whose 31.5k baseline was ~1950 t/s; the
+  crossover is configuration-shaped, so it is measured here.)
+* **A token-split ubatch below 128 tokens can overflow the Meta split-state recursion (r291, open, `TODO` #329).**
+  A nested lookup in `ggml_backend_meta_get_split_state` retires the cache version the non-recursive warm walk
+  is filling (it switches version when a tensor's bytes changed since it was cached), so the recursion then
+  descends the whole `src` chain -- ~10 frames per layer, ~500 for a 48-layer qwen4exp graph -- and a
+  thread stack dies.  Reproduced with the feature on at T = 48, 64, 80 and 112 (`llama-bench -p 4096/8192`,
+  gdb: unbounded `calculate_split_state` <-> `get_split_state`); **clean at 32, 96, 128, 144, 160, 192, 200,
+  224, 240, 256, 320, 512, 1024, 2048, 4096 and 31500**, and seqpar-off at the same T is fine, so the hazard is
+  the cache's, reachable only through this feature's longer chain.  A mis-set `MIN` also reaches a *second*
+  failure at T <= 2 (the token-scatter split-state assertion fires outright, deterministically, on the warmup
+  graph), so the value is **clamped to 128 with one WARN**: a setting below it degrades to "off" for the
+  ubatches it cannot handle instead of aborting, the shipped default (512) is above the clamp, and
+  `scripts/gate-seqpar.sh` arm 6 asserts all of that.  The re-entry condition for lowering the clamp is fixing
+  block 09's cache (`TODO` #330).
+* **Above 2 ranks the reduce-scatter declines and only the gathers help (r291).**  The copy-engine exchange is
+  2-rank by construction (one exchange of the other rank's half, one event pair), so at 3+ devices the Meta
+  backend all-reduces and slices while the token gathers run over N peers: measured 3-card prefill 3445.3 ->
+  3539.7 t/s (ce, **+2.7 %**) and 3134.3 -> 3200.1 (auto, **+2.1 %**), 3-device logits 0.014133 / 96.147 %
+  against a control of 0.013662 / 96.235 %.  The graph layer and the slice-offset maths stay device-count
+  agnostic; the 2-rank restriction lives only in the comm layer and in the RS eligibility test.
+* **The collectives live outside the ggml allocators and the gather never grows an existing scratch (r291).**
+  The reduce-scatter asks for what the all-reduce it replaces would have asked for (2 x ceil(ne/2) bf16); the
+  gather creates a scratch only when none exists (<= 24 MiB) and otherwise chunks through it, because growth
+  retires the old buffers until teardown -- that is the **+60 MiB/device** (3 x 20 MiB at `-ub 4096`) the
+  default chain carries with the feature on, and it is raw device memory, so the allocator breakdown is
+  unchanged (the census line says which caller grew it).  A gather that declines (no scratch, multi-process,
+  `GGML_SEQPAR_CE_GATHER=0`) warns with **its own** message and flag instead of consuming the all-reduce's.
+
+## r292 — the expert arena is sized ONCE, from the slab's *birth* boundary, so `-ub` silently shrinks it (promoted into block 09, r292)
+
+1. **The arena's slot count is a one-shot function of the slab boundary at the instant the cache sizes, and
+   that boundary is the prefill layout.**  `alloc_all_locked` sizes from `ggml_cuda_slab_arena_total()` =
+   `arena_top - boundary` (`ggml-cuda-slab.cu`), whose own comment says it "must reflect what is allocatable
+   NOW".  The slab is born at the first compute-buffer allocation — the `sched_reserve` of the `pp` graph — so
+   its initial `boundary` is `narrow + ring + wide`, i.e. **ubatch-proportional** (`SLAB_INIT ... boundary=
+   6.50 GiB` at `-ub 16384`, `12.62 GiB` at `-ub 32768`).  `g_sized = true` latches the result, `moe_cache_rearm`
+   re-arms only to `g_rearm_slots[layer]`, and `TODO` #70 forbids revisiting a deficit layer.  The band the
+   prefill→decode drop returns is therefore **never given to the tables**.
+2. **The loss is a closed form: `max(0, boundary_at_birth - narrow_floor)`.**  Measured on 1 × R9700,
+   QFN `GSQ-RCO-IQ3_S`, `-ncmoe 47` (region vs the arena the tables were sized to): `-ub 4096` 1 600 vs 2 048
+   → **0** (saturated); `8192` 3 200 → 1 448 MiB (6 %); `16384` 6 656 → **4 948 MiB (21 %)**; `32768` 12 928 →
+   **11 215 MiB (49 %)**.  It is not the timing: `MOE_EXPERT_CACHE_SIZE_AT_PRIME=0` gives byte-identical
+   results, because the slab already exists, wide, before any sizing can run.
+3. **An explicit `MOE_EXPERT_CACHE_MIB` larger than that arena is silently clamped, and the census
+   contradicts itself.**  `MOE_EXPERT_CACHE_MIB=24000` at `-ub 16384` → `VRAM budget: requested=24000
+   MiB/device, free-clamped=1` beside `arena=18137.1 MiB total (budget 24000 MiB/device)` and
+   `evictions=10781`.  A user who raises `-ub` loses residency with no line saying why.  (The beta candidate
+   adds an `arena settle:` census line naming the effective figure; reconciling `requested` against the
+   reported arena is still open.)
+4. **Do not measure a residency/arena change at 128 generated tokens.**  The same change reads **+1.8 %** over
+   128 tokens and **+4.0 %** over 2 000 on the same arm: the arena only reaches its steady state after a few
+   hundred tokens, so a short decode understates every residency win.  Use >= 1 000, 2 000 preferred.
+5. **The arena's value is the *cost of a miss*, not the hit rate** (this extends r219 fact 6).  Two runs with
+   near-identical arena hit rates can differ by 2.8x: a 100 % mirror host tier (pool hit 1.000) does 51.5 t/s
+   at hit 0.834, while a partial pool (`-lme 8` of 46.9 GiB → **pool hit 0.094**) does 18.3 t/s at hit 0.852.
+   Quote the **miss bytes** (`expert H2D traffic:`), which are hardware-independent, and convert with the
+   link rate; the wall-time ratio then follows from whether the expert path is the bottleneck (+4.0 % on a
+   mirror where it is ~13 % of the wall, +29 % on a pool where it *is* the wall, for the same −29..−32 %
+   traffic).  A box with PCIe5 x16 + a PCIe5 SSD is the *best* case for masking this and must not be used to
+   size an arena policy.
+6. **Arena capacity is worth ~`1 / arena_size`, and the 24 GiB card proves it — validate this class on the
+   smallest card available.**  Same fix, same ~-33 % miss traffic, two cards at `-ub 16384`, 2 000 tokens:
+   32 GiB (arena 23 GiB, mirror) **+4.0 %**; **RX 7900 XTX 24 GiB (`gfx1100`, PCIe 4.0 x16, arena 8.12 GiB,
+   mirror)** arena 7 962.5 -> **12 888.2 MiB (+62 %)**, hit 0.6038 -> 0.7337, miss traffic 757 391.7 ->
+   500 773.0 MiB (**-33.9 %**), decode 45.44 -> **54.09 t/s (+19.0 %)**, greedy text byte-identical
+   (`sha 4df76b729a6ba020`).  Base miss traffic there is **379 MiB/token ≈ 17 GB/s of effective read at
+   45 t/s**, i.e. the card is link-bound, and the settle removes 128 MiB/token of it.  The 24 GiB box's defect
+   is `6.50 - 1.875 = 4.6 GiB` of an **8.12 GiB** arena.  **A 32 GiB R9700 understates this class by ~5x; do
+   not size an arena policy on it.**
+7. **The settle must scale the sizing count, not re-derive it.**  A per-device re-derivation has to reproduce
+   every sizing-time exclusion (`table_pinned_head`, the per-table arena-unit rounding, `g_extra_reserve`);
+   diverging from it builds a **non-uniform layer**, the one state that reads the wrong expert.  Scaling by
+   `min(avail_now, request) / avail_sizing` from the recorded sizing inputs is scan-free and cannot disagree.
+   The cap must use the **pre-clamp** request: recording the post-clamp budget makes `auto` indistinguishable
+   from an explicit budget that matched the capacity, and the ratio pins to 1.0 (the whole settle silently
+   does nothing — this was the first implementation's bug).
+8. **The band is not free: taking it evicts WHOLE tables, and that is a prefill cost.**  The slab's arena is
+   per-table atomic.  A full arena fills the lowest VA chunks with whole tables; a prefill boundary move
+   stands those tables down whole, so the prefill re-reads **every** expert of them from the host instead of
+   the 85 % that were resident.  Measured on a 2-device `-sm tensor` split (sizing 437/512 slots/table, prior
+   already covering 99.56 %): taking the band bought **0.44 pp** of decode mass and cost prefill **1625 ->
+   903 t/s (-44 %)** and decode **-5 %** (51.9 -> 49.3 t/s).  The same change on 1 device (sizing 201/512,
+   prior 82.68 %) is **+8.2 %** decode at `-ub 16384` and **+32 %** at `-ub 32768`.  Arena capacity is worth
+   `~1/arena_size`, but only where the decode set is actually short of it.
+9. **Decide on the MARGINAL mass of the growth the drop offers, not on full residency.**  A few-slot growth
+   still frees and re-seeds every table.  At `-ub 2048` the first drop offered only **1.9 %** more arena
+   (28 956 -> 29 412 slots) and **0.50 pp** of prior mass; taking it measured **-2.7 %** decode at 2 000
+   tokens.  At `-ub 16384` the drop offers **26.3 %** and **6.98 pp**, and the whole-table re-seed is paid
+   back (+8.2 %).  The decision must therefore be made at the **first drop** (the first time the decode
+   capacity is visible), from the persisted decode-band prior, with a threshold
+   (`MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP`, default 1.0 pp).  Measured decisions: 1-device 6.98 pp **on**;
+   `-ub 2048` 0.50 pp **off**; 2-device tensor 0.44 pp **off**; 2-device layer 0.14 pp **off**; 3-device
+   0.00 pp **off**.
+10. **A settled slot count must be sticky per layer, together with the capacity it was achieved at.**  At a
+   prefill -> decode drop the live narrow re-reserve varies (a second sequence's verify band, a live
+   prefill), so the arena a drop returns can be smaller than the one the count was settled at.  Re-deriving
+   from the sizing count on every drop ratchets the count **down** and, when the capacity returns, **up**
+   again — an oscillation that re-seeds the tables on every transition.  Keep the achieved count and the
+   capacity reference per layer; re-arm at the achieved count when the capacity has not grown, and only
+   re-derive when it has.  Measured on a two-slot server (`--parallel 2`, 1 x R9700): one slot decoding
+   while the other prefills, then the prefill completes, then the short slot starts a **new** prefill while
+   the long one still decodes, then a fresh prefill after both idle — coherent on every run, no
+   `could not be re-armed slot-uniformly`, no `is not slot-uniform`, no stood-down layer, the settle fires
+   **once** (47 layers, arena 22 388.2 MiB at the two-slot narrow floor) and later drops re-arm without
+   growing or shrinking.  Concurrent text need not be byte-deterministic (KV placement); the invariants are
+   the layer uniformity and the coherence.

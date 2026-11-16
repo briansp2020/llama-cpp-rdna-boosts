@@ -1,3 +1,574 @@
+## 261115.007 (r292, RELEASE v16-4f9dfa0e3-r292) -- block 09 gains the demand-gated arena settle (amend block 09, no new block): the band a prefill -> decode drop returns is taken where the decode set is short of it (+8.2 % at `-ub 16384`, +31.9 % at 32768, +36.8 % partial pool, +19.5 % on the 24 GiB card) and left alone on a saturated split
+
+The v2 candidate (now `archive/work/arena-steady-sizing/`, r292 entries below) is **promoted into block 09**, on the
+maintainer's decision -- **no `0301`**.  Block 09 now carries the settle: at each prefill -> decode drop the
+per-layer slot count is scaled by the capacity ratio (growth only, no table scan), **demand-gated at the
+first drop** on the marginal persisted decode-band prior mass the offered growth buys
+(`MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP`, default 1.0 pp), and the achieved count is **sticky per layer with
+the capacity it was achieved at** so a two-slot decode/prefill transition re-arms at the achieved count and
+only a capacity that GROWS re-derives it.  A saturated 2-device split or a small `-ub 2048` leaves the band
+and is byte-identical to base; the kill switch `MOE_EXPERT_CACHE_STEADY_REARM=0` is bit-for-bit the old
+behaviour.  Blocks 10-15 and 0300 were re-cut onto the amended 09; the block 09 tree compiles on its own.
+
+**The delivery is still 16 official blocks + the temporary `0300` = 17 default patches** (`n_blocks 16`,
+`n_temporary 1`, `n_default 17`); the release prefix is `v16`.  `release.json`:
+`base 4f9dfa0e3`, `tip 2b7a65309`, `tree 4a67e7c9d7b1925081db04a814f03ae40627325f`,
+`optional_tree a22261928d0b1aaccfa76c755790e0248ea9e40d`.  The release tree differs from the tested
+candidate tree (`9cd799ca`) only in comment/line wrapping and a redundant scope; the behaviour is
+identical.
+
+**Measured** (r291 tree + the change, interleaved A/B, 2 000 greedy tokens, heat prior pinned, text
+byte-identical everywhere): 1 x R9700 `-ub 16384` arena 18 411.9 -> **22 819.7 MiB**, miss traffic -39 %,
+decode **41.7 -> 45.1 t/s (+8.2 %)**; `-ub 32768` 12 183.0 -> **23 018.0 MiB**, traffic **-70 %**,
+**34.3 -> 45.3 (+31.9 %)**; partial pool (`-lme 8` + `DIO=1`) **16.9 -> 23.1 (+36.8 %)**; 24 GiB RX 7900
+XTX arena 11 428.6 -> **15 995.3 MiB**, traffic -38.2 %, **36.5 -> 43.6 (+19.5 %)**.  The saturated arms are
+byte-identical: 2-device tensor 51.90 vs 51.90 (0.44 pp), 2-device layer 39.34 vs 39.37 (0.14 pp),
+3-device 57.45 vs 57.51 (0.00 pp), `-ub 2048` batched B=1 49.61 vs 49.56 (0.50 pp).  MTP four-axis: text and
+acceptance identical (R 0.62267, P 0.82563, C 0.91975, K 0.99200), decode +2.8..16 % where the band is
+taken.  Two-slot server (`--parallel 2`, one decoding while the other prefills, then the reverse and a
+fresh prefill after both idle): coherent, no non-uniform layer, no stand-down, arena stable.
+
+**Gates.** `scripts/validate-set.sh` green (17 default + 2 optional, strict apply, optional trees
+re-derived, Windows portability 512 files); `scripts/gate-host-pool.sh` **54/54**;
+`scripts/gate-prefill-logits.sh --ab "MOE_EXPERT_CACHE_STEADY_REARM=0"` **KLD 0.000000 / top-p 99.990 %** on
+the MoE model; `llama-batched-bench -npl 1,4,8` neutral; same-seed greedy text byte-identical in every arm;
+no GPU faults; the per-block build gate built the 4 changed block commits (09, 12, 15, 0300) 4/4 on a
+fresh `all` build each.  `scripts/fork-refresh.sh --build --gates --push` re-cut the branch at
+`4f9dfa0e3`, reproduced tree `4a67e7c9` and tip `2b7a65309`, passed the coherence gate and the recorded-base
+prefill-logit gate (mean KLD 0.000697, limit 0.005), and force-pushed `rdna-boosts` to the personal fork
+(`ec721312c -> 2b7a65309`).  The optional artifacts (`0100` two-lane prefill, `0101` mixed K/V) still apply
+strictly to the new default tree; their trees were re-derived and recorded.  The ROCm images are built and
+pushed off-host by `scripts/container-watch.sh` on `radiance` after the tag.
+
+**Bookkeeping.** The candidate moved to `archive/work/arena-steady-sizing/` (no stub); `beta/README.md`
+carries the promotion.  `ENVIRONMENT.md` records both knobs, `INVARIANTS.md` r292 items 8-10 the findings,
+`patches/README.md` the block 09 amendment note.  The next step after this release is the
+`wip/moe-static-hot-tier/` update: placement above the widest prefill boundary instead of a freeze
+primitive, with the two-segment slot addressing as the real blocker (the 2-device 0.44 pp becomes a free
+win once prefill keeps its hot K slots above the boundary).
+
+## 261115.006 (r292) -- the multi-GPU gap in the arena settle: the band is not free.  The settle is now demand-gated on the MARGINAL mass the drop offers (2-device tensor +0.44 pp -> leave it, prefill 1625 -> 903 t/s avoided) and sticky per layer with its capacity (two-slot decode/prefill transitions stable).  +8.2 % on 1 x R9700 at `-ub 16384`, +31.9 % at 32768, +36.8 % on a partial pool, +19.5 % on the 24 GiB card
+
+The v1 candidate (`beta/arena-steady-sizing/`, r292 entry below) settled the slot count at every
+prefill -> decode drop on the *full* capacity ratio.  It was only ever measured on one device.  The
+multi-GPU gap the maintainer asked for found that **the band is not free**: on a 2-device `-sm tensor`
+split the sizing pass already holds 437/512 experts per table and its persisted decode prior covers
+**99.56 %** of the routed mass, so the extra 75 slots buy **0.44 pp**; taking them fills the arena's
+lowest VA chunks with whole tables, and the next prefill stands those tables down **whole**, so the
+prefill re-reads every expert of them from the host.  Measured: prefill **1625 -> 903 t/s (-44 %)**, decode
+**51.9 -> 49.3 (-5 %)**, text byte-identical.  `-sm layer` is 0.14 pp, 3-device 0.00 pp.  v1 was a loss on
+every saturated split.
+
+The same measurement exposed a second gate hole: even a **few-slot** growth pays a whole-table re-seed.  At
+`-ub 2048` the first drop offered 1.9 % more arena and 0.50 pp of prior mass; taking it read **-2.7 %**
+decode at 2 000 tokens.  So the decision cannot be "full residency is worth X pp"; it must be "the growth
+**this drop** offers is worth X pp", and it has to be made at the **first drop** (the first moment the decode
+capacity is visible).  v2 computes the marginal prior coverage of the offered target against the sizing
+count, once, and takes the band only at >= `MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP` (default 1.0 pp).
+
+The second maintainer requirement -- two sessions, one decoding while the other prefills, then the prefill
+completing to decode, then the reverse when a session finishes and starts prefilling again -- exposed the
+count ratchet.  The narrow re-reserve varies with the live sequence set, so the arena a drop returns can be
+smaller than the one the count was settled at; re-deriving from the sizing count every drop ratchets the
+count DOWN, then UP when the capacity returns, re-seeding the tables on every transition.  v2 keeps the
+achieved count and the capacity it was achieved at **per layer**; a drop re-arms at the achieved count unless
+the capacity has GROWN.  The two-slot harness (`--parallel 2`, 1 x R9700, one slot decoding while the other
+prefills, then the short slot starts a new prefill while the long one still decodes, then a fresh prefill
+after both idle) ran three times: all responses coherent, no `could not be re-armed slot-uniformly`, no
+`is not slot-uniform`, no stood-down layer, no fault, the settle fires **once** (47 layers, arena
+22 388.2 MiB at the two-slot narrow floor) and later drops re-arm without growing or shrinking.  Concurrent
+text happened to be deterministic here; that is not required.
+
+**Measured (r291 tree, interleaved A/B, 2 000 greedy tokens, heat prior pinned, text byte-identical every
+arm).**  1 x R9700: `-ub 16384` arena 18 411.9 -> **22 819.7 MiB**, miss traffic 211 498.5 -> **129 117.3
+MiB (-39 %)**, decode **41.7 -> 45.1 t/s (+8.2 %)**; `-ub 32768` 12 183.0 -> **23 018.0 MiB**, traffic
+425 828.6 -> **126 134.3 (-70 %)**, **34.3 -> 45.3 t/s (+31.9 %)**; partial pool (`-lme 8` + `DIO=1`)
+**16.9 -> 23.1 (+36.8 %)**.  24 GiB RX 7900 XTX (`gfx1100`, PCIe 4.0 x16, r291 re-run at its field shape):
+arena 11 428.6 -> **15 995.3 MiB**, hit 0.7418 -> 0.8412, traffic 479 658.3 -> **296 483.2 (-38.2 %)**,
+decode **36.50 -> 43.61 t/s (+19.5 %)**.  The saturated/tiny-growth arms are byte-identical to base:
+2-device tensor 51.90 vs 51.90, 2-device layer 39.34 vs 39.37, 3-device 57.45 vs 57.51, `-ub 2048` batched
+bench B=1 49.61 vs 49.56 (ntg 2000) and B=1/4/8 47.89/127.36/176.52 -> 48.04/127.67/176.61 (ntg 512).
+
+**Gates.**  Same-seed greedy text byte-identical in every arm; MTP four-axis text and acceptance identical
+(R 0.62267, P 0.82563, C 0.91975, K 0.99200), decode +2.8..16 % where the band is taken;
+`gate-host-pool.sh` **54/54**; `gate-prefill-logits.sh --ab "MOE_EXPERT_CACHE_STEADY_REARM=0"` **KLD 0.000000 /
+top-p 99.990 %** on the MoE model; `llama-batched-bench -npl 1,4,8` neutral; no GPU faults.
+
+Still a **beta candidate**, not in `patches/`: where it folds is the maintainer's decision (block 09 needs a
+09-15 chain rewrite, block 15 is one commit but an APU/GTT semantic mismatch, `0301` is a new temporary
+block).  The recommendation is block 09 at the next re-base.  `beta/arena-steady-sizing/` carries the
+patch (sha256 `dcbfce70...`, applied tree `9cd799ca...`), its README and the tester checklist.
+
+## 261115.005 (r292) -- the expert arena was sized once, from the slab's *prefill* boundary: `-ub` silently shrank it by 21 % / 49 %.  A one-file beta candidate settles the count at each drop: +4.0 % on the 32 GiB R9700, +19.0 % on the 24 GiB 7900 XTX, same-seed text byte-identical
+
+Started as a feasibility question about a *strictly bimodal* slab (prefill band XOR expert arena on
+`--parallel 1`), and the assessment of that is `wip/bimodal-slab/` — short version: the modality mechanism
+already exists and is already engaged (the boundary move evicts whole tables, `moe_cache_rearm` re-arms and
+bulk-fills them at 17-33 GB/s, and at `-ub 32768` the code already leaves the arena 1 024 MiB of a 24.3 GiB
+slab), and a *modal reload* moves the same bytes at the same link rate, so it is worth ~nothing on 24-32 GiB
+(the on-demand fill hides behind compute: 44.6 t/s over a 128-token decode against 27.7 over an 8-token one).
+What the session actually found was the reason the proposal was asked for: **the arena shrinks as `-ub`
+grows and never recovers.**
+
+**The defect (r292).** The cache sizes itself once from `ggml_cuda_slab_arena_total()` = `arena_top -
+boundary`, sampled while the wide (prefill) compute view is live — the slab's birth `boundary` is the widest
+`--fit` probe layout, so it is `narrow + ring + wide` and ubatch-proportional. `g_sized` latches it,
+`moe_cache_rearm` restores only `g_rearm_slots[layer]`, and `TODO` #70 deliberately never revisits a deficit
+layer, so the band the prefill->decode drop returns is never given to the tables. Loss is exactly
+`max(0, boundary_at_birth - narrow_floor)`: **0 at `-ub 4096` (saturated), 1.4 GiB at 8192, 4.9 of 23.4 GiB
+(21 %) at 16384, 11.2 of 22.8 GiB (49 %) at 32768.** `MOE_EXPERT_CACHE_SIZE_AT_PRIME=0` changes nothing
+(byte-identical), and an explicit `MOE_EXPERT_CACHE_MIB=24000` is silently free-clamped — the census reports
+`requested=24000 MiB/device, free-clamped=1` next to an 18 137 MiB arena and 10 781 evictions.
+
+**The candidate (`beta/arena-steady-sizing/`, one file, one commit).** At each drop (the narrow re-reserve
+has already shrunk the boundary, so `arena_total()` *is* the decode steady-state arena) scale the sizing
+count by `min(avail_now, request) / avail_sizing`, growth only, capped at each layer's expert count. No table
+scan, so it cannot disagree with the sizing about which tables count — diverging there builds a non-uniform
+layer, the one state that reads the wrong expert. Kill-switch `MOE_EXPERT_CACHE_STEADY_REARM=0` is bit-for-bit
+the old behaviour.
+
+**Measured** (1 × R9700, QFN IQ3_S, `-ncmoe 47`, `-ub 16384`, `--parallel 1`, 4 k prompt + **2 000** greedy
+tokens, two snapshot builds, interleaved ABAB, heat prior pinned): arena 18 411.9 -> **22 705.1 MiB**, hit
+0.8337 -> 0.8866, decode **51.45 -> 53.54 t/s (+4.0 %)** on a 100 % mirror host tier; and on a partial pool
+(`-lme 8`, `DIO=1`) **18.30 -> 23.60 (+29 %)**. Expert miss traffic **-32 % / -29 %** (302 194 -> 204 406 MiB
+and 271 398 -> 192 635 MiB over the run) — the hardware-independent figure; how much wall time that buys
+depends only on whether the expert path is the bottleneck. **Same-seed greedy text byte-identical**
+(`sha256 af0ec4edd999a414`) with the settle provably firing.
+
+**Validated on the target hardware (RX 7900 XTX, 24 560 MiB, `gfx1100`, PCIe 4.0 x16, 61 GiB RAM -> mirror
+host tier), at that box's own field `runme`, `-ub 16384`, ctx 32 768, 2 000 greedy tokens, 2 interleaved
+cycles:** arena **7 962.5 -> 12 888.2 MiB (+62 %)**, hit 0.6038 -> 0.7337, miss traffic **757 391.7 ->
+500 773.0 MiB (-33.9 %)**, decode **45.44 -> 54.09 t/s (+19.0 %)**, greedy text byte-identical.  The defect
+there is `6.50 - 1.875 = 4.6 GiB` of an **8.12 GiB** arena -- e.g. the base arm is link-bound (379 MiB/token
+of expert traffic at 45 t/s ~= 17 GB/s).  **So the same change is +4.0 % on the 32 GiB R9700 and +19.0 % on
+the 24 GiB 7900 XTX: arena capacity is worth roughly `1/arena_size`, and a 32 GiB card understates the class
+by ~5x.**  That is the strongest argument yet for validating arena/residency work on the *smallest* card
+available.  Reverting the patch on that host left `b1f559df7` clean; two snapshot builds are kept there as
+`/tmp/tree-base/bin` and `/tmp/tree-fix/bin`.
+
+Two methodology corrections this session produced, both now in `INVARIANTS.md` r292: **never measure a
+Two methodology corrections this session produced, both now in `INVARIANTS.md` r292: **never measure a
+residency change at 128 generated tokens** (the same change reads +1.8 % there and +4.0 % at 2 000, because
+the arena reaches steady state after a few hundred tokens), and **the arena's value is the cost of a miss,
+not the hit rate** (0.834 hit at 51.5 t/s on a mirror vs 0.852 hit at 18.3 t/s on a partial pool — quote the
+miss bytes and convert with the link rate; this box's PCIe5 x16 + PCIe5 SSD is the best case for masking it).
+
+Not in `patches/`: the patch edits a file blocks 09/10/15 own, and where it folds is a maintainer decision
+(amend block 09 needs a chain rewrite — the sizing loop's block-09 context predates block 15's GTT branch;
+block 15 is one commit but a poor semantic fit; `0301` is a new block). Staged in `beta/` per the WIP and
+promotion rules, with the checklist in its `BETA-TESTING.md`. Gates not yet run: the MTP four-axis protocol,
+`gate-host-pool.sh`, `llama-batched-bench -npl 1,4,8`, depth-varied decode, and `validate-set.sh` once it is
+in the set.
+
+## 261115.004 (r291, RELEASE v16-4f9dfa0e3-r291) -- block 12 gains sequence parallelism for the qwen4exp hyper-connection work (PR #315, @briansp2020): default ON, +7 % copy-engine / +2.2 % default-chain prefill at 31.5k, +15.3 % MTP prefill
+
+PR #315 (`wip/seqpar-r289`, v2 of a series reviewed here on 2026-11-15) keeps the qwen4exp residual streams
+token-split through a 2+-device `-sm tensor` prefill, so the hyper-connection chain -- mixers, combine, gated
+norms, the shared expert and the GEMMs over them, which every device used to run for **every** token of a
+ubatch -- runs on each device's own slice instead.  It is accepted **into block 12** (`campaign remainder`: the
+block that owns the `ALL_GATHER` collective, the Meta collective dispatch and the op-table plumbing this
+extends), with **no new block**, and it ships **default ON** (`LLAMA_SEQPAR=0` is the kill switch).  The v2
+resubmission answered the whole correction list from the 2026-11-15 review: the purity claim is corrected in the
+README and the commit messages (the per-token chain at `T/n`, **not** the reduce-scattered sums), the switch is
+inverted, the `MIN` sweep and the env table are supplied, the three diagnostic lines are implemented (executed
+form census, not-engaged reason, a gather-side scratch message that no longer consumes the all-reduce's flag),
+the decode/verify inertness arm is added, and the cross-backend fallback is stated.  We made the **3-card
+extension** (the contributor's series gated on exactly 2 devices) and re-cut the two `optional/` artifacts.
+
+**Everything of the review reproduced on our box, to the digit.**  Off is inert: `LLAMA_SEQPAR=0` reads prefill
+logits **0.000000 / 99.990 %** against the r290 binary and byte-identical greedy text at 2 devices
+(`3098a0b3693c`), 3 devices and `-sm layer` (`19d357f76b27`).  The family-switch point is unchanged from the
+review: base PPL **2.8450**, control (`-ub 256`) **2.8502**, candidate **0.014184 / 96.373 %** (bf16 wire),
+**0.010644 / 96.833 %** (F32 wire), **0.014184** with `RS=0` (the reduce-scatter is provably not the source).
+Their own table's numbers matched ours exactly -- 0.014184 / 96.373 %, control 0.013587 / 96.225 %, base PPL
+2.8450, control 2.8502 -- on a different box, which is the strongest evidence a contributor's claims can have.
+
+**What it measures here** (Flash-Next GSQ-RCO IQ3_XXS, `-ncmoe 47 -ot per_layer_token_embd.*=CPU`, `-ub 4096`,
+pinned heat prior, two interleaved rounds): pp31500 copy-engine chain 2635.9/2774.7 -> **2828.0/2967.7
+(+7.3/+7.0 %)**; default (RCCL-ring) chain 2634.9/2638.8 -> **2693.3/2693.7 (+2.2/+2.1 %)**; MTP
+(`draft-mtp n3`) prefill 1275.4 -> **1471.1 t/s (+15.3 %)** with decode flat (92.1 vs 92.0) and different text;
+`llama-batched-bench -npl 1,4,8` flat at 1/4 slots and +3.2 % prefill at 8.  **3 cards** (our extension): ce
+3445.3 -> 3539.7 (**+2.7 %**), default 3134.3 -> 3200.1 (**+2.1 %**), 3-device logits 0.014133 / 96.147 % against
+a control of 0.013662 / 96.235 % -- the reduce-scatter declines there (its copy-engine exchange is 2-rank by
+construction) and only the gathers work, which is the documented shape of the extension.
+
+**Two decisions, both from measurement.**  (1) **`LLAMA_SEQPAR_MIN` stays 512**, and the contributor's
+"ahead at every T" sweep does not reproduce here: `-p 8192` reads **-1.0 % at 128**, **-0.8 % at 256**,
+**+6.4 % at 512** (ce) / **+3.0 %** (default), +8.3 % at 1024.  A floor that ships must be a win, so 512 it is.
+(2) **The bf16 gather wire ships** even though the F32 wire is *better* on both logit metrics: the F32 wire is
+**-2.1 %** against seqpar off on the default chain (2578.6 vs 2634.9 t/s), because the gather bytes are the whole
+cost there.  The bf16 wire is exactly its own round-only control (`GGML_SEQPAR_GATHER_ROUND=1`), so the logit
+difference is the wire's rounding and nothing else; `LLAMA_SEQPAR_GATHER_BF16=0` is the documented trade, not a
+free purity dial (`ENVIRONMENT.md` §21).
+
+**One limitation, measured, bounded -- and then closed by a floor guard.**  The contributor reported a crash with
+`LLAMA_SEQPAR_MIN` forced low; we reproduced and characterised **two** failure modes in the band below 128 tokens:
+a token-split ubatch of 48..112 tokens can overflow the thread stack in the Meta split-state recursion (block 09's
+cache -- a nested lookup retires the cache version the non-recursive warm walk is filling, so the recursion
+descends the whole `src` chain), and with `MIN` <= 2 the **2-token warmup graph** trips the token-scatter
+split-state assertion deterministically.  Measured: crashes at T = 48, 64, 80, 112 (and every `MIN` <= 2 run at
+its 2-token graph); clean at 32, 96, 128, 144, 160, 192, 200, 224, 240, 256 (`-p 24576`), 320, 512, 1024, 2048,
+4096, 31500, and seqpar-off is clean at the same T.  I tried the obvious cache fix (restart the walk when a nested
+lookup moves the version) and it does **not** close it -- the switch that matters happens on the root's own lookup
+*after* the walk -- and the cheap alternative (resolving a miss from any version with a byte-identical entry)
+crosses the version-consistency invariant the cache exists to keep, a wrong version of which mis-splits tensors
+**silently**.  So the cache work stays `TODO` #330, and the *band* is closed instead: **`LLAMA_SEQPAR_MIN` is
+clamped to 128 with one WARN**, so a mis-set value degrades to "off" for the ubatches it cannot handle instead of
+aborting.  The shipped default (512) is above the clamp and untouched, `MIN=2 -ub 32` now exits 0 and reports
+`not engaged`, `MIN=128 -ub 128` engages and runs clean, and `scripts/gate-seqpar.sh` arm 6 asserts the clamp.
+
+**Gates.**  `scripts/gate-seqpar.sh` (new: off-inert logits, the F32-wire family-switch calibration, bf16 ==
+its own round-only control, the ON text + executed-form census, ON==OFF text in every layout that cannot split
+with its `not engaged` reason, the T=128 bound, GPU faults) -- PASS.  `scripts/validate-set.sh` -- OK (strict
+apply from a fresh base tarball, applied tree `04bc47fc`, both optional artifacts re-cut and verified alone and
+cumulatively, 512-file Windows portability scan clean).  Prefill logits at 2 and 3 devices (above).  MTP and
+`-npl 1,4,8` arms (above).  CPU-only and Vulkan `llama-cli` builds compile.  No GPU fault in any run of this
+release.  `release.json` was regenerated (`make-release.sh`), and its `.tip` -- which was recorded at r290 as
+`14f3749bed`, a typo for `14f3749bea...` that made `scratch-tree.sh arm` and `fork-refresh.sh` unable to check
+the tip out -- is fixed.  It names the **`apply-all.sh` re-cut tip** (`ec721312c`), not the working chain's
+(`951ec437b`, same tree): the two differ by the re-cut's committer stamp, and recording the working one is the
+trap `AGENTS.md` calls out -- `fork-refresh.sh` caught it (`release.json .tip does NOT match`) and the value was
+corrected to what the branch carries.
+
+**Records.**  `benchmarks/2026-11-15-seqpar.md`; `patches/README.md` block 12; `ENVIRONMENT.md` §21;
+`INVARIANTS.md` r291; `GREEDY-PURITY.md` §92; `TODO` #330 (and #328 closed by this entry); `scripts/README.md`;
+the submission's own notes are archived at `archive/work/seqpar/`.
+
+## 261115.002 (r290) -- block 07 gains the verify band's WMMA iu8 matvec family (PR #317): opt-in `--wmma-verify N|auto`, floor 7, Q8_0 included.  +10.6 % at 8 columns on a 2-GPU tensor split, byte-identical to r289 with it off
+
+PR #317 (@burnoutIA; campaign record now in `archive/work/rdna4-wmma-verify/`) offers a 2..16-column WMMA `iu8` matvec family for the
+speculative verify band.  It is accepted **into block 07** (the decode-numerics block: it owns
+`vecdotq.cuh`'s `vec_dot_*` family and the `mmvq` K-split loop, and its contract is already "same
+real-number result, different addition order") as an **opt-in that is OFF by default**, with three
+changes to what was offered: the floor is a **CLI option** (`--wmma-verify off|auto|N`, `auto` = 7)
+rather than an environment variable alone, the shipped floor is **7 and not 2** (below 7 the family is
+slower than the kernel it replaces -- see the curve below), and the family covers **Q8_0 as well** (ours:
+~40 lines, exact to 1.7e-7, worth +4 % at 8 columns -- the format most likely to be run at a deep verify
+width on a 2-card box).  Nothing of the default delivery changes: with the floor at 0 the hook is not
+reached and this release is byte-identical to r289 on every measured arm.
+
+**What it is.**  For a dense, unfused `MUL_MAT` at N..8 columns on RDNA4, the product is computed with
+`wmma_i32_16x16x16_iu8`, dequantizing each weight **once for all the verified columns** instead of once
+per column (the K-split kernel's cost, which is why it becomes instruction bound at 7-8 columns: 25.9 ->
+34.3 ms of matvec time per pass at 1 -> 8 verified tokens on 27B UD-Q4_K_M).  Q4_K, Q5_K, Q6_K, IQ4_XS
+and Q8_0, read in their GGUF layout on the existing q8_1 activations (`block_q8_1.ds`, DPP `row_share` for
+the 8 column scales a lane accumulates); Q4_K/Q5_K's min term is `d.SUM(xq)` through a ones matrix, as
+`vec_dot_q4_K_q8_1` does.  Numerics against the K-split kernel: **~3.2e-7 relative** (max 4.2e-5 on a
+130-magnitude output) at widths 2..8 for every covered type; Q8_0 1.7e-7.  Not bit-identical, so it is
+opt-in -- see `GREEDY-PURITY.md` §91.
+
+**The band is 2..8, not 2..16, and the win is width-shaped.**  Two measurements decided both the "16"
+claim and the floor:
+
+| verify width | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9..16 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 GPU, Q4_K_M | -- | -8.5 % | -4.8 % | -3.4 % | -1.6 % | +1.9 % | +5.8 % | **+9.4 %** | n/a |
+| 2 GPU tensor, Q4_K_M | -- | -5.7 % | -4.7 % | -5.3 % | -4.7 % | -4.4 % | +7.1 % | **+10.6 %** | n/a |
+| 2 GPU tensor, Q8_0 | -- | -1.0 % | -0.2 % | -0.7 % | -0.5 % | +1.4 % | +2.0 % | **+3.7 %** | n/a |
+
+(Content-fixed: `llama-batched-bench -npp 512 -ntg 64 -npl 1..8`, TG t/s, ON vs OFF.)  Widths 9..16 are
+**unreachable on a dense model**: the delivery dispatches `ne11 > 8` to MMQ, and the RDNA4 "dense band"
+promotion that could reach 9..16 requires `src0->ne[1] % 128 != 0`, which none of a 27B's matrices
+satisfies -- measured as **0.0 difference at widths 9, 13 and 16**.  Hence `auto` = 7 (the first width it
+wins) and hence adaptive MTP `n_max 12` -- whose deep rounds are width 9-13, i.e. MMQ -- is *neutral*
+(recall cycle +0.8 %): the feature's footprint is a **fixed deep draft**, DFlash2 `n_max 5..7`.
+
+**End to end** (27B, 2-GPU tensor split, `--wmma-verify auto`, acceptance held identical):
+
+| arm | off | on | cycle |
+|---|---|---|---|
+| DFlash2 `n-max 7`, recall | 205.6 t/s | **221.5 t/s (+7.7 %)** | 36.5 -> 33.9 ms (-7.2 %) |
+| four-axis R (adaptive n7, `-n 3000`) | 91.0 | 91.6 (+0.7 %) | 30.1 -> 29.9 ms |
+| four-axis P | 121.3 | 126.8 (+4.5 %) | 37.8 -> 37.0 ms |
+| four-axis C | 151.6 | 161.8 (+6.7 %) | 40.4 -> 38.1 ms |
+| four-axis K | 169.7 | 175.9 (+3.7 %) | 40.1 -> 38.7 ms |
+| `llama-batched-bench -npl 1,4,8` (TG) | 48.8 / 157.7 / 231.5 | 49.1 / 157.1 / **261.3** | +0.7 / -0.4 / **+12.9 %** |
+| 27B Q8_0 + DFlash2 `n-max 7`, recall | 170.1 | 177.3 (+4.2 %) | 43.6 -> 41.8 ms |
+
+**Gates (all of them, this release).**  Coherence: with the option unset the amended build is
+**byte-identical to the r289 build** on the spec arm (27B UD-Q4_K_M + DFlash2 n7, 2 GPU tensor, code
+prompt: sha `ce6f9a37494b` both) and on plain decode (prose, 1 GPU: sha `75baf55d43c0` both), both arms
+with `ROCBLAS_USE_HIPBLASLT=0`.  MTP: the four-axis above at `-n 3000` (all four non-negative) plus the
+`-npl 1,4,8` arm.  Prefill logits: KLD **0.000697** / same-top-p **98.784 %** (limit 0.005 / 98 %), i.e.
+the default path did not move.  Per-block build: **17/17** on a wiped build dir per commit.  GPU faults:
+clean (journal + logs).  `validate-set.sh`: OK, including the 512-file Windows portability scan and both
+optional artifacts re-cut onto the new tree.
+
+**What changed from the PR.**  (1) `--wmma-verify off|auto|N` is the interface; `GGML_CUDA_WMMA_MMVQ=N`
+stays as the environment alias and **wins when set**, so a gate can force either arm (`=0` disables a run
+the option enabled).  (2) The floor ships at 7, not 2.  (3) Q8_0 added, which needed a per-format stride
+unit (`row_bytes = stride_row_x * RB`): a Q8_0 block is 32 elements where a K-quant's is 256, and the
+PR's `stride_row_x * BB` reads garbage there (it aborts).  (4) The "2..16 columns" claim is corrected to
+2..8 with the reachability reason.  (5) `=1` is clamped to 2 -- it would have taken width-1 *decode* off
+the K-split kernel, contradicting the PR's own note.  (6) Reported to the submitter on the PR, which
+carries their authorship (`Co-authored-by` on blocks 07 and 08).
+
+**Attribution and the campaign record.**  The kernel, the four K-quant formats and the measurement
+protocol are @burnoutIA's (PR #317); the Q8_0 case, the floor, the option plumbing and the numbers above are
+this release's.  The campaign is **promoted**, so its record lives in
+[`archive/work/rdna4-wmma-verify/`](archive/work/rdna4-wmma-verify/README.md) (the submitter's own README
+verbatim, plus the resolution: what shipped, what changed from the offer and why); blocks 07 and 08 of the
+fork carry `Co-authored-by: burnoutIA`, and `README.md` lists them under Community Acknowledgements.
+
+---
+## 261115.001 (r289, wip) -- PR #316 (`wip/gdn-conv-norm-deferred-gather`) reviewed and NOT taken: the fusion it fixes is not issued on r289 at all -- the r244 one-kernel conv step owns the decode/verify band
+
+PR #316 (@burnoutIA) is one patch (`gdn-conv.cu`, +13/-2) that skips `gdn_conv_norm_match`'s overlap
+test against `m.state` when that state's `GET_ROWS` is in `gdn_deferred_gathers`, i.e. when the GDN conv
+kernel reads the cache row itself.  It is a correct change where it fires, and it applies with a strict
+`git am` on the r289 tree, but its motivating observation and its measurement are stale: **on r289 the
+shape it describes never reaches the matcher**, so nothing is refused and nothing is saved there.
+`CHANGES_REQUESTED` on the PR; nothing of it is applied or committed, and `wip/` is unchanged (the PR's
+`wip/gdn-conv-norm-deferred-gather/` directory is also not registered in `wip/CAMPAIGNS.md`).
+
+1. **The r244 one-kernel conv step owns the path.**  `ggml_cuda_gdn_store_try_fuse()` is dispatched ahead
+   of `ggml_cuda_gdn_conv_try_fuse()`, and `gdn_conv_store_kernel` (`gdn-conv-store.cu`) already writes
+   the q/k norm outputs.  Census on the r289 tree (27B UD-Q4_K_XL + DFlash2-Q4_K_M, `draft-dflash
+   n_max 7`, 128 tokens, one counter in the matcher's caller and one in `gdn_store_launch`):
+   `94 x GDN_CONV_STORE T=8 S=1` (every verify step) and `47 x GDN_CONV_DIRECT T=42 snap=0` (the
+   prefill).  No `T=8` call enters `gdn_conv_norm_match`.  The code agrees: the deferral needs `m.snap`,
+   every `n_rs_seq > 0` graph uses the SET_ROWS store, and `gdn_conv_check()` sets `snap_ok = false` for
+   it -- so `m.snap` is false and `ggml_cuda_gdn_conv_gather_deferrable()` declines.  The patch cannot
+   touch a draft-armed graph on r289, with the store on or off (with `GGML_CUDA_FUSE_GDN_CONV_STORE=0`
+   the matcher is not entered either; text identical).
+2. **The measurement predates r244.**  The README's numbers are from the delivery of `81e969e`
+   (2026-11-03) and say "the matcher is unchanged between that tree and r289" -- true of the matcher text
+   (only the `getenv` caching differs) but the *dispatch* changed on 2026-11-09 (r244, PR #292).  r289
+   reproduction (DFlash2 n7, `prompts/recall.txt`, 256 tokens, temp 1, seeds 42/43/44, patched vs
+   unpatched, interleaved): acceptance identical (170/586, 173/569, 208/328), generation 55.2/55.1,
+   56.8/56.7, 98.8/99.0 t/s -- inert.
+3. **The one arm that fires, and what is left open.**  `test-logits-width-probe
+   prompts/prose-rdna-boosts.txt 4096 512 KV=q8_0`: at `W=6,7,8` the unpatched build refuses (48/layer,
+   `snap=1`), the patched build folds, and the probe's W1..W8 + row0/row1 hashes are byte-identical with
+   `width_purity=PASS` (so the skip is safe).  No production arm reaches it: short prefills at T=9..15
+   already fold, and `--spec-type ngram-mod` verify at T=8 and T=16 already folds at a short and a
+   ~5.8k-token context (its T=65 arm is a legitimate non-deferred refusal, where the kernel really reads
+   the state buffer).  The open question returned to the submitter is a path census on a tree with r244
+   (or `main`) proving the matcher is reached with a deferred gather in a deliverable arm, plus the
+   README correction and the `wip/CAMPAIGNS.md` entry.
+4. **What was verified so it does not have to be re-derived.**  Strict `git am` on the r289 tree; the only
+   file touched is `ggml/src/ggml-cuda/gdn-conv.cu`; no new environment variable; `GGML_CUDA_FUSE_GDN_CONV_NORM=0`
+   still stands the fold down; `gdn_conv_decode_ok` keeps calling the matcher without a context, so the
+   single-token decide is unchanged; `test-backend-ops -o SSM_CONV,GATED_DELTA_NET,RMS_NORM` 236/236 on the
+   patched build (MUL_MAT is untouched by a gdn-conv-only diff).
+
+## 261114.010 (r289) -- issue #314: a windowed KV on an UNEVEN tensor split faults the GPU because the spill boundary was one byte offset for tensors with different cell strides; the boundary is a per-tensor cell count from the USED extent now, every child's in-place rate is calibrated, and `-sm layer` becomes the recommended split on a heterogeneous or slow-link set
+
+**`release.json` changed: release `v16-4f9dfa0e3-r288` -> `v16-4f9dfa0e3-r289`; 17 default patches (16
+official + 1 temporary) and 2 optional, unchanged in number; tip `8b653ad6d…` ->
+`b1f559df78d472b70b1d7ce1c9e2139c9ca7ebd3`, tree `79d18f41b…` ->
+`7181d396977e90270528d8478ee7b04894a3f39e`; base unchanged (`4f9dfa0e3`).**  Block 14 (the streamed KV) is
+amended; blocks 00-13 and 15 carry the same deltas as r288 (the per-block ladder confirms it: 2/2 built, 15
+skipped as unchanged).  The optional artifacts are unchanged but their recorded trees moved with the default
+tree (`0100` -> `b15769c72`, `0101` -> `be40d5ed4`, cumulative `1c09de9a0`).
+
+**F1/F2.3 -- the fault, and its root cause (a real defect, reproduced on this box).**  The reporter's
+`-ts 24/16` 2-device 27B died in `rms_norm_mul_rope_f32` (`HSA_STATUS_ERROR_MEMORY_FAULT`, "Page not
+present", grid `[256, 2048, 1]`) at the first spill slide, and the q8_0 arm's refusal
+("region 868 MiB, mapped 734 MiB, wanted 864..868 MiB, cap 0 MiB") was the same bug's other face.  Cause: a
+tensor split shards the KV row by the `-ts` ratio and rounds each shard to its own head grid, so an **uneven**
+ratio gives two tensors of ONE cache different cell strides in the same VMM region (measured
+`LLAMA_KV_REGION_DEBUG` on a 27B at `-ts 24/16`: 1024 B and 1536 B on device 0, and the region is 480 MiB /
+288 MiB across the pair).  The window computed ONE byte boundary from `vmm_tensors[0].nb1` and applied it to
+every tensor: the shorter tensors' VRAM watermark (a max over the region) already sat past their whole extent,
+so their resident tail was never mapped and the first ubatch that wrote it faulted; on the last tensor the
+`lead` span ran past the region end, which is the "wanted 864..868 MiB" refusal.  An **even** split has uniform
+strides and is clean, which is exactly why every gate arm (all even) missed it.  Reproduced on 3 identical
+R9700 at `-ts 24/16` (`-b 8192 -ub 2048 -p 4096 -d 8096`, `--kv-window 8192`) and NOT at `-ts 1/1`.  Fix: the
+boundary is a **cell count** (`used - W`), turned into bytes and floored to the map unit in **that tensor's**
+`nb1`, with per-tensor `lead`/`dev` watermarks (the write path picks the owning tensor's boundary too), plus a
+defensive region-end clamp that reports itself.  After it: the same arm completes every depth, no journal
+fault, `-ts 1/1` unchanged (22.19 vs 21.95 t/s at `d16384`).
+
+**F7 -- the padded extent no longer decides what spills.**  `grow_regions()` grew and slid from the PADDED
+`get_n_kv()`; on a multi-device split `LLAMA_KV_N_PAD_PREFILL` defaults to 8192, so a 12192-cell depth asked
+for 16384 and spilled 8192 cells of a window of 8192, i.e. **fewer than W used cells stayed resident**.  The
+hook now takes both extents: `n_cells` (padded) is still what is MAPPED (the graph's views read it), `n_used`
+(the used extent) is what the spill boundary follows.  Measured effect at `d8096` `-ts 1/1`: no spill at all
+(used 10144 - W 8192 = 1952 cells is under one map unit) where the padded boundary spilled 8192 cells.  Cost of
+the honest model: a windowed split's VRAM is `W + (padded - used)` cells, stated in `ENVIRONMENT.md` and in the
+window line.
+
+**F2 -- the refusal now says what failed.**  `ggml_backend_cuda_kv_region_log()` printed
+`LLAMA_KV_REGION_MAP_MAX_MIB` as "cap" unconditionally, and that knob is 0 when unset, so a pinned-host
+mapping failure, a VRAM exhaustion and a real cap hit all read "cap 0 MiB".  It takes a reason now and prints
+the cap clause only when a cap is set; the pinned-budget refusal adds the bytes it could not pin next to
+`ggml_cuda_kv_spill_allow()`'s arithmetic.  Verified with `LLAMA_KV_REGION_MAP_MAX_MIB=8`:
+"...reason: LLAMA_KV_REGION_MAP_MAX_MIB is 8 MiB and this mapping would end at 20 MiB".
+
+**F3 -- the per-cell figure was 32x low.**  `WINDOWED KV ENABLED` printed `cell` (one tensor's row, 2.0 KiB on
+a 27B) where the spill is counted in `cell_all` (64.0 KiB: every K/V tensor).  It prints `cell_all` now and
+says so, matching the RAM-budget line in the same release.
+
+**F4 -- the cost model calibrates every child and reads them in parallel.**  `llama_kv_cache` and `--fit` both
+built the estimate from `dev_layer(0)`: one card's rate for the whole spill, and the other card never measured.
+Both now enumerate the Meta wrapper's children, calibrate each one's in-place host read, weight by the split's
+shares and quote `max_i(share_i x bytes / rate_i)` (the children read in parallel), e.g. "23.1 GB/s on device 0
+(60 % of the split, its share in 97.7 ms) + 11.8 GB/s on device 1 (40 %, 127.6 ms) ... the slowest share sets
+the wait".  Two measured caveats are recorded in `INVARIANTS.md`: the calibrated number is a cold burst, so the
+quoted ms is a floor (at 65536 cells the sustained aggregate is ~10 GB/s per device), and a window at or above
+the run depth costs **nothing** on a split (2x R9700, 27B, a 5996-token request, pp5996 / tg64: 1853.9 / 43.07
+without a window, 1850.1 / 43.16 at `W=8192`, 1849.8 / 43.15 at `W=65536`, 1807.7 / 43.06 at `W=1`), so **F6
+does not reproduce here** -- the 29 % the reporter measured is their mixed gfx1100+gfx1201 x8 pair with
+known-bad compiler flags, not the split's region-backed KV path.  Same at `-ts 24/16`, `-p 4096`:
+1689.2 / 38.13 without a window, 1684.0 / 38.22 at `W=8192`, 1685.2 / 38.12 at `W=65536`.
+
+**F5 -- `--fit` does size a window on a split; the `auto` message is the defect.**  The reporter's
+"the windowed KV needs one region-backed KV cache to size against (this config has 2 device(s))" came from the
+single-device branch, but a `-sm tensor` config takes the tensor-split branch that sizes and clamps against the
+split's per-device budget (verified: `--kv-window auto -fitt 1024` decides "no window is needed" instead of
+doing nothing, and `llama-fit-params -c 65536 --kv-window 8192` reports the windowed split).  On a **layer** or
+row split the window does host (one region per device, verified on 2 devices), but `--fit` cannot size it: there
+is no single KV byte count or budget to divide.  That branch now says exactly that and, for `auto`, declines the
+window explicitly ("pass a fixed N to window it") instead of leaving it "as configured".
+
+**Along the way (found while investigating, fixed here).**  `LLAMA_KV_REGION_DEBUG`'s exhaustive host re-read
+ran on **every** `grow_regions()` call, i.e. on every batch even when the mapping had not changed, which turned
+a 22 t/s decode into **1.3 t/s** with the knob on and made three debug runs look like a performance
+regression; it now runs only on a grow that changed the mapping (`mapped_after != mapped_before`), and logs the
+per-tensor layout once (that layout is what identified the F1 cause).  `-sm layer` is now the **recommended**
+split on a heterogeneous, imbalanced or slow-link set (`README.md`, `INVARIANTS.md`): a tensor split needs the
+cross-device all-reduce on every layer's critical path, so the slowest card and the slowest link set every
+token's pace, and an imbalanced ratio produces the uneven shards above; a layer split keeps whole layers per
+device (no all-reduce, no sharded tensors) and is what the gates cover most heavily.
+
+**Gates (all on the r289 tree).**  `scripts/gate-kv-window-split.sh` PASS, including a NEW uneven-split arm
+(`ref2u`/`win2u` at `-ts 6,4`, whose debug re-run must show >= 2 distinct cell strides in one region or the arm
+is an even split in disguise) with `win2u == ref2u` and no fault, and the recorded r204 hashes reproduced
+exactly (`win3 = 057ea27b1009`, `win2 = ref2 = win2mtp = ref2mtp = 7a7430617465`, acceptance 0.46154, 32 flips
+per device, 128 at a 1 MiB unit, `big2`, `win1`, `nkvo`, 6 fit arms).  `scripts/gate-kv-residency.sh` PASS
+(window + pool arms; `wspill` 64 MiB host-backed, pool 89.96 % / 89.24 % hit rates).  `scripts/gate-state-pipe.sh`
+PASS **with and without** `LLAMA_KV_RESIDENT_CELLS=2048` (windowed: batched save+load 23.6 ms vs the synchronous
+arm's 43.2 ms, bound 3.0x; the write path is what the per-tensor boundary changed).  `gate-prefill-logits.sh`
+PASS at both points: canonical 0.000697 / 98.784 %, and `--device 0,1,2 --sm tensor` 0.000000 / 99.990 % against
+the recorded base.  `gate-per-block-build.sh --changed-from 8b653ad6d`: 2/2 built (`all` target), 15 skipped as
+unchanged.  `validate-set.sh` OK (17 default + 2 optional, tree `7181d3969`, cumulative optional `1c09de9a0`,
+Windows portability lint clean over 510 files).  Kernel journal clean in every gate.  MTP (the canonical dense
+arm of `benchmarks/mtp-adaptive-methodology.md`, 1 GPU, 27B UD-Q4_K_XL, bf16 KV, `-n 3000`): draft-mtp
+**55.4 t/s** against plain **30.1 t/s** (1.84x), acceptance **0.55463** (1 873/3 377, mean len 2.66), i.e.
+draft >= plain and acceptance above the ~0.45 floor; the windowed split's own MTP arm is covered by
+`gate-kv-window-split.sh` (`win2mtp == ref2mtp`, identical acceptance, batched state save on the region path).
+
+**Reply:** posted on issue #314 (no em dashes), including the split-mode recommendation, and the issue is
+closed.  The recommendation is stated with its counter-measurement so nobody reads it as "layer is always
+better": a HOMOGENEOUS deployment keeps `-sm tensor` (2x R9700, Flash-Next IQ4_NL, `-ncmoe 48`: 35.5 vs 25.7 t/s at the
+same hit rate, the r16 record), and `-sm layer` is the first thing to try on a **mixed or imbalanced** set
+(different architectures, uneven VRAM, a card behind a slower link) or when several multi-device features are
+stacked, because then the all-reduce on every layer's critical path and the uneven shards both bite.  That
+qualification is in `README.md` -> *Picking a split mode*, in `INVARIANTS.md`, and as a pointer from the
+`-sm layer` vs `-sm tensor` row of `COMMUNITY-CONFIG.md` (whose numbers are, and are now labelled as, a
+homogeneous deployment).
+
+**Records:** `patches/README.md` block 14 amendment note, `INVARIANTS.md` (four new facts), `MANIFESTS.md`
+(block 14 row + gate 18), `ENVIRONMENT.md` (`LLAMA_KV_N_PAD_PREFILL` and a windowed KV), `README.md` (the split
+mode section), `scripts/README.md` + `scripts/gate-kv-window-split.sh` (the new arm).
+
+## 261114.009 (r288) -- the block-number re-org: 16 official blocks `0000`-`0015` + the temporary `0300` + the optional `0100`/`0101`, and the mixed K/V cache leaves the default set; no code change, so the tag goes `v18` -> **`v16`**
+
+**`release.json` changed: release `v18-4f9dfa0e3-r287` -> `v16-4f9dfa0e3-r288`; 18 patches -> 17 default
+(16 official + 1 temporary) + 2 optional; `n_blocks` 18 -> 16, plus the new `n_default` 17,
+`n_temporary` 1, `n_optional` 2, an `optional` map and `optional_tree`; tip `f8c79c35c9…` ->
+`8b653ad6d64fda0703c240ed8deb0cb15c2b44b5`, tree `89b25552…` -> `79d18f41b9ab9b235d35fd3a5034858eddd94844`;
+base unchanged (`4f9dfa0e3`).**  **No block's code changed.**  This is a *structure* change: the apply order,
+the ranges and the counts.  The re-org was the maintainer's call (`wip/block-number-reorg/`, now
+`archive/work/block-number-reorg/`), not a gate outcome.
+
+**The ranges (now `AGENTS.md` policy).**  `00xx` = official supported blocks, contiguous from `0000`; `03xx`
+= **temporary** blocks, in the default apply after every `00xx`, **not** counted in `v<N>`; `01xx` =
+**optional** blocks under `optional/<name>/<NNNN>-<name>.patch`, applied only by
+`scripts/apply-all.sh --include-optional[-all]`, in numeric order, after the verified default tree.  The
+default apply is therefore **all `00xx` then all `03xx`** (`release.json.n_default` patches).
+
+| was | is | note |
+|---|---|---|
+| `0014` `-sm relaxed-tensor` (temporary) | **`0300`** | re-ported onto the new tip; applied last, not an official block |
+| `0015` streamed KV | **`0014`** | same bytes, new number |
+| `0016` UMA GTT expert store | **`0015`** | same bytes, new number |
+| `0017` mixed K/V cache types | **optional `0101`** | left the default set; `optional/mixed-kv/` |
+| (unnumbered) `optional/two-lane-prefill` | **optional `0100`** | `optional/two-lane-prefill/0100-two-lane-prefill.patch` |
+
+**Why `v16`, not `v17`.**  `N` is the number of **defined official blocks in `0000`-`0099`** only: 16
+(`0000`-`0015`).  `0300` is temporary and `0100`/`0101` are optional, so none of them counts.  The
+`v<N>` prefix is now **derived** by `scripts/make-release.sh` from that count (it refuses a `--release`
+whose prefix disagrees), never hand-written.
+
+* **Invariant 1 — the default tree is unchanged.**  `0000`-`0015` + `0300` builds
+  `79d18f41b9ab9b235d35fd3a5034858eddd94844`, byte-identical to r287's default tree with block 17 removed
+  (r287's `83d2593fe^{tree}`).  The intermediate trees *do* differ from r287's (old `0014`'s content now
+  arrives last), which is why the temporary block was re-ported rather than renamed; the final tree is the
+  contract and it matches.
+* **Invariant 2 — mixed K/V is preserved, bit for bit.**  The default tree + optional `0101` produces
+  `89b2555296146290f556f1cf017ed6ee124dfce6`, **exactly the r287 release tree**: moving block 17 to the
+  optional set changed no byte of it.  Cumulative `0100` then `0101` = `d85868cdd23447b4d7fa0f9b9f5f7bb5fa7363cf`
+  (the two artifacts do not conflict; numeric order is the contract `--include-optional-all` gives a
+  consumer).
+* **Invariant 3 — two-lane is preserved.**  The r285 artifact applied **strictly** on the r288 default tree
+  with nothing to reconcile, so its diff is byte-identical (a mechanical re-cut, not a port; recorded in
+  `optional/two-lane-prefill/README.md` item 19).  It produces `1bfccf843b7da66ac2d464bd7b89c27d02a426be`.
+  Re-measured: prefill **5312.7 / 5712.5 -> 6797.6 / 6813.7 t/s** (35B-A3B Q8_0, 5 298-token prose prompt,
+  `-sm layer -ot`, `-b 2048 -ub 2048`, `MOE_EXPERT_HEATMAP=load`), **+23.5 %** on the 1-lane mean (the r285
+  cut: 5426.6 -> 6815.6, +25.6 %), with the pair really engaging (3 x `pair decided: splits a=4 b=4,
+  interleaved=1`).  The 1-lane arm spreads ~7 % between two identical runs (5312.7 / 5712.5), so judge the
+  gain against both, not one.
+* **Gates, default tree.**  Full build of the new default tree (`~/bin/build-llama-rocm`, all targets,
+  0 errors).  Coherence identical to the r287 build on 1 GPU and 3-GPU `-sm tensor`: `1c5d32ac537d` on all
+  four arms.  `scripts/gate-prefill-logits.sh` **PASS, mean KLD 0.000697 / same-top-p 98.784 %** — the
+  release's own reading, so the default path did not move.  `scripts/gate-per-block-build.sh --fast
+  --changed-from f8c79c35c` **3/3 built** in 838 s: blocks 00-13 are skipped as delta-identical (their
+  commit ids are literally unchanged: `7d3f2c726` … `13d2196fd`), and the three re-ordered/renumbered commits
+  (`4d714fad6` streamed KV, `78b2427ad` UMA, `8b653ad6d` `0300`) each build the release profile.  GPU-fault
+  scan clean.
+* **Gates, optional build.**  Build of default + `0100` + `0101` (`d85868cdd`), 0 errors.
+  `scripts/gate-mixed-kv.sh` on that build: **PASS 12/12** — `FLASH_ATTN_EXT` 7021/7021 in the default,
+  `GGML_CUDA_FA_KV_MIXED=0` and `GGML_CUDA_FA_KV_NATIVE=0` arms, W=1..8 width purity maxdiff 0 for
+  q8_0/q8_0 and the three pairs at `-sm tensor`, four greedy text arms, kernel journal clean.  The refusals
+  were SKIPped (no `--other-model` / `--qsa-model` was passed on this box); they are unchanged code and are
+  covered by the r287 run.  Two-lane numbers above.
+* **`scripts/validate-set.sh` is green** on the new layout: 17 default patch sha256 + counts
+  (official/temporary/default/optional) vs the files, strict 17/17 apply on a fresh tarball of the base,
+  base/applied tree equality, the every-block-tree conflict-marker scan, each optional artifact applied
+  **alone** and compared to its recorded tree, the cumulative numeric order against `optional_tree`, and the
+  Windows portability lint over `HEAD~17`.
+* **The tip is reproducible** — a fresh checkout of `4f9dfa0e3` + `scripts/apply-all.sh` prints
+  `8b653ad6d`.  The fork's `rdna-boosts` branch still carries r287's `f8c79c35c` **because this change was
+  not published**: no push, no tag, no fork refresh (deliberate — the maintainer publishes).  The
+  release-time `scripts/fork-refresh.sh` re-cuts and verifies `.tip`/`.tree` before the branch moves.
+
+**Tooling (the old globs are gone, not left beside the new ones).**
+* `apply-all.sh`: builds the default list as **all `00[0-9][0-9]` then all `03[0-9][0-9]`** and refuses any
+  other number in `patches/` (an `01xx` there is an error, not silently skipped); reads `n_default` for the
+  count; the optional list is `optional/*/01[0-9][0-9]-*.patch` sorted by **numeric basename** (0100 before
+  0101, not directory order) and applied with strict `git am` on the verified tree; `--include-beta`
+  unchanged.
+* `make-patches.sh`: exports `BASE..TIP` and **names every file after the block number in its own subject**
+  (`00`->`0000`, `0300`->`0300`), so it generalises to more than one `03xx` and refuses a `01xx` in the
+  chain; `--optional NNNN=<rev>[:<dir>]` exports one optional artifact as
+  `optional/<dir>/NNNN-<dir>.patch` and refuses a `<rev>` whose parent is not the default tip;
+  `rdna-boosts-all.patch` is the default tree only.
+* `make-release.sh`: `n_blocks` = official `00xx`, `n_temporary` = `03xx`, `n_default` = their sum,
+  `n_optional` + an `optional` map `{dir, sha256, tree}` + `optional_tree`; the `v<N>-` prefix is derived
+  from the official count; a re-cut artifact needs an explicit `--optional-tree` (only an unchanged sha256
+  inherits one), and `validate-set.sh` re-derives both trees.
+* `validate-set.sh`: default apply/commit count/Windows diff all use `n_default`; the optional check applies
+  each artifact alone (tree compared to `release.json.optional`) and then the numeric order (compared to
+  `optional_tree`); messages name official / temporary / default / optional separately.
+* `fork-refresh.sh` verifies the commit count against `n_default`; `gate-mixed-kv.sh` is retitled as
+  **optional block `0101`** and says it runs on the optional-applied build (`MANIFESTS.md` gate 7 no longer
+  lists it as a default release gate); the CI workflows read `n_default` for the reconstruction/apply count
+  while the tag and the `RELEASE_BLOCKS` label keep the **official** `n_blocks`, and `release.yml` hashes
+  the optional patches too.
+* New artifact `optional/mixed-kv/` (README with the trees/measurements/history); `optional/two-lane-prefill`
+  re-cut and renamed; `archive/work/mixed-kv/` re-headed as the submission record (it now points at the live
+  artifact).
+
+**Docs.**  Current-state references updated in `README.md`, `patches/README.md` (block index + sections
+renumbered, block 17's section replaced by a pointer to the artifact), `MANIFESTS.md`, `BASELINE.md`,
+`AGENTS.md` (the ranges are now policy; the layout table), `TODO.md`, `INVARIANTS.md`, `GREEDY-PURITY.md`,
+`ENVIRONMENT.md` (§17 -> block 14, §20 -> block 15, §18 + the `GGML_CUDA_FA_KV_MIXED` row -> optional 0101),
+`scripts/README.md`, `optional/README.md`, `CONTAINERS.md`.  Dated entries keep the block numbers they were
+written with; each of those files carries the r288 mapping note at the top.  Record:
+`archive/work/block-number-reorg/` (the handover and this entry).
+
 ## 261114.008 (r287) -- PR #312 is accepted as **block 17**: a q8_0 K cache with a q4_0 / q5_0 / q5_1 V cache is read natively on 256-wide heads, the QSA model and every other pair stay refused, and the default path is bit-identical (prefill-logit 0.000697 / 98.784 % f16, 0.000580 / 98.882 % q8_0)
 
 **`release.json` changed: tip `83d2593fe` -> `f8c79c35c9b56964ab7019569afda75678b506a7`, tree `79d18f41b9ab9b235d35fd3a5034858eddd94844` ->

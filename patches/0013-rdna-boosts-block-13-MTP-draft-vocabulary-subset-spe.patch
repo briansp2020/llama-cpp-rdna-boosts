@@ -1,7 +1,7 @@
-From 13d2196fdeb90a620352ceee5d19accbcb7a1040 Mon Sep 17 00:00:00 2001
+From 452c213e4965bf8f437a1a5ad091da99a605de10 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
-Subject: [PATCH 13/17] rdna-boosts: block 13: MTP draft vocabulary subset
+Subject: [PATCH 13/16] rdna-boosts: block 13: MTP draft vocabulary subset
  (--spec-draft-mtp-vocab N)
 
 The MTP draft head scores only the LM-head rows for token ids < N plus every
@@ -97,10 +97,10 @@ Exit verified on this tree (gfx1201, ROCm 10.1.0, VMM build):
  create mode 100644 tests/test-mtp-draft-vocab.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index e145edfcd..9aa335e38 100644
+index f3155c0a4..9f995deb8 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -4289,6 +4289,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4316,6 +4316,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_max = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
@@ -116,7 +116,7 @@ index e145edfcd..9aa335e38 100644
          {"--spec-draft-n-min"}, "N",
          string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
 diff --git a/common/common.cpp b/common/common.cpp
-index e8683d436..b1f38dec9 100644
+index 108fbe536..1ff821c25 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1280,7 +1280,8 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
@@ -130,7 +130,7 @@ index e8683d436..b1f38dec9 100644
      cparams_dft.n_rs_seq = 0;
  
 diff --git a/common/common.h b/common/common.h
-index 4d2c4d56f..5dd1aad50 100644
+index 4f0a18875..71f251387 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -374,6 +374,9 @@ struct common_params_speculative_draft {
@@ -158,10 +158,10 @@ index aeaaaa351..0f84f1a0a 100644
          // LLAMA_MTP_DRAFT_OP_OFFLOAD=0: keep the draft context's host-resident ops (e.g. the MTP
          // layer's experts under -otd exps=CPU) on the host instead of offloading them to the device
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 1a9f689d0..433b9587f 100644
+index 9ebe2b08c..9c8056bca 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -2405,6 +2405,59 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
+@@ -2491,6 +2491,59 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
      const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
      GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
  
@@ -665,10 +665,10 @@ index c0ee6fa03..595f0c1bd 100644
  
      res->t_logits = cur;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 11bc16f6b..c2fe708f8 100644
+index a1ca77188..9c424666c 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -1377,7 +1377,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
+@@ -1540,7 +1540,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
          GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
      }
  

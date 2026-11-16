@@ -35,16 +35,28 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
 
 ## Current candidates
 
-**None.**  `0016-host-experts-window` was **withdrawn 2026-11-02**: the mode is unimplementable on a no-XNACK
-GPU (a kernel read of a reclaimable registered page is a fatal fault, and holding it is pinning — the RAM saving
-disappears).  It is archived with a resolution at
+**None.**  The `arena-steady-sizing` v2 candidate was **promoted into block 09 at r292** (2026-11-15);
+see *Recently promoted* below and `archive/work/arena-steady-sizing/`.
+`0016-host-experts-window` was **withdrawn 2026-11-02**: the mode is unimplementable on a
+no-XNACK GPU (a kernel read of a reclaimable registered page is a fatal fault, and holding it is pinning —
+the RAM saving disappears).  It is archived with a resolution at
 [`../archive/work/host-experts-window-beta/`](../archive/work/host-experts-window-beta/README.md) and
 [`../archive/work/host-expert-pinned-window/RESOLUTION.md`](../archive/work/host-expert-pinned-window/RESOLUTION.md);
-the two mechanisms worth keeping moved to [`../archive/work/host-pool-speed/`](../archive/work/host-pool-speed/HANDOVER-2026-11-02.md) (the campaign has since retired there).
+the two mechanisms worth keeping moved to
+[`../archive/work/host-pool-speed/`](../archive/work/host-pool-speed/HANDOVER-2026-11-02.md) (the campaign has
+since retired there).
 
 (Empty before this: both earlier candidates were promoted in `v12-097cf33d9-r86`, 2026-10-19.)_
 
 ## Recently promoted
+
+* **`arena-steady-sizing` v2** — promoted into **block 09** at **r292** (2026-11-15), no new block.  The
+  expert arena is now settled against the capacity a prefill -> decode drop returns, demand-gated at the
+  first drop on the marginal decode-band prior mass (`MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP`, default 1.0 pp)
+  and sticky per layer with the capacity it was achieved at (two-slot transitions stable).  Measured: 1 x
+  R9700 +8.2 % at `-ub 16384`, +31.9 % at 32768, partial pool +36.8 %; 24 GiB `gfx1100` +19.5 %; the
+  saturated 2-device splits and a small `-ub 2048` are byte-identical to base.  Record:
+  `archive/work/arena-steady-sizing/`; `WORKLOG.md` 261115.005/.006 and the r292 release entry.
 
 * **`0012-slab-transient-absorption`** — promoted into **r86**, folded per owning block: **block 09**
   (derived draft reserve, draft model loaded before the target context, slab-served common/all-reduce

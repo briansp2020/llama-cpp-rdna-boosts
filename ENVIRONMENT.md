@@ -1,5 +1,10 @@
 # ENVIRONMENT.md — environment variables that affect this repo
 
+**Block numbering (r288).**  The default set is the 16 official blocks `0000`-`0015` plus the temporary
+`0300`; the optional blocks are `0100` (two-lane prefill) and `0101` (mixed K/V cache types).  Rows and
+sections below name the block that owns the code; a row added before r288 keeps the number it was written
+with (an `rNN` row that says "block 15" means the streamed KV, today's block 14 — see `WORKLOG.md` r288).
+
 Scope: everything **this repo adds or repurposes**, plus the upstream variables and the non-ggml
 runtime variables (HIP/ROCm) that materially affect how this delivery behaves.  Defaults are taken from
 the `rdna-boosts` tree at the current release (`release.json`; every default stated here is the shipped
@@ -111,6 +116,8 @@ the slack up front moves the cost to before the arena is sized.
 | `MOE_EXPERT_SEED` | **`eager`** | **opt-in (measured arm)** | r270, `TODO` #318: how much of the sizing fill (the arena seed AND the host-pool prewarm) happens up front.  **The catalogue entry, with the numbers, is in §20**: the fill is the prefetch, so `auto`/`lazy` move the same bytes into the request, and on a covering pool they cost the device remap. |
 | `MOE_EXPERT_PREFILL_IN_PLACE` | `1` | **kill-switch** | **an identity (fully resident) expert table is served IN PLACE in the prefill band** (r258, block 12, `TODO` #133).  Above the decode/verify band the scheduler used to stage the whole table into a ring slot (pinned master) or gather it into the split input (host pool) on **every ubatch** — for a 100 %-resident arena that is the whole table read back out of VRAM: measured 63 648 MiB re-copied for a 5246-token prompt on three RDNA4 GPUs, serialised against the compute, which left 3-GPU prefill **slower than 1-GPU**.  On: the op reads the arena directly (`moe_cache_get_table`'s identity fast path, at any width), the scheduler skips the staging/gather for that input, and the prefill MoE fusions that read the expert table directly (MMB GLU / the fused MMQ gate+up / the MMQ swiglu→down fold) stand down for such a table so the per-op chain can redirect.  **Since r266 it also covers the ARENA tier's prefill band** (`TODO` #317): a partly-resident table is served in place too, by admitting its used-and-missing experts (empty slot -> the table's landing slots -> the coldest resident THE PASS DOES NOT ROUTE, ranked by the decode heat prior) and publishing the slot-remapped routing, so no resident is copied out.  A table that cannot fit (`|used| > slots`) is declined WHOLE and stages as before, which is why a wide `-ub 4096` prefill on a 78 %-resident arena is exactly inert.  `0` now selects the r265 staging path for BOTH tiers.  Worth +6.3 % prompt eval / +5 % decode on 122B Q8_0 `-lme 90` and +28.5 % on Q5_K_XL `-lme 75` (250-token prompt), identity of text, MTP acceptance and prefill logits, and no two-slot decoder disturbance (`benchmarks/2026-11-12-prefill-in-place-arena.md`).  **This is NOT the r40 in-place prefill read coming back** — that one was a device-side per-expert policy with a device map and a complement to fetch (see §1.2's r40 note); this one has no complement, no policy and no map, it is a base-pointer swap on a table whose arena IS the table.  Worth **+171 %** prefill on the pinned tier (1489.6 -> 4033.9 t/s) and **+13.5 %** on the default pool mirror (3588.8 -> 4072.4), out-of-band on a non-identity arena (2275.6 vs 2266.4, 1 GPU at 69.1 % residency); byte-identical greedy text, prefill KLD 0.000000 and identical MTP acceptance across the switch.  `0` restores the staged/gathered path (A/B and bisect only; the two arms read the same bytes, so a logit difference between them is a bug).  Records: `benchmarks/2026-11-10-prefill-in-place.md`.  **r284:** the arm's per-table decision is chosen by RESIDENCY, so a run whose `.moe-heatmap` prior differs takes this path for a different set of tables -- and on a 2-device `-sm layer` split with a drafter loaded that changes the text (`MOE_EXPERT_PREFILL_IN_PLACE=0` collapses the two priors to one text).  The comparison rule is in `MOE_EXPERT_HEATMAP` below; the finding in `GREEDY-PURITY.md` §89, and the fix that removes the coupling (teaching the fusions the in-place contract) is `TODO` #327. |
 | `MOE_EXPERT_CACHE_SIZE_AT_PRIME` | `1` | kill-switch | **size the arena at the warmup, not the first real decode, and stop the seed at the prefill reclaim boundary** (r75, blocks 09/10/11; developed as the unpublished r74 beta).  The warmup only *primes* each host table, so the deferred sizing used to wait for the first user decode and pay the whole arena allocation + H2D seed on the first generated token.  On (default): the priming pass sizes, `slab_extend_all` is skipped there (it over-mapped the reserve and a later graph capture OOM'd), and the arena is sized to the **full** region while the seed stops at `narrow_floor + ring + wide` -- the band a wide prefill immediately reclaims (the coldest, heat-ordered-last tables stay unseeded and fill lazily during decode).  Measured (maintainer's GSQ command, 13.8K prompt): arena 15666.6 MiB at load, 97/144 tables seeded, first-prefill eviction 6150 MiB (the band), re-arm restores the arena, decode 75.0 t/s.  `0` restores the deferred sizing. |
+| `MOE_EXPERT_CACHE_STEADY_REARM` | `1` | kill-switch | **settle the expert arena's slot count against the VRAM a prefill -> decode drop returns** (r292, **block 09** (promoted; record `archive/work/arena-steady-sizing/`)).  The arena is sized ONCE, from `ggml_cuda_slab_arena_total()` sampled while the wide (prefill) compute view is live -- the slab's birth boundary is the widest `--fit`/`sched_reserve` layout, so that figure is `mapped - (narrow + ring + wide)` and **shrinks as `-ub` grows**.  With the count latched at sizing and a deficit layer deliberately never revisited (`TODO` #70: right for an arena that really did shrink, wrong for a band a drop hands back) the loss is permanent: measured `loss = max(0, boundary_at_birth - narrow_floor)` = **0 at `-ub 4096`, 1.4 GiB at 8192, 4.9 of 23.4 GiB (21 %) at 16384, 11.2 of 22.8 GiB (49 %) at 32768**.  On: at each drop, scale the count each layer holds by the capacity ratio, growth only, capped at each layer's expert count -- no table scan, so it cannot disagree with the sizing about which tables count and cannot build a non-uniform layer.  **Demand-gated at the first drop** on the marginal prior mass the offered growth buys (see `MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP`): a saturated split or a tiny growth leaves the band alone and is byte-identical to base (2-device `-sm tensor` 0.44 pp, 2-device `-sm layer` 0.14 pp, 3-device 0.00 pp, `-ub 2048` 0.50 pp -- taking the 2-device band cost a whole-table prefill eviction, prefill 1625 -> 903 t/s).  **Sticky per layer with the capacity it was achieved at**, so a two-slot decode/prefill transition re-arms at the achieved count and only a capacity that GROWS re-derives it (no ratchet, no oscillation).  Measured (r291, 2 000 tokens, text byte-identical everywhere): 1 x R9700 `-ub 16384` arena 18 411.9 -> 22 819.7 MiB, miss traffic **-39 %**, decode 41.7 -> **45.1 t/s (+8.2 %)**; `-ub 32768` 12 183.0 -> 23 018.0 MiB, traffic **-70 %**, 34.3 -> **45.3 t/s (+32 %)**; partial pool (`-lme 8` + `DIO=1`) 16.9 -> **23.1 t/s (+37 %)**; 24 GiB RX 7900 XTX arena 11 428.6 -> 15 995.3 MiB, traffic -38.2 %, 36.5 -> **43.6 t/s (+19.5 %)**.  Arena capacity is worth roughly `1/arena_size`.  `0` restores the pre-change behaviour exactly (bit-for-bit, so it is the A/B arm).  Measure residually at **>= 1 000 generated tokens** (2 000 preferred): at 128 tokens the same change reads +1.8 % and a few-slot growth still pays a whole-table re-seed. |
+| `MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP` | `1.0` | tuning | **the marginal decode-band prior mass (percentage points) that makes taking the prefill band worth its whole-table re-seed** (r292, block 09 (promoted)).  The settle decides this ONCE, at the first prefill -> decode drop (the first moment the decode capacity is visible), from the persisted decode-band prior (`heat_rank_vec`): it computes the arena's sizing slot count and the target the drop offers, and compares the prior mass the two cover.  Below the threshold the settle stays off for the run (the band is left for the next prefill).  Measured thresholds: 1 x R9700 `-ub 16384` gain 6.98 pp -> on; `-ub 2048` 0.50 pp -> off (taking it was -2.7 % decode); 2-device `-sm tensor` 0.44 pp -> off; 2-device `-sm layer` 0.14 pp -> off; 3-device 0.00 pp -> off.  `0` takes every growth; a large value forces the band only when the prior is absent (with no prior the settle stays off and `MOE_EXPERT_HEATMAP=1` writes one for the next run). |
 | `MOE_EXPERT_HEATMAP` | `1` | kill-switch | **persistent cross-run expert heat map** (r60, block 09).  On: the cache tallies a long-horizon per-expert use count (device-side on the prefill band, host-side on the eager decode band) and writes it to a sidecar next to the model; the next run seeds the arena with the hottest experts at sizing and allocates the hottest **layers** first (so the work-pool boundary reclaims the coldest).  Measured on `MOE_EXPERT_CACHE_MIB=4096`: **+34 % decode over a 48-token turn** (38.15 -> 51.30 t/s, hit 0.767 -> 0.940, fills 11748 -> 2976) and **+10.3 % over 256 tokens** (48.53 -> 53.55 t/s, fills 19452 -> 6912); prefill unchanged.  It is a placement prior only (the expert bytes are unchanged), so the output is bit-identical.  `0` restores the exact pre-change behaviour.  `load` (aliases `ro`, `read-only`) loads and seeds from the map but never writes it.  A **read-only heat-map file** is also loaded and frozen: the file's mode is the freeze signal, and it does not fall back to a cache directory. |
 | `MOE_EXPERT_HEATMAP_DIR` | unset | tuning | directory for the sidecar when the model directory is not writable.  Otherwise the fallback order is `$XDG_CACHE_HOME/llama-moe-heatmap`, `$HOME/.cache/llama-moe-heatmap`, `/tmp`. |
 | `MOE_EXPERT_HEATMAP_DEBOUNCE_S` | `60` | tuning | minimum seconds between heat-map writes (the server flushes at turn end; process exit always flushes). |
@@ -442,7 +449,7 @@ workspace, and the workspace-pool high-water mark.  So ~200-350 MiB free is norm
 raises it one-for-one (8192 -> ~4.3 GiB free) at the cost of an equal amount of arena.
 
 > **At the VRAM cliff, raise the headroom instead of dropping hipBLASLt (r194; the default covers it since r206).**  Measured on Flash-Next
-> (qwen4exp, `-ncmoe 48`, q8_0 KV, `-c 262144`, block 15's attention pool, one R9700, 1 slot): the then-default
+> (qwen4exp, `-ncmoe 48`, q8_0 KV, `-c 262144`, block 14's attention pool, one R9700, 1 slot): the then-default
 > 768 MiB left `hipBLASLt out of memory` on the **first prefill** (`hipblaslt.cpp:169`) while the server stayed
 > healthy and the request failed with no reply.  `GGML_CUDA_SLAB_HEADROOM_MIB=1536` served 3/3 requests clean
 > with the arena at 19.12 GiB instead of 19.88, and `ROCBLAS_USE_HIPBLASLT=0` also worked (up to -15 % decode).
@@ -567,7 +574,7 @@ is §50).  With `--parallel >= 2` the *batch* is the sum over the verifying slot
 | `LLAMA_LAYER_INP_EARLY` | **on** (r244, block 12) | kill-switch | where an extracted DFlash/DSpark layer input is copied into the device store (`build_layer_inp_dev()`, upstream #31506's order), the copy's four nodes (VIEW, RESHAPE, SET_ROWS and the index use) are moved to just after the next layer's input node instead of being appended after the whole graph.  Only the node **order** moves -- every node computes the same -- so the allocator can free each extracted layer input after its last reader instead of holding all of them to the end.  Measured on dense 27B UD-Q4_K_XL + DFlash2 (5 layers) at `-ub 2048`: the target's compute buffer 756.97 -> **624.99 MiB** (`llama-cli`, `-np 1`) / **580.99 MiB** (server, `-np 2 --kv-unified`), steady-state VRAM on the card -185 MB, and greedy text plus draft counts identical in every arm (1 GPU, 2- and 3-GPU `-sm tensor`/`-sm layer`).  The move is skipped (the copy stays where upstream put it) when the next layer's input is not a node of its own or its source is recorded later.  `LLAMA_LAYER_INP_EARLY=0` restores upstream's order -- the A/B arm.  Read once (static). |
 | `LLAMA_LOAD_STAGE_MB` | `4` | tuning (r122, block 00) | size in MiB of each of the 4 pinned staging slots the non-mmap (`--load-mode none`) loader streams a tensor through on its way to a device.  The old 1 MiB slot measured 15.7 s on the cold Flash-Next load (`-sm tensor`), 2 MiB 13.7, **4 MiB 13.7**, 8 MiB 14.8, 32 MiB 16.3, 64 MiB 16.8; larger slots scale better on faster disks but cost 4x the pinned footprint.  DIO reads keep their own 64 MiB buffer. |
 | `LLAMA_KV_N_PAD_MIN` | `256` | tuning (**opt-in**) | raises the n_kv padding floor (r25).  n_kv is padded to this many cells, so a larger value keeps the per-device tensor-split graphs constant for longer (the PR measured `1024` as the useful value, `4096` gave nothing more).  Default unchanged. |
-| `LLAMA_KV_N_PAD_PREFILL` | `8192` on a multi-device split, `0` on a single device | default-on (r79, block 10); `0` disables | a coarser n_kv pad for **prompt ubatches only** (`n_tokens > 64`), rounded up to a power of two, so consecutive prompt chunks share one graph shape instead of rebuilding the split state and re-allocating every ubatch.  It applies only once the decode-padded occupancy is past `LLAMA_KV_N_PAD_PREFILL_FROM`, so a model's small-context shortcuts (qwen4exp's dense attention for the first ~2051 cells) still apply; decode/verify batches keep the decode pad, and the extra cells are masked exactly as before (prefill logits are unchanged).  **Default-on only when more than one device is in use** (`model.n_devices() > 1` or the meta split state has more than one device); a single GPU keeps the r77 default of `0` because the coarse pad only adds masked attention work there (-0.35 % measured), and that shape is now inactive.  The env value still overrides the default (`0` disables).  Measured on r79, `-ub 2048 -b 2048`, q8_0 KV, 31 k-token prompt: **+2.5 %** prefill on 35B-A3B (3 GPUs, `-sm tensor`), **+0.8 %** on the dense 27B (3 GPUs, tensor), and **+42 % / +49 %** on a 3-GPU `-sm layer` split (MoE / dense), with the decoded text identical; the r77 2-GPU numbers were +2.0 % (MoE) and +1.0 % (dense), and the 1-GPU shape is inactive.  It affects the **unified** KV cache only (not the iswa/DSA caches) and is not for training, whose graphs assert `n_kv == n_tokens`. |
+| `LLAMA_KV_N_PAD_PREFILL` | `8192` on a multi-device split, `0` on a single device | default-on (r79, block 10); `0` disables | a coarser n_kv pad for **prompt ubatches only** (`n_tokens > 64`), rounded up to a power of two, so consecutive prompt chunks share one graph shape instead of rebuilding the split state and re-allocating every ubatch.  It applies only once the decode-padded occupancy is past `LLAMA_KV_N_PAD_PREFILL_FROM`, so a model's small-context shortcuts (qwen4exp's dense attention for the first ~2051 cells) still apply; decode/verify batches keep the decode pad, and the extra cells are masked exactly as before (prefill logits are unchanged).  **Default-on only when more than one device is in use** (`model.n_devices() > 1` or the meta split state has more than one device); a single GPU keeps the r77 default of `0` because the coarse pad only adds masked attention work there (-0.35 % measured), and that shape is now inactive.  The env value still overrides the default (`0` disables).  Measured on r79, `-ub 2048 -b 2048`, q8_0 KV, 31 k-token prompt: **+2.5 %** prefill on 35B-A3B (3 GPUs, `-sm tensor`), **+0.8 %** on the dense 27B (3 GPUs, tensor), and **+42 % / +49 %** on a 3-GPU `-sm layer` split (MoE / dense), with the decoded text identical; the r77 2-GPU numbers were +2.0 % (MoE) and +1.0 % (dense), and the 1-GPU shape is inactive.  It affects the **unified** KV cache only (not the iswa/DSA caches) and is not for training, whose graphs assert `n_kv == n_tokens`.  **r289 (issue #314): with a windowed KV the pad sets the MAPPED extent only, not what spills** -- the spill boundary follows the USED extent, so this pad no longer pushes live cells out of the resident window.  Its VRAM cost on a windowed split is therefore up to `LLAMA_KV_N_PAD_PREFILL` cells on top of `W` (lower it, or `-c`, if the window's fit is tight), and it never spills. |
 | `LLAMA_KV_N_PAD_PREFILL_FROM` | `4096` | tuning (r77, block 10) | the decode-padded occupancy (cells) above which `LLAMA_KV_N_PAD_PREFILL` starts to apply.  Compared with `GGML_PAD(used, LLAMA_KV_N_PAD_MIN)`, not with the raw used count. |
 | `GGML_READBACK_SYNC` | **on** | kill-switch (block 06, r43) | completes the per-ubatch device->host logits/embd readbacks before the next ubatch's graph reuses the same device output tensor.  Required because ROCm's pinned async D2H copy is not ordered against the following compute, which otherwise lets an earlier ubatch's host rows receive a later ubatch's data (multi-ubatch per-token outputs: perplexity / KLD).  `0` restores the unordered readback for A/B.  A single-ubatch decode is unaffected either way. |
 | `LLAMA_STATE_GET_MERGE_GAP` | `262144` (256 KiB) | tuning (r56, block 12) | in `llama_io_write_host` (the state / prompt-cache save), consecutive deferred `write_tensor` ranges of one tensor whose gaps are at most this many bytes are read as one `ggml_backend_tensor_get` span and scattered on the host; contiguous ranges are read straight into the output.  Under concurrent decoding a slot save was ~8,000-10,000 short synchronous reads on ROCm (340-400 ms); merged it is one get per tensor (25-65 ms).  The saved bytes are identical.  `0` restores the per-range reads. |
@@ -850,6 +857,42 @@ one of these as a **new reference**, not as a tuning experiment.
 
 ---
 
+### 7.6 `--wmma-verify` / `GGML_CUDA_WMMA_MMVQ` — the verify band's WMMA iu8 matvec family (block 07) — **opt-in, default OFF**
+
+> **This is the delivery's one deliberate, opt-in escape from the decode/verify purity contract.**  The
+> family replaces the K-split `mmvq` kernel for a dense, unfused `MUL_MAT` at N..8 columns and **always
+> leaves 1 column on it**, so while it is enabled a W=1 decode and a W=N verify of the same state take
+> different kernels (`GREEDY-PURITY.md` invariant 1, §91).  It is not bit-identical to the K-split kernel
+> (same real number, different accumulation order: **3.2e-7 relative**, Q8_0 1.7e-7) and greedy text
+> **does** move with it on.  With it **off** -- the default -- nothing of it is reached and the release's
+> byte-identical contract holds; that is the arm every gate runs.
+>
+> **Use it for a fixed deep draft.**  Content-fixed TG t/s by verify width, ON vs OFF
+> (`llama-batched-bench -npp 512 -ntg 64 -npl 1..8`, 27B):
+>
+> | width | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+> |---|---|---|---|---|---|---|---|
+> | Q4_K_M, 1 GPU | -8.5 % | -4.8 % | -3.4 % | -1.6 % | +1.9 % | +5.8 % | **+9.4 %** |
+> | Q4_K_M, 2 GPU `tensor` | -5.7 % | -4.7 % | -5.3 % | -4.7 % | -4.4 % | +7.1 % | **+10.6 %** |
+> | Q8_0, 2 GPU `tensor` | -1.0 % | -0.2 % | -0.7 % | -0.5 % | +1.4 % | +2.0 % | **+3.7 %** |
+>
+> End to end (`--wmma-verify auto`, acceptance held identical, 2-GPU `tensor`): DFlash2 `n-max 7` recall
+> 27B Q4_K_M **205.6 -> 221.5 t/s** (cycle 36.5 -> 33.9 ms), 27B Q8_0 **170.1 -> 177.3 t/s** (43.6 -> 41.8
+> ms); the adaptive-MTP four-axis at `-n 3000` is `+0.7 / +4.5 / +6.7 / +3.7 %` on R/P/C/K.  **Widths above
+> 8 are MMQ**, so an adaptive `n_max 12` arm (deep rounds at 9-13 columns) is neutral -- the feature is for
+> a *fixed* deep draft (`n_max 5..7`), which is where the floor of 7 puts it.
+>
+> **RDNA4 only** (gfx1200/gfx1201 device code, `GGML_CUDA_CC_IS_RDNA4` at dispatch); every other type, shape
+> and GPU falls through to the K-split kernel, as does anything fused, `MUL_MAT_ID`, and a non-unit batch
+> dimension.  Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0.
+
+| variable / option | default | class | notes |
+|---|---|---|---|
+| `--wmma-verify off\|auto\|N` (`common`) | `off` | opt-in | the **floor** in verified columns: the first verify width that takes the family (2..16, clamped; `1` is clamped to 2 because width 1 is decode and must keep the K-split kernel).  `auto` = **7**, the first width it wins on both a single card and a 2-GPU tensor split.  Values above 8 are meaningless in practice (MMQ owns those widths) but are accepted, so a calibration arm can be run without editing the option. |
+| `GGML_CUDA_WMMA_MMVQ` | unset = off | opt-in (**deprecated alias**) | the contributor's original switch (PR #317): the same floor, read from the environment.  It is the A/B and bisection knob and it **wins when set**, so `GGML_CUDA_WMMA_MMVQ=0` disables a run that `--wmma-verify` enabled, and `=7` reproduces `--wmma-verify auto`.  Value-gated (`0` = off), latched once per process.  It is the only way to reach the family from a tool that does not go through `common` (`test-backend-ops`, a bench harness). |
+
+---
+
 ## 8. Flash attention / QSA (qwen4exp)
 
 | variable | default | class | notes |
@@ -861,7 +904,7 @@ one of these as a **new reference**, not as a tuning experiment.
 | `LLAMA_TEST_SEED` / `LLAMA_TEST_OP_NMSE` | unset | diagnostic (test harness only) | r103, `tests/test-backend-ops.cpp`.  `LLAMA_TEST_SEED=<n>` makes the test data deterministic so the same op on two builds/arms can be compared element by element (unseeded, an NMSE moves by up to 13x between runs — that is how the first "WMMA is more accurate" reading in the head-512 campaign was produced and then refuted).  `LLAMA_TEST_OP_NMSE=1` prints the error magnitude every case already computes against the CPU reference, including the passing ones, so a kernel-family switch can be judged by *how far* each arm is from the truth rather than by a pass/fail at a fixed threshold.  Neither variable affects a model run. |
 | `GGML_HIP_FA_BAND_FETCH_AHEAD` | **on** | kill-switch | r98 (PR #195): with `q8_0` K and V read in place (decode/verify, `n_q <= 8`, head 256) the RDNA4 band runs a kernel variant that fetches the next K/V batches into registers ahead of use and orders only shared memory at its barriers.  `=0` runs the same kernel without the fetch-ahead, as every other K/V type does.  Bit-identical either way; worth ~+1 % decode at 8K and ~+2.4 % at 110K context (27B, `q8_0` K/V). |
 | `GGML_CUDA_FA_KV_NATIVE` / `GGML_CUDA_FA_MASK_SKIP` | unset | tuning | native-KV and mask-skip paths. |
-| `GGML_CUDA_FA_KV_MIXED` | **on** | kill-switch (block 17, PR #312) | `0` switches the **native read of a mixed K/V pair** off: `ggml_cuda_fattn_kv_mixed_native()` returns false, the tile kernel takes its F16 instantiation, the launcher stages both operands, and the RDNA4 decode/verify band is left -- the pre-block-17 behaviour of a mixed pair (measured on a 2-GPU `-sm tensor` split: decode 11-12 % behind the native read at 32768 cells and 25 % behind at 100000, and +1100 MiB at load at `-c 204800`).  The context gate still accepts the pair, so `0` is a bisect/A/B arm, not a refusal.  A same-type cache does not reach this path at all.  The pair the gate accepts is K `q8_0` with V `q4_0` / `q5_0` / `q5_1` on a model whose attention layers are all 256-wide and that does not use the sparse QSA attention; every other head size, pair and qwen4exp is still refused.  Gate: `scripts/gate-mixed-kv.sh`. |
+| `GGML_CUDA_FA_KV_MIXED` | **on** | kill-switch (optional block `0101`, PR #312; not in the default build) | `0` switches the **native read of a mixed K/V pair** off: `ggml_cuda_fattn_kv_mixed_native()` returns false, the tile kernel takes its F16 instantiation, the launcher stages both operands, and the RDNA4 decode/verify band is left -- the pre-block-17 behaviour of a mixed pair (measured on a 2-GPU `-sm tensor` split: decode 11-12 % behind the native read at 32768 cells and 25 % behind at 100000, and +1100 MiB at load at `-c 204800`).  The context gate still accepts the pair, so `0` is a bisect/A/B arm, not a refusal.  A same-type cache does not reach this path at all.  The pair the gate accepts is K `q8_0` with V `q4_0` / `q5_0` / `q5_1` on a model whose attention layers are all 256-wide and that does not use the sparse QSA attention; every other head size, pair and qwen4exp is still refused.  Gate: `scripts/gate-mixed-kv.sh`.  **Since r288 this code is optional block `0101`, not a default block**: a default `patches/` build never reaches it, and the variable exists only in a build with `optional/mixed-kv/` applied (see §18). |
 | `LLAMA_ATTN_ROT_DISABLE` | unset = rotation **on** | kill-switch / A/B arm (**upstream**, #21038; not added by the delivery) | `1` forces the KV Hadamard rotation off.  With a **quantized** K or V cache (`n_embd_head_%64 == 0`, or a DeepSeek/GLM-DSA lightning indexer) the cache rows are rotated on the way in and the attention result on the way out, so the graph carries four `llama_mul_mat_hadamard` chains per layer plus one rotation constant **per layer** as a graph leaf -- 14 hash entries per layer that `graph_max_nodes()` has to budget for (`INVARIANTS.md` r267, GitHub issue #302: phi-4 `q8_0` needed 2064 against a 1944 budget and aborted).  `1` is the reference arm for a suspected rotation problem and the pre-#21038 numerics; it also drops the budget term with the tensors, so it is the arm that loads a high-layer quantized-KV model when the budget is what is wrong.  Not a speed knob: the rotation is what makes a quantized KV cache accurate, so a cross-arm text comparison is expected to move; measure *within* an arm, never across. |
 | `GGML_CUDA_FA_BAND_SKIP` | **on** | kill-switch (block 05, r133) | the fully-masked KV-group skip in the decode/verify band (PR #223).  With `--kv-unified` a sequence's cells usually sit behind another slot's, and since `LLAMA_SERVER_LAZY_IDLE_SLOTS` (r130) an idle slot's context stays resident, so the band used to read every one of those `-INF` cells on every decode step.  The band now gets the packed per-(stream, query tile, 256-cell group) bitmap and skips the groups that are `-INF` for every query row of its tile, keeping its round-robin KV split (block i still owns iterations i, i+P, ...), so the result is bit-identical.  `0` restores the pre-r133 behaviour; `GGML_CUDA_FA_MASK_SKIP=0` disables the whole mechanism (this switch is the band's arm of it).  The band is the gate, so it applies on RDNA4, head 256, GQA 5..12, `n_q <= 8` only; the tile-kernel decode other models use does not skip.  Measured (gfx1201, 27B UD-Q4_K_XL, 2 slots unified, `q8_0` K/V, 384 greedy tokens): a resident ~105K conversation in front of an active 9.8K one, **50.8 -> 41.7 ms/step (-18 %)**, token ids identical (with a DFlash2 draft at `n_max 5`: 18.6 -> 14.8); a single slot at 9.8K **-0.6 %** and at 105K neutral (the padded tail group is skipped too, so the per-layer prepass is not a tax). |
 | `GGML_CUDA_FA_STAGE_MAX_MB` | unset | tuning | FA staging budget: the **per-operand** cap on a staging request (MiB, `0` = unbounded).  A K/V view larger than the cap is not staged at all (the native read is used); it also caps the growth hint, so it is the knob that bounds the arena on a deep prefill.  It is per operand because the arena request covers **both** operands: `GGML_CUDA_FA_STAGE_MAX_MB=256` on a K+V op caps each at 256 MiB and the arena at **512 MiB** (the reporter's question on issue #237 — intended, not rounding).  `=1` is the "never stage" arm (the native read). |
@@ -1067,9 +1110,9 @@ with it every compute buffer, so `set_sampler()` asks for one only when it has t
 |---|---|---|---|
 | `LLAMA_BACKEND_SAMPLER_RESERVE_ONCE` | **on** | kill-switch (r169, contributor PR #245, block 12) | the compute buffers remember what they were reserved with (`sampling.reserved`: per sequence, the backend sampler chain's node count, `llama_sampler_backend_n_nodes()`) and `set_sampler()` reserves only when a sequence gets a **wider** chain than that, or has no record yet.  A chain set again, a narrower one, or a removal asks for none: the graph is rebuilt anyway (the samplers are part of the graph-reuse check), the output buffers are sized per decode, and the graph allocator grows a buffer if a chain needs more bytes.  The key is the **node count**, not the sequence id, because a reserve is the only thing that recomputes `graph_max_nodes()` — which sizes the graph's node capacity (`llm_graph_result::max_nodes` -> `ggml_new_graph_custom`), the scheduler's node/leaf arrays and the compute-metadata arena — and the allocator's growth covers buffer sizes only.  `0` restores the pre-r169 behaviour (a reserve on every set and every removal: 4 `sched_reserve: reserving ...` lines over three requests instead of 2, and +68.7 ms of median prompt time per sampled request on a 27B at `-c 65536 --parallel 2 --kv-unified`).  No arithmetic changes: request text and the prefill logits are byte-identical across the arms.  Only reaches a context that sets a backend sampler — `llama-cli`/`llama-bench` and a `-sm tensor` context (backend sampling is refused there) never touch it. |
 
-## 17. The streamed KV (block 15): the resident window, the attendance pool and the MTP draft window
+## 17. The streamed KV (block 14): the resident window, the attendance pool and the MTP draft window
 
-Block 15 carries **three** ways to move the attention KV out of VRAM, and they are easy to confuse because they
+Block 14 carries **three** ways to move the attention KV out of VRAM, and they are easy to confuse because they
 share vocabulary.  They are not layers: §17.0 and §17.1 are two **alternative** designs for the same bytes
 (one copy tiered by address, versus a host-authoritative copy plus a device cache keyed by the sparse
 selection), and §17.2 acts on a **different cache** entirely (the MTP drafter's) and **truncates** it.
@@ -1181,7 +1224,7 @@ identical**; dense 27B `-c 102400` Protocol A neutral (71.9 vs 72.1 layer, 72.6 
 2083/2747 in all four arms); target text byte-identical off/auto/4096 and plain == draft-mtp == draft-mtp
 (`W=512`) at `-c 16384`.  A unified 2-slot cache sizes the window per sequence, and the windowed drafter's
 text is byte-identical to `LLAMA_SPEC_DRAFT_WINDOW=0` on both slots of `--kv-unified -np 2` (issue #264).
-Records: `patches/README.md` block 15, `WORKLOG.md` 261031.014 and 261101.006,
+Records: `patches/README.md` block 14, `WORKLOG.md` 261031.014 and 261101.006,
 `archive/work/kv-residency/O3-DRAFTER-RING.md` §2.3.
 
 
@@ -1194,9 +1237,9 @@ writers, `state_write`/`state_read`, the K-shift, defrag and parking all work on
 resolves its top-k selection through the table and fills the pages it missed from the mirror; the QSA reader
 gathers K/V at the pool slots while the mask stays cell-indexed.  **Default: off** — with the variable unset
 the KV takes the plain device buffer and the run is byte-identical to a build without the block, including its
-OOM.  Opt-in is deliberate: it is a **fittability** feature like block 15 (a 204 MiB pool instead of a 1.6-2.4
+OOM.  Opt-in is deliberate: it is a **fittability** feature like block 14 (a 204 MiB pool instead of a 1.6-2.4
 GiB resident KV at 103k-180k depth), and on a config whose KV already fits it costs the sparse-vs-dense decode
-gap (7-12 % at depth, `patches/README.md` block 15).
+gap (7-12 % at depth, `patches/README.md` block 14).
 
 **It also costs the PROMPT, and that is the bigger number (r216).**  The page-fill path is per *decode* step;
 a prompt chunk writes every cell of its range and reuses nothing, so on one RX 7900 XTX at `-c 204800` with
@@ -1205,7 +1248,7 @@ this model `LLAMA_KV_REGION_POOL=16384` read **427.5 t/s at pp32K against 829.3*
 decode being exactly the 2.3 GiB of expert arena the pool frees (12 084 against 9 742 MiB).  The KV of this
 model is ~13 KiB per token, i.e. ~2.6 GiB at `-c 204800`, which a 24 GiB card can hold; the pool's own case
 does not arise until the KV does not fit.  **Do not enable it on a prompt-heavy server**, and never take it for
-a decode default on one: block 15 Goal A (`LLAMA_KV_RESIDENT_CELLS`, the window) is the placement that buys the
+a decode default on one: block 14 Goal A (`LLAMA_KV_RESIDENT_CELLS`, the window) is the placement that buys the
 arena back with no kernel change.  `WORKLOG.md` 261105.001.
 
 | variable | default | what it does |
@@ -1220,7 +1263,7 @@ arena back with no kernel change.  `WORKLOG.md` 261105.001.
 The mirror is **grown on demand** (r196, `TODO` #123): the buffer type reserves the whole `-c` as one
 page-aligned `mmap` range but pins only the units a run actually reaches, so a 5 298-token run in a
 `-c 262144` context pins **72 MiB** instead of 3264.  Every write grows first (a state restore included) and a
-read above the pinned extent is refused loudly; `LLAMA_KV_SPILL_RAM_PCT` (block 15's ceiling) bounds it.
+read above the pinned extent is refused loudly; `LLAMA_KV_SPILL_RAM_PCT` (block 14's ceiling) bounds it.
 Parking on a pooled cache **declines** to the server's save-and-clear fallback: a park packs to the top of the
 cache, so growing the mirror to its destination would pin the whole context again.
 
@@ -1264,11 +1307,11 @@ scope -- where the buffered arm holds **12.8-12.9** and `auto` reaches it on the
 `MOE_HOST_POOL_STAGE_SPAN=0` **refuses** the buffered arm (it falls back to the mapping) and the ladder steps over
 `file` to `dio`.  Nothing an operator can type lands in that pair.
 
-## 20. The UMA GTT expert store (block 16) — an APU's MoE expert set in one registered region
+## 20. The UMA GTT expert store (block 15) — an APU's MoE expert set in one registered region
 
 On an **integrated GPU** "VRAM" and host RAM are one pool, so r236 refuses the host-expert tier there
 (`-ncmoe`/`--host-experts` are inert) and upstream's answer is to disable the expert cache outright: a MoE model
-whose expert set exceeds RAM simply cannot run.  Block 16 adds the tier that can: **ONE anonymous region**
+whose expert set exceeds RAM cannot run.  Block 15 adds the tier that can: **ONE anonymous region**
 (`mmap` + `MADV_HUGEPAGE`, `hipHostRegister(Mapped|ReadOnly)` once, `mlock`'ed, sliced per `(tensor, expert)`) that
 the GPU reads in place at 230-233 GB/s.  **`-lme N|auto` sizes it** — the same flag, units and heat ranking as the
 discrete host-expert budget — and the shape follows that budget: a budget that covers the whole set **places** it
@@ -1285,7 +1328,7 @@ left to swap).  Everything here is inert on a discrete GPU, measured: zero censu
 | `MOE_EXPERT_GTT_RO` | `1` | **kill-switch** | `0` = register the region writable instead of `ReadOnly` (the measured 232 -> 60 GB/s A/B) |
 | `MOE_EXPERT_GTT_MLOCK` | `1` | **kill-switch** | `0` = do not `mlock`.  A registered-only region is RECLAIMABLE: under pressure the kernel splits its huge pages and swaps parts of it out, and the next GPU read stalls 12-37x while the driver faults them back (measured). Diagnostic/bisection only |
 | `MOE_EXPERT_GTT_ARENA` | unset = the budget decides | **override (tri-state)** | `1` = force the arena, `0` = force placement, unset = **arena iff the store cannot hold the whole expert set**.  The default is the budget because `-lme` caps NON-SWAPPABLE memory: only the arena keeps that promise (the excess streams from the reclaimable page cache).  Note the old parse was presence-only, so `=0` used to ENABLE it |
-| `MOE_EXPERT_GTT_PREFILL` | `1` | **kill-switch** | `0` = the per-expert used-expert copy for the prefill band (block 16's streaming read is the default) |
+| `MOE_EXPERT_GTT_PREFILL` | `1` | **kill-switch** | `0` = the per-expert used-expert copy for the prefill band (block 15's streaming read is the default) |
 | `MOE_EXPERT_GTT_FILL_DIRECT` | `1` | **kill-switch** | `0` = the buffered fill goes through the per-table bounce ring instead of straight into the arena slot (no bounce, no H2D on the direct arm) |
 | `MOE_EXPERT_GTT_PREFILL_READERS` | `8` | tuning | reader-pool width for the coalesced prefill spans.  `1` reads inline on the caller (the parallel-transport A/B).  Contends with `-t` for CPU |
 | `MOE_EXPERT_GTT_PREFILL_VERIFY` | unset | **diagnostic** | byte-compare every coalesced span against the pageable model mapping and log the first mismatch (a shard-relative offset or an `O_DIRECT` slip shows up here and nowhere else) |
@@ -1305,10 +1348,48 @@ this tier** (every miss fills: the pageable mapping is not a GPU-readable cold s
 +63-67 % on a >RAM model with the logits unmoved (mean KLD -0.000000, same-top-p 99.990 %).  Gate:
 `scripts/gate-uma-experts.sh` (16 arms, 40 checks).
 
+## 21. Sequence parallelism (block 12, r291) — the qwen4exp hyper-connection chain, token-split
+
+Under `-sm tensor` the hyper-connection chain (mixers, combine, gated norms, the shared expert and the GEMMs over
+them) is mirrored: every device ran it for **every** token of a ubatch.  With `LLAMA_SEQPAR` on -- the shipped
+default -- a prefill ubatch of at least `LLAMA_SEQPAR_MIN` tokens on a **2+-device `-sm tensor`** layout keeps the
+residual streams token-split from layer 0 to the last layer: each device runs that chain on its own slice, each
+block gathers its `hc_mixed` input for the feature-split parts (attention, router, routed MoE), and the attention
+and MoE partial sums are reduce-scattered by token instead of all-reduced.  PLE layers and the last layer run on
+the gathered streams, so the logits/MTP tails keep their shape.  It is **OFF-path inert** (prefill logits
+0.000000 against r290, byte-identical greedy text) and **not** part of decode or a verify batch: those graphs are
+1..n_draft+1 tokens, below `MIN`, and say so once in the log.
+
+| variable | default | class | meaning |
+|---|---|---|---|
+| `LLAMA_SEQPAR` | `1` | **kill-switch** | `0` = the unsplit graph, exactly as before (verified as an arm in `scripts/gate-seqpar.sh`, and bit-inert in the release record) |
+| `LLAMA_SEQPAR_GATHER_BF16` | `1` | **kill-switch** | `0` = the F32 wire for the per-layer `hc_mixed` gathers. **This is a real trade, not a purity dial**: the F32 wire is *better* on both logit metrics (0.010644 / 96.833 % against the bf16 wire's 0.014184 / 96.373 %, control 0.013587 / 96.225 %) and *slower where it matters* -- on the default (RCCL-ring) chain the F32 wire measures **-2.1 %** against seqpar OFF, because the gather bytes are the cost there.  The bf16 wire rounds exactly as its own round-only control (`GGML_SEQPAR_GATHER_ROUND=1`) and is the arm the throughput numbers are for |
+| `LLAMA_SEQPAR_MIN` | `512` | tuning | smallest ubatch that splits.  Measured on 2 x R9700, `llama-bench -p 8192`: **-1.0 % at 128, -0.8 % at 256** (no win), **+6.4 % at 512** (copy-engine chain) / **+3.0 %** (default chain), +8.3 % at 1024.  **Values below 128 are clamped to 128 with one WARN**, because a token-split ubatch that small can overflow the thread stack in the Meta split-state recursion (block 09's cache; reproduced at T = 48/64/80/112 and, with `MIN` \<= 2, a 2-token graph trips the token-scatter split-state assertion; clean at 128 and above).  So a mis-set value degrades to "off" for the ubatches it cannot handle instead of aborting; `TODO` #330 is the cache fix, and `scripts/gate-seqpar.sh` arm 6 asserts the clamp |
+| `LLAMA_SEQPAR_RS` | `3` | tuning / test | bit 0 = the attention output is reduce-scattered, bit 1 = the MoE output.  A cleared bit all-reduces and slices instead (**the same values**, more link bytes; `RS=0` reads the identical KLD), which is the arm that proves the reduce-scatter is not the source of the rounding change |
+| `LLAMA_SEQPAR_ODD` | `1` | tuning | `0` = split even token counts only.  Default: the first `T % n` devices take one token more (ceil/floor) |
+| `GGML_SEQPAR_CE_GATHER` | `1` | **test only** | `0` = the gathers take the Meta backend's generic copies instead of the copy-engine path (an A/B for the transport, and the arm that proves the gather-side scratch warning is its own message) |
+| `GGML_SEQPAR_GATHER_ROUND` | `0` | **test only** | `1` = F32 wire, then round in place: the **round-only control** for the bf16 wire (same values, no link saving) |
+| `GGML_SEQPAR_GATHER_CHUNK` | `0` | **test only** | cap the gather chunk in elements, to exercise the multi-chunk path |
+
+**Where it can engage.**  Exactly: `-sm tensor` on a **Meta device with at least 2 sub-devices**, a ubatch
+>= `LLAMA_SEQPAR_MIN`, and no drafter layer tap (`embeddings_layer_inp`).  Everything else prints one
+`sequence parallelism not engaged: <reason>` line per reason (`LLAMA_SEQPAR=0`, not `-sm tensor`, `N devices < 2`,
+a drafter tap, or the ubatch below `MIN`).  Above 2 ranks the copy-engine reduce-scatter **declines** (its exchange
+is 2-rank by construction) and the Meta backend all-reduces + slices, while the gathers still run over N peers --
+measured at 3 cards, +2.7 % (ce) / +2.1 % (default) prefill on 31.5k tokens.
+
+**Diagnostics are INFO**, i.e. `-lv 4`: the engaged graph shape, the **executed** form census (copy-engine
+reduce-scatter / all-reduce + slice / fallback all-reduce + slice, and the same split for the gathers), the
+copy-engine decline with its reason, and the copy-engine scratch size in MiB per device when it grows.  The graph
+node counts are *eligibility*; the census is what ran.  `scripts/gate-seqpar.sh` is the gate; the record is
+`benchmarks/2026-11-15-seqpar.md`.
+
 ## 18. Optional artifacts (`optional/`) — **not part of the delivery**
 
-These exist only in a checkout made with `scripts/apply-all.sh --include-optional` (`[y/N]` per artifact) or
-`--include-optional-all`; the delivery itself never reads them.  They are catalogued here because a consumer
+These are **optional blocks `01xx`** and exist only in a checkout made with `scripts/apply-all.sh
+--include-optional` (`[y/N]` per artifact, applied in numeric order) or `--include-optional-all`; the
+default delivery never reads them, and `release.json` records their sha256 and produced trees in its
+`optional` map (the counts are `n_optional` / `optional_tree`).  They are catalogued here because a consumer
 who applies an optional artifact is running these code paths and needs the same default/class discipline
 (`optional/README.md`).
 
@@ -1318,7 +1399,12 @@ delivery: see `MOE_HOST_POOL_TRANSPORT` / `_FILL_SRC` / `_DEMAND_SRC` in §19, w
 arm as a **diagnostic** and `auto` is the shipped default.  `archive/work/host-pool-fill-src/` keeps the
 r241/r243 measurement that motivated it.
 
-`optional/two-lane-prefill` (from PR #268/#279/#296, @slavap):
+`optional/mixed-kv` (**block `0101`**; block 17 of r287, moved out of the default set by the r288 re-org)
+adds the mixed K/V cache types.  Its one variable is `GGML_CUDA_FA_KV_MIXED`, catalogued in §8 (the row
+notes it is not in the default build); the artifact, its trees and its measurements are in
+`optional/mixed-kv/README.md`, and its gate is `scripts/gate-mixed-kv.sh` on the optional-applied build.
+
+`optional/two-lane-prefill` (**block `0100`**; from PR #268/#279/#296, @slavap):
 
 | variable | default | class | notes |
 |---|---|---|---|

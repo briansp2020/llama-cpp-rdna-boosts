@@ -18,11 +18,14 @@ campaign records.
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **18-block V2.1 set** (block 00 + blocks 01-17) at fork point **`4f9dfa0e3`**
-(the 2026-11-13 r278 re-base); read `.release` in `release.json` for the release id -- it is the source of
-truth, not this line.  Block 15 is the **streamed KV** (the resident window, the attendance pool and the MTP
-draft window -- all three opt-in, default off).  Block 17 is the **mixed K/V cache types** (r287, PR #312; the one native pair, head 256 only).  `release.json` is the source of truth for the
-tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
+**Current state:** the **17-patch default set** (16 official blocks `0000`-`0015` + the temporary `0300`)
+at fork point **`4f9dfa0e3`** (the 2026-11-13 r278 re-base); read `.release` in `release.json` for the
+release id -- it is the source of truth, not this line.  Block 14 is the **streamed KV** (the resident
+window, the attendance pool and the MTP draft window -- all three opt-in, default off); block 15 is the UMA
+GTT expert store.  The **mixed K/V cache types** are **optional block `0101`** since the r288 block-number
+re-org (they were block 17 in r287, PR #312; the one native pair, head 256 only), and `0100` is two-lane
+prefill.  `release.json` is the source of truth for the tip/tree, counts and hashes; the top of `WORKLOG.md`
+is the newest record.  **Block `0300` is temporary** (item #104).
 The r278 re-base (`archive/work/upstream-rebase-261113/`, base `4f9dfa0e3`) is **cut and released into
 `patches/`**: its 17 blocks are replayed, both rung-repairs are squashed into their owning blocks, and the gates
 are recorded in `WORKLOG.md` 261113.015.  What it left open -- #322 (a stale `gate-server-arms` baseline), #323 (the
@@ -39,10 +42,11 @@ left in this file.  The r236 re-base
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
 | **327** | a table served in place loses the prefill MoE fusions, so residency selects the kernel set — teach the fusions the in-place contract | purity / architecture (blocks 06/08/09/12) | **OPEN** (2026-11-14) — the maintainer's chosen answer to `GREEDY-PURITY.md` §89; deferred, not urgent — §327 |
+| **330** | the Meta split-state cache's warm walk is defeated by a version switch mid-walk, so a token-split ubatch below 128 tokens can overflow the thread stack | correctness (block 09; reachable only with `LLAMA_SEQPAR_MIN` < 128) | **OPEN** (2026-11-15) — reproduced at T = 48/64/80/112, clean at 128+; the shipped `MIN` 512 cannot reach it and `scripts/gate-seqpar.sh` arm 6 is the tripwire |
 
 ## Handle numbering
 
-**New handles append after `#327`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
+**New handles append after `#328`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
 that cites `TODO #74` still means the same subject after that item has closed and left this file.
 
 **Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
@@ -226,7 +230,7 @@ its A/B and it is documented bit-identical to the triple, §69); **MMB's fused G
    the per-block ladder for the blocks touched.
 
 **Where it lands.**  Blocks **06** (MMB), **08** (the old-08 fusions), **09/12** (the cache and scheduler contracts:
-`sched_stage_split`, `moe-expert-cache.{cu,h}`); blocks 15/16 untouched.  **No new environment variable** --
+`sched_stage_split`, `moe-expert-cache.{cu,h}`); blocks 14/15 untouched.  **No new environment variable** --
 `MOE_EXPERT_PREFILL_IN_PLACE` stays a kill switch, and the per-fusion bisect arms already exist
 (`GGML_CUDA_MMB_GLU`, `GGML_PAIR_ROUTED_OFF`, `GGML_CUDA_DISABLE_FUSION`).
 
@@ -254,7 +258,7 @@ asking too much of too little.
 
 **The answers, in order** (cheaper than a cold-source redesign, and why nothing is owed): `MOE_EXPERT_CACHE_MIB=0`
 is 2.2x faster than the declining arm; or `-lme auto` (the covering mirror) / `--host-experts pinned` (exempt by
-construction); or recover the capped VRAM with block 15's streaming KV (`--kv-window`, `--kv-attendance-pool`).
+construction); or recover the capped VRAM with block 14's streaming KV (`--kv-window`, `--kv-attendance-pool`).
 Not shipped on purpose: a WARN for the cell (a code change and a gate for a configuration the delivery does not
 validate, when `decline_all`/`takeover=` already name it at `-lv 4`).
 
@@ -332,7 +336,7 @@ refusal for a pool allocation the driver will not give.  The shipped guard is me
 refused `cudaHostAlloc` logs once and latches the pinned tier off, and no new pool is attempted after it.  The old
 `TODO` #95 pointer (the reporter's r227 log) has left this file; **re-entry is that log.**
 
-### No handle — block 16's GTT tier does not reach a multi-device split, or Windows, or a discrete box
+### No handle — block 15's GTT tier does not reach a multi-device split, or Windows, or a discrete box
 
 Three limits of the same tier, recorded together because they are one hardware story:
 
@@ -347,5 +351,56 @@ Three limits of the same tier, recorded together because they are one hardware s
   but the store/arena is **inert on a discrete GPU by measurement** (forced-on envs produce zero `GTT` lines:
   `plan_gtt_expert_store()` is only reached from the UMA branch, `gtt_store_open()` is never called, and
   `moe_cache_prefill_stream()` declines on `!g_gtt_arena`), so that arm cannot witness this tier there.  The width
-  arm's own subject is decode width (blocks 12/15) and it lives in the MTP protocol, not here.  Record:
+  arm's own subject is decode width (blocks 12/14) and it lives in the MTP protocol, not here.  Record:
   `archive/work/apu-expert-gtt/MEASUREMENTS.md` §27.1 and §28.
+
+### #329 -- block 07's WMMA verify family loses at 2..5 columns; a narrower tile would let the floor go to 2 (and the feature to default-on)
+
+**Open, not scheduled** (r290, PR #317).  The family (`--wmma-verify`, `ENVIRONMENT.md` §7.6) amortizes
+dequantization over the verified columns, which is why it wins at 7-8 columns (+5.8..+10.6 %) and *loses*
+below 6 (-1.6..-8.5 %, and -4.4 % at 6 on a 2-GPU split).  The cause is structural, not tuning: the kernel
+computes a full 16x16 tile and streams the whole weight row whatever the column count, so at 2-4 columns it
+does N/8ths of the arithmetic and 8/8ths of the traffic where the K-split kernel does a small fraction of
+both.  A 2..4-column arm would need a narrower tile or a different operand shape (a 16x16x16 `iu8` WMMA
+cannot be narrowed, so this likely means a *dot-product* form rather than a tile form for the low band).
+
+**What it would buy.**  The floor could ship at 2 (or 6), which would make the family a **default-on**
+candidate: the delivery's own adaptive-MTP drafts produce 2..8-column verify batches, and an arm that wins
+across that whole band is a pure win instead of a config-shaped opt-in.  Until then it stays opt-in with a
+floor of 7 and the purity note in `GREEDY-PURITY.md` §91 -- do not lower the floor without measuring the
+low band on both a single card and a 2-GPU `tensor` split (the crossover moves).
+
+### #330 -- the Meta split-state warm walk is defeated by a cache-version switch mid-walk, so a token-split ubatch below 128 tokens can overflow the stack
+
+**Open, not scheduled** (r291, PR #315).  `ggml_backend_meta_get_split_state` has a non-recursive pre-warm that
+exists precisely to stop `calculate_split_state` from recursing the whole `src` chain (a 1200-node qwen35moe
+chain crashed the allocator this way).  The walk fills the cache version that is current **when it starts**, and
+a nested lookup inside it switches version whenever a tensor's bytes changed since it was cached -- which a graph
+re-allocation does for some tensor on every pass.  The entries the walk already filled then belong to the retired
+version, `wseen` keeps the walk from re-visiting those nodes, and the recursion cannot see the walk's stack, so it
+descends the chain anyway: ~10 frames per layer, ~500 for a 48-layer qwen4exp graph, then a SIGSEGV in
+`ggml_backend_meta_get_split_state` (gdb: unbounded `calculate_split_state` <-> `get_split_state`).
+
+**Reachable only through the r291 sequence-parallel path with its floor lowered**, because that is the only way
+to get a token-split graph at a small ubatch: with `LLAMA_SEQPAR_MIN` forced to 2, `llama-bench -p 4096/8192`
+reproduced it at **T = 48, 64, 80 and 112** and stayed clean at 32, 96, 128, 144, 160, 192, 200, 224, 240, 256,
+256/24576, 320, 512, 1024, 2048, 4096 and 31500; seqpar-off is fine at the same T.  The shipped
+`LLAMA_SEQPAR_MIN=512` cannot reach it, `scripts/gate-seqpar.sh` arm 6 (T=128 forced on) is the tripwire, and
+`INVARIANTS.md` r291 + `GREEDY-PURITY.md` §92 record the numbers.
+
+**Why it is not fixed here.**  A restart of the walk does not close it (measured: the switch that matters happens
+on the root's own lookup *after* the walk, retiring the version the walk just filled), and the plausible cheap
+fix -- resolving a miss from any version that holds a byte-identical entry -- crosses the version-consistency
+invariant the cache exists to keep.  A wrong fix there mis-splits tensors **silently**, which is worse than a
+crash that needs a non-default threshold, so it is block 09 work with its own gates (every `-sm tensor` arm of
+`gate-host-pool`, `gate-kv-residency`, `gate-prefill-logits` and the qwen4exp per-block build), not a rider on
+this feature.
+
+**The band is closed by a floor guard, not left open (r291).**  `LLAMA_SEQPAR_MIN` is clamped to **128** with one
+WARN, so a mis-set value degrades to "off" for the ubatches it cannot handle instead of aborting -- the shipped 512
+is above the clamp, `MIN=2 -ub 32` exits 0 and reports `not engaged`, `MIN=128 -ub 128` engages and runs clean, and
+`scripts/gate-seqpar.sh` arm 6 asserts all three.  A token-split ubatch below 128 therefore cannot be requested at
+all until this is fixed.
+
+**Re-entry:** any proposal to lower that clamp (or to expose `MIN` below 128 again), or a report of this crash at
+or above 128.
