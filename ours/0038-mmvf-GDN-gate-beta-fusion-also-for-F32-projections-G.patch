@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 15 Nov 2026 03:26:08 +0000
-Subject: [PATCH 43/43] mmvf: GDN gate/beta fusion also for F32 projections
+Subject: [PATCH 38/44] mmvf: GDN gate/beta fusion also for F32 projections
  (GGML_CUDA_FUSE_GATE_BETA_F32=0: off)
 
 unsloth UD-IQ4_XS stores ssm_alpha / ssm_beta as F32, so the BF16-only gate/beta fusion did
@@ -9,6 +9,8 @@ not apply and each GDN layer ran the alpha GEMV, the beta GEMV and add_softplus_
 The same fused launch with T = float: each row the plain F32 mul_mat_vec_f instantiation, the
 epilogue add_softplus_mul_bcast_f32's arithmetic.  Bit-identical.  Each type keeps its own
 switch (GGML_CUDA_FUSE_GATE_BETA_BF16 / _F32).  gfx1201 decode: -22 launches per draft step.
+
+(cherry picked from commit e37787676d58f584307d80069a01be6a91af77ea)
 ---
  ggml/src/ggml-cuda/mmvf.cu | 17 +++++++++++------
  1 file changed, 11 insertions(+), 6 deletions(-)

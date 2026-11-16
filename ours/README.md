@@ -3,7 +3,7 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v18-4f9dfa0e3-r287` (upstream llama.cpp `4f9dfa0e3` + this repo's release).
+**Base:** `v16-4f9dfa0e3-r292` (upstream llama.cpp `4f9dfa0e3` + this repo's release).
 The rest of this branch is that release as published; only `ours/` is added.
 
 **New layout (2026-11-08).** Up to r228 this was a 55-patch series (0000-0054) that replaced the release's
@@ -17,11 +17,11 @@ The old series is kept as the tag `ours-r228-series`; the mapping table below sh
 
 ```
 git checkout 4f9dfa0e3
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r287 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 43 patches (0001-0043)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r292 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 44 patches (0001-0044)
 ```
 
-Result: tree `fd3935be4d56`. This is the production build from 2026-11-14 (2 GPUs, `-sm tensor`).
+Result: tree `2889c1710ee2`. This is the production build from 2026-11-16 (2 GPUs, `-sm tensor`).
 
 ## Patches
 
@@ -29,10 +29,11 @@ The release has taken the r251 series' 0018 (DeepSeek-V4 cache size probes) and 
 #300, fixed in r254); they are dropped here. Earlier releases took the r236 series' 0009, 0011, 0014-0015, 0017 and 0018.
 r272 took our copy-engine all-reduce single exchange (PR #304, r265 0012); it is dropped here. r279 fixed the
 `-sm tensor --load-mode none` load race (issue #308, `GGML_META_SEG_DRAIN`), so our drain (r277 0037) is dropped too.
-The numbers below are the r287 series: the r277 series rebased onto r283 (r278 moved the upstream base to `4f9dfa0e3`;
-conflicts in 0001, 0013, 0016 and 0022, all mechanical) and then onto r287 (one conflict, in 0001: r287's mixed K/V
-`type_V` and our q8_0 tile dequant `c_perm` both kept; the q8_0/q8_0 path is unchanged, mixed types run r287's code),
-plus 0038-0043.
+r291 took our qwen4exp sequence parallelism (PR #315: on by default, bf16 all-gathers by default, at least 128 tokens per
+split); the r287 series' 0022-0024, 0027 and 0028 are dropped and the later patches move up.
+The numbers below are the r292 series: the r287 series rebased onto r290 (one conflict, in 0001: r290 removed the mixed
+K/V `type_V` template parameter next to our q8_0 tile dequant `c_perm`; `c_perm` kept), onto r291 (seqpar dropped, no
+conflicts) and onto r292 (no conflicts), plus 0039-0044.
 
 | | what | env switch (off) |
 |---|---|---|
@@ -57,33 +58,57 @@ plus 0038-0043.
 | 0019 | qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy; the gate copy runs before attention on prefill-sized graphs | `LLAMA_QSA3_DIRECT_F16=0`, `LLAMA_GATE_EARLY=0` |
 | 0020 | qwen4exp qsa3: the packs read the Q8_0 cache views directly, no F16 copies in the graph | `LLAMA_QSA3_PACK_Q8=0` |
 | 0021 | `-sm tensor` ubatch overlap: asynchronous graph-input views, asynchronous CPU-split output upload, deferred input wait | `GGML_SCHED_ASYNC_INPUT_VIEWS=0`, `GGML_SCHED_ASYNC_CPU_OUT=0`, `LLAMA_DEFER_INPUT_WAIT=0` |
-| 0022 | qwen4exp sequence parallelism: in 2-GPU `-sm tensor` prefill the hyper-connection work (mixers, residual streams, norms) is split by token instead of computed on both GPUs; reduce-scatter + all-gather around attention and the FFN | opt-in `LLAMA_SEQPAR=1` (production sets it) |
-| 0023 | seqpar review fix: the all-gather never grows an existing copy-engine scratch | `GGML_SEQPAR_CE_GATHER=0` (generic gather) |
-| 0024 | seqpar debug switch: token-split only layers a..b | `LLAMA_SEQPAR_LAYERS=a-b` (default all) |
-| 0025 | decode MoE gate+up+GLU fusion when the GLU output overlaps only the unfilled weight copy (41 of 47 layers were blocked) | `GGML_MOE_FUSE_COPY_ALIAS=0` |
-| 0026 | moe cache: identity (fully resident) tables are served in place above the band in mmap mode too; fixes NaN at small ubatches since r258, with a warn-once `MOE_INPLACE_MISS` tripwire | `MOE_EXPERT_PREFILL_IN_PLACE=0` |
-| 0027 | seqpar: the two per-layer `hc_mixed` all-gathers send bf16 (rounding-level KLD, 0.013) | opt-in `LLAMA_SEQPAR_GATHER_BF16=1` (production sets it) |
-| 0028 | seqpar: odd token counts split ceil/floor | `LLAMA_SEQPAR_ODD=0` |
-| 0029 | moe cache: a table is pool-backed only when the pool was requested | `GGML_MOE_POOL_TABLE_REQ=0` |
-| 0030 | mmq: RDNA4 IQ routed-compact experts with 65-96 rows per expert use J=64 (+1-2 % prefill at `-ub 4096`, bit-identical) | `GGML_MMQ_IQ_J64_WIDE=0` |
-| 0031 | moe cache: the release's in-place prefill stands down when a sparse table exists (only reachable with a GTT arena and mixed tables; inert on discrete GPUs) | - |
-| 0032 | moe cache: KV segment -- under `GGML_MOE_KV_LEND=1`, the lent KV rows past the context in use are an expert-cache tier below the arena (heat-seeded, then demand-filled from the RAM tier; the arena evolves as without it); every device lends its own K/V slices under `-sm tensor` | opt-in `GGML_MOE_KV_SEG=1` (production sets it) |
-| 0033 | KV segment: one take-back per request (the server hints the prompt length) instead of stepwise takes during long prefills | `GGML_MOE_KV_SEG_TAKE1=0` |
-| 0034 | KV segment: small prefill ubatches (decode band < n < 512) read non-resident experts from their KV copies | `GGML_MOE_KV_SEG_PF=0` |
-| 0035 | KV segment: review fixes (source counters, the hint returns to 0 when idle) | - |
-| 0036 | KV segment: 0034 on by default with the segment | `GGML_MOE_KV_SEG_PF=0` |
-| 0037 | hc mixer: Q8_0 path (models whose hyper-connection weights are Q8_0, e.g. unsloth UD-IQ4_XS): persistent down-done counters, planar mixer output, Q8_1 epilogue in collapse+inject, combine+RMS-norm+gamma fused; bit-identical, BF16 kernels byte-identical | `GGML_CUDA_HC_DONE_PERSIST=0`, `LLAMA_HC_MIX_PLANAR_Q8=0`, `GGML_CUDA_HC_Q8_EPI=0`, `GGML_CUDA_FUSE_HC_COMBINE_MIX_Q8=0` |
-| 0038 | loader: open the MoE heat map in `--host-experts mmap` mode (the map was never loaded or saved there: the only opener ran after mmap mode had returned) | `LLAMA_MMAP_HEAT_OPEN=0` |
-| 0039 | expert cache: the persisted-heat seed of a sparse (mmap) table fills through the tier code (it used a pageable copy from the mapping; a warm start took more than 15 min) | - |
-| 0040 | expert cache: a sparse table's staged fill at sizing takes the heat map's hottest experts; the per-expert heat seed leaves sparse tables to it | `GGML_MOE_STAGE_HEAT_RANK=0` |
-| 0041 | hc mixer: the Q8_0 up band kernel loads its weights before the prologue barrier (compile-time blocks per row, 3 items per thread); bit-identical | `GGML_CUDA_HC_UP_PRELOAD=0` |
-| 0042 | hc mixer: Q8_0 up dots and collapse in one launch (each block replays the 8 up blocks of its 32 columns and collapses them, Q8_1 epilogue included); the F32 inject rows move to the front of the down-dots grid; bit-identical | `GGML_CUDA_HC_UP_FUSE=0`, `GGML_CUDA_HC_INJECT_DOWN=0` |
-| 0043 | GDN gate/beta fusion also for F32 projections (unsloth UD-IQ4_XS stores `ssm_alpha` / `ssm_beta` as F32, so the BF16-only fusion did not apply and each GDN layer ran two GEMVs and the softplus epilogue): the same fused launch with an F32 instantiation; bit-identical | `GGML_CUDA_FUSE_GATE_BETA_F32=0` |
+| 0022 | decode MoE gate+up+GLU fusion when the GLU output overlaps only the unfilled weight copy (41 of 47 layers were blocked) | `GGML_MOE_FUSE_COPY_ALIAS=0` |
+| 0023 | moe cache: identity (fully resident) tables are served in place above the band in mmap mode too; fixes NaN at small ubatches since r258, with a warn-once `MOE_INPLACE_MISS` tripwire | `MOE_EXPERT_PREFILL_IN_PLACE=0` |
+| 0024 | moe cache: a table is pool-backed only when the pool was requested | `GGML_MOE_POOL_TABLE_REQ=0` |
+| 0025 | mmq: RDNA4 IQ routed-compact experts with 65-96 rows per expert use J=64 (+1-2 % prefill at `-ub 4096`, bit-identical) | `GGML_MMQ_IQ_J64_WIDE=0` |
+| 0026 | moe cache: the release's in-place prefill stands down when a sparse table exists (only reachable with a GTT arena and mixed tables; inert on discrete GPUs) | - |
+| 0027 | moe cache: KV segment -- under `GGML_MOE_KV_LEND=1`, the lent KV rows past the context in use are an expert-cache tier below the arena (heat-seeded, then demand-filled from the RAM tier; the arena evolves as without it); every device lends its own K/V slices under `-sm tensor` | opt-in `GGML_MOE_KV_SEG=1` (production sets it) |
+| 0028 | KV segment: one take-back per request (the server hints the prompt length) instead of stepwise takes during long prefills | `GGML_MOE_KV_SEG_TAKE1=0` |
+| 0029 | KV segment: small prefill ubatches (decode band < n < 512) read non-resident experts from their KV copies | `GGML_MOE_KV_SEG_PF=0` |
+| 0030 | KV segment: review fixes (source counters, the hint returns to 0 when idle) | - |
+| 0031 | KV segment: 0029 on by default with the segment | `GGML_MOE_KV_SEG_PF=0` |
+| 0032 | hc mixer: Q8_0 path (models whose hyper-connection weights are Q8_0, e.g. unsloth UD-IQ4_XS): persistent down-done counters, planar mixer output, Q8_1 epilogue in collapse+inject, combine+RMS-norm+gamma fused; bit-identical, BF16 kernels byte-identical | `GGML_CUDA_HC_DONE_PERSIST=0`, `LLAMA_HC_MIX_PLANAR_Q8=0`, `GGML_CUDA_HC_Q8_EPI=0`, `GGML_CUDA_FUSE_HC_COMBINE_MIX_Q8=0` |
+| 0033 | loader: open the MoE heat map in `--host-experts mmap` mode (the map was never loaded or saved there: the only opener ran after mmap mode had returned) | `LLAMA_MMAP_HEAT_OPEN=0` |
+| 0034 | expert cache: the persisted-heat seed of a sparse (mmap) table fills through the tier code (it used a pageable copy from the mapping; a warm start took more than 15 min) | - |
+| 0035 | expert cache: a sparse table's staged fill at sizing takes the heat map's hottest experts; the per-expert heat seed leaves sparse tables to it | `GGML_MOE_STAGE_HEAT_RANK=0` |
+| 0036 | hc mixer: the Q8_0 up band kernel loads its weights before the prologue barrier (compile-time blocks per row, 3 items per thread); bit-identical | `GGML_CUDA_HC_UP_PRELOAD=0` |
+| 0037 | hc mixer: Q8_0 up dots and collapse in one launch (each block replays the 8 up blocks of its 32 columns and collapses them, Q8_1 epilogue included); the F32 inject rows move to the front of the down-dots grid; bit-identical | `GGML_CUDA_HC_UP_FUSE=0`, `GGML_CUDA_HC_INJECT_DOWN=0` |
+| 0038 | GDN gate/beta fusion also for F32 projections (unsloth UD-IQ4_XS stores `ssm_alpha` / `ssm_beta` as F32, so the BF16-only fusion did not apply and each GDN layer ran two GEMVs and the softplus epilogue): the same fused launch with an F32 instantiation; bit-identical | `GGML_CUDA_FUSE_GATE_BETA_F32=0` |
+| 0039 | GDN gate/beta epilogue for models whose `ssm_alpha` / `ssm_beta` are not Q8_0 (Q4_K, MXFP4, ...): the matvec writes the softplus and sigmoid outputs itself (decode 3 launches -> 1, verify 5 -> 2) | `GGML_CUDA_FUSE_GDN_EPI=0` |
+| 0040 | 0039's memory check made precise (the generic window check declined about 29 of 30 layers) | - |
+| 0041 | MoE decode: the down + weighted-reduction fold takes precedence over the MUL-only down fold, and its sum runs without fma contraction (exact against the unfused graph) | `GGML_CUDA_MWR_FOLD_FIRST=0`, `GGML_CUDA_MWR_FOLD_CONTRACT=1` (old sum) |
+| 0042 | the standalone MoE weighted-reduction kernels without fma contraction (exact against the unfused graph; changes output at rounding level) | `GGML_CUDA_MWR_EXACT=0` |
+| 0043 | r292's arena settle skips layers that hold an mmap-tier table (re-sizing such a layer frees the table, which turned our RAM tier off for the rest of the process) | `GGML_MOE_SETTLE_SPARSE=1` (release behaviour) |
+| 0044 | QSA indexer top-k: fast path for the regular cache layout (block-level first pass and gather, visible width computed instead of counted); a device check falls back to the general path | `GGML_QSA_TOPK_REGULAR=0` |
 
 0005, 0006 (down-fold part) and 0009 were workarounds for the bug the release's fusion overlap check fixes at the source;
 0010 removes 0005. The others only run after a decline or a failed fill.
 
 Production also sets `MOE_HOST_POOL_TRANSPORT=map` (pins the host-read transport the r262 adaptive mode would otherwise pick).
+
+## Validation on r290-r292 (2026-11-15 and 2026-11-16, Radeon AI PRO R9700 x 2, ROCm 10.1)
+
+On the production configuration (described in the next section) unless another model is named.
+
+- Each rebase (r290, r291, r292): greedy, prompt-set, mid-length and depth hashes identical to the series before it, 259.6k
+  needle correct, byte checks (`GGML_MOE_VERIFY`) 0 differences, 6 of 6 loads clean under `-sm tensor --load-mode none`.
+  r291's sequence parallelism gives the same output as our dropped patches.
+- r292's settle does not fire on this configuration (no decode-band prior; no capacity growth after sizing), so 0043 does not
+  change output here.
+- 0039-0040, on models with Q4_K / MXFP4 `ssm_alpha` / `ssm_beta`: KLD on vs off at the level of off vs off; decode
+  Qwen3.6-35B-A3B +1.4 %, Qwen3.8-27B +0.6 %. No effect on the production model (BF16 / F32 projections).
+- 0041: Qwen3.6-35B-A3B decode +2.5 %, Qwen3-30B-A3B and gemma-4-26B-A4B flat; KLD against the unfused graph 0 (was 0.0018
+  on Qwen3.6-35B-A3B and 0.0021 on Qwen3-30B-A3B).
+- 0042 changes the production model's output at rounding level, toward the unfused graph: KLD against the unfused graph
+  0.011 (96.7 % same top token) before, 0 after; perplexity 2.5558 -> 2.5504. Decode speed unchanged.
+- 0044: QSA top-k about 4.7 ms per call before; 259.6k needle prefill 2915 -> 3185 t/s (+9.3 %), 31.5k +1.5 %, every hash
+  identical with the switch on and off.
+- Nightly on the final tree: 0 faults. The 7-model comparison with the release differs only on the three MoE models
+  (Qwen3-30B-A3B, Qwen3.6-35B-A3B, gemma-4-26B-A4B), as 0041-0042 intend: KLD 0.005 and 0.009; gemma's 0.54 is measured
+  where its raw-wikitext perplexity is about 17,000 (the release too), and its multi-turn text is coherent. The dense
+  models are identical. Four stress sessions: 61 rounds, 0 faults, every round the expected hash, needle correct.
+- Production since 2026-11-16: 31.5k prefill 3456-3521 t/s, 159k 3362-3384 t/s, greedy decode about 135 t/s.
 
 ## Validation on r283 and r287 (2026-11-14, Radeon AI PRO R9700 x 2, ROCm 10.1)
 

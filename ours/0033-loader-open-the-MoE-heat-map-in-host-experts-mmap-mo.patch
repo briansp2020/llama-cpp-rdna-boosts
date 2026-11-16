@@ -1,13 +1,15 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 15:57:29 +0000
-Subject: [PATCH 38/43] loader: open the MoE heat map in --host-experts mmap
+Subject: [PATCH 33/44] loader: open the MoE heat map in --host-experts mmap
  mode (LLAMA_MMAP_HEAT_OPEN=0: off)
 
 The mmap mode returned from plan_host_expert_placement before the heat-map open, the only call site, so
 the persisted heat map was never loaded or saved with --host-experts mmap (last write by a run on Flash-Next:
 2026-11-08, the r235 layout).  Open it on every GPU device before that return; tables adopt the prior at
 registration and the session tallies are saved on the debounce and at exit.
+
+(cherry picked from commit c70ca4dde91e84b554e37b6df3045f04467dcb2e)
 ---
  src/llama-model-loader.cpp | 15 +++++++++++++++
  1 file changed, 15 insertions(+)

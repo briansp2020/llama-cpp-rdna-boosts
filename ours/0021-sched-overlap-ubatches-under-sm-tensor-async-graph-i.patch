@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 13:42:02 +0000
-Subject: [PATCH 21/43] sched: overlap ubatches under -sm tensor -- async
+Subject: [PATCH 21/44] sched: overlap ubatches under -sm tensor -- async
  graph-input views, async CPU-split output, deferred input wait
 
 The host waited on every split for a view of a graph input (96 waits, ~1 s per 4096-token prefill ubatch:
@@ -23,6 +23,8 @@ The view, CPU-output and deferred-wait paths run only on a scheduler with a META
 plain device (1 GPU, -sm layer) keeps the old ordering. sched_free waits for pending uploads.
 
 Same bytes, ordering only (FINDINGS 882).
+
+(cherry picked from commit e84058cdfe3ff4e60e5911857d81c04426d3a94b)
 ---
  ggml/include/ggml-backend.h                   |   3 +
  ggml/src/ggml-backend-meta.cpp                |  17 +++
@@ -32,10 +34,10 @@ Same bytes, ordering only (FINDINGS 882).
  5 files changed, 165 insertions(+), 9 deletions(-)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 46988501f..7c1749fb2 100644
+index e6c3373a9..8d4bcb08c 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -536,6 +536,9 @@ extern "C" {
+@@ -545,6 +545,9 @@ extern "C" {
      // wait until no asynchronous upload still reads a user input buffer (GGML_SCHED_ASYNC_USER_INPUT); call before
      // writing the inputs of a reused graph (alloc_graph does it for a new one)
      GGML_API void                 ggml_backend_sched_wait_input_uploads(ggml_backend_sched_t sched);
@@ -46,10 +48,10 @@ index 46988501f..7c1749fb2 100644
      // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
      // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index e92c95161..e6d3cf1b2 100644
+index d8c817080..8818f1fca 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -3176,6 +3176,7 @@ struct ggml_backend_meta_context {
+@@ -3264,6 +3264,7 @@ struct ggml_backend_meta_context {
      int   stage_n_slots   = 8;              // GGML_SCHED_STAGE_SLOTS, clamped to the ring's 16
      std::vector<std::vector<ggml_backend_event_t>> stage_done_ev; // [device][slot], upload complete
      std::vector<std::vector<ggml_backend_event_t>> stage_free_ev; // [device][slot], slot reusable
@@ -57,7 +59,7 @@ index e92c95161..e6d3cf1b2 100644
  
      void *                               comm_ctx       = nullptr;
      ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
-@@ -3215,6 +3216,8 @@ struct ggml_backend_meta_context {
+@@ -3313,6 +3314,8 @@ struct ggml_backend_meta_context {
              for (size_t j = 0; j < n_devs; j++) {
                  stage_done_ev[j].resize(stage_n_slots, nullptr);
                  stage_free_ev[j].resize(stage_n_slots, nullptr);
@@ -66,7 +68,7 @@ index e92c95161..e6d3cf1b2 100644
              }
          }
  
-@@ -3642,6 +3645,19 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+@@ -3746,6 +3749,19 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
  
      const int slot = backend_ctx->stage_slot_next;
      backend_ctx->stage_slot_next = (backend_ctx->stage_slot_next + 1) % backend_ctx->stage_n_slots;
@@ -86,7 +88,7 @@ index e92c95161..e6d3cf1b2 100644
  
      // Reserve every device's ring slot before anything is uploaded: a ring that cannot hold its chunk
      // aborts the whole attempt, because staging only part of an upload would leave the rest on the
-@@ -3825,6 +3841,7 @@ struct ggml_backend_meta_stage_guard {
+@@ -3929,6 +3945,7 @@ struct ggml_backend_meta_stage_guard {
                      simple_tensor->data = chunk.orig;
                  }
                  ggml_backend_event_record(ctx->stage_free_ev[chunk.device][entry.slot], chunk.backend);
@@ -338,7 +340,7 @@ index 140ecbb81..a88be3790 100644
      }
      CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 76def8da3..72b5817ab 100644
+index f5557e92b..ef72b5988 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3180,6 +3180,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll

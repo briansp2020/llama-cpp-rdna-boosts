@@ -1,10 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 06:08:29 +0000
-Subject: [PATCH 13/43] cuda: graph eviction on the active clock again
+Subject: [PATCH 13/44] cuda: graph eviction on the active clock again
  (FINDINGS 519), on top of r236; keep upstream never-evicting the looked-up
  key
 
+(cherry picked from commit 920799a4f244d1d016f07359766b2b0e02c6a93d)
 ---
  ggml/src/ggml-cuda/common.cuh   |  7 ++++---
  ggml/src/ggml-cuda/ggml-cuda.cu | 23 +++++++++++++----------
@@ -32,10 +33,10 @@ index d759c7218..834402ad9 100644
      // Check if any CUDA graph is enabled for this context (used by kernels that need to know
      // if graphs are in use without having access to the specific graph key)
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index cb4bf839e..93944a026 100644
+index a0fe82b41..83352789c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1503,16 +1503,19 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
+@@ -1504,16 +1504,19 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
  // bare first_node_ptr -- so decode, the speculative verify widths and per-layer subgraphs each keep their own
  // captured graph.  Out of line here because the eviction/insert path needs the complete `ggml_cuda_graph`,
  // which lives in graph.cuh.

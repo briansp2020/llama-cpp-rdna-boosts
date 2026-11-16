@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 02:28:14 +0000
-Subject: [PATCH 32/43] moe cache: KV segment -- lent KV rows as an
+Subject: [PATCH 27/44] moe cache: KV segment -- lent KV rows as an
  expert-cache tier below the arena
 
 GGML_MOE_KV_LEND=1 + GGML_MOE_KV_SEG=1 (default off; unset GGML_MOE_KV_SEG = off).
@@ -26,6 +26,8 @@ Fable design + logic reviews (no open must-fix).  Production config,
 -c 262144, two rounds (FINDINGS 935): decode +2.5 % at 4.2k, +1.7..2.5 % at
 101k, midpf +1.4..2.5 %; prefill equal except -0.6 % on a 260k prompt
 (stepwise take-backs); output identical.
+
+(cherry picked from commit 86300ecc1f2944abe4374e4e8487f8d6868b1ffb)
 ---
  ggml/include/ggml-backend.h            |   3 +
  ggml/src/ggml-backend-meta.cpp         |   8 +
@@ -34,7 +36,7 @@ Fable design + logic reviews (no open must-fix).  Production config,
  4 files changed, 587 insertions(+), 51 deletions(-)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 1ae474887..48f7696fb 100644
+index 8d4bcb08c..6f89c4108 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -665,6 +665,9 @@ extern "C" {
@@ -48,7 +50,7 @@ index 1ae474887..48f7696fb 100644
      // issue #164: the byte size of device `dev`'s slice of `tensor` under `split_state`.  This is the
      // single definition of the meta split size -- `ggml_backend_meta_stage_input` sizes the H2D ring slot
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 30f7504c6..9b73b9dff 100644
+index 8818f1fca..19669dde8 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1024,6 +1024,14 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct
@@ -900,10 +902,10 @@ index c3ac5880f..4d9fcf6b8 100644
                  int64_t pf_held = 0;
                  for (const kvl_slot_t & sl : g_kvl_slots) {
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 0b77cc503..c0ea2bb01 100644
+index 849ed1728..a6b2b55c6 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1206,16 +1206,45 @@ void llama_kv_cache::lend_attach() {
+@@ -1288,16 +1288,45 @@ void llama_kv_cache::lend_attach() {
          has_kv_pool() || layers.empty()) {
          return;
      }
@@ -954,7 +956,7 @@ index 0b77cc503..c0ea2bb01 100644
          return;
      }
      auto reg_fn   = (llama_kv_lend_register_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_kv_register");
-@@ -1225,10 +1254,8 @@ void llama_kv_cache::lend_attach() {
+@@ -1307,10 +1336,8 @@ void llama_kv_cache::lend_attach() {
          return;
      }
      int n = 0;
@@ -967,7 +969,7 @@ index 0b77cc503..c0ea2bb01 100644
      }
      if (n == 0) {
          return;
-@@ -1236,8 +1263,8 @@ void llama_kv_cache::lend_attach() {
+@@ -1318,8 +1345,8 @@ void llama_kv_cache::lend_attach() {
      g_kv_lend_owner      = this;
      g_kv_lend_need       = need_fn;
      g_kv_lend_unregister = unreg_fn;
@@ -978,7 +980,7 @@ index 0b77cc503..c0ea2bb01 100644
  }
  
  // The indexer's keys-only cache uses the attention cache's slot layout, so the attention cache's lend line covers its
-@@ -1248,6 +1275,11 @@ void llama_kv_cache::lend_follow(const llama_kv_cache & owner) {
+@@ -1330,6 +1357,11 @@ void llama_kv_cache::lend_follow(const llama_kv_cache & owner) {
          has_kv_pool() || layers.empty() || get_size() != owner.get_size()) {
          return;
      }

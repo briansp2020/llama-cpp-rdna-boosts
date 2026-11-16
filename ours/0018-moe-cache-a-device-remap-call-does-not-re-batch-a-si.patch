@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 10 Nov 2026 15:28:45 +0000
-Subject: [PATCH 18/43] moe cache: a device-remap call does not re-batch a
+Subject: [PATCH 18/44] moe cache: a device-remap call does not re-batch a
  sibling already taken over in this round (GGML_MOE_DEVREMAP_REBATCH)
 
 A layer whose down (or up) table was not served by the first remap call of
@@ -16,15 +16,17 @@ Skip a sibling already published in the current round.  With
 GGML_MOE_FILL_BATCH_FAULT at 45/47/50/51 (and 50 + VERIFY_EVERY) the logits
 are now bit-identical to the fault-free run; fault-free output unchanged.
 GGML_MOE_DEVREMAP_REBATCH=1 restores the old re-batch.
+
+(cherry picked from commit 387e8239c57389b5c85d19990aee9c5255879ce5)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 13 +++++++++++++
  1 file changed, 13 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index de3daae7b..a4f07082d 100644
+index 9b2ae1f52..19dfbad23 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -11976,6 +11976,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+@@ -12290,6 +12290,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
      return true;
  }
  
@@ -37,7 +39,7 @@ index de3daae7b..a4f07082d 100644
  bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids,
                           void * stream, int device, bool check_only) {
      bool pf_ret = false;
-@@ -12071,6 +12077,13 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -12385,6 +12391,13 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
                  !devremap_ok_locked(u, n_used, n_tok, device)) {
                  continue;
              }

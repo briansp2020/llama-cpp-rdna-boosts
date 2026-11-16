@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:09:29 +0000
-Subject: [PATCH 33/43] moe cache: KV segment -- one take per request
+Subject: [PATCH 28/44] moe cache: KV segment -- one take per request
  (GGML_MOE_KV_SEG_TAKE1)
 
 With the KV segment the lend line follows the cells in use, so a long
@@ -28,6 +28,8 @@ otherwise; GGML_MOE_KV_SEG_TAKE1=0 restores the stepwise takes.
 The take log line (GGML_MOE_KV_LEND_LOG) also splits its time into the
 first synchronise, the pointer writes, the memset and the second
 synchronise, to show where a take spends it.
+
+(cherry picked from commit 6cbcc5d01c8bf63ceb7bc86d0f81107d5a50498c)
 ---
  ggml/src/ggml-cuda/moe-expert-tier.inc | 13 +++++++++++--
  src/llama-ext.h                        |  8 ++++++++
@@ -107,10 +109,10 @@ index b2c8d8bc7..d7eada88c 100644
  // no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
  // attention cells, that cache as well.  A memory without an attention cache: true.
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index c0ea2bb01..452ac5447 100644
+index a6b2b55c6..f0cbe3bfd 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -421,6 +421,7 @@ typedef void (*llama_kv_lend_unregister_t)();
+@@ -500,6 +500,7 @@ typedef void (*llama_kv_lend_unregister_t)();
  static const llama_kv_cache *     g_kv_lend_owner      = nullptr;
  static llama_kv_lend_need_t       g_kv_lend_need       = nullptr;
  static llama_kv_lend_unregister_t g_kv_lend_unregister = nullptr;
@@ -118,7 +120,7 @@ index c0ea2bb01..452ac5447 100644
  
  //
  // llama_kv_cache
-@@ -1310,13 +1311,33 @@ void llama_kv_cache::lend_need(uint32_t at_least) const {
+@@ -1392,13 +1393,33 @@ void llama_kv_cache::lend_need(uint32_t at_least) const {
          return;
      }
      const auto & cells = v_cells[0];
@@ -153,7 +155,7 @@ index c0ea2bb01..452ac5447 100644
  void llama_kv_cache::init_rotation(const char * name_tag) {
      if (!(n_rot_k || n_rot_v) || layers.empty()) {
          return;
-@@ -2712,6 +2733,7 @@ llama_kv_cache::~llama_kv_cache() {
+@@ -2794,6 +2815,7 @@ llama_kv_cache::~llama_kv_cache() {
          g_kv_lend_owner      = nullptr;
          g_kv_lend_need       = nullptr;
          g_kv_lend_unregister = nullptr;
@@ -162,10 +164,10 @@ index c0ea2bb01..452ac5447 100644
      // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
      // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 1f675b8b1..6bfd23f35 100644
+index f1e4f0cc5..99f823cfb 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
-@@ -306,6 +306,7 @@ public:
+@@ -309,6 +309,7 @@ public:
      void lend_follow(const llama_kv_cache & owner);   // keys-only cache on owner's slot layout: lent by owner's line
      bool lend_follower = false;
      void lend_need(uint32_t at_least) const;   // the next write or read reaches up to row `at_least`

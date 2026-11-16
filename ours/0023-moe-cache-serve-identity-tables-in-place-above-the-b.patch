@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 03:28:17 +0000
-Subject: [PATCH 26/43] moe cache: serve identity tables in place above the
+Subject: [PATCH 23/44] moe cache: serve identity tables in place above the
  band in mmap mode too
 
 r258 (TODO #133) takes an identity (fully resident) table over at any
@@ -20,6 +20,8 @@ redirect aliases an identity table the take-over serves.
 Production model: -ub 512 PPL 2.2453 (was nan); KLD vs the staged path
 0.000000, 100 % same top (rounding control 0.014); production server
 config unchanged (0 identity tables, all hashes equal) (FINDINGS 910).
+
+(cherry picked from commit a35a444e8b29dbfe2a505f8de198f03efaa83bc0)
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu        | 11 +++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.cu | 15 +++++++++++++++
@@ -28,10 +30,10 @@ config unchanged (0 identity tables, all hashes equal) (FINDINGS 910).
  4 files changed, 35 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index b614c1539..6e52ba612 100644
+index 4293add9a..e4dea0e32 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -7301,6 +7301,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -7582,6 +7582,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
              dst->src[2] = saved_s2;
              return;
          }
@@ -50,10 +52,10 @@ index b614c1539..6e52ba612 100644
  
      GGML_TENSOR_BINARY_OP_LOCALS
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index a4f07082d..dcefb6789 100644
+index 19dfbad23..bbdd5c900 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -12199,6 +12199,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
+@@ -12513,6 +12513,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
      return n_tok <= MOE_EXPERT_CACHE_MAX_TOK || moe_cache_prefill_in_place();
  }
  

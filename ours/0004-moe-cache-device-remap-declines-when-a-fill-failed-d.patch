@@ -1,20 +1,22 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:24:54 +0000
-Subject: [PATCH 04/43] moe cache: device remap declines when a fill failed
+Subject: [PATCH 04/44] moe cache: device remap declines when a fill failed
  during its policy pass
 
 The remap took the input over although the consumer then refuses a table with fill_failed: the op read an input_cpy nobody filled.
+
+(cherry picked from commit 3e4ae9b42f532905c99dc612fea38c13856d8ad1)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu |  4 ++--
  ggml/src/ggml-cuda/moe-expert-tier.inc | 23 ++++++++++++++++++++++-
  2 files changed, 24 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 7cee9cdd8..de3daae7b 100644
+index c848418ec..9b2ae1f52 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -11907,8 +11907,8 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+@@ -12221,8 +12221,8 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
              bool cold = false;
              (void) access_locked(t, t.dr_lag_host[i], stream, t.dr_lag_host, n, &cold);
          }

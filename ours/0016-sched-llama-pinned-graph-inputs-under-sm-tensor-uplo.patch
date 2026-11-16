@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 19:06:53 +0000
-Subject: [PATCH 16/43] sched/llama: pinned graph inputs under -sm tensor,
+Subject: [PATCH 16/44] sched/llama: pinned graph inputs under -sm tensor,
  uploaded asynchronously per device; keep host compute buffers across the drop
 
 - llama-context: a tensor-split (meta) device has no single host buffer type when its GPUs report per-device
@@ -20,6 +20,8 @@ Subject: [PATCH 16/43] sched/llama: pinned graph inputs under -sm tensor,
 Prod config (-sm tensor -ub 4096), x2: 31.5k 3452/3485, 3456/3489 vs 3363/3433, 3370/3431 (+1.6-2.6 %), midpf
 +2.2 %, 101k 3274/3274 vs 3187/3197 (+2.5 %); outputs identical, 0 faults.  -sm layer unchanged.  Fable: design
 review (M1-M4 applied), code reviews no must-fix (FINDINGS 861).
+
+(cherry picked from commit 82e3797173e9ed345558784cc0a1790d7122e8af)
 ---
  ggml/include/ggml-backend.h    |  3 ++
  ggml/src/ggml-alloc.c          | 13 +++++++
@@ -29,10 +31,10 @@ review (M1-M4 applied), code reviews no must-fix (FINDINGS 861).
  5 files changed, 103 insertions(+)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index ded4c81a5..46988501f 100644
+index f02eb3698..e6c3373a9 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -533,6 +533,9 @@ extern "C" {
+@@ -542,6 +542,9 @@ extern "C" {
      GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
      GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
      GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
@@ -71,10 +73,10 @@ index 84896dc2f..adc0031c8 100644
              if (galloc->buffers[j] == galloc->buffers[i]) {
                  galloc->buffers[j] = NULL;
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index b8235bbba..ad8ab3f95 100644
+index 98ad9298e..f26993dbd 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -3383,6 +3383,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -3487,6 +3487,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
              }
              backend_ctx->seg_upload_async_pending = false;
          }
@@ -204,7 +206,7 @@ index 5c6677e6c..a28fb94c2 100644
          // the rings keeps them from synchronizing on the host at every wrap in a long prefill.
          sched->copy_event_next[i] = 0;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 68ada5263..76def8da3 100644
+index d1dc2c830..f5557e92b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -850,6 +850,15 @@ llama_context::llama_context(

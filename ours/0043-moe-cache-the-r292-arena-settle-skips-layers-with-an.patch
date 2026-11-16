@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 16 Nov 2026 01:42:16 +0000
+Subject: [PATCH 43/44] moe cache: the r292 arena settle skips layers with an
+ mmap-tier table (GGML_MOE_SETTLE_SPARSE=1 = Stew behaviour)
+
+Re-sizing such a layer frees its tables, and free_table_buffers_locked then calls
+tier_drop_all_locked("re-size"), which latches the RAM tier off for the process
+(and with it KV lending and the tier device remap).
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 1f5f2489c..366b4ce49 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -668,6 +668,9 @@ int64_t                             g_arena_releases = 0;
+ // it after a compute-buffer drop returned the VRAM.  -1 = the layer was not cacheable at sizing time.
+ int                                 g_rearm_slots[512];
+ bool                                g_steady_rearm    = true;
++// ours: the settle skips a layer with an mmap-tier table (re-sizing it drops the RAM tier for good,
++// and with it KV lending and the tier remap).  GGML_MOE_SETTLE_SPARSE=1 lets it grow them (Stew behaviour).
++bool                                g_steady_sparse   = false;
+ int64_t                             g_steady_raised   = 0;   // layers whose slot count grew at a drop
+ int64_t                             g_steady_skipped  = 0;   // drops where the capacity did not grow (no-op)
+ // wip/arena-steady-sizing: the settle is DEMAND-GATED.  Filling the band the next prefill reclaims is only
+@@ -1689,6 +1692,7 @@ void parse_env() {
+     // returns, rather than only restoring the count the sizing pass froze while the wide prefill view was
+     // live.  Kill-switch only (the default-on policy): `=0` restores the frozen behaviour for an A/B.
+     g_steady_rearm   = env_int("MOE_EXPERT_CACHE_STEADY_REARM", 1) != 0;
++    g_steady_sparse  = env_int("GGML_MOE_SETTLE_SPARSE", 0) != 0;
+     {
+         // the prior-mass gain (percentage points) that makes taking the prefill band worth its eviction
+         const char * e = getenv("MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP");
+@@ -8325,6 +8329,9 @@ static int settle_slots_locked(int layer, const std::vector<int> & ids, int base
+         if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES || !ggml_cuda_slab_enabled()) {
+             return base;
+         }
++        if (!g_steady_sparse && (t.host_sparse || t.ram_base != nullptr)) {
++            return base;   // ours: re-sizing this table would drop the RAM tier (tier_drop_all_locked)
++        }
+         if (g_size_avail[dev] == 0 || g_size_request[dev] == 0) {
+             return base;   // not sized against a slab arena: nothing to settle
+         }
+-- 
+2.53.0
+

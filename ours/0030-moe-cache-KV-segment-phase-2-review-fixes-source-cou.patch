@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:16:22 +0000
-Subject: [PATCH 35/43] moe cache: KV segment phase 2 -- review fixes (source
+Subject: [PATCH 30/44] moe cache: KV segment phase 2 -- review fixes (source
  counters, idle hint)
 
 Three small fixes from the logic review of the two phase 2 commits.  None
@@ -25,6 +25,8 @@ changes which bytes are read.
   update_slots, so the floor of a finished or cancelled prompt does not
   outlive it until the next request; the comment at the hint now says
   what is sent and when.
+
+(cherry picked from commit 3fc542666b22d380a064f543f54b513a498e9119)
 ---
  ggml/src/ggml-cuda/moe-expert-tier.inc | 44 +++++++++++++++++++-------
  tools/server/server-context.cpp        |  8 +++--

@@ -1,21 +1,23 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 18:02:50 +0000
-Subject: [PATCH 31/43] moe cache: the release in-place prefill (TODO #317)
+Subject: [PATCH 26/44] moe cache: the release in-place prefill (TODO #317)
  stands down when a sparse table exists
 
 With any sparse (mmap) table, moe_cache_get_table answers from the tier code, which
 refuses a remap published without a freshness round; pf_in_place_locked sets none.
 Only reachable with a GTT arena (APU) and mixed tables; inert on discrete GPUs.
+
+(cherry picked from commit 89cf15085fd10300e6ce42f1f69461e412ccb41a)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 5 ++++-
  1 file changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 81e5c092b..2f7702b1a 100644
+index 008cf50cf..262076c48 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -11447,7 +11447,10 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -11761,7 +11761,10 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          // and this arm is INERT (never wrong -- the seed and this path are otherwise independent).
          t.remap_n_used  = 0;
          t.remap_prefill = false;

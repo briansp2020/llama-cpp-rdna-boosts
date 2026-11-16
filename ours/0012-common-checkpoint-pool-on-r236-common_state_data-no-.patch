@@ -1,18 +1,19 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 06:08:29 +0000
-Subject: [PATCH 12/43] common: checkpoint pool on r236 common_state_data
+Subject: [PATCH 12/44] common: checkpoint pool on r236 common_state_data
  (no-init allocator), pages still touched by the pool thread
 
+(cherry picked from commit 21677dab1721c6ef67982dd752e6f47af5fe45fd)
 ---
  common/common.cpp | 13 +++++++------
  1 file changed, 7 insertions(+), 6 deletions(-)
 
 diff --git a/common/common.cpp b/common/common.cpp
-index f0a1dfa4a..0c992ac19 100644
+index 7f0c22c6e..61ecdd2b2 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -2861,7 +2861,7 @@ struct ckpt_pool {
+@@ -2889,7 +2889,7 @@ struct ckpt_pool {
      static constexpr size_t K = 3;
      std::mutex mtx;
      std::condition_variable cv;
@@ -21,7 +22,7 @@ index f0a1dfa4a..0c992ac19 100644
      size_t want[2] = { 0, 0 };
      bool on = false;
  
-@@ -2873,7 +2873,7 @@ struct ckpt_pool {
+@@ -2901,7 +2901,7 @@ struct ckpt_pool {
          }
      }
  
@@ -30,7 +31,7 @@ index f0a1dfa4a..0c992ac19 100644
  #if !defined(_WIN32)
          if (!v.empty()) {
              if (lock) { (void) mlock(v.data(), v.size()); } else { (void) munlock(v.data(), v.size()); }
-@@ -2883,9 +2883,9 @@ struct ckpt_pool {
+@@ -2911,9 +2911,9 @@ struct ckpt_pool {
  #endif
      }
  
@@ -42,7 +43,7 @@ index f0a1dfa4a..0c992ac19 100644
          {
              std::lock_guard<std::mutex> lk(mtx);
              if (want[kind] < n) {
-@@ -2932,7 +2932,8 @@ struct ckpt_pool {
+@@ -2960,7 +2960,8 @@ struct ckpt_pool {
                  kind = want[0] && spares[0].size() < K ? 0 : 1;
                  n = want[kind];
              }
@@ -52,7 +53,7 @@ index f0a1dfa4a..0c992ac19 100644
              lock_pages(v, true);
              {
                  std::lock_guard<std::mutex> lk(mtx);
-@@ -2948,7 +2949,7 @@ struct ckpt_pool {
+@@ -2976,7 +2977,7 @@ struct ckpt_pool {
      }
  };
  
