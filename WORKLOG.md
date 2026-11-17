@@ -1,3 +1,607 @@
+## 261116.006 (r299, RELEASE v16-4f9dfa0e3-r299) -- `TODO` #282 retired: the mid-run latch's mixture is a ~1e-5 fp32 path difference, NOT corruption -- and the `pinlate` arm had degenerated to 1 pool of 141, so it is now gated on the LOGITS
+
+**Amends block 12** (no new block: the `MOE_HOST_POOL_PIN_FAULT` diagnostic and its `late` latch live there).  The gate
+(`scripts/gate-host-pool.sh`) gains the delivery's logit instrument for that one arm.  Patches regenerated and re-cut
+from a canonical apply at `4f9dfa0e3`; `release.json` at **`v16-4f9dfa0e3-r299`**, `validate-set.sh` GREEN,
+`gate-per-block-build.sh --changed-from <prev tip> --fast` GREEN on 12.  Record:
+[`benchmarks/2026-11-16-pinlate-mixture-logits.md`](benchmarks/2026-11-16-pinlate-mixture-logits.md),
+`INVARIANTS.md` r299, `GREEDY-PURITY.md` §95, `ENVIRONMENT.md` (`MOE_HOST_POOL_PIN_FAULT`).
+
+**The item as written.**  A mid-run pinned-tier latch (`MOE_HOST_POOL_PIN_FAULT=late`) leaves a MIXTURE of
+cache-served and stood-down ops, and on r231 (this box) that flipped a greedy token -- measured at ~1e-5 KLD, two
+orders inside the 0.005 tolerance, so "a path difference, not corruption".  Owed: name the mechanism, then decide the
+arm's criterion (the gate reported it as a WARN and kept the text assertion for the wholesale arms).
+
+**The arm was not measuring what it claimed, and that is the first half of the answer.**  `late` fired on the first
+bounce-ring grow after `g_sized`; when sizing moved to **registration** (r254/r292) that became true *before* the pool
+tier is built, so on the shipped tree the latch left **1 of 141** pools built (239 MiB of a 31 GiB tier) with **2**
+cache-served ops out of 5 069 -- the "mixture" the gate asserted about was two operations.  `late` now also waits for
+the first ROUTED op (`g_routed_op_seen`, set in `moe_cache_update_host` / `_gather_host` / `_stage_table`), which is
+the field's sequence (pools built at placement -> run live -> a later grow refused).  Restored shape on the gate's
+config: 141 pools / 30 791 MiB, 6 342 fills served from pre-latch pools, 151 rolled-back fills, `get_ok` 660 /
+`decline_all` 1 082 -- and the text is byte-identical to `ref` (`a99ccbd97ecb`) in 5/5 runs.
+
+**With the field-shape latch the divergence reproduces again, deterministically, on the r231..r269 lineage.**  A tag
+bisect (each release re-cut into the scratch tree with the latch fix, `ref` + `pinlate`): r231 `a19aab55e`, r254,
+r262, r264 and r269 all read **158 chars `c634f36735fa`** against `ref`'s 182 `a99ccbd97ecb`; r270 is the first
+release that reads `ref`'s text, and r273/r298 + the fix stay identical.  The measured magnitude on r269 (which
+diverges) under the field-shape latch: `llama-perplexity -c 512 --chunks 2 --kl-divergence` **mean KLD 0.000001, max
+0.000051, 99.9 % 0.000050, same-top-p 100.000 %** (base PPL 3.6948) -- ~1e-5, exactly the item's own figure.  So it is
+an fp32 association difference between the set of cache-served and scheduler-served ops, **not wrong bytes**:
+`MOE_HOST_POOL_VERIFY=1` is clean, and the WHOLESALE arms (`fail`, `late`, `get_ok=0`) stay byte-identical to `ref` on
+every build, i.e. the fallback computes the same logits as the cache.
+
+**What actually moved the flip is the LAYOUT, not the code -- which is why the text cannot be the criterion.**  On
+r269: `MOE_EXPERT_PREFILL_IN_PLACE=0` does not move it (158), `MOE_HOST_POOL_SINK=0` gives a *third* text (175
+`d3d1fe6b3db3`), and `MOE_HOST_POOL_FILL_ORDER=rank` (the pre-r231 prewarm order) reproduces `ref` exactly (182
+`a99ccbd97ecb`).  The prewarm's issue order decides which experts land before a RAM-capped pool runs out, hence the
+residency set, hence which ~1e-5 residue the near tie sees -- and r270's `TODO` #318 ordering change "fixed" the flip
+with no numerics change at all.  A matching text is therefore not evidence about the arithmetic, and a differing text
+is not evidence of a defect: that is `GREEDY-PURITY.md` §11's rule, in its mixture-shaped case (§95).
+
+**So the arm's criterion is now the logits.**  `gate-host-pool.sh` records its own KLD base from the `ref` config in
+the same run (no golden file to go stale), compares the `pinlate` config against it, and requires **mean KLD <= 0.005
+and same-top-p >= 98 %**; the KLD run must itself be a mixture (a rolled-back fill, a pre-latch pool serving, the latch
+line), so a degenerate latch cannot pass it by being inert.  `llama-perplexity` is a hard dependency of that arm
+(startup check; `LLAMA_PPL`/`CORPUS`/`KLD_CTX`/`KLD_CHUNKS`/`KLD_MEAN_MAX`/`KLD_TOPP_MIN` are the knobs) -- the two
+runs cost ~10 s each on this config.  The WHOLESALE arms keep the byte-identical text check and still FAIL on a
+divergence.  `pinlate`'s text is reported, never required.
+
+**Release gates.**  `gate-host-pool.sh` **59/59** (the 56 plus the three KLD checks): every healthy arm byte-identical
+(`a99ccbd97ecb`), the two failure arms byte-identical with 2 790 / 2 625 rolled-back fills and `takeover=0`, `sink`
+5 868 demotes / `sinkfail` 0, `tsplit`/`tsplitnosink` 171 `8c39335bbceb` with 141 of 141 pools non-expressible,
+`pinlate` a real mixture at KLD 0.000000 / same-top-p 100.000 %, every arm's census printed once from the teardown,
+no aborts, kernel journal clean.  Coherence 4B (`1c5d32ac537d`) and `validate-set.sh` GREEN; the change is inert
+without `MOE_HOST_POOL_PIN_FAULT` set (it only narrows a diagnostic's latch condition), so the performance gates are
+not owed and no default moved.
+
+## 261116.005 (r298, RELEASE v16-4f9dfa0e3-r298) -- `TODO` #335 and #336 retired together: the in-place prefill read was NEVER the carrier -- a stale expert-cache ALIAS resolved a SIBLING ROLE's arena
+
+**Amends blocks 09, 10 and 15** (no new block: the cache engine's alias guard and the take-over promise in **09**, the
+repair + its census and the consumer's served/declined split in **10**, the promise in the GTT prefill in-place path in
+**15**).  Patches regenerated and re-cut from a canonical apply at `4f9dfa0e3`; `release.json` at
+**`v16-4f9dfa0e3-r298`** (`tip 99c4717c6`, `tree 5f55d95a5`; optional `0100` -> `19cb07ae4`, `0101` -> `ad7862e3e`,
+cumulative `d344b4188`), `validate-set.sh` GREEN, `gate-per-block-build.sh --changed-from 1347f895a --fast` GREEN
+5/5 (09/10/12/15/0300).  Record:
+[`benchmarks/2026-11-16-in-place-read-alias-role.md`](benchmarks/2026-11-16-in-place-read-alias-role.md),
+`INVARIANTS.md` r298, `GREEDY-PURITY.md` §89 (corrected again) + §94.
+
+**What r297 had left open, and what it actually was.**  Both items were written as defects of the in-place prefill
+**read**: `#336` said the in-place and staged arms "read the same bytes, so a logit difference between them is a bug"
+(Flash-Next + MTP, `-c 32768`: `f40ae789f219` in place against `7a3474cbe5f1` staged) and `#335` said a captured graph
+replays an arena pointer whose table the slab evicted mid-run (degenerate `a753000294c9` under VRAM pressure).  Both
+are the same bug, and it is not the read: the expert cache resolves a table from the scheduler's **copy tensor
+address**, guarded by device + layer only -- and a layer's `gate`/`up`/`down` tables share both.  The hooks resolve the
+**host master** (so they decline correctly for a non-identity role) while the consumer's redirect resolves the **copy
+pointer** (so a stale alias serves the *neighbour role's* arena).  Measured at the first divergent dispatch:
+`blk.43.ffn_up_exps` (T=42, `identity=0`, remap 10 wide) produced `nan`, then `-2.1e7`, because it was read out of
+`blk.43.ffn_down_exps`'s arena (`identity=1`, device 1, layer 43); the two arms' 8022 earlier dispatches are the same
+kernel family with the same hashes.  The fix compares the semantic role in `alias_find_checked` (in place, no
+allocation); its first refusal in that run names exactly that pair, and there is **one refusal in a 24 K-token
+prompt**.  Both of r297's pairs collapse to `835 chars 7a3474cbe5f1`, and `GGML_MOE_DEVREMAP=0`,
+`GGML_CUDA_DISABLE_GRAPHS=1` and `GGML_SCHED_DEVGATHER=0` all leave the pre-fix pair unmoved.
+
+**`#336`'s owed magnitude: 0.000000.**  `gate-prefill-logits.sh --ab "MOE_EXPERT_PREFILL_IN_PLACE=0"` on the
+Flash-Next host-expert arm (2 devices `-sm layer`, `-ncmoe 48`, `--ctx 2048 --chunks 7` on
+`prompts/kld-corpus-35b-in-domain.txt`, 143 identity tables, `get_ok` 1280) reads **mean KLD 0.000000 / same-top-p
+100.000 %** -- on the pre-fix build too.  So the read is a base-pointer swap and `ENVIRONMENT.md`'s "the two arms read
+the same bytes" claim was right all along; the difference was a *wrong pointer*, not a different read.
+
+**`#335`'s workaround matrix, explained.**  `GGML_CUDA_DISABLE_GRAPHS=1` (a capture bakes the pointer it served into
+the launch parameters and a replay repeats the wrong table), `GGML_CUDA_SLAB=0` / `MOE_EXPERT_CACHE_MIB=20000` / a
+smaller `-c` (no eviction -> no stand-down/re-arm -> no alias churn), `MOE_EXPERT_PREFILL_IN_PLACE=0` (the staged
+arms never run the redirect) and dropping the drafter (no `T=42` MTP ingest batch, the width where the first wrong
+read appears) are each a *less-stale-alias* arm.  And r297's `MOE_EXPERT_CACHE_VALIDATE=3` was right to report 0
+`MISMATCH` over 157 sampled dispatches: the **arena** held the model's bytes -- the consumer was reading the wrong
+table's slots, which a byte validator cannot see.  Not reproduced on this box: `#335`'s exact degenerate text (the
+pressure arm here is coherent pre-fix, with its wrong-role refusal at layer 30); the hazard is present in it, and its
+severity is one near-tie unless the wrong pointer is baked into a capture.
+
+**Also closed, as hardening rather than as the fix.**  A take-over hook's promise ("do not fill `input_cpy`") can be
+broken by an arena eviction that lands between the hook and the consumer's launch (an op's workspace allocation can
+move the work boundary from inside a graph), which the per-table guards could not see.  `moe_cache_repair_copy()`
+re-fills the skipped buffer from the host master when the table still holds a promise for that buffer, and
+`MOE_EXPERT_TAKEOVER_FAULT=1` makes the identity take-over break its own promise so the path is exercised: the arm's
+text is byte-identical to both no-fault arms (`595 chars c0e7e91d84c4`) while re-filling 343.8-450.0 MiB per broken
+promise.  The exit census prints `take-over promises broken=N repaired=N`; ordinary runs -- including the pressure arm,
+which evicts mid-prompt -- read **0 / 0**.
+
+**Two diagnostic environment variables, no behaviour change on any measured arm:** `MOE_EXPERT_ALIAS_ROLE_CHECK`
+(default 1; `0` is the pre-r298 arm) and `MOE_EXPERT_TAKEOVER_FAULT` (default off).  Throughput of the role check
+(35B-A3B Q8_0 `-ncmoe 48` 2 devices, `tg128`, interleaved): `=0` 62.61 / 64.26 t/s against the default 64.05 / 64.92
+t/s, i.e. inside the run spread.
+
+**Release gates.**  Coherence 4B 3-device `1c5d32ac537d` (the documented reference); `gate-host-pool.sh` **56/56**
+(nine arms byte-identical, `ref`/`dio`/`nodisk`/`fail`/`late`/`pinlate`/`pin0` = `a99ccbd97ecb`, `tsplit`/`tsplitnosink`
+= `8c39335bbceb`); `gate-prefill-logits.sh` canonical 27B 0.000000 / 100.000 % (base re-recorded from this build --
+against the r297-era base the same candidate reads 0.000697 / 98.784 %, reproducible, and this change is inert on a
+dense model: no expert table means `moe_cache_enabled()` is false and the redirect never runs); the Flash-Next
+host-expert `--ab` arm 0.000000 / 100.000 %; per-block build 5/5; `validate-set.sh` GREEN; every run's kernel journal
+clean.
+
+**Release mechanics.**  The revision number first went out as `r321` (there is no `r298`-`r320`; the sequence is one
+per `WORKLOG` entry, so `r297` -> **`r298`**).  Corrected at the source: the block-09 commit's comment, the re-cut
+patches, `rdna-boosts-all.patch` and `release.json` all say `r298`, and `fork-refresh.sh` re-derived the same tip/tree.
+
+## 261116.004 (r297, RELEASE v16-4f9dfa0e3-r297) -- `TODO` #327 retired, and it was a refutation: the prefill MoE fusions cannot fire for a cache-managed table, so the coupling they were blamed for never existed -- and the residency-dependent text is the in-place READ (two new items, #335/#336)
+
+**Amends blocks 09 and 10** (no new block: the cache engine and its fusion contract in **09**, the fusion dispatcher
+and the MMQ pair/`swiglu` folds in **10**).  Patches regenerated and re-cut from a canonical apply at `4f9dfa0e3`;
+`release.json` at **`v16-4f9dfa0e3-r297`** (`tip 8983054be`, `tree a638c8b76`; optional `0100` -> `bdaf5de9c`,
+`0101` -> `962e5779b`, cumulative `d6645f573`), `validate-set.sh` GREEN, `gate-per-block-build.sh --changed-from
+1282102c6` GREEN on 09/10/12/15.  Record:
+[`benchmarks/2026-11-16-prefill-in-place-fusion-contract.md`](benchmarks/2026-11-16-prefill-in-place-fusion-contract.md),
+`INVARIANTS.md` r297, `GREEDY-PURITY.md` §89 (corrected) + §93.
+
+**The item as written.**  `MOE_EXPERT_PREFILL_IN_PLACE` (r258/r266) buys its prefill win by skipping the staged copy,
+and the three prefill MoE fusions read the expert table **directly**, so they stood down for a table served in place;
+residency therefore "selected the kernel set", the two sets were not bit-identical (r284), and a run's greedy text was
+a function of the persisted heat prior.  The maintainer's chosen fix (2026-11-14) was to teach the fusions the in-place
+contract.
+
+**What the census says instead.**  `ggml_cuda_try_fuse` runs per **split** graph, and a routed `MUL_MAT_ID` whose
+weight is a host buffer is a split of its own -- so `gate`, `up` and `GLU` never share a graph when the tables are
+host-resident.  Measured split sizes on 35B-A3B Q3_K_M `-ncmoe 48 -ub 2048` 2 devices: **117 x 1 node, 117 x 2
+nodes**, and the multi-node splits are the attention and the device-resident layers (26/72/74/99 nodes).  The new
+`-lv 4` census reads **all four kinds at zero** on every cache-managed arm measured -- 35B-A3B Q8_0 / Q4_K_M / Q3_K_M
+and Flash-Next GSQ-IQ3_XXS, `-sm layer` and `-sm tensor`, `-ncmoe 48`, `get_ok` 951-7510 in-place reads -- and
+`pair=0/117` only on a **fully device-resident** 35B-A3B (no `-ncmoe`), where the cache has no tables at all.  So the
+above-band stand-down was dead code, r284's `GGML_CUDA_MMB=0` differential was MMB's **dense** GEMM (router + shared
+expert), and the item's premise does not hold.
+
+**What shipped anyway, and why it is inert.**  `moe_cache_fusion_serve()` answers the same per-lane question as
+`moe_cache_get_table()` and returns `NONE` (keep the graph's staged tensors), `IN_PLACE` (launch on the arena copies +
+the remapped ids) or `MIXED` (**stand the fusion down** -- one lane's copy was never filled, so only the per-op chain,
+which resolves each table itself, is correct).  Taught sites: the MMB routed gate+up+GLU triple, both MMQ gate+up+GLU
+triples (RDNA and the NVIDIA dense arm), the MMQ shared-quantize pair (`ggml_cuda_mul_mat_q_pair` gained optional
+`src0`/`ids`) and the MMQ `swiglu->down` fold; the guard's above-band stand-down is gone.  The staged arms are
+byte-identical to r296: 35B-A3B Q3_K_M device-resident, `-ub 2048 -c 8192`, `prompts/prose-rdna-boosts.txt`, 16 tokens
+-> `73 chars sha=86b7f9b5aa80` on **both** builds, `pair=0/117`; the 4B coherence gate is `sha=1c5d32ac537d` on 1
+device `-sm layer` and 3 devices `-sm tensor`.  No new environment variable; `MOE_EXPERT_PREFILL_IN_PLACE` stays the
+kill switch and the per-fusion bisect arms are unchanged.
+
+**The new `-lv 4` census** is the durable part: `report_locked: prefill MoE fusions: mmb_glu=<in_place>/<staged>
+mmq_triple=... pair=... swiglu_down=... mixed_lanes=N` makes the claim above checkable in any future run, and
+`mixed_lanes` names a broken lane-agreement assumption instead of a slow run.
+
+**What actually moves the text (two items opened, not filed as deferrals).**  Both are the in-place **read**, and both
+vanish with `MOE_EXPERT_PREFILL_IN_PLACE=0` -- so r284's rule (a fresh-process text comparison must pin the cache
+state) stands; only its carrier was misattributed.
+
+* **#335 (correctness, pre-existing on r296).**  Flash-Next GSQ-IQ3_XXS + MTP sidecar, 2 devices `-sm layer`,
+  `-ncmoe 48`, `-c 16384` (VRAM at `free-clamped=2`): in place reads **82 chars `sha=a753000294c9`** -- `...3333333...`,
+  degenerate -- against the staged arm's `328 chars 7c5a512a8447`, while `GGML_CUDA_DISABLE_GRAPHS=1` (`04ca2590aebf`),
+  `GGML_CUDA_SLAB=0` (`7c5a512a8447`) and `MOE_EXPERT_CACHE_MIB=20000` (`04ca2590aebf`) are each coherent.  Ruled out:
+  the arena's bytes (`MOE_EXPERT_CACHE_VALIDATE=3`, 157 sampled dispatches, 36 of them `resident=132 down=12`: 0
+  `MISMATCH`), the skipped `input_cpy` copy (filling it changes nothing) and the fusions (census 0).  The carrier is a
+  **captured graph replaying an arena pointer whose table `moe_cache_evict_slab_range` stood down mid-run** -- the
+  eviction *and* its re-arm land inside the prompt (`evicted 3946.0 MiB ... 12 table(s) stood down`, then `re-armed
+  12`), and `GGML_CUDA_DISABLE_GRAPHS=1` removing the symptom is the direct evidence.
+* **#336 (measurement owed).**  `-c 32768`, prior absent: `f40ae789f219` in place against `7a3474cbe5f1` staged
+  (coherent; the prior-present arm reads `7a3474cbe5f1` either way).  r284's KLD instrument still cannot see it
+  (`llama-perplexity` cannot load a drafter), so the magnitude is owed: give perplexity an `-md`, or force partial
+  residency without one and run `gate-prefill-logits.sh --ab "MOE_EXPERT_PREFILL_IN_PLACE=0"` there.
+
+**Release mechanics worth knowing.**  The per-block gate caught the fold twice: a first attempt moved block 10's
+`g_total_one_expert_bytes` declaration into block 09 while the block-09 `--fixup` carried tip-based content, and the
+gate failed block 09 in 4 s with `use of undeclared identifier`.  The final chain keeps every block's own content
+(09 = the cache engine + the census + the contract; 10 = the dispatcher, the pair and the `swiglu` fold sites), and the
+tip tree is byte-identical to the tested build.  `--changed-from 1282102c6` builds 09, 10, 12 and 15 (the blocks whose
+own delta moved) plus the tip.
+
+## 261116.003 (r296, RELEASE v16-4f9dfa0e3-r296) -- `TODO` #330 and #333 retired: the Meta split-state walk can no longer be stranded (so the seqpar floor is the fused-HC band's 17, not 128), and `--load-mode mlock` no longer pins the pageable `-lme` holes
+
+**Amends blocks 09, 12 and 14** (no new block; split by code ownership: the split-state cache in **09**, the seqpar
+floor + `--load-mode`'s help text in **12**, the mlock/hole composition and the tier's residency census in **14**).
+Patches regenerated and re-cut from a canonical apply at `4f9dfa0e3`; `release.json` at **`v16-4f9dfa0e3-r296`**
+(`tip 1282102c6`, `tree 019249493`; optional `0100` -> `8b1b6fd8c`, `0101` -> `093eaa17f`, cumulative
+`ff897703c`), `validate-set.sh` GREEN.  Two `TODO` handles retired, both of them *policies meeting a dynamic
+decision*: a cache-version mechanism against a re-allocated graph shape, and a VM residency request against a tier
+budget.  Record: [`benchmarks/2026-11-16-split-state-walk-and-mlock.md`](benchmarks/2026-11-16-split-state-walk-and-mlock.md).
+
+**#330: the walk could be stranded, and the "second failure mode" was the first one.**  `ggml_backend_meta_get_split_state`
+pre-warms the split-state cache with a non-recursive walk (a qwen4exp `src` chain is ~500-1200 nodes, so the recursion
+alone overflows the 8 MiB stack), and the walk fills **the cache version that is current when it starts**.  A nested
+lookup of a tensor whose cached bytes changed switched the version, and every entry the walk had already filled became
+invisible; when the switch landed on the root's own lookup -- *after* the walk -- the whole walk was stranded and the
+recursion descended the chain.  A version is only a performance mechanism: an entry is valid iff its key is present
+**and the tensor's raw bytes are identical**, so the fix is to make one walk fill one version.  Two parts: the tensor's
+own resolution now runs **before** the walk (so the walk starts on the version the lookup ends on), and while the walk
+runs a nested lookup that finds a stale entry for its own key **erases it and computes into the current version**
+(`ss_pin`) instead of switching -- the entry was invalid for those bytes anyway, so nothing is lost.
+Measured: a temporary depth probe in `calculate_split_state` reads **depth 1** on every arm (qwen4exp 2 devices
+`LLAMA_SEQPAR_MIN=2 -ub 48 pp4096`, and the multi-shape sweep `-p 24,48,64,80,112,160,256,512` in one process --
+the shape alternation that retires versions), and `GGML_META_SS_VERIFY=1` (abort on a stale entry) is clean over
+the same sweeps.  Every shape r291 recorded as a crash at T = 48/64/80/112 is clean here, and so are the chunk
+sequences whose **tail** lands below the floor (`-p 64 -ub 48`, `-p 23 -ub 17`).
+**r291's "second failure mode" was mislabelled**: the 2-token abort is `ggml-backend-meta.cpp:1953`, the first
+`GGML_OP_HC_MIX` assert, and it fires for **any** token-split ubatch at or below the fused hyper-connection band
+(measured: 8 and 16 abort, 17 and up run clean) -- not the token-scatter assertion.  `GGML_OP_HC_MIX`/`HC_COMBINE`
+assert mirrored inputs and have no token-split form, so that band is a **graph** property: the seqpar floor is
+**17** (`HC_BF16_MAX_TOKENS + 1`), one floor for both mixer families (the Q8_0 band ends at 8; the 9..16 band is
+simply not split rather than plumbing a per-layer weight-type decision into the engage predicate).  `LLAMA_SEQPAR_MIN`
+is clamped to 17 with one WARN, the shipped default stays **512** (a floor that ships must be a win: -1.0 % at 128,
+-0.8 % at 256, +6.4 % at 512 on the copy-engine chain), and decode/verify graphs (1..n_draft+1) are below the floor
+by construction.
+**Text is unchanged** wherever the change is not supposed to be visible (r295 build against this one, same seed,
+`ROCBLAS_USE_HIPBLASLT=0`): qwen4exp Flash-Next 2 devices `-sm tensor` **166 chars `97a8c2a4929b`** with seqpar ON
+**and** OFF; 27B Q4_K_XL 3 devices `-sm tensor` **96 chars `db556809f0e6`**; 4B Q8_0 3 devices `-sm tensor` and
+`-sm layer` **96 chars `6541eadb9041`**.
+
+**#333: `mlock` is a residency request, and it now composes with `-lme`.**  `grow_to()` locks everything from the
+mapping base up to its target, and `load_all_data` calls it for every tensor that points into the mapping -- with an
+`-lme` budget those are exactly the **holes**, so an mlock mode pinned the swept range across the whole hole set and
+silently overrode the budget.  Measured (`-ncmoe 48 -lme 30 --load-mode mmap+mlock`, RLIMIT_MEMLOCK raised, VmLck
+sampled from `/proc`): **43.5 GiB pinned before, 260 MiB after**, against a **40 925 MiB** hole set, with the pool's
+own `30 693.8 MiB` pinned in both arms.  Two changes: a hole is **exempt** from the load-mode pin (one WARN, and the
+new `mlock: N MiB of the model mapping pinned (the -lme host-expert holes, M MiB left pageable)` census makes the
+composition visible), and where a hole set exists the loader pins each non-hole tensor's **own range**
+(`llama_mlock::lock_range`) instead of sweeping across the holes.
+**The "why does upstream mlock the model at all" question is answered by measurement**: on the 4B Q8_0,
+`--load-mode mmap+mlock` pins **4 274 MiB at `-ngl 0`** (the whole model -- CPU inference re-reads it from host RAM
+every token, so residency is the whole point) and **654 MiB at `-ngl 99`** (what still lives in the mapping: the
+output layer and any `-ot` tensor).  A model whose weights are all in device buffers has little left for the pin to
+keep, so the flag is a **residency request for the CPU-read path**, not a transport -- which is why it can compose.
+And the host-expert tier is pinned **by necessity whatever the load mode says** (an RDNA GPU has no XNACK, so a
+device read of a host-resident expert must come from a resident page: the pinned master or the bounded pool), now
+stated once at INFO in `report_host_expert_placement`; `--load-mode`'s help says both things where an operator
+chooses the flag.  Nothing about the host-expert tier's residency moved.
+
+**A third finding, found by the gate ladder and pre-existing: `scripts/gate-kv-residency.sh`'s multi-device pool
+text assertion was RED, and it has been red since at least r295.**  The section demanded `pmres == pmref` ("a
+per-device pool is byte-identical to the 2-device sparse arm").  Measured identically on the **r295** and the
+**r296** build: the pooled arms read `f260d1824ab3` (842 chars, == the single-device pool arm `pres`) against the
+resident arm's `1e944569dbd6` (831 chars), diverging 539 characters into a coherent continuation, with
+`LLAMA_KV_POOL_VERIFY=1` reporting `bad 0` -- every resolved page matched the authoritative mirror byte for byte,
+so the KV data is right.  Both records that ever measured it agree with themselves and disagree with today:
+r213 lists `f260d1824ab3` for all three 2-device arms and r284 (`GREEDY-PURITY.md` §89, after the heat-map pin)
+lists `b08d3dbcb1e9` for all three -- while today the two pooled arms read `f260d1824ab3` and the resident one
+`1e944569dbd6`.  So a re-baseline moved one side and the assertion was never re-cut; it also conflated the
+placement with the device count (text is a per-device-count reference under `-sm layer`) and gave only the
+reference arm the forced-sparse `LLAMA_QSA_DENSE_DECODE_UNTIL=0`.  A three-arm text identity is not a property
+this section can assert.  The gate now
+asserts `pmlegacy == pmres` and `pmres == pres` (the pool's text is **device-count invariant** -- the
+multi-device placement's real signature, and a split that mis-claims a resolve corrupts it) and REPORTS the
+resident arm's number and char delta in the log.  `INVARIANTS.md` r296 item 5, `scripts/README.md`.
+
+**Gates**, all on this tree with the r296 build.  `validate-set.sh` GREEN (fresh-tarball strict 17/17, both optional
+artifacts re-cut against `1282102c6` and verified alone and cumulatively, 512-file Windows portability scan).
+`gate-seqpar.sh` **PASS** -- off-inert logits **-0.000000 / 99.990 %**, the F32-wire family-switch calibration
+unchanged (0.010644 / 96.833 %, control 0.013587 / 96.225 %), the bf16 wire still its own round-only control, the
+inertness arms identical, and **arm 6 re-cut** for the new floor: `MIN=2 -ub 32` engages (clamped to 17),
+`-ub 16` is refused *and does not crash*, `-ub 17` engages and a sub-floor tail runs clean, `MIN=128 -ub 128`
+engages.  `gate-host-read-transport.sh` **30/30** -- including two new arms (`mlock-hole`, `mlock-nohole`): the hole
+set is named PAGEABLE, the census reports it, the tier's residency is named as necessity, and, with `sudo` available
+for a raised RLIMIT_MEMLOCK, **322 MiB pinned against 47 962 MiB of holes** (the sweep-back would fail the arm).
+`gate-host-pool.sh` **56/56** (every arm byte-identical: 182 chars `a99ccbd97ecb`, `tsplit`/`tsplitnosink` 171 chars
+`8c39335bbceb`).  `gate-prefill-logits.sh` **PASS** (mean KLD **0.000697**, same-top-p **98.784 %**, the r295 values
+to the digit -- the change moves no prefill number).  `gate-kv-residency.sh` **PASS** in full (window, single-device
+pool and multi-device pool sections) on the release build, after the text-comparison correction described above;
+`gate-per-block-build.sh --tip ec7007e5d --changed-from 713a75c1a` **4/4** (blocks 09, 12, 14, 0300 -- 9 / 12 / 20 /
+5 s; every other block's delta is unchanged) and `check-gpu-faults.sh` clean over every gate's window (kernel
+journal since 10:30).
+
+**Not run, and why.**  The MTP four-axis protocol: the change moves no kernel, no placement and no sampling path (a
+cache lookup's version bookkeeping, one floor constant, one pin exemption and one census line), and every arm above
+is byte-identical (`gate-prefill-logits.sh` also reproduces the r295 numbers exactly).  `gate-uma-experts.sh` needs
+an APU (this box is discrete).
+
+## 261116.002 (r295) -- the `--kv-window` help text stops quoting the retired `11-26 %`, `parse_env()`'s diagnostics are buffered past the `--fit` probe's quiet logger, and the pool exchange's inertness is named (`TODO` #331, #332, #334 retired)
+
+**Amends blocks 12, 14 and 15** (no new block; split by code ownership: the env-log buffer and four of the five
+`parse_env` lines it could already emit in **12**, the two shipped help/fit strings in **14**, the fifth `parse_env` line
+(`MOE_EXPERT_SEED`) plus the exchange's census counter in **15**).  Patches
+regenerated, `release.json` at `v16-4f9dfa0e3-r295` (`tip 713a75c1a` -- the re-cut value `fork-refresh.sh` prints, not the
+working chain's `c98b6f0c1`, same tree; `tree bdfd4a18`; optional `0100` -> `87b399a4f`,
+`0101` -> `5143475fc`, cumulative `af4c85cfe`), `validate-set.sh` GREEN.  Three `TODO` handles retired; two of them were
+"do not re-derive" traps rather than code defects, and one turned out to be a measurement that no longer reproduces.
+
+**#331: the shipped text said "11-26 % of decode".**  r292 corrected every doc (`ENVIRONMENT.md` §17.0, `README.md`,
+`patches/README.md`, `MANIFESTS.md`, `scripts/README.md`, `COMMUNITY-CONFIG.md`) to "the penalty is linear in the depth past
+the window", but deliberately left the two strings the USER reads: `common/arg.cpp`'s `--kv-window` help line and
+`common/fit.cpp`'s placement hint.  Both now say that, with the one nuance worth carrying in `--help`: **a window at or above
+the run depth costs nothing**.  Text only -- `--fit`'s per-token estimate already divides by the calibrated in-place read rate,
+so no computed number moves, and both gates that print the line (`gate-kv-window-split.sh`, `gate-kv-residency.sh`) reproduce
+every arm's token and rate.
+
+**#332: everything `parse_env()` logs was swallowed, and the mechanism was not the one the note guessed.**  The r294 finding
+blamed the pre-callback window (`ensure_env()` runs before the host installs its ggml log callback).  Measured here, the
+actual mechanism is broader and permanent: on a default `--fit` run the first cache call is the FIT PROBE's load, and the
+probe wraps the logger in `common_fit_log_scope`, which demotes every level below its own to `GGML_LOG_LEVEL_DEBUG` -- and
+`common_log_add` drops DEBUG at every default verbosity.  So no `parse_env` line ever reached a log file, on any verbosity:
+
+| arm (`4B Q8_0`, `-lv 4`) | `MOE_EXPERT_SEED=bogus` line |
+|---|---|
+| `--fit off` | `W parse_env: MOE_EXPERT_SEED=bogus is not eager|auto|lazy; using eager` |
+| default `--fit` (before) | **nothing at all** |
+| default `--fit` (after) | the same WARN, at 1.7 s (the probe's own model teardown flushes it) |
+
+The values must be parsed that early (the preflight reads them, and it can run before backend init -- issue #136), so only the
+REPORTING moved: `env_logf()` buffers the lines verbatim and the first caller that cannot be inside a quiet probe flushes them
+-- a routed op, the first pool build, or the exit census.  The two `pool_transport_init_locked` deprecation WARNs r294 added
+stay where they are (they are already late).
+
+**#334: `gate-host-pool.sh`'s `tsplit` arm.  The assertion was too strong, and the failure it recorded does not reproduce.**
+The arm demanded `0 demoted / 0 geometry declines / 0 retirements` as its proof that the r273 guard works.  `demote_ok` is a
+pure table predicate (`n_slices == 0 && host_bytes == expert_bytes`) and a tensor split gives every device a SLICE of every
+expert, so the guard fires before any attempt -- the zeros are the right answer for a reason the census did not state, and
+they hold only while every pool on the split is non-expressible.  The r294 ladder read `demoted=5399 geometry=0 retired=4`
+(the r292 build by hand: `8736 demoted ... 12348 retired`); re-run on the SAME r294 build with the arm's exact flags it reads
+`0 demoted / 0 geometry / 0 retired`, on 2 **and** 3 devices, on Flash-Next IQ3_XXS *and* IQ3_S (the shape r294's own work
+was on) -- so the recorded census is not reachable from the shipped code and is recorded as such rather than explained
+away.  The `-lv 4` geometry census (`GGML_CUDA_CACHE_GEOM_DEBUG=1`) is the evidence: all 282 (2 devices) / 423 (3 devices)
+registered tables are slice-sized -- `gate`/`up` `split_axis=1 host_pitch=0`, `down_exps` `split_axis=0 host_pitch=180`, and
+**no table has `expert_bytes == host_bytes`** -- so nothing can demote, on either shape.
+
+What changed, then, is the assertion and the evidence it is allowed to use:
+* block 15's census gains `sink no-demote tables (demote cannot be expressed -- r273 guard, exchange DISENGAGED before any
+  attempt): N`, so an inert census NAMES its geometry instead of being an unexplained zero;
+* the gate requires a **retirement to be paid for by a landed demote** (`retired > 0` with `0 demoted` is the r273 defect:
+  a vacancy nothing fills, measured pre-fix at 792 321 retirements against 52 704 slots);
+* `0 demoted` must be EXPLAINED -- a geometry decline, or the new no-demote count -- so a pool that never engaged cannot pass
+  as "inert";
+* and full inertness (0/0/0) is still required, but only where the census says every pool is non-expressible.  The single-GPU
+  `sink` arm keeps proving the demote is exercised where it CAN be (5852 demotions this run), so the pair cannot pass by the
+  sink silently going global-off.
+
+**Gates**, all on the release tree `bdfd4a18` (the last step was a comment-only amendment -- `pool_transport_init_locked`'s
+note still claimed `parse_env`'s logging is lost, which this change makes false; the tree it produced was rebuilt and both
+re-cut gates re-run).  `validate-set.sh` GREEN (fresh-tarball strict 17/17, both optional artifacts
+re-cut and verified alone and cumulatively, Windows portability 512 files).  `gate-per-block-build.sh --changed-from
+a060ce2a5` **4/4** (blocks 12, 14, 15, 0300; 48 / 46 / 47 / 8 s).  `gate-host-pool.sh` **56/56** -- the two new checks are
+this change's, and every arm is byte-identical (182 chars `a99ccbd97ecb`; `tsplit`/`tsplitnosink` 171 chars `8c39335bbceb`,
+the same text r292/r294 recorded) with `sink` demoting 5852 times, `sinkfail` publishing nothing, and `tsplit` reporting
+`0 demoted / 0 geometry / 0 retired` from **141 of 141 non-expressible pools**.  `gate-host-read-transport.sh` **23/23**
+(transport, pool bound and text identity unchanged).  `gate-kv-residency.sh --window-only` PASS (window arms byte-identical,
+`hintwin` offers the window and not the pool, the selftest sensitive both ways) and `gate-kv-window-split.sh` PASS (every
+split, `-nkvo`, and all five `--fit` arms).  `gate-prefill-logits.sh` **PASS** (mean KLD **0.000697**, same-top-p
+**98.784 %** against the recorded base -- unchanged code paths, the delta is the recorded-base point).  `check-gpu-faults.sh`
+clean over every gate's window.
+
+**Not run, and why.**  The MTP four-axis protocol and `llama-batched-bench -npl 1,4,8`: this release moves no kernel, no
+placement and no sampling path (two help strings, a log buffer, one census line and one gate assertion), and every arm above
+is byte-identical.  `gate-uma-experts.sh` needs an APU (this box is discrete); block 15's change is the census line the
+discrete pool gate reads.
+
+**Not shipped:** the r294 `demoted=5399` observation itself.  It is not reproducible on the build that recorded it, and the
+honest answer is that the census carries a name for the guard now, so the next report of an inert-on-a-split arm (or of an
+emptied pool there) resolves in one log line.
+
+## 261116.001 (r294) -- the load mode is not the tier: `--load-mode dio` gets the host-expert pool, the pool's demand transport becomes `--load-mode` alone, and `-lme mirror` states a covering pool
+
+**Amends blocks 12, 14 and 15** (no new block; the change was split by code ownership: the demand transport and
+`-lme mirror`'s CLI + pool semantics in **12**, the storage/transport split itself in **14** — the block that makes a
+hole mapping-backed — and the placement switch in **15**).  Patches regenerated, `release.json` at
+`v16-4f9dfa0e3-r294` (`tip a060ce2a5`, `tree 59f2cc49`; optional `0100` -> `c9e7915cd`, `0101` -> `560b1d1c0`, cumulative
+`58610c50`), cut on top of **r293**'s block-02 MTP readback (issue #318) -- the first cut of this change silently
+dropped that fix because it was built from a stale checkout, which is why the release number moved from r293 to
+r294 and the fork branch was restored to the r293 tip before the corrected chain was cut.  `validate-set.sh` GREEN.  Found while answering "why does `--load-mode dio` bypass the
+`-lme` host-pool limit?" on a Flash-Next GSQ-RCO-IQ3_S `-ncmoe 48` config.
+
+**The defect.**  `--load-mode dio` (and `none`) set `use_mmap = false`, and five separate `use_mmap` tests then
+decided, between them, that the host experts could have no file-backed master: the plan skipped
+`moe_cache_set_host_pool_budget()`/`set_host_pool()`, `host_expert_buft()` handed back the pinned `ROCm_Host` buffer
+type, `init_mappings()` never ran and `host_master_mapped` stayed false.  So the whole host expert set was
+materialised -- **pinned** -- and the pool the operator had just sized never existed.  `-lme` means "cap the
+NON-SWAPPABLE memory spent on MoE experts that are not in VRAM", and under `dio` it silently did the opposite:
+
+| arm (`-ngl all -ncmoe 48 -c 4096 -lme 30`) | host-expert master | pool | pinned tier |
+|---|---|---|---|
+| `--load-mode dio`, **before** | `ROCm_Host` **48 284.6 MiB** (one pinned copy) | none | 48 284.6 MiB |
+| `--load-mode dio`, **after** | `ROCm_HostMap` 47 962.5 MiB (the mapping) | `dio`, 76 970 storage reads, **0 mapping memcpys** | **31 363.7 MiB** |
+| `--load-mode none`, after | the mapping | `file`, 76 899 storage reads, **0 memcpys** | **31 414.4 MiB** |
+| `--load-mode mmap` + `MOE_HOST_POOL_TRANSPORT=dio` | the mapping | `dio`, 0 memcpys | 31 364.4 MiB |
+
+Greedy text `152 chars sha=560704192d30` in every arm (dio / none / mmap, `-lme 30` and `-lme mirror`).
+
+**The fix, and why it is a storage decision.**  A ggml tensor must have a home, and only the read-only model mapping
+is free (pinned costs all of it and is non-swappable; a pageable copy costs all of it and is not GPU-readable).  So
+"does the host expert master cost RAM?" is the TIER's question, not the load mode's.  One predicate replaces the five
+tests:
+```cpp
+bool host_expert_master_mapped() const {   // llama-model-loader.h
+    return host_experts_plan_done && !host_experts_holes.empty() && llama_mmap::SUPPORTED;
+}
+```
+`--load-mode` keeps exactly what it should own: how bytes are READ.  `init_mappings()` builds the mapping with
+`prefetch_size == 0` on a non-mmap load (no `MAP_POPULATE`, no `MADV_WILLNEED`), so it costs address space and no
+pages.
+
+**The demand transport is `--load-mode`, alone: `MOE_HOST_POOL_DIO` and `MOE_HOST_POOL_TRANSPORT` are REMOVED.**  Both
+were a second spelling of a decision the load mode already made and reported.  The mirror is now `dio` -> O_DIRECT,
+`buffered`/`none` -> a buffered `pread` (`none` is upstream's "no special loading mode", which IS a buffered read, and
+it is the arm r232 measured best at a sub-complement budget), `mmap` -> the page cache, `auto` -> the adaptive ladder.
+Setting either removed variable WARNs once and is ignored.  **The one case the removed knob could express and
+`--load-mode` cannot -- "page cache for the model, O_DIRECT for the experts" -- was not worth a variable: the benefit
+it assumed does not exist.**  `LLAMA_LOAD_RELEASE_MMAP=1` (default since r273) `munmap`s each device tensor and
+`posix_fadvise(DONTNEED)`s its page-cache copy right after upload, so a warm restart gains nothing.  Measured, same
+config, two consecutive runs: `mmap` **9.2 / 9.2 s** against `dio` **9.8 / 9.6 s** -- and the second run is identical
+to the first, i.e. there is no warmth to harvest.  A rung stays pinnable for an A/B through `MOE_HOST_POOL_TR_START`.
+
+**The placement transport is the ONE decision that must NOT follow `--load-mode`**, because a placement read is a copy
+into the pool's own storage, never a cache miss.  `MOE_HOST_POOL_BULK_DIO` is therefore renamed
+**`MOE_HOST_POOL_PLACEMENT_MODE=dio|buffered`** (`dio` default) and is reported once per load -- it previously only
+appeared inside `pool_decide_dio_locked`, i.e. never on a pinned demand transport, which is a blind spot now that the
+two decisions are separate.  Re-measured cold with `drop_caches` between arms on a 47.9 GiB `-lme mirror` placement:
+**+1 675 MiB** of page cache on `dio` against **+31 796 MiB** on `buffered` for the same bytes -- r273's
+amplification, 19x, on one env var.
+
+**`-lme mirror`** (new value, `-2` sentinel): the whole host expert set, stated rather than inferred.  `auto` resolves
+to the whole set when it fits `MOE_HOST_LIMIT_FRAC` of MemAvailable, which on a RAM-rich box *is* a mirror -- measured
+identical for `--load-mode mmap` and `dio` (47 962.5 MiB, `h=1.0000`, 73 728 slots), so this was always inference, never
+a load-mode effect.  Nothing scales the explicit request: with `MOE_HOST_POOL_RAM_PCT=20 MOE_HOST_LIMIT_FRAC=5` it is
+still 47 962.5 MiB / `h=1.0000` / 512 of 512 slots, and it is not refused for exceeding MemAvailable.  On an APU it
+sizes the GTT store to `padded_total`; the physical lock/RAM clamps stay there, because a registered region that
+cannot be pinned is not a reservation.
+
+**Census honesty.**  `report_host_expert_placement` prints the PLAN's hole set as "pageable", which was a lie in a
+materialised load (48 GiB of pinned `ROCm_Host`) and is true again now; it names the realised backing whenever the
+platform cannot map.  Six user-visible log lines that told operators to set the removed variables were rewritten.
+
+**Two defects found on the way.**  An invalid `MOE_HOST_POOL_TRANSPORT` value left the pool with **no transport
+decision at all** (`g_pool_tr_env_set` made the loader's seed return early, and `g_pool_tr_mode < 0` then returned
+from `pool_transport_init_locked`) -- measured: no transport line, 1 798 mapping memcpys, silently the MAP default;
+the WARN that would have explained it was invisible because **everything `parse_env()` logs is swallowed**
+(`ensure_env()` runs before the host installs its callback).  Both are recorded: the first is gone with the variable,
+the second is `TODO` **#332**.  `TODO` **#333** records the `mlock`/`-lme` interaction the maintainer deferred.
+
+**Gates**, all re-run on the r294 tree `59f2cc49` (i.e. with r293's block-02 fix in it).  `validate-set.sh` GREEN.  `gate-host-read-transport.sh` **23/23**.  `gate-host-pool.sh`
+**53/54** -- and the one red is a **pre-existing** finding, not this change: `tracked` #334, the `tsplit` arm's
+demote-geometry assertion fails identically on the r292 build when the arm is run by hand
+(`8736 demoted ... 0 geometry ... 12348 promoter slots retired` against r294's `demoted=5399 geometry=0 retired=4`;
+every arm's text is `a99ccbd97ecb` in both).  `gate-prefill-logits.sh` **PASS** (mean KLD **0.000000**, same-top-p
+**100.000 %**).  `gate-per-block-build.sh --changed-from b950836f9` (the r293 fork tip) **4/4** (blocks 12, 14, 15, 0300).
+`check-gpu-faults.sh` clean, and the kernel journal is clean for every gate's window.
+
+Both pool gates were re-cut for the removed variables (`dio` is now `--load-mode dio`, `bulkbuf` is
+`MOE_HOST_POOL_PLACEMENT_MODE=buffered`) and extended: every arm of the read-transport gate must now report a bounded
+pool that honours `-lme`, and the `dio` arm must show the mapping as its master -- the regression this entry fixes.
+Two things the re-cut caught, both fixed here rather than papered over: the gate's `fill_mode()` read a
+`host pool fill mode:` line that only the ADAPTIVE path emits (so a pinned transport had no line at all -- it now
+reads `host read transport -> <arm>`), and a **PINNED** `dio` transport never asked the platform question, i.e. on a
+box with no pool file I/O (`MOE_HOST_POOL_DIO_FAULT=1`, or a build without the helpers) `--load-mode dio` silently
+filled through the mapping with no WARN.  `pool_transport_apply_locked()` now answers it for the pinned path too
+(`pool_dio_effective(true)`, which WARNs once) and lands on the mapping, which every pool has.  Windows: `check-windows-paths.sh` OK,
+`check-windows-portability.sh` OK on the default set (512 files, the CI scope), on this change's own diff, and on the
+two optional artifacts; plus a manual audit of the parts that linter cannot see (the header-inline predicate reads
+`llama_mmap::SUPPORTED`, which is `true` under `_WIN32`; a `dio`-paced load now builds a mapping on Windows, and it
+maps from the *buffered* handle that `llama_file` keeps as its logical cursor in direct-io mode).  One residual note
+is on the record in `INVARIANTS.md` r294: if a Windows reporter ever sees an unresolved external on
+`llama_mmap::SUPPORTED`, the fix is to move the predicate out of line.
+## 261115.010 (r293, RELEASE v16-4f9dfa0e3-r293) -- GitHub issue #318: the MTP target h-rows path is a -1.5 % Windows/HIP loss and a Linux no-op, so block 02 ships the host readback and keeps the device path behind `LLAMA_MTP_DEV_ROWS=1`
+
+**`release.json` changed: tip `2b7a65309` -> `b950836f9`, tree `4a67e7c9` -> `92e77acf`, release
+`v16-4f9dfa0e3-r292` -> `v16-4f9dfa0e3-r293`; 17 blocks, base unchanged.**  One file moved
+(`common/speculative.cpp`, **block 02**); blocks 03-`0300` were re-cut (their `From` id only).  The two optional
+artifacts re-apply strictly at the new default tree and their produced trees were re-recorded (`0100` ->
+`abe412bb8`, `0101` -> `fafeec707`, cumulative `795b1b0be`).  Record:
+[`archive/work/mtp-dev-rows/`](archive/work/mtp-dev-rows/).
+
+* **The report.**  `@DanoPTT` bisected an MTP decode loss to the one arm r281 turned on: upstream `#31927` keeps
+  the target's MTP hidden rows (`h_nextn`) in a device buffer and lets the drafter read them in place
+  (`llama_set_embeddings_nextn_dev` + `llama_set_ctx_state_src`).  On Windows 11 / one R9700 / dense Qwen3.8-27B
+  UD-Q5_K_XL / `draft-mtp` n3 / `-np 2` / q8_0 KV: **-1.48 / -1.30 / -1.59 %** at 62 857 / 68 767 / 100 607,
+  +0.25-0.30 ms per generated token, with **byte-identical text and identical draft acceptance** in all three
+  arms and an op census showing the same graph shapes and the same GPU time (+0.04 ms).  The cost is host-side:
+  the device path replaces one async device->host readback (which the host path had already paid for) with a
+  host-blocking event wait plus two blocking row copies per decode round.
+* **It was never a decision of ours.**  The call site is upstream's own `if (!is_mem_shared && !chain_heads)`, so
+  r278's re-base brought `#31927` in and r281 enabled it for every single-head MTP model without anyone choosing
+  it.  A default that arrives with a base needs its own measurement; this one had none.
+* **Here it is neutral, at two depths.**  Dense 27B UD-Q5_K_XL, 1 x R9700, `-sm layer`, q8_0 KV, `draft-mtp` n3,
+  `--seed 42 --temp 0`, three interleaved reps: **47.9 / 48.0 / 47.9** t/s (device rows) against **47.9 / 47.9 /
+  48.0** (host rows) at a 61 525-token prompt with `-n 128`, and **49.2 against 49.2** t/s on a 5 246-token
+  prompt with `-n 512`; prefill 873.5 vs 872.4 t/s (noise).  So there is no arm on this box where the device path
+  wins, and one field platform where it loses: the delivery now ships upstream's **pre-`#31927` host readback**
+  and keeps the device path behind `LLAMA_MTP_DEV_ROWS=1` (an opt-in, not a kill switch, since the default is
+  the host arm).
+* **The reporter's alternative - a cheaper ordering - was implemented and measured WORSE, so it was dropped.**
+  Keeping the drafter's carry row on the device (`ggml_backend_tensor_copy_async` into the reserved row
+  `n_batch + seq`, the drafter's first step reading that row too, `ggml_backend_event_wait` instead of
+  `ggml_backend_event_synchronize` in `decode()`) removes every host row round trip in a round and gives
+  identical text and acceptance - but measures **47.7 / 47.7 / 47.7** t/s against the host arm's 47.9 / 48.0 /
+  48.0, i.e. **-0.5 %**; the stream-wait half alone is neutral (47.7 with either wait).  Two tiny copies, two
+  async-input drains and two event records cost more here than two blocking copies of one 10 KB row.  The diff
+  and the bisect are preserved in `archive/work/mtp-dev-rows/` with a do-not-re-derive note (`INVARIANTS.md`
+  r293 fact 3).  What the two arms may NOT differ in - greedy text and draft acceptance - is now gated.
+* **Gates.**  New `scripts/gate-mtp-dev-rows.sh` **PASS** (default arm: census `target h rows on the device: no`
+  and no `h_nextn buffer size` line at all, i.e. the buffer is never allocated; `=1` arm: `yes` with the buffer;
+  text `sha=bbb051e2aeab` and acceptance **87/119** in both; no GPU faults).  Coherence 4B Q8_0
+  `100 chars sha=1c5d32ac537d` on 1 GPU **and** the 3-GPU `-sm tensor` split (the recorded reference).
+  `gate-prefill-logits.sh` **0.000697 / 98.784 %** (unchanged).  MTP four-axis + phase-switch on the 4B, both
+  arms: text hashes `c08c660d3e54` / `0d64a57d271a` / `e4434e9a1e11` / `a36b056175c4` / `11bd75974e63` identical,
+  205.5/205.2, 179.9/179.3, 202.8/203.0, 284.4/284.5, 156.3/156.3 t/s.  `validate-set.sh` green (checksums,
+  fresh-tarball strict 17/17, both optional artifacts, the cumulative optional tree, the Windows lints).  A
+  non-MTP run cannot move: the helper is read only in the `draft-mtp` impl's constructor.  The recorded `.tip`
+  is the value `scripts/fork-refresh.sh` printed after its re-cut (`b950836f9`, tree `92e77acf`), not the
+  working chain's tip (`b39bd8342`, same tree): the amendment was made with an `--amend` + rebase, and
+  `apply-all.sh` stamps the committer date from each patch's own author date, so only its re-cut is
+  reproducible (AGENTS.md's tip trap (a)).
+* **Adjacent finding, recorded not acted on: ROCm 10.0 builds measure ~+0.6-0.8 % prefill here, and the reporter
+  measured ~2 % at depth on Windows.**  Same tree, same flags, two toolchains, one model (27B UD-Q5_K_XL, 1 x
+  R9700, q8_0 KV, `-ub 512`, `llama-bench -r 2`, interleaved): `pp4096 @ d32768` **872.0 / 872.6 (10.1) vs
+  878.5 / 878.6 (10.0)** = +0.7 / +0.7 %; `pp4096 @ d0` **1202.9 / 1199.9 vs 1207.7 / 1206.6** = +0.4 / +0.6 %;
+  `tg64` 25.38/25.38 vs 25.45/25.44 at depth, 26.90/26.90 vs 26.84/26.84 at d0.  The reporter's Windows arm also
+  attributes about half of theirs to `-real-true16` (`-Xclang -target-feature -Xclang -real-true16`, device
+  only), which was **not** measured here.  Nothing was changed for it: the container images build with 10.1 and
+  7.14.1 by policy, and the prefill-logit base is per ROCm line, so a toolchain swap is a re-baseline decision,
+  not a flag flip (`CONTAINERS.md`).  Recorded in `INVARIANTS.md` r293 fact 5.
+* **Issue handling.**  Replied to `@DanoPTT` with the numbers, what the new release does by default, and how to
+  A/B the device path (`LLAMA_MTP_DEV_ROWS=1`); asked him for a Windows A/B of the two arms on r293 so the
+  platform split can be recorded rather than assumed; closed as fixed (the shipped default is the arm that
+  matches r277 on his box).
+
+## 261115.009 (r292, docs only -- NO delivery change) -- issue #314's field grid corrects two doc claims: a spill costs the depth past the window (not "11-26 %"), and "layer first on a mixed set" is a starting point, not a criterion (that pair measures tensor +63-70 % of decode)
+
+The reporter of issue #314 re-ran the r289 fix on his own settings and then posted a full grid: `--kv-window
+{auto, 8192, 1}` x `-sm {tensor, layer}` x `-ts {24/16, 1/1}` x depth `{0, 4095, 8127, 8192, 16384, 65536}`,
+`llama-bench` on a mixed pair (`gfx1100` RX 7900 XTX 24 GB + `gfx1201` RX 9070 XT 16 GB, `ROCm1/ROCm0`), r289
+build `3124657c0`, 27B Q5_K_M, `-b 8192 -ub 2048`.  No fault anywhere in it, and his standard-settings arm shows
+the fix landing: the window arm reads **-8 % prefill / -31 % decode** against no window where his pre-fix report
+was ~-29 % prefill.  Two of our own claims did not survive the grid, and both were prose, so this entry is the
+correction (no patch, no `release.json` change, no gate to re-run).
+
+**1. The spill cost was quoted as a percentage of nothing.**  `ENVIRONMENT.md`'s `--kv-window` summary row (and
+the block-14 bullet in `patches/README.md`) said a spilled cell costs "11-26 % once the request is deeper than the
+window", which is one depth from r181's campaign and reads as a bound.  It is not a bound: the cost is **linear in
+the depth past the window**, which our own r286 record already showed (-10 / -19 / -42 % decode at one / two / six
+spilled 4 MiB map units, `benchmarks/2026-11-14-kv-window-313.md`) and his grid extends to the far end (`W=8192`
+at 65 536: 55.4 vs 851.6 t/s prefill, 1.73 vs 40.05 decode on `tensor 24/16`).  Corrected in `ENVIRONMENT.md`
+§17.0 + summary row, `patches/README.md`, `MANIFESTS.md` and `scripts/README.md` (the two gate-side references
+that quoted the number), and `patches/README.md`'s historical P2 rejection keeps its dated 11-26 % because it is
+a decision record, not a current claim.
+
+**2. The PREFILL side of a spill is not settled, and we had implied it was.**  Our r286 record has prefill at
+-1.8 % with a 31 000-token request at `W=8192`; his pair reads `pp4096` **1 401 -> 590 t/s at `d8127`,
+1 346 -> 445 at `d8192`, 1 245 -> 218 at `d16384`**, with spreads of +/- 120-190 t/s, i.e. a slide during a
+prefill is not free on that box.  `ENVIRONMENT.md` §17.0 now carries a fourth bullet that states the decode
+figures are decode, quotes his, and marks the prefill penalty **open** (his pair is not a validated
+configuration and there is no `gfx1100` on the validation box).  Not a TODO item because there is nothing to
+change until someone measures a `gfx1100`; the bullet is the record.
+
+**3. "Mixed or imbalanced set: try `-sm layer` first" was written as a criterion and is a risk list.**  The r289
+reply's split advice (and `README.md` -> *Picking a split mode*, `INVARIANTS.md`'s r289 entry,
+`COMMUNITY-CONFIG.md`'s split row) reasoned that a mixed pair pays the per-layer all-reduce and should therefore
+prefer `layer`.  His grid measures the opposite on exactly that shape: at `d0`, `tensor 24/16` **1 470 / 47.30**
+against `layer 24/16` **1 291 / 27.80**, and `tensor 1/1` **1 662 / 44.38** against `layer 1/1` **1 328 / 27.28**,
+i.e. +14-25 % prefill and +63-70 % decode, holding at every depth to 65 536.  So the criterion is now: a
+homogeneous set is measured and has nothing to decide (the r16 arm stands), and a mixed or stacked set is an
+**A/B on your own box**, with `layer` the simpler contract to start from when `tensor` misbehaves or underperforms
+rather than because it measures faster.  `README.md`'s heading and section, `INVARIANTS.md`'s r289 entry (corrected
+in place, `r292` appended) and the `COMMUNITY-CONFIG.md` row all say that now.  His `layer` decode loss (-40 %) is
+recorded with the numbers and no explanation: `layer` needs no all-reduce, so on paper it should not pay a handoff
+that large, and that is his box's property until a homogeneous-arm-free measurement says otherwise.
+
+**What did NOT change.**  Nothing under `patches/`, `optional/` or `rdna-boosts-all.patch`; `release.json` still
+reads `v16-4f9dfa0e3-r292`, tip `2b7a653097c3`, tree `4a67e7c9d7b1`, and every recorded artifact sha256 still
+matches its file (checked: 17 default patches, `rdna-boosts-all.patch`, both optional artifacts), so
+`validate-set.sh` sees no change and the block commits are identical.  **One thing was deliberately left in the
+code**: `common/arg.cpp`'s `--kv-window` help line and `common/fit.cpp`'s `--fit` output still say "11-26 %% of
+decode", which is block 14's text and needs a patch amendment with its gates.  That is `TODO` **#331** (text only,
+no computed number moves) and it is the honest caveat to the correction: the docs are right before `--help` is.
+`WORKLOG.md`'s dated entries keep their 11-26 % quotations (they are records of what was believed then).
+
+**Reply:** posted on issue #314 (no em dashes), thanking him for the grid and pointing at both corrections,
+including the `--help` caveat.
+
+## 261115.008 (r292) -- post-release 24 GiB confirmation with the final gate: the fix arm is unchanged (43.54/43.61 t/s, arena 15 995.3 MiB, traffic -38.2 %, text identical); same-binary A/B +18.4 % (the release's +19.5 % was against the separately built r291 base at 36.50)
+
+Re-ran the RX 7900 XTX (`gfx1100`, 24 GiB, PCIe 4.0 x16, mirror) field shape on the **final release tree**
+(`tip 2b7a65309`, tree `4a67e7c9`) -- 2 interleaved cycles, 2 000 greedy tokens, heat prior pinned,
+`-ncmoe 48 -ub 16384 -c 32768`, plain decode.  Same-binary A/B (`MOE_EXPERT_CACHE_STEADY_REARM=1/0`):
+
+| arm | arena | hit | decode t/s | traffic |
+|---|---:|---:|---:|---:|
+| base (=0) | 11 428.6 MiB | 0.7416 | 36.69 / 36.89 | 479 996 / 479 429 MiB |
+| **fix (=1)** | **15 995.3 MiB** | **0.8412** | **43.61 / 43.54** | **296 483 MiB (-38.2 %)** |
+
+Text byte-identical (`sha 4ff95271242c`).  The decision line: the first drop offers **42.34 %** of the
+arena (17 568 -> 24 912 slots), prior coverage 65.05 % -> 76.90 %, **gain 11.85 pp** vs the 1.00 pp gate ->
+**settle ENABLED**.  The fix arm is unchanged from the pre-gate run (43.66/43.56); the separately built
+r291 base binary measured 36.16/36.84 (avg 36.50), which is where the release entry's +19.5 % came from.
+So the final gate changes nothing on this config (it is enabled, as expected); the honest same-binary
+delta is **+18.4 %**.  No non-uniform layer, no stand-down, no GPU faults.
+
 ## 261115.007 (r292, RELEASE v16-4f9dfa0e3-r292) -- block 09 gains the demand-gated arena settle (amend block 09, no new block): the band a prefill -> decode drop returns is taken where the decode set is short of it (+8.2 % at `-ub 16384`, +31.9 % at 32768, +36.8 % partial pool, +19.5 % on the 24 GiB card) and left alone on a saturated split
 
 The v2 candidate (now `archive/work/arena-steady-sizing/`, r292 entries below) is **promoted into block 09**, on the

@@ -8,7 +8,15 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `33902efebd4051d6eaa94b49a4584133e3df249441f306e934402617dbc609c9` (the r291 cut; the r288/r290 cuts are recorded below)
+  `b64c825acfe2e0736d18b75ffd5b047ae670aa6ea3e5ec282aee4eb90e22fff2` (the r299 cut; the earlier cuts are recorded below)
+* **r299 re-cut verification**: applies strictly at the r299 default tree
+  `3da54a4c10d7350eddc5c0d8eae384086a306b0f` and produces `9068f9c8aa15a50544d1ae20bb1ed5dce16400ca`; cumulative with
+  the other optional artifact, numeric order, is `3eeb8f6f1dea6d7d550980afde5072049b5ac665`.  The default tree moved by
+  block 12's r299 amendment, outside this artifact's mechanisms.
+* **r295 re-cut verification**: applies strictly at the r295 default tree
+  `bdfd4a182dc9bdf9a7b6a46a0f206622f37b5e34` and produces `5143475fc21ee964717497dd5f0eb4c4e8a48ac8`; cumulative with the
+  other optional artifact, numeric order, is `af4c85cfedb7eea6a1eb3a71eb0448a40e03aea3`.  The default tree moved by blocks
+  12/14/15's r295 amendments, outside this artifact's mechanisms.
 * cut against the **r288 default delivery tree** `79d18f41b9ab9b235d35fd3a5034858eddd94844` (official blocks
   `0000`-`0015` plus the temporary `0300`; that is the r287 release tree with block 17 removed)
 * produces tree `89b2555296146290f556f1cf017ed6ee124dfce6` when applied alone on that tree — byte-identical
@@ -22,6 +30,11 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
   `00f2150fad1ad44c2d40c1456c708ea4c7103390`.  The produced tree is no longer the r287 release tree's
   bytes — expected, since the r290 default tree moved (block 07's opt-in WMMA verify family) while this
   artifact's own diff is unchanged.
+* **r293 re-cut verification**: applies strictly at the r293 default tree
+  `92e77acfae0700b68439d69923fcb79d6fbe3a54` and produces `fafeec707a0e6c128ee6026001088b85b595272c`; cumulative with the other optional
+  artifact, numeric order, is `795b1b0be4d56c75b6bb9707c46d207c0b5bb452`.  The patch file is unchanged (sha256 above) and the default tree
+  moved by block 02's MTP h-rows default (r293, issue #318), outside this artifact's mechanisms.
+
 * **r291 re-cut**: applies strictly at the r291 default tree
   `8423b2b5eac33f97ad530229b8c35240aa64fa08` and produces
   `02f8e9d0b9c0077e795c71a2e32b2ae890b41ab1`; cumulative with `0100` (numeric order) is

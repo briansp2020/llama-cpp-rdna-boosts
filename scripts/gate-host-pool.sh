@@ -6,7 +6,7 @@
 #   `--host-experts pool` / `-lme auto` in the NOT-FITTING band places the host expert master in the read-only
 #   model mapping and serves every GPU read through the bounded pinned pool.  A pool fill can be served from two
 #   places: the mapping itself (a plain memcpy out of the page cache, always available) and the pool's DISK
-#   TIER (`MOE_HOST_POOL_DIO=1`), which reads the GGUF with positional aligned reads -- `pread`/`O_DIRECT` on
+#   TIER (`--load-mode dio`), which reads the GGUF with positional aligned reads -- `pread`/`O_DIRECT` on
 #   POSIX, `ReadFile`/`FILE_FLAG_NO_BUFFERING` on Windows (r227; before that Windows had a stub that returned -1,
 #   which is the shape this gate was written against).  Three things were wrong and together they silently
 #   produced garbage on Windows:
@@ -17,16 +17,18 @@
 #     3. `access_locked()` recorded the slot as RESIDENT anyway and only printed
 #        `async fill failed ...: no error` (`cudaGetLastError()` is empty for a host-side failure), so the arena
 #        served stale bytes: the reporter's run prefilled at 20 t/s, generated ONE token and stopped.
-#   r212 already made `MOE_HOST_POOL_DIO=auto` mirror `--load-mode` (a mapped load fills buffered), which is why
-#   a fresh `--load-mode mmap` run can no longer reach (1) by default -- but the mode is still one env var away,
+#   r212 made the fill mode mirror `--load-mode` (a mapped load fills buffered), and r294 removed the separate
+#   override entirely: an arm reaches (1) by saying `--load-mode dio`, and nothing else.
 #   and (2) and (3) are correctness, not defaults.
 #
 # WHAT IT CHECKS
 #   One pool-backed host-expert config (the issue's: Flash-Next, `-ncmoe` most of the trunk, `--load-mode mmap`,
 #   a `MOE_HOST_LIMIT_FRAC` low enough that the set does not fit), nine arms, same-seed greedy text:
 #     ref     the shipped default (buffered fills out of the model mapping)
-#     dio     MOE_HOST_POOL_DIO=1                (the disk tier, available on Linux)
-#     nodisk  MOE_HOST_POOL_DIO=1 + MOE_HOST_POOL_DIO_FAULT=1
+#     dio     --load-mode dio                    (the disk tier, available on Linux; r294: the load mode IS the
+#                                                 demand transport, and it builds a pool over the file-backed
+#                                                 master -- it used to pin the whole set and build none)
+#     nodisk  --load-mode dio + MOE_HOST_POOL_DIO_FAULT=1
 #                                                (a platform with NO pool disk tier -- the Windows shape)
 #     fail    MOE_HOST_POOL_FILL_FAULT=1         (no source can be resolved for a pageable master)
 #     late    MOE_HOST_POOL_FILL_FAULT=late      (each table gets ONE source, then loses it -- the
@@ -39,22 +41,27 @@
 #                                                the victim as before -- and never publish the slot)
 #     pinlate MOE_HOST_POOL_PIN_FAULT=late       (the platform LATCHES the pinned tier off mid-run -- the
 #                                                Windows shape at the adapter's shared-segment ceiling, issue
-#                                                #278: the pools are built, then one grow is refused and
-#                                                every later allocation is refused too.  The latch must stop
-#                                                the tier GROWING, not abandon the pinned memory the run
-#                                                already owns, so the existing pools must keep serving the
+#                                                #278: the pools are built, the run is live, then one grow is
+#                                                refused and every later allocation is refused too.  The latch
+#                                                must stop the tier GROWING, not abandon the pinned memory the
+#                                                run already owns, so the existing pools must keep serving the
 #                                                fills (`N expert fills were served from a host pool built
-#                                                BEFORE the refusal`, N > 0) and the text must not move)
+#                                                BEFORE the refusal`, N > 0).  This is the only arm whose
+#                                                arithmetic path legitimately differs, so its criterion is the
+#                                                LOGITS, not the text -- see its HARD bullet and
+#                                                `GREEDY-PURITY.md` §95)
 #     tsplit  the SAME pool on a 2-device `-sm tensor` split, sink on (r273)
 #     qd1     MOE_EXPERT_FILL_QD=1               (r277: the placement read queue at depth 1 -- the A/B for
 #                                                the batch fill.  Its text must equal ref's AND the census
 #                                                must show the queue ran with 8 readers in ref)
-#     bulkbuf MOE_HOST_POOL_BULK_DIO=0           (r277: the placement reads buffered through the page cache;
+#     bulkbuf MOE_HOST_POOL_PLACEMENT_MODE=buffered (r277; renamed from MOE_HOST_POOL_BULK_DIO in r294: the
+#                                                 placement reads buffered through the page cache;
 #                                                the A/B for "a placement fill never uses the page cache")
 #     tsplitnosink the same, MOE_HOST_POOL_SINK=0 -- the A/B the split arm is judged against
 #                                                (r273: a tensor split gives each device a SLICE of every
 #                                                expert, so the arena->pool demote cannot be expressed at
-#                                                all.  The exchange was nevertheless "engaged", which
+#                                                all -- r295 confirms it from the `-lv 4` geometry census,
+#                                                see the HARD list.  The exchange was nevertheless "engaged", which
 #                                                reserved slots no demote could use AND retired the pool's
 #                                                copy of every expert it promoted with nothing to refill the
 #                                                vacancy: measured 766 758 geometry declines out of 766 758
@@ -62,7 +69,9 @@
 #                                                701 706 refills, h=0.3473 and 0 evictions.  The arm proves
 #                                                the r273 guard: on that geometry the exchange is INERT --
 #                                                0 demoted, 0 geometry, 0 retirements -- and SINK=1 is
-#                                                indistinguishable from SINK=0)
+#                                                indistinguishable from SINK=0; r295 asserts that shape only
+#                                                when the census shows NO expressible pool, and always
+#                                                requires a retirement to be paid for by a landed demote)
 #     pin0    MOE_HOST_POOL_PIN=0                (r233: the kill switch closes the pinned tier from the start
 #                                                on ANY platform -- the state a Windows box stuck on the
 #                                                driver-shipped HIP runtime can run in, issue #278.  No pool
@@ -83,29 +92,45 @@
 #           filled.  The TEXT half of that is box-dependent (a stale-but-valid `input_cpy` can hide it -- it
 #           did here; it corrupted the reporter's server), but the take-over counter is not: measured
 #           takeover=128/129 on the pre-fix code and 0 with the fix, in both arms.
-#   HARD  * `tsplit` builds a real pool, and on that geometry the exchange is INERT: 0 demoted, 0 geometry
-#           declines and 0 promoter slots retired.  `tsplit` must also match `tsplitnosink` byte for byte: with
-#           no expressible demote there is nothing for the exchange to do, so switching it on may not change
-#           one byte of the answer.  (Before r273 the same arm retired ~15x its slot count and refilled every
-#           expert from the page cache; the TEXT matched then too, which is why the census is the check.)
+#   HARD  * `tsplit` builds a real pool and `tsplit` matches `tsplitnosink` byte for byte: with no expressible
+#           demote there is nothing for the exchange to do, so switching it on may not change one byte of the
+#           answer.  (Before r273 the same arm retired ~15x its slot count and refilled every expert from the
+#           page cache; the TEXT matched then too, which is why the census is the check.)
+#   HARD  * `tsplit`'s exchange state is asserted as the GUARD's rule, not as one geometry's answer (r295,
+#           `TODO` #334).  `demote_ok` is a pure table-geometry predicate (`n_slices == 0 && host_bytes ==
+#           expert_bytes`), so a `-sm tensor` split normally registers nothing that can demote and the guard
+#           disengages the exchange BEFORE any attempt.  The rules: (1) a retirement must be PAID FOR by a
+#           landed demote -- `retired > 0` with `0 demoted` is the r273 defect (a vacancy nothing fills);
+#           (2) the arm must EXPLAIN `0 demoted`: a geometry decline or the census's `sink no-demote tables`
+#           count must be there, so a pool that never engaged cannot pass as "inert"; (3) when the census says
+#           every pool is non-expressible, full inertness (0/0/0) IS required.  The reason #3 is conditional:
+#           the old unconditional 0/0/0 encoded this model's block geometry, and the r294 ladder's `demoted=5399`
+#           reading could not be reproduced on the same build with the arm's exact flags (measured r295: 0
+#           demoted, 0 geometry declines, 0 retirements on 2 AND 3 devices, on both Flash-Next IQ3_XXS and IQ3_S;
+#           the `-lv 4` `CACHE_GEOM` census shows all 282/423 tables with `expert_bytes != host_bytes`).
 #   HARD  * `sink` demotes at least once (the arm is not vacuous) and its text is byte-identical to `ref`
 #   HARD  * `sinkfail`: text byte-identical to `ref`, the census reports copy-error declines > 0 (the arm
 #           really failed the copies) and **0 demoted** -- a copy that failed must not be published as a
 #           resident victim, or that slot serves stale bytes for the life of the run
-#   HARD  * `pinlate` (issue #278): text byte-identical to `ref`; the arm is not vacuous (the latch line is
-#           there, the pools were built BEFORE it, and fills still fail afterwards); and the fix holds --
-#           `N expert fills were served from a host pool built BEFORE the refusal` with N > 0, i.e. one late
-#           refusal does not throw away the pinned memory the run already owns.  Measured with the lookup
-#           placed AFTER the latch guard (the pre-fix order): the same arm reports 0 (the census line is
-#           absent) and the run fails 1 587 fills instead of 110 -- the text is identical in both, because a
-#           pool-less fill still serves the right BYTES through the pageable mapping; it is the pinned memory,
-#           not the answer, that is lost.
-#           **The text half is conditional since issue #282**: a MID-RUN latch leaves a MIXTURE of cache-served
-#           and stood-down ops, and on `soar` at r231 that diverges from `ref` by one greedy token
-#           (deterministic: 171 chars sha=b981e742aa13 against 182 / a99ccbd97ecb, two builds, two runs).  The
-#           wholesale arms (`fail`, `late`: get_ok=0) still match `ref`, so the fallback's byte-identity is
-#           proven in the same run and the check now requires that plus a real mixture; it is reported as a
-#           WARN and owed as `TODO` #282.  A wholesale fault arm that diverges still FAILS.
+#   HARD  * `pinlate` (issue #278): the arm is not vacuous (the latch line is there, the pools were built
+#           BEFORE it, and fills still fail afterwards); and the fix holds -- `N expert fills were served from
+#           a host pool built BEFORE the refusal` with N > 0, i.e. one late refusal does not throw away the
+#           pinned memory the run already owns.  Measured with the lookup placed AFTER the latch guard (the
+#           pre-fix order): the same arm reports 0 (the census line is absent) and the run fails 1 587 fills
+#           instead of 110 -- the text is identical in both, because a pool-less fill still serves the right
+#           BYTES through the pageable mapping; it is the pinned memory, not the answer, that is lost.
+#           **The criterion is the LOGITS, not the text (issue #282, retired r299).**  A mid-run latch leaves a
+#           MIXTURE of cache-served and stood-down ops, and that mixture takes a different fp32 association
+#           order on one or two near-tie tokens: measured with the field-shape latch (r269, this config)
+#           `llama-perplexity -c 512 --chunks 2 --kl-divergence` reads **mean KLD 0.000001, worst 0.000051,
+#           same-top-p 100.000 %**, and the 32-token greedy text flips one token of the reasoning preamble.
+#           So the mixture is gated ON THE LOGIT INSTRUMENT (`GREEDY-PURITY.md` §95): this gate runs the `ref`
+#           and `pinlate` configs through `llama-perplexity` and the arm passes only inside the delivery's
+#           0.005 / 98 % tolerance.  The WHOLESALE arms (`fail`, `late`: get_ok=0) stay BYTE-IDENTICAL -- they
+#           are the proof that the fallback computes the same bytes, and a wholesale arm that diverges FAILS.
+#           The arm also had to be repaired: a `g_sized`-only `late` latch fired BEFORE the pool tier was
+#           built once sizing moved to registration (r254/r292) -- 1 pool of 141 -- so `late` now waits for
+#           the first routed op, and the mixture is ~660 served / ~1 090 declined ops over all 141 pools.
 #   HARD  * no arm logs `async fill failed` (the old, cause-hiding message) or aborts
 #   HARD  * every arm prints the exit census ONCE, from the MODEL TEARDOWN and before it (`host pool (L2)` above
 #           `model teardown: dropped ...`).  On Windows the `atexit` hook runs after `main` and llama-server's
@@ -119,6 +144,12 @@
 #
 # Environment:
 #   LLAMA_CLI   llama-cli binary   (default: ~/llama.cpp/build-rocm/bin/llama-cli)
+#   LLAMA_PPL   llama-perplexity binary, for the mixture's HARD logit check
+#                                  (default: next to LLAMA_CLI)
+#   CORPUS      the KLD corpus      (default /llm/models/wikitext-2-raw/wiki.test.raw)
+#   KLD_CTX     KLD chunk context   (default 512, the delivery's standard KLD point)
+#   KLD_CHUNKS  KLD chunks          (default 2: this is a near-tie instrument, not a PPL run)
+#   KLD_MEAN_MAX / KLD_TOPP_MIN     the tolerance (default 0.005 / 98.0 %, the delivery's limits)
 #   MODEL       GGUF               (default: Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS shard 1)
 #   GPU         HIP device index   (default: 0; the pool needs one device, the master is host-resident)
 #   CTX         context            (default: 4096 -- this gate is about fills, not context length)
@@ -139,6 +170,11 @@ set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA_CLI="${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}"
+# The mixture arm's criterion (see its HARD bullet): the delivery's own logit instrument.
+LLAMA_PPL="${LLAMA_PPL:-$(dirname "$LLAMA_CLI")/llama-perplexity}"
+CORPUS="${CORPUS:-/llm/models/wikitext-2-raw/wiki.test.raw}"
+KLD_CTX="${KLD_CTX:-512}"
+KLD_CHUNKS="${KLD_CHUNKS:-2}"
 MODEL="${MODEL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"
 GPU="${GPU:-0}"
 # r273: the tensor-split arms need TWO devices.  Pinned explicitly: on this box the 9950X3D's iGPU (gfx1036)
@@ -175,6 +211,10 @@ if [ -n "$PROMPT_FILE" ] && [ ! -f "$PROMPT_FILE" ]; then
     echo "ERROR: no prompt file at $PROMPT_FILE" >&2
     exit 2
 fi
+if [ "$FAULTS" -eq 1 ]; then
+    [ -x "$LLAMA_PPL" ] || { echo "ERROR: no llama-perplexity at $LLAMA_PPL (the mixture arm is gated on the logits; set LLAMA_PPL)" >&2; exit 2; }
+    [ -f "$CORPUS" ]    || { echo "ERROR: no KLD corpus at $CORPUS (set CORPUS)" >&2; exit 2; }
+fi
 [ -n "$PROMPT_FILE" ] && PROMPT="$(cat "$PROMPT_FILE")"
 
 CHECKS=0
@@ -190,10 +230,13 @@ run_arm() {
     local dir="$KEEPOUT/$arm"
     mkdir -p "$dir"
     echo "==> arm $arm${*:+ ($*)}"
+    # r294: `--load-mode` IS the pool's demand transport, so an arm that wants O_DIRECT names the LOAD MODE
+    # (`LM=dio`), not an env var.  Default: the delivered mmap.
+    local lm=${LM:-mmap}
     env "$@" HIP_VISIBLE_DEVICES="$GPU" ROCBLAS_USE_HIPBLASLT=0 MOE_HOST_LIMIT_FRAC="$LIMIT_FRAC" \
         MOE_EXPERT_HEATMAP="${HEATMAP:-load}" \
         timeout 3600 "$LLAMA_CLI" -v -m "$MODEL" --fit off -ngl all --n-cpu-moe "$NCMOE" \
-        --load-mode mmap --lazy-mode on -c "$CTX" -np 1 -fa on -ctk q8_0 -ctv q8_0 \
+        --load-mode "$lm" --lazy-mode on -c "$CTX" -np 1 -fa on -ctk q8_0 -ctv q8_0 \
         -b "$UB" -ub "$UB" -t 8 --jinja --spec-type none \
         -p "$PROMPT" -n "$NGEN" --temp 0 --seed 42 --single-turn --no-display-prompt \
         $EXTRA_ARGS > "$dir/out.txt" 2> "$dir/err.txt"
@@ -236,7 +279,19 @@ text_only() { python3 "$REPO_DIR/scripts/extract-generated.py" "$KEEPOUT/$1/out.
 # the pool's exit census: `host pool (L2): <tensors> tensors, <slots> slots, <MiB> pinned`
 pool_slots() { grep -o 'host pool (L2): [0-9]* tensors, [0-9]* slots' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*, \([0-9]*\) slots/\1/'; }
 pool_mib()   { grep -o 'host pool (L2): .* MiB pinned' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*, \([0-9.]*\) MiB pinned/\1/'; }
-fill_mode()  { grep -o 'host pool fill mode: [a-zA-Z_]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: //'; }
+# r294: the transport is reported as `host read transport -> <arm>` and always is (the old `fill mode: ...` line
+# only existed on the ADAPTIVE path, so a pinned transport -- which is every `--load-mode` value but `auto` -- had
+# no line at all).  Keep the gate's vocabulary: O_DIRECT / buffered / map.
+fill_mode() {
+    local t
+    t=$(grep -o 'host read transport -> [a-z]*' "$KEEPOUT/$1/err.txt" | tail -1 | awk '{print $NF}')
+    case "$t" in
+        dio)  echo O_DIRECT ;;
+        file) echo buffered ;;
+        map)  echo map ;;
+        *)    echo "" ;;
+    esac
+}
 failed_fills(){ grep -o 'FAILED fills: [0-9]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: //'; }
 # issue #278: fills served from a pool that existed BEFORE the pinned tier latched off.
 pool_after_latch() { grep -o '[0-9][0-9]* expert fills were served from a host pool' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/ .*//'; }
@@ -260,18 +315,60 @@ sink_copyerr(){ sink_line "$1" | sed -n 's/.*, \([0-9][0-9]*\) copy-error.*/\1/p
 # defect).  Both are taken from the same census line, with the `[0-9][0-9]*` digit class the note above explains.
 sink_geomdecl(){ sink_line "$1" | sed -n 's/.*, \([0-9][0-9]*\) geometry.*/\1/p'; }
 sink_retired(){  sink_line "$1" | sed -n 's/.*\([0-9][0-9]*\) promoter slots retired.*/\1/p'; }
+# r295 (TODO #334): the third reason the exchange is inert, NAMED.  `sink no-demote tables (demote cannot be
+# expressed -- r273 guard, exchange DISENGAGED before any attempt): N`.  `demote_ok` is a pure table-geometry
+# predicate (`n_slices == 0 && host_bytes == expert_bytes`), so on a `-sm tensor` split every table is
+# non-expressible and `pool_sink_active()` returns false BEFORE any attempt: the census then reads
+# 0 demoted / 0 declines / 0 retired, which is the right answer with no reason attached.  This counter attaches it.
+sink_nodemote(){ grep -o 'sink no-demote tables .*: [0-9][0-9]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: //'; }
+sink_pools(){   grep -o 'host pool (L2): [0-9][0-9]* tensors' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: \([0-9][0-9]*\) tensors/\1/'; }
 # `gt0 <value>`: true when value is a number above zero (empty/garbage is false)
 gt0() { [ -n "${1:-}" ] && awk "BEGIN{exit !(${1} + 0 > 0)}"; }
 
+# ---- the MIXTURE's criterion: the LOGITS (issue #282, r299) ------------------------------------
+# `pinlate` is the only arm whose arithmetic path legitimately differs (an fp32 association difference of
+# ~1e-5), so it is gated on the delivery's own logit instrument instead of on the generated text -- see
+# `GREEDY-PURITY.md` §95 and `benchmarks/prefill-logit-methodology.md`.  Self-contained: the base file is
+# recorded from the `ref` config in THIS run on the same model/corpus/context, so there is no golden file to go
+# stale.  `llama-perplexity` is a hard dependency (checked at startup): a gate that silently skips its own arm
+# is what `MANIFESTS.md` forbids.
+KLD_MEAN_MAX="${KLD_MEAN_MAX:-0.005}"     # the delivery's mean-KLD limit
+KLD_TOPP_MIN="${KLD_TOPP_MIN:-98.0}"      # ... and its same-top-p limit (%)
+kld_run() {
+    local mode="$1"; shift   # record | compare
+    local log="$KEEPOUT/kld-$mode.log"
+    local args=(-m "$MODEL" -f "$CORPUS" --fit off -ngl all --n-cpu-moe "$NCMOE"
+                --load-mode mmap --lazy-mode on -c "$KLD_CTX" --chunks "$KLD_CHUNKS"
+                -fa on -ctk q8_0 -ctv q8_0 -b "$UB" -ub "$UB" -t 8
+                --kl-divergence-base "$KEEPOUT/kld-ref.bin")
+    [ "$mode" = compare ] && args+=(--kl-divergence)
+    echo "==> KLD $mode (llama-perplexity), log: $log"
+    env "$@" HIP_VISIBLE_DEVICES="$GPU" ROCBLAS_USE_HIPBLASLT=0 MOE_HOST_LIMIT_FRAC="$LIMIT_FRAC" \
+        MOE_EXPERT_HEATMAP="${HEATMAP:-load}" \
+        timeout 3600 "$LLAMA_PPL" "${args[@]}" > "$log" 2>&1
+}
+kld_mean() { sed -n 's/^Mean[[:space:]]*KLD:[[:space:]]*\([-0-9.][0-9.]*\).*/\1/p' "$KEEPOUT/kld-$1.log" | head -1; }
+kld_topp() { sed -n 's/^Same top p:[[:space:]]*\([0-9.][0-9.]*\).*/\1/p' "$KEEPOUT/kld-$1.log" | head -1; }
+kld_ok()   { awk -v m="${1:-1e9}" -v t="${2:--1}" -v mm="$KLD_MEAN_MAX" -v tt="$KLD_TOPP_MIN" \
+                 'BEGIN{exit !(m + 0 <= mm + 0 && t + 0 >= tt + 0)}'; }
+# The perplexity run must itself be a MIXTURE: a fill rolled back, a pre-latch pool still serving, the latch.
+kld_mixture() {
+    local f p
+    f="$(grep -o 'FAILED fills: [0-9][0-9]*' "$KEEPOUT/kld-compare.log" | tail -1 | sed 's/.*: //')"
+    p="$(grep -o '[0-9][0-9]* expert fills were served from a host pool' "$KEEPOUT/kld-compare.log" | tail -1 | sed 's/ .*//')"
+    gt0 "$f" && gt0 "$p" && \
+        [ -n "$(grep -o 'MOE_HOST_POOL_PIN_FAULT: refusing the pinned' "$KEEPOUT/kld-compare.log" | tail -1)" ]
+}
+
 # ---- the arms ---------------------------------------------------------------------------------------
-run_arm ref    MOE_HOST_POOL_DIO=0 || exit 2
+run_arm ref || exit 2
 # r277: the PLACEMENT read queue.  `qd1` is the same arm at depth 1 (the pre-r277 one-read-at-a-time
 # transport) and `bulkbuf` is the same arm with the placement reads buffered through the page cache; both must
 # generate ref's text byte for byte, and the census below must show the queue was really the path taken.
-run_arm qd1     MOE_HOST_POOL_DIO=0 MOE_EXPERT_FILL_QD=1  || exit 2
-run_arm bulkbuf MOE_HOST_POOL_DIO=0 MOE_HOST_POOL_BULK_DIO=0 || exit 2
-run_arm dio    MOE_HOST_POOL_DIO=1 || exit 2
-run_arm nodisk MOE_HOST_POOL_DIO=1 MOE_HOST_POOL_DIO_FAULT=1 || exit 2
+run_arm qd1     MOE_EXPERT_FILL_QD=1  || exit 2
+run_arm bulkbuf MOE_HOST_POOL_PLACEMENT_MODE=buffered || exit 2
+LM=dio run_arm dio || exit 2
+LM=dio run_arm nodisk MOE_HOST_POOL_DIO_FAULT=1 || exit 2
 run_arm fail   MOE_HOST_POOL_FILL_FAULT=1 || exit 2
 run_arm late   MOE_HOST_POOL_FILL_FAULT=late || exit 2
 run_arm sink     MOE_HOST_POOL_SINK=1 || exit 2
@@ -287,37 +384,66 @@ REF_HASH="$(text_hash ref)"
 echo "==> text: ref $(text_hash ref)"
 
 # ---- HARD: identical greedy text ---------------------------------------------------------------
-# `pinlate` is the one arm whose text may legitimately differ (issue #282, `TODO` #282): it is a MID-RUN fault,
+# `pinlate` is the one arm whose text may legitimately differ (issue #282, retired r299): it is a MID-RUN fault,
 # so with the latch off the pool serves some tables and the run falls back for others -- a MIXTURE.  The two
 # ends of that spectrum are proven byte-identical IN THIS RUN: `ref` (no fault) and `fail`/`late` (every table
 # stood down, get_ok=0) generate the same greedy text, which is what says the fallback computes the same
-# logits.  What is left is the mixture, and on `soar` at r231 it does not: pinlate measured 171 chars
-# sha=b981e742aa13 against ref 182 chars sha=a99ccbd97ecb (deterministic across two builds and two runs), a
-# one-token divergence at ~31 of 32 greedy tokens.  MEASURED as a path difference, not corruption: the same
-# contrast under the delivery's own logit criterion (`llama-perplexity -c 512 --chunks 2 --kl-divergence
-# --kl-divergence-base`, the gate's config) reads median KLD -0.000000, worst 0.1 % -0.000040, **same-top-p
-# 100.000 %** -- i.e. ~1e-5, two orders inside the 0.005 tolerance, flipping one near-tie in one 32-token run.
-# So a byte-identical TEXT assertion is simply the wrong instrument for a mixed fault state, while it is the
-# right one for the wholesale arms (which are bit-exact).  Recorded and owed as `TODO` #282 rather than
-# papered over: the check still fails loudly for a WHOLESALE fault arm, and for a mixture it requires both
-# that the mixture is real (get_ok > 0 and decline_all > 0) and that `fail` proved the fallback's identity in
-# the same run.
+# logits.  What is left is the mixture, and it takes a different fp32 association order on a near tie: measured
+# with the field-shape latch (r269, this config) `llama-perplexity -c 512 --chunks 2 --kl-divergence` reads
+# **mean KLD 0.000001, worst 0.000051, same-top-p 100.000 %** -- ~1e-5, two orders inside the 0.005 tolerance
+# -- and the 32-token greedy text flips one token of the reasoning preamble.  So a byte-identical TEXT
+# assertion is the wrong instrument for a mixed state while it is the right one for the WHOLESALE arms (which
+# are bit-exact and still FAIL here if they diverge).  The mixture's own requirement is the HARD logit check
+# below, plus the mixture being real (get_ok > 0, decline_all > 0, a pre-latch pool serving).
 for a in dio nodisk fail late sink sinkfail pinlate pin0 qd1 bulkbuf; do
     hard
     if [ "$(text_hash "$a")" = "$REF_HASH" ] && [ -s "$KEEPOUT/$a/text.txt" ]; then
         ok "$a text == ref ($(text_hash "$a"))"
     elif [ "$a" = pinlate ] && gt0 "$(get_ok pinlate)" && gt0 "$(decline_all pinlate)" \
          && [ "$(text_hash fail)" = "$REF_HASH" ]; then
-        echo "  WARN  pinlate text != ref ($(text_hash pinlate) against $REF_HASH) -- the MID-RUN latch serves a"
-        echo "        mixture (get_ok=$(get_ok pinlate) decline_all=$(decline_all pinlate)); the wholesale arms"
-        echo "        (fail, late) match ref, so the fallback is byte-identical and only the mixture diverges."
-        echo "        Known, owed as TODO #282: a ~1e-5 path difference (same-top-p 100.000 % over 2 x 512\n"
-        echo "        tokens), not corruption -- see wip/host-pool-fill-transport/README.md"
+        ok "pinlate is a real MIXTURE (get_ok=$(get_ok pinlate) decline_all=$(decline_all pinlate)) and the"
+        echo "        wholesale arms are byte-identical to ref; its text may move at a near tie"
+        echo "        ($(text_hash pinlate) against $REF_HASH) because its criterion is the LOGITS: the HARD"
+        echo "        KLD check below (GREEDY-PURITY.md §95)"
     else
         fail "$a text != ref ($(text_hash "$a") against $REF_HASH)"
         sed 's/^/      /' "$KEEPOUT/$a/text.txt" | head -5
     fi
 done
+
+# ---- HARD: the MID-RUN MIXTURE is logit-equivalent (issue #282, r299) ---------------------------
+# `pinlate`'s text is not a criterion (see above); the logits are.  This is the check that catches a mixture
+# serving WRONG bytes -- a corrupted expert moves the KLD by orders of magnitude, while the legitimate path
+# difference sits at ~1e-5 against the 0.005 limit.
+if [ "$FAULTS" -eq 1 ]; then
+    hard
+    if kld_run record; then
+        ok "KLD base recorded from the ref config ($(grep -o 'Final estimate: *PPL *= *[0-9.]*' "$KEEPOUT/kld-record.log" | head -1))"
+    else
+        fail "the KLD base run failed (see $KEEPOUT/kld-record.log)"
+        tail -5 "$KEEPOUT/kld-record.log" | sed 's/^/      /'
+    fi
+    hard
+    if ! kld_run compare MOE_HOST_POOL_PIN_FAULT=late; then
+        fail "the KLD mixture run failed (see $KEEPOUT/kld-compare.log)"
+        tail -5 "$KEEPOUT/kld-compare.log" | sed 's/^/      /'
+    else
+        km="$(kld_mean compare)"; kp="$(kld_topp compare)"
+        if kld_ok "$km" "$kp"; then
+            ok "pinlate logits == ref (mean KLD ${km:-?} <= $KLD_MEAN_MAX, same-top-p ${kp:-?} % >= $KLD_TOPP_MIN %)"
+        else
+            fail "pinlate logits moved (mean KLD ${km:-<none>}, same-top-p ${kp:-<none>} %; limits $KLD_MEAN_MAX / $KLD_TOPP_MIN %)"
+            grep -E '^Mean +KLD|^Maximum KLD|^Same top p' "$KEEPOUT/kld-compare.log" | sed 's/^/      /'
+        fi
+    fi
+    hard
+    if kld_mixture; then
+        ok "the KLD mixture run is not vacuous (a rolled-back fill, a pre-latch pool serving, the latch line)"
+    else
+        fail "the KLD mixture run was not a mixture (no rolled-back fill / no pre-latch pool fill / no latch line); see $KEEPOUT/kld-compare.log"
+        grep -m3 'FAILED fills\|built BEFORE the refusal\|MOE_HOST_POOL_PIN_FAULT' "$KEEPOUT/kld-compare.log" | sed 's/^/      /'
+    fi
+fi
 
 # ---- HARD: the PLACEMENT read queue (r277) ---------------------------------------------------
 # The mechanism must be LIVE, not merely benign: a gate that only compares text passes with the queue inert
@@ -348,9 +474,9 @@ else
 fi
 hard
 if grep -q "host pool PLACEMENT reads: buffered" "$KEEPOUT/bulkbuf/err.txt"; then
-    ok "bulkbuf: MOE_HOST_POOL_BULK_DIO=0 flips the placement read to buffered (the A/B is real)"
+    ok "bulkbuf: MOE_HOST_POOL_PLACEMENT_MODE=buffered flips the placement read (the A/B is real)"
 else
-    fail "bulkbuf: MOE_HOST_POOL_BULK_DIO=0 did not report a buffered placement read"
+    fail "bulkbuf: MOE_HOST_POOL_PLACEMENT_MODE=buffered did not report a buffered placement read"
 fi
 
 # ---- HARD: a real pool, no fill failures ------------------------------------------------------
@@ -442,15 +568,43 @@ else
     fail "tsplit: no sink census line -- MOE_HOST_POOL_SINK was not on, so the arm proves nothing"
 fi
 hard
+# r295 (TODO #334): assert the GUARD's rule, not one geometry's answer.  The old check demanded
+# `0 demoted / 0 geometry declines / 0 retired` and called that "demote_ok is false".  That holds only while
+# EVERY pool on the split is non-expressible, which is what this box's Flash-Next shapes measure (`expert_bytes
+# != host_bytes` on all 282/423 registered tables, `host_pitch=180` on the axis-0 `down_exps`, `split_axis=1`
+# on `gate`/`up`), but it is a property of the model's block geometry, not of the exchange.  Three rules now:
+#   1. a retirement must be PAID FOR by a landed demote -- `retired > 0` with `0 demoted` is the r273 defect
+#      (a vacancy nothing can fill: measured 792 321 retirements against 52 704 slots with every attempt
+#      structurally declined, so the pool emptied while the text stayed identical);
+#   2. the arm must EXPLAIN its inertness: `0 demoted` is only acceptable next to a geometry decline or a
+#      non-expressible-table count from the census, so a pool that never engaged cannot pass as "inert";
+#   3. when the census says NO pool can express a demote, full inertness is required -- that is the r273
+#      guarantee, asserted where the geometry actually makes it meaningful.
 td="$(sink_demoted tsplit)"; tg="$(sink_geomdecl tsplit)"; tr="$(sink_retired tsplit)"
-if [ "${td:-x}" = "0" ] && [ "${tg:-x}" = "0" ] && [ "${tr:-x}" = "0" ]; then
-    ok "tsplit: the exchange is INERT (0 demoted, 0 geometry declines, 0 retirements) -- demote_ok is false"
+tnd="$(sink_nodemote tsplit)"; tpl="$(sink_pools tsplit)"
+hard
+if gt0 "$tr" && [ "${td:-0}" = "0" ]; then
+    fail "tsplit: ${tr} retirements against 0 demotions -- a vacancy nothing can fill (the r273 defect)"
+    echo "      every promoted expert then has to be refilled from the page cache/disk: measured 792 321"
+    echo "      retirements / 701 706 refills / h=0.3473 on the pre-r273 code"
 else
-    fail "tsplit: the exchange acted on a geometry that cannot demote (demoted='${td}' geometry='${tg}' retired='${tr}')"
-    echo "      a retirement with no demote that can land empties the pool: every promoted expert has to be"
-    echo "      refilled from the page cache/disk (measured 792 321 retirements / 701 706 refills / h=0.3473)"
+    ok "tsplit: retirements are paid for (demoted='${td:-0}' retired='${tr:-0}')"
 fi
 hard
+if [ "${td:-x}" != "0" ] || gt0 "$tg" || gt0 "$tnd"; then
+    ok "tsplit: the exchange's state is reported (demoted='${td:-0}' geometry='${tg:-0}' retired='${tr:-0}', no-demote tables='${tnd:-0}' of '${tpl:-?}')"
+else
+    fail "tsplit: 0 demoted with no geometry decline and no no-demote table in the census -- the arm is vacuous"
+    echo "      (would pass with a pool that never built, a sink silently off, or a tsplit arm that reached nothing)"
+fi
+if gt0 "$tnd" && [ "${td:-x}" = "0" ] && [ "${tg:-x}" = "0" ]; then
+    hard
+    if [ "${tr:-x}" = "0" ]; then
+        ok "tsplit: the exchange is INERT (0 demoted, 0 geometry declines, 0 retirements) -- every one of the ${tnd} sub-mirror pools cannot express a demote"
+    else
+        fail "tsplit: retired=${tr} on a geometry where no demote can be expressed"
+    fi
+fi
 if [ "$(text_hash tsplit)" = "$(text_hash tsplitnosink)" ] && [ -s "$KEEPOUT/tsplit/text.txt" ]; then
     ok "tsplit SINK=1 == SINK=0 on the same split ($(text_hash tsplit))"
 else

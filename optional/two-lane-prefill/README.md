@@ -19,7 +19,22 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `8814fffe90e776a8ed99950c16c0ab746a81a67e13ec183a5311af88c285273d` (the r291 cut; the earlier cuts are recorded below)
+  `d025be5f683d1594556803a0db0baaad7d8d17ca3c0496aac428cc55673a299f` (the r299 cut; the earlier cuts are recorded below)
+* **r299 re-cut verification**: applies strictly at the r299 default tree
+  `3da54a4c10d7350eddc5c0d8eae384086a306b0f` and produces `1d389b8db32c28462aae2aca2f413daf31344022`; cumulative with
+  the other optional artifact, numeric order, is `3eeb8f6f1dea6d7d550980afde5072049b5ac665`.  The default tree moved by
+  block 12's r299 amendment (the `MOE_HOST_POOL_PIN_FAULT=late` latch waits for the first routed op), outside this
+  artifact's mechanisms; `validate-set.sh` check 8 verifies all three trees on every run.
+* **r295 re-cut verification**: applies strictly at the r295 default tree
+  `bdfd4a182dc9bdf9a7b6a46a0f206622f37b5e34` and produces `87b399a4f61008d8af7443b444f244b0fde97a77`; cumulative with
+  the other optional artifact, numeric order, is `af4c85cfedb7eea6a1eb3a71eb0448a40e03aea3`.  The default tree moved by
+  blocks 12/14/15's r295 amendments (`parse_env` logging, the `--kv-window` help text, the pool exchange's census line),
+  outside this artifact's mechanisms; `validate-set.sh` check 8 verifies all three trees on every run.
+* **r293 re-cut verification**: applies strictly at the r293 default tree
+  `92e77acfae0700b68439d69923fcb79d6fbe3a54` and produces `abe412bb86f98aa60224a8fdea41521b314d03f3`; cumulative with the other optional
+  artifact, numeric order, is `795b1b0be4d56c75b6bb9707c46d207c0b5bb452`.  The patch file is unchanged (sha256 above) and the default tree
+  moved by block 02's MTP h-rows default (r293, issue #318), outside this artifact's mechanisms.
+
 * **r291 re-cut**: applies strictly at the r291 default tree `8423b2b5…` and produces
   `4b0b8da0154aac69ab61998865956deaec9ec9a8`; cumulative with `0101` is `310386642121ffd22eb74268a6446b31433aada0`.
   The default tree moved by block 12's r291 amendment (sequence parallelism), outside this artifact's mechanisms.

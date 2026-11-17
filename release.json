@@ -1,47 +1,47 @@
 {
-  "release": "v16-4f9dfa0e3-r292",
+  "release": "v16-4f9dfa0e3-r299",
   "base": "4f9dfa0e3",
   "base_tree": "cfb1f99a2793d89250533834737764cebff10be7",
   "n_blocks": 16,
   "n_default": 17,
   "n_temporary": 1,
   "n_optional": 2,
-  "tip": "2b7a653097c3961b926a45c4c584020664788dbf",
-  "tree": "4a67e7c9d7b1925081db04a814f03ae40627325f",
-  "optional_tree": "a22261928d0b1aaccfa76c755790e0248ea9e40d",
+  "tip": "c215c77f3",
+  "tree": "3da54a4c10d7350eddc5c0d8eae384086a306b0f",
+  "optional_tree": "3eeb8f6f1dea6d7d550980afde5072049b5ac665",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "670f958e0e11a1d90ac3225c2124970fc99a7680ee34077e38f9c75109f28bc1"
+    "sha256": "b18a3b74cafdb124f6ccc6c9763f59d1a7bc4e61e87652e9047f9aa42c81839a"
   },
   "patches": {
     "0000-rdna-boosts-block-00-foundation-band-uniformity-Meta.patch": "57e8975c0c5e83a7e8d38f554f38b5cb3fc335522a569c33afe92b00ed156497",
     "0001-rdna-boosts-block-01-hybrid-HIP-all-reduce-RDNA4-gat.patch": "94035f2c0df9f71eeb8f2af84d13e1beb81e6823452a6c345d1d700386588660",
-    "0002-rdna-boosts-block-02-adaptive-MTP-draft-depth.patch": "29a27e9aef4d4597b476db11c7fa5fefa5861e7cadd8d416ab1d78b59f7331c7",
-    "0003-rdna-boosts-block-03-chunked-gated-delta-net-prefill.patch": "cd53bbf3a36321fe7f7ea908c0e57993c93bd04476fdfa0503eb4855ecd6a675",
-    "0004-rdna-boosts-block-04-BF16-KV-cache-and-native-BF16-f.patch": "fe529ba4f322bb5d948c38fb94e22a91f8ab167a808747a0ab4bbb5db6c2b9e3",
-    "0005-rdna-boosts-block-05-flash-attention-band-native-qua.patch": "aca96d143fa8569f72759e6556061b018ebad65b8acb13c41ad55ec64af8f1ab",
-    "0006-rdna-boosts-block-06-MMB-quantized-prefill-GEMM.patch": "8ead7eaa8ec56c1cb93291ae71c5ca8518cf18a9a4a01c282b8f023fdef0296b",
-    "0007-rdna-boosts-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM.patch": "477619b083105035919f8f9f4ac635ffa976a4a7a148dd9b61b694ba8e175ebc",
-    "0008-rdna-boosts-block-08-fused-kernels-old-08-fusions-ol.patch": "bcc1b2d09e697b4600cb948945f4ef79fb819ecaf2bb8e598ddef50f8dfdffd6",
-    "0009-rdna-boosts-block-09-host-resident-MoE-iface-schedul.patch": "acf0b6aa05dfb788dfa94056918ee2f371bd920ee0ae3ae733546c0d3edc5f64",
-    "0010-rdna-boosts-block-10-slab-fusion-dispatcher-and-asyn.patch": "e19afb800576931a8082fa043b707bd8704d289162b64fd33132eb3e599c5759",
-    "0011-rdna-boosts-block-11-qwen4exp-model-hyper-connection.patch": "ee0c343c981ff0bffccafc55781afa3b687dfa6d34fc827a561e70c699910dda",
-    "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "4f1c3c5e634e271b017d5654b2753b1d4f63d25d8b980841c3dae1f1436aaae6",
-    "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "10bb655d3e5fd557f57229f79a3f8ff038855d5f4d554f9b59734d14960f009e",
-    "0014-rdna-boosts-block-14-the-streamed-KV-a-fixed-VRAM-re.patch": "28897b91a2b5e614d0fd60efcb3945da9e404dac9e6e0e7762fbf7fb966b27c5",
-    "0015-rdna-boosts-block-15-the-UMA-GTT-expert-store-an-APU.patch": "f705d9adc7302e7d8baa07302a14c458f260ad7f7a77c018a0624d82f4409eb7",
-    "0300-rdna-boosts-block-0300-relaxed-tensor-split-mode-TEM.patch": "50d1795f3be342ab76066076a12177caf4aa2c0752c7cae7553b058460257ab8"
+    "0002-rdna-boosts-block-02-adaptive-MTP-draft-depth.patch": "9c88614a4e1608eed48573f719f91d31b1ca85ca30a4105cf81d11a08462b276",
+    "0003-rdna-boosts-block-03-chunked-gated-delta-net-prefill.patch": "3f0a5ea01db9639410f656e24f5d59e1ad00660c333b672087c753cb9fb47a17",
+    "0004-rdna-boosts-block-04-BF16-KV-cache-and-native-BF16-f.patch": "c43b37e485fa37edd1f79c3a25af229dd0cb2163b5ab62b858ee54426db51d80",
+    "0005-rdna-boosts-block-05-flash-attention-band-native-qua.patch": "f23f7ce09dbae9d9275f3b94517491408ffc91ddefc6e3c0540531ac86a7e0f1",
+    "0006-rdna-boosts-block-06-MMB-quantized-prefill-GEMM.patch": "d96dc8ead76dc6e665fdcd4025281964b8ab2087eb4645785bd3bd80b9b1c84a",
+    "0007-rdna-boosts-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM.patch": "96093088a277b9b91eb5833fcd18497fca9e2eadfae4c96b38513827d851fa39",
+    "0008-rdna-boosts-block-08-fused-kernels-old-08-fusions-ol.patch": "9e4ed13434bead3b3ea1a4af0e338f11af1b7e6e50fe8d548d52c9eaf61bd828",
+    "0009-rdna-boosts-block-09-host-resident-MoE-iface-schedul.patch": "a3105afa131f3c51df13ae14db3965e7a7dc7bb140605ac7b29f593eaad0d914",
+    "0010-rdna-boosts-block-10-slab-fusion-dispatcher-and-asyn.patch": "d7c8f82e5cfd2d04f4d45e4d7308e3bc730be517efbd0b44e85a50135fcca584",
+    "0011-rdna-boosts-block-11-qwen4exp-model-hyper-connection.patch": "c86e6aad853056d71cccce814b42ca4223814ddc4bd920da846117cc3c6a333a",
+    "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "cca225f7aa6435895408bf816b74babcb8ff05bc7f0129472df1be802248a7ec",
+    "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "b7191fb69bf99d310f44b962a61d6f9d3a9a364a2385762b4ea1a59193c26463",
+    "0014-rdna-boosts-block-14-the-streamed-KV-a-fixed-VRAM-re.patch": "06d68f1f3bc1e4d220f80c9be50ba6689dd155e3582ae2d7266b8ec77887a7bf",
+    "0015-rdna-boosts-block-15-the-UMA-GTT-expert-store-an-APU.patch": "26dbc37275c4add4422c7d049495a43296540c78c31e28f55f733355f6e245c7",
+    "0300-rdna-boosts-block-0300-relaxed-tensor-split-mode-TEM.patch": "6b9c3e324e35eadcfb93331d81a235d3d14acd976ad8f14c7238883ad99c74c6"
   },
   "optional": {
     "0100-two-lane-prefill.patch": {
       "dir": "two-lane-prefill",
-      "sha256": "8814fffe90e776a8ed99950c16c0ab746a81a67e13ec183a5311af88c285273d",
-      "tree": "b92169e73664f4e3cc57d5066c73555dac5212ad"
+      "sha256": "d025be5f683d1594556803a0db0baaad7d8d17ca3c0496aac428cc55673a299f",
+      "tree": "1d389b8db32c28462aae2aca2f413daf31344022"
     },
     "0101-mixed-kv.patch": {
       "dir": "mixed-kv",
-      "sha256": "33902efebd4051d6eaa94b49a4584133e3df249441f306e934402617dbc609c9",
-      "tree": "ffae0e4e0c3ee75fca9d8ae284aa7fa376921223"
+      "sha256": "b64c825acfe2e0736d18b75ffd5b047ae670aa6ea3e5ec282aee4eb90e22fff2",
+      "tree": "9068f9c8aa15a50544d1ae20bb1ed5dce16400ca"
     }
   }
 }
