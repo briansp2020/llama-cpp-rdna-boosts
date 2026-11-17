@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 18:31:51 +0000
-Subject: [PATCH 10/44] moe cache: drop the decline unfuse workaround
+Subject: [PATCH 10/46] moe cache: drop the decline unfuse workaround
  (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 A declined or fill-failed table ran its decode-band gate+up+GLU and down fold
@@ -23,10 +23,10 @@ fill_failed table.
  4 files changed, 4 insertions(+), 35 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index cc0ad0c9b..a3ad074de 100644
+index bac613a7e5..2ee368c258 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2706,9 +2706,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2696,9 +2696,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                      fusion_local.gate_ids = &gate_ids_c;
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
                  } else if (ids != nullptr &&
@@ -39,7 +39,7 @@ index cc0ad0c9b..a3ad074de 100644
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                  }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index fd0dbc10d..694d99d7e 100644
+index fd0dbc10d5..694d99d7eb 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -3251,9 +3251,8 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
@@ -55,10 +55,10 @@ index fd0dbc10d..694d99d7e 100644
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 94649fc26..a2e46e76d 100644
+index 9b6ad3ee13..546126cfe1 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -451,11 +451,6 @@ bool moe_cache_prefill_in_place_enabled();
+@@ -461,11 +461,6 @@ bool moe_cache_prefill_in_place_enabled();
  bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
                                  const struct ggml_tensor * gate, int device);
  
@@ -71,7 +71,7 @@ index 94649fc26..a2e46e76d 100644
                                const struct ggml_tensor * src0,
                                const struct ggml_tensor * gate,
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index fd1c59af6..e76055a96 100644
+index fd1c59af6d..e76055a963 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -3091,30 +3091,6 @@ uint64_t moe_cache_redirect_sig(const ggml_cgraph * cgraph, int device) {

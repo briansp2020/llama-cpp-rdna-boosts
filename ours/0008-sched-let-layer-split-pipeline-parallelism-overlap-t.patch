@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 23:32:10 +0000
-Subject: [PATCH 08/44] sched: let layer-split pipeline parallelism overlap the
+Subject: [PATCH 08/46] sched: let layer-split pipeline parallelism overlap the
  devices on ROCm
 
 Layer split with pipeline parallelism (several devices, no -ot) ran the GPUs
@@ -41,7 +41,7 @@ layer split identical to the base-vs-base control at 8k and 32k. Full
  4 files changed, 113 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 20fc5dbc1..84896dc2f 100644
+index 20fc5dbc1b..84896dc2f8 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
 @@ -674,8 +674,18 @@ static uint64_t ggml_gallocr_graph_fp(const struct ggml_cgraph * graph) {
@@ -66,7 +66,7 @@ index 20fc5dbc1..84896dc2f 100644
          v = v*0x100000001b3ull ^ (uint64_t) (t->view_src != NULL);
          v = v*0x100000001b3ull ^ (uint64_t) (t->flags & flags_mask);
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index d1781645b..87d36992e 100644
+index d1781645b5..87d36992e8 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1521,6 +1521,15 @@ struct ggml_backend_sched_split {
@@ -201,7 +201,7 @@ index d1781645b..87d36992e 100644
      ggml_backend_sched_split_graph(sched, graph);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 3fe9efc1f..d1dc2c830 100644
+index 3fe9efc1f0..d1dc2c8307 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3113,7 +3113,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
@@ -220,7 +220,7 @@ index 3fe9efc1f..d1dc2c830 100644
  
          // with pipeline parallelism, the previous graph_compute_async may still be running
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index c592716b0..849ed1728 100644
+index c592716b09..849ed17282 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -3041,6 +3041,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 15 Nov 2026 17:52:07 +0000
-Subject: [PATCH 40/44] mmvq GDN epilogue: precise memory check (the window
+Subject: [PATCH 40/46] mmvq GDN epilogue: precise memory check (the window
  check declined ~29 of 30 layers)
 
 ggml_cuda_check_fusion_memory_ranges over the matched window declined almost every layer: the
@@ -20,7 +20,7 @@ noise floor, 0 faults.
  1 file changed, 20 insertions(+), 11 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index fd578bfb9..80aeccc8e 100644
+index fd578bfb98..80aeccc8eb 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -3238,19 +3238,28 @@ static int mmvq_gdn_epi_find(const ggml_cgraph * cgraph, const int first, const

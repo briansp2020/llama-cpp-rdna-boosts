@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:16:22 +0000
-Subject: [PATCH 30/44] moe cache: KV segment phase 2 -- review fixes (source
+Subject: [PATCH 30/46] moe cache: KV segment phase 2 -- review fixes (source
  counters, idle hint)
 
 Three small fixes from the logic review of the two phase 2 commits.  None
@@ -33,7 +33,7 @@ changes which bytes are read.
  2 files changed, 38 insertions(+), 14 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index e67e89518..ac1f4f4b7 100644
+index e67e895186..ac1f4f4b75 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -2359,37 +2359,46 @@ static __global__ void moe_cache_route_kernel(char * __restrict__ dst, const cha
@@ -159,7 +159,7 @@ index e67e89518..ac1f4f4b7 100644
              }
              if (g_pf_lends > 0 || g_pf_takes > 0) {
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 9563d74b1..f64faa103 100644
+index 9563d74b16..f64faa103c 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -3913,6 +3913,8 @@ private:

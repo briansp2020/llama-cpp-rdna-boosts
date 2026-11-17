@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 13:42:02 +0000
-Subject: [PATCH 21/44] sched: overlap ubatches under -sm tensor -- async
+Subject: [PATCH 21/46] sched: overlap ubatches under -sm tensor -- async
  graph-input views, async CPU-split output, deferred input wait
 
 The host waited on every split for a view of a graph input (96 waits, ~1 s per 4096-token prefill ubatch:
@@ -34,7 +34,7 @@ Same bytes, ordering only (FINDINGS 882).
  5 files changed, 165 insertions(+), 9 deletions(-)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index e6c3373a9..8d4bcb08c 100644
+index e6c3373a9e..8d4bcb08c3 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -545,6 +545,9 @@ extern "C" {
@@ -48,10 +48,10 @@ index e6c3373a9..8d4bcb08c 100644
      // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
      // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index d8c817080..8818f1fca 100644
+index 653fadf358..060b84ca61 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -3264,6 +3264,7 @@ struct ggml_backend_meta_context {
+@@ -3299,6 +3299,7 @@ struct ggml_backend_meta_context {
      int   stage_n_slots   = 8;              // GGML_SCHED_STAGE_SLOTS, clamped to the ring's 16
      std::vector<std::vector<ggml_backend_event_t>> stage_done_ev; // [device][slot], upload complete
      std::vector<std::vector<ggml_backend_event_t>> stage_free_ev; // [device][slot], slot reusable
@@ -59,7 +59,7 @@ index d8c817080..8818f1fca 100644
  
      void *                               comm_ctx       = nullptr;
      ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
-@@ -3313,6 +3314,8 @@ struct ggml_backend_meta_context {
+@@ -3348,6 +3349,8 @@ struct ggml_backend_meta_context {
              for (size_t j = 0; j < n_devs; j++) {
                  stage_done_ev[j].resize(stage_n_slots, nullptr);
                  stage_free_ev[j].resize(stage_n_slots, nullptr);
@@ -68,7 +68,7 @@ index d8c817080..8818f1fca 100644
              }
          }
  
-@@ -3746,6 +3749,19 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+@@ -3781,6 +3784,19 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
  
      const int slot = backend_ctx->stage_slot_next;
      backend_ctx->stage_slot_next = (backend_ctx->stage_slot_next + 1) % backend_ctx->stage_n_slots;
@@ -88,7 +88,7 @@ index d8c817080..8818f1fca 100644
  
      // Reserve every device's ring slot before anything is uploaded: a ring that cannot hold its chunk
      // aborts the whole attempt, because staging only part of an upload would leave the rest on the
-@@ -3929,6 +3945,7 @@ struct ggml_backend_meta_stage_guard {
+@@ -3964,6 +3980,7 @@ struct ggml_backend_meta_stage_guard {
                      simple_tensor->data = chunk.orig;
                  }
                  ggml_backend_event_record(ctx->stage_free_ev[chunk.device][entry.slot], chunk.backend);
@@ -97,7 +97,7 @@ index d8c817080..8818f1fca 100644
          }
          ctx->stage_pending.clear();
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index a28fb94c2..55ead6969 100644
+index a28fb94c24..55ead69695 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1641,6 +1641,15 @@ struct ggml_backend_sched {
@@ -303,7 +303,7 @@ index a28fb94c2..55ead6969 100644
      sched->upfront_on = on;
  }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-index 140ecbb81..a88be3790 100644
+index 140ecbb81f..a88be37902 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 @@ -37,15 +37,28 @@ static bool ggml_backend_cuda_stage_from_cache(ggml_backend_cuda_context * cuda_
@@ -340,7 +340,7 @@ index 140ecbb81..a88be3790 100644
      }
      CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index f5557e92b..ef72b5988 100644
+index f5557e92b7..ef72b5988c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3180,6 +3180,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll

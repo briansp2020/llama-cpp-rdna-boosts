@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 07:02:17 +0000
-Subject: [PATCH 32/44] hc-mix: Q8_0 mixer path - persistent down counters,
+Subject: [PATCH 32/46] hc-mix: Q8_0 mixer path - persistent down counters,
  planar output, Q8_1 epilogue, combine+norm fusion
 
 Fewer launches per hc site for models whose hc weights are Q8_0/F32 (unsloth
@@ -25,7 +25,7 @@ UD quants), bit-identical to the current Q8_0 path, BF16 path unchanged:
  5 files changed, 198 insertions(+), 21 deletions(-)
 
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 2a68f252d..72e823847 100644
+index 2a68f252d3..72e8238475 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -12669,7 +12669,7 @@ void ggml_compute_forward_lightning_indexer(
@@ -38,7 +38,7 @@ index 2a68f252d..72e823847 100644
      const ggml_tensor * x         = dst->src[0];
      const ggml_tensor * w_norm    = dst->src[1];
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 834402ad9..917063612 100644
+index 834402ad91..9170636123 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1725,6 +1725,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
@@ -76,7 +76,7 @@ index 834402ad9..917063612 100644
      // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
      // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e4dea0e32..024fbcbea 100644
+index b7c7773a34..8a45ce03b3 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1649,6 +1649,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -90,7 +90,7 @@ index e4dea0e32..024fbcbea 100644
          CUDA_CHECK(cudaFree(moe_glu_q8_cnt));
      }
 diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
-index 4a615ee7c..265797f05 100644
+index 4a615ee7ce..265797f056 100644
 --- a/ggml/src/ggml-cuda/hc-mix.cu
 +++ b/ggml/src/ggml-cuda/hc-mix.cu
 @@ -192,6 +192,77 @@ static __global__ void hc_mix_combine_rms_gamma(
@@ -408,10 +408,10 @@ index 4a615ee7c..265797f05 100644
  
  void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index daace2e07..966c59753 100644
+index a1440a11f7..b8ecb56303 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -918,7 +918,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+@@ -921,7 +921,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
          // planar output (BF16 path): mixed [n_embd, nt] then inject [hc, nt], both contiguous, so the verify band
          // needs no ggml_cont of the mixed head; byte-identical at nt == 1.  LLAMA_HC_MIX_PLANAR=0 disables it.
          static const bool planar_env = [] { const char * e = getenv("LLAMA_HC_MIX_PLANAR"); return !e || atoi(e) != 0; }();

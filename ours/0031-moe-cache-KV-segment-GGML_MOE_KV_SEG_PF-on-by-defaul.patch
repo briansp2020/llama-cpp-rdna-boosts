@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:46:49 +0000
-Subject: [PATCH 31/44] moe cache: KV segment -- GGML_MOE_KV_SEG_PF on by
+Subject: [PATCH 31/46] moe cache: KV segment -- GGML_MOE_KV_SEG_PF on by
  default with the segment
 
 The A/B on the production config (FINDINGS 943) gave small-prompt prefill
@@ -14,7 +14,7 @@ The A/B on the production config (FINDINGS 943) gave small-prompt prefill
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index ac1f4f4b7..5c925517b 100644
+index ac1f4f4b75..5c925517ba 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -2355,14 +2355,14 @@ static __global__ void moe_cache_route_kernel(char * __restrict__ dst, const cha

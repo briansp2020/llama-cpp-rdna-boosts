@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 15 Nov 2026 03:26:08 +0000
-Subject: [PATCH 38/44] mmvf: GDN gate/beta fusion also for F32 projections
+Subject: [PATCH 38/46] mmvf: GDN gate/beta fusion also for F32 projections
  (GGML_CUDA_FUSE_GATE_BETA_F32=0: off)
 
 unsloth UD-IQ4_XS stores ssm_alpha / ssm_beta as F32, so the BF16-only gate/beta fusion did
@@ -16,7 +16,7 @@ switch (GGML_CUDA_FUSE_GATE_BETA_BF16 / _F32).  gfx1201 decode: -22 launches per
  1 file changed, 11 insertions(+), 6 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index 350f0a998..f6a44d6da 100644
+index 350f0a9984..f6a44d6daa 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
 @@ -611,7 +611,7 @@ static void mul_mat_vec_f_switch_fusion(

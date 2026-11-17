@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:09:29 +0000
-Subject: [PATCH 28/44] moe cache: KV segment -- one take per request
+Subject: [PATCH 28/46] moe cache: KV segment -- one take per request
  (GGML_MOE_KV_SEG_TAKE1)
 
 With the KV segment the lend line follows the cells in use, so a long
@@ -39,7 +39,7 @@ synchronise, to show where a take spends it.
  5 files changed, 58 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index 4d9fcf6b8..c6b13c8c4 100644
+index 4d9fcf6b8c..c6b13c8c49 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -3607,6 +3607,7 @@ void moe_cache_kv_need(int64_t rows) {
@@ -90,7 +90,7 @@ index 4d9fcf6b8..c6b13c8c4 100644
      } else if (want + 4 * step <= old) {
          g_kvl_line = want;
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index b2c8d8bc7..d7eada88c 100644
+index b2c8d8bc79..d7eada88c4 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
 @@ -151,6 +151,14 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
@@ -109,7 +109,7 @@ index b2c8d8bc7..d7eada88c 100644
  // no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
  // attention cells, that cache as well.  A memory without an attention cache: true.
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index a6b2b55c6..f0cbe3bfd 100644
+index a6b2b55c63..f0cbe3bfd0 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -500,6 +500,7 @@ typedef void (*llama_kv_lend_unregister_t)();
@@ -164,7 +164,7 @@ index a6b2b55c6..f0cbe3bfd 100644
      // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
      // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index f1e4f0cc5..99f823cfb 100644
+index f1e4f0cc56..99f823cfbd 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -309,6 +309,7 @@ public:
@@ -176,7 +176,7 @@ index f1e4f0cc5..99f823cfb 100644
      //
      // input API
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 4786180a5..9563d74b1 100644
+index 4786180a51..9563d74b16 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -23,6 +23,7 @@

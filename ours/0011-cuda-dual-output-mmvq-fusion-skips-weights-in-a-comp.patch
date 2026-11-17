@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 21:45:55 +0000
-Subject: [PATCH 11/44] cuda: dual-output mmvq fusion skips weights in a
+Subject: [PATCH 11/46] cuda: dual-output mmvq fusion skips weights in a
  compute buffer (GGML_CUDA_FUSION_CHECK_LEAVES)
 
 (cherry picked from commit 5fbc2ac0f739e52e3ccac7927607c6cadfbd08a8)
@@ -10,7 +10,7 @@ Subject: [PATCH 11/44] cuda: dual-output mmvq fusion skips weights in a
  1 file changed, 10 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 694d99d7e..a1de2c9b6 100644
+index 694d99d7eb..a1de2c9b63 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -3059,7 +3059,15 @@ static int ggml_cuda_ssm_prescan_impl(ggml_backend_cuda_context * ctx, const ggm

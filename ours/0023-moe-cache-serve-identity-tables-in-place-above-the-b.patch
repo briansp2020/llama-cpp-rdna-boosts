@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 03:28:17 +0000
-Subject: [PATCH 23/44] moe cache: serve identity tables in place above the
+Subject: [PATCH 23/46] moe cache: serve identity tables in place above the
  band in mmap mode too
 
 r258 (TODO #133) takes an identity (fully resident) table over at any
@@ -23,23 +23,26 @@ config unchanged (0 identity tables, all hashes equal) (FINDINGS 910).
 
 (cherry picked from commit a35a444e8b29dbfe2a505f8de198f03efaa83bc0)
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu        | 11 +++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 14 +++++++++++++-
  ggml/src/ggml-cuda/moe-expert-cache.cu | 15 +++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h  |  4 ++++
  ggml/src/ggml-cuda/moe-expert-tier.inc |  9 +++++----
- 4 files changed, 35 insertions(+), 4 deletions(-)
+ 4 files changed, 37 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 4293add9a..e4dea0e32 100644
+index 5a34d3ed85..b7c7773a34 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -7582,6 +7582,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
-             dst->src[2] = saved_s2;
-             return;
-         }
+@@ -7586,7 +7586,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         // TODO #335/#336: the cache declined this table.  If a take-over hook had told the scheduler to skip
+         // `input_cpy` for it (and the slab then took its arena before this launch), that buffer holds stale or
+         // uninitialised bytes; re-fill it from the host master.  No promise outstanding -> no work.
+-        moe_cache_repair_copy(src0, ctx.device, ctx.stream());
++        const size_t repaired = moe_cache_repair_copy(src0, ctx.device, ctx.stream());
 +        // FINDINGS 909 tripwire: above the band a declined redirect should not be an identity table the take-over
-+        // serves (its input copy would be unstaged).  Logged once; validation greps for it.
-+        if (dst->ne[2] > MOE_EXPERT_CACHE_MAX_TOK && src0->buffer != nullptr &&
++        // serves (its input copy would be unstaged).  Logged once; validation greps for it.  ours: not when the
++        // repair above just re-filled the copy.
++        if (repaired == 0 && dst->ne[2] > MOE_EXPERT_CACHE_MAX_TOK && src0->buffer != nullptr &&
 +                moe_cache_inplace_miss(dst, src0, ctx.device)) {
 +            static bool warned = false;
 +            if (!warned) {
@@ -52,10 +55,10 @@ index 4293add9a..e4dea0e32 100644
  
      GGML_TENSOR_BINARY_OP_LOCALS
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 19dfbad23..bbdd5c900 100644
+index bcb3733bda..c5944ba77f 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -12513,6 +12513,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
+@@ -12690,6 +12690,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
      return n_tok <= MOE_EXPERT_CACHE_MAX_TOK || moe_cache_prefill_in_place();
  }
  
@@ -78,7 +81,7 @@ index 19dfbad23..bbdd5c900 100644
                           void ** arena, int64_t * n_slots,
                           size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index a2e46e76d..18ad70602 100644
+index 546126cfe1..7a9b6376b0 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
 @@ -406,6 +406,10 @@ void moe_cache_graph_begin(int device);
@@ -93,7 +96,7 @@ index a2e46e76d..18ad70602 100644
                           void ** arena, int64_t * n_slots,
                           size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok);
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index e76055a96..c3ac5880f 100644
+index e76055a963..c3ac5880f0 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -3034,11 +3034,12 @@ static bool get_table_locked(const ggml_tensor * op, const ggml_tensor * weight_

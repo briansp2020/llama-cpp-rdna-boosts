@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 15:57:29 +0000
-Subject: [PATCH 33/44] loader: open the MoE heat map in --host-experts mmap
+Subject: [PATCH 33/46] loader: open the MoE heat map in --host-experts mmap
  mode (LLAMA_MMAP_HEAT_OPEN=0: off)
 
 The mmap mode returned from plan_host_expert_placement before the heat-map open, the only call site, so
@@ -15,7 +15,7 @@ registration and the session tallies are saved on the debounce and at exit.
  1 file changed, 15 insertions(+)
 
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 339ac9e92..46520c26f 100644
+index 0668afb362..57ee01c814 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -194,7 +194,22 @@ bool llama_model_loader::host_expert_selected(const std::string & name, int laye

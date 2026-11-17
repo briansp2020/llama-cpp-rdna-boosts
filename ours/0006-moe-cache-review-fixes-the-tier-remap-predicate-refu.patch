@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:41:12 +0000
-Subject: [PATCH 06/44] moe cache: review fixes: the tier remap predicate
+Subject: [PATCH 06/46] moe cache: review fixes: the tier remap predicate
  refuses a fill_failed table; the down-fold also runs unfused for a declined
  sparse table
 
@@ -13,7 +13,7 @@ Subject: [PATCH 06/44] moe cache: review fixes: the tier remap predicate
  3 files changed, 5 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 694d99d7e..fd0dbc10d 100644
+index 694d99d7eb..fd0dbc10d5 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -3251,8 +3251,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
@@ -29,10 +29,10 @@ index 694d99d7e..fd0dbc10d 100644
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 492f32680..0ae3d1965 100644
+index 1209373680..4a530aa98f 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -451,7 +451,7 @@ bool moe_cache_prefill_in_place_enabled();
+@@ -461,7 +461,7 @@ bool moe_cache_prefill_in_place_enabled();
  bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
                                  const struct ggml_tensor * gate, int device);
  
@@ -42,7 +42,7 @@ index 492f32680..0ae3d1965 100644
  bool moe_cache_fused_declined_sparse(const struct ggml_tensor * op, const struct ggml_tensor * src0,
                                       const struct ggml_tensor * gate, int device);
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index 577e25eda..9bfb2fd08 100644
+index 577e25eda9..9bfb2fd088 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -3628,7 +3628,7 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st

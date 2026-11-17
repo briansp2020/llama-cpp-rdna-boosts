@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 15 Nov 2026 16:07:03 +0000
-Subject: [PATCH 39/44] mmvq: GDN gate/beta epilogue for non-Q8_0
+Subject: [PATCH 39/46] mmvq: GDN gate/beta epilogue for non-Q8_0
  ssm_alpha/ssm_beta (GGML_CUDA_FUSE_GDN_EPI=0: off)
 
 Qwen3.5/3.6/3.8 GDN layers whose ssm_alpha/ssm_beta are Q4_K/Q5_K/Q6_K/IQ4_XS/MXFP4 ran the
@@ -28,7 +28,7 @@ Q4_K_M MTP +0.9 %, plain +0.3 %, 27B MXFP4 MTP +1.0 %, 35B-A3B Q4_K_M +0.4 %.
  6 files changed, 299 insertions(+), 9 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 917063612..51b49fe42 100644
+index 9170636123..51b49fe426 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -2877,6 +2877,12 @@ struct ggml_cuda_mm_fusion_args_host {
@@ -55,10 +55,10 @@ index 917063612..51b49fe42 100644
      const void * cat_x[2] = { nullptr, nullptr };
      float * cat_dst[2] = { nullptr, nullptr };
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index b1583732a..4600d14d1 100644
+index 47072083e2..a5aa3476ab 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2826,6 +2826,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2850,6 +2850,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      if (const int n_row_concat = ggml_cuda_mul_mat_row_concat_try_fuse(*cuda_ctx, cgraph, i)) {
          return n_row_concat;
      }
@@ -69,10 +69,10 @@ index b1583732a..4600d14d1 100644
          return n_dual_output;
      }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 024fbcbea..95cf83927 100644
+index 8a45ce03b3..8e38230a4d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -10296,6 +10296,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -10302,6 +10302,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // (the ssm_conv_in fusion skips the nodes up to its CONCAT, e.g. attn_qkv), not Q8_0 (the GDN prescan matches
          // positions).  Only nodes reading that activation and a weight move earlier: bit-identical.  Structural only, every
          // ubatch size, idempotent.  GGML_CUDA_MMVQ_CONCAT_REORDER=0: off.
@@ -82,7 +82,7 @@ index 024fbcbea..95cf83927 100644
          static const bool cat_reorder = [] { const char * e = getenv("GGML_CUDA_MMVQ_CONCAT_REORDER"); return e == nullptr || atoi(e) != 0; }();
          const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
          if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
-@@ -10336,10 +10339,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -10342,10 +10345,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                              (b->src[0]->ne[1] > 256 && large) || feeds_concat(j)) {
                          continue;
                      }
@@ -99,7 +99,7 @@ index 024fbcbea..95cf83927 100644
                  }
                  i = pos - 1;
 diff --git a/ggml/src/ggml-cuda/mmvq-ksplit-body.inc b/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
-index cbac1aaa5..a2f3c24de 100644
+index cbac1aaa51..a2f3c24de8 100644
 --- a/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
 +++ b/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
 @@ -29,6 +29,7 @@
@@ -150,7 +150,7 @@ index cbac1aaa5..a2f3c24de 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index a1de2c9b6..fd578bfb9 100644
+index a1de2c9b63..fd578bfb98 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1020,7 +1020,27 @@ static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float
@@ -492,7 +492,7 @@ index a1de2c9b6..fd578bfb9 100644
  
  // MoE down fold: ffn_moe_weighted = moe_down * topk_weights.  Fold the MUL into the matmul epilogue
 diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
-index ea7ce5ad9..711fb1651 100644
+index ea7ce5ad95..711fb16518 100644
 --- a/ggml/src/ggml-cuda/mmvq.cuh
 +++ b/ggml/src/ggml-cuda/mmvq.cuh
 @@ -63,6 +63,9 @@ int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c

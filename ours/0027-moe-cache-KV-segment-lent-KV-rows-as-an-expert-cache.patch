@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 02:28:14 +0000
-Subject: [PATCH 27/44] moe cache: KV segment -- lent KV rows as an
+Subject: [PATCH 27/46] moe cache: KV segment -- lent KV rows as an
  expert-cache tier below the arena
 
 GGML_MOE_KV_LEND=1 + GGML_MOE_KV_SEG=1 (default off; unset GGML_MOE_KV_SEG = off).
@@ -36,7 +36,7 @@ Fable design + logic reviews (no open must-fix).  Production config,
  4 files changed, 587 insertions(+), 51 deletions(-)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 8d4bcb08c..6f89c4108 100644
+index 8d4bcb08c3..6f89c4108c 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -665,6 +665,9 @@ extern "C" {
@@ -50,7 +50,7 @@ index 8d4bcb08c..6f89c4108 100644
      // issue #164: the byte size of device `dev`'s slice of `tensor` under `split_state`.  This is the
      // single definition of the meta split size -- `ggml_backend_meta_stage_input` sizes the H2D ring slot
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 8818f1fca..19669dde8 100644
+index 060b84ca61..2da5da1dbb 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1024,6 +1024,14 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct
@@ -69,7 +69,7 @@ index 8818f1fca..19669dde8 100644
  static size_t ggml_backend_meta_inner_extent(const struct ggml_tensor * tensor, int skip_dim) {
      size_t extent = 0;
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index c3ac5880f..4d9fcf6b8 100644
+index c3ac5880f0..4d9fcf6b8c 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -310,6 +310,12 @@ static int64_t tier_touch() {
@@ -902,7 +902,7 @@ index c3ac5880f..4d9fcf6b8 100644
                  int64_t pf_held = 0;
                  for (const kvl_slot_t & sl : g_kvl_slots) {
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 849ed1728..a6b2b55c6 100644
+index 849ed17282..a6b2b55c63 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -1288,16 +1288,45 @@ void llama_kv_cache::lend_attach() {

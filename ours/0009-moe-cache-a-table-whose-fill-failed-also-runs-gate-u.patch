@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 04:08:22 +0000
-Subject: [PATCH 09/44] moe cache: a table whose fill failed also runs
+Subject: [PATCH 09/46] moe cache: a table whose fill failed also runs
  gate+up+GLU unfused
 
 r235 declines a table in moe_cache_update_host once one of its fills fails
@@ -21,7 +21,7 @@ changes. GGML_MOE_FUSED_DECLINE_UNFUSE=0 turns the fallback off.
  1 file changed, 5 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index 9bfb2fd08..fd1c59af6 100644
+index 9bfb2fd088..fd1c59af6d 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -3097,7 +3097,10 @@ bool moe_cache_fused_declined_sparse(const ggml_tensor * op, const ggml_tensor *

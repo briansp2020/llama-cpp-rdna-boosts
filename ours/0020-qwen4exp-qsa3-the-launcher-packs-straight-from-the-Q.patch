@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 02:48:30 +0000
-Subject: [PATCH 20/44] qwen4exp qsa3: the launcher packs straight from the
+Subject: [PATCH 20/46] qwen4exp qsa3: the launcher packs straight from the
  Q8_0 cache views, no F16 copies in the graph (LLAMA_QSA3_PACK_Q8)
 
 (cherry picked from commit 37a2edf7902a6e40cb3dc10262af9ea7adf991dd)
@@ -12,7 +12,7 @@ Subject: [PATCH 20/44] qwen4exp qsa3: the launcher packs straight from the
  3 files changed, 108 insertions(+), 20 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/fattn-qsa3.cu b/ggml/src/ggml-cuda/fattn-qsa3.cu
-index 93fc0641f..ca8d03d01 100644
+index 93fc0641fd..ca8d03d01c 100644
 --- a/ggml/src/ggml-cuda/fattn-qsa3.cu
 +++ b/ggml/src/ggml-cuda/fattn-qsa3.cu
 @@ -1,5 +1,6 @@
@@ -140,7 +140,7 @@ index 93fc0641f..ca8d03d01 100644
      }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 8e2548dac..d3e218270 100644
+index 8e2548dacf..d3e2182704 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -5715,9 +5715,13 @@ void ggml_flash_attn_qsa_set_packed(
@@ -161,10 +161,10 @@ index 8e2548dac..d3e218270 100644
      GGML_ASSERT(packed_keys->ne[0]   == k->ne[0] && packed_keys->ne[1]   == k->ne[2] && packed_keys->ne[2]   == k->ne[1] && packed_keys->ne[3]   == 1);
      GGML_ASSERT(packed_values->ne[0] == k->ne[0] && packed_values->ne[1] == k->ne[2] && packed_values->ne[2] == k->ne[1] && packed_values->ne[3] == 1);
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index a2f7afb8b..daace2e07 100644
+index 9ee324a36d..a1440a11f7 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -383,7 +383,8 @@ static bool qsa_derived_vis_supported(const llama_model & model, const llama_hpa
+@@ -386,7 +386,8 @@ static bool qsa_derived_vis_supported(const llama_model & model, const llama_hpa
  // will not read them is pure waste (issue #60's r17+qsa3-off headroom).  Under -sm tensor
  // model.dev_layer() is the Meta device, whose supports_op() requires EVERY child to accept, so
  // the probe is also the tensor-parallel safety condition.
@@ -174,7 +174,7 @@ index a2f7afb8b..daace2e07 100644
      ggml_backend_dev_t dev = model.dev_layer(il);
      if (dev == nullptr) {
          return false;
-@@ -410,8 +411,9 @@ static bool qsa3_op_supported(const llama_model & model, const llama_hparams & h
+@@ -413,8 +414,9 @@ static bool qsa3_op_supported(const llama_model & model, const llama_hparams & h
      ggml_tensor * v   = ggml_new_tensor_4d(ctx, type_kv,       D,       n_kv, 1,  1);
      ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1,       128, 1,  1);
      ggml_tensor * msk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv,    128, 1,  1);
@@ -186,7 +186,7 @@ index a2f7afb8b..daace2e07 100644
  
      ggml_tensor * op = ggml_flash_attn_qsa(ctx, q, k, v, idx, msk, 1.0f, 0.0f, nullptr, nullptr);
      ggml_flash_attn_qsa_set_packed(op, pk, pv);
-@@ -2633,8 +2635,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2636,8 +2638,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          // backend probe: never materialise the F16 packs when the acting device's qsa3 predicate
          // will not read them (the runtime arch/env policy lives there; issue #59/#60).
          constexpr bool qsa3_pack = LLAMA_QSA3_ENABLE != 0;
@@ -204,7 +204,7 @@ index a2f7afb8b..daace2e07 100644
              // The launcher packs these into the block layouts itself (one fused pass, session 7);
              // the graph only materialises the natural contiguous F16 view [D, n_head_kv, n_kv].
              // LLAMA_QSA3_DIRECT_F16=0: the Q8_0 cache goes through the F32 intermediate again (A/B)
-@@ -2642,9 +2652,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2645,9 +2655,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
              ggml_backend_dev_t layer_dev = model.dev_layer(il);
              const bool direct_q8_0 = direct_env && layer_dev != nullptr &&
                  ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_CPU;

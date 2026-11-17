@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 17:15:00 +0000
-Subject: [PATCH 35/44] moe cache: a sparse table staged fill at sizing takes
+Subject: [PATCH 35/46] moe cache: a sparse table staged fill at sizing takes
  the heat map hottest experts (GGML_MOE_STAGE_HEAT_RANK=0: off)
 
 With a persisted heat map, the eager per-expert heat seed of a sparse (mmap) table registered each expert and
@@ -16,10 +16,10 @@ instead of 0..k-1, and the heat seed leaves sparse tables to it.  No map: 0..k-1
  2 files changed, 51 insertions(+), 10 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 360d9c99c..1f5f2489c 100644
+index 55087e5871..77a30090dd 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -301,6 +301,16 @@ struct table_t : moe_tier_fields {
+@@ -311,6 +311,16 @@ struct table_t : moe_tier_fields {
  
  // TODO #88: the band a heat-driven arena decision ranks by (defined with the heat-map code below).
  static const std::vector<uint32_t> & heat_rank_vec(const table_t & t);
@@ -36,7 +36,7 @@ index 360d9c99c..1f5f2489c 100644
  
  std::mutex                          g_mutex;
  std::vector<table_t>                g_tables;
-@@ -5323,6 +5333,9 @@ void apply_heat_seed_locked(table_t & t) {
+@@ -5492,6 +5502,9 @@ void apply_heat_seed_locked(table_t & t) {
          !heat_seed_above_floor(t)) {
          return;
      }
@@ -47,7 +47,7 @@ index 360d9c99c..1f5f2489c 100644
          return;
      }
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index 5c925517b..3bb0ccdee 100644
+index 5c925517ba..3bb0ccdee8 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -218,9 +218,10 @@ static void sparse_pack_expert(const table_t & t, int32_t e, char * dst) {

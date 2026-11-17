@@ -3,7 +3,7 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-4f9dfa0e3-r292` (upstream llama.cpp `4f9dfa0e3` + this repo's release).
+**Base:** `v16-4f9dfa0e3-r299` (upstream llama.cpp `4f9dfa0e3` + this repo's release).
 The rest of this branch is that release as published; only `ours/` is added.
 
 **New layout (2026-11-08).** Up to r228 this was a 55-patch series (0000-0054) that replaced the release's
@@ -17,11 +17,11 @@ The old series is kept as the tag `ours-r228-series`; the mapping table below sh
 
 ```
 git checkout 4f9dfa0e3
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r292 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 44 patches (0001-0044)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r299 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 46 patches (0001-0046)
 ```
 
-Result: tree `2889c1710ee2`. This is the production build from 2026-11-16 (2 GPUs, `-sm tensor`).
+Result: tree `7bb45a3ebf07`. This is the production build from 2026-11-17 (2 GPUs, `-sm tensor`).
 
 ## Patches
 
@@ -31,9 +31,9 @@ r272 took our copy-engine all-reduce single exchange (PR #304, r265 0012); it is
 `-sm tensor --load-mode none` load race (issue #308, `GGML_META_SEG_DRAIN`), so our drain (r277 0037) is dropped too.
 r291 took our qwen4exp sequence parallelism (PR #315: on by default, bf16 all-gathers by default, at least 128 tokens per
 split); the r287 series' 0022-0024, 0027 and 0028 are dropped and the later patches move up.
-The numbers below are the r292 series: the r287 series rebased onto r290 (one conflict, in 0001: r290 removed the mixed
-K/V `type_V` template parameter next to our q8_0 tile dequant `c_perm`; `c_perm` kept), onto r291 (seqpar dropped, no
-conflicts) and onto r292 (no conflicts), plus 0039-0044.
+The numbers below are the r299 series: the r292 series rebased onto r299 (four conflicts, all in our hooks where r297-r298's
+fused-prefill in-place contract (TODO #327), take-over promise repair (TODO #335/#336) and alias role check meet our mmap
+tier; merged keeping both sides, with the follow-up fixes in 0045), plus 0046.
 
 | | what | env switch (off) |
 |---|---|---|
@@ -81,11 +81,29 @@ conflicts) and onto r292 (no conflicts), plus 0039-0044.
 | 0042 | the standalone MoE weighted-reduction kernels without fma contraction (exact against the unfused graph; changes output at rounding level) | `GGML_CUDA_MWR_EXACT=0` |
 | 0043 | r292's arena settle skips layers that hold an mmap-tier table (re-sizing such a layer frees the table, which turned our RAM tier off for the rest of the process) | `GGML_MOE_SETTLE_SPARSE=1` (release behaviour) |
 | 0044 | QSA indexer top-k: fast path for the regular cache layout (block-level first pass and gather, visible width computed instead of counted); a device check falls back to the general path | `GGML_QSA_TOPK_REGULAR=0` |
+| 0045 | r299 merge fixes for the mmap tier: our prefill resolve runs only when the fused prefill serves nothing in place; our in-place-miss check only when the release's repair copied nothing; gate/up lanes with different tier remaps count as mixed (the fused kernels read one ids copy); our tier serves and take-overs clear the release's take-over promise | - |
+| 0046 | our namespace-scope env-flag initializers are named functions instead of lambdas (see the r299 validation) | - |
 
 0005, 0006 (down-fold part) and 0009 were workarounds for the bug the release's fusion overlap check fixes at the source;
 0010 removes 0005. The others only run after a decline or a failed fill.
 
 Production also sets `MOE_HOST_POOL_TRANSPORT=map` (pins the host-read transport the r262 adaptive mode would otherwise pick).
+
+## Validation on r299 (2026-11-16 and 2026-11-17, Radeon AI PRO R9700 x 2, ROCm 10.1)
+
+On the production configuration (described in the next section) unless another model is named.
+
+- 0046: in this translation unit (our `.inc` files are included into the release's `moe-expert-cache.cu`) clang gave
+  namespace-scope lambda initializers in different `namespace {}` blocks the same name and reused the first body. On r299
+  this left our in-place prefill off (wrong output on the first build); on the r292 series `GGML_MOE_PF_PREFETCH` and
+  `GGML_MOE_PREFILL_INPLACE` read `GGML_MOE_FILL_FENCE` / `GGML_MOE_TIER_PRECOPY` (all on by default, so output was
+  unaffected, but those two switches did nothing). With 0046 every one of our 11 env flags is bound to its own variable
+  (checked on the compiled object).
+- Greedy, prompt-set, mid-length and depth hashes identical to the r292 series, 259.6k needle correct, speed equal, byte
+  checks (`GGML_MOE_VERIFY`) 0 differences, 6 of 6 loads identical under `-sm tensor --load-mode none`.
+- Nightly on the final tree: the 7-model comparison with the release passes with 0 problems; three 2-GPU stress sessions,
+  57 rounds, 0 faults, every round the expected hash, needle correct; byte checks 0 differences.
+- Production since 2026-11-17: greedy decode about 133 t/s, 31.5k prefill about 3480 t/s, 159k about 3378 t/s.
 
 ## Validation on r290-r292 (2026-11-15 and 2026-11-16, Radeon AI PRO R9700 x 2, ROCm 10.1)
 

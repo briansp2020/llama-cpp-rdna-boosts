@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 16 Nov 2026 03:37:40 +0000
-Subject: [PATCH 44/44] QSA indexer top-k: regular-layout fast path
+Subject: [PATCH 44/46] QSA indexer top-k: regular-layout fast path
  (block-level pass 1 / gather, analytic wvis, no recount;
  GGML_QSA_TOPK_REGULAR=0 off)
 
@@ -10,7 +10,7 @@ Subject: [PATCH 44/44] QSA indexer top-k: regular-layout fast path
  1 file changed, 232 insertions(+), 10 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
-index 45a431566..423dc9a47 100644
+index 45a431566a..423dc9a470 100644
 --- a/ggml/src/ggml-cuda/indexer-topk.cu
 +++ b/ggml/src/ggml-cuda/indexer-topk.cu
 @@ -415,6 +415,174 @@ static __global__ void indexer_topk_write_blocks(

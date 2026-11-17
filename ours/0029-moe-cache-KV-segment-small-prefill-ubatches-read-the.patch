@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:10:35 +0000
-Subject: [PATCH 29/44] moe cache: KV segment -- small prefill ubatches read
+Subject: [PATCH 29/46] moe cache: KV segment -- small prefill ubatches read
  the KV copies (GGML_MOE_KV_SEG_PF)
 
 A prefill ubatch between the decode band and the prefetch band stages
@@ -38,7 +38,7 @@ KV copy, RAM tier, file), counted whether the switch is on or not.
  1 file changed, 25 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index c6b13c8c4..e67e89518 100644
+index c6b13c8c49..e67e895186 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -2355,23 +2355,41 @@ static __global__ void moe_cache_route_kernel(char * __restrict__ dst, const cha

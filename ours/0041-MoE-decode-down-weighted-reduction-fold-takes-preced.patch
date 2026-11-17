@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 15 Nov 2026 18:14:58 +0000
-Subject: [PATCH 41/44] MoE decode: down + weighted-reduction fold takes
+Subject: [PATCH 41/46] MoE decode: down + weighted-reduction fold takes
  precedence over the MUL-only down fold; fold sum without fma contraction
 
 - ggml_cuda_moe_down_fold_try_fuse steps aside when ggml_cuda_mwr_fold_mark armed the down + reduction fold for
@@ -21,7 +21,7 @@ tg128 (1 GPU): Qwen3.6-35B-A3B Q4_K_M 151.1 -> 154.9 t/s (+2.5 %); Qwen3-30B-A3B
  3 files changed, 28 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 51b49fe42..00c7019ef 100644
+index 51b49fe426..00c7019ef1 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -2922,6 +2922,7 @@ struct ggml_cuda_mm_fusion_args_device {
@@ -33,7 +33,7 @@ index 51b49fe42..00c7019ef 100644
      // write gb_dst2; rows below write softplus(v + gb_dt[row]) * gb_a[row].
      const void * gb_x2 = nullptr;
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
-index 54495f669..92c997742 100644
+index 54495f6695..92c997742d 100644
 --- a/ggml/src/ggml-cuda/mmvq-moe.cu
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -687,12 +687,25 @@ static __global__ void mul_mat_vec_q_moe(
@@ -68,7 +68,7 @@ index 54495f669..92c997742 100644
                  if (threadIdx.x == 0) {
                      *cnt = 0;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 80aeccc8e..894cb247b 100644
+index 80aeccc8eb..894cb247bb 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1966,6 +1966,8 @@ void ggml_cuda_mul_mat_vec_q(
