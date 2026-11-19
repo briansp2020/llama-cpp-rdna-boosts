@@ -70,6 +70,13 @@
 #                                subject in BASE..REV (release speedup: pass the
 #                                previous release tip); the tip is always built so
 #                                the final combination stays compiler-verified
+#   HF_UI_VERSION=b12387         NOT a gate option: an upstream breakage workaround.  Every commit here is
+#                                configured FRESH, so a broken `ggml-org/llama-ui` `latest` bundle aborts the
+#                                configure at `ui-assets.cmake:137` (missing `workbox[hash].js`) -- see `TODO.md`
+#                                #342 / `INVARIANTS.md` r303 item 6.  Export the pin for the gate window
+#                                (`HF_UI_VERSION=b12387 ./scripts/gate-per-block-build.sh ...`); incremental
+#                                builds never see it, which is why it bites exactly here.  Drop it when the
+#                                bundle validates again.
 #   --fast                       build the release profile per commit instead of
 #                                `all`: ggml-hip, llama, llama-cli, llama-server,
 #                                llama-bench, llama-perplexity.  Drops the test and
@@ -81,6 +88,15 @@
 #                                ~4 distinct contents, i.e. ~21 of ~35 minutes)
 #   --targets "T1 T2 ..."        an explicit target list (default: `all`)
 #   --list-only                  print the commits that would be built, then exit
+#
+#   HF_UI_VERSION=<tag>          upstream's own knob (tools/ui/CMakeLists.txt) for the llama-ui
+#                                asset bundle a fresh configure downloads.  Unset (the default) it
+#                                resolves `latest`.  Set it when upstream publishes a bundle that
+#                                llama.cpp's validator rejects -- measured 2026-11-17: `latest`
+#                                (75 files) has no `workbox[hash].js`, so every block's configure dies
+#                                in ui-assets.cmake:137, while `HF_UI_VERSION=b12387` carries
+#                                `workbox-b3c04f83.js` and validates.  This gate wipes the build dir
+#                                per commit, so a broken upstream bundle hits it first.
 #
 # Exit: 0 = every commit built, 1 = at least one failed, 2 = usage/prereq error.
 #

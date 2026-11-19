@@ -1,3 +1,438 @@
+## 261117.004 (r305, RELEASE v17-4f9dfa0e3-r305) -- GitHub issue #323: a host-expert routed MoE is offloaded to the GPU at every ubatch width (block 09), so a 17..31-token ubatch stops running its experts on the CPU at 31x the cost
+
+**What shipped.**  Block **09** only (`ggml/src/ggml-cuda/ggml-cuda.cu`: `ggml_backend_cuda_device_offload_op()`
+and two helpers); `release.json` at **`v17-4f9dfa0e3-r305`** (tip `73295b281`, tree `ef8a4adcc`; optional re-cut
+`c47157994` / `0d86727bf`, cumulative `20cdb42f1`).  Block 09 owns the offload hook and the scheduler that
+consults it, so this is an amendment and the block count is unchanged (17 official + `0300`).
+
+**The report was right, and it is worse than "a tuning gap".**  `ggml_backend_cuda_device_offload_op()` relaxed a
+cache-managed `MUL_MAT_ID` into the device's decode band (16 on RDNA4) and left everything wider to
+`GGML_OP_OFFLOAD_MIN_BATCH` (upstream's, default 32).  A ubatch between the band and 32 tokens therefore ran its
+routed MoE on the **CPU** -- and that is the width a chat server lives at, not a benchmark shape: a short prompt
+chunk, a follow-up turn's new tokens, one slot's prefill step while another decodes.  The generic threshold's
+premise (a host weight is uploaded whole, so a small batch is cheaper on the CPU) is false twice over in this
+tier: the GPU arm uploads no whole table (the cache serves the routed set from the arena/pool, or streams only the
+non-resident experts through the pool's own coalesced read engine), and the CPU arm reads the **same bytes** out of
+the pageable model mapping through a page fault per 4 KiB -- exactly the reporter's `perf` profile (38 % kernel,
+`native_queued_spin_lock_slowpath` under `filemap_fault`/`do_sync_mmap_readahead`, 19 % libgomp, 15 %
+`ggml_vec_dot_iq*_q8_*`).
+
+**Reproduced on this box, on his model and his flags.**  The reachability detail matters: `ggml_backend_buft_is_cuda()`
+is a function-pointer identity on the DEVICE buffer name, so a `ROCm_Host`/`ROCm_HostMap` expert weight is owned by no
+GPU backend and pass 1's `1.off` path decides it by `offload_op` -- which is why `-sm layer` and Flash-Next +
+`-sm tensor` were exposed while `Qwen3.6-35B-A3B-Q4_K_M -sm tensor` was not (its host master is merged into a
+per-layer Meta buffer, so buffer ownership already assigns it to the GPUs; that arm is unchanged).  Cold page cache
+(`sync; echo 3 > /proc/sys/vm/drop_caches` before every run), a 19-token prompt, prompt eval, "before" = the new
+`GGML_MOE_HOST_OFFLOAD=0` kill switch, `mmid@CPU` = `MUL_MAT_ID` nodes the scheduler placed on the CPU:
+
+| arm (Flash-Next GSQ-RCO IQ3_S, 2 x R9700, `-ncmoe 47 -lme 47`) | before | after | ratio |
+|---|---:|---:|---:|
+| `-sm tensor`, pool tier (pageable master) | 2.4 / 2.5 t/s, 138 | **76.2 / 78.5**, 0 | **31x** |
+| `-sm layer`, pool tier | 2.5, 138 | **80.5**, 0 | 32x |
+| `-sm tensor`, `--host-experts pinned` | 58.7, 138 | **70.7**, 0 | +20 % |
+| `-sm tensor`, `MOE_EXPERT_CACHE_MIB=0` | 1.1, 2271 | **7.9**, 0 | 7.2x |
+| control: 436-token prompt, `-sm tensor` | 442.2, 0 | 435.2, 0 | inert |
+
+The pinned-master arm is the important one for the rule: it is the *cheapest possible CPU arm* (the experts are
+already in RAM, nothing is read from disk) and the GPU arm still wins by 20 % **on the fastest consumer CPU there
+is** (9950X3D), so the rule is not tuned to a slow CPU; the cache-off arm is the most expensive GPU arm the delivery
+has (a plain whole-table upload) and still wins 7.2x.  Purity: the same-seed greedy text at the affected width is
+byte-identical across the two arms and to the all-VRAM build (`105 chars sha=c16075337035`, 35B-A3B UD-Q4_K_M,
+`-sm layer -ncmoe 40`), so on the measured arms this moves a backend, not a number -- it also removes a split where
+the same routed op ran on a different backend depending on how many tokens happened to share its ubatch.
+
+**Why the default threshold stays.**  It is upstream's and it is still right for a *plain* host weight, including a
+CPU-buffer expert bank (`--override-tensor 'exps=CPU'`, i.e. the delivery's tier bypassed): there is no pool or
+stream to serve the GPU arm from, so the upload really is the CPU's competition.  The APU GTT store is a DEVICE
+buffer type, so its ops are assigned by ownership and never reach this decision (`gate-uma-experts.sh` covers that
+tier and is not reachable by this change).  `GGML_MOE_HOST_OFFLOAD=0` is the kill switch (A/B and bisection only).
+
+**Gates.**  `gate-host-pool.sh` **59/59** with its recorded anchors unmoved (`182 chars a99ccbd97ecb` on all eight
+single-device arms, `171 chars 8c39335bbceb` on the two `-sm tensor` arms, `pinlate` KLD 0.000000 / 100.000 %);
+`gate-prefill-logits.sh` **PASS, mean KLD 0.000000** against the recorded base; the standard coherence arm
+(Qwen3.5-4B Q8_0, 3 GPU `-sm tensor`) `100 chars sha=1c5d32ac537d` -- unchanged since r152; `gate-per-block-build.sh
+--fast --changed-from c4d421cc2` **1/1** (block 09 is the only changed block); new **`scripts/gate-moe-host-offload.sh`
+PASS** (19-token prompt: default 0 `MUL_MAT_ID` on the CPU at 188.5 t/s, kill switch 117 nodes at 2.6 t/s -- the arm
+is not vacuous -- and the text identical across the default, the kill switch and `GGML_OP_OFFLOAD_MIN_BATCH=9`; a
+>= 64-token control 0/0 with equal text; `check-gpu-faults.sh` clean); `validate-set.sh` **GREEN** on a fresh tarball
+(strict 18/18, applied tree `ef8a4adcc`, both optional artifacts re-cut and re-verified alone and cumulatively,
+Windows portability clean over 512 files).
+
+**Two findings recorded while fixing it.**  (1) The 17..31-token window is invisible to every existing gate: the
+host-expert gate drives `-ub 1024` and a 6-token prompt (inside the band), and a `llama-cli` run with a long ubatch
+never shows it -- hence the new gate, and `AGENTS.md`/`MANIFESTS.md` now say so.  (2) The reachability depends on
+whether the loader merges a device's host-master buffer into a per-layer Meta buffer, so one model's `-sm tensor` arm
+is not evidence that the decision is unreachable (`INVARIANTS.md` r305 item 3).
+
+## 261117.003 (r304, RELEASE v17-4f9dfa0e3-r304) -- the GDN gate/beta chain fused for F32 and K-quant projections (contributor PR #322), folded into block 10
+
+**What shipped.**  Block **10** only (`mmvf.cu`, `mmvq.cu`, `mmvq.cuh`, `mmvq-ksplit-body.inc`, `common.cuh`,
+`ggml-cuda.cu`, `ggml-cuda-try-fuse.cu`, `tests/test-fusion-gate-beta-multiseq.cpp`); `release.json` at
+**`v17-4f9dfa0e3-r304`** (tip `c4d421cc2`, tree `e4791d001`; optional re-cut `f1f7d18e8` / `25fbd3c7b`, cumulative
+`52ad58504`).  Contributor PR #322 (`briansp2020`) extends both chain fusions block 10 already owns -- BF16 in
+`mmvf` and Q8_0 in `mmvq` -- to the projection types the published Qwen3.5/3.6/3.8 GGUFs actually use: **F32**
+(`GGML_CUDA_FUSE_GATE_BETA_F32`; unsloth's UD quants keep `ssm_alpha`/`ssm_beta` F32) and **Q4_K / Q5_K / Q6_K /
+IQ4_XS / MXFP4** (the ksplit body's `gdn_epi` epilogue, `GGML_CUDA_FUSE_GDN_EPI`: folded into the decode
+alpha/beta/`attn_gate` row concat, and alpha + beta as ONE row-concat launch in the 2..8-token verify band).
+Block **03** was considered and rejected as the home: it owns the GDN *math* (chunked prefill, the rollback
+tracker) and touches none of these seven files; block 10 introduced every function the series extends, including
+the concat reorder that has to put the larger `attn_gate` projection in front for the verify-band launch.
+
+**The report was accurate, and its numbers are conservative.**  Applied clean to the r303 tree (plain
+`git apply`, no 3-way fuzz; the resulting tree is byte-identical to the set that was measured).  Their "output =
+stock" claim holds exactly: prefill-logit KLD **-0.000001 / 100.000 %** on the F32 arm (35B-A3B UD-Q4_K_M) and
+**0.000000 / 100.000 %** on the Q4_K arm (LMStudio Q4_K_M) at `-ub 1`, **4** and **8** -- each against a base
+recorded from the *previous build's binary*, so it is a stock-vs-series compare and not a self-compare.  Their
+"decode +0.9-1.1 %" reproduces and is beaten here: `llama-bench` tg128 (r=3, two interleaved rounds, 1 GPU
+`-sm layer`, `ROCBLAS_USE_HIPBLASLT=0`) **114.84/114.92 -> 117.10/117.12 (+1.9 %)** on the F32 arm and
+**148.62/148.61 -> 150.21/150.08 (+1.0 %)** on the Q4_K arm, with the single-switch controls landing back on the
+old number (`FUSE_GATE_BETA_F32=0` 115.61, `FUSE_GDN_EPI=0` 150.00).  Flash-Next IQ4_NL -- the *reorder-only*
+class, whose projection type takes neither epilogue -- is byte-identical at `df389355f5e8` and 68.8 -> 69.7 t/s.
+
+**Three things were added before it could be a block.**  (1) **A hole in 0003's memory rule.**  The epilogue
+replaces `ggml_cuda_check_fusion_memory_ranges` for its own window, on the argument that the launch reads only
+the weights, `dt`, `ssm_a` and the activation's **Q8_1 copy**; the check itself now covers `dt`/`ssm_a` as weights
+and requires no written tensor to overlap them.  The argument is right -- and load-bearing: instrumented, the
+gate `MUL` lands **inside `attn_norm-N`** (the F32 layer input) on every GDN layer of the 35B-A3B, which is why
+the generic check declined ~29 of 30 layers.  It is harmless only while that copy exists, so the rule now also
+requires disjointness **when the activation's type is already `Q8_1`** (no quantize launch then, and the kernel
+reads it in place).  (2) **The F32 arm could not be gated.**  The submission's `GGML_CUDA_GDN_EPI_LOG` line only
+existed in the mmvq half, so nothing could prove the mmvf F32 fusion fires; it now prints for both families
+(`gdn_epi: gate_beta decode|verify f32 ...`), which is what `scripts/gate-gdn-epi.sh` checks.  (3) **No test and
+no gate.**  `tests/test-fusion-gate-beta-multiseq.cpp` grew F32 and Q4_K arms (77 shapes, all bit-identical) and
+its F32 arm is **negative-tested**: reverting the F32 branch's `gb_x2 ? 2*ne01 : ne01` row count fails all 11 F32
+shapes at maxdiff 0.7-1.4, which is the bug class the doubling exists for.  `scripts/gate-gdn-epi.sh` is new.
+Two README nits, no code change: `GGML_CUDA_FUSE_GATE_BETA_BF16` is not new (it has shipped since r102), and the
+series is cut against r298/r299, two releases behind this base.
+
+**Verification.**  `scripts/gate-gdn-epi.sh` **PASS**: mechanism lines `gate_beta decode|verify f32` and
+`decode|verify q4_K` present, the other family's lines absent (the matchers are type-disjoint), the OFF arm
+silent, and `22bfcf93c0ab` identical in ON/OFF at `-ub 2`, `4`, `8` and `512` on both models (+0.2-2.4 % t/s in
+the ON arms); `--self-test` against the r303 binary reports no `gdn_epi` line, so the mechanism check has teeth.
+`test-fusion-gate-beta-multiseq` **77/77** shapes fused and bit-identical.  `scripts/gate-fusion-alias-copy.sh`
+PASS with its anchor `3fab4da87774` unmoved (this fusion replaced that check for its own window).
+`scripts/validate-set.sh` **GREEN** (18 default + 2 optional, Windows portability 512 files clean, fresh-tarball
+strict apply); `scripts/gate-per-block-build.sh --changed-from af497e7ba` **3/3** on the `all` profile (blocks
+10, 14, 0300 -- block 14's delta is the `cat_reorder` line the fold touches), with `HF_UI_VERSION=b12387`: the
+current `ggml-org/llama-ui` bundle breaks a fresh configure (`INVARIANTS.md` r303 item 6), not this change.
+MTP Protocol A, four axes, `-n 2000`, 1 GPU (r303 -> r304): R 106.6->187.2 / **108.4->189.0**, P 105.7->188.6 /
+**107.6->190.6**, C 106.6->208.3 / **108.4->210.2**, K 106.2->225.0 / **107.9->227.1** t/s, every axis's text
+byte-identical between the builds and `none == draft-mtp` on both (`61a693160ecb` 6165 / `b8ea708ffddc` 6020 /
+`f03a24e52c17` 8580 / `5ebd156073f6` 2167 chars).  Rule-5 `llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8` (q8_0 KV,
+two interleaved rounds): TG 106.7/320.9/454.7 -> 107.9/327.4/458.6 (F32 arm), 138.8/357.7/489.8 -> 139.9/364.9/497.5
+(Q4_K arm), and the Q8_0-alpha 27B control flat (PP 359.9/820.5/1015.2 -> 359.8/855.6/1014.0, TG
+32.78/111.0/172.1 -> 32.80/111.1/171.4).  Prefill at realistic prompt lengths is unchanged (B=1 PP at
+`npp` 512: 4001/4022 -> 4053/4025 t/s; 1024: 4605/4632 -> 4632/4591; `llama-bench` pp512 5383/5410 -> 5362/5397);
+the `npp 16/128` B=1 PP cell reads 3-10 % lower for both this build **and** the un-amended submission build with
+both switches off, i.e. it is a fixed-cost/layout artifact of a one-wave prefill, not a regression -- do not quote
+it.  No GPU fault in any arm.
+
+**Two facts for the next reader.**  The ksplit row-concat's segment-boundary assumption is already enforced for
+these shapes (`launch_ksplit` forces one row per block below `512 * rpb` rows, and GDN alpha/beta have 32-48), so
+the epilogue's per-block segment id is exact; and `-ub 1` is not reachable from `llama-cli` on these models
+(`-b 1` aborts in `common.cpp`'s `get_sub_batch`), which is why the gate sweeps `2/4/8/512` and the 1-token point
+comes from `gate-prefill-logits.sh --ub 1`.  `INVARIANTS.md` r304 records both, plus the memory-rule rule and the
+subshell-PASS trap the gate's first cut fell into.
+
+## 261117.002 (r303, RELEASE v17-4f9dfa0e3-r303) -- the merged-layout qwen4exp GGUF (post-#31028 `hc_*_down_inject`) gets a graph that builds AND the fused mixer, folded into official block 11 with a synthetic fixture, a CI arm and a repaired gate
+
+**What shipped.**  Block 11 only (`src/models/qwen4exp.cpp`, `src/llama-model-loader.cpp`,
+`tests/test-llama-archs.cpp`); `release.json` at **`v17-4f9dfa0e3-r303`** (tip `af497e7ba` = the re-cut `rdna-boosts` branch tip, tree `f80b71fab`,
+optional trees re-cut `81e6abfe6` / `05488f858`, cumulative `394796a10`).  Contributor PR #321
+(`briansp2020`) reported the crash; the fold is its guard plus the rest of the layout's support.
+
+**The report was accurate, and the crash reproduces exactly as described.**  `build_hc_mix` computed
+`fused_bf16`/`fused_ok` from `w_down->ne[1]` / `w_down->type` before any null test, and
+`create_merged()` leaves `w_down == nullptr` when `blk.N.hc_{attn,ffn}_down_inject` is present.  On the
+r302 build with a merged-layout GGUF: **SIGSEGV in `build_hc_mix`, reached
+`graph_reserve -> resolve_fused_ops -> sched_reserve`** (the reporter named `sched_reserve`), on a merged
+*target* and on a merged MTP *draft* (which the report did not mention).  The fleet had no such
+checkpoint -- the r141 note in this file says so -- so the path had shipped unexercised since r138.
+
+**Folded as submitted, plus the reason to keep the band fused.**  Its guard makes a merged GGUF take the
+chain; the mixer's weights are two row ranges of the one tensor and the kernel addresses every weight row
+packed at `ggml_row_size(ne[0])`, so `build_hc_mix` now passes the fused op two `ggml_view_2d` row views
+(`w_down_f` / `w_inject_f`) and a merged file keeps the fused decode band.  `LLAMA_FUSED_HC_MIX=0` stays
+the kill switch for both layouts.  Measured, one `llama-bench` invocation with both models (r=5, 3 GPU
+`-sm tensor`, all-VRAM, `ROCBLAS_USE_HIPBLASLT=0` + `MOE_EXPERT_HEATMAP=load` pinned):
+
+| arm | pp2048 | pp512 | tg128 |
+|---|---:|---:|---:|
+| separate layout, fused mixer (default) | 1647.5 | 1723.1 | **86.49** |
+| separate layout, `LLAMA_FUSED_HC_MIX=0` | 1647.6 | 1725.3 | 74.71 |
+| merged layout, fused mixer | 1804.1 | 1897.1 | **84.50** |
+| merged layout, `LLAMA_FUSED_HC_MIX=0` | 1805.0 | 1897.2 | 75.82 |
+
+The mixer fusion is worth **+15.8 % tg128** on the separate layout and **+11.4 %** on the merged one (i.e.
+the extension fires: without it the merged row sits on the chain, 75.8); the merged layout is **-2.3 %
+decode and +9.5/-10.1 % prefill** against the separate-tensor file of the same weights, which is
+upstream's reason for the layout.
+
+**Verification.**  `scripts/gate-hc-fusions.sh` on the merged fixture: **6/6 hard arms byte-identical to
+the chain** (449 chars `6a102dbc62d6`, i.e. the same text as the separate-tensor file of the same
+weights), `dsv4_pre_chain` the one numeric arm (448 `/` `e45e77d50544`, unanchored class -> reported); the
+separate BF16-hc class stays **7/7** (its r236 anchors, unchanged).  Same-seed greedy text: dense 4B 3-GPU
+`1c5d32ac537d`, 35B-A3B 2-GPU `-sm layer -ncmoe 40` `627b2ebd7792`, qwen4exp separate AND merged
+`6a102dbc62d6`.  Prefill-logit gate vs the 2026-11-16 base: **KLD 0.000000 / 100.000 %**.  Merged-vs-separate
+prefill logits are **0.017579 / 96.863 %** (10 chunks) and PPL 1.9934 vs 2.0182 (8 chunks): the merged
+branch does the pair as ONE 324-row GEMM instead of a 320-row plus a 4-row one, so prefill reorders at
+the ULP level while single-token decode is bit-identical -- do not expect `merged == separate` on a
+prefill oracle.  `test-backend-ops -o HC_MIX -o HC_COMBINE -o HC_COMBINE_MIX` 6/6 on 4/4 backends.  MTP
+(`draft-mtp n3`, `-n 1000`, prose): merged draft decodes, acceptance **0.58818 sep / 0.60526 merged**,
+generation 146.9 t/s both.  Protocol A (35B-A3B Q8_0, 3 GPU, `-n 3000`, bf16 KV, draft-mtp vs none):
+R 129.7 -> **222.4** t/s (acc 0.725), P 129.3 -> **223.7** (0.718), C 130.2 -> **246.6** (0.854), K 129.4 ->
+**261.2** (0.995) -- healthy on all four axes.  Rule-5 `llama-batched-bench -npl 1,4,8`: dense 4B PP
+5271.6/8748.5/9533.2 TG 127.0/508.1/836.2; 35B-A3B PP 2573.1/4863.4/5280.9 TG 116.3/364.5/563.6.
+`scripts/validate-set.sh` GREEN, `scripts/gate-per-block-build.sh --changed-from 5510b8a3f` **3/3** (blocks
+11, 14, 0300), no GPU fault in the journal or in 74 arm logs.
+
+**Three things were added before it could be a block.**  (1) A **merged-layout arm in CI**: the virtual
+fixture path skipped merged tensors (`TENSOR_SKIP_IF_VIRTUAL`), so `test-llama-archs` could not reach the
+shape at all; the loader now materialises one the metadata NAMES (real loads are unaffected -- they have
+files), `get_gguf_ctx(..., merged_hc)` writes it, and the new arm asserts the graph builds, the logits are
+finite at nt = 4 and 64, the saved file really carries `hc_attn_down_inject`, and a save -> reload round trip
+reproduces the logits bit for bit.  **Negative control: with r302's `qwen4exp.cpp` the arm SIGSEGVs (exit
+139)**, so it has teeth.  (2) `scripts/make-merged-hc-gguf.py`, the fixture generator, because otherwise the
+merged path is untestable again the moment the local file is deleted: its output is byte-identical
+(identical tensor headers AND data offsets) to the fixture this session validated, and its type table is
+verified against the file (each tensor must tile the gap to the next one).  (3) Three repairs to
+`scripts/gate-hc-fusions.sh`, found while running it: its **`fused_fused` arm ran `env -`, which is GNU
+`env -i`**, so on any pinned multi-device run that arm wiped `HIP_VISIBLE_DEVICES` and died with `ROCm
+error: invalid kernel file` while the others passed; it pinned neither `ROCBLAS_USE_HIPBLASLT=0` (r302
+fact 1) nor `MOE_EXPERT_HEATMAP=load`, and unpinned arms split 449/459/447; and it printed NO class for a
+merged GGUF.  All three are fixed, and the gate now pins both variables itself.
+
+**Two pre-existing findings, reported and NOT fixed here** (`TODO` #341 / #342): the IQ4_NL hc class still
+disagrees across the combine arms (446 `a5d0ec7b809d` vs 459 `9f8819c4c2c5`) with **identical shas on the
+r302 build**, i.e. it predates this change and gate 9's byte-identity invariant no longer holds on that
+class (PPL is identical, 2.1640 in both arms, so it is a ULP-class divergence); and upstream's llama-ui
+`latest` bundle now lacks `workbox[hash].js`, which breaks a fresh SOURCE configure (`ui-assets.cmake:137`, i.e.
+the per-block ladder and any clean checkout) -- `HF_UI_VERSION=b12387` is the workaround, recorded in
+`scripts/gate-per-block-build.sh`'s header.  The **container images are not affected** (their `web` stage
+supplies `tools/ui/dist`, `ui-assets.cmake`'s Priority 1, so neither the bucket nor its validator is reached) --
+checked on `radiance` while it built r303.
+
+**The fixtures are on this box** (`make-merged-hc-gguf.py` rebuilds them from the separate-tensor files in
+~2 min each): `/llm/models/Qwen3.8/Flash-Next/MERGED-Q8_0/` -- the target (70.63 GiB, 96 merged pairs, byte
+identical to the hand-built one) and the MTP draft (2.60 GiB, 2 pairs).  They are test fixtures, not a second
+distribution: 73 GiB of `/llm`, and the tool says so in its header.
+
+Record: `INVARIANTS.md` r303, `patches/README.md` block 11, gate row `MANIFESTS.md` (gate 9), contributor
+reply on PR #321.  The `From` ids move (the chain is re-cut); the tree is the contract.
+
+## 261117.001 (r302, RELEASE v17-4f9dfa0e3-r302) -- the QSA indexer top-k gets a REGULAR-LAYOUT fast path (contributor PR #320), folded into official block 11 with a census, eight new oracle cases and a gate
+
+**What shipped.**  Block 11 only, `ggml/src/ggml-cuda/indexer-topk.cu` + `tests/test-backend-ops.cpp`; every other
+block is byte-identical to r301 (the chain was re-cut, so the `From` ids move -- the tree is the contract).  With
+one stream and derived visibility the indexer cache is usually laid out in position order, and then a block's
+visible cells are its leading `w(b) = clamp(min(q, n_used-1) - b*r + 1, 0, n_in)` cells: pass 1 and the block
+passes compute `w(b)` instead of reading `cell_blk`/`cell_pos` per cell, `wvis` is not written,
+`count_cells_grouped` returns early and the gather walks whole blocks in ascending cell order.  A one-workgroup
+device check re-validates the layout on **every call (including every graph replay)** and anything else runs the
+existing code, so the fast path is inert rather than wrong on a pool/window/offset/multi-stream cache.
+`release.json` at **`v17-4f9dfa0e3-r302`** (tip `5510b8a3f`, tree `97bcb47a3`, optional trees re-cut:
+`a2c20d716` / `87b4979e0`, cumulative `35781eb6c`).  Record: [`archive/work/qsa-topk-regular/`](archive/work/qsa-topk-regular/README.md) (the
+contributor's material as submitted + this repo's re-measurement), knobs `ENVIRONMENT.md` §8, gate
+`scripts/gate-qsa-topk-regular.sh`, block note `patches/README.md`, gate row `MANIFESTS.md`.
+
+**The PR's claims, checked rather than taken.**  It applied unchanged (r298's `indexer-topk.cu` is byte-identical
+to r301's), and its "output identical" claim holds far beyond its own evidence: `INDEXER_TOPK` **12/12 on both
+arms** with 8 new cases covering the fast path's reachable state (partial visibility, a single visible block, a
+partial tail block, visibility across that tail, a QSA-trimmed range, `k == n_kv`, `k` above the visible count,
+`blk_idx == -1` blocks), and a deliberate gather probe fails exactly the 9 regular layouts -- so the path is
+really taken and the guard really declines.  Model text byte-identical to r301 in every arm (`1c5d32ac537d` dense
+4B 3-GPU; `b3de97c70c88` qwen4exp 1-GPU `-sm layer` at 24k; `5120581a3300` qwen4exp 3-GPU `-sm tensor` at 84k;
+`2cf39d00172c` qwen4exp + `draft-mtp n4`).  A temporary device printf showed **708/708** launches taking the fast
+path on the tested shape.
+
+**Magnitude: same direction, ~10 % smaller here, and neutral on the streamed shape.**  Interleaved on/off, same
+binary, `ROCBLAS_USE_HIPBLASLT=0` + `MOE_EXPERT_HEATMAP=load` on both arms: 3-GPU `-sm tensor` all-VRAM
+**+1.26 %** at ~24k (2509.5 -> 2541.1 t/s) and **+3.47 %** at ~96k (2432.8 -> 2517.3); 1-GPU `-sm layer -ncmoe 48`
+(streamed, host-expert bound) **+0.16 %** (494.10 -> 494.87).  They claimed +1.7-1.9 % at 31.5k and +3.8-3.9 % at
+101k on 2 GPUs and -2.5 % wall on a host-pool shape; their +9.3 % was against their own tree, which we do not
+run.  Decode unchanged; their `rocprofv3` trace (top-k 8.5 % -> 4.3 % of kernel time at 101k) is the mechanism.
+
+**Three things were added before it could be a block** (the maintainer's call: fold, do not hold up a good idea
+over a handful of missing lines):
+1. **`GGML_QSA_TOPK_REGULAR_LOG=1`** -- the fallback is SILENT by construction, so a later re-derivation that
+   breaks the layout would lose the whole win with every text gate green (`GGML_CUDA_QSA_SCORE_LOG`'s blind spot,
+   §r236).  The verdict is mirrored by the check kernel into **mapped pinned host memory**: a `cudaMemcpyAsync`
+   D2H and a stream sync are both illegal inside the graph capture this kernel is part of, so the host prints the
+   previous launch's verdict (a census, not a barrier).  0 cost when unset, 0 lines on the kill-switch arm.
+2. **Eight oracle cases** (above).  The shipped suite's only regular case was "everything visible, exact tail",
+   so the analytic `w(b)`'s edges were untested.
+3. **`scripts/gate-qsa-topk-regular.sh`** -- and the reason it is not a text gate: the two paths are
+   bit-identical by construction, so it asserts the ORACLE on both arms, the CENSUS, and a measured prefill DELTA
+   against the kill switch (`NGPU<3` FAILS the section rather than passing it vacuously).
+
+**The one trap that looked like a defect.**  A qwen4exp prefill-logit point recorded from the r301 build (default
+env) against a candidate run with `ROCBLAS_USE_HIPBLASLT=0` reads **0.019670 / 96.627 %** -- 4x the limit, the
+issue #113 signature.  The **pre-change** build reads the identical pair with the same mismatch, and with the pin
+on both arms r301 vs r302 is **0.000000 / 100.000 %**.  §44's rule at a new point: record the base with the pin.
+
+**Gates (all green, on the release tree).**  `INDEXER_TOPK` 12/12 both arms; `FLASH_ATTN_QSA` green;
+prefill-logit **0.000000 / 100.000 %** canonical, **0.000000 / 99.990 %** 3-device `-sm tensor`, **0.000000 /
+100.000 %** qwen4exp (base from the r301 build, pinned); `gate-qsa-topk-regular.sh` PASS (oracle + census +3
+engaged / 0 + delta **+2.22 %** at ~84k + dense arm inert + no faults); `gate-qwen4exp-quant-coherence.sh`
+(sparse QSA section: fused == chain `200edcd422c7`, dense `13406dc51399`, census 4/0/0; gather on == off
+`a99ccbd97ecb`); `llama-batched-bench -npl 1,4,8` flat (PP 4785/4822, 7498/7569, 8126/8112, 7726/7698, 7978/7985,
+8012/7997; TG within 1 %, both directions); `gate-per-block-build.sh --changed-from 52174079a` **2/2**;
+`validate-set.sh` **GREEN** (18 patches strict on a fresh tarball, tree `97bcb47a3`, per-artifact sha256, both
+optional artifacts and the cumulative optional tree re-cut and verified, Windows portability 512 files);
+`check-gpu-faults.sh` clean over every arm.  **Not run, with the reason:** the four-axis MTP protocol on the dense
+27B (the change is unreachable there -- no QSA indexer; the qwen4exp MTP arm was run instead and is
+byte-identical), `gate-hc-fusions` (no hc code touched), `gate-park-idle-slots` / `gate-state-pipe` /
+`gate-spec-*` / `gate-mixed-kv` (untouched paths, the last being an optional artifact).
+
+**Also recorded:** `INVARIANTS.md` r302 (5 facts: the hipBLASLt pin, "a device-validated fast path needs a delta
+assertion", the pinned-mirror census, why the graded kernels must not read host memory, and the box's period-2
+bimodality), and `TODO` gained nothing -- the PR's open items are the contributor's untested platforms, which is
+the documented acceptable state for a non-AMD backend.
+
+## 261116.008 (r301, RELEASE v17-4f9dfa0e3-r301) -- the server's prompt admission becomes its own block (NEW official `0016`), gains the PREFILL/DECODE DUTY CYCLE default-on at 16, and retires `TODO` #338/#339/#340
+
+**New block `0016`** (17 official blocks; `n_blocks` 16 -> 17, `n_default` 18), cut from block 12, which is the
+campaign remainder again.  Blocks 00-11 and 13-15 are **byte-identical** to r300, block 12 loses exactly the
+admission hunks (205 lines of `tools/server/server-context.cpp`), and the applied tree is identical once `0016`
+lands.  Patches regenerated from a canonical apply at `4f9dfa0e3`; `release.json` at **`v17-4f9dfa0e3-r301`**
+(tip `52174079a`, tree `d5435845a`); optional `0100`/`0101` re-cut against the new default tree.  Records:
+[`archive/work/prefill-duty-cycle/`](archive/work/prefill-duty-cycle/README.md) (this release's campaign),
+`archive/work/session-scheduling/` (r300), `ENVIRONMENT.md` §22, `MANIFESTS.md` gates 30 and 31 +
+block 16, `patches/README.md` blocks 12/16, `scripts/gate-prefill-duty.sh`.
+
+**`TODO` #340: the duty cycle ships, and the design changed because of a measurement.**  A decoding slot gets one
+token per step, so its rate is `1/step_time` and a prefill step is the slow one: on the field shape a decoder
+sharing the server with a 20k-token prefill delivered **5 tokens in 6.0 s** (worst gap 4.3 s).  r300's chunk
+bounds that stall; the duty cycle leaves up to `K-1` steps **decode-only** and puts the prompt into one step per
+cycle.  The campaign's own draft was a strict cycle, and its cost is `1 + (K-1)*decode_step/prefill_step` -- 1.03x
+on the field shape, **2.96x on a dense 4B at a 512-token chunk**, up to 16x on a shape whose decode step is as slow
+as its prefill step.  So `K` cannot be a default on its own: **the shipped cap is TIME, not steps** -- the
+deferral also stops once the idle time since the last prefill step reaches that step's own measured duration,
+which holds the stretch at ~2x on every shape without any model knowledge.  Measured (pinned slots, `-np 2`):
+
+| shape | duty 0 | strict `K=16` | shipped |
+|---|---|---|---|
+| dense 4B, chunk 512 | 0.97 s / 15 tok | 2.86 s (2.96x) / 207 | **2.06 s (2.13x) / 126** |
+| Flash-Next streamed, 1 GPU | 5.00 s / 9 | 8.42 s (1.68x) / 129 | **7.90 s (1.58x) / 109** |
+| Flash-Next 3 GPU tensor, chunk off, 20.3k | 6.02 s / 5 | 6.56 s (1.09x) / 36 | **6.64 s (1.10x) / 41** |
+| 27B + `draft-mtp n3`, chunk 512 | 5.41 s / 46 | 13.26 s (2.45x) / 879 | **11.50 s (2.13x) / 684** |
+
+**`LLAMA_SERVER_PREFILL_DUTY` defaults to 16** (`0`/`1` = off), a default-on feature with the prefill stretch as
+its documented trade.  Gate `scripts/gate-prefill-duty.sh`: **16 -> 137** decode tokens (dense, +113 % prefill),
+**46 -> 200** (MTP n3, +25 %, acceptance 234/269 -> 233/271 judged for collapse), **9 -> 109** (streamed
+host-expert, +56 %), lone prompt within 1 %, **0** "no tokens to decode" lines, text byte-identical, no GPU fault.
+
+**`TODO` #340's five open questions, settled by measurement rather than argument.**  (1) **The arena is
+unaffected**: on a really streaming arena (`MOE_EXPERT_CACHE_MIB=8192`, 8 127 MiB of a 76 GiB model) the `-lv 4`
+census reads `h` 0.7358 -> 0.7345, evictions 28 291 -> 27 157, hit 73.58 % -> 73.45 %, i.e. the prefill rate falls
+by exactly the stretch and the cache is untouched -- `TODO` #317's warning is about a *slab band move*, which a
+step-shape change is not.  (2) `K` is not one number (`b` spans 2 ms to 196 ms), which is why the bound is time.
+(3) MTP composes: 14.9x the decode tokens, text identical, acceptance moved by two verify events.  (4) default-on,
+maintainer's call, safe because of the cap.  (5) block 16, see below.
+
+**`TODO` #339: the block 12 split, decided here (the maintainer deferred it to this session).**  A new official
+`0016` rather than a `03xx`: the policy is settled and gated (two gates, one with a `--self-test`), it is a
+default-on product behaviour, and `03xx` means "expect to drop it".  Block 12's title describes its contents
+again and either feature can now be reverted alone.
+
+**`TODO` #338: the fairness gate's bound is DERIVED, and the attendance-pool arm was never short of its ceiling.**
+(a) The short-TTFT ratio bound is now `min(3.0, 0.8 x the shape's own ceiling)`, where the ceiling is the
+baseline's own wait over the candidate's measured floor, and the floor is `(k-1 placement + 1 alignment) x p` with
+`k` from the short request's `return_progress` chunks and `p` from its own `prompt_ms`.  A second HARD check
+(ADMISSION) asserts the floor directly, so a late admission cannot pass: the r299 fill reads **6x** it.  The
+streamed host-expert arm reads **2.6x** with a derived bound of 1.5x -- and `L/(k*chunk)` promises 2.9x there
+because it assumes the baseline's step is *chunk*-wide with no fixed cost, while it is `n_batch`-wide.  (b) The
+pooled arm's "2.6x against a 5.7x ceiling" **does not reproduce**, and the discriminating experiment (slot 1's
+admission from the `-lv 5` `fair share: budget=..., added=...` line) says the carrier is the **pool's per-step
+cost**, not the scheduler: slot 1 is admitted on the *first step after its arrival* in both the pooled and the
+unpooled arm (`budget = 7, added = 3`, then 4 for the checkpoint tail), its TTFT is exactly its own 3 steps, and
+the pool costs **1.30x per step** (1 144 ms vs 878 ms) because a spilled-cell page read does not shrink with the
+chunk.  Same prompt, pinned slots: 17.913 s (r299 fill) -> 3.353 s pooled (5.34x) -> 2.741 s unpooled (6.54x).
+
+**Two measurement corrections this session made, kept so they are not re-derived.**  (i) **`return_progress`
+breaks a TTFT harness**: a prompt-progress chunk carries `tokens: [0]` with empty `content`, so the gate's
+"any content/reasoning/tokens is an arrival" rule counted the *arrival* progress chunk and collapsed TTFT to the
+launch time (0.002 s for a 52 ms prefill; the baseline arm read 1.63 s instead of 1.94 s).  Both gates now skip a
+chunk that carries `prompt_progress`.  (ii) **The single-slot text oracle needs a fresh server per arm on a pooled
+cache**: the KV cells a request gets follow the page residency the earlier arms left behind and FA's summation
+depends on the cell tile indices, so `[P1]` flipped between two arms that did nothing wrong and read identically
+on fresh servers; the gate now hashes text in its own pass (three server starts per arm).  A third, older one was
+re-confirmed: the pools' own `--kv` arms are not oracles for a *chunked* candidate unless the ubatch shape is
+equalised, which is exactly what (ii) makes irrelevant.
+
+**Gates (all green, on the release tree).**  `gate-prefill-fairness.sh`: dense 4B **6.3x** (1.94 -> 0.31 s),
+admission 0.31 s against a 0.34 s x 1.25 floor, ITL 334 -> 79 ms, lone prefill -1.0 %; streamed 2-GPU tensor
+`-ncmoe 47` **2.6x** (bound 1.5x, the derived one); pooled `--kv-attendance-pool on` 1.6x, reported as
+no-room-to-improve and judged on admission (5.17 s vs a 5.37 s x 1.25 floor); 27B + `draft-mtp n3` **8.7x**
+(11.648 -> 1.343 s, ITL 1883 -> 555 ms, acceptance **identical** 0.866 = 58/67 in both arms); `--self-test`
+rejects the r299 fill (6x its own floor, ratio 1.0).  `gate-prefill-duty.sh` PASS on the dense 4B
+(16 -> 137 tokens, 2.13x stretch), the 27B + `draft-mtp n3` (46 -> 200, 1.25x) and the streamed host-expert
+shape (9 -> 109, 1.56x).  `validate-set.sh` GREEN (18 patches strict on a fresh tarball, tree `d5435845a`,
+2 optional artifacts and the cumulative optional tree `b9e234af6`); `gate-per-block-build.sh --changed-from
+24211c158 --fast` **3/3** (blocks 12, 16, 0300); `fork-refresh.sh --build --gates` green with the applied tip
+`52174079a` == `release.json.tip`; prefill-logit **mean KLD 0.000000 / same-top-p 100.000 %**; `check-gpu-faults.sh`
+clean with `--since` bounded to each run.  Coherence is an actual A/B here, because the change is unreachable
+outside `update_slots()`: `llama-cli` 4B 3-GPU `-n 64` reads **`280 chars sha=7386359e5dac` on the r300 tree and
+on the r301 tree** (the r300 build was re-verified to carry no `duty` string, so neither run could be the other's
+binary).
+
+**Two process corrections worth keeping.**  (i) A gate run was **discarded** because `fork-refresh.sh` had left
+`~/llama.cpp` checked out at `4f9dfa0e3` while a background gate started a server from `build-rocm`: the census
+line came back without `duty` and the census check failed, which is what caught it.  A background GPU run and a
+fork re-cut must not overlap; the run was repeated on the rebuilt release tree.  (ii) A pre-existing nit, NOT
+introduced here: block 10's patch adds a blank line at EOF, so `git am` prints one
+`new blank line at EOF` whitespace warning (it did at r299 too -- the patch body is unchanged).  It is recorded
+rather than fixed because a fix is a block-10 content change and therefore a tree change.
+
+**Not run, and recorded as a gap:** `gate-prefill-server-slots.sh` -- its default model is 122B-A10B **Q8_0**,
+which this box does not hold (Q4_K_XL only), and the duty gate's streamed host-expert arm measures the same
+two-slot question far more cheaply.
+
+## 261116.007 (r300, RELEASE v16-4f9dfa0e3-r300) -- block 12 gains FAIR-SHARE server prompt admission: `--parallel N` stops serialising prompts (7-token TTFT 1.91 s -> 0.28 s, decoder ITL 334 -> 107 ms), with the skew and chunk as tunables
+
+**Amends block 12** (no new block: the maintainer's call, and block 12 already owns the server's prompt/idle-slot
+code -- `LLAMA_SERVER_LAZY_IDLE_SLOTS`, the idle-slot prompt cache, the spec-checkpoint placement).  Patches
+regenerated from a canonical apply at `4f9dfa0e3`; `release.json` at **`v16-4f9dfa0e3-r300`** (tip `3e5dd2e40`,
+tree `4baf1b67`); `n_blocks` unchanged at 16.  `TODO` #339 records that block 12 now carries two unrelated
+features and should be split, and `TODO` #338 keeps the one shape-limited gate ratio.  Record:
+[`archive/work/session-scheduling/`](archive/work/session-scheduling/README.md) (design, all nine layouts, the
+patch series backup), `ENVIRONMENT.md` §22, `MANIFESTS.md` gate 30 + block 12, `patches/README.md` block 12.
+
+**The defect.**  `update_slots()` adds the decode tokens first, then walked the prompt slots in **slot-index
+order**, each filling `n_batch` (`server-context.cpp`).  The lowest slot therefore took the whole window and every
+other prompt waited for that slot's *entire* prompt: a 7-token prompt arriving 50 ms behind a 13204-token one
+waited **1.91 s** (`prompt_ms` 270 ms -- it was never slow, it was unseated), and a *decoding* slot's
+inter-token latency went **10 ms -> 266-331 ms** for six consecutive tokens while the other slot prefilled.
+`-b 512` did not help (1.92 s): it changes the grab size, not the order.  The ubatch splitter was already fair
+(`split_equal` takes one token per sequence per round); the *admission* policy was the whole defect, so no KV,
+kernel or scheduler work was needed.
+
+**The change.**  `share_prompt_budget()` shares `n_batch - (decode tokens)` max-min fairly: water-filling over
+the slots that still have prompt tokens, every active prompt admitted to every step, and a slot that needs less
+returns the difference to the pool for the slots that can still use it.  A one-token floor per active prompt
+makes starvation impossible in every mode, including `n_parallel >= n_batch`.  Three variables
+(`ENVIRONMENT.md` §22): `LLAMA_SERVER_PREFILL_FAIR` (kill-switch, **on**), `LLAMA_SERVER_PREFILL_SKEW`
+(**1** = the equal share; `N` weights the shortest-remaining slot N:1) and `LLAMA_SERVER_PREFILL_CHUNK`
+(**unset = one `n_ubatch`**, `0` = off).
+
+**Measured** (4B dense, 1 GPU, `-np 2`, `-b 2048 -ub 512`, gate `scripts/gate-prefill-fairness.sh`): short-prompt
+TTFT **1.90 -> 0.28 s (6.8x)**, decoder ITL **334 -> 107 ms**, lone prefill **-0.8 %**, one request's greedy text
+byte-identical.  Nine layouts green: 1/2/3-GPU `-sm tensor`, MTP n3 (acceptance identical, 0.853 both arms),
+host-expert arena resident and really streaming (`evictions=48166`, prefill -0.3 %), gfx1151, gfx1100,
+`--kv-unified`, `--kv-window 2048` (ITL 492 -> 251 ms).  `SKEW` on a heterogeneous mix: mean TTFT 1.401 -> 1.082 s
+at 5 and 1.040 s at 20 -- and the *longest* prompt improves too (2.201 -> 1.975 s), because short slots retire
+and stop competing, so the skew is not a mean-vs-tail trade here.
+
+**What the measurements corrected, kept so it is not re-derived:** the fair share alone moves ITL by **0 ms**
+(a decoding slot is not a prompt slot, so the long prompt still takes the window -- only the chunk bounds it);
+`chunk = n_ubatch` is a **floor, not a sweet spot** (below it a step re-pays its fixed cost for no fewer
+launches: `b ~= 196 ms` on the Flash-Next field shape against `b ~= 2 ms` on a dense 4B, so ubatch-sized chunks
+cost ~52 % of prefill there while costing +1.9 % on the 4B); an ITL bound derived from the *lone* prefill rate
+is wrong on a UMA box; and `max`/`p95` disagree honestly (the cap trades a few ~1 s stalls for many ~300 ms
+ones).  Two phantom findings were retracted rather than shipped: a "pre-existing first-step stall" that did not
+survive six controlled runs, and a "+25 %" solo-prefill win that was arm-ordering, not the policy -- both caused
+by an **unpinned slot assignment**, which matters for any two-slot measurement in this repo.
+
 ## 261116.006 (r299, RELEASE v16-4f9dfa0e3-r299) -- `TODO` #282 retired: the mid-run latch's mixture is a ~1e-5 fp32 path difference, NOT corruption -- and the `pinlate` arm had degenerated to 1 pool of 141, so it is now gated on the LOGITS
 
 **Amends block 12** (no new block: the `MOE_HOST_POOL_PIN_FAULT` diagnostic and its `late` latch live there).  The gate

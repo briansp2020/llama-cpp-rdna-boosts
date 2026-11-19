@@ -1,5 +1,12 @@
 # Open WIP campaigns (index)
 
+> **Promoted (r300, 2026-11-16):** `session-scheduling` is folded into **block 12** (the maintainer's decision:
+> a new block was declined "for now"; block 12 is the campaign-remainder block and already owns the server
+> prompt/idle-slot code).  Its record moved to [`archive/work/session-scheduling/`](../archive/work/session-scheduling/README.md),
+> the gate is `scripts/gate-prefill-fairness.sh`, and the knobs are `ENVIRONMENT.md` §22.  Two items stay open
+> in `TODO` **#338** (the fairness ratio is shape-dependent) and **#339** (block 12 now carries two features
+> and should be split).  It is not an open campaign and it is not kept here as a stub.
+>
 > **Promoted:** `apu-expert-gtt` is now **block 16** of the delivery (r263, `v17-a691b2345-r263`); its record moved to [`archive/work/apu-expert-gtt/`](../archive/work/apu-expert-gtt/README.md) and its gate is `scripts/gate-uma-experts.sh`.  It is no longer an open campaign.
 >
 > **Closed (r298, 2026-11-16):** the in-place-prefill-read campaign (`TODO` #335 + #336) is **finished**: the read was
@@ -195,6 +202,18 @@ are the submitter's numbers** (one R9700, one model, one run per arm; the exact 
 built by them either, commits 3+4 were measured together, and commit 1 is ~2 t/s *slower* on their headless card);
 the re-entry conditions are in [`../archive/work/windows-host-memory/RESOLUTION.md`](../archive/work/windows-host-memory/RESOLUTION.md).
 The campaign directory moved there with a `RESOLUTION.md` and no stub was left.  See `WORKLOG.md` 261103.014.
+
+**Promoted (r301, 2026-11-17, block 16).**  `prefill-duty-cycle/` left `wip/` for
+[`archive/work/prefill-duty-cycle/`](../archive/work/prefill-duty-cycle/README.md) and ships as the **new
+official block `0016`**, together with the r300 fair-share prompt admission that block 12 had been carrying as an
+amendment (`TODO` #339: the maintainer deferred that structure call to this session, which chose `0016` over a
+`03xx` because the policy is settled and gated).  `LLAMA_SERVER_PREFILL_DUTY` is **default 16**: up to `K-1`
+decode-only steps before a prefill step, and the burst is capped in TIME by the last prefill step's own measured
+duration, which is what makes one number safe across shapes whose per-step fixed cost spans 2 ms to 196 ms.  The
+same session closed `TODO` #338 (the fairness gate's ratio bound is now derived from the short prompt's own
+measured step count and per-step cost, and the attendance-pool arm's "2.6x against a 5.7x ceiling" was shown to
+be the pool's 1.30x per-step read with the short prompt admitted on its first step, not a scheduler defect).
+`v17-4f9dfa0e3-r301`; record `WORKLOG.md` 261117.001.
 
 **Shipped (2026-10-26, r149, block 09 — `TODO #107` closed).**  `graph-replay-placement/` left `wip/` for
 [`archive/work/graph-replay-placement/`](../archive/work/graph-replay-placement/README.md) and its fix
