@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 15 Nov 2026 21:31:00 +0000
-Subject: [PATCH 42/46] MoE weighted reduction: no fma contraction in the
+Subject: [PATCH 39/44] MoE weighted reduction: no fma contraction in the
  standalone kernels (GGML_CUDA_MWR_EXACT=0: old)
 
 moe_weighted_reduction_f32_vec4 / _f32 sum (expert * scale) * weight with the multiply-add contracted into an

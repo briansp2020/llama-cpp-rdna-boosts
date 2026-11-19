@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 17:23:25 +0000
-Subject: [PATCH 36/46] hc-mix: Q8_0 up band kernel loads its weights before
+Subject: [PATCH 36/44] hc-mix: Q8_0 up band kernel loads its weights before
  the prologue barrier (GGML_CUDA_HC_UP_PRELOAD=0: off)
 
 Each thread loads its weight ints and scales into registers before the y_pre copy barrier, the item math uses

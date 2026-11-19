@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 18:31:51 +0000
-Subject: [PATCH 10/46] moe cache: drop the decline unfuse workaround
+Subject: [PATCH 10/44] moe cache: drop the decline unfuse workaround
  (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 A declined or fill-failed table ran its decode-band gate+up+GLU and down fold
@@ -23,7 +23,7 @@ fill_failed table.
  4 files changed, 4 insertions(+), 35 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index bac613a7e5..2ee368c258 100644
+index 1674e0c026..93efadb479 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -2696,9 +2696,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
@@ -39,10 +39,10 @@ index bac613a7e5..2ee368c258 100644
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                  }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index fd0dbc10d5..694d99d7eb 100644
+index 0493e71b3e..65d2b089d4 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -3251,9 +3251,8 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+@@ -3522,9 +3522,8 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
              if (moe_cache_redirect_fused(mm_node, mm_node->src[0], nullptr, mm_node->src[2],
                                           ctx.device, ctx.stream(), &src0_c, &ids_c, nullptr, nullptr)) {
                  ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);

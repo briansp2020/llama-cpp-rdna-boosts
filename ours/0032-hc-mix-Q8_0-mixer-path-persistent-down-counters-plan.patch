@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 07:02:17 +0000
-Subject: [PATCH 32/46] hc-mix: Q8_0 mixer path - persistent down counters,
+Subject: [PATCH 32/44] hc-mix: Q8_0 mixer path - persistent down counters,
  planar output, Q8_1 epilogue, combine+norm fusion
 
 Fewer launches per hc site for models whose hc weights are Q8_0/F32 (unsloth
@@ -38,7 +38,7 @@ index 2a68f252d3..72e8238475 100644
      const ggml_tensor * x         = dst->src[0];
      const ggml_tensor * w_norm    = dst->src[1];
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 834402ad91..9170636123 100644
+index 65c2f5fb71..51b49fe426 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1725,6 +1725,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
@@ -76,7 +76,7 @@ index 834402ad91..9170636123 100644
      // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
      // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index b7c7773a34..8a45ce03b3 100644
+index 13aa136305..90ebf492ec 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1649,6 +1649,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -408,20 +408,20 @@ index 4a615ee7ce..265797f056 100644
  
  void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index a1440a11f7..b8ecb56303 100644
+index 4022c38457..43c7f8e936 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -921,7 +921,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+@@ -941,7 +941,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
          // planar output (BF16 path): mixed [n_embd, nt] then inject [hc, nt], both contiguous, so the verify band
          // needs no ggml_cont of the mixed head; byte-identical at nt == 1.  LLAMA_HC_MIX_PLANAR=0 disables it.
          static const bool planar_env = [] { const char * e = getenv("LLAMA_HC_MIX_PLANAR"); return !e || atoi(e) != 0; }();
--        const bool planar = planar_env && fused_bf16 && w_inject != nullptr;
+-        const bool planar = planar_env && fused_bf16 && w_inject_f != nullptr;
 +        // the Q8_0 op writes the same planar layout (LLAMA_HC_MIX_PLANAR_Q8=0: the packed rows + ggml_cont); only the
 +        // GPU backend implements it (the CPU op asserts the packed layout), so hc weights in a host buffer keep it.
 +        // LLAMA_HC_MIX_PLANAR=0 turns off both the BF16 and the Q8_0 planar layout
 +        static const bool planar_q8_env = [] { const char * e = getenv("LLAMA_HC_MIX_PLANAR_Q8"); return !e || atoi(e) != 0; }();
-+        const bool planar_q8 = planar_q8_env && !fused_bf16 && w_down->buffer != nullptr && !ggml_backend_buffer_is_host(w_down->buffer);
-+        const bool planar = planar_env && (fused_bf16 || planar_q8) && w_inject != nullptr;
++        const bool planar_q8 = planar_q8_env && !fused_bf16 && w_down_buf->buffer != nullptr && !ggml_backend_buffer_is_host(w_down_buf->buffer);
++        const bool planar = planar_env && (fused_bf16 || planar_q8) && w_inject_f != nullptr;
          if (planar) {
              ggml_hc_mix_set_planar(dst_t);
          }

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 15 Nov 2026 18:14:58 +0000
-Subject: [PATCH 41/46] MoE decode: down + weighted-reduction fold takes
+Subject: [PATCH 38/44] MoE decode: down + weighted-reduction fold takes
  precedence over the MUL-only down fold; fold sum without fma contraction
 
 - ggml_cuda_moe_down_fold_try_fuse steps aside when ggml_cuda_mwr_fold_mark armed the down + reduction fold for
@@ -68,7 +68,7 @@ index 54495f6695..92c997742d 100644
                  if (threadIdx.x == 0) {
                      *cnt = 0;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 80aeccc8eb..894cb247bb 100644
+index 718403e551..dcac0d0dab 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1966,6 +1966,8 @@ void ggml_cuda_mul_mat_vec_q(
@@ -80,7 +80,7 @@ index 80aeccc8eb..894cb247bb 100644
          ctx.mwr_done_graph = ctx.mwr_fold_graph;
          ctx.mwr_done_idx   = ctx.mwr_fold_idx;
      }
-@@ -3505,6 +3507,13 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+@@ -3510,6 +3512,13 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
      ggml_tensor * mm_node  = cgraph->nodes[i];
      ggml_tensor * mul_node = cgraph->nodes[i + 1];
  

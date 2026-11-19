@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 02:13:28 +0000
-Subject: [PATCH 01/46] our series outside moe-expert-cache.cu (patches
+Subject: [PATCH 01/44] our series outside moe-expert-cache.cu (patches
  0000-0054 of stack-r228, squashed for the merge)
 
 (cherry picked from commit 7be306cc9478b190c9daaf3677ff1665bd79c5e1)
@@ -975,7 +975,7 @@ index b65c6c137e..9fc532d75f 100644
          case GGML_OP_SCALE:
          case GGML_OP_SET:
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 127a4a1429..d759c7218c 100644
+index f2808c006f..1b2b1177fa 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1747,6 +1747,15 @@ struct ggml_backend_cuda_context {
@@ -1013,7 +1013,7 @@ index 127a4a1429..d759c7218c 100644
      const ggml_tensor * gate_bias = nullptr;
      const ggml_tensor * x_scale = nullptr;
      const ggml_tensor * gate_scale = nullptr;
-@@ -2853,6 +2867,10 @@ struct ggml_cuda_mm_fusion_args_host {
+@@ -2859,6 +2873,10 @@ struct ggml_cuda_mm_fusion_args_host {
  struct ggml_cuda_mm_fusion_args_device {
      const void * x_bias = nullptr;
      const void * gate = nullptr;
@@ -1024,7 +1024,7 @@ index 127a4a1429..d759c7218c 100644
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
-@@ -2872,6 +2890,8 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -2878,6 +2896,8 @@ struct ggml_cuda_mm_fusion_args_device {
      block_q8_1 * glu_q8 = nullptr;
      int * glu_q8_cnt = nullptr;
      uint32_t glu_q8_stride_channel = 0;
@@ -1531,7 +1531,7 @@ index d6ed08aeb5..80f46cc4fa 100644
              const size_t aux_end = s.wide_aux_off + s.wide_aux_size;
              if (aux_end > floor) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index f70fe3ae2d..2ee368c258 100644
+index b7906b2b91..93efadb479 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -2656,6 +2656,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
@@ -1574,7 +1574,7 @@ index f70fe3ae2d..2ee368c258 100644
                  }
                  moe_cache_fusion_launched(serve, 1);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d0b9997ad9..7032a61171 100644
+index 3ed22112e1..064f780254 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -73,6 +73,7 @@
@@ -1891,7 +1891,7 @@ index d0b9997ad9..7032a61171 100644
          CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
      }
  
-@@ -10292,6 +10416,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -10299,6 +10423,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  if (ggml_cuda_gdn_conv_pattern_at_concat(cgraph, i, gm)) {
                      params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.x), cgraph->nodes[gm.conv_idx]);
                      params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.state), cgraph->nodes[gm.conv_idx]);
@@ -1902,7 +1902,7 @@ index d0b9997ad9..7032a61171 100644
                  }
                  continue;
              }
-@@ -10661,6 +10789,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -10668,6 +10796,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -1914,7 +1914,7 @@ index d0b9997ad9..7032a61171 100644
  static bool ggml_backend_cuda_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight);
  
  static const ggml_backend_i ggml_backend_cuda_interface = {
-@@ -11550,6 +11683,15 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
+@@ -11579,6 +11712,15 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
      // consumer can read the compact arena.  ONLY within the decode band: above it the cache is not
      // involved, and forcing offload there took the >8-token batched decode off its normal path
      // (measured: `llama-batched-bench -npl 16` 137 -> 52 t/s with the cache merely enabled).
@@ -1930,7 +1930,7 @@ index d0b9997ad9..7032a61171 100644
      if (moe_cache_enabled() && op->op == GGML_OP_MUL_MAT_ID &&
          op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
          return true;
-@@ -12101,6 +12243,25 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_split_for_dev
+@@ -12158,6 +12300,25 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_split_for_dev
      return nullptr;
  }
  
@@ -1956,7 +1956,7 @@ index d0b9997ad9..7032a61171 100644
  static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
      GGML_UNUSED(reg);
      if (strcmp(name, "ggml_backend_cuda_kv_pool_mirror_buft") == 0) {
-@@ -12135,6 +12296,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -12192,6 +12353,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_cuda_kv_region_spill_ram_reserve") == 0) {
          return (void *) ggml_backend_cuda_kv_region_spill_ram_reserve;
      }
@@ -2813,10 +2813,10 @@ index cbde504132..54495f6695 100644
      const auto launch_rpb = [&](auto rpb_c) {
          if (has_fusion) {
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 29c0b215e6..694d99d7eb 100644
+index af196265e5..65d2b089d4 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1814,6 +1814,13 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1847,6 +1847,13 @@ void ggml_cuda_mul_mat_vec_q(
              GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
              fusion_local.gate = fusion->gate->data;
          }
@@ -2830,7 +2830,7 @@ index 29c0b215e6..694d99d7eb 100644
          if (fusion->gate_bias) {
              GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
              GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
-@@ -1848,33 +1855,37 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1881,33 +1888,37 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -2877,7 +2877,7 @@ index 29c0b215e6..694d99d7eb 100644
                                                  sd->ne[0], sd->ne[1], sd->ne[2], sd->ne[3],
                                                  sd->nb[1]/ts_sd, sd->nb[2]/ts_sd, sd->nb[3]/ts_sd, sfound);
                  if (!sfound) {
-@@ -3238,8 +3249,10 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+@@ -3509,8 +3520,10 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
              // the compact arena/remap exactly as the gate+up+GLU site does.
              ggml_tensor src0_c, ids_c;
              if (moe_cache_redirect_fused(mm_node, mm_node->src[0], nullptr, mm_node->src[2],
@@ -2889,7 +2889,7 @@ index 29c0b215e6..694d99d7eb 100644
              } else {
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
-@@ -3456,11 +3469,26 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
+@@ -3727,11 +3740,26 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
      return 5;
  }
  
@@ -2917,7 +2917,7 @@ index 29c0b215e6..694d99d7eb 100644
      ggml_tensor * node = cgraph->nodes[i];
      ctx.glu_q8_1_node = nullptr;
      ctx.glu_q8_1_mm   = nullptr;
-@@ -3469,10 +3497,10 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
+@@ -3740,10 +3768,10 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
          return;
      }
      const ggml_tensor * mm = nullptr;
@@ -2930,7 +2930,7 @@ index 29c0b215e6..694d99d7eb 100644
          mm = cgraph->nodes[i + 2];
      }
      if (mm == nullptr) {
-@@ -3484,7 +3512,8 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
+@@ -3755,7 +3783,8 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
          a_root = a_root->view_src;
      }
      if (a_root == node && ggml_is_contiguous(a) && a->ne[0] % QK8_1 == 0 && ggml_nelements(a) == ggml_nelements(node) &&
@@ -3965,7 +3965,7 @@ index 9a3c32d121..29b7992311 100644
      }
  }
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index c4587fc084..e1c7d9e192 100644
+index 6236cfdf5d..7ea7469aa6 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -26,13 +26,15 @@ static const size_t kiB = 1024;
@@ -4070,7 +4070,7 @@ index c4587fc084..e1c7d9e192 100644
              auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
              if (!cpu_dev) {
                  throw std::runtime_error("no CPU backend found");
-@@ -3017,7 +3037,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -3022,7 +3042,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              return nullptr;
          }
          if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
@@ -4080,7 +4080,7 @@ index c4587fc084..e1c7d9e192 100644
              account_host_expert_tier(tn.str(), ggml_nbytes(&t_meta));
          }
          ggml_context * ctx = ctx_for_buft(buft);
-@@ -3071,7 +3092,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -3076,7 +3097,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return nullptr;
      }
      if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
@@ -4165,7 +4165,7 @@ index bbaf25b0b2..ec8a8cd58c 100644
      ~llama_model_qwen4exp() override {
          if (lazy_reader) {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 0229abbfab..2b78759b33 100644
+index d88a924cc7..0a3ae5173e 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -642,6 +642,14 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
@@ -4197,7 +4197,7 @@ index 0229abbfab..2b78759b33 100644
  
      // there is no output_norm: the final hyper-connection mixer carries it
      // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
-@@ -1118,7 +1133,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1138,7 +1153,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
          ggml_build_forward_expand(gf, ple_emb);
      }
  
@@ -4235,7 +4235,7 @@ index 7383082518..b0507e2dc6 100644
                          invalid_param = true;
                          break;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 53ed1c7947..4786180a51 100644
+index 304b60770c..cc96609346 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1,3 +1,4 @@
@@ -4243,7 +4243,7 @@ index 53ed1c7947..4786180a51 100644
  #include "server-context.h"
  #include <atomic>
  #include <thread>
-@@ -4179,6 +4180,25 @@ private:
+@@ -4372,6 +4373,25 @@ private:
          std::vector<server_slot *> generating;
          std::vector<server_slot *> drafting;
  
@@ -4269,7 +4269,7 @@ index 53ed1c7947..4786180a51 100644
          // determine which slots are generating and drafting
          iterate(slots, [&](server_slot & slot) {
              if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
-@@ -4204,7 +4224,7 @@ private:
+@@ -4397,7 +4417,7 @@ private:
                  const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                  const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
  
@@ -4278,7 +4278,7 @@ index 53ed1c7947..4786180a51 100644
  
                  if (n_draft_max > 0) {
                      GGML_ASSERT(slot.can_speculate());
-@@ -4867,7 +4887,16 @@ private:
+@@ -5137,7 +5157,16 @@ private:
                          slot.prompt.tokens.push_back(cur_tok);
  
                          // break at the last user message, or at user messages at least min step past the last checkpoint

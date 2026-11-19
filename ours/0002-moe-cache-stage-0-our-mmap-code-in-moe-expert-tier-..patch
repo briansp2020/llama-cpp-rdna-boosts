@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 03:54:06 +0000
-Subject: [PATCH 02/46] moe cache: stage 0: our mmap code in
+Subject: [PATCH 02/44] moe cache: stage 0: our mmap code in
  moe-expert-tier*.inc, not yet hooked in
 
 (cherry picked from commit 53eab4bce495c8fabb6fd1ac58f82a8023d4a43a)
@@ -3353,7 +3353,7 @@ index 0000000000..b4cc7cc8b3
 +    g_kvl_stream     = nullptr;
 +}
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index e1c7d9e192..0668afb362 100644
+index 7ea7469aa6..e50b321ca7 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -193,12 +193,10 @@ bool llama_model_loader::host_expert_selected(const std::string & name, int laye

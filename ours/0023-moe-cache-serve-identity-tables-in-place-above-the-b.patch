@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 03:28:17 +0000
-Subject: [PATCH 23/46] moe cache: serve identity tables in place above the
+Subject: [PATCH 23/44] moe cache: serve identity tables in place above the
  band in mmap mode too
 
 r258 (TODO #133) takes an identity (fully resident) table over at any
@@ -30,7 +30,7 @@ config unchanged (0 identity tables, all hashes equal) (FINDINGS 910).
  4 files changed, 37 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 5a34d3ed85..b7c7773a34 100644
+index f21b5df05b..13aa136305 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -7586,7 +7586,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *

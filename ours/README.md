@@ -3,7 +3,7 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v16-4f9dfa0e3-r299` (upstream llama.cpp `4f9dfa0e3` + this repo's release).
+**Base:** `v17-4f9dfa0e3-r305` (upstream llama.cpp `4f9dfa0e3` + this repo's release).
 The rest of this branch is that release as published; only `ours/` is added.
 
 **New layout (2026-11-08).** Up to r228 this was a 55-patch series (0000-0054) that replaced the release's
@@ -17,11 +17,11 @@ The old series is kept as the tag `ours-r228-series`; the mapping table below sh
 
 ```
 git checkout 4f9dfa0e3
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r299 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 46 patches (0001-0046)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r305 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 44 patches (0001-0044)
 ```
 
-Result: tree `7bb45a3ebf07`. This is the production build from 2026-11-17 (2 GPUs, `-sm tensor`).
+Result: tree `7d26cfab3d83`. This is the production build from 2026-11-19 (2 GPUs, `-sm tensor`).
 
 ## Patches
 
@@ -31,9 +31,10 @@ r272 took our copy-engine all-reduce single exchange (PR #304, r265 0012); it is
 `-sm tensor --load-mode none` load race (issue #308, `GGML_META_SEG_DRAIN`), so our drain (r277 0037) is dropped too.
 r291 took our qwen4exp sequence parallelism (PR #315: on by default, bf16 all-gathers by default, at least 128 tokens per
 split); the r287 series' 0022-0024, 0027 and 0028 are dropped and the later patches move up.
-The numbers below are the r299 series: the r292 series rebased onto r299 (four conflicts, all in our hooks where r297-r298's
-fused-prefill in-place contract (TODO #327), take-over promise repair (TODO #335/#336) and alias role check meet our mmap
-tier; merged keeping both sides, with the follow-up fixes in 0045), plus 0046.
+r302 took our QSA indexer top-k fast path (PR #320, r299 0044) and r304 our GDN gate/beta epilogue (PR #322, r299
+0038-0040, with the release's own Q8_1-activation fix); they are dropped here and the later patches move up.
+The numbers below are the r305 series: the r299 series rebased onto r305 (one conflict, the hc mixer's Q8_0 weight
+lookup against r303's row views of `w_down`, resolved as in PR #326), plus 0043 and 0044.
 
 | | what | env switch (off) |
 |---|---|---|
@@ -74,20 +75,36 @@ tier; merged keeping both sides, with the follow-up fixes in 0045), plus 0046.
 | 0035 | expert cache: a sparse table's staged fill at sizing takes the heat map's hottest experts; the per-expert heat seed leaves sparse tables to it | `GGML_MOE_STAGE_HEAT_RANK=0` |
 | 0036 | hc mixer: the Q8_0 up band kernel loads its weights before the prologue barrier (compile-time blocks per row, 3 items per thread); bit-identical | `GGML_CUDA_HC_UP_PRELOAD=0` |
 | 0037 | hc mixer: Q8_0 up dots and collapse in one launch (each block replays the 8 up blocks of its 32 columns and collapses them, Q8_1 epilogue included); the F32 inject rows move to the front of the down-dots grid; bit-identical | `GGML_CUDA_HC_UP_FUSE=0`, `GGML_CUDA_HC_INJECT_DOWN=0` |
-| 0038 | GDN gate/beta fusion also for F32 projections (unsloth UD-IQ4_XS stores `ssm_alpha` / `ssm_beta` as F32, so the BF16-only fusion did not apply and each GDN layer ran two GEMVs and the softplus epilogue): the same fused launch with an F32 instantiation; bit-identical | `GGML_CUDA_FUSE_GATE_BETA_F32=0` |
-| 0039 | GDN gate/beta epilogue for models whose `ssm_alpha` / `ssm_beta` are not Q8_0 (Q4_K, MXFP4, ...): the matvec writes the softplus and sigmoid outputs itself (decode 3 launches -> 1, verify 5 -> 2) | `GGML_CUDA_FUSE_GDN_EPI=0` |
-| 0040 | 0039's memory check made precise (the generic window check declined about 29 of 30 layers) | - |
-| 0041 | MoE decode: the down + weighted-reduction fold takes precedence over the MUL-only down fold, and its sum runs without fma contraction (exact against the unfused graph) | `GGML_CUDA_MWR_FOLD_FIRST=0`, `GGML_CUDA_MWR_FOLD_CONTRACT=1` (old sum) |
-| 0042 | the standalone MoE weighted-reduction kernels without fma contraction (exact against the unfused graph; changes output at rounding level) | `GGML_CUDA_MWR_EXACT=0` |
-| 0043 | r292's arena settle skips layers that hold an mmap-tier table (re-sizing such a layer frees the table, which turned our RAM tier off for the rest of the process) | `GGML_MOE_SETTLE_SPARSE=1` (release behaviour) |
-| 0044 | QSA indexer top-k: fast path for the regular cache layout (block-level first pass and gather, visible width computed instead of counted); a device check falls back to the general path | `GGML_QSA_TOPK_REGULAR=0` |
-| 0045 | r299 merge fixes for the mmap tier: our prefill resolve runs only when the fused prefill serves nothing in place; our in-place-miss check only when the release's repair copied nothing; gate/up lanes with different tier remaps count as mixed (the fused kernels read one ids copy); our tier serves and take-overs clear the release's take-over promise | - |
-| 0046 | our namespace-scope env-flag initializers are named functions instead of lambdas (see the r299 validation) | - |
+| 0038 | MoE decode: the down + weighted-reduction fold takes precedence over the MUL-only down fold, and its sum runs without fma contraction (exact against the unfused graph) | `GGML_CUDA_MWR_FOLD_FIRST=0`, `GGML_CUDA_MWR_FOLD_CONTRACT=1` (old sum) |
+| 0039 | the standalone MoE weighted-reduction kernels without fma contraction (exact against the unfused graph; changes output at rounding level) | `GGML_CUDA_MWR_EXACT=0` |
+| 0040 | r292's arena settle skips layers that hold an mmap-tier table (re-sizing such a layer frees the table, which turned our RAM tier off for the rest of the process) | `GGML_MOE_SETTLE_SPARSE=1` (release behaviour) |
+| 0041 | r299 merge fixes for the mmap tier: our prefill resolve runs only when the fused prefill serves nothing in place; our in-place-miss check only when the release's repair copied nothing; gate/up lanes with different tier remaps count as mixed (the fused kernels read one ids copy); our tier serves and take-overs clear the release's take-over promise | - |
+| 0042 | our namespace-scope env-flag initializers are named functions instead of lambdas (see the r299 validation) | - |
+| 0043 | the Q8_1 copy of a layer's input quantized for the attention / shared-expert matvecs is carried across the routed-MoE graph split, so the routed experts do not quantize the same input again; bit-identical | `GGML_CUDA_Q8_1_CARRY=0` |
+| 0044 | prompt GEMMs off hipBLASLt: on ROCm, rocBLAS hands GEMMs to hipBLASLt by default, and hipBLASLt returned one of two results for bit-identical inputs, chosen once per process (the same prompt gave two different outputs across server starts). The F32 split tile of our MMB GEMM gets its own token floor (33 on RDNA4, above the matvec band) so the MoE router's whole prompt band runs on it, and `ggml_cuda_init` sets `ROCBLAS_USE_HIPBLASLT=0` (rocBLAS's own Tensile path) unless the variable is already set. Changes output at rounding level | `GGML_CUDA_HIPBLASLT=1`, `GGML_CUDA_MMB_F32SPLIT_MIN_T=512` (old floor) |
 
 0005, 0006 (down-fold part) and 0009 were workarounds for the bug the release's fusion overlap check fixes at the source;
 0010 removes 0005. The others only run after a decline or a failed fill.
 
 Production also sets `MOE_HOST_POOL_TRANSPORT=map` (pins the host-read transport the r262 adaptive mode would otherwise pick).
+
+## Validation on r305 (2026-11-17 to 2026-11-19, Radeon AI PRO R9700 x 2, ROCm 10.1)
+
+On the production configuration (described in the next section) unless another model is named.
+
+- Rebase: greedy, prompt-set, mid-length, depth and needle hashes identical to the r299 series.
+- 0043: bit-identical; the duplicate quantize launch is gone, decode gain within noise.
+- 0044: 10 of 10 server starts give one output (before: two outcomes, deterministic per process; first seen in the
+  router GEMM of 41-266 token prompts, then in the next hipBLAS GEMM in graph order once the router was moved). KLD
+  against the old path on the production model: 0.0109 (ubatch 256) / 0.0100 (ubatch 4096), top token the same in
+  about 96.8 %, perplexity within error. `GGML_CUDA_HIPBLASLT=1` brings back the hipBLASLt outcome.
+- Nightly on the final tree: the 7-model comparison with the release passes; the q30 fault-injection arms change hash,
+  0 faults: in mmap mode from 0044's floor (it moves the q30 router GEMM; the old floor gives the old hash); in the
+  release's pool mode the text already differs from mmap on r305 with 0043 and 0044 off (coherent, near-tie), which
+  we did not chase since production runs mmap. Four stress sessions, 48 2-GPU
+  rounds, 0 faults, every round the expected hash, needle correct; byte checks (`GGML_MOE_VERIFY`) 0 differences.
+- Production since 2026-11-19: greedy decode 125-138 t/s; in the nightly, 31.5k prefill about 3430 t/s, 159k about
+  3338 t/s.
 
 ## Validation on r299 (2026-11-16 and 2026-11-17, Radeon AI PRO R9700 x 2, ROCm 10.1)
 

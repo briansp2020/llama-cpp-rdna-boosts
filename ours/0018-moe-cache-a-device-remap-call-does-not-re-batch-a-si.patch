@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 10 Nov 2026 15:28:45 +0000
-Subject: [PATCH 18/46] moe cache: a device-remap call does not re-batch a
+Subject: [PATCH 18/44] moe cache: a device-remap call does not re-batch a
  sibling already taken over in this round (GGML_MOE_DEVREMAP_REBATCH)
 
 A layer whose down (or up) table was not served by the first remap call of
