@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 17 Nov 2026 03:11:06 +0000
-Subject: [PATCH 42/44] moe tier: namespace-scope env flags initialized by
+Subject: [PATCH 39/48] moe tier: namespace-scope env flags initialized by
  named functions, not lambdas
 
 clang names a lambda in a namespace-scope initializer per anonymous-namespace block ($_0, $_1, ...), so
@@ -11,6 +11,9 @@ GGML_MOE_FILL_FENCE / GGML_MOE_TIER_PRECOPY (right values by luck, their own swi
 r298 lambdas (MOE_EXPERT_ALIAS_ROLE_CHECK / MOE_EXPERT_TAKEOVER_FAULT) took those slots and g_prefill_inplace
 read 0 -> prefill fills never resolved, garbage output. The 7 namespace-scope lambda initializers of
 moe-expert-tier.inc become <name>_init() functions; function-local ones are named by their function and stay.
+
+(cherry picked from commit 96e57c2e20da996a80f8eaeb187639087aaad0d2)
+(cherry picked from commit 8f66667ef43b2b97e044ab5dd03813616dfb5d08)
 ---
  ggml/src/ggml-cuda/moe-expert-tier.inc | 33 ++++++++++++++++----------
  1 file changed, 20 insertions(+), 13 deletions(-)

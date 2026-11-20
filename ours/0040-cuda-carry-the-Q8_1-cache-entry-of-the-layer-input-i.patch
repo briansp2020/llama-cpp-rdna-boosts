@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 18 Nov 2026 07:33:10 +0000
-Subject: [PATCH 43/44] cuda: carry the Q8_1 cache entry of the layer input
+Subject: [PATCH 40/48] cuda: carry the Q8_1 cache entry of the layer input
  into the routed-MoE split
 
 Decode/verify layers run as three graph computes per device; the scheduler
@@ -17,6 +17,9 @@ them on) and are recaptured when the carried entry differs from the one
 they were captured with (q8_carry_sig). GGML_CUDA_Q8_1_CARRY=0: off;
 GGML_CUDA_Q8_1_CARRY_LOG=1: report carries; GGML_CUDA_GRAPH_TRACE also
 counts carry-only recaptures. Bit-identical (FINDINGS 1011).
+
+(cherry picked from commit c2ab621c8a6ffa7b6b167222be68a4ab350b1bd0)
+(cherry picked from commit 338d10db5b46f6188db98adc29a1571b0848daa6)
 ---
  ggml/src/ggml-cuda/common.cuh   |  18 ++++-
  ggml/src/ggml-cuda/ggml-cuda.cu | 126 +++++++++++++++++++++++++++++++-
@@ -25,7 +28,7 @@ counts carry-only recaptures. Bit-identical (FINDINGS 1011).
  4 files changed, 146 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 00c7019ef1..89aea29ec6 100644
+index 2b902217d1..c2f8695b67 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1806,6 +1806,8 @@ struct ggml_backend_cuda_context {
@@ -52,7 +55,7 @@ index 00c7019ef1..89aea29ec6 100644
      char * q8_1_arena = nullptr;
      size_t q8_1_arena_size = 0;
      std::vector<char *> q8_1_arena_retired;
-@@ -1951,7 +1960,7 @@ struct ggml_backend_cuda_context {
+@@ -1953,7 +1962,7 @@ struct ggml_backend_cuda_context {
              }
              if (same) {
                  found = true;
@@ -61,7 +64,7 @@ index 00c7019ef1..89aea29ec6 100644
              }
          }
          found = false;
-@@ -1984,6 +1993,13 @@ struct ggml_backend_cuda_context {
+@@ -1986,6 +1995,13 @@ struct ggml_backend_cuda_context {
          return data;
      }
  
@@ -76,7 +79,7 @@ index 00c7019ef1..89aea29ec6 100644
      // source read range (the tensor's own ne/nb extent) must lie within the root tensor's
      // buffer allocation.  A compute buffer that is reallocated while a cache entry still
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 90ebf492ec..82e9e58989 100644
+index 64997f8d3c..6f826a1769 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -8932,11 +8932,15 @@ static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {
@@ -220,7 +223,7 @@ index 90ebf492ec..82e9e58989 100644
      cuda_ctx->mwr_done_graph = nullptr;
      cuda_ctx->bf16_src1_cache_clear();
      ggml_cuda_mmb_set_active_ctx(cuda_ctx);
-@@ -9716,9 +9828,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -9726,9 +9838,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      // and one whose MoE redirect choice changed (a table declined or took over since its capture;
                      // GGML_CUDA_GRAPH_MOE_SIG=0 disables the check, A/B only)
                      static const bool moe_sig_check = [] { const char * e = getenv("GGML_CUDA_GRAPH_MOE_SIG"); return !e || atoi(e) != 0; }();
@@ -238,7 +241,7 @@ index 90ebf492ec..82e9e58989 100644
                  }
              }
  
-@@ -9769,6 +9888,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -9779,6 +9898,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
          graph->mem_gen = ggml_cuda_graph_mem_gen(cuda_ctx->device);
          graph->moe_sig = moe_cache_redirect_sig(cgraph, cuda_ctx->device);
@@ -246,7 +249,7 @@ index 90ebf492ec..82e9e58989 100644
          CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
      }
  
-@@ -9777,6 +9897,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -9787,6 +9907,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                                          use_cuda_graph ? graph : nullptr);
      if (t_gc) { g_ev_rest_us += ggml_time_us() - g_loop_start; }
  
@@ -271,10 +274,10 @@ index 087f5d9c36..8274b91e87 100644
      // guards a replay is O(nodes) and runs on EVERY graph_compute (the scheduler mints a fresh
      // `cgraph->uid` per split, so the `uid` early-out in ggml_cuda_graph_update_required cannot fire),
 diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
-index d779e87c46..e4a88acf21 100644
+index 3a6353da28..01a432c94b 100644
 --- a/ggml/src/ggml-cuda/hc-mix.cu
 +++ b/ggml/src/ggml-cuda/hc-mix.cu
-@@ -1618,6 +1618,7 @@ static void ggml_cuda_op_hc_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor
+@@ -1626,6 +1626,7 @@ static void ggml_cuda_op_hc_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor
                                        n_embd, n_tokens, 1, 1, mixed_stride_t, mixed_stride_t*n_tokens, mixed_stride_t*n_tokens, found);
          if (!found) {
              q8 = (block_q8_1 *) p;

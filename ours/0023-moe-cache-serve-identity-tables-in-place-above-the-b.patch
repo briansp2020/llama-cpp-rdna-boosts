@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 03:28:17 +0000
-Subject: [PATCH 23/44] moe cache: serve identity tables in place above the
+Subject: [PATCH 23/48] moe cache: serve identity tables in place above the
  band in mmap mode too
 
 r258 (TODO #133) takes an identity (fully resident) table over at any
@@ -22,6 +22,8 @@ Production model: -ub 512 PPL 2.2453 (was nan); KLD vs the staged path
 config unchanged (0 identity tables, all hashes equal) (FINDINGS 910).
 
 (cherry picked from commit a35a444e8b29dbfe2a505f8de198f03efaa83bc0)
+(cherry picked from commit a88fb64b2bf4a9138a28df869f4bebc989489b24)
+(cherry picked from commit 293cdc802ad072e12fc463a82b93dd09082d24c3)
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu        | 14 +++++++++++++-
  ggml/src/ggml-cuda/moe-expert-cache.cu | 15 +++++++++++++++
@@ -30,10 +32,10 @@ config unchanged (0 identity tables, all hashes equal) (FINDINGS 910).
  4 files changed, 37 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f21b5df05b..13aa136305 100644
+index b28b0312fa..64997f8d3c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -7586,7 +7586,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -7589,7 +7589,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
          // TODO #335/#336: the cache declined this table.  If a take-over hook had told the scheduler to skip
          // `input_cpy` for it (and the slab then took its arena before this launch), that buffer holds stale or
          // uninitialised bytes; re-fill it from the host master.  No promise outstanding -> no work.
@@ -55,10 +57,10 @@ index f21b5df05b..13aa136305 100644
  
      GGML_TENSOR_BINARY_OP_LOCALS
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index bcb3733bda..c5944ba77f 100644
+index 7f719ebd42..eb53f572dc 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -12690,6 +12690,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
+@@ -12742,6 +12742,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
      return n_tok <= MOE_EXPERT_CACHE_MAX_TOK || moe_cache_prefill_in_place();
  }
  
@@ -81,7 +83,7 @@ index bcb3733bda..c5944ba77f 100644
                           void ** arena, int64_t * n_slots,
                           size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 546126cfe1..7a9b6376b0 100644
+index 7686adc656..372989a09b 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
 @@ -406,6 +406,10 @@ void moe_cache_graph_begin(int device);

@@ -1,11 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 00:12:06 +0000
-Subject: [PATCH 19/44] qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy
+Subject: [PATCH 19/48] qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy
  (LLAMA_QSA3_DIRECT_F16); gate copy before attention on prefill-sized graphs
  so Qcur_full dies early (LLAMA_GATE_EARLY)
 
 (cherry picked from commit 6f5294d318800a6a20aa38a78206281df17d2429)
+(cherry picked from commit 3faaf1d1a3844cebabdc989b8ee73b15ad999d89)
+(cherry picked from commit 7c247ce91113de18a6de55a16c4c7e5f51e09597)
 ---
  ggml/src/ggml-cuda/cpy.cu       | 29 +++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda.cu |  3 +++
@@ -67,10 +69,10 @@ index 6e1fda1127..5a3dca7936 100644
          ggml_cpy_f32_q4_0_cuda
                  (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7b1f1167d5..f21b5df05b 100644
+index 29bd656ca7..b28b0312fa 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -11350,6 +11350,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -11363,6 +11363,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                  if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
                      return true;
                  }
@@ -81,10 +83,10 @@ index 7b1f1167d5..f21b5df05b 100644
                      return true;
                  }
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index e6cdec88b3..04f2647711 100644
+index 65020d23db..10eca5b417 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -2502,14 +2502,18 @@ static bool qwen4exp_qsa3_kv_type(ggml_type type) {
+@@ -2506,14 +2506,18 @@ static bool qwen4exp_qsa3_kv_type(ggml_type type) {
  // layout before any permute: a quantized tensor cannot be permuted, and the backend dup only
  // dequantizes to F32, so those route through an F32 intermediate.  The permute/cont that follows
  // is then a plain F16 copy.
@@ -106,7 +108,7 @@ index e6cdec88b3..04f2647711 100644
      if (!ggml_is_contiguous(t)) { t = ggml_cont(ctx0, t); }
      return t;
  }
-@@ -2656,8 +2660,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2660,8 +2664,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
              qwen4exp_qsa3_kv_type(k_raw->type) && qsa3_op_supported(model, hparams, il, k_raw->type)) {
              // The launcher packs these into the block layouts itself (one fused pass, session 7);
              // the graph only materialises the natural contiguous F16 view [D, n_head_kv, n_kv].
@@ -122,7 +124,7 @@ index e6cdec88b3..04f2647711 100644
              ggml_flash_attn_qsa_set_packed(cur, k16, v16);
          }
  
-@@ -2859,6 +2868,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -2863,6 +2872,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          ggml_element_size(Qcur_full) * n_embd_head);
      gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
      cb(gate, "gate_reshaped", il);

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:46:49 +0000
-Subject: [PATCH 31/44] moe cache: KV segment -- GGML_MOE_KV_SEG_PF on by
+Subject: [PATCH 31/48] moe cache: KV segment -- GGML_MOE_KV_SEG_PF on by
  default with the segment
 
 The A/B on the production config (FINDINGS 943) gave small-prompt prefill
@@ -9,6 +9,8 @@ The A/B on the production config (FINDINGS 943) gave small-prompt prefill
 (GGML_MOE_VERIFY 0 differ).  GGML_MOE_KV_SEG_PF=0 turns it off.
 
 (cherry picked from commit 27111eb7b06356d00ce17bb980de343595a12515)
+(cherry picked from commit ee8477f8b2272a30351bb5117c2e5a0caafc1e23)
+(cherry picked from commit 5eff711b23353148a7973f3c04beba3ee6b4f00d)
 ---
  ggml/src/ggml-cuda/moe-expert-tier.inc | 4 ++--
  1 file changed, 2 insertions(+), 2 deletions(-)

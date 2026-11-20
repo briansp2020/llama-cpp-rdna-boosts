@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 23:32:10 +0000
-Subject: [PATCH 08/44] sched: let layer-split pipeline parallelism overlap the
+Subject: [PATCH 08/48] sched: let layer-split pipeline parallelism overlap the
  devices on ROCm
 
 Layer split with pipeline parallelism (several devices, no -ot) ran the GPUs
@@ -33,6 +33,8 @@ layer split identical to the base-vs-base control at 8k and 32k. Full
 128K the pipelined server runs out of memory on device 1 (extra copies).
 
 (cherry picked from commit 4bc2ece636d71c52425d4e981830a0cae5c68ec9)
+(cherry picked from commit 3fc31bd929c8d34ec743dfeb46a530393327687f)
+(cherry picked from commit 5f3593b9f743df441160ea720810fdec01f52980)
 ---
  ggml/src/ggml-alloc.c     | 14 ++++++-
  ggml/src/ggml-backend.cpp | 82 ++++++++++++++++++++++++++++++++++++++-
@@ -201,10 +203,10 @@ index d1781645b5..87d36992e8 100644
      ggml_backend_sched_split_graph(sched, graph);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 3fe9efc1f0..d1dc2c8307 100644
+index b39e6582d1..54e0f702ba 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -3113,7 +3113,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3326,7 +3326,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
      const auto gparams = graph_params(res, ubatch, mctx, gtype);
  

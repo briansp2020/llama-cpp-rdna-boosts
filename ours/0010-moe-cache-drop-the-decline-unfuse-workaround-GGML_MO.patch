@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 18:31:51 +0000
-Subject: [PATCH 10/44] moe cache: drop the decline unfuse workaround
+Subject: [PATCH 10/48] moe cache: drop the decline unfuse workaround
  (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 A declined or fill-failed table ran its decode-band gate+up+GLU and down fold
@@ -15,6 +15,8 @@ which the unfused fallback did not.  The tier remap keeps refusing a
 fill_failed table.
 
 (cherry picked from commit 34e21c3a7e9f0d7343a0fac106b30796af80e1e3)
+(cherry picked from commit 87e2230a8012762926a73fb7bd9adeefcb504d58)
+(cherry picked from commit 95da2bee1ee13c99739f264cd56e4faefcc3e555)
 ---
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |  5 ++---
  ggml/src/ggml-cuda/mmvq.cu               |  5 ++---
@@ -23,42 +25,43 @@ fill_failed table.
  4 files changed, 4 insertions(+), 35 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 1674e0c026..93efadb479 100644
+index c6db149420..e6b1242a3f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2696,9 +2696,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2805,10 +2805,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                      fusion_local.gate_ids = &gate_ids_c;
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
                  } else if (ids != nullptr &&
 -                           (moe_cache_fused_lane_taken(glu, src0, fusion_data.gate, cuda_ctx->device) ||
 -                            moe_cache_fused_declined_sparse(glu, src0, fusion_data.gate, cuda_ctx->device))) {
--                    continue;   // no redirect: run gate, up and the GLU unfused
 +                           moe_cache_fused_lane_taken(glu, src0, fusion_data.gate, cuda_ctx->device)) {
-+                    continue;   // a taken-over lane has no full copy: run gate, up and the GLU unfused
+                     moe_cache_fusion_launched(MOE_CACHE_SERVE_MIXED, 5);
+-                    break;   // no redirect: run gate, up and the GLU unfused
++                    break;   // a taken-over lane has no full copy: run gate, up and the GLU unfused
                  } else {
-                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
-                 }
+                     if (ids != nullptr) {
+                         moe_cache_fusion_launched(MOE_CACHE_SERVE_NONE, 5);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 0493e71b3e..65d2b089d4 100644
+index d172ad79a9..75cf862e26 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -3522,9 +3522,8 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
-             if (moe_cache_redirect_fused(mm_node, mm_node->src[0], nullptr, mm_node->src[2],
-                                          ctx.device, ctx.stream(), &src0_c, &ids_c, nullptr, nullptr)) {
+@@ -3528,9 +3528,8 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+             if (serve == MOE_CACHE_SERVE_IN_PLACE) {
                  ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
--            } else if (moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device) ||
+             } else if (serve == MOE_CACHE_SERVE_MIXED ||
+-                       moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device) ||
 -                       moe_cache_fused_declined_sparse(mm_node, mm_node->src[0], nullptr, ctx.device)) {
 -                return 0;   // not redirected: the unfused consumer reads the arena or the scheduler copy
-+            } else if (moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device)) {
++                       moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device)) {
 +                return 0;   // taken over but not redirectable: the unfused consumer reads the arena
              } else {
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 9b6ad3ee13..546126cfe1 100644
+index 6ecc82ee26..7686adc656 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -461,11 +461,6 @@ bool moe_cache_prefill_in_place_enabled();
+@@ -473,11 +473,6 @@ bool moe_cache_prefill_in_place_enabled();
  bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
                                  const struct ggml_tensor * gate, int device);
  

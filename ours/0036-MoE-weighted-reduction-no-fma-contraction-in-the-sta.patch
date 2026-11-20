@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 15 Nov 2026 21:31:00 +0000
-Subject: [PATCH 39/44] MoE weighted reduction: no fma contraction in the
+Subject: [PATCH 36/48] MoE weighted reduction: no fma contraction in the
  standalone kernels (GGML_CUDA_MWR_EXACT=0: old)
 
 moe_weighted_reduction_f32_vec4 / _f32 sum (expert * scale) * weight with the multiply-add contracted into an
@@ -12,6 +12,8 @@ ub 512 0.008215 -> 0.000000, Qwen3-30B-A3B 0.003479 -> 0.000000, production Flas
 unfused graph; needle and server checks clean. BF16 variants (BLK16 / DOWN16, default off) unchanged.
 
 (cherry picked from commit 08f775d67295f56243ea0b69473bd88420461bed)
+(cherry picked from commit b7bec5e9c048cd9cce31e6a78e7cebaf05c7edee)
+(cherry picked from commit 27adcab758f5e05b5e26ae63c01b05ef75f92db3)
 ---
  ggml/src/ggml-cuda/moe-weighted-reduction.cu | 46 ++++++++++++++++----
  1 file changed, 37 insertions(+), 9 deletions(-)

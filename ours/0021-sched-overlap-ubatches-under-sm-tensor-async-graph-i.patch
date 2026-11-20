@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 13:42:02 +0000
-Subject: [PATCH 21/44] sched: overlap ubatches under -sm tensor -- async
+Subject: [PATCH 21/48] sched: overlap ubatches under -sm tensor -- async
  graph-input views, async CPU-split output, deferred input wait
 
 The host waited on every split for a view of a graph input (96 waits, ~1 s per 4096-token prefill ubatch:
@@ -25,6 +25,8 @@ plain device (1 GPU, -sm layer) keeps the old ordering. sched_free waits for pen
 Same bytes, ordering only (FINDINGS 882).
 
 (cherry picked from commit e84058cdfe3ff4e60e5911857d81c04426d3a94b)
+(cherry picked from commit 92d06a4a72f223a2a960a0bf2b52cec076fe1ee9)
+(cherry picked from commit b9009a0aca6d175c8d532d060fa5859516dd37c5)
 ---
  ggml/include/ggml-backend.h                   |   3 +
  ggml/src/ggml-backend-meta.cpp                |  17 +++
@@ -340,10 +342,10 @@ index 140ecbb81f..a88be37902 100644
      }
      CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index f5557e92b7..ef72b5988c 100644
+index 8becae7737..6683e2065d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -3180,6 +3180,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3393,6 +3393,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                  ggml_backend_dev_slab_compute_plain(d.dev, sched_alt_in_use);
              }
          }
@@ -358,7 +360,7 @@ index f5557e92b7..ef72b5988c 100644
          const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
          if (is_draft) {
              for (const auto & d : model.devices) {
-@@ -3201,6 +3209,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3414,6 +3422,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          //const auto t_start_us = ggml_time_us();
  
          // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated

@@ -1,21 +1,23 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 06:08:29 +0000
-Subject: [PATCH 13/44] cuda: graph eviction on the active clock again
+Subject: [PATCH 13/48] cuda: graph eviction on the active clock again
  (FINDINGS 519), on top of r236; keep upstream never-evicting the looked-up
  key
 
 (cherry picked from commit 920799a4f244d1d016f07359766b2b0e02c6a93d)
+(cherry picked from commit 8fb83f138c4c1620da24a91e7d63eb8aaa67b181)
+(cherry picked from commit 9da869ea432cda0648a60a60ff4f767569440e38)
 ---
  ggml/src/ggml-cuda/common.cuh   |  7 ++++---
  ggml/src/ggml-cuda/ggml-cuda.cu | 23 +++++++++++++----------
  2 files changed, 17 insertions(+), 13 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 1b2b1177fa..65c2f5fb71 100644
+index 9fd2d6ffb8..dcd71788be 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1775,12 +1775,13 @@ struct ggml_backend_cuda_context {
+@@ -1776,12 +1776,13 @@ struct ggml_backend_cuda_context {
      // graph per decode/verify width.
      std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
  
@@ -33,7 +35,7 @@ index 1b2b1177fa..65c2f5fb71 100644
      // Check if any CUDA graph is enabled for this context (used by kernels that need to know
      // if graphs are in use without having access to the specific graph key)
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 064f780254..7b1f1167d5 100644
+index a316631f0f..29bd656ca7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1504,16 +1504,19 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :

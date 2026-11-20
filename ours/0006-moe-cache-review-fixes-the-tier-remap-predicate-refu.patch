@@ -1,11 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:41:12 +0000
-Subject: [PATCH 06/44] moe cache: review fixes: the tier remap predicate
+Subject: [PATCH 06/48] moe cache: review fixes: the tier remap predicate
  refuses a fill_failed table; the down-fold also runs unfused for a declined
  sparse table
 
 (cherry picked from commit 038d644e4b5a8602ac12fd3b9a6b1dba23f007bd)
+(cherry picked from commit 2e6747c0d8975ce9550ac43f582f81a785afd2ef)
+(cherry picked from commit 96945be1f56fccf9f435041d391d83a18e886f5a)
 ---
  ggml/src/ggml-cuda/mmvq.cu             | 5 +++--
  ggml/src/ggml-cuda/moe-expert-cache.h  | 2 +-
@@ -13,26 +15,26 @@ Subject: [PATCH 06/44] moe cache: review fixes: the tier remap predicate
  3 files changed, 5 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 65d2b089d4..0493e71b3e 100644
+index 75cf862e26..d172ad79a9 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -3522,8 +3522,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
-             if (moe_cache_redirect_fused(mm_node, mm_node->src[0], nullptr, mm_node->src[2],
-                                          ctx.device, ctx.stream(), &src0_c, &ids_c, nullptr, nullptr)) {
+@@ -3528,8 +3528,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+             if (serve == MOE_CACHE_SERVE_IN_PLACE) {
                  ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
--            } else if (moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device)) {
+             } else if (serve == MOE_CACHE_SERVE_MIXED ||
+-                       moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device)) {
 -                return 0;   // taken over but not redirectable: the unfused consumer reads the arena
-+            } else if (moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device) ||
++                       moe_cache_fused_lane_taken(mm_node, mm_node->src[0], nullptr, ctx.device) ||
 +                       moe_cache_fused_declined_sparse(mm_node, mm_node->src[0], nullptr, ctx.device)) {
 +                return 0;   // not redirected: the unfused consumer reads the arena or the scheduler copy
              } else {
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 1209373680..4a530aa98f 100644
+index 7a854814ff..8d6331a9f9 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -461,7 +461,7 @@ bool moe_cache_prefill_in_place_enabled();
+@@ -473,7 +473,7 @@ bool moe_cache_prefill_in_place_enabled();
  bool moe_cache_fused_lane_taken(const struct ggml_tensor * op, const struct ggml_tensor * src0,
                                  const struct ggml_tensor * gate, int device);
  

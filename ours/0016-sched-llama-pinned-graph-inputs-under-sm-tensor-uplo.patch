@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 19:06:53 +0000
-Subject: [PATCH 16/44] sched/llama: pinned graph inputs under -sm tensor,
+Subject: [PATCH 16/48] sched/llama: pinned graph inputs under -sm tensor,
  uploaded asynchronously per device; keep host compute buffers across the drop
 
 - llama-context: a tensor-split (meta) device has no single host buffer type when its GPUs report per-device
@@ -22,6 +22,8 @@ Prod config (-sm tensor -ub 4096), x2: 31.5k 3452/3485, 3456/3489 vs 3363/3433, 
 review (M1-M4 applied), code reviews no must-fix (FINDINGS 861).
 
 (cherry picked from commit 82e3797173e9ed345558784cc0a1790d7122e8af)
+(cherry picked from commit 8d5f687651bb46e601537ff33efda83c77457c5f)
+(cherry picked from commit 8a02a5bcb32596b5d732890cb65481bd870a30d7)
 ---
  ggml/include/ggml-backend.h    |  3 ++
  ggml/src/ggml-alloc.c          | 13 +++++++
@@ -206,10 +208,10 @@ index 5c6677e6c9..a28fb94c24 100644
          // the rings keeps them from synchronizing on the host at every wrap in a long prefill.
          sched->copy_event_next[i] = 0;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index d1dc2c8307..f5557e92b7 100644
+index 54e0f702ba..8becae7737 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -850,6 +850,15 @@ llama_context::llama_context(
+@@ -1026,6 +1026,15 @@ llama_context::llama_context(
                  // use the host buffer of the first device CPU for faster transfer of the intermediate state
                  const auto & dev = model.devices[0];
                  auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
@@ -225,7 +227,7 @@ index d1dc2c8307..f5557e92b7 100644
                  if (host_buft) {
                      buft = host_buft;
                  }
-@@ -3128,6 +3137,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3341,6 +3350,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          if (cparams.pipeline_parallel) {
              ggml_backend_sched_synchronize(sched.get());
          }

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:16:22 +0000
-Subject: [PATCH 30/44] moe cache: KV segment phase 2 -- review fixes (source
+Subject: [PATCH 30/48] moe cache: KV segment phase 2 -- review fixes (source
  counters, idle hint)
 
 Three small fixes from the logic review of the two phase 2 commits.  None
@@ -27,6 +27,8 @@ changes which bytes are read.
   what is sent and when.
 
 (cherry picked from commit 3fc542666b22d380a064f543f54b513a498e9119)
+(cherry picked from commit 6712e76af8e4755f69f85f677b0bc2fc549a92e2)
+(cherry picked from commit 64237877012ee0395f85079093c7e0864e02af1f)
 ---
  ggml/src/ggml-cuda/moe-expert-tier.inc | 44 +++++++++++++++++++-------
  tools/server/server-context.cpp        |  8 +++--
@@ -159,10 +161,10 @@ index e67e895186..ac1f4f4b75 100644
              }
              if (g_pf_lends > 0 || g_pf_takes > 0) {
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 9a8a688275..acb8f98d1d 100644
+index 64c574611f..d43d78a917 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -4106,6 +4106,8 @@ private:
+@@ -4138,6 +4138,8 @@ private:
  
                  metrics_flush_idle();
  
@@ -171,7 +173,7 @@ index 9a8a688275..acb8f98d1d 100644
                  return; // skip further processing
  
              } else {
-@@ -4165,8 +4167,10 @@ private:
+@@ -4197,8 +4199,10 @@ private:
              llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
          }
  

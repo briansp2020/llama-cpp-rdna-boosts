@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 17:04:25 +0000
-Subject: [PATCH 14/44] qwen4exp: PLE page hints only when a mincore sample
+Subject: [PATCH 14/48] qwen4exp: PLE page hints only when a mincore sample
  says the table is cold (LLAMA_PLE_ADVISE)
 
 One MADV_WILLNEED per page costs ~13 ms per 4096-token ubatch (~60k pages on the main thread while the GPUs
@@ -12,15 +12,17 @@ cold page cache = always-advise speed; outputs identical (FINDINGS 859).
 LLAMA_PLE_ADVISE=1: always advise (old), 0: never.
 
 (cherry picked from commit 591183cf2d82ee8f636c9a71098c1d4022b50729)
+(cherry picked from commit 695d9a1e9ed5dbe5050784a70b875c3e7778311c)
+(cherry picked from commit c65f50f6a8023b281b701f4b005a2d0ea5f3e9b9)
 ---
  src/models/qwen4exp.cpp | 48 +++++++++++++++++++++++++++++++++--------
  1 file changed, 39 insertions(+), 9 deletions(-)
 
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 0a3ae5173e..e6cdec88b3 100644
+index c4ae7b02b2..65020d23db 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -3220,7 +3220,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -3224,7 +3224,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          // CPU get_rows would (same to_float dequant), so that no CPU get_rows node cuts
          // the graph into GPU/CPU/GPU splits with a launch + sync per ubatch. The mmap
          // pages are random-access, so queue every distinct page with one WILLNEED batch
@@ -29,7 +31,7 @@ index 0a3ae5173e..e6cdec88b3 100644
          const ggml_tensor * tab = pmodel.per_layer_tok_embd;
          const size_t  row_size = ggml_row_size(tab->type, tab->ne[0]);
          const int64_t dim      = tab->ne[0];
-@@ -3231,17 +3231,47 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -3235,17 +3235,47 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
  
  #if defined(__linux__) || defined(__APPLE__)
          {

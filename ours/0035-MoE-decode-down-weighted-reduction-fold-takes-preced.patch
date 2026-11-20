@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 15 Nov 2026 18:14:58 +0000
-Subject: [PATCH 38/44] MoE decode: down + weighted-reduction fold takes
+Subject: [PATCH 35/48] MoE decode: down + weighted-reduction fold takes
  precedence over the MUL-only down fold; fold sum without fma contraction
 
 - ggml_cuda_moe_down_fold_try_fuse steps aside when ggml_cuda_mwr_fold_mark armed the down + reduction fold for
@@ -14,6 +14,8 @@ Subject: [PATCH 38/44] MoE decode: down + weighted-reduction fold takes
 tg128 (1 GPU): Qwen3.6-35B-A3B Q4_K_M 151.1 -> 154.9 t/s (+2.5 %); Qwen3-30B-A3B and gemma-4-26B unchanged.
 
 (cherry picked from commit 311f0c34ebaf2daa2d3ba10c219faff7003e989b)
+(cherry picked from commit e6a27cd42f7d9cecbcd4fc9586169793df87b485)
+(cherry picked from commit 6d43146465837fa5e734247e05e4e480f2094020)
 ---
  ggml/src/ggml-cuda/common.cuh  |  1 +
  ggml/src/ggml-cuda/mmvq-moe.cu | 23 ++++++++++++++++++-----
@@ -21,10 +23,10 @@ tg128 (1 GPU): Qwen3.6-35B-A3B Q4_K_M 151.1 -> 154.9 t/s (+2.5 %); Qwen3-30B-A3B
  3 files changed, 28 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 51b49fe426..00c7019ef1 100644
+index dcd71788be..2b902217d1 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -2922,6 +2922,7 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -2924,6 +2924,7 @@ struct ggml_cuda_mm_fusion_args_device {
      const float * red_w = nullptr;
      const float * red_scale = nullptr;
      int * red_cnt = nullptr;
@@ -68,7 +70,7 @@ index 54495f6695..92c997742d 100644
                  if (threadIdx.x == 0) {
                      *cnt = 0;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 718403e551..dcac0d0dab 100644
+index 1bfb76e992..3a1c116d4e 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1966,6 +1966,8 @@ void ggml_cuda_mul_mat_vec_q(

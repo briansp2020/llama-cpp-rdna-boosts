@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 19 Nov 2026 08:11:21 +0000
-Subject: [PATCH 44/44] cuda/hip: keep prompt GEMMs off hipBLASLt (one result
+Subject: [PATCH 41/48] cuda/hip: keep prompt GEMMs off hipBLASLt (one result
  per input)
 
 On ROCm, rocBLAS hands GEMMs to hipBLASLt by default, and hipBLASLt returned
@@ -20,13 +20,16 @@ graph order once the router was moved).
 
 10/10 server starts give one output (was 2 outcomes); KLD vs the old path
 0.0109 (ub 256) / 0.0100 (ub 4096), rounding level.
+
+(cherry picked from commit ffb81dfb94dcbb109cdd3c8727ace22495d7bd15)
+(cherry picked from commit 805e7fb4a8955f912ed0f86f7cb741567f8e9afd)
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu | 22 ++++++++++++++++++++++
  ggml/src/ggml-cuda/mmb.cu       | 22 +++++++++++++++++++++-
  2 files changed, 43 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 82e9e58989..c185747756 100644
+index 6f826a1769..5cb10f8767 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -565,6 +565,26 @@ static int ggml_cuda_parse_id(const char * devName) {
