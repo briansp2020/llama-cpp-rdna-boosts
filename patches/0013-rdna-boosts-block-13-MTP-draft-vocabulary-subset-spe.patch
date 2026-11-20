@@ -1,4 +1,4 @@
-From df694f83b8594e2cad1954ec03a0e6daa2ce9d51 Mon Sep 17 00:00:00 2001
+From 814bba2438aaddc7f6b92617202ab7b6a2a41e73 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/17] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -97,7 +97,7 @@ Exit verified on this tree (gfx1201, ROCm 10.1.0, VMM build):
  create mode 100644 tests/test-mtp-draft-vocab.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 69b117204..0d2b0debe 100644
+index bb51905a5..129eebd3f 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -4333,6 +4333,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -116,7 +116,7 @@ index 69b117204..0d2b0debe 100644
          {"--spec-draft-n-min"}, "N",
          string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
 diff --git a/common/common.cpp b/common/common.cpp
-index 108fbe536..1ff821c25 100644
+index 54bb82bdc..da2740501 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1280,7 +1280,8 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
@@ -130,7 +130,7 @@ index 108fbe536..1ff821c25 100644
      cparams_dft.n_rs_seq = 0;
  
 diff --git a/common/common.h b/common/common.h
-index 4f0a18875..71f251387 100644
+index 70b3dec09..67e3f9c44 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -374,6 +374,9 @@ struct common_params_speculative_draft {
@@ -234,10 +234,10 @@ index 8f8fcb531..6311f1356 100644
          enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
          enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 620d9d152..a07b3a71a 100644
+index d5e585e64..83a048267 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -963,6 +963,22 @@ llama_context::llama_context(
+@@ -1139,6 +1139,22 @@ llama_context::llama_context(
              }
          }
  
@@ -260,7 +260,7 @@ index 620d9d152..a07b3a71a 100644
          sched_reserve();
  
          // wip/first-prefill-latency: reserve the wide prefill work region in the slab BEFORE the MoE
-@@ -4391,6 +4407,7 @@ llm_graph_params llama_context::graph_params(
+@@ -4604,6 +4620,7 @@ llm_graph_params llama_context::graph_params(
          /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
          /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
          /*.samplers    =*/ sampling.samplers,
@@ -268,7 +268,7 @@ index 620d9d152..a07b3a71a 100644
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
-@@ -6259,6 +6276,7 @@ llama_context_params llama_context_default_params() {
+@@ -6472,6 +6489,7 @@ llama_context_params llama_context_default_params() {
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
@@ -665,10 +665,10 @@ index c0ee6fa03..595f0c1bd 100644
  
      res->t_logits = cur;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index fdd60dd0e..d3c2f38ec 100644
+index 4b28fe00c..a29b9457b 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -1563,7 +1563,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
+@@ -1566,7 +1566,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
          GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
      }
  

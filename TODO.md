@@ -8,17 +8,22 @@ and parked ideas.  **A closed or resolved item is not kept here** — it is one 
 Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `ENVIRONMENT.md`, `wip/*` and `benchmarks/`.
 
-**How this file is organised.**  The **index table** is the only list: every open, parked or in-flight
-handle appears there exactly once, in handle order, and nothing else does.  The `## NNN.` sections that
-follow carry the detail, in the same order; a row never states a status its section disagrees with, and a
-closed item leaves both (the record is a `WORKLOG.md` entry plus the campaign it points at).  Unnumbered
-**accepted limitations** — deliberately not fixed, do not re-report — come last, with the pointers to the
-campaign records.
+**How this file is organised.**  The **index table** is the only list: every **OPEN**, **PARKED** or
+**WAITING** handle appears there exactly once, in handle order, and nothing else does.  The `## NNN.` detail
+sections follow in the same order, one per row; a row never states a status its section disagrees with, and a
+closed item leaves both (the record is a `WORKLOG.md` entry plus the campaign it points at).
+
+**Accepted limitations** — deliberately not fixed, do not re-report — come last, as `### #NNN — subject`
+entries, and they are **not** rows: an accepted limitation is not open work, so listing it in the table would
+be the one place a "status" could read as a task.  The handle stays in the heading where one was ever
+allocated (a dated record that cites it still resolves, and a re-entry condition needs a name); an entry that
+never had one says `### No handle — …`.  Each entry names its re-entry condition, where it has one, and the
+records it points at (`WORKLOG.md`, the campaign, the `benchmarks/` or `archive/work/` file).
 
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **17-patch default set** (16 official blocks `0000`-`0015` + the temporary `0300`)
+**Current state:** the **18-patch default set** (17 official blocks `0000`-`0016` + the temporary `0300`)
 at fork point **`4f9dfa0e3`** (the 2026-11-13 r278 re-base); read `.release` in `release.json` for the
 release id -- it is the source of truth, not this line.  Block 14 is the **streamed KV** (the resident
 window, the attendance pool and the MTP draft window -- all three opt-in, default off); block 15 is the UMA
@@ -40,19 +45,34 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
-| **341** | the IQ4_NL (chain-mixer) qwen4exp hc class no longer reads byte-identical across the `LLAMA_FUSED_HC_COMBINE` arms (446 `a5d0ec7b809d` vs 459 `9f8819c4c2c5`; identical at r302 too, PPL equal in both arms) | correctness / gate invariant (block 11) | **OPEN** — pre-existing, gate 9's hard-arm invariant does not hold on that class until it is root-caused — §341 |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
-| **343** | `Q5_K` / `Q6_K` / `IQ4_XS` `ssm_alpha` projections take block 10's gate/beta epilogue but no GDN GGUF on this box or the contributor's has that type, so the path is untested for them | coverage / accepted limitation (block 10) | **ACCEPTED** — the mechanism check in `scripts/gate-gdn-epi.sh` is what would close it; do not add a KLD arm before the `gdn_epi` line is observed — §343 |
 
 ## Handle numbering
 
-**New handles append after `#342` (the highest issued so far; #338-#340 were all retired at r301, and #341/#342
-were issued at r303), and a number is never reused.**  (`#337` was opened and retired the
-same day, 2026-11-16: the attendance pool *does* engage on Qwen3.8-Flash-Next under `--kv-unified`, so the
-"cannot be exercised" premise was wrong; the arm and its numbers are in `archive/work/session-scheduling/`.)  (`#335`/`#336` were retired at r298 -- an alias
-ROLE gap in the expert cache, `WORKLOG.md` 261116.005 -- and `#282` at r299 -- the mid-run latch's mixture is gated on
-the logits, `WORKLOG.md` 261116.006 -- so the next free handle is `#341`.)  `#NN` is a permanent handle: a `WORKLOG.md` entry
-that cites `TODO #74` still means the same subject after that item has closed and left this file.
+**New handles append after `#346`, the highest issued so far, so the next free handle is `#347`; a number is
+never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
+subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
+
+* **issued and retired the same day** (2026-11-16): `#337` — the attendance pool *does* engage on
+  Qwen3.8-Flash-Next under `--kv-unified`, so the "cannot be exercised" premise was wrong; the arm and its
+  numbers are in `archive/work/session-scheduling/`.
+* **`#329`** retired at r312 (`WORKLOG.md` 261118.005) — *refuted*, not implemented: at 2..4 verified columns the
+  K-split `mmvq` kernel is already at 92-98 % of the DRAM roof, so no narrower tile or dot-product low-band arm
+  has anything to win; the family stays opt-in and width-split, and what shipped instead is the measured
+  **per-type** `auto` floor (5 / 5 / 8 / 8 / 8).  Record: `archive/work/rdna4-wmma-verify/LOW-BAND-2026-11-18.md`.
+* **`#345`** (issued r308 -- the 256-dim band) retired at **r315** (`WORKLOG.md` 261118.010): implemented as the
+  class's per-layer work gate, with its preferred route (an adaptive `P`) refuted by measurement.  It was
+  mistakenly listed here as retired at r311 while the open table still carried it; the r315 record is the
+  authoritative closure.
+* **`#346`** (issued r315 -- the band's fixup period `P`) retired at **r316** (`WORKLOG.md` 261118.011): the
+  quantized types' `P = nsm` shipped as `nsm/2` (one constant for every K/V type), chosen on the deep
+  attention-bound arm; **`P` 8 was measured and rejected**, and the 2-byte family's own verify-width optimum is
+  recorded in the benchmark rather than acted on.
+* **`#338`-`#340`** retired at r301, **`#341`** (issued r303) retired at r309 (`WORKLOG.md` 261117.008).
+* **`#335`/`#336`** retired at r298 — an alias ROLE gap in the expert cache, `WORKLOG.md` 261116.005;
+  **`#282`** at r299 — the mid-run latch's mixture is gated on the logits, `WORKLOG.md` 261116.006.
+* **`#342`** (r303) and **`#343`** (r304) are the newest still tracked; `#342` is WAITING on upstream, `#343`
+  is an accepted limitation.
 
 **Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
 records** (the commit messages that cite them are immutable).  The r187-r189 sessions allocated `#190`-`#196` (and
@@ -161,11 +181,28 @@ arena is now read IN PLACE at any width (`MOE_EXPERT_PREFILL_IN_PLACE`: 1489.6 -
 `-sm tensor`, 3588.8 -> 4072.4 on the pool mirror).  Consolidating the three transports for a **partly resident**
 table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2026-11-10-prefill-in-place.md`.
 
+## 342. A broken upstream UI asset bundle breaks every fresh configure
+
+**Waiting on upstream** (r303). The llama-ui bucket's `latest` archive (75 files, 3.3 MB, 2026-11-17) has no
+`workbox[hash].js`, and `scripts/ui-assets.cmake:137` validates that file, so a configure with no
+`tools/ui/dist` aborts with `UI: missing required asset(s): workbox[hash].js`.  Incremental builds never see it
+(`build-rocm`'s stamp caches the resolved bundle), so it appears exactly where a source tree is configured
+fresh: `gate-per-block-build.sh` (wipes its build dir per commit), a clean checkout, the hosted CI tiers.
+
+**The container release path is NOT affected, verified on `radiance` for r303**: `.devops/rdna-rocm.Dockerfile`
+builds the UI in its own `web` stage (`npm ci` + `npm run build`) and copies it in before the cmake step
+(`COPY --from=web /app/tools/ui/dist tools/ui/dist`), which is `ui-assets.cmake`'s Priority 1 -- pre-built
+assets win over both npm and the HF fetch, so that build never downloads or validates the bucket's bundle.
+Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
+
+Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
+validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
+
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
-These are closed: no work is owed and no row above tracks them.  A handle is kept where one was ever allocated, so
-the dated records that cite it still resolve and a re-entry condition has a name; the ones that never had a handle
-say so in their heading.
+These are closed or accepted: no work is owed, and no row above tracks them (see *How this file is
+organised*).  A handle is kept in the heading where one was ever allocated, so the dated records that cite
+it still resolve and a re-entry condition has a name; the ones that never had a handle say `No handle`.
 
 ### #282 — the mid-run latch's MIXTURE is a ~1e-5 path difference, and it is gated on the LOGITS (retired r299)
 
@@ -296,61 +333,24 @@ Three limits of the same tier, recorded together because they are one hardware s
   arm's own subject is decode width (blocks 12/14) and it lives in the MTP protocol, not here.  Record:
   `archive/work/apu-expert-gtt/MEASUREMENTS.md` §27.1 and §28.
 
-### #329 -- block 07's WMMA verify family loses at 2..5 columns; a narrower tile would let the floor go to 2 (and the feature to default-on)
+### #343 — Q5_K / Q6_K / IQ4_XS `ssm_alpha` projections are on the r304 path with no local GGUF to test it
 
-**Open, not scheduled** (r290, PR #317).  The family (`--wmma-verify`, `ENVIRONMENT.md` §7.6) amortizes
-dequantization over the verified columns, which is why it wins at 7-8 columns (+5.8..+10.6 %) and *loses*
-below 6 (-1.6..-8.5 %, and -4.4 % at 6 on a 2-GPU split).  The cause is structural, not tuning: the kernel
-computes a full 16x16 tile and streams the whole weight row whatever the column count, so at 2-4 columns it
-does N/8ths of the arithmetic and 8/8ths of the traffic where the K-split kernel does a small fraction of
-both.  A 2..4-column arm would need a narrower tile or a different operand shape (a 16x16x16 `iu8` WMMA
-cannot be narrowed, so this likely means a *dot-product* form rather than a tile form for the low band).
+### No handle — a merged-layout (`hc_*_down_inject`) qwen4exp GGUF with Q8_0 hc weights is untested (r313)
 
-**What it would buy.**  The floor could ship at 2 (or 6), which would make the family a **default-on**
-candidate: the delivery's own adaptive-MTP drafts produce 2..8-column verify batches, and an arm that wins
-across that whole band is a pure win instead of a config-shaped opt-in.  Until then it stays opt-in with a
-floor of 7 and the purity note in `GREEDY-PURITY.md` §91 -- do not lower the floor without measuring the
-low band on both a single card and a 2-GPU `tensor` split (the crossover moves).
-
-
-### #341 -- the IQ4_NL hc class disagrees across the combine arms, and it did so before r303
-
-**Open, not scheduled** (r303).  `scripts/gate-hc-fusions.sh` on Flash-Next IQ4_NL (hc weights IQ4_NL in all 48
-layers -> the CHAIN mixer, so `LLAMA_FUSED_HC_MIX` is inert for the file) reads:
-
-| arm | chars | sha |
-|---|---:|---|
-| `chain_chain`, `mixed_comb` (`LLAMA_FUSED_HC_COMBINE=0`) | 459 | `9f8819c4c2c5` |
-| every arm with the combine fusion ON (`fused_fused`, `mixfused_comb`, `no_cuda_fuse`) | 446 | `a5d0ec7b809d` |
-
-The same two shas reproduce **identically on the r302 build**, so this is not r303's (that release touched
-`build_hc_mix`'s entry checks and the merged layout only, and both layouts of the BF16-hc class stay 100 %
-byte-identical).  Quality is not the symptom: PPL is **2.1640 in both arms** (4 x 512 wikitext chunks), so it is
-a ULP-class reordering that flips a greedy near-tie, not the #228-style `/hc` degeneration.  What it costs is
-the *invariant*: gate 9 (and `GREEDY-PURITY.md`, r148/r236) says every hard arm is byte-identical to the chain,
-and that claim is false on this class.  Root-cause before quoting the class as a pass: the fused
-`GGML_OP_HC_COMBINE` against its own chain on a *chain-mixer* file, `LLAMA_HC_CN_DEBUG=1` to see whether the
-combine+norm matcher or the op itself is the arm that moves, and a chunk-by-chunk PPL diff.  Until then the gate
-prints FAIL for that class, which is the honest state -- do not add an anchor to hide it.
-
-### #342 -- a broken upstream UI asset bundle breaks every fresh configure
-
-**Waiting on upstream** (r303). The llama-ui bucket's `latest` archive (75 files, 3.3 MB, 2026-11-17) has no
-`workbox[hash].js`, and `scripts/ui-assets.cmake:137` validates that file, so a configure with no
-`tools/ui/dist` aborts with `UI: missing required asset(s): workbox[hash].js`.  Incremental builds never see it
-(`build-rocm`'s stamp caches the resolved bundle), so it appears exactly where a source tree is configured
-fresh: `gate-per-block-build.sh` (wipes its build dir per commit), a clean checkout, the hosted CI tiers.
-
-**The container release path is NOT affected, verified on `radiance` for r303**: `.devops/rdna-rocm.Dockerfile`
-builds the UI in its own `web` stage (`npm ci` + `npm run build`) and copies it in before the cmake step
-(`COPY --from=web /app/tools/ui/dist tools/ui/dist`), which is `ui-assets.cmake`'s Priority 1 -- pre-built
-assets win over both npm and the HF fetch, so that build never downloads or validates the bucket's bundle.
-Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
-
-Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
-validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
-
-### #343 -- Q5_K / Q6_K / IQ4_XS `ssm_alpha` projections are on the r304 path with no local GGUF to test it
+**Accepted limitation** (r313, contributor PR #326).  Block 11's Q8_0 hyper-connection mixer covers the
+**separate-tensor** UD layout (`hc_attn_down`/`hc_attn_up` Q8_0, inject F32 or Q8_0), which is what every UD file
+on this box is and what `scripts/gate-hc-fusions.sh` and `test-backend-ops` were run against (`UD-Q4_K_XL`,
+`test-backend-ops -o HC_COMBINE_MIX` 13/13 with the Q8_0 arms).  A **post-#31028 merged** file (`hc_*_down_inject`
+as ONE tensor) takes the same kernels through two `ggml_view_2d` row views of the merged tensor, and the kernels
+address every weight row packed at `ggml_row_size(ne[0])`, which a row view preserves -- so the path is
+structurally identical to the separate-tensor one -- but **no such GGUF exists here or at the contributor's**, and
+the synthetic merged-HC fixture (`tests/test-llama-archs.cpp`, the r303 arm) is F32 with `hc_lr 8`, so it never
+reaches the fused op at all.  What would close it: any merged-layout UD flash-next GGUF whose hc weights are Q8_0
+(`scripts/gate-hc-fusions.sh MODEL.gguf`, whose class line then says `FUSED-capable ... merged`, with
+`SOFT_EXPECT=""`), or a fixture that can emit Q8_0 rows for the merged tensor and pass the fused gating
+(`hc == 4`, `hc_lr == 320`).  `LLAMA_FUSED_HC_MIX=0` is the reference for anyone holding such a file; the same
+gap is recorded in `archive/work/hc-mix-q8/README.md` and in the PR #326 reply, so it is a stated limitation, not
+a claim.
 
 **Accepted limitation** (r304).  Block 10's GDN gate/beta epilogue takes `Q4_K`, `Q5_K`, `Q6_K`, `IQ4_XS` and
 `MXFP4` (`mmvq_gdn_epi_type`), but neither this box nor the contributor's has a GDN GGUF whose

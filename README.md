@@ -19,8 +19,8 @@ assumes its predecessors), so the set is applied whole.  **Block `0300` is tempo
 and treat it as a stop-gap, not a feature.  Two further blocks are **optional** and are NOT in the
 default set: `0100` (two-lane prefill) and `0101` (mixed K/V cache types), applied only with
 `--include-optional` (see [`optional/README.md`](optional/README.md)).  The release `v<N>-...` prefix is
-the **official** block count (`N` = 16); `0300` and the optional blocks are not counted.  The current
-release is **`v16-4f9dfa0e3-r295`** (read `.release` in `release.json` -- it is the source of truth, not this
+the **official** block count (`N` = 17); `0300` and the optional blocks are not counted.  The current
+release is **`v17-4f9dfa0e3-r321`** (read `.release` in `release.json` -- it is the source of truth, not this
 line): the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
@@ -165,10 +165,10 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The blocks: official `0000`-`0015` + temporary `0300` + optional `0100`/`0101`
+## The blocks: official `0000`-`0016` + temporary `0300` + optional `0100`/`0101`
 
 `release.json` (the current release).  Each row is one `git am` commit, applied in filename order:
-`0000`-`0015` then `0300`.  The optional `0100`/`0101` are **not** in this table and never in the default
+`0000`-`0016` then `0300`.  The optional `0100`/`0101` are **not** in this table and never in the default
 apply -- see [`optional/README.md`](optional/README.md).
 
 **r263 adds block 15 — the UMA GTT expert store.**  On an **integrated GPU** (an APU: `gfx1151`, and any newer
@@ -186,6 +186,28 @@ arm, +63-67 % prefill from streaming only what is not resident — with the logi
 is **inert on a discrete GPU, measured** (zero census lines with its envs forced on; `gate-host-pool.sh` 42/42).
 `ENVIRONMENT.md` §20 is the knob list, `patches/README.md` → Block 15 the detail, and
 `archive/work/apu-expert-gtt/` the campaign record.
+
+**r307 fixed issue #327 — the host-expert cache's take-over promise was scoped by buffer address, not by pass.**
+On a host-resident MoE (`-ncmoe`) a short prompt (about 17-64 tokens) could re-read **every** routed expert table
+from the host master on every pass: the scheduler recycles the copy buffer the promise names, and a promise left
+over from a decode pass (whose captured graph never asks the cache anything) matched a later pass' address, so the
+repair re-filled 138 tables x 206-450 MiB — about 10 s of prefill on the reporter's box — while producing the same
+text.  A promise now lives for exactly one staging pass.  Nothing to configure; the exit census prints
+`take-over promises broken=<n> repaired=<n> stale=<n>` and `stale` is the count of promises that died with their
+pass (normal on a captured decode).  Gate: `scripts/gate-moe-promise.sh`; `WORKLOG.md` 261117.006.
+
+**r301 added block 16 — the server's prompt admission policy; r306 made its per-step cap a CONTENDED bound and a
+first-class option.**  `update_slots()` assembles one batch per step and it cannot be joined mid-flight, so the
+policy that decides *which* prompt tokens enter that step also decides how long every other slot waits: the window
+is now shared **max-min fairly** (every active prompt is admitted to every step), `--interactive-batch-size` / `-ib`
+caps the prompt tokens admitted per step **while a decoder is waiting** (the bound on a decoding slot's inter-token
+latency), and `LLAMA_SERVER_PREFILL_DUTY` leaves up to `K-1` steps decode-only so a decoder gets a burst of tokens
+instead of one per slow step, bounded in time.  **r306 fixes the cap's scope:** r300/r301 applied it to *every*
+step, including one with nothing decoding, where it bounds nothing -- on the field shape that cost **1454 vs
+3036 t/s** for the same 65536 tokens.  A step with no slot generating now takes the whole `-b` window (shared
+max-min fairly, so the number of concurrent prompts is irrelevant); `LLAMA_SERVER_PREFILL_CHUNK` is the option's
+deprecated alias.  Gates: `scripts/gate-prefill-fairness.sh` and `scripts/gate-prefill-duty.sh`;
+`ENVIRONMENT.md` §22.
 
 **r287 added block 17 — mixed K/V cache types (PR #312); r288 made it optional block `0101`.**  The
 delivery refused every `type_k != type_v` pair since 2026-09-11 because a mixed pair could not take the
@@ -208,7 +230,7 @@ artifact and review: `archive/work/mixed-kv/`.
 | `0002` | **adaptive MTP draft depth** (`--spec-type draft-mtp-adaptive`) | old-01; + opt-in MTP prompt-tail ingest and the last-row prompt copy (r52); + the embeddings-layer-input preset API the draft setup calls (r94 block-boundary repair); + the draft context's KV cache type follows the main `-ctk` / `-ctv` unless `-ctkd` / `-ctvd` pins it (r125, issue #216) |
 | `0003` | **chunked gated-delta-net prefill** (bf16/WMMA GDN) | old-02; + the per-sequence rollback tracker folds in every ubatch and `LLAMA_RS_ROLLBACK_DEBUG` (r91) |
 | `0004` | **BF16 KV cache + native-BF16 flash attention** | old-03 |
-| `0005` | **flash-attention band / native quantized K-V / derived kq mask** | old-04 FA + the old-15 FA work; + the 2-byte arm joins the 32-column band block and the head-512 MMA row is retuned (r92); + the q8_0 fetch-ahead band variant, default on (`GGML_HIP_FA_BAND_FETCH_AHEAD=0`), r98 PR #195; + one tile K/V type selection for the instantiation and the F16 scratch, and an RDNA2-gated checked tail, r99 PR #198; + the derived mask's input is reusable through a hybrid memory context, so a >8-token verify step stops rebuilding its graph (r164, PR #242) |
+| `0005` | **flash-attention band / native quantized K-V / derived kq mask** | old-04 FA + the old-15 FA work; + the 2-byte arm joins the 32-column band block and the head-512 MMA row is retuned (r92); + the q8_0 fetch-ahead band variant, default on (`GGML_HIP_FA_BAND_FETCH_AHEAD=0`), r98 PR #195; + one tile K/V type selection for the instantiation and the F16 scratch, and an RDNA2-gated checked tail, r99 PR #198; + the derived mask's input is reusable through a hybrid memory context, so a >8-token verify step stops rebuilding its graph (r164, PR #242); + every fused-op probe that cannot see its node in the probe graph asks the acting device instead and SAYS how it verified (r311) |; **+ r314 (PR #329): the band also takes 128-dim heads whose GQA ratio is not a multiple of 8** (5, 6, 7, 9..12 -- an odd ratio folds nothing outside it), **on where it pays**: a layer takes it only when `K->ne[1] * passes_saved >= 20000`, keyed on the padded **used** extent the op executes (`INVARIANTS.md` r315 corrects r314's "cache size" here; a sliding-window layer holds `n_swa + n_ubatch` cells for the whole run) and never on the query width -- `GGML_HIP_FA_BAND_WMMA_H128` (`auto`/`0`/`1`), `GGML_HIP_FA_BAND_H128_MIN_WORK`; **+ r315: the 256-dim head class gets the same gate** (`K->ne[1] * max(passes_saved, 1) >= 20000` -- band from 10000 cells for GQA 6, 20000 for GQA 8/12; a verify-width kernel, so the decode width decides), worth **+4.4 %** (27B d0), **+7.4 %** (35B-A3B d0), **+3.1 %** (Flash-Next d0) of tg64 and +2.0 % on a MoE MTP arm, at -1.1 % on one dense MTP arm, with the deep `draft-mtp n7` band kept where it is worth +6.4 % -- `GGML_HIP_FA_BAND_WMMA_H256` (`auto`/`0`/`1`), `GGML_HIP_FA_BAND_H256_MIN_WORK` |
 | `0006` | **MMB quantized prefill GEMM** | old-08 MMB |
 | `0007` | **k-quant boosts** (mmvq VDR, Q6_K MMQ, Q1_0, grid pad) | old-10 + old-04 MMQ + old-15 Q1_0/grid/PR57; + the RDNA3_0 per-shape mmvq `nwarps` (r93) |
 | `0008` | **fused kernels** (conv1d/RMS/top-k MoE/verify fusions + fused MoE gate+up+GLU) | old-08 fusions + old-13 fused MoE + old-15 PR63/114; + `topk_moe` sorted-key argmax (r52); + the RDNA3_0 per-shape mmvq `nwarps` (r93) |
@@ -693,8 +715,8 @@ following users for the assistance in finding issues and offering solutions!
 
 - https://github.com/1337hero
 - https://github.com/bakon11
-- https://github.com/burnoutIA  (PR #317: the 2..8-column speculative-verify matvec family in WMMA `iu8` — Q4_K/Q5_K/Q6_K/IQ4_XS read in their GGUF layout on the existing q8_1 activations, each weight dequantized once for all the verified columns, plus the design notes and the min-term pitfall (`d.SUM(xq)`, not `ds.y`).  Folded into block 07 in r290 as an opt-in (`--wmma-verify N|auto`, floor 7, `GGML_CUDA_WMMA_MMVQ` kept as the A/B alias) with the Q8_0 case and the per-format stride unit added here; the band and end-to-end numbers are in `WORKLOG.md` 261115.002 and `ENVIRONMENT.md` §7.6)
-- https://github.com/briansp2020  (block-13 moe_weighted_reduction float4 remainder fix + block-14 MUL_MAT_ID pair-fusion layout gate, issues #19 and #18; PR #213: the split-state cache hit returns instead of copying the state, folded into block 09 in r132); PR #315: sequence parallelism for the qwen4exp hyper-connection work -- the residual streams stay token-split through a 2+-device `-sm tensor` prefill, a new `GGML_OP_TOKEN_SCATTER` and a copy-engine reduce-scatter / token all-gather pair on the all-reduce's own scratch, default ON (`LLAMA_SEQPAR=0` off), +7 % copy-engine and +2.2 % default-chain prefill at 31.5k; reviewed, reproduced to the digit and extended to 3 cards here)
+- https://github.com/burnoutIA  (PR #317: the 2..8-column speculative-verify matvec family in WMMA `iu8` — Q4_K/Q5_K/Q6_K/IQ4_XS read in their GGUF layout on the existing q8_1 activations, each weight dequantized once for all the verified columns, plus the design notes and the min-term pitfall (`d.SUM(xq)`, not `ds.y`).  Folded into block 07 in r290 as an opt-in (`--wmma-verify N|auto`, `GGML_CUDA_WMMA_MMVQ` kept as the A/B alias) with the Q8_0 case and the per-format stride unit added here; the band and end-to-end numbers are in `WORKLOG.md` 261115.002 and `ENVIRONMENT.md` §7.6.  r312 made `auto` a per-type floor from a DRAM-cold sweep (5 for Q4_K/Q5_K, 8 for Q6_K/IQ4_XS/Q8_0) and refuted the "narrow low-band arm" follow-up: at 2..4 columns the K-split kernel is at 92-98 % of the memory roof — `WORKLOG.md` 261118.005)
+- https://github.com/briansp2020  (block-13 moe_weighted_reduction float4 remainder fix + block-14 MUL_MAT_ID pair-fusion layout gate, issues #19 and #18; PR #213: the split-state cache hit returns instead of copying the state, folded into block 09 in r132); PR #326: the Q8_0 hyper-connection mixer path for UD quants (persistent `down_dots` counters, planar output, a Q8_1 epilogue, the combine+norm+Q8_1 kernel, a weight-preloading up band, an up+collapse launch and the F32 inject rows on the down grid) -- folded into block 11 in r313, output byte-identical on `UD-Q4_K_XL` across all ten hc-fusion arms, +7.1 % decode, with the redundant `_Q8` sub-switches folded into the switches that already covered the class (`WORKLOG.md` 261118.007); PR #315: sequence parallelism for the qwen4exp hyper-connection work -- the residual streams stay token-split through a 2+-device `-sm tensor` prefill, a new `GGML_OP_TOKEN_SCATTER` and a copy-engine reduce-scatter / token all-gather pair on the all-reduce's own scratch, default ON (`LLAMA_SEQPAR=0` off), +7 % copy-engine and +2.2 % default-chain prefill at 31.5k; reviewed, reproduced to the digit and extended to 3 cards here)
 - https://github.com/eoprede
 - https://github.com/mjohanning99  (PR #312: the mixed K/V cache types — a q8_0 K with a q4_0 / q5_0 / q5_1 V read natively through a second tile type parameter, head 256 only, with the QSA refusal and the one-V-type-function contract; promoted as block 17 in r287, moved to optional block `0101` in the r288 block-number re-org, `scripts/gate-mixed-kv.sh`)
 - https://github.com/overdoingism  (issue #45: the RDNA4 head-256 GQA-6 decode/verify flash-attention band, reported with the diagnosis, op-level data, the round-robin KV split idea and a working opt-in patch; the r4 block-15 band is built on that submission.  PR #223: the fully-masked KV-group skip extended to the band itself, so a resident idle conversation no longer taxes the active one's decode — folded into block 05 in r133.  Issue #224: the r126 row change left widths 5..8 on a different per-column KV split, so greedy decode with a draft diverged from plain decode; the band's own 64-column instantiation is back in r134, with a build-time guard and a width probe that reaches it)

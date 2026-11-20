@@ -1,7 +1,12 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r288`** (against the
-r288 default delivery tree `79d18f41b9ab9b235d35fd3a5034858eddd94844` = official blocks `0000`-`0015` plus the
+**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r320`** (against the r320
+default delivery tree `3334a4eb31124213805ae5a0a019f6aaf86d5d7b` = official blocks `0000`-`0016` plus the
+temporary `0300`; the r319 cut is at the bottom of the list, against the r319 default delivery tree
+`9f53a85322eb8c0327c350fca89fe5af76a30806`; the r318 cut is at the bottom of the list, against the r318 default delivery tree
+`d586e2a5fdfda303ea8363dfac20ca72784bf90a`; the r307 cut is at the bottom of the list, against the r307 default delivery tree
+`f91aa81202fd32d060f9afb0f9c54824116758b9`; the r288 re-cut is at the bottom of the list, against the r288 default delivery tree
+`79d18f41b9ab9b235d35fd3a5034858eddd94844` = official blocks `0000`-`0015` plus the
 temporary `0300`; the r259, r254, r247, r246, r243, r241 and r229 cuts and their measurements are kept below
 as the dated record).  The r288 re-cut is **mechanical**: the r285 patch applied STRICTLY on the r288 default
 tree with nothing to reconcile, so the artifact's diff is byte-identical to the r285 cut and the r285 numbers
@@ -19,7 +24,76 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `d025be5f683d1594556803a0db0baaad7d8d17ca3c0496aac428cc55673a299f` (the r299 cut; the earlier cuts are recorded below)
+  `79cbf54eefcfeb699a863bed4054bef3f88a3a833a9eaed289680b27da76fa53` (the r320 cut -- every re-cut moves the exported commit
+  and the hunk offsets, see below; every earlier cut is recorded below)
+* **r320 re-cut verification**: applies strictly at the r320 default tree
+  `3334a4eb31124213805ae5a0a019f6aaf86d5d7b` (sha256
+  `79cbf54eefcfeb699a863bed4054bef3f88a3a833a9eaed289680b27da76fa53`), producing tree
+  `9d8474c19d8a3eca56334c0b99f7f61e5229fc12`; with the other optional artifact on top, the cumulative tree is
+  `b61726912339d2f2e0a9abb646190f38690aec52`.  r320 amends **block 10** (`ggml/src/ggml-cuda/gdn-conv.cu`: the
+  conv + q/k norm fold's overlap test follows a deferred conv-state gather, PR #316), a file this artifact owns
+  no hunk of, so the re-cut moved only the exported commit id and the context offsets.
+* **r319 re-cut verification**: applies strictly at the r319 default tree
+  `9f53a85322eb8c0327c350fca89fe5af76a30806` (sha256
+  `0eaff51b987b789bbef9960229505de6beefec82d6b95c8c379eb5868e25287a`), producing tree
+  `cb07e2f41578163dbe5db56cc94da538f9a99110`.  r319 amends blocks 05 (the FA KV split) and 10 (the width probe),
+  neither of which this artifact edits, so the re-cut moved only the exported commit id and the context offsets.
+* **r318 re-cut verification**: applies strictly at the r318 default tree
+  `d586e2a5fdfda303ea8363dfac20ca72784bf90a` (sha256
+  `eb19211a0f3cbdf3bf6bb332d1d3fa389b64c17c8ff7ae1684e5cad6ad0cc911`), producing tree `ffb6c3239df6098f1f9315fc472273a062d3aa94`; with the other
+  optional artifact on top, the cumulative tree is `820b327d2310a3d0f105d66de0e9767199bed7ff`.  r318 amends **block 10**
+  (`ggml-cuda-try-fuse.cu`: the Q8_1 MUL fusion now counts readers through views, issue #331), a file this
+  artifact owns no hunk of, so only the exported commit id moved and `validate-set.sh` check 8 verifies all
+  three trees on every run.
+* **r317 re-cut verification**: applies strictly at the r317 default tree
+  `7d6b3f11062aa16922f6680af0c336973f847d1b`, producing tree `a7ce03f62b2a87d149bbdc82760005916a2c2934`; cumulative with the other
+  optional artifact, numeric order, is `8ebf851d99874fc9992a212c775160ec16f4ee6f`.  Recorded here for the
+  first time: r317 re-cut both artifacts (blocks 09/10 amendments) but wrote no bullet, so this file still
+  claimed the r316 cut for one release.
+* **r316 re-cut verification**: applies strictly at the r316 default tree
+  `4119a6f862cff0f3b8840be51426e1a3028d8a71` (sha256
+  `5ebab36f7f51f100eb7181498a2240325faeada169d1632ac87f61d4c565cd3a`), producing tree `d0cf0c723b1389dea7854f04ddd126a84d4f92cf`; with `0101` on top, the cumulative
+  tree is `3447592e07c2a260e25b0c17e1e9ecb3bf5f6b02`.  Block 05's r316 amendment touches
+  `fattn-rdna.cuh` / `fattn-common.cuh` only, which this artifact does not edit, so its **patch-id is unchanged**
+  from the r315 cut and `validate-set.sh` check 8 verifies all three trees on every run.
+* **r315 re-cut verification**: applies strictly at the r315 default tree
+  `ff3c4d85732d9dda27a6a4914c728afb541d7ae6` and produces `6328a17fa5b71d5bb621ac74d6d906913935ae34`; cumulative with the other
+  optional artifact, numeric order, is `7aec397b249a6f968e1cc425d63d89fbf8fad291`.  **The patch file moved**
+  (sha256 `4ad739ce8b66f53ddee3fab6bbce990d816b5b48bd5e5fddb3af11a3406a47fc`): block 05's r315 amendment adds the 256-dim work gate (`ggml_cuda_fattn_band_wmma_h256_applies()` and the new rows of
+  `fattn-rdna.cuh`), which is a file this artifact owns no hunk of, so the exported commit id and the hunk offsets
+  moved while the produced diff is otherwise unchanged.  `validate-set.sh`
+  check 8 verifies all three trees on every run.
+* **r314 re-cut verification**: applies strictly at the r314 default tree
+  `623e5a13f376e45f01fdecc6929c6dd5de0ab1d5` and produces `7704a44e6c7a629458fb5982a8a30b864b2dd117`; cumulative with the other
+  optional artifact, numeric order, is `4ea663b57d2d150d7452657ec526c84241e4c1a9`.  The patch file moved
+  (sha256 `4b61ecb6c5658dc067e1e3378e7c714fb66c34cb1c7f1ace4b55a6b43bcb3524`) **only in its `From <sha>` line** --
+  block 05's r314 amendment touches the CUDA FA band, which this artifact owns no hunk of.  `validate-set.sh`
+  check 8 verifies all three trees on every run.
+* **r313 re-cut verification**: applies strictly at the r313 default tree
+  `a9b88bab56ceb20a820044deda4e86504d47fe5b` and produces `b40c32caadee0ab2ed066f153d150bf901a08b33`; cumulative with the other
+  optional artifact, numeric order, is `06013692f6ad9a28fc69ba7da7868b3b55420e80`.  **The patch file moved**
+  (sha256 `4b61ecb6c5658dc067e1e3378e7c714fb66c34cb1c7f1ace4b55a6b43bcb3524`): block 11's r313 amendment (the Q8_0 hc mixer) rewrites `ggml/src/ggml-cuda/hc-mix.cu`,
+  `common.cuh`, `ggml-cuda.cu`, `ggml/src/ggml-cpu/ops.cpp` and `src/models/qwen4exp.cpp`, which this artifact
+  edits nothing of, so only the exported commit id and the hunk offsets moved -- the produced diff is otherwise
+  unchanged.  `validate-set.sh` check 8 verifies all three trees on every run.
+* **r311 re-cut verification**: applies strictly at the r311 default tree
+  `4a3db2c29d294987b95206fd663bc345114df455` and produces `48dbb770030653be116fb72f15fc64d58fa9b883`; cumulative with the other
+  optional artifact, numeric order, is `5fa077f78da0c50265febcfaf6351484475b3973`.  **The patch file moved**
+  (sha256 `00454bc676c9877792e9d5e951311f5db2906540ed89f518eb00f76b111ba92d`): block 05's r311 amendment rewrites `src/llama-context.cpp`, which this artifact edits
+  nothing of, so only the exported commit id and the hunk offsets moved -- the produced diff is otherwise
+  unchanged.  `validate-set.sh` check 8 verifies all three trees on every run.
+* **r307 re-cut verification**: applies strictly at the r307 default tree
+  `f91aa81202fd32d060f9afb0f9c54824116758b9` and produces `7cafcacf5dea9677c318aba7713ba80802d144f9`; cumulative with the other
+  optional artifact, numeric order, is `db5d26d45d5c8258b686151e3e42b63e139c301d`.  The patch file is
+  **unchanged** (same sha256) -- r307's block-10 amendment touches the host-expert cache's take-over promises, which
+  this artifact owns no hunk of, so only the produced tree moved with the default tree.  `validate-set.sh` check 8
+  verifies all three trees on every run.
+* **r306 re-cut verification**: applies strictly at the r306 default tree
+  `f12b1a0c8ee6c24b77467f93550322e74762aef0` and produces `d1dbe7733171065b99f0f2adee189c1bfd0bc309`; cumulative with the other optional artifact, numeric order, is `445ace2475eb41c0ae543242efcee636513898ac`.
+  The patch file moved (sha256 `00abb040e7debc4b6499f5262936c392019c93b2414d360cdb66fda7526eacb0`) because the exported commit id moved -- block 16's r306 amendment rewrites
+  the commit this artifact is cut on top of -- and **only the `From <sha>` line changed**: the artifact owns no
+  `tools/server/server-context.cpp` hunk, so the default tree's new admission code is the only difference in the
+  produced tree.  `validate-set.sh` check 8 verifies all three trees on every run.
 * **r300 re-cut verification**: applies strictly at the r300 default tree
   `4baf1b67ae591e6661a1e3c5365457a747b688ab` and produces `49f3086f63ce7683705be315060b25a828152d61`; cumulative with the other optional artifact,
   numeric order, is `dc9a8815bd56be9a2e9cae48f7b19d26e7da922a`.  **The patch file is unchanged** (sha256 `d025be5f683d1594556803a0db0baaad7d8d17ca3c0496aac428cc55673a299f`,

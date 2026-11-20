@@ -1,4 +1,4 @@
-From 35e00c16fcf5c281213e62781241cdcabb7869fb Mon Sep 17 00:00:00 2001
+From 4805dbbf631b01fdd6f8f6181da01056f42e94fb Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/17] rdna-boosts: block 09: host-resident MoE (iface,
@@ -79,12 +79,12 @@ text/acceptance byte-identical everywhere.
  ggml/src/ggml-cuda/cpy-batch.cu               |  109 +
  ggml/src/ggml-cuda/cpy-batch.cuh              |    9 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   87 +
- ggml/src/ggml-cuda/ggml-cuda.cu               | 2801 ++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 2803 ++++++-
  ggml/src/ggml-cuda/graph.cuh                  |    4 +
  ggml/src/ggml-cuda/mmvq.cu                    |  276 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 7084 +++++++++++++++++
- ggml/src/ggml-cuda/moe-expert-cache.h         |  382 +
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 7107 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.h         |  384 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
  ggml/src/ggml-cuda/vendors/hip.h              |   13 +
@@ -122,7 +122,7 @@ text/acceptance byte-identical everywhere.
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 18209 insertions(+), 540 deletions(-)
+ 70 files changed, 18236 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -147,7 +147,7 @@ index e38485ca0..688639a72 100644
      fit.h
      file-lock.cpp
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 46b2a6407..c37f6af85 100644
+index 99e5d713e..6e77c9fc1 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2694,6 +2694,74 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -255,7 +255,7 @@ index 46b2a6407..c37f6af85 100644
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 diff --git a/common/common.cpp b/common/common.cpp
-index d9fda7c53..4c99105cf 100644
+index e13669356..047f79a5e 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -7,6 +7,7 @@
@@ -597,7 +597,7 @@ index d9fda7c53..4c99105cf 100644
  
      llama_model * model = res->model();
      if (model == NULL) {
-@@ -1816,6 +2044,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1817,6 +2045,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.split_mode      = params.split_mode;
      mparams.load_mode       = params.load_mode;
      mparams.lazy_mode = params.lazy_mode;
@@ -617,7 +617,7 @@ index d9fda7c53..4c99105cf 100644
      mparams.tensor_split    = params.tensor_split;
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
-@@ -1892,6 +2133,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1893,6 +2134,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.op_offload        = !params.no_op_offload;
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
@@ -626,7 +626,7 @@ index d9fda7c53..4c99105cf 100644
      // issue #238: a multimodal projector feeds 2-D (M-RoPE) positions into this context, and the packed KQ
      // mask must be part of the compute reserve for those.  Without a projector the context only ever sees
 diff --git a/common/common.h b/common/common.h
-index 4a6f7d9df..4c1016015 100644
+index 021421293..92e046cf8 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -20,6 +20,7 @@
@@ -714,7 +714,7 @@ index 4a6f7d9df..4c1016015 100644
      bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
      bool verbose_prompt    = false; // print prompt tokens before generation
      bool display_prompt    = true;  // print prompt before generation
-@@ -1029,12 +1079,21 @@ common_gguf_info common_get_gguf_info(const std::string & fname);
+@@ -1030,12 +1080,21 @@ common_gguf_info common_get_gguf_info(const std::string & fname);
  
  // note: defines the model, context, samplers, ets. lifetimes
  struct common_init_result {
@@ -737,7 +737,7 @@ index 4a6f7d9df..4c1016015 100644
      common_sampler * sampler(llama_seq_id seq_id);
      void reset_samplers();
  
-@@ -1047,7 +1106,7 @@ private:
+@@ -1048,7 +1107,7 @@ private:
  
  using common_init_result_ptr = std::unique_ptr<common_init_result>;
  
@@ -746,7 +746,7 @@ index 4a6f7d9df..4c1016015 100644
  
  struct llama_model_params   common_model_params_to_llama  (      common_params & params);
  struct llama_context_params common_context_params_to_llama(const common_params & params);
-@@ -1313,6 +1372,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
+@@ -1314,6 +1373,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
  inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
      // keep strings alive and avoid leaking memory by storing them in a static list
      static std::list<std::string> buft_override_strings;
@@ -7438,7 +7438,7 @@ index 000000000..8005b57b4
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
 +void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index cfc0394ac..5db751515 100644
+index cfc0394ac..9d56c1f80 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -35,6 +35,7 @@
@@ -10395,19 +10395,21 @@ index cfc0394ac..5db751515 100644
  }
  
  // TODO: move these functions here
-@@ -8493,9 +10771,69 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -8493,9 +10771,71 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
      }
  }
  
 +// Issue #323: is this a HOST-EXPERT master buffer type -- the delivery's own tier for a `-ncmoe`/`-cmoe`
-+// expert bank?  `ROCm_Host` is the pinned whole-tensor master, `ROCm_HostMap` the pageable model mapping
-+// behind the pool.  Neither is a "cuda" buffer type for `ggml_backend_buft_is_cuda()` (that is a
++// expert bank?  Neither is a "cuda" buffer type for `ggml_backend_buft_is_cuda()` (that is a
 +// function-pointer identity on the DEVICE name), so under `-sm layer` / `-sm none` such a weight is not
 +// owned by any GPU backend and its routed op reaches `offload_op` with the generic threshold as the only
 +// gate -- which is what sent 17..31-token ubatches to the CPU (see the rule below).
++//
++// r307: this is the PINNED master (`ROCm_Host`).  The pageable `ROCm_HostMap` mapping is the other half of the
++// tier, and it is added by block 12, which defines that buffer type -- naming it here would leave blocks 09-11
++// uncompilable (`INVARIANTS.md` r307 fact 5).
 +static bool ggml_backend_buft_is_cuda_host_expert(ggml_backend_buffer_type_t buft) {
-+    return buft != nullptr && (ggml_backend_buft_is_cuda_host(buft) ||
-+        buft->iface.get_name == ggml_backend_cuda_host_map_buffer_type_name);
++    return buft != nullptr && ggml_backend_buft_is_cuda_host(buft);
 +}
 +
 +// Issue #323: the host-expert offload relaxation, default ON.  `GGML_MOE_HOST_OFFLOAD=0` restores the
@@ -10465,7 +10467,7 @@ index cfc0394ac..5db751515 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -8530,6 +10868,155 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -8530,6 +10870,155 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -10621,7 +10623,7 @@ index cfc0394ac..5db751515 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -8546,6 +11033,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -8546,6 +11035,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -10653,7 +10655,7 @@ index cfc0394ac..5db751515 100644
  };
  
  // backend reg
-@@ -8744,6 +11256,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8744,6 +11258,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -11005,10 +11007,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..95f3e7bc5
+index 000000000..4d7a64ff2
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,7084 @@
+@@ -0,0 +1,7107 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -11521,6 +11523,13 @@ index 000000000..95f3e7bc5
 +// Kinds: 0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold.
 +int64_t                             g_pf_fuse[4][2]   = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
 +int64_t                             g_pf_fuse_mixed   = 0;  // a fused consumer's lanes disagreed on residency (stood down)
++// issue #294: the same census for the DECODE/verify-band MoE fusions (mmvf/mmvq).  They used to launch on the
++// scheduler's staged copy without asking the cache, and a take-over promise means that copy may never have
++// been filled -- so a nonzero IN-PLACE column is also the proof that the fused read really went through the
++// arena.  Kinds: 4 = mmvf gate+up+GLU, 5 = mmvq gate+up+GLU (any of the subgraph / bias / shared-expert
++// shapes, and the single routed projection folds, which have no gate lane).
++int64_t                             g_dec_fuse[2][2]  = {{0, 0}, {0, 0}};
++int64_t                             g_dec_fuse_mixed  = 0;
 +// Fail-soft / --fit interaction (issue #33).  The arena is the LOWEST-priority VRAM consumer: it is
 +// sized from what is actually FREE at sizing time (after --fit, the compute reserve and the KV cache
 +// have taken theirs) minus `g_reserve_mib`, so it cannot over-commit and `--fit` does not need to know
@@ -17642,9 +17651,17 @@ index 000000000..95f3e7bc5
 +
 +moe_cache_serve_status moe_cache_fusion_launched(moe_cache_serve_status status, int kind) {
 +    if (status == MOE_CACHE_SERVE_MIXED) {
-+        g_pf_fuse_mixed++;
++        // The same kinds select the same census in both bands, so a mixed prefill and a mixed decode are
++        // counted where a reader looks for them.
++        if (kind >= 4) {
++            g_dec_fuse_mixed++;
++        } else {
++            g_pf_fuse_mixed++;
++        }
 +    } else if (kind >= 0 && kind < 4) {
 +        g_pf_fuse[kind][status == MOE_CACHE_SERVE_IN_PLACE ? 1 : 0]++;
++    } else if (kind >= 4 && kind < 6) {
++        g_dec_fuse[kind - 4][status == MOE_CACHE_SERVE_IN_PLACE ? 1 : 0]++;
 +    }
 +    return status;
 +}
@@ -17860,6 +17877,14 @@ index 000000000..95f3e7bc5
 +                  (long long) g_pf_fuse[2][1], (long long) g_pf_fuse[2][0],
 +                  (long long) g_pf_fuse[3][1], (long long) g_pf_fuse[3][0],
 +                  (long long) g_pf_fuse_mixed);
++    // issue #294: the decode/verify band's counterpart.  A nonzero IN-PLACE column says the fused launch read
++    // the arena (the take-over's promise is honoured); a nonzero mixed_lanes says a pair was stood down because
++    // only one of its lanes was served, which is the state the per-op chain must resolve on its own.
++    GGML_LOG_INFO("%s: decode MoE fusions: mmvf_glu=%lld/%lld mmvq_glu=%lld/%lld (in_place/staged) "
++                  "mixed_lanes=%lld\n",
++                  __func__, (long long) g_dec_fuse[0][1], (long long) g_dec_fuse[0][0],
++                  (long long) g_dec_fuse[1][1], (long long) g_dec_fuse[1][0],
++                  (long long) g_dec_fuse_mixed);
 +    if (g_cold_uva) {
 +        static const char * const admit_names[] = { "always", "value", "touch" };
 +        GGML_LOG_INFO("%s: cold admission=%s, admission-rejected (served cold)=%lld\n",
@@ -18095,10 +18120,10 @@ index 000000000..95f3e7bc5
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..006e62f4b
+index 000000000..86da99cb5
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,384 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -18445,8 +18470,10 @@ index 000000000..006e62f4b
 +//                                on its own, is the only correct consumer of that state.
 +//
 +// Every returned placement must be fed to `moe_cache_fusion_launched()` with the fusion's census `kind`
-+// (0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold), once the
-+// launch actually happens: that census is what a gate reads to prove residency no longer selects the kernel set.
++// (0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold,
++//  4 = decode mmvf gate+up+GLU, 5 = decode mmvq gate+up+GLU), once the launch actually happens: that census is
++// what a gate reads to prove residency no longer selects the kernel set.  Kinds 4/5 also cover the single-lane
++// routed folds (bias / scale / shared-expert), which have no gate lane; their MIXED count is a decode one.
 +enum moe_cache_serve_status {
 +    MOE_CACHE_SERVE_NONE     = 0,
 +    MOE_CACHE_SERVE_IN_PLACE = 1,
@@ -19325,10 +19352,10 @@ index 49bf5558a..730f87f39 100644
  
      LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 87ed80cdf..1578db9de 100644
+index edcdc6ecb..ea0ffdfdd 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -568,8 +568,9 @@ llama_context::llama_context(
+@@ -744,8 +744,9 @@ llama_context::llama_context(
  
      cparams.op_offload     = params.op_offload;
      cparams.kv_unified     = params.kv_unified;
@@ -19339,7 +19366,7 @@ index 87ed80cdf..1578db9de 100644
  
      // resolved after flash attention, see resolve_fused_ops()
      {
-@@ -1042,6 +1043,55 @@ void llama_context::sched_new(const sched_params & params) {
+@@ -1255,6 +1256,55 @@ void llama_context::sched_new(const sched_params & params) {
      sched_params_cur = params;
  }
  
@@ -19395,7 +19422,7 @@ index 87ed80cdf..1578db9de 100644
  // the attention KV caches that decide the derived kq mask: the cache itself, the attention part of a hybrid memory,
  // or both caches of an iSWA memory; empty for any other memory (which then keeps the packed reserve).  Resolved once:
  // `memory` is immutable for the lifetime of the context, and decode() asks this on every batch until a latch fires.
-@@ -1123,6 +1173,10 @@ void llama_context::sched_reserve() {
+@@ -1336,6 +1386,10 @@ void llama_context::sched_reserve() {
  
      gf_res_prev_active = nullptr;
  
@@ -19406,7 +19433,7 @@ index 87ed80cdf..1578db9de 100644
      gf_res_reserve->set_max_nodes(max_nodes);
      gf_res_reserve->reset();
      for (auto & res : gf_res_prev) {
-@@ -1269,6 +1323,22 @@ void llama_context::sched_reserve() {
+@@ -1482,6 +1536,22 @@ void llama_context::sched_reserve() {
              __func__, (t_end_us - t_start_us_l)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
  }
  
@@ -19429,7 +19456,7 @@ index 87ed80cdf..1578db9de 100644
  void llama_context::synchronize() {
      if (!sched) {
          return;
-@@ -1378,6 +1448,7 @@ bool llama_context::memory_update(bool optimize) {
+@@ -1591,6 +1661,7 @@ bool llama_context::memory_update(bool optimize) {
              res->reset();
          }
          gf_res_prev_active = nullptr;
@@ -19437,7 +19464,7 @@ index 87ed80cdf..1578db9de 100644
  
          if (!mctx->apply()) {
              LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
-@@ -2137,6 +2208,13 @@ bool llama_context::set_adapter_cvec(
+@@ -2350,6 +2421,13 @@ bool llama_context::set_adapter_cvec(
      return res;
  }
  
@@ -19451,7 +19478,7 @@ index 87ed80cdf..1578db9de 100644
  llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
      if (mctx && !mctx->apply()) {
          LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-@@ -2144,7 +2222,193 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2357,7 +2435,193 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -19646,7 +19673,7 @@ index 87ed80cdf..1578db9de 100644
      auto * gf  = res->get_gf();
  
      // the new graph parameters
-@@ -2213,6 +2477,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2426,6 +2690,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
  }
  
  int llama_context::encode(const llama_batch_ext & batch_inp) {
@@ -19659,7 +19686,7 @@ index 87ed80cdf..1578db9de 100644
      if (batch_inp.tokens.empty()) {
          LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
          return -1;
-@@ -2461,6 +2731,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -2674,6 +2944,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
  }
  
  int llama_context::decode(const llama_batch_ext & batch_inp) {
@@ -19672,7 +19699,7 @@ index 87ed80cdf..1578db9de 100644
      if (!memory) {
          LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
          return encode(batch_inp);
-@@ -3124,6 +3400,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3337,6 +3613,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
          // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
          auto * output_dev = model.dev_output();
          auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
@@ -19688,7 +19715,7 @@ index 87ed80cdf..1578db9de 100644
          if (output_dev_host_buft) {
              buft = output_dev_host_buft;
          }
-@@ -3375,8 +3660,15 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
+@@ -3588,8 +3873,15 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
      return static_cast<llm_graph_result *>(gf_res_reserve.get());
  }
  
@@ -19706,7 +19733,7 @@ index 87ed80cdf..1578db9de 100644
  }
  
  // pack sampler outputs into as few sequences as possible before using sequences without samplers
-@@ -3454,6 +3746,7 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -3667,6 +3959,7 @@ ggml_cgraph * llama_context::graph_reserve(
          res->reset();
      }
      gf_res_prev_active = nullptr;
@@ -19714,7 +19741,7 @@ index 87ed80cdf..1578db9de 100644
  
      // store the n_outputs as it is, and restore it afterwards
      // TODO: not sure if needed, might simplify in the future by removing this
-@@ -3583,8 +3876,6 @@ ggml_status llama_context::graph_compute(
+@@ -3796,8 +4089,6 @@ ggml_status llama_context::graph_compute(
          set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
      }
  
@@ -19723,7 +19750,7 @@ index 87ed80cdf..1578db9de 100644
      auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
-@@ -3598,85 +3889,13 @@ ggml_status llama_context::graph_compute(
+@@ -3811,85 +4102,13 @@ ggml_status llama_context::graph_compute(
  bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
      auto * lctx = static_cast<llama_context *>(user_data);
  
@@ -19816,7 +19843,7 @@ index 87ed80cdf..1578db9de 100644
  }
  
  llm_graph_cb llama_context::graph_get_cb() const {
-@@ -4580,6 +4799,52 @@ void llama_context::perf_reset() {
+@@ -4793,6 +5012,52 @@ void llama_context::perf_reset() {
      // note: the reallocation counters are not reset - they track the lifetime totals for this context
  }
  
@@ -19869,7 +19896,7 @@ index 87ed80cdf..1578db9de 100644
  llama_memory_breakdown llama_context::memory_breakdown() const {
      std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
      for (const auto & [buft, size] : model.memory_breakdown()) {
-@@ -4590,22 +4855,38 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+@@ -4803,22 +5068,38 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
              ret[buft].context += size;
          }
      }
@@ -19910,7 +19937,7 @@ index 87ed80cdf..1578db9de 100644
          }
      }
      return ret;
-@@ -4756,12 +5037,15 @@ void llama_context::opt_epoch_iter(
+@@ -4969,12 +5250,15 @@ void llama_context::opt_epoch_iter(
                  break;
              }
  
@@ -19927,7 +19954,7 @@ index 87ed80cdf..1578db9de 100644
              res->reset();
  
              auto * gf = model.build_graph(gparams);
-@@ -4792,7 +5076,6 @@ void llama_context::opt_epoch_iter(
+@@ -5005,7 +5289,6 @@ void llama_context::opt_epoch_iter(
                      ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                  }
              }
@@ -19935,7 +19962,7 @@ index 87ed80cdf..1578db9de 100644
              ggml_opt_eval(opt_ctx, result);
              if (callback) {
                  callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
-@@ -4894,6 +5177,7 @@ llama_context_params llama_context_default_params() {
+@@ -5107,6 +5390,7 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,
