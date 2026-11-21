@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 16 Nov 2026 01:42:16 +0000
-Subject: [PATCH 37/48] moe cache: the r292 arena settle skips layers with an
+Subject: [PATCH 35/52] moe cache: the r292 arena settle skips layers with an
  mmap-tier table (GGML_MOE_SETTLE_SPARSE=1 = Stew behaviour)
 
 Re-sizing such a layer frees its tables, and free_table_buffers_locked then calls
@@ -10,12 +10,13 @@ tier_drop_all_locked("re-size"), which latches the RAM tier off for the process
 
 (cherry picked from commit 35d8c7b136b3c18148cde459b0d9d8c079e32e0a)
 (cherry picked from commit 3e14a8151da49b7ae65730325109f856bc910788)
+(cherry picked from commit fe9ef2da9c89947f7a5e9ddc16605e449561d452)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 7 +++++++
  1 file changed, 7 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 9c5ae090db..bb70a47c91 100644
+index 13940af454..276e126089 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -740,6 +740,9 @@ int64_t                             g_arena_releases = 0;

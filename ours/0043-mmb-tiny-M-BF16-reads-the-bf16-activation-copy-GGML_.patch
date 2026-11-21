@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 20 Nov 2026 05:26:25 +0000
-Subject: [PATCH 45/48] mmb: tiny-M BF16 reads the bf16 activation copy
+Subject: [PATCH 43/52] mmb: tiny-M BF16 reads the bf16 activation copy
  (GGML_CUDA_MMB_TINY_BF16_XH=0: F32)
 
 The tiny-M kernel is bandwidth-bound on the BF16 hc inject (84 MB of F32
@@ -14,6 +14,8 @@ hit, and the activation is rounded to bf16 exactly as the dense tile does.
 IQ3_S, 2 x R9700, one run vs the two F32-read runs: pf31k 3898-3908 -> 3932,
 midpf prompt 3070-3085 -> 3098, needle prefill 3485-3490 -> 3516 t/s; the
 production model (UD IQ4_XS) never reaches this kernel.
+
+(cherry picked from commit 91387b2e14f18290f38dbd063f11371554991c06)
 ---
  ggml/src/ggml-cuda/mmb.cu | 11 ++++++++---
  1 file changed, 8 insertions(+), 3 deletions(-)

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 17:15:00 +0000
-Subject: [PATCH 34/48] moe cache: a sparse table staged fill at sizing takes
+Subject: [PATCH 34/52] moe cache: a sparse table staged fill at sizing takes
  the heat map hottest experts (GGML_MOE_STAGE_HEAT_RANK=0: off)
 
 With a persisted heat map, the eager per-expert heat seed of a sparse (mmap) table registered each expert and
@@ -12,13 +12,14 @@ instead of 0..k-1, and the heat seed leaves sparse tables to it.  No map: 0..k-1
 (cherry picked from commit 503fd28fdf54c505703e79ffec3e444fb33e2ec6)
 (cherry picked from commit 0bbfdd9ccf5d54b16259d0c3fd2613c6d17b0e88)
 (cherry picked from commit 369771474807ef789f7c60ed4835234e750d1a20)
+(cherry picked from commit c075d68b21ac73affae05f356a0a57f15a1095e1)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 13 +++++++
  ggml/src/ggml-cuda/moe-expert-tier.inc | 48 ++++++++++++++++++++------
  2 files changed, 51 insertions(+), 10 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 75416e74fb..9c5ae090db 100644
+index 40557181fc..13940af454 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -320,6 +320,16 @@ struct table_t : moe_tier_fields {

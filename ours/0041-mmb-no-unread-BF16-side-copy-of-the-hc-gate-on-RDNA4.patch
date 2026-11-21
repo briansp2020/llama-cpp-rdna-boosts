@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 20 Nov 2026 04:17:02 +0000
-Subject: [PATCH 43/48] mmb: no unread BF16 side copy of the hc gate on RDNA4
+Subject: [PATCH 41/52] mmb: no unread BF16 side copy of the hc gate on RDNA4
  (GGML_CUDA_MMB_HC16=1: old)
 
 The hc gate GEMM (K 320, M 10240) also stored a BF16 copy of its output into
@@ -12,6 +12,8 @@ read. RDNA4 now defaults hc16 off.
 
 IQ3_S Flash-Next, 2 x R9700, one run each (on / off): pf31k 3800 -> 3877,
 needle prefill 3406 -> 3478, smallpf 792 -> 803 t/s; every hash identical.
+
+(cherry picked from commit ae2eb31b3b1ca7fd4f846cc2668788ec9cdc242a)
 ---
  ggml/src/ggml-cuda/mmb.cu | 4 ++++
  1 file changed, 4 insertions(+)

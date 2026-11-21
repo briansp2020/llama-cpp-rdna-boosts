@@ -1,12 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 02:13:28 +0000
-Subject: [PATCH 01/48] our series outside moe-expert-cache.cu (patches
+Subject: [PATCH 01/52] our series outside moe-expert-cache.cu (patches
  0000-0054 of stack-r228, squashed for the merge)
 
 (cherry picked from commit 7be306cc9478b190c9daaf3677ff1665bd79c5e1)
 (cherry picked from commit eaf4b033f30ac08b277504d1450e035ed89c7144)
 (cherry picked from commit 666450e32bcc0a89057519e980af97d40f144c42)
+(cherry picked from commit ee598de4b38c25811851d919bc06da898866e660)
 ---
  common/arg.cpp                                |  12 +-
  common/common.cpp                             | 146 ++++-
@@ -28,13 +29,13 @@ Subject: [PATCH 01/48] our series outside moe-expert-cache.cu (patches
  ggml/src/ggml-cuda/graph.cuh                  |   3 +
  ggml/src/ggml-cuda/mmq.cu                     |   2 +
  ggml/src/ggml-cuda/mmq.cuh                    |  44 +-
- ggml/src/ggml-cuda/mmvq-moe.cu                | 586 ++++++++++++++++--
+ ggml/src/ggml-cuda/mmvq-moe.cu                | 614 +++++++++++++++---
  ggml/src/ggml-cuda/mmvq.cu                    |  56 +-
  ggml/src/ggml-cuda/moe-expert-cache.h         |  50 +-
- ggml/src/ggml-cuda/topk-rows.cu               | 175 ++++++
+ ggml/src/ggml-cuda/topk-rows.cu               | 175 +++++
  ggml/src/ggml-cuda/topk-rows.cuh              |  23 +
  include/llama.h                               |  12 +-
- src/llama-context.cpp                         | 278 ++++++++-
+ src/llama-context.cpp                         | 278 +++++++-
  src/llama-context.h                           |  31 +
  src/llama-kv-cache.cpp                        | 121 ++++
  src/llama-kv-cache.h                          |   6 +
@@ -47,7 +48,7 @@ Subject: [PATCH 01/48] our series outside moe-expert-cache.cu (patches
  src/models/qwen4exp.cpp                       |  21 +-
  tools/llama-bench/llama-bench.cpp             |   6 +-
  tools/server/server-context.cpp               |  33 +-
- 39 files changed, 2258 insertions(+), 272 deletions(-)
+ 39 files changed, 2272 insertions(+), 286 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/topk-rows.cu
  create mode 100644 ggml/src/ggml-cuda/topk-rows.cuh
 
@@ -977,7 +978,7 @@ index b65c6c137e..9fc532d75f 100644
          case GGML_OP_SCALE:
          case GGML_OP_SET:
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 1880d449f7..9fd2d6ffb8 100644
+index 2e14c57f92..84faf06f96 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1748,6 +1748,15 @@ struct ggml_backend_cuda_context {
@@ -2113,7 +2114,7 @@ index de281a724e..749118366a 100644
          const int max_descriptors = (args.ncols_dst + J - 1) / J + n_experts_ids;
          ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
-index cbde504132..54495f6695 100644
+index 1b954bfa6a..2781d08759 100644
 --- a/ggml/src/ggml-cuda/mmvq-moe.cu
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -8,6 +8,173 @@
@@ -2618,7 +2619,7 @@ index cbde504132..54495f6695 100644
      // Warp-level reduction only - no shared memory needed
  #pragma unroll
      for (int i = 0; i < c_rows_per_block; ++i) {
-@@ -213,36 +617,7 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -213,50 +617,7 @@ static __global__ void mul_mat_vec_q_moe(
          dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
      }
  
@@ -2638,12 +2639,26 @@ index cbde504132..54495f6695 100644
 -                if ((int) threadIdx.x < rows_valid) {
 -                    const int   r  = row0 + threadIdx.x;
 -                    const float s0 = fusion.red_scale != nullptr ? fusion.red_scale[0] : 1.0f;
--                    float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
--                    for (int e = 1; e < (int) nchannels_dst; ++e) {
--                        const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
--                        sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
+-                    // This sum must be moe_weighted_reduction's own order AND expression: contracted, HIP clang
+-                    // turns `sum + (x * scale) * w` into an fma and the fold stops matching the graph's MUL + ADD
+-                    // chain (KLD 0.0021 against it on Qwen3-30B-A3B decode).  fusion.red_contract
+-                    // (GGML_CUDA_MWR_EXACT=0) is the pre-r324 sum, and it contracts the standalone kernels too.
+-                    if (!fusion.red_contract) {
+-#pragma clang fp contract(off)
+-                        float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
+-                        for (int e = 1; e < (int) nchannels_dst; ++e) {
+-                            const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
+-                            sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
+-                        }
+-                        fusion.red_dst[r] = sum;
+-                    } else {
+-                        float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
+-                        for (int e = 1; e < (int) nchannels_dst; ++e) {
+-                            const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
+-                            sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
+-                        }
+-                        fusion.red_dst[r] = sum;
 -                    }
--                    fusion.red_dst[r] = sum;
 -                }
 -                if (threadIdx.x == 0) {
 -                    *cnt = 0;
@@ -2656,7 +2671,7 @@ index cbde504132..54495f6695 100644
      // GLU output -> Q8_1 for the down projection (fusion.glu_q8, 1 token, routed lanes): the 32 rows of a Q8_1 block come from
      // 32/rpb blocks, so each block adds its rows to the (slot, group) counter and the block that completes the group quantizes
      // it with one warp exactly as quantize_q8_1 does (same 32-lane reductions and rounding), then resets the counter.
-@@ -250,8 +625,9 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -264,8 +625,9 @@ static __global__ void mul_mat_vec_q_moe(
          if (warp_size == 32 && use_gate && (shared_expert ? fusion.shared_glu_q8 != nullptr : fusion.glu_q8 != nullptr)) {
              const int g = row0 / QK8_1;
              // the shared lane counts after the routed lanes (its channel_dst is 0, like the first routed lane's)
@@ -2667,7 +2682,7 @@ index cbde504132..54495f6695 100644
              __threadfence();
              int prev = 0;
              if (threadIdx.x == 0) {
-@@ -261,14 +637,15 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -275,14 +637,15 @@ static __global__ void mul_mat_vec_q_moe(
              if (prev + rows_valid == QK8_1) {
                  __threadfence();
                  if (threadIdx.x < QK8_1) {
@@ -2685,7 +2700,7 @@ index cbde504132..54495f6695 100644
                      const uint32_t ystr = shared_expert ? fusion.shared_glu_q8_stride : fusion.glu_q8_stride_channel;
                      block_q8_1 * y = ybase + g;
                      y->qs[threadIdx.x] = q;
-@@ -291,6 +668,39 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -305,6 +668,53 @@ static __global__ void mul_mat_vec_q_moe(
          }
      }
  
@@ -2708,12 +2723,26 @@ index cbde504132..54495f6695 100644
 +                if ((int) threadIdx.x < rows_valid) {
 +                    const int   r  = row0 + threadIdx.x;
 +                    const float s0 = fusion.red_scale != nullptr ? fusion.red_scale[0] : 1.0f;
-+                    float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
-+                    for (int e = 1; e < (int) nchannels_dst; ++e) {
-+                        const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
-+                        sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                    // This sum must be moe_weighted_reduction's own order AND expression: contracted, HIP clang
++                    // turns `sum + (x * scale) * w` into an fma and the fold stops matching the graph's MUL + ADD
++                    // chain (KLD 0.0021 against it on Qwen3-30B-A3B decode).  fusion.red_contract
++                    // (GGML_CUDA_MWR_EXACT=0) is the pre-r324 sum, and it contracts the standalone kernels too.
++                    if (!fusion.red_contract) {
++#pragma clang fp contract(off)
++                        float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
++                        for (int e = 1; e < (int) nchannels_dst; ++e) {
++                            const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
++                            sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                        }
++                        fusion.red_dst[r] = sum;
++                    } else {
++                        float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
++                        for (int e = 1; e < (int) nchannels_dst; ++e) {
++                            const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
++                            sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                        }
++                        fusion.red_dst[r] = sum;
 +                    }
-+                    fusion.red_dst[r] = sum;
 +                }
 +                if (threadIdx.x == 0) {
 +                    *cnt = 0;
@@ -2725,7 +2754,7 @@ index cbde504132..54495f6695 100644
      if constexpr (!has_fusion) {
          GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
      } else if constexpr (type != GGML_TYPE_NVFP4) {
-@@ -321,11 +731,19 @@ void mul_mat_vec_q_moe_launch(
+@@ -335,11 +745,19 @@ void mul_mat_vec_q_moe_launch(
      int64_t cold_gate_n_res    = 0;
      size_t  cold_gate_channel_bytes = 0;
      size_t  cold_gate_row_bytes     = 0;
@@ -2745,7 +2774,7 @@ index cbde504132..54495f6695 100644
          }
      }
      // The kernel indexes in type-block units; the cold geometry is reported in bytes.
-@@ -370,19 +788,34 @@ void mul_mat_vec_q_moe_launch(
+@@ -384,19 +802,34 @@ void mul_mat_vec_q_moe_launch(
      // (768 rows x 8 experts) 24.1 -> 19.2 us; Qwen3.6-35B-A3B gate/up (512 rows x 9) stays at 2 (4 measured 15.4 -> 17.3 us).
      // Bit-identical: with blocks_per_row_x % n_groups == 0 every row keeps its K-blocks in the same thread group and order, and
      // the per-row warp reduction does not depend on rows per block.  GGML_CUDA_MOE_RPB_WIDE=0: off.
@@ -2790,7 +2819,7 @@ index cbde504132..54495f6695 100644
      }
      const int64_t nblocks_rows = (nrows_x + rpb - 1) / rpb;
      // Upstream's fused shared-expert lane is the last blockIdx.y column.
-@@ -397,16 +830,45 @@ void mul_mat_vec_q_moe_launch(
+@@ -411,16 +844,45 @@ void mul_mat_vec_q_moe_launch(
                              fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
                              fusion.red_dst != nullptr;
  
@@ -2840,10 +2869,10 @@ index cbde504132..54495f6695 100644
      const auto launch_rpb = [&](auto rpb_c) {
          if (has_fusion) {
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 535ea76cc0..75cf862e26 100644
+index ca9f64aa12..a845c54101 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1847,6 +1847,13 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1848,6 +1848,13 @@ void ggml_cuda_mul_mat_vec_q(
              GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
              fusion_local.gate = fusion->gate->data;
          }
@@ -2857,7 +2886,7 @@ index 535ea76cc0..75cf862e26 100644
          if (fusion->gate_bias) {
              GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
              GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
-@@ -1881,33 +1888,37 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1882,33 +1889,37 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -2904,7 +2933,7 @@ index 535ea76cc0..75cf862e26 100644
                                                  sd->ne[0], sd->ne[1], sd->ne[2], sd->ne[3],
                                                  sd->nb[1]/ts_sd, sd->nb[2]/ts_sd, sd->nb[3]/ts_sd, sfound);
                  if (!sfound) {
-@@ -3516,6 +3527,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+@@ -3542,6 +3553,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
              moe_cache_fusion_launched(serve, 5);
              if (serve == MOE_CACHE_SERVE_IN_PLACE) {
                  ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
@@ -2914,7 +2943,7 @@ index 535ea76cc0..75cf862e26 100644
              } else {
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
-@@ -3749,11 +3763,26 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
+@@ -3775,11 +3789,26 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
      return 5;
  }
  
@@ -2942,7 +2971,7 @@ index 535ea76cc0..75cf862e26 100644
      ggml_tensor * node = cgraph->nodes[i];
      ctx.glu_q8_1_node = nullptr;
      ctx.glu_q8_1_mm   = nullptr;
-@@ -3762,10 +3791,10 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
+@@ -3788,10 +3817,10 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
          return;
      }
      const ggml_tensor * mm = nullptr;
@@ -2955,7 +2984,7 @@ index 535ea76cc0..75cf862e26 100644
          mm = cgraph->nodes[i + 2];
      }
      if (mm == nullptr) {
-@@ -3777,7 +3806,8 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
+@@ -3803,7 +3832,8 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
          a_root = a_root->view_src;
      }
      if (a_root == node && ggml_is_contiguous(a) && a->ne[0] % QK8_1 == 0 && ggml_nelements(a) == ggml_nelements(node) &&

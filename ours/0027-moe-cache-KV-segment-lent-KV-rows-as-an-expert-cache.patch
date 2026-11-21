@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 02:28:14 +0000
-Subject: [PATCH 27/48] moe cache: KV segment -- lent KV rows as an
+Subject: [PATCH 27/52] moe cache: KV segment -- lent KV rows as an
  expert-cache tier below the arena
 
 GGML_MOE_KV_LEND=1 + GGML_MOE_KV_SEG=1 (default off; unset GGML_MOE_KV_SEG = off).
@@ -30,6 +30,7 @@ Fable design + logic reviews (no open must-fix).  Production config,
 (cherry picked from commit 86300ecc1f2944abe4374e4e8487f8d6868b1ffb)
 (cherry picked from commit 9ee21e44e679ae3e077398d9e8ddb4d1dfdee3bd)
 (cherry picked from commit 014ae592d9658c7f1fafd243f47852e3601cd8af)
+(cherry picked from commit 4e5dc2ed03a9844229dde23ec92338df9c7f25a9)
 ---
  ggml/include/ggml-backend.h            |   3 +
  ggml/src/ggml-backend-meta.cpp         |   8 +

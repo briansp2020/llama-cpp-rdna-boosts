@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 20 Nov 2026 04:50:22 +0000
-Subject: [PATCH 44/48] mmb: tiny-M kernel for BF16 weights with M <= 8 on
+Subject: [PATCH 42/52] mmb: tiny-M kernel for BF16 weights with M <= 8 on
  RDNA4 (GGML_CUDA_MMB_TINY_M_BF16=0: dense tile)
 
 The warp-per-token tiny-M kernel gains a BF16-weight variant (four values per
@@ -15,6 +15,8 @@ IQ3_S, 2 x R9700, one run each (off / on): smallpf 802 -> 826, pf31k 3903 ->
 3898, midpf prompt 3054 -> 3070, needle prefill 3488 -> 3485 t/s. =0
 reproduces the previous hashes; the production model (UD IQ4_XS) has no such
 weight and every hash is identical either way.
+
+(cherry picked from commit 19ffaaa42fd5b0e1fd067457c6d3e74cd65e2d4f)
 ---
  ggml/src/ggml-cuda/mmb.cu | 83 ++++++++++++++++++++++++++++-----------
  1 file changed, 59 insertions(+), 24 deletions(-)

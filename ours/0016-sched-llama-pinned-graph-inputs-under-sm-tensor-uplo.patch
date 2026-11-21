@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 19:06:53 +0000
-Subject: [PATCH 16/48] sched/llama: pinned graph inputs under -sm tensor,
+Subject: [PATCH 16/52] sched/llama: pinned graph inputs under -sm tensor,
  uploaded asynchronously per device; keep host compute buffers across the drop
 
 - llama-context: a tensor-split (meta) device has no single host buffer type when its GPUs report per-device
@@ -24,6 +24,7 @@ review (M1-M4 applied), code reviews no must-fix (FINDINGS 861).
 (cherry picked from commit 82e3797173e9ed345558784cc0a1790d7122e8af)
 (cherry picked from commit 8d5f687651bb46e601537ff33efda83c77457c5f)
 (cherry picked from commit 8a02a5bcb32596b5d732890cb65481bd870a30d7)
+(cherry picked from commit 8631e49b18a8577fb1361c293b2832674ea05e41)
 ---
  ggml/include/ggml-backend.h    |  3 ++
  ggml/src/ggml-alloc.c          | 13 +++++++
@@ -47,10 +48,10 @@ index f02eb3698c..e6c3373a9e 100644
      // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
      // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 84896dc2f8..adc0031c8a 100644
+index a507e7cb51..bd639e4308 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -1145,10 +1145,23 @@ void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc) {
+@@ -1176,10 +1176,23 @@ void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc) {
      if (galloc == NULL || galloc->buffers == NULL) {
          return;
      }

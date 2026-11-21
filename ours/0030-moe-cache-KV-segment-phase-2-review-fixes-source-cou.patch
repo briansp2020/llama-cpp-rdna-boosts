@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:16:22 +0000
-Subject: [PATCH 30/48] moe cache: KV segment phase 2 -- review fixes (source
+Subject: [PATCH 30/52] moe cache: KV segment phase 2 -- review fixes (source
  counters, idle hint)
 
 Three small fixes from the logic review of the two phase 2 commits.  None
@@ -29,6 +29,7 @@ changes which bytes are read.
 (cherry picked from commit 3fc542666b22d380a064f543f54b513a498e9119)
 (cherry picked from commit 6712e76af8e4755f69f85f677b0bc2fc549a92e2)
 (cherry picked from commit 64237877012ee0395f85079093c7e0864e02af1f)
+(cherry picked from commit 77defaf9b41261bb416686e94f0c1c7574c562fe)
 ---
  ggml/src/ggml-cuda/moe-expert-tier.inc | 44 +++++++++++++++++++-------
  tools/server/server-context.cpp        |  8 +++--

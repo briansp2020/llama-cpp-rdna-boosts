@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 19 Nov 2026 08:11:21 +0000
-Subject: [PATCH 41/48] cuda/hip: keep prompt GEMMs off hipBLASLt (one result
+Subject: [PATCH 39/52] cuda/hip: keep prompt GEMMs off hipBLASLt (one result
  per input)
 
 On ROCm, rocBLAS hands GEMMs to hipBLASLt by default, and hipBLASLt returned
@@ -23,6 +23,7 @@ graph order once the router was moved).
 
 (cherry picked from commit ffb81dfb94dcbb109cdd3c8727ace22495d7bd15)
 (cherry picked from commit 805e7fb4a8955f912ed0f86f7cb741567f8e9afd)
+(cherry picked from commit 75227992feaae5cdec6b62dded4847d51051eb96)
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu | 22 ++++++++++++++++++++++
  ggml/src/ggml-cuda/mmb.cu       | 22 +++++++++++++++++++++-

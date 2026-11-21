@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 20 Nov 2026 23:56:53 +0000
+Subject: [PATCH 49/52] tensor split: log the even FFN split once per model
+ (the fitting pass loads with logging silenced, so a process-wide flag hid the
+ line)
+
+---
+ src/llama-model.cpp | 5 ++---
+ src/llama-model.h   | 2 ++
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 920d11edff..9306ce8408 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1017,9 +1017,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+                         g /= 2;
+                     }
+                     if (g != blck_size_perf && g % blck_size == 0 && share % g == 0) {
+-                        static bool logged = false;
+-                        if (!logged) {
+-                            logged = true;
++                        if (!ud->ffn_even_logged) {
++                            ud->ffn_even_logged = true;
+                             LLAMA_LOG_WARN("%s: tensor split: FFN granularity %lld -> %lld so %s splits %lld / device (LLAMA_TP_FFN_EVEN=0: off)\n",
+                                     __func__, (long long) blck_size_perf, (long long) g, tensor_name.c_str(), (long long) share);
+                         }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index d26aeb2204..3b5113b9bc 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -697,6 +697,8 @@ struct llama_meta_device_get_split_state_userdata {
+     // dereferences `model` through this struct.
+     size_t                     n_devices = 0;
+     const struct llama_model * model     = nullptr;
++    // once per model: the fitting pass loads its own model with logging silenced, so a process-wide flag hid the line
++    mutable bool               ffn_even_logged = false;
+ };
+ 
+ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
+-- 
+2.53.0
+

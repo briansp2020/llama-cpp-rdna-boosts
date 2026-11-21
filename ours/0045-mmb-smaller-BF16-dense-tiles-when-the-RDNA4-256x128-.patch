@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 20 Nov 2026 06:02:34 +0000
-Subject: [PATCH 47/48] mmb: smaller BF16 dense tiles when the RDNA4 256x128
+Subject: [PATCH 45/52] mmb: smaller BF16 dense tiles when the RDNA4 256x128
  grid is small (GGML_CUDA_MMB_SMALL_TILE=0: off)
 
 At small prompt widths the BF16 dense GEMMs launched tiny grids of the
@@ -14,6 +14,8 @@ accumulates over K in the same order, so this is bit-identical.
 
 IQ3_S Flash-Next, 2 x R9700, one run (every hash equal): smallpf 835 -> 864,
 midpf prompt 3131 -> 3185, pf31k 4003 -> 4027, needle prefill 3578 -> 3585.
+
+(cherry picked from commit f48674dff268976bbcabd91b067d25eaf6669995)
 ---
  ggml/src/ggml-cuda/mmb.cu | 26 ++++++++++++++++++++++++++
  1 file changed, 26 insertions(+)

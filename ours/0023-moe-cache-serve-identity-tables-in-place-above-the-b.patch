@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 03:28:17 +0000
-Subject: [PATCH 23/48] moe cache: serve identity tables in place above the
+Subject: [PATCH 23/52] moe cache: serve identity tables in place above the
  band in mmap mode too
 
 r258 (TODO #133) takes an identity (fully resident) table over at any
@@ -24,6 +24,7 @@ config unchanged (0 identity tables, all hashes equal) (FINDINGS 910).
 (cherry picked from commit a35a444e8b29dbfe2a505f8de198f03efaa83bc0)
 (cherry picked from commit a88fb64b2bf4a9138a28df869f4bebc989489b24)
 (cherry picked from commit 293cdc802ad072e12fc463a82b93dd09082d24c3)
+(cherry picked from commit 10eaf58745e87ce4b52bc0bd6f667799fda634e9)
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu        | 14 +++++++++++++-
  ggml/src/ggml-cuda/moe-expert-cache.cu | 15 +++++++++++++++
@@ -57,10 +58,10 @@ index b28b0312fa..64997f8d3c 100644
  
      GGML_TENSOR_BINARY_OP_LOCALS
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 7f719ebd42..eb53f572dc 100644
+index 52aa142b6e..6fc1cf83ed 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -12742,6 +12742,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
+@@ -12757,6 +12757,21 @@ static bool moe_cache_width_serves_in_place(int64_t n_tok) {
      return n_tok <= MOE_EXPERT_CACHE_MAX_TOK || moe_cache_prefill_in_place();
  }
  

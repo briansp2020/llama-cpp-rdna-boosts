@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 20 Nov 2026 05:50:23 +0000
-Subject: [PATCH 46/48] mmb: take the producer-written BF16 activation from
+Subject: [PATCH 44/52] mmb: take the producer-written BF16 activation from
  bf16_src1_cache (GGML_CUDA_MMB_PRODUCER_BF16=0: convert)
 
 The qwen4exp prefill producers (hc_combine_norm's xn, dsv4_hc_pre's mixed
@@ -16,6 +16,8 @@ bit-identical.
 IQ3_S Flash-Next, 2 x R9700, one run (before / after, every hash equal):
 smallpf 827 -> 835, pf31k 3932 -> 4003, midpf prompt 3098 -> 3131, needle
 prefill 3516 -> 3578 t/s.
+
+(cherry picked from commit 2bb3d2888fd521e046c449b25716734f58d98e3e)
 ---
  ggml/src/ggml-cuda/mmb.cu | 12 ++++++++++++
  1 file changed, 12 insertions(+)

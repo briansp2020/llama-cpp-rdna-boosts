@@ -1,20 +1,21 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 06:08:29 +0000
-Subject: [PATCH 13/48] cuda: graph eviction on the active clock again
+Subject: [PATCH 13/52] cuda: graph eviction on the active clock again
  (FINDINGS 519), on top of r236; keep upstream never-evicting the looked-up
  key
 
 (cherry picked from commit 920799a4f244d1d016f07359766b2b0e02c6a93d)
 (cherry picked from commit 8fb83f138c4c1620da24a91e7d63eb8aaa67b181)
 (cherry picked from commit 9da869ea432cda0648a60a60ff4f767569440e38)
+(cherry picked from commit 6947d079c3ed4d89b5877fdca0f22a6956b14de4)
 ---
  ggml/src/ggml-cuda/common.cuh   |  7 ++++---
  ggml/src/ggml-cuda/ggml-cuda.cu | 23 +++++++++++++----------
  2 files changed, 17 insertions(+), 13 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 9fd2d6ffb8..dcd71788be 100644
+index 84faf06f96..a706bbeb36 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1776,12 +1776,13 @@ struct ggml_backend_cuda_context {

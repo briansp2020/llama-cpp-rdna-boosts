@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 04:20:06 +0000
-Subject: [PATCH 24/48] moe cache: a table is pool-backed only when the pool
+Subject: [PATCH 24/52] moe cache: a table is pool-backed only when the pool
  was requested
 
 moe_cache_table_is_pool now also requires g_pool_requested, as
@@ -18,12 +18,13 @@ Production model: KLD 0 vs the r261 candidate, server hashes unchanged
 (cherry picked from commit ae109df06412a6b22fe90e301458e7695ae99435)
 (cherry picked from commit 4dbfa749136a8bcae13d4f664bc9e20a2fce9004)
 (cherry picked from commit e0891d735d34d15916b02c350561cdbd42cf6972)
+(cherry picked from commit bcc3995a079f24d847571e47548693b8831256c8)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 7 ++++++-
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index eb53f572dc..6ec7583898 100644
+index 6fc1cf83ed..171dcf456b 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -9089,7 +9089,12 @@ bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device) {

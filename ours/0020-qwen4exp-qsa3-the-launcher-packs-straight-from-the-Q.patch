@@ -1,12 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 02:48:30 +0000
-Subject: [PATCH 20/48] qwen4exp qsa3: the launcher packs straight from the
+Subject: [PATCH 20/52] qwen4exp qsa3: the launcher packs straight from the
  Q8_0 cache views, no F16 copies in the graph (LLAMA_QSA3_PACK_Q8)
 
 (cherry picked from commit 37a2edf7902a6e40cb3dc10262af9ea7adf991dd)
 (cherry picked from commit e52cc68d52c6576f0d4e0fd14d996634c12f2e6c)
 (cherry picked from commit 101535fe7078155dafbca993cb4f4e80c4ba785a)
+(cherry picked from commit 4513bd60b647c7c1d3b7ac9ae34a649530d58030)
 ---
  ggml/src/ggml-cuda/fattn-qsa3.cu | 90 ++++++++++++++++++++++++++++----
  ggml/src/ggml.c                  | 10 ++--

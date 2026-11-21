@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 18 Nov 2026 07:33:10 +0000
-Subject: [PATCH 40/48] cuda: carry the Q8_1 cache entry of the layer input
+Subject: [PATCH 38/52] cuda: carry the Q8_1 cache entry of the layer input
  into the routed-MoE split
 
 Decode/verify layers run as three graph computes per device; the scheduler
@@ -20,6 +20,7 @@ counts carry-only recaptures. Bit-identical (FINDINGS 1011).
 
 (cherry picked from commit c2ab621c8a6ffa7b6b167222be68a4ab350b1bd0)
 (cherry picked from commit 338d10db5b46f6188db98adc29a1571b0848daa6)
+(cherry picked from commit 6a9e786b4a9a5590ca0c7a5de0876d476107e6e4)
 ---
  ggml/src/ggml-cuda/common.cuh   |  18 ++++-
  ggml/src/ggml-cuda/ggml-cuda.cu | 126 +++++++++++++++++++++++++++++++-
@@ -28,7 +29,7 @@ counts carry-only recaptures. Bit-identical (FINDINGS 1011).
  4 files changed, 146 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 2b902217d1..c2f8695b67 100644
+index a706bbeb36..eaf765810d 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1806,6 +1806,8 @@ struct ggml_backend_cuda_context {

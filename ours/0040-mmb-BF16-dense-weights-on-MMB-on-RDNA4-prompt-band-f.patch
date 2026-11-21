@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 20 Nov 2026 03:39:34 +0000
-Subject: [PATCH 42/48] mmb: BF16 dense weights on MMB on RDNA4, prompt band
+Subject: [PATCH 40/52] mmb: BF16 dense weights on MMB on RDNA4, prompt band
  from 33 tokens (GGML_CUDA_MMB_BF16_DENSE=0: rocBLAS)
 
 With hipBLASLt off for determinism (ROCBLAS_USE_HIPBLASLT=0, one result per
@@ -20,6 +20,8 @@ IQ3_S, 2 x R9700 -sm tensor, one run each (off / on):
 smallpf 694 -> 798, pf31k 2710 -> 3808, midpf prompt 2270 -> 3003,
 needle prefill 2513 -> 3409 t/s; decode unchanged. =0 reproduces the old
 hashes.
+
+(cherry picked from commit 8289866b2d372bc7996b04c41284825055027948)
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu |  3 ++-
  ggml/src/ggml-cuda/mmb.cu       | 29 +++++++++++++++++++++++++----

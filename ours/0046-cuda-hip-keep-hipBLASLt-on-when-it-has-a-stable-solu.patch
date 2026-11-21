@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 20 Nov 2026 06:35:49 +0000
-Subject: [PATCH 48/48] cuda/hip: keep hipBLASLt on when it has a stable
+Subject: [PATCH 46/52] cuda/hip: keep hipBLASLt on when it has a stable
  solution order (>= 1.5.0); MMB BF16 path only while it is off
 
 FINDINGS 1020 set ROCBLAS_USE_HIPBLASLT=0 because hipBLASLt returned one of
@@ -23,6 +23,8 @@ hipBLASLt 1.5.0 in ROCm 10.2 contains it (1.4.1 in 10.1 does not).
 IQ3_S Flash-Next on ROCm 10.2, one run each (auto = hipBLASLt on / forced
 off = MMB): smallpf 878 / 855, pf31k 4082 / 4014, midpf prompt 3289 / 3202,
 needle prefill 3630 / 3587 t/s. Both arms reproduce their ROCm 10.1 hashes.
+
+(cherry picked from commit a43c1c1545b8d865fe803b029136fedadb82dd08)
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu | 71 +++++++++++++++++++++++++++++----
  ggml/src/ggml-cuda/mmb.cu       |  5 ++-

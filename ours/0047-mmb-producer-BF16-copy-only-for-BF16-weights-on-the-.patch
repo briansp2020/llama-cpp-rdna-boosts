@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 20 Nov 2026 18:25:09 +0000
+Subject: [PATCH 47/52] mmb: producer BF16 copy only for BF16 weights on the
+ bf16-dense route (keeps the hc gate-mix cache lookup)
+
+mmb_bf16_activation took ctx.bf16_src1_cache for every MMB GEMM. On RDNA4 the combine+norm producers fill that cache unconditionally, so an IQ4_NL hc_down GEMM no longer inserted xn into the MMB cache, ggml_cuda_hc_gate_mix found nothing and the default-on gate-mix fusion stood down (with hipBLASLt on too). The producer copy is now taken only by a BF16 weight routed by mmb_bf16_dense() (producer_ok); every other caller converts and inserts as before. Found by the Fable review of PR #340 (FINDINGS 1039). GGML_CUDA_MMB_PRODUCER_BF16=0 still converts always.
+---
+ ggml/src/ggml-cuda/mmb.cu | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index e999c5009c..10f08a5137 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1775,7 +1775,8 @@ static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_t
+     cache.push_back({mmb_root(t), t->data, n, buf});
+     return buf->get();
+ }
+-static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
++static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream,
++                                             const bool producer_ok = false) {
+     const ggml_tensor * root = mmb_root(src1);
+     for (auto & e : mmb_state().slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+     for (auto & e : mmb_state().cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+@@ -1783,9 +1784,11 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
+     // norm) already write the RNE BF16 copy of their output into bf16_src1_cache for the cuBLAS BF16 GEMMs, with the
+     // same rounding as mmb_cvt_f32_bf16 (hc_f2bf32 / dsv4_f2bf == mmb_f2bf).  Take it instead of converting again --
+     // same key as the cuBLAS lookup (whole view root, same data, stream and size), so the GEMM is bit-identical.
++    // Only for the BF16-weight GEMMs routed here by mmb_bf16_dense() (producer_ok): every other caller keeps inserting
++    // the activation into the MMB cache, where later lookups (the hc gate-mix fusion) expect it.
+     // GGML_CUDA_MMB_PRODUCER_BF16=0: always convert (old).
+     static const bool use_producer = [] { const char * e = getenv("GGML_CUDA_MMB_PRODUCER_BF16"); return e == nullptr || atoi(e) != 0; }();
+-    if (use_producer && ggml_cuda_bf16_src1_cache_on() && src1->data == root->data && ggml_nelements(root) == (int64_t) n) {
++    if (producer_ok && use_producer && ggml_cuda_bf16_src1_cache_on() && src1->data == root->data && ggml_nelements(root) == (int64_t) n) {
+         const auto & c = ctx.bf16_src1_cache;
+         if (c.buf && c.src1 == root && c.data == root->data && c.stream_no == ctx.curr_stream_no && c.n == (int64_t) n) {
+             return (const uint16_t *) c.buf->get();
+@@ -2375,12 +2378,12 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         const ggml_tensor * x_root = src1;
+         while (x_root->view_src) x_root = x_root->view_src;
+         const uint16_t * Xh = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root)
+-                            : use_xh ? mmb_bf16_activation(ctx, src1, (size_t) T * K, stream) : nullptr;
++                            : use_xh ? mmb_bf16_activation(ctx, src1, (size_t) T * K, stream, mmb_bf16_dense()) : nullptr;
+         const float * Xf = Xh ? (const float *) Xh : (const float *) src1->data;
+         mmb_tiny_m_launch<true>(src0->data, Xf, Xh != nullptr, (float *) dst->data, M, K, T, mmb_tiny_m_f32_tt(), stream);
+         return;
+     }
+-    const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
++    const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream, src0->type == GGML_TYPE_BF16 && mmb_bf16_dense());
+     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
+     // The tall tile is a 384-row panel, so an M below this wastes most of it.  The model emits an M=4
+     // (HC inject) GEMM that otherwise takes the tall tile for 4 of 384 rows; the reference routes it
+-- 
+2.53.0
+

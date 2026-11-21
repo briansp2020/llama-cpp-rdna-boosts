@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 16:52:11 +0000
-Subject: [PATCH 33/48] moe cache: the persisted-heat seed of a sparse (mmap)
+Subject: [PATCH 33/52] moe cache: the persisted-heat seed of a sparse (mmap)
  table fills through the tier code
 
 apply_heat_seed_locked was the one seed site still calling fill_slot_from_host for a host_sparse table (the
@@ -11,12 +11,13 @@ map was opened there; with a loaded map, warm starts stalled for more than 15 mi
 (cherry picked from commit eacd9ddf995fa6852b5746eb5b7b67e223749f4f)
 (cherry picked from commit b4feaf01c4de9d958ee7aad93e3bbf8edfad82f7)
 (cherry picked from commit ac8ec254629c63c20438c989c65bd28473993819)
+(cherry picked from commit 05ecd9317e6d2a36935a57d7fbc7b36c83de7594)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 6 ++++--
  1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index a513b31318..75416e74fb 100644
+index ce684a44bf..40557181fc 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -5579,8 +5579,10 @@ void apply_heat_seed_locked(table_t & t) {

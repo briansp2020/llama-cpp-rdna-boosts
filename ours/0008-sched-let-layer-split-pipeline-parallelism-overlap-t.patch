@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 23:32:10 +0000
-Subject: [PATCH 08/48] sched: let layer-split pipeline parallelism overlap the
+Subject: [PATCH 08/52] sched: let layer-split pipeline parallelism overlap the
  devices on ROCm
 
 Layer split with pipeline parallelism (several devices, no -ot) ran the GPUs
@@ -35,6 +35,7 @@ layer split identical to the base-vs-base control at 8k and 32k. Full
 (cherry picked from commit 4bc2ece636d71c52425d4e981830a0cae5c68ec9)
 (cherry picked from commit 3fc31bd929c8d34ec743dfeb46a530393327687f)
 (cherry picked from commit 5f3593b9f743df441160ea720810fdec01f52980)
+(cherry picked from commit 124d9db7e169c2289a9bb31d506dfb390f72dbd3)
 ---
  ggml/src/ggml-alloc.c     | 14 ++++++-
  ggml/src/ggml-backend.cpp | 82 ++++++++++++++++++++++++++++++++++++++-
@@ -43,10 +44,10 @@ layer split identical to the base-vs-base control at 8k and 32k. Full
  4 files changed, 113 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 20fc5dbc1b..84896dc2f8 100644
+index 35b07f5f65..a507e7cb51 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -674,8 +674,18 @@ static uint64_t ggml_gallocr_graph_fp(const struct ggml_cgraph * graph) {
+@@ -698,8 +698,18 @@ static uint64_t ggml_gallocr_graph_fp(const struct ggml_cgraph * graph) {
  
          uint64_t v = (uint64_t) t->op;
          v = v*0x100000001b3ull ^ (uint64_t) t->type;
