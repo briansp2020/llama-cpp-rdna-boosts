@@ -46,10 +46,13 @@ left in this file.  The r236 re-base
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
+| **347** | PR #334 item 2 (HIP graph replay up to 16 tokens, `GGML_CUDA_GRAPH_MAX_TOKENS`): needs its own PR plus the multi-slot and 4B arms, because it is inert at the delivery's default draft depth and the delivery's text is not stable above the 8-row purity band | contribution / waiting on the submitter (`PR #334` declined for now) | **WAITING** -- separate PR requested; requirements in the PR review and §347 |
+| **348** | PR #334 item 3 (one FA KV-group bitmap per graph evaluation, `GGML_CUDA_FA_KQ_BLOCKS_REUSE`): correct as designed (`built=1 reused=15`) but worth nothing measurable on this box, unreachable in every single-sequence arm, and it leaks a per-context `cudaMalloc` behind a raw context pointer | contribution / waiting on the submitter (`PR #334` declined for now) | **WAITING** -- separate PR requested with a census, a context teardown and a Windows/launch-bound measurement; §348 |
+| **349** | `scripts/gate-server-arms.sh`'s `35b10` arm is not bit-reproducible on its **second slot** even with both of r324's fixes (a `MOE_EXPERT_HEATMAP=load` pin and a fixed-order admission): slot 0 is stable, slot 1 reads three different texts at three acceptances, because a 0.5 s stagger lands at a *variable* point in slot 0's prefill | tooling / gate (`TODO` #295's gate, gate 24 step 5c) | **OPEN** -- admit slot 1 on slot 0's first STREAMED TOKEN instead of on a clock; until then that arm's text is reported, not asserted (its acceptance checks stay hard, which is the collapse detector the arm exists for); §349 |
 
 ## Handle numbering
 
-**New handles append after `#346`, the highest issued so far, so the next free handle is `#347`; a number is
+**New handles append after `#350`, the highest issued so far, so the next free handle is `#351`; a number is
 never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
@@ -197,6 +200,76 @@ Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
 
 Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
 validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
+
+## 347. PR #334 item 2 — HIP graph replay for 9..16-token graphs (separate PR requested)
+
+**Waiting on the submitter** (r323).  `GGML_CUDA_GRAPH_MAX_TOKENS` (default 16) makes a 9..16-token verify
+graph replayable, on the argument that those widths "keep a fixed shape from step to step like the <=
+`MMVQ_MAX_BATCH_SIZE` widths".  Measured here on r322+r323:
+
+* at the delivery's **default** drafting (`--spec-draft-n-max 7`, so at most an 8-row verify) it is **inert**:
+  `GGML_CUDA_GRAPH_TRACE=1` reads `direct=7554 replay=37482 capture=819 properties_changed=858` at `=8` and at
+  `=16` alike (no 9..16-token graph exists there), and plain decode likewise;
+* where 9..16-row verifies do occur it moves most steps onto replay (`direct` 45783 -> 8490) and pays a capture
+  per distinct width (`capture` 138 -> 924, `properties_changed` 183 -> 1002) -- which is the wrong trade for
+  block 02's per-sequence *adaptive* depth and the n-gram family's variable draft length;
+* "bit for bit" cannot be asserted there: above the 8-row band the delivery's own text is not run-to-run stable
+  (`GREEDY-PURITY.md` §11).  The same binary at `--spec-draft-n-max 15` read three different texts in three runs.
+
+**What it needs**: a multi-slot arm measured with the repo's own instrument (`LLAMA_SPEC_ALIGN` makes those
+verifies a fixed 16 rows; run-to-run spread at 4 slots is ±7 %, so several reps), a **4 B** arm (WORKLOG
+260928.003 measured verify graphs ~2.5 % slower there and left a size gate unshipped), a `llama-batched-bench
+-npl 1,4,8` arm, and the `ENVIRONMENT.md` + gate + record treatment any block owes.  Review:
+`https://github.com/stew675/llama-cpp-rdna-boosts/pull/334#issuecomment-7025668812`.
+
+## 348. PR #334 item 3 — one FA KV-group bitmap per graph evaluation (separate PR requested)
+
+**Waiting on the submitter** (r323).  The mechanism is sound and was verified here with a temporary census: in
+its best-case shape (2-slot `--kv-unified` server, 27B, q8_0 KV, `-c 65536`, a parked 10.5 k-token slot) the
+packed bitmap is built **once** per evaluation and reused 15 times, i.e. every replayed decode step carries one
+memset + prepass instead of sixteen.  It is worth **nothing measurable on gfx1201**: 31.90/31.88/31.85 t/s with
+the reuse against 31.83/31.86/31.86 without (~31 ms/step).  It is also unreachable in every single-sequence arm
+(a single-sequence batch takes the *derived* bitmap; the packed form needs a multi-sequence ubatch or the RDNA4
+band at depth, which itself has a work floor `K->ne[1]*saving >= 20000`).
+
+**Two defects**: `fattn_eval`/`fattn_kq_blocks` are process-global maps keyed by
+`const ggml_backend_cuda_context *`, with nothing erased at `ggml_backend_cuda_free` and a 64 KiB `cudaMalloc`
+never freed — the address is routinely reused (`llama-bench` over several models, `test-backend-ops` across
+devices), and if the new context is on a **different device** the stale pointer is handed to that device's
+kernel.  Key the entry on `ctx.device` as well, and erase + free in the context destructor.
+
+**What it needs**: a `-lv 4` census (`built= reused= fallback=`, otherwise no arm can be told from the pre-change
+behaviour), the teardown above, a comment saying the reuse key must be re-audited whenever the band's split
+changes (r319/#330 and r322/#333 both moved it), and a **measured** win.  The argument is 15 removed *launches*
+per step, so Windows/WDDM — where this repo's own #58 measurement showed verify graphs worth +16-19 % — is the
+platform to make it on; a feature that only pays on a platform this repo does not validate belongs in
+`optional/<name>/` (or `beta/` for a tester) until one of its own configurations shows a win.
+
+## 349. `gate-server-arms.sh`'s `35b10` arm: slot 1 is not bit-reproducible
+
+**Open** (r324, found while re-recording the gate's anchors for the MoE reduction re-baseline).  The arm's
+purpose (R13's silent failure: with host-resident experts and two sequences in one decode step, draft
+acceptance collapses to ~0 while the text stays correct) is still covered -- that is what the acceptance
+checks measure and they are unchanged -- but its **text** check cannot be a fixed hash set for this arm today.
+
+Two defects were fixed on the way, both verified: the gate never pinned `MOE_EXPERT_HEATMAP`, so each run
+started from the prior the *previous* run wrote back into the model directory's `.moe-heatmap` (r323 unpinned
+read `9e1a1221c30d e29d01e5edca` against its recorded `b337648c3ef9 b73aa781bca5`); and it fired both slots'
+requests **simultaneously**, so the server's admission order was a race that selected between two states of
+both the text and the acceptance (r324 before the fix: 3 of 4 runs one state, 1 the other).  With
+`MOE_EXPERT_HEATMAP=load` and a 0.5 s stagger, `fn24`/`fn10` are reproducible (verified twice on each of r323
+and r324) and are now exact anchors.
+
+`35b10` still moves, slot 1 only (slot 0 is stable at `1b2dac950888`): three further r324 runs read
+`1bb3415d743a`, `2cd90f70be03` and `50f29e574939` at acceptance 0.71074/0.75214, 0.68548/0.72269 and
+0.60741/0.73729.  **Cause**: a fixed-*time* stagger is a fixed point in a *variable* process -- slot 1 arrives
+somewhere inside slot 0's ~1-2 s prefill, and its KV/arena cell placement (hence a near tie) depends on how far
+that got.  An order race became a timing race.
+
+**What it needs**: admit slot 1 on slot 0's **first streamed token** (request slot 0 with `"stream": true`,
+release slot 1 on the first chunk) instead of on the clock; verify two runs on each of two builds reproduce;
+then restore an exact anchor.  Do not serialise the two requests -- with one sequence decoding at a time the
+arm cannot reach the shape it exists for.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

@@ -1,3 +1,411 @@
+## 261120.002 (r325, RELEASE v17-4f9dfa0e3-r325) -- the MoE device gather's launch shape: `n_split` 8 -> 32, a block 09 amendment (+7.5 % prefill on the 1-GPU host-expert shape)
+
+**Release:** `v17-4f9dfa0e3-r325`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `4132c5155` (tree
+`5959be96f`), 17 official + 1 temporary = 18 default blocks, optional `0100` -> `c3a25080d` / `0101` ->
+`547321720` (cumulative `fa0dc3aae`).  **No block created, split or renumbered**: one same-block amendment,
+**block 09** (`ggml/src/ggml-cuda/moe-expert-cache.cu`, `moe_cache_gather_host`).  One environment variable
+added (`MOE_GATHER_NSPLIT`).
+
+### The finding
+
+`moe_cache_gather_host` launches `moe_cache_gather_kernel<<<n_experts * n_split, ...>>>` with `n_split = 8` — a
+constant chosen for the **decode** band ("~64 concurrent blocks for the usual 8 routed experts", the kernel's own
+comment).  A **prefill** ubatch routes essentially every expert of the table, so 8 left only 8 blocks per expert,
+each carrying a 0.6-1 MiB copy, and the copy was pipeline-limited instead of link-limited wherever the per-call
+volume is small (i.e. worst at HIGH residency, where the non-resident set is smallest).  `n_split` is now **32**,
+with `MOE_GATHER_NSPLIT` (1..256) as the A/B and bisect knob.
+
+| arm (1 x R9700, gfx1201, `-b 2048 -ub 2048`, 4932-token prompt, interleaved reps) | `=8` | `=32` | delta |
+|---|---|---|---|
+| Q8_0, auto arena (84 % residency) | 2307.9 / 2307.2 t/s | **2480.8 / 2480.8 t/s** | **+7.5 %** |
+| Q4_K_M, arena 8000 MiB | 2414.6 t/s | 2470.4 t/s | +2.3 % |
+| 3 GPU `-sm tensor`, Q8_0 | 4125.8 t/s | 4141.4 t/s | +0.4 % (neutral) |
+
+Greedy text is byte-identical (`572 chars sha=40e29c2b46b6`) and the KLD point is an exact fallback (below): the
+gather only partitions the same bytes across more blocks.  **Scope: this is a 1-GPU host-expert-tier win**; on a
+3-device tensor split each device gathers a third of the volume and the constant was already enough parallelism.
+
+### Gates
+
+* `scripts/validate-set.sh` — **green**: 18 default patches + 2 optional + `rdna-boosts-all.patch` checksums,
+  strict apply on a fresh `4f9dfa0e3` tarball, applied tree **`5959be96f`** == `release.json`, both optionals
+  apply alone (`c3a25080d` / `547321720`) and cumulatively (`fa0dc3aae`), Windows portability scan clean.
+* `scripts/gate-host-expert-text.sh` (the host-expert text oracle, pins applied) — **PASS**, 3/3 runs read
+  `296 chars sha=3205db133b1d`; the flipped-library arm reads its own text (reported, r310) and GPU faults are
+  clean.
+* **The change is a `moe_cache_gather` implementation change, so it owes the kill-switch arms** (MANIFESTS gate 1):
+  Flash-Next IQ3_XXS, `-ncmoe 47`, pins applied, 2 runs each — default, `GGML_MOE_DEVREMAP=0`,
+  `MOE_HOST_POOL_COLD=0` and `--host-experts pool` (with `-lme auto`) **all read `160 chars sha=200edcd422c7`,
+  2/2 each**.
+* `scripts/gate-prefill-logits.sh --ab "MOE_GATHER_NSPLIT=8"` (35B-A3B Q8_0, `-ncmoe 48 -ub 2048`, device 0) —
+  **PASS**: mean KLD **-0.000000** (limit 0.005), same-top-p **99.990 %** (floor 98.0 %), GPU faults clean.  The
+  base is recorded with the fallback `=8` arm, so this is the exact-fallback A/B the mode exists for.
+* `scripts/gate-host-pool.sh` — **PASS, 59/59 checks** (`takeover=0` under both fill faults, every failed fill
+  reporting NOT resident, the census printed once from the teardown, no abort in any of the 9 arms), every arm's
+  text as recorded and GPU faults clean.
+* `scripts/gate-per-block-build.sh --fast` (the release target profile, **all 18 rungs**) — **PASS, 18/18**
+  (`all 18 block commits build the release target profile`, 2008 s of gate time; the four heavy rungs, blocks
+  11-13 and 15, are the ones that recompile HIP kernels).
+  (`HF_UI_VERSION=b12387` was needed: the known `TODO` #342 `ui-assets.cmake:137` failure, unrelated to this
+  change.)
+
+### Notes
+
+* The retired campaign that found this (`archive/work/prefill-transfer-overlap/`, pass 9) and the campaign it
+  opened (`wip/prefill-decode-arms/`) are recorded in `WORKLOG.md` 261120.001.
+* The optional artifacts were re-cut against the new default tree; their recorded trees moved
+  (`c3a25080d` / `547321720` / cumulative `fa0dc3aae`) because block 09 changed.
+
+## 261120.001 (r324) -- campaign housekeeping: `prefill-transfer-overlap` retired, `prefill-decode-arms` opened, and the gather's `n_split` re-measured and scoped (no delivery change)
+
+**No delivery patch changed, no block created, split or renumbered, no release.**  This entry records a
+research campaign's retirement, the campaign that replaces it, and the one measured candidate it left behind.
+
+### The campaign result, in one line
+
+A prefill and a decode on one GPU should **not** be interleaved by policy at all: give the server **two
+contexts on two threads** (a prefill arm and a decode arm), let the GPU schedule them, and move a slot between
+the arms only at a request boundary.  Measured on 1 x R9700, Qwen3.6-35B-A3B Q4_K_M, `-ncmoe 40 -lme auto`,
+arena 5000 MiB, a 4932-token prompt + a 128-token decoder, warm reps: the decoder reads **p95 50 ms** during a
+2.27 s prefill for a prefill cost of **-11.3 %**, against the shipped duty cycle's **p95 519-568 ms at -30 %**
+(the `DUTY=0` row is `p95 568 ms` at -2 %).  Every host-side policy on top of the concurrency was measured and
+**lost**: a cumulative rate gate (F = 0 / .25 / .5 / 1 / inf), a per-gather yield point built on a new sched
+callback (`splits = 120` per ubatch, so the per-layer switch point does exist) and HIP stream priority
+(verified applied — the device reports `least=1/greatest=-1`).  The reason is queue depth: a phase-locked
+decoder waits ~600 ms for its step because a lone queued burst schedules behind the prefill's deep kernel
+queue, while a free-running one always has work pending (42 ms).
+
+Two constraints are measured, not assumed, and both are written into the new campaign's landmines: the window
+exists **only** on a residency-deficient host-expert tier (full residency: zero gathers, two contexts
+byte-identical to one, compute-vs-compute), and **two contexts that both submit decode-band work corrupt each
+other** through the per-table, per-process `GGML_MOE_DEVREMAP` map (`=0` reads one text 3/3; a prefill+decode
+pair does not collide).  The cost is real resource sharing: ~7.7 ms of prefill per decode token against a
+10.9 ms standalone step, rising to 12.8 / 16.0 ms at arena 4000 / 3000 — the window is dearest exactly where
+it is worth most.
+
+### What moved
+
+* `wip/prefill-transfer-overlap/` -> `archive/work/prefill-transfer-overlap/` (**retired**; it answered its
+  question).  The record carries passes 1-13, the two losing patches
+  (`candidate-split-yield-and-priority.patch`), the gather probe, the `two_ctx` harness and the `smooth.py`
+  baseline table.
+* Its enabling change (a generic second `llama_context` sharing the first one's KV, `qwen35moe` included,
+  text-verified on the dense 4B and 35B-A3B) moved to the new campaign as
+  `wip/prefill-decode-arms/enabling-0001-second-context-shared-kv.patch`.
+* **`wip/prefill-decode-arms/` opened** (`wip/CAMPAIGNS.md`): one prefill arm + one decode arm in
+  `llama-server`.  First task is the hybrid model's **recurrent** state (a slot cannot cross arms without it);
+  then the server skeleton, the boundary handover with a per-request text oracle, the opt-in gate and the
+  measurements.  Nothing is implemented and nothing is in `patches/`.
+
+### The gather's `n_split`, re-measured on this tip and scoped (`TODO` #350)
+
+`moe_cache_gather_kernel`'s block count is `n_experts * n_split` with `n_split = 8`, a constant chosen for the
+**decode** band; a prefill ubatch routes essentially every expert of the table, so only 8 blocks per expert
+carry a 0.6-1 MiB copy each.  Re-measured on `923b910eb` (interleaved reps, `MOE_EXPERT_HEATMAP=load` +
+`ROCBLAS_USE_HIPBLASLT=0`, `-b 2048 -ub 2048`, the 4932-token corpus prefix):
+
+| shape | `MOE_GATHER_NSPLIT=8` | `=32` | delta |
+|---|---|---|---|
+| 1 GPU, Q8_0, auto arena (84 % residency) | 2307.9 / 2307.2 t/s | **2480.8 / 2480.8 t/s** | **+7.5 %** |
+| 1 GPU, Q4_K_M, arena 8000 MiB | 2414.6 t/s | 2470.4 t/s | +2.3 % |
+| 3 GPU `-sm tensor`, Q8_0 | 4125.8 t/s | 4141.4 t/s | +0.4 % (neutral) |
+
+Greedy text byte-identical in every pair (`572 chars sha=40e29c2b46b6`), and the change only partitions the
+same bytes across more blocks.  So it is a **1-GPU host-expert-tier win, neutral on the 3-GPU tensor split** —
+worth shipping because it never measured worse, and it is left **WAITING** on a block decision (a new block or
+a 09/12 amendment; that is the maintainer's call, not a gate outcome) plus `gate-prefill-logits.sh`,
+`gate-host-pool.sh` and `check-gpu-faults.sh`.  Candidate:
+`archive/work/prefill-transfer-overlap/candidate-gather-nsplit.patch`.
+
+## 261119.008 (r324, RELEASE v17-4f9dfa0e3-r324) -- contributor PR #335 taken in full, corrected: the MoE weighted reduction is computed without fma contraction and its fold outranks the MUL-only fold (block 10); the delivery's MoE decode text was NOT the unfused chain's text before this
+
+**Release:** `v17-4f9dfa0e3-r324`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `923b910eb`
+(the `apply-all.sh` re-cut, tree `d3babb65a`; the *working* chain tip `141ef9246` is a
+**different commit with the same tree** -- a rebase re-stamps committers, so it is never the value to record), 17 official + 1 temporary = 18 default blocks, optional
+`0100` -> `705df1213` / `0101` -> `69cfea715` (cumulative `adf514489`).  **No block created, split or
+renumbered**: one same-block amendment, **block 10** (`mmvq.cu`, `mmvq.cuh`, `mmvq-moe.cu`,
+`moe-weighted-reduction.cu/.cuh`, `common.cuh`).  Two environment variables added and one repurposed
+(`GGML_CUDA_MWR_EXACT`, `GGML_CUDA_MWR_FOLD_FIRST`, `GGML_CUDA_MWR_DEBUG`).
+
+### The finding
+
+The PR's two items are small and the second one is not cosmetic: `ENVIRONMENT.md` has said since r175 that the
+down + weighted-reduction fold sums "in `moe_weighted_reduction`'s own order **and expression**".  Both halves
+were true of the source and the identity still failed, because **HIP clang contracts `sum + (x * scale) * w` into
+an `v_fmac_f32`** — in the fold *and* in the standalone kernels it replaces — while the graph's `MUL`/`VIEW`/`ADD`
+chain rounds each multiply and each add on its own.  So the fold matched the kernel, and neither matched the
+chain: **the r323 delivery's MoE decode text was not the unfused chain's text** on qwen35moe, qwen3moe and
+gemma4, and the `-ub 512` prefill point read mean KLD **0.006613 / 96.627 %** against the fully unfused graph.
+Measured now: **0.000000 / 100.000 %**, with the unfused base logits byte-identical on both builds
+(sha256 `0a4a69973ab8…`, base PPL 7.1177) — the reference is the same object, so the divergence was entirely the
+fused paths.  The greedy text now EQUALS the chain on all three families:
+
+| arm (1 GPU, 256 tok, `prompts/prose-rdna-boosts.txt`) | r323 default | r323 unfused | r324 default |
+|---|---|---|---|
+| Qwen3.6-35B-A3B Q4_K_M | `bd111389f051` | `abed0bf40d87` | `abed0bf40d87` |
+| Qwen3-Coder-30B-A3B Q4_K_M | `553b730d2e24` | `fc94447651c1` | `fc94447651c1` |
+| gemma-4-26B-A4B Q8_0 | `63f491378b41` | `6faaaeff2903` | `6faaaeff2903` |
+| Qwen3.5-4B Q8_0 (dense, inert) | `18d8b09cd3d3` | — | `18d8b09cd3d3` |
+
+The second item is the other half of the same launch: `ggml_cuda_moe_down_fold_try_fuse` folded the weighted
+`MUL` into the down through `x_scale`, which **disqualified** the larger fold `ggml_cuda_mwr_fold_mark` had
+already armed for the same `MUL_MAT_ID`, so the reduction fell back to a second launch per MoE layer.
+`MWR FOLD` served **1 of 83** armed sites on r323 and serves **163 of 163** here (census, one graph capture of
+35B-A3B Q4_K_M; `MWR FOLD ASIDE` 163, `MWR FOLD DECLINE` 0).  tg128 **+3.3 %** (121.66/121.71 -> 125.90/125.33
+t/s), Qwen3-Coder-30B-A3B **+2.2 %**, gemma4 flat (it already took the larger fold), pp512 flat everywhere.
+
+### What was corrected before it shipped
+
+* **One knob, not two.**  The PR added `GGML_CUDA_MWR_FOLD_CONTRACT` (the fold's sum) beside `GGML_CUDA_MWR_EXACT`
+  (the kernels).  Both defaulted to exact, but `MWR_EXACT=0` alone would leave the fold exact and the kernel
+  contracted — a state no release shipped, and a bisect would blame the wrong one.  Collapsed into
+  `GGML_CUDA_MWR_EXACT`, which drives both (`fusion.red_contract = !ggml_cuda_mwr_exact()`).
+* **The stand-aside predicate was looser than the fold's** (a real, latent defect).  `mwr_fold_mark` armed from
+  the graph pattern alone, while the fold also needs `warp_size == 32`, `ne[2] == ne[3] == 1`, a contiguous down
+  output and `ne[0] <= 2*GGML_CUDA_MOE_RED_CNT-2` = 8190.  Any disagreement — CDNA's warp 64, an `n_embd` above
+  8190, an `ne[3] != 1` graph — would have made the MUL fold step aside and gained nothing.  The conditions now
+  live in `ggml_cuda_mwr_fold_serve_ok()` and are enforced at the **arming** site, so "armed implies servable" is
+  a property of the code.  Not reachable on anything this repo validates (every fleet MoE is `n_embd` 2048-2816
+  and every RDNA part is warp-32), which is exactly why it is closed by construction rather than by a gate arm.
+* **A census, because the PR had none.**  `GGML_CUDA_MWR_DEBUG` only printed when the *standalone* kernel ran,
+  and on these shapes it never does — so it read 0 in both arms and could not tell the precedence from a defect.
+  It now names the arithmetic once (`MWR EXACT exact|contracted`) and every decision (`MWR FOLD`,
+  `MWR FOLD ASIDE`, `MWR FOLD DECLINE`, plus the existing `MWR FUSED`).
+* **Two of the PR's own claims are wrong and are corrected on the PR**: its `-ub 1` decode row read 0.000000 on
+  the unpatched build and concluded "keeps an already-exact result" — that window cannot see the decode
+  difference (the text and the census can); and its "(flat, as expected: the fold already ran there)" for
+  Qwen3-30B-A3B does not generalise — on Qwen3-Coder-30B-A3B (same architecture) r323 takes the MUL fold on all
+  238 sites and r324 is +2.2 %.  Which fold wins is a per-shape property, not an architectural one.
+
+### Gates
+
+* `scripts/gate-mwr-exact.sh` (**new**, MANIFESTS gate 37): **PASS** — census (`exact`, `FOLD == ASIDE == 163`,
+  `DECLINE 0`), `default == unfused` on the MoE model *and* on the host-expert `-ncmoe` shape (the fold is one of
+  the gate-less `moe_cache_fusion_serve()` sites, §101), the `BEFORE_HASH` reproduced by the two kill switches,
+  `MWR_EXACT=0` alone as its own text, the dense arm inert.  **Negative-tested on the r323 build: 9 checks fail.**
+* `gate-prefill-logits.sh --ab "<the unfused env>"`: **PASS**, 0.000000 / 100.000 %.  On a **MoE** model against
+  an r323 base the same gate reads 0.006513 / 96.392 % (canonical), 0.006874 / 96.627 % (`-ub 512`) and
+  0.006412 / 96.588 % (3-device `-sm tensor`) — that shift IS the change, and it is a move onto the exact
+  reference.  **The canonical release point is a dense model** (`Qwen3.8/27B/Q8_0`, which this cannot reach) and
+  was re-recorded clean on build `923b910eb` (`base PPL=5.9325`, 0.000000 / 100.000 %), so
+  `fork-refresh.sh --gates` is green.  **Every MoE prefill-logit base recorded before r324 is stale**; they are
+  listed in `benchmarks/2026-11-19-mwr-exact.md`, they were left in place rather than deleted, and they must be
+  re-recorded before they are quoted.
+* `gate-host-pool.sh`: **59/59**.  `gate-moe-promise.sh`: **PASS** (`repaired == broken`, `c0e7e91d84c4` held).
+  `gate-fusion-alias-copy.sh`: **PASS** (anchor `3fab4da87774` held).
+  `gate-host-expert-text.sh`: **PASS 3/3** (informational anchor moves `319/a455bfe7267a` -> `296/3205db133b1d`).
+* `gate-server-arms.sh`: **PASS**, and it needed two repairs of its own (below).
+
+### The re-baselined gates, and one arm that stays reported
+
+`gate-server-arms.sh` (gate 24 step 5c, a *re-base* arm) was found **not reproducible** while re-recording it, and
+neither defect was this change: it never pinned `MOE_EXPERT_HEATMAP`, so every run started from the arena seed
+prior the previous run wrote back into the model's `.moe-heatmap` (r323 unpinned read `9e1a1221c30d e29d01e5edca`
+against its recorded `b337648c3ef9 b73aa781bca5`), and it fired both slots' requests **simultaneously**, so which
+slot the server admitted first was a race that selected between two states of both the text and the acceptance
+(r324 before the fix: 3 of 4 runs one state, 1 the other).  With `MOE_EXPERT_HEATMAP=load` plus a fixed-order
+stagger, each build reproduces its own numbers exactly — verified twice on r323 (`9e1a1221c30d e29d01e5edca` /
+0.69672) and on r324 (`9564942b467b 9564942b467b` / 0.69106) — and the anchors are re-recorded from the r324
+pair.  The `35b10` arm's **second slot** still moves (a fixed-*time* stagger lands at a variable point in slot 0's
+prefill), so that one arm's text is now *reported, not asserted*, with its acceptance checks — the collapse
+detector the arm exists for — unchanged; the deterministic form is `TODO` #349.
+
+`benchmarks/2026-11-19-mwr-exact.md` is the record; `GREEDY-PURITY.md` §102 is the doctrine (`INVARIANTS.md` r324).
+PR #335 is taken in full (review on the PR); its material is archived to `archive/work/mwr-exact/` as submitted.
+
+## 261119.007 (r323, RELEASE v17-4f9dfa0e3-r323) -- contributor PR #334 taken as item 1 only: an FFN's GLU may take the memory of its gate (-149.6 MiB of compute buffer, +7.0 % on the host-expert MoE decode); the PR's other two items are declined and asked for as separate PRs
+
+**Release:** `v17-4f9dfa0e3-r323`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `bdd7fc6ee`
+(the `apply-all.sh` re-cut, tree `4f94e92a0`), 17 official + 1 temporary = 18 default blocks, optional
+`0100` -> `705df1213` / `0101` -> `69cfea715` (cumulative `adf514489`).  **No block created, split or
+renumbered**: one same-block amendment, **block 00** (`ggml_op_can_inplace()` and the parent-reuse scan in
+`ggml/src/ggml-alloc.c`, plus `tests/test-alloc.cpp`).  One environment variable added (`GGML_GLU_INPLACE`,
+kill switch, default on), no kernel arithmetic touched, and **no token moved**.
+
+### The PR, and what was taken from it
+
+overdoingism's PR #334 is three unrelated changes, one commit each.  The maintainer's decision was to take
+**item 1 only** and to ask for items 2 and 3 as separate PRs with the promotion requirements spelled out
+(`TODO` #347/#348); the review with the measurements is on the PR, and the PR is closed with that pointer.
+
+* **Item 1 (taken): a GLU may take the memory of one of its inputs.**  `GGML_OP_GLU` joins
+  `ggml_op_can_inplace()`, so an FFN's gate, up and GLU output are not all live at once.
+* **Item 2 (declined for now): HIP graph replay up to 16 tokens** (`GGML_CUDA_GRAPH_MAX_TOKENS`).  At the
+  delivery's default drafting (`--spec-draft-n-max 7`, so at most an 8-row verify) it is **provably inert**:
+  the `GGML_CUDA_GRAPH_TRACE` census is identical at `=8` and `=16` (`direct=7554 replay=37482 capture=819
+  properties_changed=858` in both).  Where 9..16-row verify batches do occur (a fixed deep draft, the 4-slot
+  aligned server) the delivery's own text is not run-to-run stable above the 8-row purity band
+  (`GREEDY-PURITY.md` §11) — measured: the same binary at `--spec-draft-n-max 15` gave three different texts
+  in three runs, so "bit for bit" cannot be asserted there — and the capture count rises 138 -> 924 as each
+  distinct width needs its own graph.  It needs the multi-slot arm (whose spread is ±7 %) and a 4B arm
+  (WORKLOG 260928.003 measured verify graphs ~2.5 % slower on a 4B) before it can be judged.
+* **Item 3 (declined for now): one FA KV-group bitmap per graph evaluation** (`GGML_CUDA_FA_KQ_BLOCKS_REUSE`).
+  The mechanism is correct and was verified with a temporary census (`built=1 reused=15` in its best-case
+  shape, so every replayed decode step carries one memset + prepass instead of sixteen) — and it is worth
+  **nothing measurable here**: 31.90/31.88/31.85 t/s with the reuse against 31.83/31.86/31.86 without, at
+  ~31 ms/step.  It is also unreachable in every single-sequence arm (a single-sequence batch takes the
+  *derived* bitmap; the packed one needs a multi-sequence ubatch or the RDNA4 band at depth) and it carries two
+  lifetime defects: process-global maps keyed by a raw `ggml_backend_cuda_context *` with no erase and a
+  64 KiB `cudaMalloc` that is never freed, so a context re-created at the same address on another device
+  would reuse a foreign device's pointer.  It needs a census, that teardown, and a demonstrated win — its
+  argument is 15 removed *launches* per step, i.e. a Windows/WDDM measurement.
+
+### The rule, and why only the gate
+
+`ggml_gallocr_allocate_node()` takes the parent's block only when the layout matches (the **two-input** form;
+the one-input/split form halves `ne[0]`) and the parent has one reader and no views, so gate/up/out collapse to
+two buffers.  **Only `src[0]` is offered**: the streaming GLU kernels read both operands before writing (CPU
+`ggml_vec_*glu_*` without `restrict`, CUDA/HIP `unary_gated_op_kernel` where the same layout makes
+`i == j0 == j1`, Metal `kernel_*glu`, Vulkan/SYCL/WebGPU/OpenCL one element per invocation), so the up would be
+numerically safe there — but **CANN**'s gated GLU is a chain (`aclnn Silu` into dst, then
+`aclnnInplaceMul(dst, src1)`), which with the output on the up squares a destroyed operand and loses the gate.
+`dst == src0` there is the in-place `GGML_OP_UNARY` path every backend already runs, and an FFN's gate and up
+are symmetric, so the restriction costs nothing (it was in place for every number below).  This is the
+"other backends uninjured" half of the scope policy: the rule is shared by every backend, so the audit is
+recorded even though only the HIP and CPU paths can be run here.
+
+### Numbers (all in `benchmarks/2026-11-19-glu-inplace.md`)
+
+* Compute buffer, 27B UD-Q4_K_XL, 1 GPU, `-ub 2048 -fa 1 -c 16384`: **624.97 -> 475.37 MiB (-149.60, -23.9 %)**.
+* Greedy decode, 35B-A3B Q8_0, 2 GPU `-sm tensor -ncmoe 40 --host-experts pool`, `-n 128`, three interleaved
+  pairs: **121.6/121.6/121.7 -> 130.5/130.2/130.1 t/s (+7.0 %)**.  Dense 27B, 3 GPU `-sm tensor` + `draft-mtp n7`:
+  neutral (109.4/109.2/108.9 vs 109.2/109.2/109.0).
+* Text byte-identical ON/OFF on a dense 4B, a dense 27B (1 GPU and 3-device tensor + MTP), the 35B-A3B
+  host-expert shape and the **CPU** backend, and every hash equals the r322 build's (`b065f37593b3`,
+  `707c7bec1465`, `5d485275db6d`, `54e07e5a163c`, `1acb04bd9104`).
+* Prefill logits: **mean KLD 0.000000 / same-top-p 100.000 %** at 1 device and at 3 devices `-sm tensor`.
+
+### Correctness and gates (all green)
+
+* `scripts/gate-glu-inplace.sh` (**new**, its unit leg is `tests/test-alloc.cpp::test_glu_inplace`):
+  **PASS** — 33/33 cases, the unit leg **fails** with `GGML_GLU_INPLACE=0` (non-vacuity), the compute-buffer
+  leg prints -149.60 MiB, and both text arms are identical.  The unit case is also **negative-tested against
+  the src[0] restriction**: with the up offered, it fails at `x[2]->data != x[1]->data`.
+* `scripts/gate-prefill-logits.sh` at 1 device and `--device 0,1,2 --sm tensor`: **PASS** (0.000000 / 100.000 %
+  both), the allocator deciding which kernels a fused FFN window may run being the reason it is owed.
+* `scripts/gate-fusion-alias-copy.sh`: **PASS** — and it had to be amended, which is the one behavioural
+  interaction of this release: with the rule on, the fused `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU` window's
+  output takes the gate's memory, so it can no longer land on the dead host-expert scheduler copy and the
+  default env declines **0** classes where r322 declined 1 (`GLU<-NONE/copy@268435456`).  The two trace arms now
+  pin `GGML_GLU_INPLACE=0` (they still log the decline, so the protection is proven live wherever the rule does
+  not apply) and the default arm's count is printed rather than asserted.  Texts: `3fab4da87774` in every arm.
+* `scripts/gate-lora-fusion.sh`: **PASS** (LoRA delta survives the fused chain, declines as recorded,
+  `984e0da01c40` -> `942ef687096b` on the prefill pair).
+* `test-backend-ops -o FLASH_ATTN_EXT` on ROCm0/1/2 and CPU: **OK**, as r322.  (`test-backend-ops` cannot see
+  an allocator rule, which is why the unit case is the real op-level coverage.)
+* `scripts/gate-per-block-build.sh` (`all`, whole ladder because an EARLY block was amended):
+  **18/18 built**, 3178 s.  `scripts/validate-set.sh`: **GREEN**, tree `4f94e92a0`; optional `0100`/`0101`
+  re-verified strictly on the new tree (`705df1213` / `69cfea715` / cumulative `adf514489`).
+* Kernel journal and every run log clean (`scripts/check-gpu-faults.sh`).
+
+### What moved for a consumer
+
+`GGML_GLU_INPLACE=0` restores the pre-r323 allocator.  Nothing else: no default changed, no knob removed, no
+kernel arithmetic touched, and a same-seed run reads the same text as r322 on every shape measured.  The one
+thing to know is the gate amendment above: a run that used to show a `FUSE_TRACE ALIAS GLU<-NONE/copy@` decline
+on the default env no longer does, because the GLU no longer lands on that block.
+
+## 261119.006 (r322, RELEASE v17-4f9dfa0e3-r322) -- GitHub issue #333 CLOSED: the band's fixup period `P` is "enough blocks to fill the machine", not a flat `nsm/2`, so a tensor split that leaves a device 1 or 2 output tiles no longer idles half of it
+
+**Release:** `v17-4f9dfa0e3-r322`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `20aaa0fb6`
+(the `apply-all.sh` re-cut, tree `de717e7a5f`), 17 official + 1 temporary = 18 default blocks, optional
+`0100` -> `f5f16105f` / `0101` -> `e491fa1bb` (cumulative `54fcae875`).  **No block created, split or
+renumbered**: one same-block amendment, **block 05**
+(`ggml_cuda_fattn_band_wmma_split()` in `ggml/src/ggml-cuda/fattn-rdna.cuh` and its one call site in
+`fattn-common.cuh`).  One default moved (`P` for a device whose slice gets fewer than 4 output tiles), no
+environment variable added or removed, and no kernel arithmetic touched -- but `P` is numeric order, so the
+greedy text of every *banded* multi-device arm moves, and the record says which and by how much.
+
+### The report, and what it is
+
+@briansp2020 (their own series, FA unchanged): after rebasing onto r317 their long-context decode dropped, and
+bisecting traced it to r316's `P` change for quantized K/V (`nsm` -> `nsm/2`).  Their arm is qwen4exp
+(Qwen3.8-Flash-Next UD-IQ4_XS, head 256, GQA 12) on **2x R9700 `-sm tensor`**, q8_0 K/V, MTP `n_max 3`,
+`-c 262144`: `P` 32 beat `P` 16 by 4-9 % at ~16k-260k, with one noisy row (their ~65k) the other way, and they
+run `GGML_HIP_FA_BAND_WMMA_SPLIT=32` meanwhile.
+
+It reproduces here on the same shape (GSQ-IQ3_XXS + the shared MTP head, 2x R9700, q8_0 K/V, this box's
+`--load-mode dio --lazy-mode mlockr` in place of their `--host-experts mmap`): the new default **is** their
+`SPLIT=32` arm, cell for cell.  And the cause is not `P`'s value but what `P` multiplies.
+
+### The mechanism: the grid is `tiles x P`, and a tensor split cuts `tiles`
+
+`P` is the interleave period of the band's fixup layout and the launch is `gridDim = (tiles, P)`, where
+`tiles = ntiles_z_gqa * K->ne[2] * Q->ne[3]`.  A `-sm tensor` split cuts `K->ne[2]` (each device owns a range of
+K/V heads), so **adding devices lowers `tiles`**: qwen4exp (2 K/V heads, GQA 12) is 4 tiles per device on one
+GPU and **2 on two**; 27B (4 K/V heads) is 2/1/1 on three.  The band's 32-column block is 8 warps with a runtime
+`max_blocks_per_sm` of 3, and its measured saturation point is **2 blocks per SM** (64 blocks on gfx1201).  So
+r316's flat `P = nsm/2 = 16` is right for the 4-tile shape it was measured on (4 x 16 = 64) and wrong
+everywhere else: at 2 tiles it launches 32 blocks on 32 SMs (one per SM, a third of the machine's block slots)
+and at 1 tile 16 blocks (half the SMs idle).
+
+Re-measured per op (`test-backend-ops perf -o FLASH_ATTN_EXT`, band forced, q8_0, `us/run`, one R9700), step
+`P` 16 -> the optimum: **tiles 1** (256-dim GQA 6, 1 K/V head) 278.2 -> **138.0** (P 64) at kv 102400, 69.2 ->
+58.4 (P 32) at 16384; **tiles 2** (GQA 12, 1 head) 291.7 -> **215.0** (P 32) at 102400, 69.0 -> 65.8 at 16384;
+**tiles 4** (r316's shape) 401.4 at P 16 unchanged; **tiles 8** -> P 8 (150.0 vs 161.1 at 16384); **tiles 16** ->
+P 4 (280.3 vs 312.5).  The 128-dim class follows the same law with 4-warp blocks (tiles 2 -> P 64: 293.2 ->
+144.9 at 102400; tiles 16 -> P 16, where it already was).  Read as a rule: **`tiles x P = 2 blocks per SM`**, or
+equivalently ~16 warps in flight per SM, which for the 4-warp 128-dim row is 4 blocks per SM.
+
+In situ, 2 devices (a `rocprofv3` kernel trace at a 39485-token prompt): the band kernel itself is **103.2 ->
+82.1 us per launch per device (-20 %)**.
+
+### The fix
+
+`ggml_cuda_fattn_band_wmma_split(dst, tiles, nwarps)`:
+
+```
+P = max(nsm/2, ceil(nsm * blocks_per_sm / tiles)),   blocks_per_sm = max(1, 16 / nwarps)
+```
+
+`nsm/2` is the floor, so a device with 4 or more tiles keeps r316's value exactly and the change can only *raise*
+`P`; 2 blocks/SM for the 8-warp 256-dim row, 4 for the 4-warp 128-dim one, and 1 for the unmeasured 16-warp
+band_wide row (which therefore only moves when a device is left with a single tile).  `tiles` is a function of the
+K/V head count, the GQA ratio and `Q->ne[3]` -- never of `n_q` (`ntiles_x` is 1 for every width 1..8, in both the
+32-column and the 64-column band row) -- so this is still **one value per shape** and `GREEDY-PURITY.md` §98's
+invariant is intact: decode and its own verify reduce identically, and a per-device `P` (32/64/64 on a 3-device
+27B split) is legal because a device's attention output never crosses the split.
+
+### Correctness and gates (all green)
+
+* `test-backend-ops -o FLASH_ATTN_EXT`: **7381/7381** on ROCm0/1/2 and CPU, as r321.
+* `scripts/gate-spec-purity.sh`: **PASS** -- `plain == draft-mtp` on both caches on the 3-device `-sm tensor`
+  split where `P` is now 32/64/64 (q8_0 `c1f9d0b3f5b6`, bf16 `2fbc183348a8`), all four R/P/C/K axes pass on both
+  caches, and the width probe's flat **and** 256-cell-boundary arms are `PASS`, worst maxdiff **0**, at q8_0 and
+  bf16.  A constant-per-shape `P` is width-pure by construction, and this is the arm that shows it.
+* Deep-context purity where `P` differs from r321: 27B Q8_0 3 devices, q8_0 K/V, a 39185-token prompt, `-n 32`:
+  plain == `draft-mtp n3`, **`58439631ccc9`**.  qwen4exp 2 devices, a 39485-token prompt, `-n 32`:
+  `--spec-type none` 74.9 t/s against `draft-mtp n3` 100.3 t/s (1.34x, non-vacuous) with byte-identical text
+  **`35699210a30e`**.
+* Coherence, f16 K/V, below the band's work gate (so the change is inert there): 4B `8d89080db673`, 27B
+  `da2e2d192e21`, 35B-A3B `265c381dbc11`, 4B at `-ctk/-ctv q8_0` `8d89080db673` -- **all identical to r316/r321**.
+* `gate-prefill-logits.sh`: **mean KLD 0.000000 / same-top-p 100.000 %** (the band is decode/verify only).
+* `gate-per-block-build.sh --fast --changed-from 4262662b8`: **2/2**.  `validate-set.sh` GREEN, tree
+  `de717e7a5`.  GPU kernel journal and every run log clean.
+
+### Throughput
+
+2 devices, qwen4exp (the reporter's shape), plain decode (no speculator, so no step-mix confound): **70.3 -> 72.3
+t/s at 65k (+2.8 %)** and **66.9 -> 70.5 at 105k (+5.4 %)**.  With `draft-mtp n3` at a 128-token sample:
+**+7.5 %** at 65.7k and **+10.2 %** at 104.9k, -4.1 % at 39.5k and -2.3 % at 196.9k where the acceptance re-roll
+runs the other way (the reporter's own write-up calls their equivalent row the noisy one; a greedy speculative
+arm's token rate is `mean_len x steps/s`, and `P` moves the acceptance).
+
+3 devices, 27B Q8_0 (the delivery's own gate shape, now 2/1/1 tiles): plain decode 32k **42.4 -> 42.6 t/s
+(+0.4 %)**, 3 interleaved repeats each; `draft-mtp n3` at `-n 512` **31.5 ms/step both** (86.5 against 85.2 t/s,
+the token rate differing only by the re-roll: 188 against 191 steps for 512 tokens).  An `-n 128` reading of the
+same pair looked like -3.4 %/step; at ~45 steps one step of arithmetic resolution is 2 %, so that arm cannot
+resolve a step rate and the rule is now in `INVARIANTS.md` r322 item 5.
+
+### Issue #333 is CLOSED on this release
+
+The report's bisection was right and its `SPLIT=32` workaround becomes the default for their shape without them
+having to set anything: the reply records the reproduction, the mechanism (the grid is `tiles x P` and their two
+cards leave 2 tiles), the per-op table, the purity, and the two end-to-end arms, and notes that the arm they
+called noisy is the acceptance re-roll rather than the kernel.  The record is
+`benchmarks/2026-11-19-band-split-blocks-per-sm.md`; `TODO` #346's r316 conclusion is amended in place rather
+than replaced (its width compromise stands; its "one constant" did not).
+
 ## 261119.005 (r321, RELEASE v17-4f9dfa0e3-r321) -- GitHub issue #332 CLOSED: a gate-less MoE fusion was judged "one lane served" when its only lane was STAGED, so every single-lane fused launch stood itself down for as long as its table was staged (and the STAGED answer now owns the broken-promise repair, so no fused site has to remember it)
 
 **Release:** `v17-4f9dfa0e3-r321`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `4262662b8`

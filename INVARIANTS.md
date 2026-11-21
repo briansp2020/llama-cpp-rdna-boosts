@@ -1183,3 +1183,170 @@ Record: `WORKLOG.md` 261119.004, `GREEDY-PURITY.md` §100, `patches/README.md` b
 
 Record: `WORKLOG.md` 261119.005, `GREEDY-PURITY.md` §101, `patches/README.md` block 10, `MANIFESTS.md` gate 28,
 issue #332, `scripts/gate-moe-promise.sh`.
+
+## r322 (2026-11-19, `WORKLOG.md` 261119.006) — the band's fixup period must FILL the machine, and a tensor split's per-device tile count decides how (issue #333)
+
+1. **`gridDim = (tiles, P)`, so `P` alone does not set the block count.**  The RDNA4 band launches one block per
+   (output tile, interleave phase); `tiles = ntiles_z_gqa * K->ne[2] * Q->ne[3]` and a **`-sm tensor` split cuts
+   `K->ne[2]`** (each device owns a range of K/V heads), so adding devices *lowers* `tiles`: qwen4exp (2 K/V heads,
+   GQA 12) is 4 tiles per device on one GPU but **2 on two**, and 27B (4 K/V heads) is 2/1/1 on three.  The
+   32-column band row is an 8-warp block whose runtime `max_blocks_per_sm` is 3, and the measured saturation point
+   is **2 blocks per SM**: at r316's flat `P` 16 a 2-tile device launched 32 blocks on 32 SMs (one per SM) and a
+   1-tile device only 16 (half the SMs idle).  Symptom, per op (q8_0, `n_q` 1/4): 291.7 -> 215.0 us at 2 tiles
+   and 278.2 -> 138.0 at 1 tile (kv 102400), 69.0 -> 65.8 at 2 tiles (kv 16384), and 5-26 % in every other row.
+2. **The rule is a warps-in-flight target, and the tile count is a legal input.**  `P = max(nsm/2, ceil(nsm *
+   blocks_per_sm / tiles))`, `blocks_per_sm = max(1, 16 / nwarps)`: 2 blocks/SM for the 8-warp 256-dim row and 4
+   for the 4-warp 128-dim one, i.e. ~16 warps resident per SM.  The measured per-tile-count optima (1/2/4/8/16 ->
+   `P` 64/32/16/8/4 on the 256-dim class, 2 -> 64 on the 128-dim one) are exactly that, and `nsm/2` is the floor,
+   so a device with 4 or more tiles keeps r316's value and nothing can be lowered.  `tiles` depends on the K/V head
+   count, the GQA ratio and `Q->ne[3]` only -- `ntiles_x` is 1 for every width 1..8 -- so this is still one value
+   per shape and never keyed on `n_q` or the KV extent (`GREEDY-PURITY.md` §98.5).
+3. **A per-device `P` is fine; a per-width one is not.**  The three devices of a 27B `-sm tensor` run now take
+   `P` 32/64/64, i.e. three different summation orders inside one layer, and that is *not* an impurity: each
+   device's attention output is its own heads and never crosses a device.  What would be an impurity is decode and
+   its own verify choosing differently, and the width probe (`PASS`, worst maxdiff 0, q8_0 and bf16) plus
+   `plain == draft-mtp` on both the 3-device 27B (`58439631ccc9`) and the 2-device qwen4exp (`35699210a30e`) arms
+   are the proof that they do not.
+4. **The fixup combine is proportional to `P`, which is why "more blocks" is not free.**  Per launch on a 27B
+   trace: 8.8 us at `P` 16 -> 31.3 us at `P` 64, against an FA kernel that fell 150.4 -> 75.2 us.  The op table
+   already prices it (it times the whole op), and the 1-tile rows' optimum drifts from `P` 32 (16-32k) to `P` 64
+   (102k) as its share falls; one constant cannot follow that, and the saturation point is the compromise.
+5. **A short greedy speculative arm cannot resolve a step rate.**  `-n 128` at a mean accepted length of ~2.8 is
+   ~45 steps, so one step of arithmetic resolution is 2 %: the same 27B pair read -3.4 %/step at `-n 128` and
+   **0.0 %** at `-n 512` (31.5 ms/step both, 188 against 191 steps for 512 tokens -- the token rate differs only
+   by the acceptance re-roll).  Quote the long arm, and derive steps as `tokens - accepted` before comparing.
+
+Record: `WORKLOG.md` 261119.006, `GREEDY-PURITY.md` §98, `patches/README.md` block 05, `MANIFESTS.md` gate 05/36,
+`ENVIRONMENT.md` §8, issue #333, `benchmarks/2026-11-19-band-split-blocks-per-sm.md`.
+
+## r323 (2026-11-19, `WORKLOG.md` 261119.007) — an FFN's GLU may take its GATE, and only its gate (contributor PR #334 item 1)
+
+1. **The saving is the whole gate buffer, and the allocator's own preconditions are what make it safe to
+   take.**  `GGML_OP_GLU` in `ggml_op_can_inplace()` reuses `ggml_gallocr_allocate_node`'s existing rule --
+   same layout and exactly one reader with no views -- so nothing about the gate/up/GLU triple is special-cased:
+   the two-input form's output has the gate's layout, and the one-input (split) form halves `ne[0]` and can
+   never qualify.  Measured on Qwen3.8-27B UD-Q4_K_XL (1 GPU, `-ub 2048 -fa 1 -c 16384`): ROCm0 compute buffer
+   **624.97 -> 475.37 MiB (-149.60, -23.9 %)**, and on the host-expert MoE shape (35B-A3B Q8_0, 2 GPUs
+   `-sm tensor -ncmoe 40 --host-experts pool`) greedy decode **121.6/121.6/121.7 -> 130.5/130.2/130.1 t/s
+   (+7.0 %)** over three interleaved pairs.  A dense 27B on 3 devices `-sm tensor` with `draft-mtp n7` is
+   neutral (109.3 vs 109.2 t/s): the win is the MoE shape's, not a general decode gain.
+2. **Only `src[0]` may be offered, and CANN is why.**  Every streaming GLU kernel reads both operands before
+   writing the element at the same index (CPU `ggml_vec_*glu_*` with no `restrict`, CUDA/HIP
+   `unary_gated_op_kernel` where the same layout makes `i == j0 == j1`, Metal `kernel_*glu`, Vulkan / SYCL /
+   WebGPU / OpenCL one element per invocation), so `dst == src1` would be numerically safe on them -- but CANN's
+   gated GLU is a **chain** (`aclnn Silu` into dst, then `aclnnInplaceMul(dst, src1)`), which with `dst == src1`
+   squares a destroyed up operand and loses the gate.  `ggml_gallocr_allocate_node()` therefore stops its parent
+   scan at `src[0]` for this op; `dst == src0` is the in-place `GGML_OP_UNARY` path every backend already runs,
+   and the gate and the up are symmetric in an FFN, so the restriction costs nothing in practice.  The unit
+   case (`tests/test-alloc.cpp::test_glu_inplace`) asserts the up is never taken and is negative-tested by
+   offering both (`x[2]->data != x[1]->data` fails).
+3. **It moves no token, so the gate is the buffer and the text, not an acceptance rate.**  Same-seed greedy
+   text is byte-identical ON/OFF on a dense 4B, a dense 27B (1 GPU and 3-device `-sm tensor` + `draft-mtp`), the
+   35B-A3B host-expert shape and the CPU backend, and those hashes equal the r322 build's
+   (`b065f37593b3` / `707c7bec1465` / `5d485275db6d` / `54e07e5a163c` / `1acb04bd9104`); prefill logits are
+   bit-identical too (mean KLD 0.000000, same-top-p 100.000 %) at 1 device **and** at 3 devices `-sm tensor`.
+   The rule must therefore be judged on the compute buffer it saves (a size that stops moving means the FFN
+   layout stopped giving the gate a single reader) plus the ON/OFF text pair -- `test-backend-ops` cannot see a
+   memory-layout decision at all.
+4. **It changes which fusion windows can overlap a dead scheduler copy, so the leaf-copy gate now pins
+   `GGML_GLU_INPLACE=0` for its trace arms.**  With the rule on, the fused `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU`
+   window's output takes the gate's memory, so it can no longer land on the host-expert scheduler copy the
+   window still reads (issue #287) and `scripts/gate-fusion-alias-copy.sh` declines **0** classes on the
+   default env, where r322 declined 1 (`GLU<-NONE/copy@268435456`).  The protection is still required wherever
+   the rule does not apply (a second reader of the gate, the split form, the switch off), so the decline
+   assertion moved to the pinned arm -- which still logs it -- and the default arm's count is printed, never
+   asserted: a decline is the protection firing, so requiring zero would punish it.
+
+Record: `WORKLOG.md` 261119.007, `benchmarks/2026-11-19-glu-inplace.md`, `patches/README.md` block 00,
+`MANIFESTS.md` gate 00/37, `ENVIRONMENT.md` §1.1b, `scripts/gate-glu-inplace.sh`, PR #334.
+
+## r324 (2026-11-19, `WORKLOG.md` 261119.008) — the MoE weighted reduction is computed without fma contraction, and its fold outranks the MUL-only fold (contributor PR #335)
+
+The expert weighted reduction has two implementations of one arithmetic — the standalone
+`moe_weighted_reduction_f32_vec4`/`_f32` kernels and `mul_mat_vec_q_moe`'s `fusion.red_dst` fold — and a precedence
+rule between that fold and `ggml_cuda_moe_down_fold_try_fuse`.  Five things were learned, in the order they bit.
+
+1. **"The same expression" is not "the same arithmetic": the ROUNDING MODE is part of the claim.**  Both sites
+   accumulate `sum + (x * scale) * w`, which HIP clang contracts into `v_fmac_f32`; no unfused graph does.  So the
+   fold matched the standalone kernel exactly and **neither matched the `MUL`/`VIEW`/`ADD` chain**, and the r323
+   delivery's MoE decode text was not the chain's text on qwen35moe, qwen3moe *and* gemma4 (`bd111389f051` vs the
+   chain's `abed0bf40d87` on 35B-A3B Q4_K_M).  KLD against the fully unfused graph at `-ub 512` was
+   **0.006613 / 96.627 %**, with the unfused base logits byte-identical on both builds (sha256 `0a4a69973ab8…`,
+   base PPL 7.1177) — i.e. the reference was the same object and the divergence was entirely the fused paths.
+2. **`__fmul_rn` / `__fadd_rn` do not work; `#pragma clang fp contract(off)` does — and only in the right place.**
+   HIP lowers the intrinsics to plain ops and contracts those.  The pragma is legal only at file scope or **at the
+   start of a compound statement** (so every site opens a block for it), it needs a toolchain default of
+   `-ffp-contract=fast-honor-pragmas` (HIP clang's is; clang-CUDA's plain `fast` and nvcc both ignore it, so a
+   non-AMD backend keeps the contracted arithmetic and changes nothing), and it survives `__forceinline__` template
+   instantiation — verified in the emitted ISA (`v_fmac_f32` against `v_mul_f32` + `v_add_f32`), including through
+   a helper.
+3. **ONE knob for two implementations that replace each other.**  `GGML_CUDA_MWR_EXACT` drives both the fold's sum
+   (`fusion.red_contract = !ggml_cuda_mwr_exact()`) and the kernels (a `mwr_acc<exact>` template).  Two independent
+   switches are a trap: `EXACT=0` alone leaves the fold exact and the kernel contracted, a state no release
+   shipped, and a bisect would blame the fold.  The pair must also be *proven* to revert:
+   `GGML_CUDA_MWR_EXACT=0 GGML_CUDA_MWR_FOLD_FIRST=0` reproduces r323 bit for bit (`bd111389f051`), while
+   `EXACT=0` alone is its own third text (`0e1e59e500e8`) — which is the non-vacuity check for the knob.
+4. **A fold may only displace another where it can SERVE the node, so the predicate lives at the ARMING site.**
+   The precedence change makes `ggml_cuda_moe_down_fold_try_fuse` stand aside for an armed node, worth a launch per
+   MoE layer (`MWR FOLD` 1 of 83 armed sites on r323 → 163 of 163 here, with `MWR FOLD ASIDE` matching and
+   `MWR FOLD DECLINE` 0).  But `ggml_cuda_mwr_fold_mark` armed from the graph pattern alone, and the fold itself
+   also needs `warp_size == 32`, `ne[2] == ne[3] == 1`, a contiguous down output and
+   `ne[0] <= 2*GGML_CUDA_MOE_RED_CNT-2` = 8190.  Any disagreement (CDNA's warp 64, a large `n_embd`, an
+   `ne[3] != 1` graph) would have cost the MUL fold and bought nothing.  The conditions now live in one function,
+   `ggml_cuda_mwr_fold_serve_ok()`, enforced where the node is **armed**, so "armed implies servable" holds by
+   construction and the stand-aside site needs no copy of it.  `GGML_CUDA_MWR_FOLD_FIRST` defaults **off** outside
+   `GGML_USE_HIP` because nvcc ignores the pragma and there the fold would be the less exact of the two.
+5. **A short `-ub 1` KLD window cannot see this class; the greedy text and a census can.**  The submitter's own
+   decode row read ≈0 on the unpatched build and concluded "already exact" — while the same-seed 256-token text
+   differs from the chain's.  512 sequential token steps over 2 chunks do not accumulate what 256 greedy tokens
+   do, so `-ub 1` KLD is the wrong instrument here and the census is not optional: `GGML_CUDA_MWR_DEBUG` now prints
+   `MWR EXACT exact|contracted` once, plus `MWR FOLD` / `MWR FOLD ASIDE` / `MWR FOLD DECLINE` / `MWR FUSED`, which
+   is what makes the precedence and the arithmetic observable rather than inferred.
+
+Measured: KLD 0.006613 / 96.627 % → **0.000000 / 100.000 %**; the default text now EQUALS the fully unfused chain
+on 35B-A3B Q4_K_M, Qwen3-Coder-30B-A3B and gemma-4-26B-A4B, dense 4B unchanged (`18d8b09cd3d3`); tg128 **+3.3 %**
+on 35B-A3B Q4_K_M (121.66/121.71 → 125.90/125.33), **+2.2 %** on Qwen3-Coder-30B-A3B, flat on gemma4 (which already
+took the larger fold), pp512 flat everywhere.
+
+Two side findings, both fixed in the same change.  **The release prefill-logit base moves**: against an r323 base
+the gate now reads 0.006513 / 96.392 % (canonical), 0.006874 / 96.627 % (`-ub 512`) and 0.006412 / 96.588 %
+(3-device `-sm tensor`), so the base is re-recorded at r324 — the justification is item 1's first table, the new
+build *is* the unfused chain and the old one was not.  **`gate-server-arms.sh` was not reproducible and had two
+defects of its own**: it never pinned `MOE_EXPERT_HEATMAP`, so each run started from the prior the previous run
+wrote back into the model's `.moe-heatmap`, and it fired both slots' requests simultaneously, so the admission
+order was a race that selected between two states of both the text and the acceptance.  With
+`MOE_EXPERT_HEATMAP=load` and a fixed-order stagger each build reproduces its own numbers exactly (verified twice
+on r323 and on r324), and its anchors are re-recorded; the `35b10` arm's *second slot* still moves (a
+fixed-time stagger lands at a variable point in slot 0's prefill), so that arm's text is now reported rather than
+asserted — its acceptance checks, which are the collapse detector the arm exists for, stay hard (`TODO` #349).
+
+Record: `WORKLOG.md` 261119.008, `benchmarks/2026-11-19-mwr-exact.md`, `patches/README.md` block 10,
+`MANIFESTS.md` gate 37, `ENVIRONMENT.md` §8 (`GGML_CUDA_MWR_EXACT`, `GGML_CUDA_MWR_FOLD_FIRST`,
+`GGML_CUDA_MWR_DEBUG`), `scripts/gate-mwr-exact.sh`, `GREEDY-PURITY.md` §102, PR #335.
+
+## r325 (2026-11-20, `WORKLOG.md` 261120.002) — the MoE device gather's block count is a DECODE-band constant, and a prefill ubatch wants 4x more of them (block 09, `TODO` #350 retired)
+
+1. **`moe_cache_gather_kernel`'s parallelism is `n_experts * n_split`, and `n_split = 8` was chosen for the decode
+   band** ("~64 concurrent blocks for the usual 8 routed experts", the kernel's own comment).  A *prefill* ubatch
+   routes essentially every expert of the table (8-of-256 per token over >= 512 tokens saturates the set), so the
+   same constant leaves 8 blocks per expert, each carrying a 0.6-1 MiB copy, and the copy runs pipeline-limited
+   instead of link-limited whenever the per-call volume is small — worst exactly at HIGH residency, where the
+   non-resident set is small.  `n_split = 32` (r325, `MOE_GATHER_NSPLIT`): **+7.5 %** prefill on 1 x R9700,
+   Q8_0 at 84 % residency (2307.9/2307.2 -> 2480.8/2480.8 t/s, interleaved reps), **+2.3 %** on Q4_K_M at an
+   8000 MiB arena, **neutral (+0.4 %)** on a 3-device `-sm tensor` split.
+2. **It is a pure launch-shape change: same bytes, same order per byte, different partition across blocks.**  The
+   greedy text is byte-identical (`572 chars sha=40e29c2b46b6` on the Q8_0 arm) and
+   `gate-prefill-logits.sh --ab "MOE_GATHER_NSPLIT=8"` reads mean KLD **-0.000000 / 99.990 % top-p** — an exact
+   fallback, which is what the A/B mode exists to certify.  So a gather change does NOT owe a numerics apology;
+   it owes the fill-path gates (`gate-host-pool.sh` 59/59 here) because it sits on the same transport.
+3. **The optimum is flat, not fitted.**  The earlier sweep (2026-11-18) put Q8_0's peak at 16-32 (48 -> 2252 ms,
+   128 -> 2342 ms on the old arm) and Q4_K_M flat across 8..32, so 32 is a safe default rather than a
+   model-specific choice; `MOE_GATHER_NSPLIT` is the A/B knob and is clamped to 1..256.
+4. **Scope, stated so it is not over-read: this is a 1-GPU host-expert-tier win.**  On a 3-device `-sm tensor`
+   split each device gathers its own slice (a third of the volume) and the constant is already enough
+   parallelism, so the arm reads 4125.8 -> 4141.4 t/s (noise).  A release that quotes "+7.5 % prefill" must say
+   which shape it was measured on.
+
+Record: `WORKLOG.md` 261120.002, `benchmarks/` — measured in the retired campaign
+`archive/work/prefill-transfer-overlap/` (pass 9 + the r325 re-measurement), `patches/README.md` block 09,
+`ENVIRONMENT.md` §2.

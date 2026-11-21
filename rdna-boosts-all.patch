@@ -5554,10 +5554,48 @@ index 2341fa6c1..137bb5ea5 100644
      GGML_API void   ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
  
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 65d2bea27..20fc5dbc1 100644
+index 65d2bea27..35b07f5f6 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -418,6 +418,52 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
+@@ -18,6 +18,27 @@
+ //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
+ #define AT_PRINTF(...)
+ 
++// GGML_GLU_INPLACE (on unless 0): a GLU may take the memory of its gate, so an FFN's gate, up and GLU output
++// are not all live at once.  The allocator's own preconditions do the gating -- the parent must have the same
++// layout (the two-input form: the one-input form halves ne[0] and never qualifies) and exactly one reader with
++// no views -- so the saving is the gate buffer itself: Qwen3.8-27B UD-Q4_K_XL, 1 GPU, -ub 2048, -fa 1, -c 16384:
++// 624.97 -> 475.37 MiB of compute buffer, and +7.1 % greedy decode on the 35B-A3B host-expert shape at
++// -ncmoe 40 --host-experts pool (see WORKLOG.md r323 and benchmarks/2026-11-19-glu-inplace.md).  The kernels
++// that write a GLU read the element at index i of BOTH operands before writing index i of the output, so
++// dst == src0 is safe on the CPU (ggml_vec_*glu_*, no restrict), CUDA/HIP (unary_gated_op_kernel), Metal
++// (kernel_*glu), Vulkan/SYCL/WebGPU/OpenCL (one element per invocation).  Only the GATE is ever taken (see
++// ggml_gallocr_allocate_node): a backend whose gated GLU is a chain would break on the up operand.
++// The switch exists for A/B and bisection; text and prefill logits are bit-identical with it on and off
++// (KLD 0.000000 / same-top-p 100.000 % on the canonical point).
++static bool ggml_glu_inplace(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("GGML_GLU_INPLACE");
++        on = e == NULL || atoi(e) != 0;
++    }
++    return on != 0;
++}
++
+ // ops that return true for this function must not use restrict pointers for their backend implementations
+ bool ggml_op_can_inplace(enum ggml_op op) {
+     switch (op) {
+@@ -42,6 +63,9 @@ bool ggml_op_can_inplace(enum ggml_op op) {
+         case GGML_OP_SOFT_MAX_BACK:
+             return true;
+ 
++        case GGML_OP_GLU:
++            return ggml_glu_inplace();
++
+         default:
+             return false;
+     }
+@@ -418,6 +442,52 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
      return size;
  }
  
@@ -5610,7 +5648,7 @@ index 65d2bea27..20fc5dbc1 100644
  static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
      struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
      if (buf == NULL) {
-@@ -425,8 +471,10 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
+@@ -425,8 +495,10 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
      }
  
      for (int n = 0; n < talloc->n_chunks; n++) {
@@ -5623,7 +5661,7 @@ index 65d2bea27..20fc5dbc1 100644
          if (buf->chunks[n] == NULL) {
              ggml_vbuffer_free(buf);
              return NULL;
-@@ -488,8 +536,20 @@ struct ggml_gallocr {
+@@ -488,8 +560,20 @@ struct ggml_gallocr {
      struct node_alloc * node_allocs; // [n_nodes]
      int n_nodes;
  
@@ -5644,7 +5682,7 @@ index 65d2bea27..20fc5dbc1 100644
  };
  
  ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
-@@ -593,6 +653,42 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor
+@@ -593,6 +677,42 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor
          || ggml_gallocr_is_own(galloc, t); // tensor will be allocated by galloc
  }
  
@@ -5687,7 +5725,23 @@ index 65d2bea27..20fc5dbc1 100644
  // free the extra space at the end if the new tensor is smaller
  static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
      struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
-@@ -757,6 +853,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+@@ -627,7 +747,14 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+ 
+         // try to reuse a parent's buffer (inplace)
+         if (ggml_op_can_inplace(node->op)) {
+-            for (int i = 0; i < GGML_MAX_SRC; i++) {
++            // GGML_OP_GLU may take only its FIRST operand (the gate).  The streaming GLU kernels read both
++            // operands before they write, so either would be safe there, but the gate and the up are symmetric
++            // in an FFN and a backend whose gated GLU is a chain must not see the up aliased: CANN runs
++            // `aclnn Silu` into dst and then `aclnnInplaceMul(dst, src1)`, which would multiply the destroyed
++            // up operand by itself and lose the gate.  dst == src0 there is the in-place UNARY path CANN
++            // already runs for GGML_OP_UNARY.  See ggml_glu_inplace() above.
++            const int n_src_inplace = node->op == GGML_OP_GLU ? 1 : GGML_MAX_SRC;
++            for (int i = 0; i < n_src_inplace; i++) {
+                 struct ggml_tensor * parent = node->src[i];
+                 if (parent == NULL) {
+                     continue;
+@@ -757,6 +884,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
          }
      }
  
@@ -5729,7 +5783,7 @@ index 65d2bea27..20fc5dbc1 100644
      // allocate tensors
      for (int i = 0; i < graph->n_nodes; i++) {
          struct ggml_tensor * node = graph->nodes[i];
-@@ -820,7 +951,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+@@ -820,7 +982,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
  }
  
  static bool ggml_gallocr_reserve_n_impl(
@@ -5738,7 +5792,7 @@ index 65d2bea27..20fc5dbc1 100644
      size_t min_hash_size = graph->n_nodes + graph->n_leafs;
      // add 25% margin to avoid hash collisions
      min_hash_size += min_hash_size / 4;
-@@ -844,6 +975,10 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -844,6 +1006,10 @@ static bool ggml_gallocr_reserve_n_impl(
      // allocate in hash table
      ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
  
@@ -5749,7 +5803,7 @@ index 65d2bea27..20fc5dbc1 100644
      // set the node_allocs from the hash table
      if (galloc->n_nodes < graph->n_nodes) {
          free(galloc->node_allocs);
-@@ -920,34 +1055,51 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -920,34 +1086,51 @@ static bool ggml_gallocr_reserve_n_impl(
              }
          }
          if (realloc) {
@@ -5812,7 +5866,7 @@ index 65d2bea27..20fc5dbc1 100644
      for (int i = 0; i < galloc->n_buffers; i++) {
          sizes[i] = 0;
          for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
-@@ -956,14 +1108,49 @@ void ggml_gallocr_reserve_n_size(
+@@ -956,14 +1139,49 @@ void ggml_gallocr_reserve_n_size(
      }
  }
  
@@ -5863,7 +5917,7 @@ index 65d2bea27..20fc5dbc1 100644
  static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
      int buffer_id = tensor_alloc->buffer_id;
      assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
-@@ -1004,6 +1191,13 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
+@@ -1004,6 +1222,13 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
  }
  
  static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
@@ -5877,7 +5931,7 @@ index 65d2bea27..20fc5dbc1 100644
      if (galloc->n_nodes != graph->n_nodes) {
  #ifndef NDEBUG
          GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
-@@ -1018,6 +1212,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
+@@ -1018,6 +1243,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
          return true;
      }
  
@@ -15464,7 +15518,7 @@ index 101afeba2..8ad5e807d 100644
              ggml_cuda_swap(dst_row[col], dst_row[ixj]);
          }
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 414177308..1880d449f 100644
+index 414177308..2e14c57f9 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -39,6 +39,44 @@
@@ -17050,7 +17104,7 @@ index 414177308..1880d449f 100644
  };
  struct ggml_cuda_mm_fusion_args_device {
      const void * x_bias = nullptr;
-@@ -1469,12 +2877,61 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1469,12 +2877,63 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -17080,6 +17134,8 @@ index 414177308..1880d449f 100644
 +    const float * red_w = nullptr;
 +    const float * red_scale = nullptr;
 +    int * red_cnt = nullptr;
++    // GGML_CUDA_MWR_EXACT=0: the fold's pre-r324 fma-contracted sum (the standalone kernels contract too, one knob)
++    bool red_contract = false;
 +    // GDN alpha/beta pair in one mmvf launch (ggml_cuda_gate_beta_bf16_try_fuse): rows >= gb_nrows read gb_x2 and
 +    // write gb_dst2; rows below write softplus(v + gb_dt[row]) * gb_a[row].
 +    const void * gb_x2 = nullptr;
@@ -17112,7 +17168,7 @@ index 414177308..1880d449f 100644
  };
  
  struct ggml_cuda_kernel_launch_params {
-@@ -1543,3 +3000,49 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+@@ -1543,3 +3002,49 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
      kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
      CUDA_CHECK(cudaGetLastError());
  }
@@ -17822,7 +17878,7 @@ index 2d0b3cfea..9c99c71dd 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 6667ca400..f35ad131c 100644
+index 6667ca400..cea9ac473 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -3,11 +3,62 @@
@@ -19130,7 +19186,7 @@ index 6667ca400..f35ad131c 100644
          // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
          const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
  
-@@ -1231,7 +2300,31 @@ void launch_fattn(
+@@ -1231,7 +2300,29 @@ void launch_fattn(
          blocks_num.y = 1;
          blocks_num.z = 1;
  
@@ -19149,21 +19205,19 @@ index 6667ca400..f35ad131c 100644
 +        // band_wmma is the evaluation the group-skip gate above reads, so the two cannot disagree.
 +
 +        if (band_wmma) {
-+            // P = nsm/2 for every K/V type (r316): measured on gfx1201 (head 256, GQA 6, 4 KV heads,
-+            // nsm 32) the decode width's optimum is 16 on both type families, and the verify widths'
-+            // is 8 -- one constant cannot serve both, and the smaller one costs the decode width more
-+            // than it buys the verify.  The r133-era note that the verify cost was "flat for P 48..96
-+            // at kv 20K..200K" does not reproduce on this kernel (verify widths are monotone in P:
-+            // at kv 32768, n_q 8, q8_0, P 8/16/32/48/64/96 = 269/280/318/345/369/401 us); what is
-+            // flat is the *decode* width above P 24.  benchmarks/2026-11-18-band-fixup-period.md.
-+            const int P = ggml_cuda_fattn_band_wmma_split(dst);
++            // P (the fixup period / blocks per output tile) is a device and SHAPE constant: it targets
++            // ~16 warps in flight per SM, so it scales with how many output tiles this device's slice
++            // of the split actually gets.  See ggml_cuda_fattn_band_wmma_split; r316's flat nsm/2 is
++            // its floor (and is what the 4-tile shape it was measured on still gets).
++            // benchmarks/2026-11-18-band-fixup-period.md, benchmarks/2026-11-19-band-split-blocks-per-sm.md.
++            const int P = ggml_cuda_fattn_band_wmma_split(dst, ntiles_z_gqa * K->ne[2] * Q->ne[3], nwarps);
 +            blocks_num.x = ntiles_dst;
 +            blocks_num.y = P;
 +        } else if(use_stream_k) {
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1247,33 +2340,73 @@ void launch_fattn(
+@@ -1247,33 +2338,74 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -19196,7 +19250,8 @@ index 6667ca400..f35ad131c 100644
 +        // the search reaches at saturation (one full wave, a device/width constant) and let a shorter
 +        // cache only take FEWER parallel blocks: then every block owns at most one KV iteration (the
 +        // order is ascending KV) and the extra trailing partials are neutral, which the combine adds as
-+        // exactly 0.  The band's own kernel already pins its P (`nsm/2`, r316) for the same reason.
++        // exactly 0.  The band's own kernel already pins its P for the same reason (a device/shape
++        // constant, `ggml_cuda_fattn_band_wmma_split`, r316/r322).
 +        const bool decode_verify_band = Q->ne[1] <= 8;
 +        const int ntiles_dst_eff = decode_verify_band ? (ntiles_z_gqa * K->ne[2] * Q->ne[3]) : ntiles_dst;
 +
@@ -19255,7 +19310,7 @@ index 6667ca400..f35ad131c 100644
          }
  
          blocks_num.x = ntiles_x;
-@@ -1309,69 +2442,270 @@ void launch_fattn(
+@@ -1309,69 +2441,270 @@ void launch_fattn(
  
      GGML_ASSERT(block_dim.x % warp_size == 0);
  
@@ -23029,10 +23084,10 @@ index 000000000..93fc0641f
 +}
 diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
 new file mode 100644
-index 000000000..529e05f6c
+index 000000000..380f22ec8
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,620 @@
 +// RDNA/ROCm flash-attention predicates: the native-KV staging policy and selectors, and
 +// the RDNA4 decode/verify band (WMMA) helpers.  Split out of fattn-common.cuh (an upstream
 +// hub) so an upstream re-base collides with the predicate call points, not their bodies.
@@ -23403,16 +23458,23 @@ index 000000000..529e05f6c
 +    return 4;
 +}
 +
-+// Blocks per output tile in the band (the interleave period P, see launch_fattn).  P = nsm/2 on
-+// gfx1201 (nsm 32 -> 16), for every K/V type; GGML_HIP_FA_BAND_WMMA_SPLIT overrides it for tuning.
-+// Whatever the source, it must not depend on n_q or on the KV length, or decode and verify would
-+// split differently.  The value is a compromise the widths force: the decode width's optimum is the
-+// larger one (P 16 beats 24/32/48/64/96 at kv 8192-102400 and is 5-8 % off at 20480-32768), while
-+// the verify widths prefer half of that (P 8), and one constant has to serve both.  At a short cache
-+// the band is below every gate anyway (and a small P is *worse* there: 1024 cells, q8_0, n_q = 1,
-+// P 16 55.0 us against P 32 42.6).  Expressed as a fraction of nsm so a smaller RDNA4 part scales
-+// down with it.  Record: benchmarks/2026-11-18-band-fixup-period.md (`r316`).
-+static inline int ggml_cuda_fattn_band_wmma_split(const ggml_tensor * dst) {
++// Blocks per output tile in the band (the interleave period P, see launch_fattn).
++// GGML_HIP_FA_BAND_WMMA_SPLIT overrides it for tuning.  Whatever the source, it must not depend on n_q
++// or on the KV length, or decode and verify would split differently (GREEDY-PURITY.md §98).
++//
++// The default keeps ~16 warps in flight per SM, which is where the launch saturates: a 256-dim band
++// block is 8 warps (2 blocks/SM) and the 128-dim row's is 4 (4 blocks/SM).  `tiles` is the number of
++// OUTPUT TILES the device's own slice gets (ntiles_z_gqa x K/V heads x Q streams: a tensor split cuts
++// the K/V head count, so this is per device), and the grid is tiles x P -- so the tile count decides
++// how many blocks per tile are needed to fill the machine.  nsm/2 (16 on gfx1201) is the floor, which
++// is what a device with 4 tiles gets (4 x 16 = 64 blocks = the saturation point) and therefore keeps
++// r316's measured value for the shape it was measured on; a device that only gets 1 or 2 tiles needs
++// 64 or 32 blocks per tile instead, or most of the SMs idle (issue #333: a 2-device tensor split of
++// qwen4exp gives 2 tiles/device and P 16 cost 4-9 % against P 32).  The tile count is constant inside
++// the band (ntiles_x is 1 for n_q = 1..8), so P is still width- and extent-independent.
++// Records: benchmarks/2026-11-18-band-fixup-period.md (`r316`),
++// benchmarks/2026-11-19-band-split-blocks-per-sm.md (`r322`).
++static inline int ggml_cuda_fattn_band_wmma_split(const ggml_tensor * dst, const int tiles, const int nwarps) {
 +    GGML_UNUSED(dst);
 +    static const int env_split = []() {
 +        const char * env = getenv("GGML_HIP_FA_BAND_WMMA_SPLIT");
@@ -23423,7 +23485,13 @@ index 000000000..529e05f6c
 +        return env_split;
 +    }
 +    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
-+    return std::max(2, nsm/2);
++    // blocks per SM that keep ~16 warps resident: 2 for the 8-warp 256-dim row, 4 for the 4-warp
++    // 128-dim one, 1 for the 16-warp wide row (which therefore keeps nsm/2 unless a device gets < 2
++    // tiles) -- only two of those are measured, so the unmeasured one stays at r316's value.
++    const int bps     = std::max(1, 16 / std::max(1, nwarps));
++    const int ntiles  = std::max(1, tiles);
++    const int need    = (nsm*bps + ntiles - 1) / ntiles;
++    return std::max(std::max(2, nsm/2), need);
 +}
 +
 +// With q8_0 K and V the band launches a kernel variant that fetches the raw K/V bytes ahead into registers
@@ -64825,10 +64893,10 @@ index 000000000..a2f3c24de
 +    }
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
 new file mode 100644
-index 000000000..cbde50413
+index 000000000..1b954bfa6
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
-@@ -0,0 +1,457 @@
+@@ -0,0 +1,471 @@
 +#include "mmvq-moe.cuh"
 +#include "mmvq-vecdot.cuh"
 +#include "mmvq.cuh"
@@ -65060,12 +65128,26 @@ index 000000000..cbde50413
 +                if ((int) threadIdx.x < rows_valid) {
 +                    const int   r  = row0 + threadIdx.x;
 +                    const float s0 = fusion.red_scale != nullptr ? fusion.red_scale[0] : 1.0f;
-+                    float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
-+                    for (int e = 1; e < (int) nchannels_dst; ++e) {
-+                        const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
-+                        sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                    // This sum must be moe_weighted_reduction's own order AND expression: contracted, HIP clang
++                    // turns `sum + (x * scale) * w` into an fma and the fold stops matching the graph's MUL + ADD
++                    // chain (KLD 0.0021 against it on Qwen3-30B-A3B decode).  fusion.red_contract
++                    // (GGML_CUDA_MWR_EXACT=0) is the pre-r324 sum, and it contracts the standalone kernels too.
++                    if (!fusion.red_contract) {
++#pragma clang fp contract(off)
++                        float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
++                        for (int e = 1; e < (int) nchannels_dst; ++e) {
++                            const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
++                            sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                        }
++                        fusion.red_dst[r] = sum;
++                    } else {
++                        float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
++                        for (int e = 1; e < (int) nchannels_dst; ++e) {
++                            const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
++                            sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                        }
++                        fusion.red_dst[r] = sum;
 +                    }
-+                    fusion.red_dst[r] = sum;
 +                }
 +                if (threadIdx.x == 0) {
 +                    *cnt = 0;
@@ -66144,19 +66226,20 @@ index 000000000..a78472231
 +// K-split kernel).  `GGML_CUDA_WMMA_MMVQ` is the contributor's environment alias and wins when it is set.
 +void ggml_cuda_mmvq_wmma_set_min_cols(int n);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index c6d895db4..535ea76cc 100644
+index c6d895db4..ca9f64aa1 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1,4 +1,8 @@
+@@ -1,4 +1,9 @@
  #include "mmvq.cuh"
 +#include "mmvq-wmma.cuh"        // the verify-band WMMA iu8 family (block 07, opt-in: --wmma-verify)
 +#include "graph.cuh"            // ggml_cuda_stream_context is defined there (the concurrent-region guard)
 +#include "gdn-conv.cuh"
 +#include "moe-expert-cache.h"   // Phase 1b: moe_cache_enabled/moe_cache_get_cold (the UVA cold seam)
++#include "moe-weighted-reduction.cuh"   // ggml_cuda_mwr_exact: the reduction's ONE arithmetic knob
  #include "quantize.cuh"
  #include "unary.cuh"
  #include "vecdotq.cuh"
-@@ -31,63 +35,8 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
+@@ -31,63 +36,8 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
  }
  #endif
  
@@ -66222,7 +66305,7 @@ index c6d895db4..535ea76cc 100644
  
  enum mmvq_parameter_table_id {
      MMVQ_PARAMETERS_GENERIC = 0,
-@@ -95,16 +44,26 @@ enum mmvq_parameter_table_id {
+@@ -95,16 +45,26 @@ enum mmvq_parameter_table_id {
      MMVQ_PARAMETERS_GCN,
      MMVQ_PARAMETERS_RDNA2,
      MMVQ_PARAMETERS_RDNA3_0,
@@ -66251,7 +66334,7 @@ index c6d895db4..535ea76cc 100644
      return MMVQ_PARAMETERS_RDNA2;
  #elif defined(GCN) || defined(CDNA)
      return MMVQ_PARAMETERS_GCN;
-@@ -117,6 +76,18 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -117,6 +77,18 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
  #endif
  }
  
@@ -66270,7 +66353,7 @@ index c6d895db4..535ea76cc 100644
  static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
      if (GGML_CUDA_CC_IS_RDNA4(cc)) {
          return MMVQ_PARAMETERS_RDNA4;
-@@ -124,7 +95,13 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+@@ -124,7 +96,13 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
      if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
          return MMVQ_PARAMETERS_RDNA3_0;
      }
@@ -66285,7 +66368,7 @@ index c6d895db4..535ea76cc 100644
          return MMVQ_PARAMETERS_RDNA2;
      }
      if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
-@@ -267,7 +244,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -267,7 +245,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
          case GGML_TYPE_Q3_K:    return 4;
          case GGML_TYPE_Q4_0:    return 7;
          case GGML_TYPE_Q4_1:    return 7;
@@ -66294,7 +66377,7 @@ index c6d895db4..535ea76cc 100644
          case GGML_TYPE_Q5_0:    return 7;
          case GGML_TYPE_Q5_1:    return 7;
          case GGML_TYPE_Q5_K:    return 5;
-@@ -277,8 +254,28 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -277,8 +255,28 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
      }
  }
  
@@ -66324,7 +66407,7 @@ index c6d895db4..535ea76cc 100644
      // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
      if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
          cc = ggml_cuda_highest_compiled_arch(cc);
-@@ -294,24 +291,38 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+@@ -294,24 +292,38 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
      // AMD
      if (GGML_CUDA_CC_IS_AMD(cc)) {
          if (GGML_CUDA_CC_IS_RDNA4(cc)) {
@@ -66369,7 +66452,7 @@ index c6d895db4..535ea76cc 100644
  bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
      if (!ggml_is_quantized(type)) {
          return false;
-@@ -428,15 +439,19 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+@@ -428,15 +440,19 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
  template <ggml_type type>
  static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
  #if defined(RDNA4)
@@ -66395,7 +66478,7 @@ index c6d895db4..535ea76cc 100644
  #elif !defined(GGML_USE_MUSA) && (__CUDA_ARCH__ == GGML_CUDA_CC_PASCAL || __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
      return MMVQ_MAX_BATCH_SIZE;
  #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
-@@ -446,7 +461,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+@@ -446,7 +462,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
  #endif
  }
  
@@ -66404,7 +66487,7 @@ index c6d895db4..535ea76cc 100644
      if (table_id == MMVQ_PARAMETERS_GENERIC) {
          switch (ncols_dst) {
              case 1:
-@@ -479,6 +494,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+@@ -479,6 +495,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                  return 1;
          }
      }
@@ -66417,7 +66500,7 @@ index c6d895db4..535ea76cc 100644
      if (table_id == MMVQ_PARAMETERS_RDNA4) {
          // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
          // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
-@@ -572,6 +593,19 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+@@ -572,6 +594,19 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
          }
          return generic;
      }
@@ -66437,7 +66520,7 @@ index c6d895db4..535ea76cc 100644
      return 1;
  }
  
-@@ -590,6 +624,28 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
+@@ -590,6 +625,28 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
  }
  
  static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
@@ -66466,7 +66549,7 @@ index c6d895db4..535ea76cc 100644
      if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
          switch (ncols_dst) {
              case 1:
-@@ -615,7 +671,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
+@@ -615,7 +672,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
      return 1;
  }
  
@@ -66479,7 +66562,7 @@ index c6d895db4..535ea76cc 100644
  __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
  static __global__ void mul_mat_vec_q(
          const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-@@ -631,10 +691,10 @@ static __global__ void mul_mat_vec_q(
+@@ -631,10 +692,10 @@ static __global__ void mul_mat_vec_q(
  
      constexpr int qk  = ggml_cuda_type_traits<type>::qk;
      constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -66492,7 +66575,7 @@ index c6d895db4..535ea76cc 100644
      constexpr int warp_size = ggml_cuda_get_physical_warp_size();
  
      constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
-@@ -642,22 +702,15 @@ static __global__ void mul_mat_vec_q(
+@@ -642,22 +703,15 @@ static __global__ void mul_mat_vec_q(
      const     int tid = warp_size*threadIdx.y + threadIdx.x;
      const     int row0 = rows_per_cuda_block*blockIdx.x;
      const     int blocks_per_row_x = ncols_x / qk;
@@ -66517,7 +66600,7 @@ index c6d895db4..535ea76cc 100644
      channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
      sample_dst = blockIdx.z;
  
-@@ -669,11 +722,17 @@ static __global__ void mul_mat_vec_q(
+@@ -669,11 +723,17 @@ static __global__ void mul_mat_vec_q(
      bool use_gate_bias = false;
      bool use_scale = false;
      bool use_gate_scale = false;
@@ -66535,7 +66618,7 @@ index c6d895db4..535ea76cc 100644
      ggml_glu_op active_glu;
      float glu_limit = 0.0f;
  
-@@ -681,17 +740,32 @@ static __global__ void mul_mat_vec_q(
+@@ -681,17 +741,32 @@ static __global__ void mul_mat_vec_q(
          use_gate      = fusion.gate      != nullptr;
          use_bias      = fusion.x_bias    != nullptr;
          use_gate_bias = fusion.gate_bias != nullptr && use_gate;
@@ -66569,7 +66652,7 @@ index c6d895db4..535ea76cc 100644
      }
  
  
-@@ -719,13 +793,11 @@ static __global__ void mul_mat_vec_q(
+@@ -719,13 +794,11 @@ static __global__ void mul_mat_vec_q(
                      gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
                  }
              }
@@ -66588,7 +66671,7 @@ index c6d895db4..535ea76cc 100644
              }
          }
      }
-@@ -737,61 +809,54 @@ static __global__ void mul_mat_vec_q(
+@@ -737,61 +810,54 @@ static __global__ void mul_mat_vec_q(
      const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
      const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
  
@@ -66685,7 +66768,7 @@ index c6d895db4..535ea76cc 100644
                      }
                  }
              }
-@@ -811,236 +876,244 @@ static __global__ void mul_mat_vec_q(
+@@ -811,236 +877,244 @@ static __global__ void mul_mat_vec_q(
          for (int i = 0; i < rows_per_cuda_block; ++i) {
  #pragma unroll
              for (int l = 0; l < nwarps-1; ++l) {
@@ -67105,7 +67188,7 @@ index c6d895db4..535ea76cc 100644
  static void mul_mat_vec_q_switch_fusion(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
          const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
-@@ -1051,11 +1124,12 @@ static void mul_mat_vec_q_switch_fusion(
+@@ -1051,11 +1125,12 @@ static void mul_mat_vec_q_switch_fusion(
          const uint32_t ids_stride, cudaStream_t stream) {
  
      const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
@@ -67120,7 +67203,7 @@ index c6d895db4..535ea76cc 100644
                   vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                   channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                   sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-@@ -1066,45 +1140,89 @@ static void mul_mat_vec_q_switch_fusion(
+@@ -1066,45 +1141,89 @@ static void mul_mat_vec_q_switch_fusion(
      GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
  
      const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -67238,7 +67321,7 @@ index c6d895db4..535ea76cc 100644
  template <ggml_type type>
  static void mul_mat_vec_q_switch_ncols_dst(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-@@ -1116,7 +1234,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1116,7 +1235,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
          const int ids_stride, cudaStream_t stream) {
  
      GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
@@ -67249,7 +67332,7 @@ index c6d895db4..535ea76cc 100644
  
      const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
      const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
-@@ -1132,7 +1252,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1132,7 +1253,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
      // How the K loop divides up at the baseline block width, both decisions below use these.
      constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
      constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
@@ -67258,7 +67341,7 @@ index c6d895db4..535ea76cc 100644
      const int     blocks_per_row_x      = ncols_x / qk;
      const int     blocks_per_iter_1warp = vdr * warp_size / qi;
  
-@@ -1195,8 +1315,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1195,8 +1316,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
          return idle * 8 <= iters_wide * 2;
      };
  
@@ -67276,7 +67359,7 @@ index c6d895db4..535ea76cc 100644
          mul_mat_vec_q_moe_launch<type>(
              vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
              stride_row_x, stride_col_y, stride_col_dst,
-@@ -1206,92 +1333,297 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1206,92 +1334,297 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -67644,7 +67727,7 @@ index c6d895db4..535ea76cc 100644
          } break;
          default:
              GGML_ABORT("fatal error");
-@@ -1469,21 +1801,24 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1469,21 +1802,24 @@ void ggml_cuda_mul_mat_vec_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  
@@ -67673,7 +67756,7 @@ index c6d895db4..535ea76cc 100644
  
          if (fusion->shared_up) {
              GGML_ASSERT(ids && fusion->gate && fusion->shared_gate && fusion->shared_dst);
-@@ -1521,9 +1856,23 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1521,9 +1857,23 @@ void ggml_cuda_mul_mat_vec_q(
          if (fusion->x_scale) {
              GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
              GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
@@ -67698,7 +67781,7 @@ index c6d895db4..535ea76cc 100644
          if (fusion->gate_scale) {
              GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
              GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
-@@ -1532,10 +1881,90 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1532,10 +1882,92 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -67768,14 +67851,16 @@ index c6d895db4..535ea76cc 100644
 +    }
 +
 +    // MoE down + weighted reduction fold, armed by ggml_cuda_mwr_fold_mark for this MUL_MAT_ID
-+    if (ids && ctx.mwr_fold_experts == dst && ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
++    if (ids && ctx.mwr_fold_experts == dst && ggml_cuda_mwr_fold_serve_ok(ctx, dst) &&
 +            fusion_local.gate == nullptr && fusion_local.shared_up == nullptr &&
-+            fusion_local.x_bias == nullptr && fusion_local.x_scale == nullptr && dst->ne[2] == 1 && dst->ne[3] == 1 &&
-+            ggml_is_contiguous(dst) && dst->ne[0] <= 2*GGML_CUDA_MOE_RED_CNT - 2) {
++            fusion_local.x_bias == nullptr && fusion_local.x_scale == nullptr) {
 +        fusion_local.red_dst   = (float *) ctx.mwr_fold_dst->data;
 +        fusion_local.red_w     = (const float *) ctx.mwr_fold_weights->data;
 +        fusion_local.red_scale = ctx.mwr_fold_scale ? (const float *) ctx.mwr_fold_scale->data : nullptr;
 +        fusion_local.red_cnt   = ctx.moe_red_counters();
++        // the reduction's arithmetic is ONE knob: the fold must compute what the kernel it replaces computes
++        fusion_local.red_contract = !ggml_cuda_mwr_exact();
++        if (ggml_cuda_mwr_debug()) GGML_LOG_INFO("MWR FOLD %s\n", dst->name);
 +        ctx.mwr_done_graph = ctx.mwr_fold_graph;
 +        ctx.mwr_done_idx   = ctx.mwr_fold_idx;
      }
@@ -67791,7 +67876,7 @@ index c6d895db4..535ea76cc 100644
          const size_t size_data  = ggml_nbytes(src0);
          const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
          if (size_alloc > size_data) {
-@@ -1546,12 +1975,27 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1546,12 +1978,27 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -67825,7 +67910,7 @@ index c6d895db4..535ea76cc 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1576,13 +2020,610 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1576,13 +2023,610 @@ void ggml_cuda_mul_mat_vec_q(
  
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
@@ -68438,7 +68523,7 @@ index c6d895db4..535ea76cc 100644
  void ggml_cuda_op_mul_mat_vec_q(
      ggml_backend_cuda_context & ctx,
      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-@@ -1613,3 +2654,1131 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1613,3 +2657,1154 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }
@@ -69270,6 +69355,13 @@ index c6d895db4..535ea76cc 100644
 +
 +// MoE down fold: ffn_moe_weighted = moe_down * topk_weights.  Fold the MUL into the matmul epilogue
 +// via the x_scale_channel_dst path.  Returns 1 when fused.  GGML_CUDA_DISABLE_MOE_DOWN_FOLD=1 off.
++bool ggml_cuda_mwr_fold_serve_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
++    return ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
++           dst->ne[2] == 1 && dst->ne[3] == 1 &&
++           ggml_is_contiguous(dst) &&
++           dst->ne[0] <= 2*GGML_CUDA_MOE_RED_CNT - 2;
++}
++
 +int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
 +    static const bool disable_moe_down_fold = [] { const char * e = getenv("GGML_CUDA_DISABLE_MOE_DOWN_FOLD"); return e != nullptr && std::atoi(e); }();
 +    if (disable_moe_down_fold || i + 1 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
@@ -69277,6 +69369,22 @@ index c6d895db4..535ea76cc 100644
 +    }
 +    ggml_tensor * mm_node  = cgraph->nodes[i];
 +    ggml_tensor * mul_node = cgraph->nodes[i + 1];
++
++    // The down + weighted-reduction fold covers this MUL and the reduction's ADDs in one launch; folding only the
++    // MUL here sets x_scale, which disqualifies that fold and leaves the reduction to a second launch per MoE
++    // layer.  ggml_cuda_mwr_fold_mark only ARMS a node ggml_cuda_mwr_fold_serve_ok() answers yes for, so an armed
++    // node really is one the reduction fold can serve -- standing aside here can never trade a fold for nothing.
++    // GGML_CUDA_MWR_FOLD_FIRST=0: the old precedence (default off outside HIP: nvcc ignores the fold sum's
++    // `#pragma clang fp contract(off)`, so there the fold would be the LESS exact of the two; =1 turns it on).
++#if defined(GGML_USE_HIP)
++    static const bool mwr_fold_first = [] { const char * e = getenv("GGML_CUDA_MWR_FOLD_FIRST"); return e == nullptr || atoi(e) != 0; }();
++#else
++    static const bool mwr_fold_first = [] { const char * e = getenv("GGML_CUDA_MWR_FOLD_FIRST"); return e != nullptr && atoi(e) != 0; }();
++#endif
++    if (mwr_fold_first && ctx.mwr_fold_experts == mm_node) {
++        if (ggml_cuda_mwr_debug()) GGML_LOG_INFO("MWR FOLD ASIDE %s\n", mm_node->name);
++        return 0;
++    }
 +
 +    const int out_nodes[] = { i + 1 };
 +    if (mul_node->op == GGML_OP_MUL &&
@@ -69571,7 +69679,7 @@ index c6d895db4..535ea76cc 100644
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
-index 5605bf7a4..711fb1651 100644
+index 5605bf7a4..4aef754a5 100644
 --- a/ggml/src/ggml-cuda/mmvq.cuh
 +++ b/ggml/src/ggml-cuda/mmvq.cuh
 @@ -1,6 +1,11 @@
@@ -69586,7 +69694,7 @@ index 5605bf7a4..711fb1651 100644
  
  bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
  
-@@ -16,3 +21,56 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -16,3 +21,61 @@ void ggml_cuda_op_mul_mat_vec_q(
      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
      const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
      const int64_t src1_padded_row_size, cudaStream_t stream);
@@ -69636,6 +69744,11 @@ index 5605bf7a4..711fb1651 100644
 +bool ggml_cuda_gdn_epi_enabled();
 +int ggml_cuda_gdn_epi_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 +int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++// The down + weighted-reduction fold's NODE-level serve conditions (mmvq-moe.cu's `fusion.red_dst` store).  Anything
++// that stands aside for that fold must ask THIS predicate: ggml_cuda_mwr_fold_mark arms from the graph pattern
++// alone, so a looser test in moe_down_fold_try_fuse would hand back its own fold for a node the reduction fold
++// cannot serve (a warp-64 device, n_embd above the counter span, a non-contiguous down output, ne[3] != 1).
++bool ggml_cuda_mwr_fold_serve_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
 +
 +int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 +int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
@@ -69646,10 +69759,10 @@ index 5605bf7a4..711fb1651 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..2a43303cc
+index 000000000..08cc946e9
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,13738 @@
+@@ -0,0 +1,13753 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -79766,8 +79879,23 @@ index 000000000..2a43303cc
 +    const int64_t head_pad = expert_bytes < 512 ? (int64_t) expert_bytes : 512;
 +    device_guard dg(device);
 +    const int threads = 256;
-+    // 8 chunks/expert -> ~64 concurrent blocks for the usual 8 routed experts (see the kernel comment).
-+    const int n_split = 8;
++    // Chunks per expert.  The block count is `n_experts * n_split`, and 8 was chosen for the DECODE band's
++    // shape ("~64 concurrent blocks for the usual 8 routed experts", see the kernel comment).  A PREFILL
++    // ubatch routes essentially every expert of the table, so the same constant leaves only 8 blocks per
++    // expert, each carrying a 0.6-1 MiB copy, and the copy is then pipeline-limited rather than
++    // link-limited wherever the per-call volume is small (the high-residency arena).  Measured (r325,
++    // 1 x R9700, gfx1201, `-b 2048 -ub 2048`, a 4932-token prompt, interleaved reps): Q8_0 at 84 %
++    // residency 2307.9/2307.2 -> 2480.8/2480.8 t/s (+7.5 %), Q4_K_M at an 8000 MiB arena 2414.6 -> 2470.4
++    // (+2.3 %), and NEUTRAL on a 3-device `-sm tensor` split (4125.8 -> 4141.4, +0.4 %); greedy text is
++    // byte-identical (`572 chars sha=40e29c2b46b6`) because this only partitions the same bytes across more
++    // blocks.  32 is within noise of each arm's best, so it is the default; `MOE_GATHER_NSPLIT` overrides
++    // the launch shape (8 restores the pre-r325 value for an A/B).
++    static const int g_gather_nsplit = [] {
++        const char * e = getenv("MOE_GATHER_NSPLIT");
++        const int v = e != nullptr && e[0] != '\0' ? atoi(e) : 32;
++        return v < 1 ? 1 : (v > 256 ? 256 : v);
++    }();
++    const int n_split = g_gather_nsplit;
 +    // The finite-head guard MUST run BEFORE the gather: the gather then overwrites every routed slot's
 +    // head with real data, so only the non-routed slots keep the zero (which is all the finite-byte
 +    // guard needs).  Launching it after the gather zeroes the routed experts' own first bytes and
@@ -83918,13 +84046,14 @@ index 000000000..31d0fd4ef
 +void moe_cache_selftest();         // synthetic arena fill/verify
 +void moe_cache_report();           // hit/miss/fill/eviction summary
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
-index 11ec58497..bcf732500 100644
+index 11ec58497..d022a5097 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
 +++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
-@@ -1,5 +1,190 @@
+@@ -1,5 +1,223 @@
  #include "moe-weighted-reduction.cuh"
 +#include "ggml-moe-weighted-reduction.h"
 +#include "mmb.cuh"
++#include "mmvq.cuh"   // ggml_cuda_mwr_fold_serve_ok: the fold's own node conditions
  
 +// HIP's float4 is a struct, and __builtin_nontemporal_load/_store only accept builtin scalar or
 +// vector types, so use an ext_vector_type view of the same 16 bytes for the streaming access.
@@ -83935,11 +84064,42 @@ index 11ec58497..bcf732500 100644
 +// -40 ms on this kernel at gfx1151 pp8192 (session 14).
 +typedef float moe_nt_f4 __attribute__((ext_vector_type(4)));
 +
++// The reduction's arithmetic, one knob (see moe-weighted-reduction.cuh).  Reading it also names the arm under
++// GGML_CUDA_MWR_DEBUG, so a census can never grade an arm the run did not take.
++bool ggml_cuda_mwr_exact() {
++    static const bool exact = [] {
++        const char * e = getenv("GGML_CUDA_MWR_EXACT");
++        const bool   on = e == nullptr || atoi(e) != 0;
++        if (getenv("GGML_CUDA_MWR_DEBUG") != nullptr) {
++            GGML_LOG_INFO("MWR EXACT %s\n", on ? "exact" : "contracted");
++        }
++        return on;
++    }();
++    return exact;
++}
++
++// sum + (x * scale) * w.  exact: no fma contraction, i.e. the graph's MUL (expert x weight) and each ADD of the
++// reduction round on their own, as the unfused MUL / VIEW / ADD chain does (HIP clang contracts the plain
++// expression, and contracted the reduction read KLD 0.0035-0.0082 against that chain on Qwen3.6-35B-A3B /
++// Qwen3-30B-A3B prefill); the down + reduction fold (mmvq-moe.cu) computes the same.  !exact: the old expression.
++// The pragma needs HIP clang's default -ffp-contract=fast-honor-pragmas; under plain `fast` (clang-CUDA) or nvcc
++// both variants compile the same, i.e. non-HIP backends keep their existing arithmetic either way.
++template <bool exact>
++static __device__ __forceinline__ float mwr_acc(const float sum, const float x, const float scale, const float w) {
++    if constexpr (exact) {
++#pragma clang fp contract(off)
++        return sum + (x * scale) * w;
++    } else {
++        return sum + (x * scale) * w;
++    }
++}
++
 +// float4 quad variant: only valid when every expert row starts 16B-aligned, i.e. when
 +// n_embd % 4 == 0 (checked by the launcher). Real models have n_embd % 4 == 0, so the
 +// aligned path below covers them unchanged; the scalar kernel is the fallback for
 +// n_embd % 4 != 0, where a vectorized kernel could neither cover the trailing 1-3
 +// columns nor assume per-row alignment.
++template <bool exact>
 +static __global__ void moe_weighted_reduction_f32_vec4(const float * __restrict__ experts,
 +                                                       const float * __restrict__ expert_scale,
 +                                                       const float * __restrict__ weights,
@@ -83971,10 +84131,10 @@ index 11ec58497..bcf732500 100644
 +        const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
 +        const moe_nt_f4 e   = __builtin_nontemporal_load(reinterpret_cast<const moe_nt_f4 *>(experts + row * n_embd + col));
 +        const float   w     = weights[row];
-+        sum.x += (e[0] * scale) * w;
-+        sum.y += (e[1] * scale) * w;
-+        sum.z += (e[2] * scale) * w;
-+        sum.w += (e[3] * scale) * w;
++        sum.x = mwr_acc<exact>(sum.x, e[0], scale, w);
++        sum.y = mwr_acc<exact>(sum.y, e[1], scale, w);
++        sum.z = mwr_acc<exact>(sum.z, e[2], scale, w);
++        sum.w = mwr_acc<exact>(sum.w, e[3], scale, w);
 +    }
 +    reinterpret_cast<float4 *>(dst + token * n_embd + col)[0] = sum;
 +}
@@ -84109,10 +84269,11 @@ index 11ec58497..bcf732500 100644
 +}
 +
 +// scalar kernel, bounds-checked per column (upstream body): correct for any n_embd.
++template <bool exact>
  static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
                                                    const float * __restrict__ expert_scale,
                                                    const float * __restrict__ weights,
-@@ -14,12 +199,12 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
+@@ -14,12 +232,12 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
  
      const uint64_t first_row   = (uint64_t) token * n_expert_used;
      const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
@@ -84123,26 +84284,39 @@ index 11ec58497..bcf732500 100644
          const uint64_t row   = first_row + expert;
          const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
 -        sum += (experts[row * n_embd + col] * scale) * weights[row];
-+        sum += (__builtin_nontemporal_load(experts + row * n_embd + col) * scale) * weights[row];
++        sum = mwr_acc<exact>(sum, __builtin_nontemporal_load(experts + row * n_embd + col), scale, weights[row]);
      }
      dst[token * n_embd + col] = sum;
  }
-@@ -33,33 +218,165 @@ static void launch_moe_weighted_reduction(const float * experts,
+@@ -32,34 +250,192 @@ static void launch_moe_weighted_reduction(const float * experts,
+                                           int64_t       n_tokens,
                                            int           n_expert_used,
                                            cudaStream_t  stream) {
++    const bool exact = ggml_cuda_mwr_exact();
      constexpr int threads = 256;
 -    const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
 -    moe_weighted_reduction_f32
 -        <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++    // both instantiations are kept so the arm is a runtime choice (one process can A/B it)
 +    if (n_embd % 4 == 0) {
 +        const int64_t n_embd4 = n_embd / 4;
 +        const dim3 blocks(n_tokens, (n_embd4 + threads - 1) / threads, 1);
-+        moe_weighted_reduction_f32_vec4
-+            <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        if (exact) {
++            moe_weighted_reduction_f32_vec4<true>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        } else {
++            moe_weighted_reduction_f32_vec4<false>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        }
 +    } else {
 +        const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
-+        moe_weighted_reduction_f32
-+            <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        if (exact) {
++            moe_weighted_reduction_f32<true>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        } else {
++            moe_weighted_reduction_f32<false>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        }
 +    }
  }
  
@@ -84216,6 +84390,14 @@ index 11ec58497..bcf732500 100644
      CUDA_CHECK(cudaGetLastError());
  }
 +
++// GGML_CUDA_MWR_DEBUG: the fold census.  FOLD = the mmvq launch wrote the reduction; FOLD ASIDE = the MUL-only down
++// fold stepped back for it; FOLD DECLINE = the pattern matched but the fold cannot serve the node (the MUL fold was
++// NOT asked to step back); FUSED = the standalone reduction kernel ran.
++bool ggml_cuda_mwr_debug() {
++    static const bool on = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
++    return on;
++}
++
 +// MoE weighted expert reduction (the MUL over the expert weights): returns the number of graph
 +// nodes to skip when fused, 0 otherwise.  GGML_CUDA_DISABLE_MWR=1 turns it off.
 +int ggml_cuda_moe_weighted_reduction_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
@@ -84224,7 +84406,6 @@ index 11ec58497..bcf732500 100644
 +        return 0;
 +    }
 +    ggml_moe_weighted_reduction_match match;
-+    static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
 +    if (!ggml_match_moe_weighted_reduction(cgraph, i, match)) {
 +        return 0;
 +    }
@@ -84258,7 +84439,7 @@ index 11ec58497..bcf732500 100644
 +        ctx.mwr_done_idx   = -1;
 +        return count - 1;
 +    }
-+    if (mwr_dbg2) GGML_LOG_INFO("MWR FUSED %s\n", cgraph->nodes[i]->name);
++    if (ggml_cuda_mwr_debug()) GGML_LOG_INFO("MWR FUSED %s\n", cgraph->nodes[i]->name);
 +    ggml_cuda_op_moe_weighted_reduction(ctx, match.experts, match.expert_scale, match.weights, match.dst, merge);
 +    return count - 1;
 +}
@@ -84269,6 +84450,7 @@ index 11ec58497..bcf732500 100644
 +void ggml_cuda_mwr_fold_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
 +    static const bool on = [] { const char * e = getenv("GGML_CUDA_MWR_FOLD"); return e == nullptr || atoi(e) != 0; }();
 +    static const bool disable_mwr = [] { const char * e = getenv("GGML_CUDA_DISABLE_MWR"); return e != nullptr && std::atoi(e); }();
++    (void) ggml_cuda_mwr_exact();   // names the arm under GGML_CUDA_MWR_DEBUG even when both paths are switched off
 +    ctx.mwr_fold_experts = nullptr;
 +    const ggml_tensor * node = cgraph->nodes[i];
 +    if (!on || disable_mwr || node->op != GGML_OP_MUL_MAT_ID || node->type != GGML_TYPE_F32 || node->ne[2] != 1 ||
@@ -84290,6 +84472,12 @@ index 11ec58497..bcf732500 100644
 +    if (d0 < i0 + ggml_nbytes(ids) && i0 < d0 + ggml_nbytes(match.dst)) {
 +        return;
 +    }
++    // Arm only a node the fold can actually serve (the predicate mmvq reads): ggml_cuda_moe_down_fold_try_fuse
++    // stands aside for an armed node, so arming one the fold declines would cost the MUL-only fold and buy nothing.
++    if (!ggml_cuda_mwr_fold_serve_ok(ctx, node)) {
++        if (ggml_cuda_mwr_debug()) GGML_LOG_INFO("MWR FOLD DECLINE %s\n", node->name);
++        return;
++    }
 +    ctx.mwr_fold_experts = node;
 +    ctx.mwr_fold_weights = match.weights;
 +    ctx.mwr_fold_scale   = match.expert_scale;
@@ -84298,10 +84486,10 @@ index 11ec58497..bcf732500 100644
 +    ctx.mwr_fold_idx     = i + 1;
 +}
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cuh b/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
-index b72f947ab..31136cb03 100644
+index b72f947ab..5752f8b7d 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
 +++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
-@@ -4,4 +4,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
+@@ -4,4 +4,14 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                           const ggml_tensor *         experts,
                                           const ggml_tensor *         expert_scale,
                                           const ggml_tensor *         weights,
@@ -84310,6 +84498,13 @@ index b72f947ab..31136cb03 100644
 +                                         const ggml_tensor *         merge = nullptr);
 +int ggml_cuda_moe_weighted_reduction_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 +void ggml_cuda_mwr_fold_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++// GGML_CUDA_MWR_EXACT (default 1; =0 restores the pre-r324 fma-contracted kernels): no fma contraction in the expert
++// weighted sum, so the fold and the standalone kernels round exactly as the graph's MUL / VIEW / ADD chain does.
++// ONE knob for both paths on purpose -- they replace each other at the same node, so an arm where only one is exact
++// would compare two different arithmetics and blame the wrong one.
++bool ggml_cuda_mwr_exact();
++// GGML_CUDA_MWR_DEBUG is on (the fold census: FOLD / FOLD ASIDE / FOLD DECLINE / FUSED / EXACT)
++bool ggml_cuda_mwr_debug();
 diff --git a/ggml/src/ggml-cuda/norm-gated.cu b/ggml/src/ggml-cuda/norm-gated.cu
 new file mode 100644
 index 000000000..a7bd8b0c6
@@ -113623,6 +113818,88 @@ index 36e48a0f2..a775d63ca 100644
  llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
  # the test serves its repos from an httplib server, and the library links it privately
  target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
+diff --git a/tests/test-alloc.cpp b/tests/test-alloc.cpp
+index 45d9a3eda..c148e2baa 100644
+--- a/tests/test-alloc.cpp
++++ b/tests/test-alloc.cpp
+@@ -677,6 +677,69 @@ static void test_graph_optimize_alloc_dep() {
+     GGML_ASSERT(!graph_reuses_allocation(true));
+ }
+ 
++// GGML_OP_GLU in place (r323): an FFN's gate, up and GLU output are not all live at once -- the GLU output takes
++// the GATE's memory when the gate has exactly one reader and no views, which is the whole of an FFN's saving
++// (Qwen3.8-27B at -ub 2048: 150 MiB of compute buffer).  Three properties matter and each has a way to be wrong:
++//   * the UP must never be taken (a backend whose gated GLU is a chain destroys it -- CANN's `aclnn Silu` into dst
++//     followed by `aclnnInplaceMul(dst, src1)` would square the up operand),
++//   * a second reader of the gate must decline,
++//   * the one-input (split) form halves ne[0], so it never has the same layout and never qualifies.
++// This is the only coverage of the rule: `test-backend-ops` cannot see a memory-layout decision, and a wrong
++// answer here is a silent one.  The GGML_GLU_INPLACE=0 arm is the shell gate's (scripts/gate-glu-inplace.sh).
++static void test_glu_inplace() {
++    {
++        // one reader each: the output takes the gate, not the up
++        dummy_backend backend      = dummy_backend_init(SIZE_MAX);
++        auto [ctx, graph, ctx_ptr] = make_context();
++
++        ggml_tensor * x[3];
++        x[0] = make_input_1d(ctx, 8);
++        x[1] = make_input_1d(ctx, 8);
++        x[2] = ggml_glu_split(ctx, x[0], x[1], GGML_GLU_OP_SWIGLU);
++        assign_names(ctx);
++
++        ggml_gallocr_ptr galloc = allocate_graph(graph, x[2], &backend.buffer_type);
++        check_all_allocated(graph);
++        check_no_overlap(graph);
++        GGML_ASSERT(x[2]->data == x[0]->data);
++        GGML_ASSERT(x[2]->data != x[1]->data);
++        GGML_ASSERT(backend.context->allocated_total() <= 2*32);   // gate + up; the output lives in the gate
++    }
++    {
++        // a second reader of the gate: the output is allocated on its own
++        dummy_backend backend      = dummy_backend_init(SIZE_MAX);
++        auto [ctx, graph, ctx_ptr] = make_context();
++
++        ggml_tensor * x[4];
++        x[0] = make_input_1d(ctx, 8);
++        x[1] = make_input_1d(ctx, 8);
++        x[2] = ggml_glu_split(ctx, x[0], x[1], GGML_GLU_OP_SWIGLU);
++        x[3] = ggml_add(ctx, x[0], x[2]);   // x0 now has two readers
++        assign_names(ctx);
++
++        ggml_gallocr_ptr galloc = allocate_graph(graph, x[3], &backend.buffer_type);
++        check_all_allocated(graph);
++        GGML_ASSERT(x[2]->data != x[0]->data);
++        GGML_ASSERT(x[2]->data != x[1]->data);
++        GGML_ASSERT(backend.context->allocated_total() > 2*32);     // the output is its own allocation
++    }
++    {
++        // the one-input form: ne[0] is halved, so the layouts differ and the gate is not reused
++        dummy_backend backend      = dummy_backend_init(SIZE_MAX);
++        auto [ctx, graph, ctx_ptr] = make_context();
++
++        ggml_tensor * x[2];
++        x[0] = make_input_1d(ctx, 16);
++        x[1] = ggml_glu(ctx, x[0], GGML_GLU_OP_SWIGLU, false);
++        assign_names(ctx);
++        GGML_ASSERT(x[1]->ne[0] == 8);
++
++        ggml_gallocr_ptr galloc = allocate_graph(graph, x[1], &backend.buffer_type);
++        check_all_allocated(graph);
++        GGML_ASSERT(x[1]->data != x[0]->data);
++    }
++}
++
+ // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
+ // matches the actual size of the buffer allocated for the ctx tensors
+ static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
+@@ -1121,6 +1184,7 @@ int main() {
+     run("test_buffer_size_zero", test_buffer_size_zero);
+     run("test_reallocation", test_reallocation);
+     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
++    run("test_glu_inplace", test_glu_inplace);
+     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
+     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
+     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
 diff --git a/tests/test-arg-parser.cpp b/tests/test-arg-parser.cpp
 index 537c33394..88f424984 100644
 --- a/tests/test-arg-parser.cpp
