@@ -145,11 +145,14 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── COMMUNITY-CONFIG.md    # running a model bigger than VRAM (`-ncmoe` + the expert cache)
 ├── rdna-boosts-all.patch  # convenience: the entire 18-patch default net as ONE patch
 ├── patches/               # the delivery set: official 0000-0016 + temporary 0300 (one `git am` block each)
-│   └── README.md          # apply instructions + block-12 env knobs + server config
+│   ├── README.md          # apply instructions + block-12 env knobs + server config
+│   └── FILE-SET-RETIREMENTS.tsv # re-base decision rows: a deliberate retirement a block may lose (gate 38)
 ├── scripts/               # apply / regenerate / validate / publish tooling; index: scripts/README.md
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift; --include-beta)
 │   ├── gate-prefill-logits.sh  # prefill-logit KLD release gate (issue #113)
 │   ├── gate-per-block-build.sh # bisect only (r332): which block broke a build
+│   ├── check-rung-file-sets.py # re-base file-set reconciliation (TODO #358): no block may lose a file,
+│   │                      #   define, env var or option the patch it replaces carried
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── prompts/               # versioned, hash-stable test prompts (sha256-recorded; never edited in place)
@@ -674,6 +677,20 @@ prefill logits bit-identical), so a default run is unaffected; the delivery stil
 itself.  If you pin for an unrelated reason on 10.2 (a hipBLASLt OOM at a tight slab headroom, say) you keep
 the speed as well.  Knobs: [`ENVIRONMENT.md`](ENVIRONMENT.md) §10.2.
 
+**Measured on both lines (r340, `TODO` #362) — and the delivery barely reaches hipBLASLt at all.**  The
+mapping above is now backed by an arm rather than by the upstream commit message, and it is backed on the
+*container* hipBLASLt picks from, because the logits cannot decide it here: on this tree block 06's `mmf32`
+claims the F32 router and the F32 GDN `ssm_alpha`/`ssm_beta` shapes and block 10's GDN epilogue fusion removes
+the per-layer `ssm` GEMMs, so a 35B-A3B prefill dispatches **0** hipBLASLt GEMMs by default (40 with
+`GGML_CUDA_MMF32=0`), and every arm we could build read **one** logits class over 68 fresh starts on 10.1 and
+52 on 10.2 — which by §44's own rule says nothing about the mechanism.  What differs is the candidate list:
+hipBLASLt **1.4.1 (ROCm ≤ 10.1) offers 18 candidates** per call for that shape, hipBLASLt **1.5.0 (10.2)
+offers exactly one** (`138457`, tag `Others`, no list) in all 320 calls over 8 starts — i.e. on 10.2 there is no
+per-start solution choice to make, which is what the fix does.  So: the pin is **not needed** on 10.2 for these
+shapes, it stays the control on ≤ 10.1 (and cheap there, above), and the delivery still never sets it.
+`scripts/check-hipblaslt-lottery.sh` re-measures this per line over `--starts N` and prints one verdict
+(`NO-CHOICE` / `EXPOSED` / `STABLE-LIST`); `BASELINE.md` records 10.2 as the canonical validated line.
+
 ## Concurrent serving with `--kv-unified` is not deterministic (issue #134)
 
 Mixing `-np > 1` with `--kv-unified` does **not** give run-to-run reproducible greedy output: a
@@ -712,6 +729,13 @@ them), regenerate the whole set with `scripts/make-patches.sh`, then refresh
 `release.json` (`scripts/make-release.sh --base … --tip … --tree …`) and update the
 current-state headers. The old `baseline/<sha>`-branch-per-upstream-range workflow
 was retired when the delivery moved to the flat patch set on `main`.
+
+**A re-base also owes `scripts/check-rung-file-sets.py`** (the one check no build can replace): a rung that
+lands fewer files than the patch it replaces still compiles, because the missing hunks live inside other files
+-- that is how block 00's `ggml-alloc.c` half was dropped at r328 and shipped for two releases (issue #345).
+Run it **per rung while porting** (`--rung NNNN --new-chain ~/llama.cpp --new-base <base>`) and on the whole
+set before the tag; a deliberate disappearance is a decision row in `patches/FILE-SET-RETIREMENTS.tsv` with a
+reason. `scripts/validate-set.sh` runs it too, so a re-cut that shrinks a block fails the delivery check.
 
 
 ## Upstreaming

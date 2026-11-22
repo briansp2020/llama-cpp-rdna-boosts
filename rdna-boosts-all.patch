@@ -3559,7 +3559,7 @@ index 000000000..1f8e8a6b5
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index b40eb5535..e52e0e503 100644
+index b40eb5535..ffcf4d230 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,9 @@
@@ -4693,16 +4693,32 @@ index b40eb5535..e52e0e503 100644
  }
  
  common_speculative_output_limits common_speculative_get_output_limits(
-@@ -3206,7 +3852,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3199,6 +3845,15 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+             throw std::runtime_error("draft-dflash, draft-dflash2, draft-dspark and draft-lilicorr cannot be combined");
+         }
+ 
++        // the same rule for the MTP pair: `draft-mtp` and `draft-mtp-adaptive` are one implementation class
++        // (`common_speculative_impl_draft_mtp`) over ONE ctx_dft, so enabling both builds two impls that each
++        // run process() on every batch and advance the same draft context twice.  Rejected, not merged.
++        // (Restored at r342: the r328 re-base dropped this check with block 02's old hunk, issue #348.)
++        if ((enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) &&
++            (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE))) {
++            throw std::runtime_error("draft-mtp and draft-mtp-adaptive cannot be enabled together");
++        }
++
+         auto add_config_if_enabled = [&](common_speculative_type type, bool available = true) {
+             if (available && (enabled_configs & (1u << type))) {
+                 configs.emplace_back(type, params);
+@@ -3206,7 +3861,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
 -        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
-+static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14);
++        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14);
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -3217,16 +3863,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3217,16 +3872,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
  
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
@@ -4729,7 +4745,7 @@ index b40eb5535..e52e0e503 100644
      for (const common_speculative_config & config : configs) {
          switch (config.type) {
              case COMMON_SPECULATIVE_TYPE_NONE:
-@@ -3240,7 +3890,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3240,7 +3899,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -4742,7 +4758,7 @@ index b40eb5535..e52e0e503 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
-@@ -3415,6 +4069,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+@@ -3415,6 +4078,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
      }
  }
  
@@ -4758,7 +4774,7 @@ index b40eb5535..e52e0e503 100644
  bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
      bool result = true;
  
-@@ -3555,6 +4218,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -3555,6 +4227,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  
@@ -4776,7 +4792,7 @@ index b40eb5535..e52e0e503 100644
  // TODO: support the case of more than one speculative implementations having a state
  bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
      if (spec == nullptr) {
-@@ -3625,3 +4299,77 @@ void common_speculative_print_stats(const common_speculative * spec) {
+@@ -3625,3 +4308,77 @@ void common_speculative_print_stats(const common_speculative * spec) {
                  str_perf.c_str());
      }
  }
@@ -31594,10 +31610,10 @@ index 000000000..69f0d4411
 +size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t max_table);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 new file mode 100644
-index 000000000..d6ed08aeb
+index 000000000..01087b511
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-@@ -0,0 +1,1984 @@
+@@ -0,0 +1,2004 @@
 +// Movable-boundary slab (OPEN 2 / r42): the per-device VMM reserve + work/arena boundary move.
 +// Split out of ggml-cuda.cu (an upstream hub); the API is declared in ggml-cuda-vmm.h.
 +
@@ -32067,9 +32083,29 @@ index 000000000..d6ed08aeb
 +// the allocations that can still appear later.  `0` disables the extension (the slab then keeps exactly
 +// the reserve it took at creation).
 +//
-+// DEFAULT: **1152 MiB per GPU, plus 128 MiB for every additional GPU** (wip/slab-transient-absorption,
-+// 2026-10-18; base raised 640 -> 1152 in r206): 1 GPU -> 1280, 2 -> 1408, 3 -> 1536 MiB.  See
-+// `ggml_cuda_slab_headroom_bytes`.
++// DEFAULT: **1408 MiB per GPU, plus 128 MiB for every additional GPU** (wip/slab-transient-absorption,
++// 2026-10-18; base raised 640 -> 1152 in r206, then 1152 -> 1408 in r343): 1 GPU -> 1536, 2 -> 1664,
++// 3 -> 1792 MiB.  See `ggml_cuda_slab_headroom_bytes`.
++//
++// 2026-11-22 (r343): the base moved 1152 -> 1408 (+256 MiB on every config) so that ONE GPU gets the 1536 MiB
++// that used to be the 3-GPU value.  This cushion is drawn on by **every allocation made after the slab has
++// extended**, and the class that motivated it is not a transient at all: a **second context's graph** comes up
++// mid-run (a draft context, or wip/prefill-decode-arms' decode arm, `RESULTS-2026-11-22.md` pass 5) and its
++// reserve is a single large allocation.  Measured need: the two-arm server's **2-row decode graph asks for
++// 741.48 MiB in ONE allocation**, and its first 2-row step at 1280 failed exactly here --
++// `the movable-boundary slab holds the VRAM; the arena cannot yield physical back to the driver` -- while the
++// identical shape with `GGML_CUDA_SLAB_HEADROOM_MIB=1536` ran with zero OOMs.  The r206 sizing below used a
++// PREFILL transient (~300 MiB + one hipBLASLt workspace) as T; a late, whole-graph allocation is a different
++// and larger T, and it is the general case (any op that allocates after the extension).
++//
++// Measured cost of the bump (the campaign's product shape: 35B-A3B Q4_K_M, `-ncmoe 40 -lme auto`,
++// `MOE_EXPERT_CACHE_MIB=5000`, `-c 16384 -b 2048 -ub 512`, `GGML_CUDA_SLAB_STATS=1`, 2 arms):
++// 1280 -> arena 4957.1 MiB / h 0.7159 / 51.12 t/s, 1536 -> **arena 4957.1 MiB / h 0.7159 / 51.36 t/s**, i.e.
++// **zero**: with an explicit `MOE_EXPERT_CACHE_MIB` the arena is a budget and the extra 256 MiB comes out of
++// the slab's own unclaimed reserve (`size(VA)` 28.12 -> 27.88 GiB).  It only costs arena where the arena is
++// sized from free VRAM, and there the documented rate applies (~1 pt of expert hit rate per GiB withheld).
++// The cost is therefore a slightly larger chance that the slab DECLINES on a card packed to the edge -- which
++// is the r206 trade, taken deliberately.
 +//
 +// 2026-11-01 (r206): the base moved 640 -> 1152 (+512 on every config) so that ONE GPU gets 1280 MiB.  The
 +// 640 base was sized on the field GSQ / `-ub 4096` shape, whose widest transient is ~300 MiB per device; the
@@ -32131,8 +32167,8 @@ index 000000000..d6ed08aeb
 +// `GGML_CUDA_SLAB_HEADROOM_MIB` sets the value VERBATIM (no per-GPU addition), like every other explicit
 +// override; the per-GPU scaling applies only to the default.  The value is the steady-state free VRAM kept
 +// outside the slab after `ggml_cuda_slab_extend` reclaims the reserve.
-+#define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 1152  // base; the default is 1152 + 128 x n_gpu
-+#define GGML_CUDA_SLAB_HEADROOM_MIB_PER_GPU 128   // per device, so 1->1280, 2->1408, 3->1536 MiB
++#define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 1408  // base; the default is 1408 + 128 x n_gpu
++#define GGML_CUDA_SLAB_HEADROOM_MIB_PER_GPU 128   // per device, so 1->1536, 2->1664, 3->1792 MiB
 +
 +static size_t g_slab_headroom_min_mib = 0;
 +void ggml_cuda_slab_headroom_at_least_mib(size_t mib) {
@@ -32146,12 +32182,12 @@ index 000000000..d6ed08aeb
 +        env_set = env != NULL;
 +        mib = env_set ? (size_t) atoll(env) : GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT;
 +    }
-+    // The outside transients are PER DEVICE, so the default grows with the number of cards (`1152 + 128 x n`,
-+    // i.e. 1280 / 1408 / 1536 MiB for 1 / 2 / 3 GPUs); an explicit `GGML_CUDA_SLAB_HEADROOM_MIB` is taken
++    // The outside transients are PER DEVICE, so the default grows with the number of cards (`1408 + 128 x n`,
++    // i.e. 1536 / 1664 / 1792 MiB for 1 / 2 / 3 GPUs); an explicit `GGML_CUDA_SLAB_HEADROOM_MIB` is taken
 +    // verbatim (an operator asks for a total, not a per-card value).
 +    size_t eff = mib;
 +    if (!env_set) {
-+        // `1152 + 128 x n_devices`: 1 GPU -> 1280, 2 -> 1408, 3 -> 1536 MiB.
++        // `1408 + 128 x n_devices`: 1 GPU -> 1536, 2 -> 1664, 3 -> 1792 MiB.
 +        const int n_phys = std::max(1, ggml_cuda_info().physical_device_count);
 +        eff += (size_t) n_phys * GGML_CUDA_SLAB_HEADROOM_MIB_PER_GPU;
 +    }
@@ -70802,10 +70838,10 @@ index 5605bf7a4..4aef754a5 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..fe5337a9e
+index 000000000..1713a03fb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,13769 @@
+@@ -0,0 +1,13903 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -73429,7 +73465,6 @@ index 000000000..fe5337a9e
 +static bool direct_fill_wanted();
 +
 +static void pool_transport_init_locked(const table_t & t, int64_t planned_pool) {
-+    (void) t;
 +    // TODO #332: the first pool build cannot be inside the `--fit` probe's quiet log scope, so it is one of the
 +    // three points that report what `parse_env()` buffered (a no-op after the first).
 +    env_log_flush();
@@ -73507,6 +73542,34 @@ index 000000000..fe5337a9e
 +                          __func__, pool_transport_name(g_pool_transport), (double) avail / (1024.0 * 1024.0),
 +                          (double) planned_pool / (1024.0 * 1024.0), (double) host / (1024.0 * 1024.0),
 +                          pool_transport_name(g_pool_transport));
++        }
++        // r344 (issue #347 follow-up): the ARENA tier has no host pool, so `planned_pool == 0` and the
++        // memory-tight warning above never fires -- yet a pinned `map` transport is exactly the arm that
++        // turns every arena miss into a `memcpy` out of the pageable model mapping, i.e. GGUF pages that
++        // become MAPPED page cache and are evicted/re-faulted under a memory cap (the cgroup `memory.max`
++        // case in issue #347).  The arena's read transport is `--load-mode`'s decision like any other, so
++        // name the arm and the one that reads straight into a slot.  The arena records its set in the
++        // per-device preflight bytes (its host-pool accumulator is deliberately not built on this tier).
++        const int64_t arena_set = t.device >= 0 && t.device < GGML_CUDA_MAX_DEVICES
++                                    ? g_preflight_device_bytes[t.device] : 0;
++        if (g_gtt_arena && g_pool_transport == POOL_TR_MAP && arena_set > 0) {
++            char budget_note[64];
++            if (g_budget == (size_t) -1) {
++                snprintf(budget_note, sizeof(budget_note), "a -lme budget");
++            } else {
++                snprintf(budget_note, sizeof(budget_note), "%.1f MiB of slots",
++                         (double) g_budget / (1024.0 * 1024.0));
++            }
++            GGML_LOG_WARN("%s: this APU's GTT expert store is the MoE ARENA (%s against a %.1f MiB expert set), "
++                          "and this load PINNED its read transport to the MAPPING (--load-mode "
++                          "mmap/mmap+mlock/mlock).  Every arena miss is then a memcpy out of the pageable model "
++                          "mapping, so the expert pages enter the page cache as MAPPED pages; under a memory cap "
++                          "(a cgroup memory.max, a model larger than RAM) that cache is the only elastic tier, so "
++                          "it churns and each miss is a major fault.  --load-mode buffered keeps the mapped master "
++                          "(so --lazy-mode still works) and reads each miss straight into its arena slot (the "
++                          "direct fill, no bounce and no H2D); --load-mode auto starts on the mapping and falls to "
++                          "that arm on a stall.  The bytes are identical; only the transport differs.\n",
++                          __func__, budget_note, (double) arena_set / (1024.0 * 1024.0));
 +        }
 +        return;
 +    }
@@ -76944,29 +77007,66 @@ index 000000000..fe5337a9e
 +// tier (`prs[e] == -1`) is copied into `dst` by the caller before this kernel runs (`skip_miss`), so the
 +// kernel never reads the pageable master: that read is what `INVARIANTS.md` (device-visible host memory
 +// must be RESIDENT) forbids.
++// r345 (issue #350): the used-expert BITMAP.  The gather's grid is `n_experts * n_split` blocks and
++// every one of them used to scan the whole routing (`n_used * n_tok` ids) to learn whether ITS expert
++// is routed -- the same scan duplicated up to `n_experts * n_split` times.  That duplication is the
++// reason a deep split (32) lost to a shallow one (4) on a residency-deficient arena: the copies shrink
++// with n_split while the scans do not, so the launch spends its time on routing reads it already did.
++// One pass builds the bitmap and every block then reads ONE word, which makes n_split proportional to
++// the copy work only.  Each block builds its own bitmap in shared memory and folds it in with one
++// atomic per word, so contention is per block, not per routed id (a direct global atomic per id
++// measured 0.11 ms per call against 16 words).
++static __global__ void moe_cache_gather_mask_kernel(const int32_t * __restrict__ ids, size_t nb0, size_t nb1,
++                                                   int n_used, int n_tok, int n_experts, int n_words,
++                                                   uint32_t * __restrict__ mask) {
++    extern __shared__ uint32_t smask[];   // n_words
++    for (int w = threadIdx.x; w < n_words; w += blockDim.x) {
++        smask[w] = 0;
++    }
++    __syncthreads();
++    const int total = n_used * n_tok;
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += blockDim.x * gridDim.x) {
++        const int tok = i / n_used;
++        const int j   = i - tok * n_used;
++        const int32_t x = *(const int32_t *) ((const char *) ids + (size_t) tok * nb1 + (size_t) j * nb0);
++        if (x >= 0 && x < n_experts) {
++            atomicOr(&smask[x >> 5], 1u << (x & 31));
++        }
++    }
++    __syncthreads();
++    for (int w = threadIdx.x; w < n_words; w += blockDim.x) {
++        if (smask[w] != 0) {
++            atomicOr(&mask[w], smask[w]);
++        }
++    }
++}
++
 +static __global__ void moe_cache_gather_kernel(
 +        char * __restrict__ dst_base, const char * __restrict__ src_base,
 +        const int32_t * __restrict__ ids, size_t nb0, size_t nb1,
 +        int n_used, int n_tok, int n_experts, int n_split,
 +        int64_t expert_bytes, int64_t host_bytes, int64_t src_off, int64_t host_pitch, int split_axis,
 +        const char * __restrict__ arena, const int32_t * __restrict__ prs, int slots,
-+        const char * __restrict__ pool_dev, int64_t pool_stride, int skip_miss) {
++        const char * __restrict__ pool_dev, int64_t pool_stride, int skip_miss,
++        const uint32_t * __restrict__ used_mask) {
 +    const int e = blockIdx.x % n_experts;
 +    const int s = blockIdx.x / n_experts;
 +
 +    __shared__ int used_s;
 +    if (threadIdx.x == 0) {
-+        used_s = 0;
++        used_s = used_mask != nullptr ? (int) ((used_mask[e >> 5] >> (e & 31)) & 1u) : 0;
 +    }
 +    __syncthreads();
-+    const int total = n_used * n_tok;
-+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
-+        const int tok = i / n_used;
-+        const int j   = i - tok * n_used;
-+        const int32_t x = *(const int32_t *) ((const char *) ids + (size_t) tok * nb1 + (size_t) j * nb0);
-+        if (x == e) { used_s = 1; break; }
++    if (used_mask == nullptr) {
++        const int total = n_used * n_tok;
++        for (int i = threadIdx.x; i < total; i += blockDim.x) {
++            const int tok = i / n_used;
++            const int j   = i - tok * n_used;
++            const int32_t x = *(const int32_t *) ((const char *) ids + (size_t) tok * nb1 + (size_t) j * nb0);
++            if (x == e) { used_s = 1; break; }
++        }
++        __syncthreads();
 +    }
-+    __syncthreads();
 +    if (!used_s) {
 +        return;
 +    }
@@ -80485,6 +80585,52 @@ index 000000000..fe5337a9e
 +    return span <= host_bytes - src_off;
 +}
 +
++// r345 (issue #350): the used-expert bitmap's per-device buffer, grown on demand (words of 32 experts).
++// One buffer per device is enough: the gather is issued on one stream and every launch is ordered before
++// the next build by that stream, so a later call can never observe an earlier call's bitmap in flight.
++static uint32_t * g_mask_dev  [GGML_CUDA_MAX_DEVICES] = {nullptr};
++static int        g_mask_words[GGML_CUDA_MAX_DEVICES] = {0};
++int64_t           g_gather_mask_calls = 0;   // r345: gathers served by the used-expert bitmap
++// `MOE_GATHER_MASK=0` restores the per-block routing scan (A/B and bisect).
++static const bool g_gather_mask = [] {
++    const char * e = getenv("MOE_GATHER_MASK");
++    return e == nullptr || atoi(e) != 0;
++}();
++// When the bitmap pays.  Its win grows with the SCAN VOLUME it replaces -- `n_experts * n_split *
++// n_used * n_tok` routed ids -- and it is one pass over those ids plus one read per block, so a shallow
++// split (or a narrow decode/verify routing) keeps the scan: the pass is then latency on the critical
++// path that buys nothing.  Measured on gfx1201 (r345, `WORKLOG.md` 261122.005): 6.7e7 ids reads -1.2 %
++// (a 512-expert table at n_split 8) and -2.3 % (a 256-expert table at 16), while 1.34e8 reads +0.7 %
++// (512 experts at 16), +1.5 % (256 at 32) and +4.1 % (512 at 32, a 54.7 %-residency arena), and 2.7e8
++// reads +12 % (256 at 64).  1e8 ids is the crossover; the default (n_split 32) is above it on both
++// shapes, and the decode band (8 ids) is five orders of magnitude below it.
++static const int64_t k_gather_mask_min_scan_ids = 100000000;
++
++static uint32_t * gather_mask_get(int device, int n_experts) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return nullptr;
++    }
++    const int words = (n_experts + 31) / 32;
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (g_mask_dev[device] != nullptr && g_mask_words[device] >= words) {
++        return g_mask_dev[device];
++    }
++    if (g_mask_dev[device] != nullptr) {
++        (void) cudaFree(g_mask_dev[device]);
++        g_mask_dev[device] = nullptr;
++        g_mask_words[device] = 0;
++    }
++    uint32_t * p = nullptr;
++    if (cudaMalloc((void **) &p, (size_t) words * sizeof(uint32_t)) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return nullptr;   // the caller falls back to the per-block scan
++    }
++    (void) cudaMemset(p, 0, (size_t) words * sizeof(uint32_t));
++    g_mask_dev[device]   = p;
++    g_mask_words[device] = words;
++    return p;
++}
++
 +// wip/fix-gemma-4 (TODO #77/C): every range of a fused table's slot must lie inside one host expert blob,
 +// and the ranges must tile the device slot exactly (they are concatenated into it).
 +static bool moe_cache_slices_addr_ok(size_t host_bytes, size_t expert_bytes,
@@ -81126,11 +81272,34 @@ index 000000000..fe5337a9e
 +        gpool_stride = (int64_t) gpool->host_bytes;
 +        skip_miss    = 1;
 +    }
++    // r345 (issue #350): one used-expert bitmap instead of a routing scan per (expert, chunk) block,
++    // when the scan volume it replaces is big enough to pay for the pass (see
++    // `k_gather_mask_min_scan_ids`).  A failed allocation or a failed build falls back to the scan, so
++    // this path can only cost a launch, never correctness.
++    uint32_t * used_mask = nullptr;
++    if (g_gather_mask && (int64_t) n_experts * n_split * n_used * n_tok >= k_gather_mask_min_scan_ids) {
++        used_mask = gather_mask_get(device, n_experts);
++        if (used_mask != nullptr) {
++            const int mwords = (n_experts + 31) / 32;
++            if (cudaMemsetAsync(used_mask, 0, (size_t) mwords * sizeof(uint32_t), (cudaStream_t) stream) != cudaSuccess) {
++                (void) cudaGetLastError();
++                used_mask = nullptr;
++            } else {
++                const int mtotal  = (int) (n_used * n_tok);
++                const int mblocks = (mtotal + 255) / 256;
++                moe_cache_gather_mask_kernel<<<mblocks, 256, (size_t) mwords * sizeof(uint32_t),
++                                               (cudaStream_t) stream>>>(
++                    (const int32_t *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, n_experts,
++                    mwords, used_mask);
++                g_gather_mask_calls++;
++            }
++        }
++    }
 +    moe_cache_gather_kernel<<<n_experts * n_split, threads, 0, (cudaStream_t) stream>>>(
 +        (char *) weight_cpy->data, (const char *) weight->data,
 +        (const int32_t *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, n_experts, n_split,
 +        (int64_t) expert_bytes, (int64_t) host_bytes, (int64_t) slice_off, (int64_t) host_pitch, split_axis,
-+        garena, gprs_dev, gprs_slots, gpool_dev, gpool_stride, skip_miss);
++        garena, gprs_dev, gprs_slots, gpool_dev, gpool_stride, skip_miss, used_mask);
 +    if (cudaGetLastError() != cudaSuccess) {
 +        (void) cudaGetLastError();
 +        return false;
@@ -84070,9 +84239,10 @@ index 000000000..fe5337a9e
 +                      (double) g_bounce_bytes / (1024 * 1024));
 +    }
 +    if (g_gather_calls > 0) {
-+        GGML_LOG_INFO("%s: device gather: %lld calls (%lld pool-backed), %lld routed experts copied into the "
-+                      "destination from the bounce/pool-fill path (neither tier)\n",
-+                      __func__, (long long) g_gather_calls, (long long) g_gather_pool, (long long) g_gather_fills);
++        GGML_LOG_INFO("%s: device gather: %lld calls (%lld pool-backed, %lld by the used-expert bitmap), %lld "
++                      "routed experts copied into the destination from the bounce/pool-fill path (neither tier)\n",
++                      __func__, (long long) g_gather_calls, (long long) g_gather_pool,
++                      (long long) g_gather_mask_calls, (long long) g_gather_fills);
 +    }
 +    if (g_pool_enabled) {
 +        const int64_t p_slots  = g_report_snap.p_slots;
@@ -115351,7 +115521,7 @@ index 5bed70163..179fb78ea 100644
  
          layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head_l}, TENSOR_NOT_REQUIRED);
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 5b997e91b..bcdefb2c7 100644
+index 5b997e91b..1caf4b407 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -180,6 +180,11 @@ set(LLAMA_CONTEXT_TEST_SRC
@@ -115402,11 +115572,12 @@ index 5b997e91b..bcdefb2c7 100644
  llama_build(test-fusion.cpp)
  
  llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
-@@ -350,6 +377,7 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
+@@ -350,6 +377,8 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
  set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
  
  llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 +llama_build_and_test(test-speculative-adaptive.cpp)
++llama_build_and_test(test-spec-type-exclusion.cpp  LABEL behavior)
  llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
  # the test serves its repos from an httplib server, and the library links it privately
  target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -118627,6 +118798,61 @@ index 000000000..249d83a35
 +    fprintf(stderr, "\n%s: total failures = %d\n", n_fail ? "FAIL" : "PASS", n_fail);
 +    return n_fail ? 2 : 0;
 +}
+diff --git a/tests/test-spec-type-exclusion.cpp b/tests/test-spec-type-exclusion.cpp
+new file mode 100644
+index 000000000..d03387256
+--- /dev/null
++++ b/tests/test-spec-type-exclusion.cpp
+@@ -0,0 +1,49 @@
++// The speculative types that share ONE draft context are rejected in combination, never merged.
++//
++// `draft-mtp` and `draft-mtp-adaptive` are one implementation class
++// (`common_speculative_impl_draft_mtp`) over one `ctx_dft`, so enabling both builds two impls that
++// each run process() on every batch and advance the same draft context twice.  The check that
++// rejected the pair arrived with block 02 (adaptive MTP) and was LOST in the r328 re-base: it was a
++// `throw` inside a hunk the re-expression no longer carried, and it is not a file, a define, an env
++// var or an option, so nothing in the release flow failed for twelve releases (issue #348).  This is
++// the instrument that would have: the combination is a behaviour, so it is tested, not grepped.
++//
++// It needs no model and no draft context -- the rejection happens while the enabled-type bitmask is
++// inspected, before any context is touched, so every arm runs with `ctx_dft == nullptr` (which also
++// means the accepted arms build no implementation at all).
++
++#include "speculative.h"
++
++#undef NDEBUG
++
++#include <cassert>
++#include <cstdio>
++#include <stdexcept>
++#include <vector>
++
++static bool init_throws(std::vector<enum common_speculative_type> types) {
++    common_params_speculative params;
++    params.types = std::move(types);
++    try {
++        common_speculative * spec = common_speculative_init(params, /*n_seq=*/ 1);
++        common_speculative_free(spec);
++    } catch (const std::exception &) {
++        return true;
++    }
++    return false;
++}
++
++int main(void) {
++    // the MTP pair shares the draft context: rejected
++    assert(init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE }));
++    // each MTP type alone is a valid run
++    assert(!init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_MTP }));
++    assert(!init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE }));
++    // the DFlash family is the same rule on the same shared context: the control that the pair check
++    // itself is still there (a fix to one pair that drops the other would fail here)
++    assert(init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK }));
++    assert(!init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH }));
++
++    printf("OK: the shared-draft-context type pairs are rejected and single types are accepted\n");
++    return 0;
++}
 diff --git a/tests/test-speculative-adaptive.cpp b/tests/test-speculative-adaptive.cpp
 new file mode 100644
 index 000000000..a5ae0bc64
@@ -120498,10 +120724,21 @@ index bfade25d7..60d3feec3 100644
                          if (slot.ctx_dft) {
                              GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
-index 9f9779348..b7e613525 100644
+index 9f9779348..c6e2738aa 100644
 --- a/tools/server/server-slot-sched.cpp
 +++ b/tools/server/server-slot-sched.cpp
-@@ -81,6 +81,74 @@ size_t server_prompt_cache::n_tokens() const {
+@@ -6,6 +6,10 @@
+ 
+ #include <algorithm>
+ 
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
+ //
+ // server_prompt
+ //
+@@ -81,6 +85,79 @@ size_t server_prompt_cache::n_tokens() const {
      return res;
  }
  
@@ -120518,6 +120755,7 @@ index 9f9779348..b7e613525 100644
 +// (transparent huge pages, madvise mode) and ~0.3 s for the state copy itself.  Measured on the 9950X3D, 3.47 GiB
 +// alloc+zero: 470 -> 125 ms, and the server's prompt-cache update for a 100K-token slot's new buffer 828 -> 497 ms.
 +// LLAMA_SERVER_CACHE_HUGEPAGE=0: 4 KiB pages
++#if defined(__linux__)
 +static bool prompt_cache_hugepage() {
 +    static const bool v = [] {
 +        const char * e = getenv("LLAMA_SERVER_CACHE_HUGEPAGE");
@@ -120525,6 +120763,7 @@ index 9f9779348..b7e613525 100644
 +    }();
 +    return v;
 +}
++#endif
 +
 +common_state_data server_prompt_cache::take(size_t n) {
 +    // the smallest spare that holds n bytes; resizing it down keeps the memory, resizing it up zero-fills only the tail
@@ -120539,7 +120778,10 @@ index 9f9779348..b7e613525 100644
 +        buf = std::move(spare[best]);
 +        spare.erase(spare.begin() + best);
 +    }
-+#if defined(__linux__) && defined(MADV_HUGEPAGE)
++#if defined(__linux__)
++    // the guard is the OS, never `defined(MADV_HUGEPAGE)`: with a guard on the macro a missing <sys/mman.h> silently
++    // compiles the whole branch out of every Linux build.  It did exactly that from r328 to r339 -- the include stayed in
++    // server-task.cpp when `take()` moved here, and LLAMA_SERVER_CACHE_HUGEPAGE did nothing (issue #348)
 +    else if (prompt_cache_hugepage() && n >= (64u << 20)) {
 +        // reserve() only maps the buffer, so the advice is in place before the zero fill below touches a page; the huge
 +        // pages cover the 2 MiB-aligned part of it (a failed madvise leaves 4 KiB pages, as before)
@@ -120576,7 +120818,7 @@ index 9f9779348..b7e613525 100644
  server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
      // first check if the current state is contained fully in the cache
      for (auto it = states.begin(); it != states.end(); ++it) {
-@@ -114,6 +182,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -114,6 +191,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
          if (len == (int) it->prompt.tokens.size() && are_lora_equal(it->prompt.lora, prompt.lora)) {
              SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
  
@@ -120585,7 +120827,7 @@ index 9f9779348..b7e613525 100644
              it = states.erase(it);
          } else {
              ++it;
-@@ -126,6 +196,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -126,6 +205,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
              SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                      states.front().size() / (1024.0 * 1024.0));
  
@@ -120594,7 +120836,7 @@ index 9f9779348..b7e613525 100644
              states.pop_front();
          }
      }
-@@ -135,8 +207,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -135,8 +216,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
  
      // check if we can allocate enough memory for the new state
      try {
@@ -120605,7 +120847,7 @@ index 9f9779348..b7e613525 100644
      } catch (const std::bad_alloc & e) {
          SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
  
-@@ -164,7 +236,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -164,7 +245,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
      return &states.back();
  }
  
@@ -120615,7 +120857,7 @@ index 9f9779348..b7e613525 100644
      // a prompt made with another lora config is cleared before the new one starts, so it counts as empty
      const bool is_empty = prompt.tokens.empty() || lora_should_clear_cache(prompt.lora, lora_new);
  
-@@ -184,6 +257,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -184,6 +266,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
              continue;
          }
  
@@ -120628,7 +120870,7 @@ index 9f9779348..b7e613525 100644
          const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
  
          const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-@@ -205,7 +284,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -205,7 +293,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
          }
      }
  
@@ -120648,7 +120890,7 @@ index 9f9779348..b7e613525 100644
          SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
  
          const int64_t t_start = ggml_time_us();
-@@ -221,8 +312,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -221,8 +321,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                  return false;
              }
  
@@ -120659,7 +120901,7 @@ index 9f9779348..b7e613525 100644
          }
  
          {
-@@ -239,8 +330,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -239,8 +339,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                      return false;
                  }
  
@@ -120699,21 +120941,6 @@ index fc0099dc0..1005ee09a 100644
      server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
  
      // lora_new: the lora config of the new prompt, the states made with another config are skipped
-diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 595e57ffb..2f1f6e149 100644
---- a/tools/server/server-task.cpp
-+++ b/tools/server/server-task.cpp
-@@ -12,6 +12,10 @@
- 
- #include <sstream>
- 
-+#if defined(__linux__)
-+#include <sys/mman.h>
-+#endif
-+
- //
- // task_params
- //
 diff --git a/tools/server/tests/unit/test_kv_keep_only_active.py b/tools/server/tests/unit/test_kv_keep_only_active.py
 index 44c05fab0..618a55de0 100644
 --- a/tools/server/tests/unit/test_kv_keep_only_active.py

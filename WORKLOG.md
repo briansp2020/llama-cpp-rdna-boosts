@@ -1,3 +1,655 @@
+## 261122.005 (r345, RELEASE v17-919794500-r345) -- issue #350 fixed: the MoE device gather's used-expert BITMAP (block 09), so a deep split stops paying for the routing scan it already did
+
+**Release:** `v17-919794500-r345`.  Base `919794500` (base tree `916941663346eb86004bed77f74e90fcf9c43126`), canonical
+tip **`e695c46ce`** (the re-cut `apply-all.sh` produces; the working chain tip `ac8515642` is a DIFFERENT
+commit with the same tree **`0d2f70e6c44eb246a9c71f29e015d6ebe98f214d`**, which is the contract), 17 official + 1 temporary = 18 default
+blocks, optional `0100` -> `151c3b84e` / `0101` -> `5377f93d0` (cumulative `db7c6be40`).  **No block created,
+split or renumbered**: one same-block amendment, **block 09** (`ggml/src/ggml-cuda/moe-expert-cache.cu`,
+`moe_cache_gather_host` + `moe_cache_gather_kernel`), plus the census wording of block 12's `device gather:` line
+(where that line lives).  One environment variable added (`MOE_GATHER_MASK`).
+
+### The finding
+
+`moe_cache_gather_kernel`'s grid is `n_experts * n_split` blocks, and every block scanned the WHOLE routing
+(`n_used * n_tok` ids) to answer one question -- "is MY expert routed?" -- so a call paid up to
+`n_experts * n_split` redundant scans.  The copies shrink with `n_split`; the scans do not, which is why a deep
+split lost at low residency.  Issue #350 reports the shape (Flash-Next IQ3_XXS, 55 % arena residency, Windows):
+`MOE_GATHER_NSPLIT` 32 is 466.5 t/s of prefill against 504.1 at 8 and 554.7 at 4, and it "stops changing at 4 and
+below" -- i.e. the shipped r325 default was the worst arm on their box, while r325 measured +7.5 % for it at 84 %
+residency.  Reproduced in direction on gfx1201 at the reporter's own 54.7 % residency (arena 21881.8 MiB of
+40012.5 MiB host experts): 32 -> 1671.7 t/s against 1719.3 at 4, -2.8 %.
+
+The fix is one pass that builds a used-expert bitmap (`moe_cache_gather_mask_kernel`: per-block shared-memory
+bitmap, one atomic per word, not one per routed id -- a direct global atomic per id measured 0.11 ms per call),
+then one word read per block.  `n_split` is now proportional to the copy work alone.  It is engaged when the scan
+volume it replaces (`n_experts * n_split * n_used * n_tok` ids) reaches `1e8`: below that the pass is latency on
+the critical path that buys nothing (measured -1.2 % at 6.7e7 ids, -2.3 % in one 16-split arm), so `n_split` 4-8
+-- the documented A/B arms -- remain exactly the pre-r345 path, and the decode/verify band (five orders of
+magnitude below the threshold) never adds a launch.
+
+| shape (1 x R9700, interleaved, pins: `MOE_EXPERT_HEATMAP=load`, `ROCBLAS_USE_HIPBLASLT=0`) | `n_split` 32, scan (r325 default) | 32, bitmap (r345 default) | delta |
+|---|---:|---:|---:|
+| **54.7 % residency**, Flash-Next IQ3_XXS 512 experts, 17 624-token prompt | 1671.7 | **1741.0** | **+4.1 %** |
+| 84.0 % residency, 35B-A3B Q8_0 256 experts, 5246-token prompt | 3722.3 | **3777.6** | +1.5 % |
+
+And on the released tree with no env knobs, three interleaved pairs: **+3.6 %** (1669.4/1668.3/1674.5 ->
+1740.8/1730.4/1720.2) at 54.7 % and **+0.8 %** at 84 %.  The bitmap also turns `n_split` 64 at 84 % residency from **3412.6 t/s (a 8 % regression)** into
+**3817.8 (+12 % over the same arm)** -- which is the proof that the cost was the scan, not the copy shape, and
+that the answer is the mechanism rather than a different constant.  Full matrix:
+`benchmarks/2026-11-22-gather-bitmap.md`.
+
+**Scope, stated so it is not over-read:** the bitmap removes the `n_split`-proportional WORK.  The reporter
+measures ~19 % where this box measures 2.8 %, so their platform amplifies it (their issue #281 was a Windows
+read-granularity problem, and per-block launch cost is the other candidate).  If 32 is still slower than 4 on
+their box after this, the cause is the grid size rather than the scan, and the fix for that class is a smaller
+grid -- which needs their logs to size, so the reply asks them to re-test rather than claiming their number.
+
+### Gates (all on the released tree, build `ac8515642` / canonical re-cut `e695c46ce`)
+
+* `scripts/validate-set.sh` -- **green**: 18 default patches + 2 optional + `rdna-boosts-all.patch` checksums,
+  strict apply on a fresh `919794500` tarball, applied tree **`0d2f70e6c`** == `release.json`, both optionals
+  apply alone (`151c3b84e` / `5377f93d0`) and cumulatively (`db7c6be40`), Windows portability clean,
+  `check-rung-file-sets.py` accounts for every file/define/env/option (**575 -> 576 envs**, 0 losses), and the
+  system-header check is clean.
+* `scripts/gate-prefill-logits.sh --ab "MOE_GATHER_MASK=0"` on the reporter's shape (`-ncmoe 47 -lme mirror
+  -ub 2048`, q8_0 KV, `MOE_EXPERT_CACHE_MIB=21882`, pins above) -- **PASS**: mean KLD **-0.000000**, same-top-p
+  **100.000 %**, GPU faults clean.  This is the exact-fallback A/B: the base is the scan, the candidate is the
+  bitmap, and the bytes are the same bytes.
+* `scripts/gate-host-pool.sh` -- **PASS, 58/58 checks** (`takeover=0` under both fill faults, every failed fill
+  NOT resident, the census printed once from the teardown, no abort in any arm), every arm's text as recorded,
+  GPU faults clean.
+* `scripts/gate-host-expert-text.sh` -- **PASS**, 3/3 runs read `328 chars sha=7c5a512a8447`; the flipped-library
+  arm reads its own text (`298 chars sha=55a50dee05e0`, reported, r310); GPU faults clean.
+* **Greedy text is byte-identical in every arm of the change**: `172 chars sha=de61b9b1bed7` on the
+  low-residency shape across bitmap on/off and `n_split` 4/32, `206 chars sha=cf7f8b23f404` on the high-residency
+  shape across bitmap on/off.
+* **MTP Protocol A** (27B-UD-Q4_K_XL, `--fit off`, bf16 KV, `-n 3000`), both reasoning axes: **on**
+  `draft-mtp` **54.9 t/s** against `none` **30.2**, **off** **72.2** against **30.3**, the same text inside each
+  pair (`12331 chars sha=eace21fc3399` / `6789 chars sha=4172642d7dc2`).  The decode band is untouched by
+  construction and by census: a decode arm reads `0 by the used-expert bitmap` out of 138 gathers, and a 9..16
+  row verify sits at 2.1e6 scan ids against the 1e8 threshold, so no captured graph changes shape.
+* Census (`-lv 4`, the low-residency prefill): `device gather: 1380 calls (1380 pool-backed, 1242 by the
+  used-expert bitmap)`; with `MOE_GATHER_MASK=0`, `0 by the used-expert bitmap`.  The 138 scan-path calls are the
+  run's narrow (decode-band-sized) routings -- the threshold doing its job, observable in one line.
+
+### Notes
+
+* `n_split` stays **32**.  With the bitmap it is the best measured arm at both residency extremes, so r325's
+  constant was right and r325's *reason* was incomplete: the gain at high residency was real, and the loss at low
+  residency was the scan, not the split.
+* The optional artifacts were re-cut against the new default tree (their recorded trees moved because block 09
+  changed), and blocks 10-16 were regenerated (their contexts and commit ids shift; no block changed content).
+* The gather's per-device bitmap is allocated on first use and falls back to the scan if the allocation fails,
+  so a first use inside a capture is a fallback rather than a capture-time `cudaMalloc`.
+
+## 261122.004 (r344) -- the APU arena's PINNED mapping transport is named: the issue #347 follow-up is a `--load-mode buffered` fix, not a leak
+
+**Delivery change: block 15 only** (one WARN; no default moved and no byte of a read changed).  `release.json` is now
+`v17-919794500-r344`, base unchanged, tip **`442a7bb50`**, tree **`39fcfe7b42035ffbdde2366926a2677cd4a89ea5`**; both
+optional artifacts were re-cut against the new default tree (0100 -> `2ac9015f7`, 0101 -> `10ebc31c6`, cumulative
+`5f63cebbe`), and `scripts/validate-set.sh` is green.  No new block, no renumbering.
+
+### 1. The report and the mechanism
+
+`@tazmaniax`'s follow-up (issue #347, comment 7078596827) is not the r337 regression returning: `anon` is the
+arena plus ~0.3 GiB, so the full pageable copy is still gone.  The churn is the **read transport**.  Since r294
+`--load-mode` *is* the host-read transport (`src/llama-model-loader.cpp:1745-1779`), and `mmap` maps to
+`POOL_TR_MAP` with `g_pool_tr_mode < 3`, i.e. **pinned, no monitor** (`moe-expert-cache.cu:2626-2706`).  Every
+arena miss is a `memcpy` out of the pageable model mapping, so the expert pages enter the page cache as **mapped**
+pages; under a hard cap that cache is the only elastic tier, so it fills and is evicted/re-faulted -- exactly the
+reporter's `file ~= file_mapped`, `unevictable` flat at the arena, `workingset_refault_file` climbing and `oom=0`.
+The r337 reply said "no setting change needed; `-lme 28 --load-mode mmap` is the r279 configuration" -- true for
+the pageable-copy fix, wrong for the transport.  `--load-mode buffered` and `auto` keep the mapped master (so
+`--lazy-mode on` for the 27.5 GiB PLE still works); `buffered` fills straight into the slot, and `auto` falls to
+it on a stall.  `dio` is also viable on the ARENA arm -- the arena force-maps the model as its fill master, so the
+lazy PLE stays mapped -- and it removes the file-page churn entirely (0 refaults, 3.3 GiB of page cache), at the
+cost of the O_DIRECT read path: on this box's Crucial T500 it read 205.6 / 15.7 t/s against `buffered` 265.4 /
+18.6.  The fill transport is the drive's O_DIRECT latency against the page-cache room, not a universal order.
+
+### 2. Measured on the equivalent shape (gfx1151, ROCm 10.2, r343 build)
+
+GSQ-IQ3_XXS (a 40 925.6 MiB expert set, 27 465 MiB PLE), `-lme 24 --lazy-mode on --fit off`, `MemoryMax=44G`,
+`MemorySwapMax=0`, cold page cache, 5 298-token prompt + 64 greedy tokens, same text on every transport
+(`614 chars sha=96533be7cb80` on the short recall arm):
+
+| `--load-mode` | page cache peak | mapped | refaults (same work) | maj faults | prefill | gen |
+|---|---:|---:|---:|---:|---:|---:|
+| `mmap` | 19.7 GiB | 17.4 | 16.54 M | 8 772 | 216.7 t/s | 9.7 t/s |
+| `buffered` | 19.5 GiB | 0.7 | 4.04 M | 152 | 265.4 t/s | 18.6 t/s |
+| `auto` (forced map start) | 19.7 GiB | 3.4 | 5.53 M | 861 | 255.4 t/s | 18.0 t/s |
+| `dio` | 3.3 GiB | 0.9 | **0** | 197 | 205.6 t/s | 15.7 t/s |
+
+The census names the difference: `direct slot fills (buffered pread into the arena, no bounce/H2D) ... 4 668
+MiB/s` against `per-expert mapping reads (bounce) ... 1 482 MiB/s`; `dio` uses the bounce/staging path at 1.9
+GiB/s and its prefill spans read 3.65 GiB/s O_DIRECT against 6.9 GiB/s buffered, which is why zero churn does not
+make it the fastest on this drive.  A sweep with `buffered` at 44 GiB read `-lme 20` 243.4 / 16.8, `-lme 24`
+265.4 / 18.6, `-lme 28` **314.6 / 21.5** (`dio` at 28: 291.8 / 20.4) -- so the 28 GiB arena is the better point
+again once a miss is cheap, and the 36 GiB cap narrows `buffered` vs `dio` to 220.7 / 15.7 against 206.9 / 15.7.
+`memory.events max` fired in every arm (`mmap` 353 496, `buffered` 152 526) with `oom`/`oom_kill` both 0: the
+reporter's guard stops on reclaim, not on OOM.
+
+**#348 is unrelated.**  That fix is `server_prompt_cache::take()` (anonymous slot-state buffers, `--cache-ram`),
+and the reporter's log says the prompt cache is disabled, so the huge-page path never runs there; it cannot move
+file-backed mapping churn either way.
+
+### 3. The change (block 15, one WARN)
+
+`pool_transport_init_locked()`'s memory-tight warning required `planned_pool > 0`, and the arena has no host
+pool, so the one shape it exists for ran silently.  It now also fires for `g_gtt_arena && transport == map`,
+names the arena budget and the per-device expert set, and says `buffered` fills straight into the slot while
+`auto` falls to it.  This is a log-only amendment: no bytes moved, no default changed.  The gate grew two arms,
+`mapwarn` (the warning must fire) and `bufferedwarn` (it must not), and asserts each arm takes the transport its
+load mode names.
+
+### 4. Verified
+
+* `scripts/gate-uma-experts.sh` **54 checks / 0 failures** (full, including the >RAM arm); all text arms
+  byte-identical (`4f29f1e4a4d6`), the two new warning checks pass, no GPU faults.
+* `scripts/gate-prefill-logits.sh --allow-base-mismatch` **PASS** 0.000000 mean KLD / 99.990 % same-top-p.  The
+  only recorded base is ROCm 10.1 and this build is 10.2, so the comparison is cross-toolchain (the 0.01 % is
+  the known cross-line figure, not this log-only change); a proper 10.2 base is still owed.
+* `scripts/validate-set.sh` green end-to-end (fresh tarball, strict 18/18, both optional artifacts strict on the
+  new tree, cumulative `5f63cebbe`, Windows lints, `check-rung-file-sets.py` 0 unexplained).
+* Coherence: dense 4B Q8_0, 1 GPU, 24 greedy tokens -- **111 chars `7e6229b260f6`** (the r336/r337 anchor,
+  unchanged), no GPU fault.
+
+### 5. Docs and issue handling
+
+`patches/README.md` block 15 (the r344 amendment), `ENVIRONMENT.md` §20 (the arena transport paragraph),
+`INVARIANTS.md` (r344, appended), `MANIFESTS.md` (block 15 + the gate row) and `scripts/README.md` (the gate's
+arm count).  Replied on issue #347 with the mechanism, the measured table and the `--load-mode buffered` request
+(`#issuecomment-7079316559`), then corrected the `dio` claim with the measured `dio` row and the drive-dependent
+crossover (`#issuecomment-7079449284`).
+
+**Release.**  The personal fork's `rdna-boosts` branch was re-cut from `patches/` at `919794500` and
+force-pushed at **`442a7bb50`** (tree `39fcfe7b4`, checked by `scripts/fork-refresh.sh --build --push`); the
+delivery repo carries the `v17-919794500-r344` tag.  The tag is the container watcher's cue on `radiance`, so no
+image was built on this box.  The fork refresh was run without `--gates` because its `gate-prefill-logits.sh` call
+refuses the 10.1 base on a 10.2 build; the coherence and KLD runs above are the gate record, and the coherence
+hash is unchanged.
+
+## 261122.003 (r343) -- the slab headroom default is `1408 + 128 x n_gpu` (1536 MiB on one GPU), sized for allocations made AFTER the slab extends
+
+**Delivery change: block 10 only** (its content, not its number).  `release.json` is now `v17-919794500-r343`, base
+unchanged, tip `6de4206f2`, tree `e71c0b5908422ad6683168ef3823af33bde7d77b`; both optional artifacts were re-cut
+against the new default tree (0100 → `d14237ed3`, 0101 → `e731d76b7`, cumulative `85d6738af`) and
+`scripts/validate-set.sh` is green end-to-end.  No new block, no renumbering.
+
+> Cut on `main` on top of **r342**, which moved while the campaign branch was open: the change was first written
+> there (as a branch-local "r342", now superseded) and re-cut here as r343.  The campaign branch was backed up as
+> patches (`wip/prefill-decode-arms/branch-backup/`) and rebased onto this revision.
+
+### 1. What changed and why
+
+`GGML_CUDA_SLAB_HEADROOM_MIB`'s default base moves `1152 -> 1408` MiB, i.e. **1536 / 1664 / 1792 MiB on 1 / 2 / 3
+GPUs** (it was 1280 / 1408 / 1536): one GPU now gets the value that used to be the 3-GPU one, +256 MiB everywhere.
+The headroom is the steady-state free VRAM the `slab_extend` reclaim leaves outside the slab, and it pays for
+**every allocation made after the extension** -- including a second context's graph reserve, which comes up
+mid-run and cannot be redirected.  Measured need (`wip/prefill-decode-arms` pass 5): the two-arm server's **2-row
+decode graph asks for 741.48 MiB in ONE allocation**, and at 1280 its first 2-row step died with
+`the movable-boundary slab holds the VRAM; the arena cannot yield physical back to the driver` → `failed to reserve
+graph buffers` → `ret = -2`, after a 1-row decode step had run clean for 5.5 s; `GGML_CUDA_SLAB_HEADROOM_MIB=1536`
+ran the identical shape with zero OOMs.  The r206 sizing took a prefill transient (~300 MiB + one hipBLASLt
+workspace) as T; a late whole-graph allocation is a larger T and it is the general case, not one campaign's.
+
+### 2. Measured cost
+
+The slab leaves 256 MiB more outside, so its arena is 256 MiB smaller on **every** shape (`size(VA)` 28.12 ->
+27.88 GiB; arena 27904 -> 27648 MiB on a `-c 8192` arm).  What that costs downstream depends on what bounds the
+expert cache.  35B-A3B Q4_K_M, `-ncmoe 40 -lme auto`, `MOE_EXPERT_CACHE_MIB=5000`, `-c 16384 -b 2048 -ub 512`,
+`GGML_CUDA_SLAB_STATS=1`, 2 arms (1280 vs 1536, same binary) -- the campaign's product shape:
+
+| headroom | `size(VA)` | expert-cache arena | `h` | fills / evictions | decode |
+|---|---|---|---|---|---|
+| 1280 | 28.12 GiB | 4957.1 MiB | 0.7159 | 17738 / 9578 | 51.12 t/s |
+| **1536** | 27.88 GiB | **4957.1 MiB** | **0.7159** | 17738 / 9578 | **51.36 t/s** |
+
+On a shape whose expert cache is bounded by its own budget the withheld 256 MiB comes out of the slab's unclaimed
+reserve and costs **nothing** measurable; where the arena is what bounds the cache, r206's ~1 pt of hit rate per GiB
+applies.  The slab also DECLINES slightly more readily on a card packed to the edge -- the documented r206 trade,
+taken deliberately.
+
+**Text: no cold-shape oracle exists for this default.**  `-c 8192`, a 12-token prompt, greedy, seed 42: three cold
+runs of the *same* arm read three different hashes (1280: `44fe5ee4` / `9f466bac` / `e207e42c`; 1536: `ac3b79f9` /
+`d9ba0b99` / `2b8d8b8b`) -- the retired campaign's cold-arena ordering effect, not the bump.  The text evidence is
+the r206 precedent (Flash-Next, text-identical) plus a **warm** oracle; the campaign's tier-1 gate is the
+instrument to re-run at this default (it is at r343 afterwards).
+
+### 3. Verified
+
+* the new default computes **`headroom=1.50 GiB`** on this 1-GPU box with **no** env override (`SLAB_INIT` with
+  `GGML_CUDA_SLAB_STATS=1`), arena 4957.1 MiB and `h` 0.6883 on the short-prompt arm -- unchanged from r342;
+* the motivating shape (arena 5000, `-c 16384 -ub 512`, a ~5900-token prompt, the two-arm server) runs **with no
+  `GGML_CUDA_SLAB_HEADROOM_MIB`**: 0 OOM lines, `headroom=1.50 GiB`, 1139.1 t/s prefill, decoder ITL p50 46.3 /
+  p95 67.7 ms (the env-knob arm read 1135.3 / 47.1 / 74.2 -- same numbers);
+* `scripts/validate-set.sh` green (fresh tarball at `919794500`, strict `git am` over all 18 default patches,
+  applied tree `e71c0b590…`, both optional artifacts strict on the new tree, cumulative optional tree `85d6738af…`,
+  Windows portability scan, and `check-rung-file-sets.py` reporting **0 unexplained** against r342).
+
+### 4. Docs
+
+`ENVIRONMENT.md` §1.3 + the §-index row (new default, the r343 note, the measured cost); `INVARIANTS.md` r343;
+`patches/README.md` block 10's row.  `n_blocks`/`n_temporary`/`n_optional` unchanged.
+43: block 10's slab headroom default is 1408 + 128 x n_gpu MiB (1536 on one GPU), sized for allocations made AFTER the slab extends; release v17-919794500-r343)
+
+## 261122.002 (r342) -- "the fork branch stopped receiving release pushes": it did not, and the UI cannot show it.  The rule is recorded (AGENTS.md `.tip` trap (d)) and `fork-refresh.sh` now says it
+
+**No delivery patch changed, no tag** (the `261121.020`/`.021` precedent for a records-and-tooling revision).
+Raised by the maintainer against `github.com/stew675/llama.cpp/tree/rdna-boosts`: the branch looked 2 days stale
+while the WebUI called it 32 minutes fresh, and three things are true at once.
+
+1. **The push landed.**  `gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` returns
+   `69c8c808607f2bf28985b8aa3e81e5382545e533` == `release.json.tip`, and the *remote* blob
+   `tools/server/server-slot-sched.cpp?ref=rdna-boosts` carries `#include <sys/mman.h>` (line 10) and the
+   `# guard is the OS` comment (line 125), i.e. the r342 fix, served from GitHub.  The feed's newest visible
+   push was r339's `41a11cf04` because `repos/.../events` lags and coalesces; it is not the authority.
+2. **The commit list is old BY DESIGN.**  `apply-all.sh` stamps each re-cut commit's committer date from its
+   own author date (the r150 tooling change that makes the ids reproducible), so the branch tip is always
+   `block 0300`, authored **2026-10-25**, whenever the release is cut.  Dating the commits "now" would break
+   `.tip` reproducibility, so this is not a defect to fix.
+3. **The repo landing page is `master`, not the branch.**  The fork's default branch is `master`, which is the
+   upstream mirror at the fork point (`919794500`, committer date 2026-11-20T19:54Z) and is never pushed at
+   release time -- that is the "2 days ago" that was being read as the branch's age.
+
+Freshness therefore has exactly two honest checks, both on the **ref**: the `branches/rdna-boosts` sha (must
+equal `.tip`) and the branch page's "updated <time>".  Recorded as AGENTS.md `.tip` trap **(d)** (with the
+instruction not to "fix" it by dating the commits or pushing `master`), and `scripts/fork-refresh.sh` prints
+the note at the end of every run (`freshness reads on the REF, not on the commit dates: ... whose newest commit
+is dated by its AUTHOR ...`), so the next operator reads it from the tool that cut the branch.  Re-ran the
+refresh to confirm the tooling change and the idempotence: `tip 69c8c8086`, `.tip matches`, tree
+`e4060a04c` -- the same commit ids the tag records.
+
+**Record:** `AGENTS.md` (Pushing policy, `.tip` trap (d)); `scripts/fork-refresh.sh`; no `patches/`, no
+`release.json`, no tag change.
+
+## 261122.001 (r342) -- issue #348 fixed and RELEASED: a missing `#include` had compiled the prompt-cache huge-page path out of every Linux build since r328, and the same re-base also dropped block 02's MTP-pair rejection; both restored, both now instrumented
+
+**Shipped:** `v17-919794500-r342`, base `919794500`, tree `e4060a04c864a50c10c72431408cc898d7d275f3`,
+tip `69c8c808607f2bf28985b8aa3e81e5382545e533`, 17 official + 1 temporary blocks (+2 optional re-cut onto the new
+tree).  Report: [issue #348](https://github.com/stew675/llama-cpp-rdna-boosts/issues/348), reported by
+`overdoingism` (written by Claude).  Blocks **02** and **12** change; **no default behaviour changes** -- a dead
+include moves to where the code it serves actually lives, a branch that was silently compiled OUT is back in, and
+a `throw` that silently vanished is back.
+
+### 1. The reported defect (block 12, `server-slot-sched.cpp`)
+
+Since r328 `server_prompt_cache::take()` lives in `tools/server/server-slot-sched.cpp`, and its huge-page branch is
+guarded by `#if defined(__linux__) && defined(MADV_HUGEPAGE)`.  The re-base moved the FUNCTION and left
+`#include <sys/mman.h>` behind in `server-task.cpp`, where it had been added for the same function.  So
+`MADV_HUGEPAGE` was undefined in the new file, the branch dropped out of every Linux build **with no diagnostic**,
+and `LLAMA_SERVER_CACHE_HUGEPAGE` (default on, PR #248) did nothing for twelve releases: a 64 MiB+ prompt-cache
+state buffer went back to 4 KiB zero filling.  The reporter's detector was
+`nm -D --undefined-only libllama-server-impl.so | grep madvise` -- absent in r329, present in r327.  Confirmed
+here on r339: absent.
+
+The fix is the reporter's, taken whole: the file includes `<sys/mman.h>` itself, `server-task.cpp` loses the dead
+include, and **the guard becomes `#if defined(__linux__)` alone** so a future lost include is a compile error
+instead of a dropped feature (the silent-drop half is the actual defect class).  `prompt_cache_hugepage()` moved
+inside the `__linux__` guard so a non-Linux build has no unused function.
+
+**Verified** (gfx1201, dense 4B Q8_0, `-c 32768 -np 2 --cache-ram 4096`, five ~11K-token prompts so the unified KV
+evicts a ~0.9 GiB slot state): `madvise@GLIBC_2.2.5` back in `libllama-server-impl.so`; `AnonHugePages` from
+`/proc/<pid>/smaps_rollup` **1 142 784 kB** at the default against **0 kB** with `LLAMA_SERVER_CACHE_HUGEPAGE=0`;
+whole-slot saves **20.74 / 20.78 / 21.46 ms** against **54.23 / 52.78 / 49.65 ms** (-61 %).  A MoE host-expert
+shape cannot isolate this number -- its `AnonHugePages` is ~48 GiB of block 09/15 pool -- which is why the dense
+shape is the record.
+
+### 2. The instrument (this is the part that had to exist before the fix means anything)
+
+`scripts/check-system-headers.py`, **check 10** of `validate-set.sh`.  Gate 38 (r341) reconciles *inventory*
+(files, `#define`s, env vars, options) and is blind here by construction: nothing disappeared -- the include was
+still present, in the file the code had LEFT.  A need that MOVES is invisible to every per-file diff, and a build
+cannot see a branch it does not compile.  The new check fails when a line the delivery inserts calls a table
+symbol whose declaring system header its **include closure** does not reach (`madvise`/`mmap`/`posix_fadvise`/
+`sendfile`/`getrandom`/`flock`/`dlopen`/`clock_gettime`/... plus the `MADV_*`/`MAP_*`/`POSIX_MADV_*`/`O_DIRECT`
+families), and when any such line **guards an `#if` on that macro**.  Scope matches
+`check-windows-portability.sh` (an added file judged whole, an edited upstream file on the inserted lines only),
+which is what keeps it CI-clean -- Hexagon's module-local `mmap(bool)` and log strings full of `O_DIRECT` are not
+findings.  **Negative control**: the r339 tree reports exactly the two `server-slot-sched.cpp` sites; the fixed
+tree reports none.
+
+### 3. The second drop: block 02's MTP-pair rejection (found by scanning the r328 re-base, fixed here)
+
+Asked to check what else that re-base lost, the scan was: delivery-owned identifiers from the r327 tree that no
+longer exist anywhere in the current tree, then delivery-owned lines against the new base.  4 527
+definition-like identifiers added by the r327 set, 25 absent, 25 explained (7 are the `lf_*` DFlash API that was
+renamed to `llama_set_embeddings_layer_inp_dev` + the nextn dev-rows path, 5 the background-prefetch worker
+removed on purpose at r114, 3 CMake function names and 1 version string from the regex, the rest dead code
+removed with `pool_resident_locked`/`table_arena_bytes`/`slab_narrow2_floor_locked`).  **One real loss**: block
+02's
+
+    throw std::invalid_argument("draft-mtp and draft-mtp-adaptive cannot be enabled together");
+
+`draft-mtp` and `draft-mtp-adaptive` are one implementation class (`common_speculative_impl_draft_mtp`) over ONE
+`ctx_dft`, so enabling both built two impls that each run `process()` on every batch and advance the same draft
+context twice.  It is not a file, a `#define`, an env var or an option and a missing `throw` builds and runs, so
+gate 38 could not see it either.  Restored at the same place and in the same shape as the neighbouring
+DFlash-family rule (upstream's bitmask form), and **pinned by a test**, because a configuration guard is a
+behaviour: `tests/test-spec-type-exclusion.cpp` asserts the pair throws, each type alone does not, and the DFlash
+pair still throws.  No model and no draft context are needed -- the rejection precedes every context use.
+Negative control: with the check removed the test asserts at `init_throws({DRAFT_MTP, DRAFT_MTP_ADAPTIVE})` (exit
+134); restored, it passes.  Also fixed en route: the `static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14)` the same
+re-base had left unindented.
+
+### 4. Gates (all mandatory ones, on this release)
+
+`validate-set.sh` **green** (18 strict, checksums, applied tree `e4060a04c`, the 3 optional trees, Windows
+portability 515 files, file-set reconciliation **0 unexplained + 1 decision row**, the new check); coherence text
+**`1c5d32ac537d`** (the dense-4B reference, unchanged); MTP purity **`none` == `draft-mtp`** `513a3c356108` on
+the Flash-Next shape, and `--spec-type draft-mtp,draft-mtp-adaptive` refused with `failed to initialize
+speculative decoding context: draft-mtp and draft-mtp-adaptive cannot be enabled together`;
+`gate-prefill-logits.sh` **PASS** (mean KLD **0.000000**, same-top-p **100.000 %**, no GPU fault);
+`check-gen-docs.sh` **ok**; `ctest -R "test-spec-type-exclusion|test-speculative-adaptive"` **2/2**;
+`check-gpu-faults.sh` clean on every run log.  The two optional artifacts were re-cut onto the new default tree
+(`0100` -> `c4122acb7`, `0101` -> `abbac6fd6`, cumulative `8b3b1301`, reproduced through the consumer path
+`apply-all.sh --include-optional-all` on a fresh checkout).
+
+**Decision row added**: `patches/FILE-SET-RETIREMENTS.tsv` records the `server-task.cpp` include retirement scoped
+to the `v17-919794500-r339` transition -- gate 38 caught it as a LOSS and the row is the decision, which is
+exactly the ledger working as designed.
+
+**Record:** `INVARIANTS.md` r342 (the rule: guard the OS, never the macro; a moved NEED is invisible to per-file
+diffs; a configuration guard must be TESTED), `MANIFESTS.md` (check 10 note + the block 02 and block 12 rows),
+`ENVIRONMENT.md`, `patches/README.md` (blocks 02 and 12), `scripts/README.md`, `optional/*/README.md`.
+
+## 261121.022 (r341) -- `TODO` #358 resolved: a re-base rung that lands fewer files is an INSTRUMENT now (`scripts/check-rung-file-sets.py`, gate 38), not a note in a gate table -- zero findings on 68 of 70 release transitions, and the r328 incident reproduced exactly
+
+**No delivery patch changed: `patches/*.patch`, `release.json` (base/tip/tree/counts/hashes) and the block
+structure are untouched, so this session cuts no tag** (the `261121.007`/`.009`/`.021` precedent for a
+tooling-and-records revision).  What changed: one new check (`scripts/check-rung-file-sets.py`) + its decision-row
+ledger (`patches/FILE-SET-RETIREMENTS.tsv`), three call sites (`validate-set.sh` check 9, `validate-gpu.sh` step 1b,
+`gate-rebase-release.sh` step 1), `MANIFESTS.md` gate 38, and the records.
+
+### 1. What the item asked
+
+`#358`, opened by the r331 review: *"a re-base rung can silently drop a file ... reconcile each rung's changed-file
+set against the patch it replaces and fail on a file the old patch touched and the new one does not; the 18/18
+ladder cannot see it."*  The incident behind it is issue #345: the r328 re-base landed **34 of block 00's 37
+files**, two of the three missing being D1's intended `mmf.cu`/`mmf.cuh` retirement and the third --
+`ggml/src/ggml-alloc.c` (+121/-2: `GGML_GLU_INPLACE`, the unused-view release, the `layout_fp` fingerprint) --
+accounted for by no decision at all.  r328 and r329 shipped without it while the block's own text,
+`ENVIRONMENT.md`, the per-block gate table and `tests/test-alloc.cpp` kept describing it, and r329's `test-alloc`
+aborts at `test-alloc.cpp:704`.
+
+Nothing in the release flow could see that class, and r332 settled the framing: **the per-block build ladder is
+not a gate any more** (a block is a layer on the blocks before it; the artifact is the applied set), so the answer
+could not be "walk the ladder harder" -- a missing file's hunks live *inside other files* and compile fine in
+every tree, warm or cold.  The reconciliation had to be a **comparison against the previous release**, which is
+what this session built.
+
+### 2. What the check is (and why it is item sets, not files)
+
+`scripts/check-rung-file-sets.py` reduces each block of the new set and of the release it replaces to five item
+kinds and diffs them:
+
+| kind | what | how it is read |
+|---|---|---|
+| **file** | every path the block touches, **with the number of lines it adds there** | `diff --git` / `+++ b/<path>` headers, and every `+` line attributed to the current path |
+| **define** | every macro the block adds | `^+#\s*define\s+NAME` |
+| **env** | every env var the block reads | `getenv("NAME")` / `std::getenv(...)` on an added line |
+| **option** | every long option the block adds | `"--name"` on an added line in `common/arg.cpp` |
+| **block** | the block itself | a block/artifact in the old set with no counterpart in the new one |
+
+The verdict turns on the **set's** total, not the block's, so a hunk that merely moves between blocks is not a
+finding: `LOSS` (a file the old set added lines to that no block of the new set touches, or a define/env/option
+gone from the whole set) and `SHRUNK` (a block's contribution to a file fell by `--shrink-pct`, default 50 %, and
+the set's total for that file did not grow) fail; `MOVED` (another block took it) and `NEW` are informational and
+printed with `-v`.  A deliberate disappearance is a **decision row** in `patches/FILE-SET-RETIREMENTS.tsv`
+(`<from-release> TAB <block> TAB <kind> TAB <item> TAB <reason>`), and a row is **scoped to the transition it was
+decided in**, so it can never suppress a later release's finding by coincidence; rows that do not apply are
+counted in the summary, never silently ignored.
+
+The line count is the leg that catches the *second* half of the r331 incident: a lost hunk inside a file the block
+still edits moves no file set at all, which is how `GGML_CUDA_DISABLE_ROPE_SET_ROWS` disappeared (a presence-only
+switch, invisible to every build, every op suite and every text arm).  It reads as `SHRUNK` on the file and as
+`LOSS` on its env name.
+
+Three input modes, all with the same semantics: `--old <ref|dir>` (default: the newest `v*` tag before `HEAD`) and
+`--new <ref|dir>` (default: `patches/` + `optional/`); and **`--new-chain <repo> --new-base <sha>`**, which takes
+the new side from an applied block CHAIN (the block number read from each commit's `rdna-boosts: block NNNN:`
+subject, `block 00`..`block 16` and `block 0300` all normalising to the four-digit file prefix).  The chain mode is
+the **ladder** mode -- after porting a rung, `--rung 0000` reconciles that rung alone, which is when a lost file is
+a five-minute fix instead of a two-release defect.  A chain is the DEFAULT blocks only, so chain mode drops the
+optional `01xx` artifacts from the comparison rather than reporting them GONE by construction.
+
+### 3. Verified: it reproduces the incident, and it is quiet everywhere else
+
+| arm | result |
+|---|---|
+| `--old v17-4f9dfa0e3-r325 --new v17-919794500-r328` (the re-base that dropped the file) | **8 unexplained** -- `LOSS` env `GGML_GLU_INPLACE` (block 00), `LOSS` env `GGML_CUDA_DISABLE_ROPE_SET_ROWS` (block 10), `LOSS` file `tools/server/server-task.h` (block 12), `SHRUNK` `ggml/src/ggml-alloc.c` (**block 00 adds 0 lines, was 120; set 155, was 275**), `SHRUNK` `mmf.cu` (4 -> 3) and `mmf.cuh` (14 -> 11) -- the D1 decision rows -- `SHRUNK` `mmid.cu` (**204 -> 100**, set 270 -> 165) and `SHRUNK` `server-task.cpp` (99 -> 4, the block-12 -> block-16 server split); plus 3 `MOVED` and 3 `NEW` (informational) |
+| `--old v17-919794500-r329 --new v17-919794500-r331` (the fix) | **0 unexplained**, 2 `NEW` -- exactly the two restored switches (`GGML_GLU_INPLACE`, `GGML_CUDA_DISABLE_ROPE_SET_ROWS`) |
+| `--old v18-4f9dfa0e3-r287 --new v16-4f9dfa0e3-r288` (the block re-org) | **2 unexplained** -- blocks `0016`/`0017` renumbered into the optional range, i.e. a decision (2 `GONE`, 99 `MOVED`, 68 `NEW`) |
+| **all 70 consecutive release-tag pairs, r263..r339** | `0 unexplained` on **68**; the two firings are the two rows above.  **Zero false positives across 68 routine releases** (most are `0 unexplained; 0 moved; 0 new`, i.e. a no-op on an unchanged set) |
+| steady state (`patches/` vs `v17-919794500-r339`) | **0 unexplained** -- blocks 20 -> 20, files 571, defines 172, envs 575, options 14 -- **0.29 s** |
+| chain mode: `--new-chain ~/llama.cpp --new-base 919794500` vs `v17-919794500-r339` | **0 unexplained**, and **every per-block added-line count equal** (36/1068, 4/2901, 24/1445, ... 12/130) -- the fork branch and the patch set are the same set, block by block; 0.57 s |
+| `--rung 0000` on the r325->r328 pair | the block-0000 review list only (5 findings: `GGML_GLU_INPLACE`, `ggml-alloc.c`, `mmf.cu`, `mmf.cuh`, `mmid.cu`) -- the per-rung form works |
+| a decision row for `mmf.cu`/`mmf.cuh` + the server move (5 rows) | the 4 matching findings read `SHRUNK/ALLOWED` with the reason, the 4 without a row still fail, and a row scoped to `r339` does **not** apply to `ggml-alloc.c` on a `r325` comparison (mis-scoped row honoured only for its own transition) |
+| malformed row / unknown kind / `--old` not resolvable / optional rung against a chain | exit **2** with the row and column named (usage errors never look like a finding) |
+| no previous-release tag: `--allow-skip` (the shallow CI clone) vs without | `SKIP: ...` exit 0 / `FAIL: ...` exit **2** ("a full clone with no tag is a defect, not a skip") |
+
+### 4. Wired into the flow, so it cannot be forgotten
+
+* **`scripts/validate-set.sh` check 9** -- the delivery check, run by tier-1 CI and by the release flow.  It
+  never needed a checkout of `$src`, so it runs in the delivery repo itself.  A **shallow** clone (the hosted
+  `actions/checkout`) says `SKIP` loudly -- it has no tags -- so tier 1 stays ~20 s; every full clone runs it for
+  real.  Verified in both directions: GREEN on this tree, and **RED** with a `python3` shim that fails the check
+  (`FAIL: file-set reconciliation failed: a file/symbol/block the previous release carried is missing ...`).
+* **`scripts/validate-gpu.sh` step 1b** -- tier 2, `radiance`, a full clone on every new `origin/main`: the first
+  thing after the strict apply, ~1 s, `SKIP_RECONCILE=1` to narrow.  This is the unattended net under a re-base
+  pushed without the check.
+* **`scripts/gate-rebase-release.sh` step 1 (`state`)** -- the one-command re-base verdict records `file-sets` as a
+  PASS/FAIL next to the state checks, so a re-base verdict cannot be green while a block shrank.
+* **`MANIFESTS.md` gate 38** -- the contract, with the non-vacuity numbers; the re-base paragraph now names the
+  instrument instead of describing a habit, and `AGENTS.md` (*Build the fork*, *Regenerate the patches*, the
+  gate-picker table, the `scripts/` and `patches/` layout rows), `README.md` (*When upstream master moves*, the
+  tree), `INVARIANTS.md` (a new `r341` section + the r331 rule now points at the check), `scripts/README.md` and
+  `TODO.md` (#358 retired) all point at it.
+
+### 5. What it does not cover (accepted, named)
+
+* A **hunk inside a file whose added-line count does not fall by half** is still a judgement call: the check reports
+  `MOVED`/`NEW` and prints the per-block inventory under `-v`, but a rewrite that adds as many lines as it loses is
+  only visible to a review.  The class it *was* built for (a whole file, a whole env switch, a whole block) is
+  exact.
+* **Renames** are decisions: upstream renaming a constant (r331's `GGML_CUDA_CC_DGX_SPARK` -> `GGML_CUDA_CC_GB10`)
+  is an add plus a retire, so it wants a decision row.  That is the intent -- r331's rename was in fact a *lost*
+  switch, and a row has to be written by someone who decided it.
+* It says nothing about behaviour: the per-block gate table and the release gates still own that.
+
+### 6. Verified on this box
+
+| item | result |
+|---|---|
+| `bash scripts/validate-set.sh` (full, check 9 live) | **GREEN** -- 18 default patches strict on a fresh tarball, tree `447ce143eb9d565fab78f81b780143d832af4baf`, both optional artifacts alone and cumulative (`d06460d4c`/`868cedb45`/`1c2af3677`), 515 added files Windows-clean, **reconciliation 0 unexplained** |
+| `bash scripts/validate-set.sh` with a `python3` shim failing the reconciliation | **FAIL** at check 9 with the restore-or-record message (the wiring is real) |
+| the 70-pair calibration + the five named arms above | as tabulated |
+| `bash -n` on `validate-set.sh` / `validate-gpu.sh` / `gate-rebase-release.sh`, `python3 -m py_compile` | clean |
+| GPU work | **none needed** -- no patch changed, no kernel touched, and the check reads patch text only.  The next release's gates run against the same binary this tree builds today |
+
+`release.json` is unchanged by design, so the `v17-919794500-r339` tag / fork branch / container images remain the
+current release; this revision is tooling + records.
+
+## 261121.021 (r340) -- `TODO` #362 resolved: the per-start hipBLASLt lottery is measured on both ROCm lines, the 10.2 mapping is verified STRUCTURALLY (1 solution offered vs 18), and 10.2 is recorded as the canonical validated line
+
+**No delivery patch changed: `patches/`, `release.json` (base/tip/tree/counts/hashes) and the block structure are
+untouched, so this session cuts no tag** (the `261121.007`/`.009` precedent for a tooling-and-records revision).
+What changed: one new check script, `BASELINE.md`'s validated-line table, the §44 doctrine text, `README.md`,
+`TODO.md` and this record.
+
+### 1. What the item asked, and what the delivery can actually reach
+
+`#362` wanted §44's two recorded call sites replayed over N fresh starts on `/opt/rocm-10.2.0-gfx120X` with
+hipBLASLt **left enabled**, to decide whether the `c50ea60130f` (hipBLASLt 1.5) mapping still needs a pin.  The
+r336 arms were vacuous on both lines (10/10 and 6/6) for a reason this session confirmed directly, with the
+`GGML_CUDA_GCDBG` matmul census and a `HIPBLASLT_LOG_LEVEL=4 HIPBLASLT_LOG_MASK=1` trace:
+**the delivery no longer sends those shapes to hipBLASLt at all.**  Block 06's `mmf32` claims the F32 router and
+the F32 GDN `ssm_alpha`/`ssm_beta` shapes (r336), and block 10's GDN gate/beta epilogue fusion removes the
+per-layer `ssm` GEMMs — on the 35B-A3B prefill arm the DEFAULT environment dispatches **0** hipBLASLt GEMMs, and
+with `GGML_CUDA_MMF32=0` (the pre-block-06 routing) exactly **40** (`A[R_32F 2048x256] B[R_32F 2048x256] OP_T
+OP_N`, one per layer × ubatch).
+
+### 2. The arms, and the counts (`N` = fresh processes, one class per start)
+
+Instrument: a prefill-logits fingerprint per start — `test-logits-width-probe`'s row-0 FNV hash for the probe
+arms, and `sha256` of `llama-perplexity --kl-divergence-base`'s dump (a function of the logits only) for the
+perplexity arms.  Box: gfx1201, 1-3 R9700, r339 tree (`41a11cf04`), one build per line.
+
+| arm | ROCm 10.1.0 (hipBLASLt 1.4.1) | ROCm 10.2.0 (hipBLASLt 1.5.0) |
+|---|---|---|
+| gemma-4-26B-A4B Q8_0, F32 router at `m=128` (probe `P=128`) | **18/18** `49b8d53c10b8ebb9` | **18/18** `49b8d53c10b8ebb9` |
+| Flash-Next GSQ-RCO-IQ3_S, BF16 dense prefill at `m=512` (probe `P=512`, 3 devices `-ncmoe 47`) | **18/18** `bd347f7b5c4c40f2` | **18/18** `bd347f7b5c4c40f2` |
+| Qwen3.8-27B BF16 dense prefill at `m=512` (probe `P=512`, 2 devices) | **16/16** `099c21da867debc6` | not run (the class is covered twice above) |
+| 35B-A3B Q8_0 GDN, delivery default (perplexity, 256 tokens, `-ub 256`) | **8/8** `c0706cdd9601708e` | **8/8** `c0706cdd9601708e` |
+| same arm, `GGML_CUDA_MMF32=0` (the library arm) | **8/8** `c35c06f93acd4030` | **8/8** `ac690ba06fe921d6` |
+
+So: **68 fresh starts on 10.1 and 52 on 10.2, one logits class per arm on both lines.**  The two probe arms
+even read the *same* hash on both lines.  By §44's own rule this is **not** evidence that the library is fixed —
+a config that does not flip says nothing about the mechanism.  §44 stays true.
+
+### 3. What settles the mapping: the candidate container, not the logits
+
+The mechanism `c50ea60130f` addresses is hipBLASLt's `getAllSolutions()` container — the candidate list whose
+order was heap-address dependent, so a fresh process could pick a different TensileLite spine.  That container is
+**directly observable** in the trace, and it differs between the lines by more than an order:
+
+| line | per call (the `ssm` shape above) | log line shape |
+|---|---|---|
+| **10.1.0 / hipBLASLt 1.4.1** | **18 candidates** `140215, 140219, 140218, 140216, 140222, 140223, 140220, 140217, 140224 …`, tag `Equal` | a bare `[Info][getBestSolutions]` header, then one `[Info][getAllSolutions] sol-idx = N` line per candidate |
+| **10.2.0 / hipBLASLt 1.5.0** | **1 candidate** — `getBestSolutions(): sol-idx = 138457`, tag `Others`, and **no candidate list at all** | the pick is printed on the header line |
+
+8 starts per line, 40 calls each (320 calls per line): 10.2 offered a single solution in **every** call, i.e. the
+per-start solution choice **cannot** happen on that line for these shapes, which is exactly the fix's effect.
+On this install 10.1's 18-candidate order was itself stable (8/8, one order), so this box cannot *witness* the
+10.1 flip — which is why the container cardinality, not a flipping start, is the evidence of record.
+
+**Verdicts.**  10.2 = **NO-CHOICE** (the §44 pin is not needed there for these shapes); ≤10.1 = **STABLE-LIST
+here, mechanism live in principle** (keep the pin; it is also cheap since r336: 1-4 %).  The delivery never pins
+it, and every gate runs with hipBLASLt enabled, so nothing in the gate ladder changes.
+
+### 4. The instrument is now repeatable, not a one-off
+
+`scripts/check-hipblaslt-lottery.sh` runs both arms over `--starts N` fresh processes and prints the class
+census, the dispatch count and the candidate-list census, then one of three verdicts: `NO-CHOICE` (one candidate
+per call — the fix is present on this line), `EXPOSED` (several candidates and the order or the class varies —
+the lottery is live, pin before comparing) or `STABLE-LIST` (several candidates, one order, one class — the arm
+did not witness it and must not be quoted as a pass).  It **fails** only if the delivery default itself splits
+(a real defect), if the library arm never reached hipBLASLt (a vacuous arm must not report a verdict) or if a run
+fails; an `EXPOSED` verdict on a ROCm ≤ 10.1 box is a valid state, not a failure.  It is a **check, not a release
+gate** (it measures a toolchain and is expected to differ per line).  Two traps it encodes: the working trace env
+is `HIPBLASLT_LOG_LEVEL=4 HIPBLASLT_LOG_MASK=1 HIPBLASLT_LOG_FILE=…` (`HIPBLASLT_LOG_MASK=160`, the value the
+2026-10-21 record quotes, emits nothing on either line today), and hipBLASLt **1.5** prints the pick on the
+header line with no candidate list, so a parser that only understands 1.4's two-line form reports `lens=0` and
+would call 1.5 "no candidates" instead of "one, chosen".
+
+### 5. Policy: ROCm 10.2 is the canonical validated line (and always was)
+
+The second half of the item is a decision, and it is answered by what the repo already does: `~/bin/build-llama-rocm`
+builds **ROCm 10.2.0** into `build-rocm`, which is the tree every gate, every recorded arm and `release.json`'s
+reference point are measured on; `build-llama-rocm-101` (`build-rocm-101`, 10.1.0) and `build-llama-rocm-714`
+(`build-rocm-714`, 7.14.1) are the siblings used for line-specific checks, and r339 already built and ran the
+whole set on all three.  What was missing was the *statement* — `BASELINE.md` now carries a validated-line table
+(which line is canonical, which are build/coherence-validated, and the per-line rule that a prefill-logit base is
+not portable: `gate-prefill-logits.sh` refuses a base recorded on another line).  A pinned arm is a
+kernel-family switch on 10.1 (r336), not a determinism requirement, and no line's numbers are quoted across lines.
+
+### 6. Records
+
+`BASELINE.md` (*Validated ROCm lines*), `GREEDY-PURITY.md` §44 (addendum r340 + the rule text), `README.md`
+(the hipBLASLt paragraph: the measured evidence and a pointer to the check), `scripts/README.md` (index + the
+check's own entry), `INVARIANTS.md` (two facts: the 1-vs-18 candidate container, and the delivery default's 0
+dispatches), `TODO.md` (`#362` retired).  No GPU fault in any arm's log; nothing was built or benchmarked beside
+another run.
+
+## 261121.020 (r340) -- `TODO` #359 resolved: `gate-fusion-alias-copy.sh`'s arm-A oracle is re-derived as a LOGIT point (the unfused chain moved at the r328 base, and the fusion is not the cause)
+
+**No delivery patch changed** (a gate script + its contract text), so no tag.  The gate was red at r329, r331 and
+r339 for one reason: arm A still asserted that the fused `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU` launch reads
+**byte-identical text** to the `GGML_CUDA_DISABLE_FUSION=1` chain at `-ub 14`, and it does not any more.
+
+### 1. Reproduced, then attributed
+
+On the r339 build, the gate's own arms: `a_chain` **194 chars `dfe59c9c5257`**, `a_fused` **193 chars
+`3fab4da87774`** (the r239 anchor, i.e. the fused arm did **not** move), `a_no_moe_band` `dfe59c9c5257`
+(= the chain), `b_fill_fault` **`3fab4da87774`** (so section B was failing against the chain too, not against
+anything it owns), and section C green (`c_cache_on` `3fab4da87774` + 1 decline with `GGML_GLU_INPLACE=0`).
+3/3 repeats, each arm deterministic.
+
+Attribution, measured rather than argued:
+
+* the **unfused chain** is what moved.  With `GGML_MOE_HOST_OFFLOAD=0` — the pre-#323 offload decision — the
+  chain reads **`3fab4da87774` 3/3**, i.e. the anchor again.  `GGML_OP_OFFLOAD_MIN_BATCH=1` and `=999` (all-GPU
+  and all-CPU per-op placement) both read the *chain* text, so it is not a CPU-vs-GPU kernel difference either;
+* what the relaxation changes at this shape is the graph's **partitioning**: `GGML_SCHED_DEBUG=2 -lv 5` counts
+  **958 splits** with it and **1443** without, which selects the per-op MoE kernel set through the same seam
+  `INVARIANTS.md` r305 / `GREEDY-PURITY.md` §89 already name (and the r328 campaign's R09.3 recorded for the
+  arena-vs-arena-off arm).  The fused launch keeps its own layout, which is why it still reads the r239 anchor;
+* the divergence is **rounding level**: mean KLD **0.000002** / same-top-p **100.000 %** between the two arms at
+  the gate's own shape (256 scored tokens, `-ub 14`, hipBLASLt enabled), **0.000008 / 100.000 %** with the pins
+  the repaired gate adds.  The 193-vs-194 difference is one near-tie at the end of a 40-token run.
+
+### 2. The repair
+
+* **A** now asserts the **fused** arm's text against the recorded `ANCHOR` (exact bytes, the same anchor section C
+  uses) and that the chain's text is not degenerate, plus the existing `GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1`
+  equality.  The fused-vs-chain equivalence is a new **A.2** leg: `llama-perplexity --kl-divergence` at the
+  gate's shape, base recorded **in-run** from the chain, both legs pinned `ROCBLAS_USE_HIPBLASLT=0` (§44: a base
+  recorded in one process is compared in another) and `MOE_EXPERT_HEATMAP=load` (§89), limits mean KLD
+  **<= 0.001** and same-top-p **>= 99.9 %**.  Not vacuous: the same-kernel `-ub 8` reordering control at that
+  shape reads **0.003746 / 93.701 %** (~470x the measured pair), and a `KLD_MAX=0.000002` run was confirmed to
+  FAIL, so the leg can fail.
+* **B** is graded against the fused arm (it runs the default, fused path), i.e. against the anchor.
+* The KLD base is written to `~/.cache/rdna-boosts/gates/fusion-alias` (never `/tmp`, which is tmpfs) and deleted
+  after the compare; `KEEP_KLD=1` keeps it.  New knobs: `LLAMA_PPL`, `KLD_CORPUS`, `KLD_CTX`, `KLD_CHUNKS`,
+  `KLD_MAX`, `KLD_MIN_TOPP`, `KLD_BASE_DIR`, `KLD_THREADS`, `KLD_ARM=0` (arm A without its oracle, which is
+  reported as such).
+
+### 3. Gate result (r339 build, gfx1201)
+
+`PASS` on all sections: `a_fused` 193 `3fab4da87774` == anchor, `a_chain` 194 `dfe59c9c5257` (judged by the KLD),
+`a_no_moe_band` == `a_chain`, the trace arm declines `GLU<-NONE/copy@268435456` (1 class, default env 0 -- the
+protection firing is the point), A.2 **0.000008 / 100.000 %**, `b_fill_fault` == anchor, `c_cache_on` == anchor
+with 1 decline under `GGML_GLU_INPLACE=0`, and `check-gpu-faults.sh` clean over the gate's own window.
+
+### 4. Records, and one handle note
+
+`scripts/README.md` (index + the gate's entry), `MANIFESTS.md` gate 25 (the oracle and the reason), `INVARIANTS.md`
+(the measured fact), `TODO.md` (`#359` retired).  **Handle note:** `#359` was also used on the record for the
+"two test TUs on the deprecated batch API" item (`WORKLOG.md` 261121.008/.009, `wip/CAMPAIGNS.md`), which closed
+at r329; both uses are left in place (dated records are immutable and numbers are never reused), and this entry's
+subject is the `TODO.md` row as it stood.
+
+## 261121.019 (r339, published) -- `v17-919794500-r339` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` is re-cut at `.tip`
+
+**Published.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `ecbc6dbb..aea49b7e`, annotated
+tag **`v17-919794500-r339`** -> `aea49b7e`.  The fork `git@github.com:stew675/llama.cpp.git` `rdna-boosts` moved
+`2f0d05010..41a11cf04` (force-with-lease, lease read `2f0d05010`, the previous release's tip), i.e. exactly
+`release.json.tip`, and `git ls-remote` re-read after the push confirms `41a11cf0411b04b84722b4700c6c70822b8d0522`.
+
+**Verified rather than assumed.**
+* **Fork refresh**: `scripts/fork-refresh.sh --push --yes` re-cut from `919794500` with `apply-all.sh`, asserted the
+  applied tree == `release.json.tree` (`447ce143e`) and the commit count == `n_default` (18), printed tip
+  **`41a11cf04`** (recorded; the same id the earlier `--build --gates` run in this session produced, so the
+  deterministic re-cut held across two independent re-cuts), and pushed after the lease read.
+* **Delivery artifacts**: `validate-set.sh` GREEN twice on the final set -- 18 default patches strict on a fresh
+  `919794500` tarball, applied tree `447ce143e`, both optional artifacts re-cut and applying strictly
+  (`d06460d4c` / `868cedb45`, cumulative `1c2af3677`, all three re-derived and checked), Windows portability 515
+  added files.
+* **The release gates for this change**: `gate-hc-fusions.sh` on the Q8_0-hc class on **both** toolchains (10.1
+  scratch pair and 10.2 r338-vs-r339 pair) with all ten arms byte-identical each time,
+  `gate-prefill-logits.sh` **-0.000000 / 100.000 %** from a 10.1 build (the line the base was recorded on;
+  `MANIFESTS.md` gate 4 now states that rule), the two release text anchors unmoved (`1c5d32ac537d`,
+  `c420dfe04c42`), `test-backend-ops -o HC_MIX` 30/30, and no GPU fault in the kernel journal or any arm's log.
+  **The whole applied set also builds at the tip on all three shipped ROCm lines** -- 10.1
+  (`BUILD_DIR=build-rocm-101 ~/bin/build-llama-rocm-101`), 10.2 (`~/bin/build-llama-rocm`) and **7.14.1**
+  (`~/bin/build-llama-rocm-714`, whole `all` target), with `test-backend-ops -o HC_MIX` **30/30 on the 7.14
+  build too** -- which is what the submission's 32-bit masks would have prevented everywhere.
+  Details: `benchmarks/2026-11-21-hc-mix-band-kernels.md`.
+* **Container images**: the worker watcher (`scripts/container-watch.sh` on `radiance`) polls for the tag and will
+  build and push both ROCm lines.  Nothing was built on the primary box (policy).
+* The contributor's PR #344 is answered and the submission is archived verbatim under
+  `archive/work/hc-mix-q8/pr344/` (with `FOLD-NOTES.md`: the 32-bit shuffle mask that made it uncompilable, and
+  the fix that shipped).
+
 ## 261121.018 (r339) -- **RELEASE**: contributor PR #344 -- the Q8_0 hc mixer's decode band is served from ONE weight read per row and its emulated reference butterfly becomes a fixed expression (block 11, bit-identical, `HC_MIX` 33.1 -> 21.6 us at `nt 4`)
 
 **`release.json` changed: release `v17-919794500-r338` -> `-r339`, tip `2f0d05010` -> `41a11cf04`, tree

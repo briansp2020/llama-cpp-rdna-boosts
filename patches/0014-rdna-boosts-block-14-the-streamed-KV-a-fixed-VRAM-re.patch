@@ -1,4 +1,4 @@
-From 8c4df40461ba7caabf088d56e2321b2bb39259ed Mon Sep 17 00:00:00 2001
+From 48c272e21dad76f883a8cb634aae0c227a0c92de Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/17] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -1290,7 +1290,7 @@ index a9cc220ad..c6c7eb6c2 100644
      } catch (const std::runtime_error & e) {
          LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index b51879cd0..e52e0e503 100644
+index 19ac017b5..ffcf4d230 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -2038,6 +2038,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -6173,7 +6173,7 @@ index d11c0e7e0..c8739b83a 100644
          }
      }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 3bac22068..368e0b107 100644
+index 7ff183b5a..6e4c0c054 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -71,10 +71,6 @@ bool    ggml_hip_win_shared_mem_info(int64_t * limit_mib, int64_t * resident_mib
@@ -6236,7 +6236,7 @@ index 3bac22068..368e0b107 100644
      return err;
  }
  
-@@ -6547,9 +6565,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -6584,9 +6602,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      }
      // The floor is a one-time early decision, but the aux estimate is only known from `common` (after the
      // model load).  Re-run it when a larger aux arrives so the load-time aux-0 answer cannot silently
@@ -6252,7 +6252,7 @@ index 3bac22068..368e0b107 100644
      }
      g_preflight_done = true;
      g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
-@@ -8974,7 +8995,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9057,7 +9078,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // `head_pad`-byte writes (~256 KiB for 512 experts), i.e. free next to the expert upload it
      // guards.  `GGML_MOE_GATHER_ONCE=1` restores the once-only arm for A/B.
      if (head_pad > 0 && weight_cpy->data != nullptr) {
