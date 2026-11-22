@@ -1,12 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 15:00:18 +0000
-Subject: [PATCH 07/52] moe cache: header comment
+Subject: [PATCH 07/49] moe cache: header comment
 
 (cherry picked from commit ba81e02fac18a14c72c86ab3e3e1d34d8073fb27)
 (cherry picked from commit cfc2250b343f02a17a0eb133cb11c4c6b4ffd7cd)
 (cherry picked from commit 76df4ab3edc71fed38b861cd6dca6a176dc8c929)
 (cherry picked from commit f1f27048ce3be256724274c81c194d45cf311e65)
+(cherry picked from commit 976b26890fbd7fb686b7829cd37d67eb9e440278)
+(cherry picked from commit fe152f2552d2861316b77af761e4c9a95c7c0124)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.h | 2 +-
  1 file changed, 1 insertion(+), 1 deletion(-)

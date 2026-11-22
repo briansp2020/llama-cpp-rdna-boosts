@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:41:12 +0000
-Subject: [PATCH 06/52] moe cache: review fixes: the tier remap predicate
+Subject: [PATCH 06/49] moe cache: review fixes: the tier remap predicate
  refuses a fill_failed table; the down-fold also runs unfused for a declined
  sparse table
 
@@ -9,6 +9,8 @@ Subject: [PATCH 06/52] moe cache: review fixes: the tier remap predicate
 (cherry picked from commit 2e6747c0d8975ce9550ac43f582f81a785afd2ef)
 (cherry picked from commit 96945be1f56fccf9f435041d391d83a18e886f5a)
 (cherry picked from commit 2f892a98a7d86e82fe46cdcd3b18d04d98e6f560)
+(cherry picked from commit 87336b4dc3192c9d409196682e077a92bd8d822f)
+(cherry picked from commit b7ae9fed2069fd2271db16ff1a82284bca511253)
 ---
  ggml/src/ggml-cuda/mmvq.cu             | 5 +++--
  ggml/src/ggml-cuda/moe-expert-cache.h  | 2 +-
@@ -16,10 +18,10 @@ Subject: [PATCH 06/52] moe cache: review fixes: the tier remap predicate
  3 files changed, 5 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index a845c54101..bb0da2e43f 100644
+index d96af860db..3d3b53d2ef 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -3554,8 +3554,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+@@ -3573,8 +3573,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
              if (serve == MOE_CACHE_SERVE_IN_PLACE) {
                  ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
              } else if (serve == MOE_CACHE_SERVE_MIXED ||

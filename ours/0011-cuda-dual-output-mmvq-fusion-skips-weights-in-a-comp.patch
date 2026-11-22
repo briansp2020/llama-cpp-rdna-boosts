@@ -1,22 +1,24 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 21:45:55 +0000
-Subject: [PATCH 11/52] cuda: dual-output mmvq fusion skips weights in a
+Subject: [PATCH 11/49] cuda: dual-output mmvq fusion skips weights in a
  compute buffer (GGML_CUDA_FUSION_CHECK_LEAVES)
 
 (cherry picked from commit 5fbc2ac0f739e52e3ccac7927607c6cadfbd08a8)
 (cherry picked from commit 984c18be492e8feb9e67e11ec811294d808babf0)
 (cherry picked from commit 4f77f192944d7937f991fda819a48dfc8664dac5)
 (cherry picked from commit ce5d3e5a5e8b852c74bb65bbdb0652da88e22f2f)
+(cherry picked from commit f74e10936e7511f5cc01290f48371895bb0104ed)
+(cherry picked from commit c7360e82ff43074f5c69f7e1c0697063b5b1eb6b)
 ---
  ggml/src/ggml-cuda/mmvq.cu | 11 ++++++++++-
  1 file changed, 10 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index a845c54101..0c2709b65e 100644
+index d96af860db..f93131d819 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -3102,7 +3102,15 @@ static int ggml_cuda_ssm_prescan_impl(ggml_backend_cuda_context * ctx, const ggm
+@@ -3121,7 +3121,15 @@ static int ggml_cuda_ssm_prescan_impl(ggml_backend_cuda_context * ctx, const ggm
  // Dual-output mmvq fusion: two matmuls over the same activation with the same output shape (e.g. the
  // K and V projections of an attention layer).  The first matmul computes both results; the gate
  // result is written to the second matmul's destination.  Returns j - i when fused.
@@ -32,7 +34,7 @@ index a845c54101..0c2709b65e 100644
      if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
          return 0;
      }
-@@ -3119,7 +3127,8 @@ int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, cons
+@@ -3138,7 +3146,8 @@ int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, cons
                  mid->src[1] != mm_a->src[1] || mid->ne[0] != mm_a->ne[0] ||
                  mid->ne[1] != mm_a->ne[1] || mid->ne[2] != mm_a->ne[2] ||
                  mid->src[0] == mm_a->src[0] || mid->src[0]->type != mm_a->src[0]->type ||

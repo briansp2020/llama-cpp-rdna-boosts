@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:24:54 +0000
-Subject: [PATCH 05/52] moe cache: run a declined decode-band sparse
+Subject: [PATCH 05/49] moe cache: run a declined decode-band sparse
  gate+up+GLU unfused (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 The fused read of the scheduler copies gave NaN output at tight pin budgets; the per-op path reads the same copies correctly.
@@ -10,16 +10,18 @@ The fused read of the scheduler copies gave NaN output at tight pin budgets; the
 (cherry picked from commit 675401cd0bfd75cea7f9afa19c75c17fbe3d0032)
 (cherry picked from commit 37528d7e2644fa6bc81ec5baff31cb818d8cd677)
 (cherry picked from commit 565eb6e9efc3045a702a5c86df04ed654ec616a0)
+(cherry picked from commit 4b57e2d8067752f80474ece68ca0acab32201db6)
+(cherry picked from commit 740812c6e3ea11480f1089ebf1e7b82c4ef24fa0)
 ---
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 5 +++--
  ggml/src/ggml-cuda/moe-expert-cache.h    | 5 +++++
  2 files changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index e6b1242a3f..c6db149420 100644
+index e52bf0a870..fcc9972833 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2805,9 +2805,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2859,9 +2859,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                      fusion_local.gate_ids = &gate_ids_c;
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
                  } else if (ids != nullptr &&

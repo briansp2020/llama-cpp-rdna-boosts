@@ -1,13 +1,15 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 03:54:06 +0000
-Subject: [PATCH 02/52] moe cache: stage 0: our mmap code in
+Subject: [PATCH 02/49] moe cache: stage 0: our mmap code in
  moe-expert-tier*.inc, not yet hooked in
 
 (cherry picked from commit 53eab4bce495c8fabb6fd1ac58f82a8023d4a43a)
 (cherry picked from commit bb4b119a8fd6174934b820f1b23735f798d6c1f0)
 (cherry picked from commit b5fbca06054c47c1b2c41cdefee1d250ed597882)
 (cherry picked from commit b41f008422f04f6195084504c6ca46e752ca7a19)
+(cherry picked from commit a8a1e4ec53f43c6834b0367e1376ad5a948f3348)
+(cherry picked from commit 410631dd47e6942389b8c1338f74149ceab95b17)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu       |   15 +-
  ggml/src/ggml-cuda/moe-expert-tier-state.inc |   72 +
@@ -18,7 +20,7 @@ Subject: [PATCH 02/52] moe cache: stage 0: our mmap code in
  create mode 100644 ggml/src/ggml-cuda/moe-expert-tier.inc
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 08cc946e92..0ca26aa376 100644
+index fe5337a9e5..6ecfa1fccd 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -103,7 +103,8 @@ struct bounce_t {
@@ -31,7 +33,7 @@ index 08cc946e92..0ca26aa376 100644
      int         layer       = -1;
      std::string role;
      int         n_experts   = 0;
-@@ -12961,7 +12962,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -12977,7 +12978,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
  
  bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate,
                                const ggml_tensor * ids, int device, void * stream,
@@ -41,7 +43,7 @@ index 08cc946e92..0ca26aa376 100644
      if (!g_enabled || ids == nullptr || src0 == nullptr) {
          return false;
      }
-@@ -13008,6 +13010,13 @@ bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0,
+@@ -13024,6 +13026,13 @@ bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0,
          *gate_cpy = *gate;
          gate_cpy->data   = gate_arena;
          gate_cpy->buffer = nullptr;
@@ -55,7 +57,7 @@ index 08cc946e92..0ca26aa376 100644
      }
      return true;
  }
-@@ -13751,3 +13760,5 @@ void moe_cache_selftest() {
+@@ -13767,3 +13776,5 @@ void moe_cache_selftest() {
          (void) cudaSetDevice(prev);
      }
  }
@@ -3356,7 +3358,7 @@ index 0000000000..b4cc7cc8b3
 +    g_kvl_stream     = nullptr;
 +}
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 7ea7469aa6..e50b321ca7 100644
+index cdca3ad1d4..2587a2da65 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -193,12 +193,10 @@ bool llama_model_loader::host_expert_selected(const std::string & name, int laye

@@ -1,14 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 20 Nov 2026 06:35:49 +0000
-Subject: [PATCH 46/52] cuda/hip: keep hipBLASLt on when it has a stable
+Subject: [PATCH 40/49] cuda/hip: keep hipBLASLt on when it has a stable
  solution order (>= 1.5.0); MMB BF16 path only while it is off
 
 FINDINGS 1020 set ROCBLAS_USE_HIPBLASLT=0 because hipBLASLt returned one of
 two results for identical inputs, picked once per process. The cause is
 known now: for an untuned shape hipBLASLt fell back to getAllSolutions(),
 ordered by the heap address of its solution objects (ROCm/rocm-libraries
-#13476, openxla/xla#47659); PR #11340 (c50ea60130f) sorts it, and
 hipBLASLt 1.5.0 in ROCm 10.2 contains it (1.4.1 in 10.1 does not).
 
 - ggml_cuda_init (HIP, not Windows): with neither ROCBLAS_USE_HIPBLASLT nor
@@ -25,16 +24,18 @@ off = MMB): smallpf 878 / 855, pf31k 4082 / 4014, midpf prompt 3289 / 3202,
 needle prefill 3630 / 3587 t/s. Both arms reproduce their ROCm 10.1 hashes.
 
 (cherry picked from commit a43c1c1545b8d865fe803b029136fedadb82dd08)
+(cherry picked from commit b7790b7df870a24cb098c85835a07de5485d9c52)
+(cherry picked from commit 120142895fec90b68658904f102ac31012c6497b)
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu | 71 +++++++++++++++++++++++++++++----
- ggml/src/ggml-cuda/mmb.cu       |  5 ++-
- 2 files changed, 68 insertions(+), 8 deletions(-)
+ ggml/src/ggml-cuda/mmb.cu       | 10 ++---
+ 2 files changed, 68 insertions(+), 13 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 77d76ef7da..eb4d3da979 100644
+index e10e982f53..5838a08f57 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -562,6 +562,46 @@ static int ggml_cuda_parse_id(const char * devName) {
+@@ -568,6 +568,46 @@ static int ggml_cuda_parse_id(const char * devName) {
  }
  #endif // defined(GGML_USE_HIP)
  
@@ -81,7 +82,7 @@ index 77d76ef7da..eb4d3da979 100644
  static ggml_cuda_device_info ggml_cuda_init() {
      ggml_cuda_device_info info = {};
  
-@@ -569,15 +609,32 @@ static ggml_cuda_device_info ggml_cuda_init() {
+@@ -575,15 +615,32 @@ static ggml_cuda_device_info ggml_cuda_init() {
      // FINDINGS 1020: rocBLAS hands GEMMs to hipBLASLt by default, and hipBLASLt returned one of two different
      // results for bit-identical inputs (the choice made once per process) -- the same prompt gave two distinct
      // outputs across server starts.  rocBLAS's own Tensile path was single-outcome (FINDINGS 1019, 12 starts).
@@ -122,7 +123,7 @@ index 77d76ef7da..eb4d3da979 100644
              setenv("ROCBLAS_USE_HIPBLASLT", "0", /*overwrite =*/ 0);
  #endif
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index 8d75933ba5..e999c5009c 100644
+index fbc1fc0a45..5f8a335624 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
 @@ -5,6 +5,7 @@
@@ -133,17 +134,23 @@ index 8d75933ba5..e999c5009c 100644
  #include "mmvf.cuh"
  #include <cstdlib>
  #include <cstring>
-@@ -1945,7 +1946,9 @@ static bool mmb_tiny_m_bf16_ok(const int64_t K, const int64_t M) {
+@@ -1946,13 +1947,10 @@ static bool mmb_tiny_m_bf16_ok(const int64_t K, const int64_t M) {
+     return v != 0 && M >= 1 && M <= 8 && K % 4 == 0;
  }
- // BF16 dense weights on MMB independently of mmb_dense_flag() (FINDINGS 1030).  GGML_CUDA_MMB_BF16_DENSE=0: only
- // mmb_dense_flag() decides again (kill switch; on RDNA4 the BF16 GEMMs then go back to rocBLAS).
--static bool mmb_bf16_dense() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_BF16_DENSE"); return e ? atoi(e) : mmb_cfg_for_device(d).bf16_dense; }) != 0; }
-+// The default applies only while hipBLASLt is off (FINDINGS 1035): with a hipBLASLt that keeps a stable solution order
-+// (>= 1.5.0, see ggml_cuda_init) the BF16 GEMMs stay on it.
-+static bool mmb_bf16_dense() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_BF16_DENSE"); return e ? atoi(e) : (mmb_cfg_for_device(d).bf16_dense && ggml_cuda_hipblaslt_off() ? 1 : 0); }) != 0; }
- // Lowest n_tokens for a BF16 dense weight on MMB.  Never below MMVF_MAX_BATCH_SIZE_FLAT + 1, like the F32 split
- // tile: the decode/verify band must stay on MMVF.  GGML_CUDA_MMB_BF16_MIN_T overrides.
- static int mmb_bf16_min_t() {
+ // True when rocBLAS was told to keep GEMMs off hipBLASLt (ROCBLAS_USE_HIPBLASLT=0, the determinism control).
++// ours (FINDINGS 1035): ggml_cuda_init's decision -- off below hipBLASLt 1.5.0 (no stable solution order, it then sets
++// ROCBLAS_USE_HIPBLASLT=0) or when forced by GGML_CUDA_HIPBLASLT / ROCBLAS_USE_HIPBLASLT.
+ static bool mmb_hipblaslt_off() {
+-#if defined(GGML_USE_HIP)
+-    static const bool off = [] { const char * e = getenv("ROCBLAS_USE_HIPBLASLT"); return e != nullptr && atoi(e) == 0; }();
+-    return off;
+-#else
+-    return false;
+-#endif
++    return ggml_cuda_hipblaslt_off();
+ }
+ // BF16 dense weights on MMB independently of mmb_dense_flag().  The arch default applies only while hipBLASLt is
+ // off: with hipBLASLt on, these GEMMs stay on it.  GGML_CUDA_MMB_BF16_DENSE=0 / 1 forces off / on.
 -- 
 2.53.0
 

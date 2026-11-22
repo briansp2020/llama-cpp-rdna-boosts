@@ -1,16 +1,18 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 02:38:37 +0000
-Subject: [PATCH 51/52] hc mix: up + collapse computes each row gate directly
+Subject: [PATCH 42/49] hc mix: up + collapse computes each row gate directly
  (the reference butterfly over two chunk partials; GGML_CUDA_HC_UP_ROWS=0:
  reference-block emulation)
 
+(cherry picked from commit 247a5b57dec7244de3fa58d261b90b21ebc90a71)
+(cherry picked from commit 8f81e6111ae82108b30a451b8233f3f8b21f31c2)
 ---
  ggml/src/ggml-cuda/hc-mix.cu | 153 +++++++++++++++++++++++++++++++++++
  1 file changed, 153 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
-index f6e5b801a5..c991136bc9 100644
+index 9662adc92c..ed454998c5 100644
 --- a/ggml/src/ggml-cuda/hc-mix.cu
 +++ b/ggml/src/ggml-cuda/hc-mix.cu
 @@ -1075,6 +1075,143 @@ static __global__ void __launch_bounds__(S*256, 1) hc_mix_up_collapse_q8(
@@ -102,10 +104,10 @@ index f6e5b801a5..c991136bc9 100644
 +            case 4:  hc_rows_chunks<4>(d, wa, wb); break;
 +            default: hc_rows_chunks<6>(d, wa, wb); break;
 +        }
-+        wa += __shfl_xor_sync(0xFFFFFFFF, wa, 2, 32);
-+        wb += __shfl_xor_sync(0xFFFFFFFF, wb, 2, 32);
-+        wa += __shfl_xor_sync(0xFFFFFFFF, wa, 1, 32);
-+        wb += __shfl_xor_sync(0xFFFFFFFF, wb, 1, 32);
++        wa += ggml_cuda_shfl_xor(wa, 2, 32);
++        wb += ggml_cuda_shfl_xor(wb, 2, 32);
++        wa += ggml_cuda_shfl_xor(wa, 1, 32);
++        wb += ggml_cuda_shfl_xor(wb, 1, 32);
 +        if (p == 0) {
 +            gate_s[t][c][col] = wa + wb;
 +        }

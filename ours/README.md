@@ -3,7 +3,7 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v17-4f9dfa0e3-r325` (upstream llama.cpp `4f9dfa0e3` + this repo's release).
+**Base:** `v17-919794500-r338` (upstream llama.cpp `919794500` + this repo's release).
 The rest of this branch is that release as published; only `ours/` is added.
 
 **New layout (2026-11-08).** Up to r228 this was a 55-patch series (0000-0054) that replaced the release's
@@ -16,12 +16,12 @@ The old series is kept as the tag `ours-r228-series`; the mapping table below sh
 **Apply:**
 
 ```
-git checkout 4f9dfa0e3
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r325 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 52 patches (0001-0052)
+git checkout 919794500
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r338 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 49 patches (0001-0049)
 ```
 
-Result: tree `7d32477fab3a`. This is the production build from 2026-11-21 (2 GPUs, `-sm tensor`, ROCm 10.2).
+Result: tree `2f3f3bb7f65a`. This is the production build from the evening of 2026-11-21 (2 GPUs, `-sm tensor`, ROCm 10.2).
 
 ## Patches
 
@@ -36,7 +36,12 @@ r302 took our QSA indexer top-k fast path (PR #320, r299 0044) and r304 our GDN 
 r313 took our Q8_0 hc mixer (PR #326, r305 0032, 0036 and 0037); they are dropped here and the later patches move up.
 r324 took our exact MoE weighted reduction (PR #335, r321 0035 and 0036, as one switch `GGML_CUDA_MWR_EXACT`); they
 are dropped here and the later patches move up.
-The numbers below are the r325 series: the r321 series rebased onto r325 (no conflicts), plus 0047-0052.
+r328 re-based the release onto upstream `919794500`.  r331 restored block 00's `ggml-alloc.c` half (issue #345; our
+interim restore is dropped).  r336 took our BF16 dense GEMMs on MMB while hipBLASLt is off (PR #340, r325 0040-0045, with
+r325 0047's producer-copy fix), and r338 our even FFN / shared-expert split (PR #342, r325 0048-0049) as an OPT-IN
+(`-of tp-ffn-even` / `LLAMA_TP_FFN_EVEN=1`; production sets it); they are dropped here and the later patches move up.
+The numbers below are the r338 series: the r325 series rebased onto r338 (r334's RDNA2-only rows-abreast K loop in
+`mmvq-moe.cu` is carried into our MoE kernel by 0049), plus 0044-0049.
 
 | | what | env switch (off) |
 |---|---|---|
@@ -79,24 +84,35 @@ The numbers below are the r325 series: the r321 series rebased onto r325 (no con
 | 0037 | our namespace-scope env-flag initializers are named functions instead of lambdas (see the r299 validation) | - |
 | 0038 | the Q8_1 copy of a layer's input quantized for the attention / shared-expert matvecs is carried across the routed-MoE graph split, so the routed experts do not quantize the same input again; bit-identical | `GGML_CUDA_Q8_1_CARRY=0` |
 | 0039 | prompt GEMMs off hipBLASLt: on ROCm, rocBLAS hands GEMMs to hipBLASLt by default, and hipBLASLt returned one of two results for bit-identical inputs, chosen once per process (the same prompt gave two different outputs across server starts). The F32 split tile of our MMB GEMM gets its own token floor (33 on RDNA4, above the matvec band) so the MoE router's whole prompt band runs on it, and `ggml_cuda_init` sets `ROCBLAS_USE_HIPBLASLT=0` (rocBLAS's own Tensile path) unless the variable is already set. Changes output at rounding level | `GGML_CUDA_HIPBLASLT=1`, `GGML_CUDA_MMB_F32SPLIT_MIN_T=512` (old floor) |
-| 0040 | MMB: BF16 dense weights (on the production model the BF16 hyper-connection, router and indexer GEMMs) run on our bf16-WMMA GEMM on RDNA4 from 33 tokens while hipBLASLt is off (0041), instead of rocBLAS's Tensile path, which was 25-35 % slower than hipBLASLt on these shapes; deterministic. Changes output at rounding level | `GGML_CUDA_MMB_BF16_DENSE=0` |
-| 0041 | MMB: no BF16 side copy of the hc gate on RDNA4 (nothing read it); bit-identical | `GGML_CUDA_MMB_HC16=1` (old) |
-| 0042 | MMB: warp-per-token tiny-M kernel for BF16 weights with M <= 8 (hc inject / shared-expert gate) on RDNA4. Changes output at rounding level | `GGML_CUDA_MMB_TINY_M_BF16=0` |
-| 0043 | MMB: the tiny-M BF16 kernel reads the cached bf16 activation copy instead of the F32 one; bit-identical to 0044's dense-tile reference rounding | `GGML_CUDA_MMB_TINY_BF16_XH=0` |
-| 0044 | MMB: take the bf16 activation the producers already wrote (`bf16_src1_cache`: hc combine+norm, dsv4 hc_pre, hc_post RMS norm) instead of converting again; same rounding, bit-identical | `GGML_CUDA_MMB_PRODUCER_BF16=0` |
-| 0045 | MMB: BF16 dense weights whose RDNA4 256x128 grid is below 64 workgroups use a 128x64 or 64x32 tile (each output still sums K in the same order); bit-identical | `GGML_CUDA_MMB_SMALL_TILE=0` |
-| 0046 | hipBLASLt by version: `ggml_cuda_init` reads hipBLASLt's version (already-loaded `libhipblaslt.so.1`, one temporary handle). 1.5.0 and later (ROCm 10.2) keep a stable solution order (ROCm/rocm-libraries PR #11340: an untuned shape fell back to a solution list ordered by heap address), so hipBLASLt stays on there; older or unreadable versions get 0041's `ROCBLAS_USE_HIPBLASLT=0`, and 0042's MMB BF16 path applies only then. One log line states the decision. Source builds of hipBLASLt between 2026-09-09 and the fix also report 1.5.0 | `GGML_CUDA_HIPBLASLT=0` / `=1` (force off / on) |
-| 0047 | MMB: the producer-written BF16 activation (0044) is taken only by BF16 weights on the BF16 dense route; other GEMMs convert and insert into the cache as before, so the hc gate-mix fusion finds its input again (it had stood down on the production model) | `GGML_CUDA_MMB_PRODUCER_BF16=0` (convert always) |
-| 0048 | `-sm tensor`: FFN / shared-expert tensors split evenly when the size divides into equal shares at a granularity of lcm(block size, 64) instead of lcm(block size, 128) (Flash-Next's 640-wide experts: 320 / 320 instead of 256 / 384, so neither GPU waits for the other in every MoE all-reduce). Changes output at rounding level | `LLAMA_TP_FFN_EVEN=0` |
-| 0049 | 0048's log line once per model (the fitting pass loads with logging silenced, so a process-wide flag hid it) | - |
-| 0050 | Q8_0 hc mixer: the down dots serve every token of the verify band from one block per row (`w_down` read once per call, not once per token); per token the same arithmetic order; bit-identical | `GGML_CUDA_HC_DOWN_MT=0` |
-| 0051 | Q8_0 hc mixer: up + collapse computes each row's gate directly as the reference mmvq butterfly's two chunk partials, instead of emulating eight reference blocks per fused block; bit-identical | `GGML_CUDA_HC_UP_ROWS=0` |
-| 0052 | mmq: Q5_0 expert tables (the production model's routed down) on the RDNA4 routed-compact path with the IQ4_NL bands, so prefill reads experts in place instead of gathering the whole 512-expert table per layer; bit-identical | `GGML_MMQ_Q5_0_COMPACT=0` |
+| 0040 | hipBLASLt by version: `ggml_cuda_init` reads hipBLASLt's version (already-loaded `libhipblaslt.so.1`, one temporary handle). 1.5.0 and later (ROCm 10.2) keep a stable solution order (ROCm/rocm-libraries PR #11340: an untuned shape fell back to a solution list ordered by heap address), so hipBLASLt stays on there; older or unreadable versions get 0041's `ROCBLAS_USE_HIPBLASLT=0`, and 0042's MMB BF16 path applies only then. One log line states the decision. Source builds of hipBLASLt between 2026-09-09 and the fix also report 1.5.0 | `GGML_CUDA_HIPBLASLT=0` / `=1` (force off / on) |
+| 0041 | Q8_0 hc mixer: the down dots serve every token of the verify band from one block per row (`w_down` read once per call, not once per token); per token the same arithmetic order; bit-identical | `GGML_CUDA_HC_DOWN_MT=0` |
+| 0042 | Q8_0 hc mixer: up + collapse computes each row's gate directly as the reference mmvq butterfly's two chunk partials, instead of emulating eight reference blocks per fused block; bit-identical | `GGML_CUDA_HC_UP_ROWS=0` |
+| 0043 | mmq: Q5_0 expert tables (the production model's routed down) on the RDNA4 routed-compact path with the IQ4_NL bands, so prefill reads experts in place instead of gathering the whole 512-expert table per layer; bit-identical | `GGML_MMQ_Q5_0_COMPACT=0` |
+| 0044 | expert cache (mmap tier): the "is this one of the call's routed experts" test in the victim / candidate searches reads a per-call bitmap instead of scanning the protect list per slot; decisions unchanged (host time of the decode policy -57 %, ~+1 %) | `GGML_MOE_PROTECT_BITMAP=0` |
+| 0045 | server: when the last prompt chunk is the checkpoint tail and has the verify width (draft n_max + 1), all its rows are outputs, so the first verify reuses the tail's graph instead of rebuilding (agent-style 2K extensions -3.4 %, extensions with a reply -1.8 %); every hash identical in our runs | `LLAMA_CKPT_TAIL_OUTPUTS=0` |
+| 0046 | server: opt-in `LLAMA_CKPT_NEAR_SKIP=K` (no checkpoint within K tokens of the newest) and `LLAMA_CKPT_TAIL_MIN=K` (no tail for a short uncached remainder); both off by default (they force longer rewinds on chat follow-ups) | (off by default) |
+| 0047 | mmvq: the dense gate/up + GLU fusion at the verify width (2-8 tokens, RDNA4; was 1 token only), the launch also publishing the down projection's Q8_1 input (one counter per 32-row group, quantized exactly as the GLU's own Q8_1 kernel); the shared expert's 3 launches per layer become 1, bit-identical | `GGML_CUDA_DENSE_GLU_VERIFY=0` |
+| 0048 | mmvq-moe (RDNA4): rows per block 8 (8-10 K-blocks) or 4 (11-15) where a 2-row block's (row, K-block) items leave the last pass partly idle; the per-device Q5_0 MoE down at K 320 48 -> 34 us at 4 tokens. Changes output at rounding level (KLD ~0) | `GGML_CUDA_MOE_RPB_K=0` |
+| 0049 | mmvq-moe: the release's r334 RDNA2 rows-abreast K loop carried into our MoE kernel (the rebase took our side of that file); RDNA2 only, compiled out elsewhere | `GGML_CUDA_MOE_ROWS_ABREAST=0` |
 
 0005, 0006 (down-fold part) and 0009 were workarounds for the bug the release's fusion overlap check fixes at the source;
 0010 removes 0005. The others only run after a decline or a failed fill.
 
-Production also sets `MOE_HOST_POOL_TRANSPORT=map` (pins the host-read transport the r262 adaptive mode would otherwise pick). It no longer sets `GGML_HIP_FA_BAND_WMMA_SPLIT=32`: r322 fixed the band fixup period (issue #333), and r325 without it gives the same hashes.
+Production also sets `LLAMA_TP_FFN_EVEN=1` (the release's opt-in even FFN split, our PR #342) and `MOE_HOST_POOL_TRANSPORT=map` (pins the host-read transport the r262 adaptive mode would otherwise pick). It no longer sets `GGML_HIP_FA_BAND_WMMA_SPLIT=32`: r322 fixed the band fixup period (issue #333), and r325 without it gives the same hashes.
+
+## Validation on r338 (2026-11-21, Radeon AI PRO R9700 x 2, ROCm 10.2)
+
+On the production configuration (described in the next section) unless another model is named.
+
+- Rebase: with `LLAMA_TP_FFN_EVEN=1` every hash identical to the r325 series and to our r329 series (greedy, 512-token
+  prompt set, 4.4k and 30k-token prompts, 259.6k needle).
+- 0044, 0045, 0047: every hash identical with the switch on and off. 0048: KLD at a 4-token batch rounds to 0 (same top
+  token 100 %, PPL ratio 1.0009 +- 0.0009), every hash identical.
+- Nightly validation on the final tree: the 7-model comparison with the release passes (KLD 0 on 6 of 6), fault arms,
+  depth, 2-GPU layer and tensor arms all as expected, 0 problems.  test-backend-ops: two `MUL_MAT_PREC_SRC1_BF16` cases
+  (128 x 512 x 512) give NaN on ROCm0 -- the release fails them identically.
+- Production since 2026-11-21 evening: greedy 144-153 t/s, 512-token prompt set 146-153 t/s; decode about 3-5 % above
+  the r325 series, prefill equal.
 
 ## Validation on r325 (2026-11-20 and 2026-11-21, Radeon AI PRO R9700 x 2, ROCm 10.2)
 

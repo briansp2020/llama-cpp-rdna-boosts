@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:09:29 +0000
-Subject: [PATCH 28/52] moe cache: KV segment -- one take per request
+Subject: [PATCH 28/49] moe cache: KV segment -- one take per request
  (GGML_MOE_KV_SEG_TAKE1)
 
 With the KV segment the lend line follows the cells in use, so a long
@@ -33,6 +33,8 @@ synchronise, to show where a take spends it.
 (cherry picked from commit f1c66deb8e1a9dc12a54dee592b7c3d96420b43b)
 (cherry picked from commit f25b950948ccf0665a262d97214e7ca09ea0f1f3)
 (cherry picked from commit 67bcaaa9b717f1ae4be745f542d35dd72658dcdc)
+(cherry picked from commit 1c48fdc27fa696319e50abb40738021a0a77c9da)
+(cherry picked from commit 72d1c13596b982306edb7964dee46592143b7494)
 ---
  ggml/src/ggml-cuda/moe-expert-tier.inc | 13 +++++++++++--
  src/llama-ext.h                        |  8 ++++++++
@@ -93,10 +95,10 @@ index 4d9fcf6b8c..c6b13c8c49 100644
      } else if (want + 4 * step <= old) {
          g_kvl_line = want;
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index b2c8d8bc79..d7eada88c4 100644
+index 860a4281a7..4edd0ea0d2 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
-@@ -151,6 +151,14 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
+@@ -153,6 +153,14 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
  // (the qwen4exp/glm5-next indexer) moves both, or neither.
  LLAMA_API bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park);
  
@@ -112,7 +114,7 @@ index b2c8d8bc79..d7eada88c4 100644
  // no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
  // attention cells, that cache as well.  A memory without an attention cache: true.
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index a6b2b55c63..f0cbe3bfd0 100644
+index 4e3c17dca7..f1f80c3599 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -500,6 +500,7 @@ typedef void (*llama_kv_lend_unregister_t)();
@@ -123,7 +125,7 @@ index a6b2b55c63..f0cbe3bfd0 100644
  
  //
  // llama_kv_cache
-@@ -1392,13 +1393,33 @@ void llama_kv_cache::lend_need(uint32_t at_least) const {
+@@ -1389,13 +1390,33 @@ void llama_kv_cache::lend_need(uint32_t at_least) const {
          return;
      }
      const auto & cells = v_cells[0];
@@ -158,7 +160,7 @@ index a6b2b55c63..f0cbe3bfd0 100644
  void llama_kv_cache::init_rotation(const char * name_tag) {
      if (!(n_rot_k || n_rot_v) || layers.empty()) {
          return;
-@@ -2794,6 +2815,7 @@ llama_kv_cache::~llama_kv_cache() {
+@@ -2797,6 +2818,7 @@ llama_kv_cache::~llama_kv_cache() {
          g_kv_lend_owner      = nullptr;
          g_kv_lend_need       = nullptr;
          g_kv_lend_unregister = nullptr;
@@ -167,7 +169,7 @@ index a6b2b55c63..f0cbe3bfd0 100644
      // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
      // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index f1e4f0cc56..99f823cfbd 100644
+index 281b580ce1..44dc19d4a6 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -309,6 +309,7 @@ public:
@@ -179,10 +181,10 @@ index f1e4f0cc56..99f823cfbd 100644
      //
      // input API
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index f3a796e125..64c574611f 100644
+index a8fb22d09d..a0f08ec0a6 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -23,6 +23,7 @@
+@@ -24,6 +24,7 @@
  #include "mtmd.h"
  #include "mtmd-helper.h"
  #include "base64.hpp"
@@ -190,7 +192,7 @@ index f3a796e125..64c574611f 100644
  
  #include <algorithm>
  #include <cstddef>
-@@ -4196,6 +4197,20 @@ private:
+@@ -4158,6 +4159,20 @@ private:
              llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
          }
  

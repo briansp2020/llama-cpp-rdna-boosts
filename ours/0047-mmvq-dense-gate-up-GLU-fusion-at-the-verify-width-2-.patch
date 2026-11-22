@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 21 Nov 2026 21:53:43 +0000
+Subject: [PATCH 47/49] mmvq: dense gate/up + GLU fusion at the verify width
+ (2-8 tokens, RDNA4), publishing the down projection Q8_1 from the ksplit
+ launch (GGML_CUDA_DENSE_GLU_VERIFY=0: off)
+
+(cherry picked from commit ee6cc7b9fc9e95bc30f2b4dc229e9131e6d79f25)
+(cherry picked from commit c7febda8c385a5413234035dee9c678b1f6462a2)
+---
+ ggml/src/ggml-cuda/common.cuh            |  3 ++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 36 +++++++++++++++++-
+ ggml/src/ggml-cuda/mmvq-ksplit-body.inc  | 38 +++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu               | 47 +++++++++++++++++++++++-
+ ggml/src/ggml-cuda/mmvq.cuh              |  1 +
+ 5 files changed, 123 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index fc518f1991..d3163d9c1c 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2952,6 +2952,9 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+                                    const ggml_tensor * ffn_gate_scale = nullptr);
+ 
+ struct ggml_cuda_mm_fusion_args_host {
++    // dense gate/up + GLU at the verify width (GGML_CUDA_DENSE_GLU_VERIFY): the matmul that reads the GLU output; the
++    // ksplit launch then also publishes that input's Q8_1 blocks into the quantize cache (nullptr = no publish)
++    const ggml_tensor * glu_q8_mm = nullptr;
+     const ggml_tensor * x_bias = nullptr;
+     const ggml_tensor * gate = nullptr;
+     // MUL_MAT_ID gate lane with its own expert ids (an expert-cache gate table: its own slot remap); nullptr = the up ids
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index bd3b18c9e7..215d186742 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -2886,11 +2886,45 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+                 break;
+             }
+ 
+-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
++            // GGML_CUDA_DENSE_GLU_VERIFY (mmvq.cu): the dense arm at the verify width (2-8 tokens, RDNA4) -- gate and up
++            // the same type, K and row stride over the same activation -- with the down projection's Q8_1 published by
++            // the launch (the matmul reading the GLU, found as ggml_cuda_glu_q8_1_mark finds it).
++            const ggml_tensor * glu_q8_mm = nullptr;
++            bool dense_verify = false;
++            if (ids == nullptr && !copy_alias && ggml_cuda_dense_glu_verify_on() &&
++                    GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
++                    up->ne[1] >= 2 && up->ne[1] <= 8 && up->ne[2] == 1 && up->ne[3] == 1 &&
++                    gate->src[1] == up->src[1] && gate->src[0]->type == up->src[0]->type &&
++                    gate->src[0]->ne[0] == up->src[0]->ne[0] && gate->src[0]->ne[1] == up->src[0]->ne[1] &&
++                    gate->src[0]->nb[1] == up->src[0]->nb[1] && ggml_is_matrix(gate->src[0]) && ggml_is_matrix(up->src[0]) &&
++                    glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && glu->ne[0] % QK8_1 == 0 &&
++                    ggml_cuda_should_fuse_mul_mat_vec_q(up, true) && ggml_cuda_should_fuse_mul_mat_vec_q(gate, true)) {
++                dense_verify = true;
++                const ggml_tensor * mm = nullptr;
++                if (i + 3 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_MUL_MAT) {
++                    mm = cgraph->nodes[i + 3];
++                } else if (i + 4 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_RESHAPE &&
++                           cgraph->nodes[i + 4]->op == GGML_OP_MUL_MAT) {
++                    mm = cgraph->nodes[i + 4];
++                }
++                if (mm != nullptr) {
++                    const ggml_tensor * a = mm->src[1];
++                    const ggml_tensor * a_root = a;
++                    while (a_root->view_src != nullptr) {
++                        a_root = a_root->view_src;
++                    }
++                    if (a_root == glu && ggml_is_contiguous(a) && a->ne[0] == glu->ne[0] && ggml_nelements(a) == ggml_nelements(glu) &&
++                            a->ne[1] >= 2 && ggml_is_quantized(mm->src[0]->type) && ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
++                        glu_q8_mm = mm;
++                    }
++                }
++            }
++            if ((ggml_cuda_should_fuse_mul_mat_vec_q(up) || dense_verify) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate->src[0];
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
++                fusion_data.glu_q8_mm = glu_q8_mm;
+ 
+                 // wip/moe-expert-cache (ours, on r317's issue #294 contract): the decode MoE may read a compact arena +
+                 // slot-remapped ids instead of the full expert tables.  Redirect BOTH lanes together; our tier tables
+diff --git a/ggml/src/ggml-cuda/mmvq-ksplit-body.inc b/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
+index 9cb9f8b8c7..5cc82895b4 100644
+--- a/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
++++ b/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
+@@ -349,6 +349,44 @@
+         }
+     }
+ 
++    // Dense gate/up + GLU at the verify width (GGML_CUDA_DENSE_GLU_VERIFY): this block wrote rows row0.. of every token;
++    // it adds its row count to its 32-row group's counter, and the block completing the group quantizes the group for
++    // every token exactly as unary_gated_q8_1_op_kernel does (one warp, lane = element, the same max / sum reductions,
++    // amax / 127 and roundf), then resets the counter.  The F32 values are re-read from dst (written above, fenced).
++    if constexpr (has_fusion && !gdn_epi && !row_cat && ncols_dst > 1) {   // 1-token kernels unchanged
++        if (fusion.glu_q8 != nullptr && ids == nullptr && warp_size == 32 && rows_per_cuda_block <= QK8_1) {
++            const int rv = (int) min((uint32_t) rows_per_cuda_block, stride_col_dst - (uint32_t) row0);
++            const int g  = row0 / QK8_1;
++            float * dst_rows = dst - row0;   // dense: sample and channel offsets are 0
++            __threadfence();
++            int prev = 0;
++            if (threadIdx.x == 0) {
++                prev = atomicAdd(fusion.glu_q8_cnt + g, rv);
++            }
++            prev = ggml_cuda_shfl(prev, 0, 32);
++            if (prev + rv == QK8_1) {
++                __threadfence();
++#pragma unroll
++                for (int j = 0; j < ncols_dst; ++j) {
++                    const float v = __builtin_nontemporal_load(&dst_rows[j*stride_col_dst + g*QK8_1 + threadIdx.x]);
++                    float amax = fabsf(v);
++                    float sum  = v;
++                    amax = warp_reduce_max<QK8_1>(amax);
++                    sum  = warp_reduce_sum<QK8_1>(sum);
++                    const float  d = amax / 127.0f;
++                    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
++                    block_q8_1 * y = fusion.glu_q8 + j*fusion.glu_q8_stride_token + g;
++                    y->qs[threadIdx.x] = q;
++                    if (threadIdx.x == 0) {
++                        y->ds = make_half2(d, sum);
++                    }
++                }
++                if (threadIdx.x == 0) {
++                    fusion.glu_q8_cnt[g] = 0;
++                }
++            }
++        }
++    }
+     if constexpr (!has_fusion) {
+         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_dst_gate, use_conv_input, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, dst_gate, conv_input, conv_states, conv_kernel_size);
+     }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index f93131d819..0f5cf48cca 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1200,6 +1200,15 @@ static void mul_mat_vec_q_switch_fusion(
+         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+ }
+ 
++// GGML_CUDA_DENSE_GLU_VERIFY (on unless 0): the dense gate/up + GLU fusion (one ksplit launch, the GLU applied in its
++// epilogue) at the verify width (2-8 tokens, RDNA4), which was 1-token only; the launch also publishes the GLU output's Q8_1
++// blocks for the down projection (FINDINGS 1059/1060: the shared expert ran gate ksplit, up ksplit and
++// unary_gated_q8_1 as three launches per layer).  GGML_CUDA_FUSE_Q8_1_VERIFY=0 also turns it off.
++bool ggml_cuda_dense_glu_verify_on() {
++    static const bool v = !getenv("GGML_CUDA_DENSE_GLU_VERIFY") || atoi(getenv("GGML_CUDA_DENSE_GLU_VERIFY")) != 0;
++    return v;
++}
++
+ // The mixed-type row concat pairs (RDNA4, 1 token): a K-quant launch type and a Q6_K segment (the attn_v of the
+ // K-quant "M" mixes), both with the same nwarps on RDNA4 (1; static_assert in mul_mat_vec_q_ksplit_cat2).  GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0: off.
+ static bool ggml_cuda_mmvq_cat2_ok(ggml_type type, ggml_type type_b, int cc) {
+@@ -1266,6 +1275,19 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+             return;
+         }
+     }
++    if constexpr (c_ncols_dst > 1 && c_ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++        // dense gate/up + GLU at the verify width (GGML_CUDA_DENSE_GLU_VERIFY): the gate dot and the GLU epilogue only
++        if (has_fusion && ids == nullptr && fusion.gate != nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
++                fusion.x_scale == nullptr && fusion.gate_scale == nullptr && !fusion.x_scale_channel_dst &&
++                fusion.conv_input == nullptr && fusion.dst_gate == nullptr && fusion.cat_dst[0] == nullptr) {
++            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
++            ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k, small_m>, launch_params,
++                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
++            return;
++        }
++    }
+ 
+     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+ 
+@@ -1869,7 +1891,9 @@ void ggml_cuda_mul_mat_vec_q(
+     if (fusion) {
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+-        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->gdn_gate_seg >= 0 && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE));
++        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->gdn_gate_seg >= 0 && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE) ||
++                  // dense gate/up + GLU at the verify width (GGML_CUDA_DENSE_GLU_VERIFY; the launcher admits the gate-only case)
++                  (fusion->gate != nullptr && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE && ggml_cuda_dense_glu_verify_on()));
+         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
+         // non-negligible for some models such as gpt-oss-20b. The per-token MoE scale is a second exception.
+         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4 || fusion->x_scale_channel_dst);
+@@ -1982,6 +2006,27 @@ void ggml_cuda_mul_mat_vec_q(
+                 }
+             }
+         }
++        // dense verify-band gate/up + GLU (GGML_CUDA_DENSE_GLU_VERIFY): publish the down projection's Q8_1 input from the
++        // launch, keyed and laid out exactly as the GLU's own Q8_1 path (unary.cu, ggml_cuda_op_unary_gated) does
++        if (fusion->glu_q8_mm != nullptr && !ids && fusion->gate && ggml_cuda_info().devices[ctx.device].warp_size == 32) {
++            const ggml_tensor * a = fusion->glu_q8_mm->src[1];
++            const ggml_tensor * a_key = a;
++            while (a_key->view_src != nullptr && a->data == a_key->data) {
++                a_key = a_key->view_src;
++            }
++            GGML_ASSERT(a->ne[0] == dst->ne[0] && ggml_nelements(a) == ggml_nelements(dst) && dst->ne[0] % QK8_1 == 0 &&
++                        dst->ne[0]/QK8_1 <= GGML_CUDA_MOE_GLU_Q8_CNT);
++            const int64_t ne10_padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
++            const size_t  q8_1_size   = a->ne[3]*a->ne[2] * a->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
++            bool cached = false;
++            void * y = ctx.q8_1_cache_get(a_key, ctx.curr_stream_no, q8_1_size, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
++                                          a->nb[1]/sizeof(float), a->nb[2]/sizeof(float), a->nb[3]/sizeof(float), cached);
++            if (!cached) {
++                fusion_local.glu_q8              = (block_q8_1 *) y;
++                fusion_local.glu_q8_cnt          = ctx.moe_glu_q8_counters();
++                fusion_local.glu_q8_stride_token = (uint32_t) (ne10_padded/QK8_1);
++            }
++        }
+         if (fusion->dst_gate) {
+             GGML_ASSERT(fusion->dst_gate->type == GGML_TYPE_F32);
+             fusion_local.dst_gate = fusion->dst_gate->data;
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 4aef754a51..1324e525ef 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -54,6 +54,7 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+     const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
+ 
+ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false);
++bool ggml_cuda_dense_glu_verify_on();
+ 
+ int ggml_cuda_mul_mat_id_weighted_down_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ 
+-- 
+2.53.0
+

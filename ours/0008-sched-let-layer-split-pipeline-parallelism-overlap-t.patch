@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 23:32:10 +0000
-Subject: [PATCH 08/52] sched: let layer-split pipeline parallelism overlap the
+Subject: [PATCH 08/49] sched: let layer-split pipeline parallelism overlap the
  devices on ROCm
 
 Layer split with pipeline parallelism (several devices, no -ot) ran the GPUs
@@ -36,40 +36,16 @@ layer split identical to the base-vs-base control at 8k and 32k. Full
 (cherry picked from commit 3fc31bd929c8d34ec743dfeb46a530393327687f)
 (cherry picked from commit 5f3593b9f743df441160ea720810fdec01f52980)
 (cherry picked from commit 124d9db7e169c2289a9bb31d506dfb390f72dbd3)
+(cherry picked from commit 9ec186548b8c1824cd39c4a5f898ea5232478f24)
+(cherry picked from commit 6d67dc91a3bcc33579d7e3cf49d773d2b04f6d23)
 ---
- ggml/src/ggml-alloc.c     | 14 ++++++-
  ggml/src/ggml-backend.cpp | 82 ++++++++++++++++++++++++++++++++++++++-
  src/llama-context.cpp     |  8 +++-
  src/llama-kv-cache.cpp    | 13 +++++++
- 4 files changed, 113 insertions(+), 4 deletions(-)
+ 3 files changed, 101 insertions(+), 2 deletions(-)
 
-diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 35b07f5f65..a507e7cb51 100644
---- a/ggml/src/ggml-alloc.c
-+++ b/ggml/src/ggml-alloc.c
-@@ -698,8 +698,18 @@ static uint64_t ggml_gallocr_graph_fp(const struct ggml_cgraph * graph) {
- 
-         uint64_t v = (uint64_t) t->op;
-         v = v*0x100000001b3ull ^ (uint64_t) t->type;
--        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
--            v = v*0x100000001b3ull ^ (uint64_t) t->ne[d];
-+        // GGML_GALLOC_FP_SHAPES=0: leave the shapes out of the fingerprint.  A graph with the same topology then keeps
-+        // the reserved layout as long as every tensor fits its planned size (checked per tensor in needs_realloc, the
-+        // upstream rule); a graph whose n_kv-sized tensors shrink no longer forces a re-reserve.  Default 1 (shapes in).
-+        static int fp_shapes = -1;
-+        if (fp_shapes < 0) {
-+            const char * e = getenv("GGML_GALLOC_FP_SHAPES");
-+            fp_shapes = e != NULL ? atoi(e) != 0 : 1;
-+        }
-+        if (fp_shapes) {
-+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-+                v = v*0x100000001b3ull ^ (uint64_t) t->ne[d];
-+            }
-         }
-         v = v*0x100000001b3ull ^ (uint64_t) (t->view_src != NULL);
-         v = v*0x100000001b3ull ^ (uint64_t) (t->flags & flags_mask);
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index d1781645b5..87d36992e8 100644
+index 473c237587..0cce3d6200 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1521,6 +1521,15 @@ struct ggml_backend_sched_split {
@@ -97,7 +73,7 @@ index d1781645b5..87d36992e8 100644
      bool lazy_events;
      struct ggml_tensor ** graph_inputs;
      int n_graph_inputs;
-@@ -3315,6 +3326,62 @@ static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sche
+@@ -3322,6 +3333,62 @@ static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sche
      return ev;
  }
  
@@ -160,7 +136,7 @@ index d1781645b5..87d36992e8 100644
  static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
      const int split_backend_id = split->backend_id;
      ggml_backend_t split_backend = sched->backends[split_backend_id];
-@@ -3340,6 +3407,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3347,6 +3414,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
      } else if ((input->flags & GGML_TENSOR_FLAG_INPUT) ||
          (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(input) != nullptr)) {
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -170,7 +146,7 @@ index d1781645b5..87d36992e8 100644
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched_event_get(sched, split_backend_id));
          } else {
-@@ -3656,7 +3726,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3663,7 +3733,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                  input->buffer != NULL &&
                  ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                  !sched_async_large_host_input();
@@ -181,7 +157,7 @@ index d1781645b5..87d36992e8 100644
                  split_backend->iface.event_wait != NULL) {
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                      sched_event_wait_self(sched, split_backend_id);
-@@ -4099,6 +4171,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -4106,6 +4178,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int e = 0; e < GGML_SCHED_COPY_EVENTS; e++) {
              ggml_backend_event_free(sched->copy_events[b][e]);
          }
@@ -195,7 +171,7 @@ index d1781645b5..87d36992e8 100644
          for (int s = 0; s < GGML_SCHED_STAGE_SLOTS; s++) {
              ggml_backend_event_free(sched->stage_done_ev[b][s]);
              ggml_backend_event_free(sched->stage_free_ev[b][s]);
-@@ -4187,6 +4266,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -4194,6 +4273,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
  
      sched->cur_copy = sched->next_copy;
      sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
@@ -204,10 +180,10 @@ index d1781645b5..87d36992e8 100644
      ggml_backend_sched_split_graph(sched, graph);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index b39e6582d1..54e0f702ba 100644
+index 25a848bc48..93a9766e86 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -3326,7 +3326,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3335,7 +3335,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
      const auto gparams = graph_params(res, ubatch, mctx, gtype);
  
@@ -223,10 +199,10 @@ index b39e6582d1..54e0f702ba 100644
  
          // with pipeline parallelism, the previous graph_compute_async may still be running
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index c592716b09..849ed17282 100644
+index 832ea8a954..b7ee12955c 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -3041,6 +3041,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
+@@ -3044,6 +3044,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
          const uint32_t used = parked.empty() ? cells.used_max_p1() : cells.used_max_p1_below(park_bound());
          const uint32_t pad  = prefill && GGML_PAD(used, n_pad_cur) > n_pad_prefill_from ? n_pad_prefill : n_pad_cur;
  

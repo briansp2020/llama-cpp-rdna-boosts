@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 22 Nov 2026 01:19:06 +0000
+Subject: [PATCH 49/49] mmvq-moe: carry release r334 RDNA2 rows-abreast K loop
+ (block 10) into our MoE kernel (the cherry-pick of our series took our side
+ of this file; RDNA2-only, compiled out elsewhere)
+
+---
+ ggml/src/ggml-cuda/mmvq-moe.cu | 59 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
+index c7b49f2733..d4cba70f89 100644
+--- a/ggml/src/ggml-cuda/mmvq-moe.cu
++++ b/ggml/src/ggml-cuda/mmvq-moe.cu
+@@ -527,7 +527,59 @@ static __global__ void mul_mat_vec_q_moe(
+                 }
+             }
+         }
+-    } else
++    } else {
++#if defined(RDNA2)
++    // RDNA2: the item loop below costs a divide per (row, K-block) item and keeps one dot product in flight.
++    // Walk the K-blocks with the rows of the block side by side instead.  A thread group g takes the items
++    // it == g (mod n_groups), so in row i it takes the K-blocks kbx == g - i*blocks_per_row_x (mod n_groups), in
++    // rising order: each row's partial sum is built from the same K-blocks in the same order as the item loop
++    // builds it, so the result is bit-identical.  GGML_CUDA_MOE_ROWS_ABREAST=0: off.  (release r334, block 10)
++    const bool rows_abreast = fusion.moe_rows_abreast;
++#else
++    constexpr bool rows_abreast = false;
++#endif
++    static_assert(((warp_size / (qi/vdr)) & ((warp_size / (qi/vdr)) - 1)) == 0, "the thread group count must be a power of two");
++    if (rows_abreast && blocks_per_row_x % n_groups == 0) {
++        // every row keeps the same K-blocks: one y block serves all rows
++        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += n_groups) {
++            const int kby = kbx * (qk/QK8_1);
++#pragma unroll
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                if (i < rows_valid) {
++                    tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++                        }
++                    }
++                }
++            }
++        }
++    } else if (rows_abreast && type != GGML_TYPE_IQ2_XS) {
++        // the group's first K-block shifts from row to row; a row past the last valid one gets none
++        // (IQ2_XS stays on the item loop here: its two items in flight are faster, k=2560 n=1 15.6 vs 16.5 us)
++        const int g = threadIdx.x / (qi/vdr);
++        int kb0[c_rows_per_block];
++#pragma unroll
++        for (int i = 0; i < c_rows_per_block; ++i) {
++            kb0[i] = i < rows_valid ? ((g - i*blocks_per_row_x) & (n_groups - 1)) : blocks_per_row_x;
++        }
++        for (int k0 = 0; k0 < blocks_per_row_x; k0 += n_groups) {
++#pragma unroll
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                const int kbx = kb0[i] + k0;
++                if (kbx < blocks_per_row_x) {
++                    const int kby = kbx * (qk/QK8_1);
++                    tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++                        }
++                    }
++                }
++            }
++        }
++    } else {
+ #pragma unroll n_unroll
+     for (int it = threadIdx.x / (qi/vdr); it < n_items; it += n_groups) {
+         const int i   = it / blocks_per_row_x;
+@@ -540,6 +592,8 @@ static __global__ void mul_mat_vec_q_moe(
+             }
+         }
+     }
++    }
++    }
+ 
+     ggml_cuda_pdl_lc();
+ 
+@@ -871,6 +925,9 @@ void mul_mat_vec_q_moe_launch(
+     static const bool dedup_on   = dedup_mode != 0;
+     ggml_cuda_mm_fusion_args_device fusion_dd = fusion;
+     fusion_dd.moe_dd_all = dedup_mode == 2;
++    // RDNA2: rows side by side in the kernel's K loop (see mul_mat_vec_q_moe).  GGML_CUDA_MOE_ROWS_ABREAST=0: off.  (release r334)
++    static const bool rows_abreast_on = [] { const char * e = getenv("GGML_CUDA_MOE_ROWS_ABREAST"); return e == nullptr || atoi(e) != 0; }();
++    fusion_dd.moe_rows_abreast = rows_abreast_on && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+     const bool dedup = dedup_on && ncols_dst >= 2 && ncols_dst <= 4 && (int64_t) nchannels_dst*ncols_dst <= 64 &&
+                        warp_size == 32 && fusion.red_dst == nullptr;
+     const auto launch = [&](auto rpb_c, auto fusion_c) {
+-- 
+2.53.0
+

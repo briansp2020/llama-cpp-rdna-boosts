@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 06:25:22 +0000
-Subject: [PATCH 25/52] mmq: RDNA4 IQ routed-compact experts with 65-96 rows
+Subject: [PATCH 25/49] mmq: RDNA4 IQ routed-compact experts with 65-96 rows
  per expert use J=64
 
 At -ub 4096 with 10 of 512 experts (80 rows per expert) the IQ / Q2_0
@@ -17,12 +17,14 @@ for RDNA4. Kill switch GGML_MMQ_IQ_J64_WIDE=0 (FINDINGS 914-915).
 (cherry picked from commit 4b68ab8eabe7923fda6dffbb67e7676a8633a9d1)
 (cherry picked from commit 34be173aefe479fdc151874ae8ca105fd494d834)
 (cherry picked from commit 0052576b615e2f6afd820e409bfbcc0f8111fd71)
+(cherry picked from commit cccbee160a119d3e9aac4bfe2c79f30fb540efb9)
+(cherry picked from commit 8f4b123f5d0c25645d4a3608a38a654567c15123)
 ---
  ggml/src/ggml-cuda/mmq.cu | 14 ++++++++++++++
  1 file changed, 14 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 9bad5154e2..38d975cfd5 100644
+index 46bc3f3538..f0e2aa52fe 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -227,6 +227,20 @@ static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, co

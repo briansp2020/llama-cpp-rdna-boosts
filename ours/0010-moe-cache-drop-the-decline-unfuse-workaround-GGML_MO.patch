@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sun, 8 Nov 2026 18:31:51 +0000
-Subject: [PATCH 10/52] moe cache: drop the decline unfuse workaround
+Subject: [PATCH 10/49] moe cache: drop the decline unfuse workaround
  (GGML_MOE_FUSED_DECLINE_UNFUSE)
 
 A declined or fill-failed table ran its decode-band gate+up+GLU and down fold
@@ -18,6 +18,8 @@ fill_failed table.
 (cherry picked from commit 87e2230a8012762926a73fb7bd9adeefcb504d58)
 (cherry picked from commit 95da2bee1ee13c99739f264cd56e4faefcc3e555)
 (cherry picked from commit d50b2c24f31d3522ae74c783c096926e5dd84c6d)
+(cherry picked from commit a0090acaddf3abe2702c5b7f482d56a6504cddc7)
+(cherry picked from commit 174c8d93f3a28443efa8c695572a1dafdcf04a44)
 ---
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |  5 ++---
  ggml/src/ggml-cuda/mmvq.cu               |  5 ++---
@@ -26,10 +28,10 @@ fill_failed table.
  4 files changed, 4 insertions(+), 35 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index c6db149420..e6b1242a3f 100644
+index fcc9972833..e52bf0a870 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2805,10 +2805,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2859,10 +2859,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                      fusion_local.gate_ids = &gate_ids_c;
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
                  } else if (ids != nullptr &&
@@ -43,10 +45,10 @@ index c6db149420..e6b1242a3f 100644
                      if (ids != nullptr) {
                          moe_cache_fusion_launched(MOE_CACHE_SERVE_NONE, 5);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index bb0da2e43f..a845c54101 100644
+index 3d3b53d2ef..d96af860db 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -3554,9 +3554,8 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+@@ -3573,9 +3573,8 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
              if (serve == MOE_CACHE_SERVE_IN_PLACE) {
                  ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
              } else if (serve == MOE_CACHE_SERVE_MIXED ||

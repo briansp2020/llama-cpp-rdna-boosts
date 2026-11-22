@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:24:54 +0000
-Subject: [PATCH 04/52] moe cache: device remap declines when a fill failed
+Subject: [PATCH 04/49] moe cache: device remap declines when a fill failed
  during its policy pass
 
 The remap took the input over although the consumer then refuses a table with fill_failed: the op read an input_cpy nobody filled.
@@ -10,16 +10,18 @@ The remap took the input over although the consumer then refuses a table with fi
 (cherry picked from commit 5b34a9a7f9cc7802e393253c629ab15fea1d588e)
 (cherry picked from commit 43d4663d0fd3ddf6e5c18f9d9f4fd515704770e6)
 (cherry picked from commit 40d74be157fd48b612e56a72855ee5d12e10abe8)
+(cherry picked from commit 9bcad978d4e219790cdbe5b75957781053e59054)
+(cherry picked from commit 2a5294e493669cc14e08c022e78b66efd0a2f858)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu |  4 ++--
  ggml/src/ggml-cuda/moe-expert-tier.inc | 23 ++++++++++++++++++++++-
  2 files changed, 24 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 879e0a0a39..84b7da1315 100644
+index 94c55af355..d0199cfe9e 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -12464,8 +12464,8 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+@@ -12480,8 +12480,8 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
              bool cold = false;
              (void) access_locked(t, t.dr_lag_host[i], stream, t.dr_lag_host, n, &cold);
          }

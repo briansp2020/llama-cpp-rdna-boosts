@@ -1,17 +1,19 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 05:52:08 +0000
-Subject: [PATCH 52/52] mmq: Q5_0 expert tables on the RDNA4 routed-compact
+Subject: [PATCH 43/49] mmq: Q5_0 expert tables on the RDNA4 routed-compact
  path with the IQ4_NL bands (prefill reads experts in place, no whole-table
  gather; GGML_MMQ_Q5_0_COMPACT=0: plain path)
 
+(cherry picked from commit 9efbe1e3924e62a08bb196568bb86652719c1922)
+(cherry picked from commit 5b399966c4bfcf2f156299d3e3d3db72245fcc13)
 ---
  ggml/src/ggml-cuda/mmq.cu  |  5 ++++-
  ggml/src/ggml-cuda/mmq.cuh | 20 +++++++++++++++++++-
  2 files changed, 23 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 38d975cfd5..210ef9342a 100644
+index f0e2aa52fe..cb55a5d53a 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -219,6 +219,9 @@ static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, co
@@ -34,10 +36,10 @@ index 38d975cfd5..210ef9342a 100644
                      rows_per_expert > 64 && rows_per_expert <= 96) {
                  J_rdna3_5 = MMQ_IQ_ID_J_MID;
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 749118366a..32d6732d54 100644
+index 8868bbff5f..aab19af2bd 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
-@@ -1571,6 +1571,14 @@ static constexpr bool mmq_rdna3_5_id_n_experts_ok(const int64_t n_experts) {
+@@ -1592,6 +1592,14 @@ static constexpr bool mmq_rdna3_5_id_n_experts_ok(const int64_t n_experts) {
  // Routed-compact arch set: RDNA3_5 (source-of-record B) + RDNA4 (2026-09-06 gfx1201 validation,
  // see the section comment above for numbers/coherence).  Arch-gated per-kernel; other archs keep
  // the plain path.
@@ -52,7 +54,7 @@ index 749118366a..32d6732d54 100644
  static inline bool mmq_routed_compact_arch_ok(const int cc) {
      return GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
  }
-@@ -1591,6 +1599,11 @@ static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t ro
+@@ -1612,6 +1620,11 @@ static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t ro
                  return 0;
              }
              [[fallthrough]];
@@ -64,7 +66,7 @@ index 749118366a..32d6732d54 100644
          case GGML_TYPE_IQ3_S:
          case GGML_TYPE_IQ4_NL:
          case GGML_TYPE_IQ4_XS:
-@@ -1619,6 +1632,11 @@ static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int
+@@ -1640,6 +1653,11 @@ static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int
                  return false;
              }
              [[fallthrough]];
@@ -76,7 +78,7 @@ index 749118366a..32d6732d54 100644
          case GGML_TYPE_IQ3_S:
          case GGML_TYPE_IQ4_NL:
          case GGML_TYPE_IQ4_XS:
-@@ -1841,7 +1859,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+@@ -1869,7 +1887,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
      const bool use_compact_routed = args.ids_dst != nullptr && args.expert_bounds != nullptr &&
          mmq_rdna3_5_id_n_experts_ok(n_experts_ids) && mmq_routed_compact_arch_ok(cc) &&
          !has_gate && !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc, prec_src1) && mmq_rdna3_5_id_use_compact(type, J, GGML_CUDA_CC_IS_RDNA4(cc)) &&

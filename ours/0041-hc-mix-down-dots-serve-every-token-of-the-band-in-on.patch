@@ -1,15 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 02:18:22 +0000
-Subject: [PATCH 50/52] hc mix: down dots serve every token of the band in one
+Subject: [PATCH 41/49] hc mix: down dots serve every token of the band in one
  block (weights read once per call; GGML_CUDA_HC_DOWN_MT=0: per-token grid)
 
+(cherry picked from commit a5a9adeb3cba8424336718716669f6707783b362)
+(cherry picked from commit 7b07a2877391031e2fa48086ba9fb3a82fff565a)
 ---
  ggml/src/ggml-cuda/hc-mix.cu | 164 ++++++++++++++++++++++++++++++++++-
  1 file changed, 163 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
-index 01a432c94b..f6e5b801a5 100644
+index 9aaafd2691..9662adc92c 100644
 --- a/ggml/src/ggml-cuda/hc-mix.cu
 +++ b/ggml/src/ggml-cuda/hc-mix.cu
 @@ -383,6 +383,147 @@ static __global__ void hc_mix_down_dots(
@@ -133,7 +135,7 @@ index 01a432c94b..f6e5b801a5 100644
 +        __threadfence();
 +        prev = atomicAdd(&done[kb], 1u);
 +    }
-+    prev = __shfl_sync(0xFFFFFFFF, prev, 0, 32);
++    prev = ggml_cuda_shfl(prev, 0, 32);
 +    if (prev != 31) {
 +        return;
 +    }

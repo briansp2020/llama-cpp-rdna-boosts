@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 21 Nov 2026 23:59:22 +0000
+Subject: [PATCH 48/49] mmvq-moe: RDNA4 rows per block 8 / 4 for 8-15 K-block
+ rows whose last (row, K-block) pass runs partly idle (GGML_CUDA_MOE_RPB_K=0:
+ off)
+
+(cherry picked from commit dfa94a2630c0b61c4a88db467ab18c5724d48406)
+(cherry picked from commit 820c7da754ef07e449f30d1fe8c6eded428e2a86)
+---
+ ggml/src/ggml-cuda/mmvq-moe.cu | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
+index 8a533d329d..c7b49f2733 100644
+--- a/ggml/src/ggml-cuda/mmvq-moe.cu
++++ b/ggml/src/ggml-cuda/mmvq-moe.cu
+@@ -813,6 +813,24 @@ void mul_mat_vec_q_moe_launch(
+             rpb = 4;
+         }
+     }
++    // RDNA4, a row of 8-15 K-blocks that is not a multiple of the lane groups (n_groups items per pass of the flattened
++    // (row, K-block) loop): with 2 rows per block the last pass runs partly idle -- the per-device Q5_0 MoE down of
++    // Qwen3.8-Flash-Next under -sm tensor (K 320 = 10 blocks, 20 items over 16 groups) took 48 us at 4 tokens against 32 us at
++    // K 256.  8 rows per block (8-10 K-blocks) or 4 (11-15) pack the passes: 34.1 / 38.2 us (test-backend-ops, FINDINGS 1062).
++    // A row's K-blocks move to other lane groups, so its partial sums are added in another order (rounding-level change,
++    // like the short-K rule above).  GGML_CUDA_MOE_RPB_K=0 (or 2): off; =4 / =8: force that value for these rows.
++    if constexpr (!moe_pfiq_ok<type>::v && type != GGML_TYPE_IQ4_NL) {
++        static const int rpb_k = getenv("GGML_CUDA_MOE_RPB_K") ? atoi(getenv("GGML_CUDA_MOE_RPB_K")) : -1;
++        const int n_groups = warp_size / (ggml_cuda_type_traits<type>::qi / get_vdr_mmvq(type, true));
++        // only where the 2-row block's items (2 x blocks_per_row_x) really leave the last pass partly idle; elsewhere
++        // (e.g. IQ4_XS gate/up, 10 blocks of 256 over 4 groups) the passes are full and rpb stays 2.  Decode and verify
++        // take the same rule (the 1-token down + reduction fold included), so a row sums in one order at every width.
++        if (rpb_k != 0 && rpb_k != 2 && rpb == 2 && n_groups > 0 && blocks_per_row_x >= 8 &&
++                blocks_per_row_x < 16 && (2*blocks_per_row_x) % n_groups != 0 &&
++                GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
++            rpb = rpb_k == 4 || rpb_k == 8 ? rpb_k : (blocks_per_row_x <= 10 ? 8 : 4);
++        }
++    }
+     // The down + weighted reduction fold costs one counter atomic per block: 8 rows per block quarters them.  Bit-identical
+     // under the same rule as above, or when n_groups <= 2 (even rows per block keep each row's group assignment).
+     if constexpr (!moe_pfiq_ok<type>::v && type != GGML_TYPE_IQ4_NL) {
+-- 
+2.53.0
+

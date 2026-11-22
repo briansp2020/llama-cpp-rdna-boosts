@@ -1,22 +1,24 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 06:08:29 +0000
-Subject: [PATCH 12/52] common: checkpoint pool on r236 common_state_data
+Subject: [PATCH 12/49] common: checkpoint pool on r236 common_state_data
  (no-init allocator), pages still touched by the pool thread
 
 (cherry picked from commit 21677dab1721c6ef67982dd752e6f47af5fe45fd)
 (cherry picked from commit 26b2dff6d15b8ad00cf5645dffb894c024726099)
 (cherry picked from commit fcc0a0c11463cf07a0d0b108c79456dddddd7c20)
 (cherry picked from commit c41a8799a6d602f20404cdeecb83e13ef37c4e35)
+(cherry picked from commit 52b4549a9fd77ea48db3d115a118cb8025fa9c21)
+(cherry picked from commit 133b2bd7dd74b8d18b692642f92a5a586000e150)
 ---
  common/common.cpp | 13 +++++++------
  1 file changed, 7 insertions(+), 6 deletions(-)
 
 diff --git a/common/common.cpp b/common/common.cpp
-index 0086e8b81b..0f069cea2b 100644
+index 6597f4f503..8fa386aecb 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -2890,7 +2890,7 @@ struct ckpt_pool {
+@@ -2977,7 +2977,7 @@ struct ckpt_pool {
      static constexpr size_t K = 3;
      std::mutex mtx;
      std::condition_variable cv;
@@ -25,7 +27,7 @@ index 0086e8b81b..0f069cea2b 100644
      size_t want[2] = { 0, 0 };
      bool on = false;
  
-@@ -2902,7 +2902,7 @@ struct ckpt_pool {
+@@ -2989,7 +2989,7 @@ struct ckpt_pool {
          }
      }
  
@@ -34,7 +36,7 @@ index 0086e8b81b..0f069cea2b 100644
  #if !defined(_WIN32)
          if (!v.empty()) {
              if (lock) { (void) mlock(v.data(), v.size()); } else { (void) munlock(v.data(), v.size()); }
-@@ -2912,9 +2912,9 @@ struct ckpt_pool {
+@@ -2999,9 +2999,9 @@ struct ckpt_pool {
  #endif
      }
  
@@ -46,7 +48,7 @@ index 0086e8b81b..0f069cea2b 100644
          {
              std::lock_guard<std::mutex> lk(mtx);
              if (want[kind] < n) {
-@@ -2961,7 +2961,8 @@ struct ckpt_pool {
+@@ -3048,7 +3048,8 @@ struct ckpt_pool {
                  kind = want[0] && spares[0].size() < K ? 0 : 1;
                  n = want[kind];
              }
@@ -56,7 +58,7 @@ index 0086e8b81b..0f069cea2b 100644
              lock_pages(v, true);
              {
                  std::lock_guard<std::mutex> lk(mtx);
-@@ -2977,7 +2978,7 @@ struct ckpt_pool {
+@@ -3064,7 +3065,7 @@ struct ckpt_pool {
      }
  };
  

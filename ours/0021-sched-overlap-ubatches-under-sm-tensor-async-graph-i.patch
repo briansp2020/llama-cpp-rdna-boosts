@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 13:42:02 +0000
-Subject: [PATCH 21/52] sched: overlap ubatches under -sm tensor -- async
+Subject: [PATCH 21/49] sched: overlap ubatches under -sm tensor -- async
  graph-input views, async CPU-split output, deferred input wait
 
 The host waited on every split for a view of a graph input (96 waits, ~1 s per 4096-token prefill ubatch:
@@ -28,6 +28,8 @@ Same bytes, ordering only (FINDINGS 882).
 (cherry picked from commit 92d06a4a72f223a2a960a0bf2b52cec076fe1ee9)
 (cherry picked from commit b9009a0aca6d175c8d532d060fa5859516dd37c5)
 (cherry picked from commit b0ee064a8192ea1e36e32d0a751bcf49b70ed5cb)
+(cherry picked from commit 3eedb9e4488186ef015fee408d8183facf2b0a2c)
+(cherry picked from commit d6c2ad23ec8af887563cb4b1079a61d33e0f4f70)
 ---
  ggml/include/ggml-backend.h                   |   3 +
  ggml/src/ggml-backend-meta.cpp                |  17 +++
@@ -51,10 +53,10 @@ index e6c3373a9e..8d4bcb08c3 100644
      // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
      // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 653fadf358..060b84ca61 100644
+index 3a2404ed0c..e5cd14987f 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -3299,6 +3299,7 @@ struct ggml_backend_meta_context {
+@@ -3306,6 +3306,7 @@ struct ggml_backend_meta_context {
      int   stage_n_slots   = 8;              // GGML_SCHED_STAGE_SLOTS, clamped to the ring's 16
      std::vector<std::vector<ggml_backend_event_t>> stage_done_ev; // [device][slot], upload complete
      std::vector<std::vector<ggml_backend_event_t>> stage_free_ev; // [device][slot], slot reusable
@@ -62,7 +64,7 @@ index 653fadf358..060b84ca61 100644
  
      void *                               comm_ctx       = nullptr;
      ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
-@@ -3348,6 +3349,8 @@ struct ggml_backend_meta_context {
+@@ -3355,6 +3356,8 @@ struct ggml_backend_meta_context {
              for (size_t j = 0; j < n_devs; j++) {
                  stage_done_ev[j].resize(stage_n_slots, nullptr);
                  stage_free_ev[j].resize(stage_n_slots, nullptr);
@@ -71,7 +73,7 @@ index 653fadf358..060b84ca61 100644
              }
          }
  
-@@ -3781,6 +3784,19 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+@@ -3788,6 +3791,19 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
  
      const int slot = backend_ctx->stage_slot_next;
      backend_ctx->stage_slot_next = (backend_ctx->stage_slot_next + 1) % backend_ctx->stage_n_slots;
@@ -91,7 +93,7 @@ index 653fadf358..060b84ca61 100644
  
      // Reserve every device's ring slot before anything is uploaded: a ring that cannot hold its chunk
      // aborts the whole attempt, because staging only part of an upload would leave the rest on the
-@@ -3964,6 +3980,7 @@ struct ggml_backend_meta_stage_guard {
+@@ -3971,6 +3987,7 @@ struct ggml_backend_meta_stage_guard {
                      simple_tensor->data = chunk.orig;
                  }
                  ggml_backend_event_record(ctx->stage_free_ev[chunk.device][entry.slot], chunk.backend);
@@ -100,7 +102,7 @@ index 653fadf358..060b84ca61 100644
          }
          ctx->stage_pending.clear();
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index a28fb94c24..55ead69695 100644
+index 5c373c13c9..2b476bebed 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1641,6 +1641,15 @@ struct ggml_backend_sched {
@@ -119,7 +121,7 @@ index a28fb94c24..55ead69695 100644
      bool                 prefetch_tried [GGML_SCHED_MAX_BACKENDS];
      struct ggml_tensor * prefetched[GGML_SCHED_MAX_SPLIT_INPUTS];
      int n_prefetched;
-@@ -2764,6 +2773,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -2771,6 +2780,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
      for (int i = 0; i < sched->n_splits; ++i) {
          sched->splits[i].graph.uid = ggml_graph_next_uid();
      }
@@ -142,7 +144,7 @@ index a28fb94c24..55ead69695 100644
  }
  
  static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
-@@ -3408,7 +3433,8 @@ static bool sched_input_stage(ggml_backend_sched_t sched, int b, ggml_backend_t
+@@ -3415,7 +3440,8 @@ static bool sched_input_stage(ggml_backend_sched_t sched, int b, ggml_backend_t
  // the meta backend: one copy per device, serially).  Small inputs are snapshotted by the backend; a large one is read
  // from the live pointer when the stream reaches it, so its completion is recorded and the host waits for it before the
  // next graph's inputs are written (ggml_backend_sched_wait_input_uploads: top of alloc_graph, and by the caller before
@@ -152,7 +154,7 @@ index a28fb94c24..55ead69695 100644
  static bool sched_async_user_input(void) {
      static const bool on = [] {
          const char * e = GGML_ENV_STR("GGML_SCHED_ASYNC_USER_INPUT");
-@@ -3428,6 +3454,60 @@ static bool sched_buffer_pinned_host(ggml_backend_buffer_t buf) {
+@@ -3435,6 +3461,60 @@ static bool sched_buffer_pinned_host(ggml_backend_buffer_t buf) {
      return n > 5 && strcmp(name + n - 5, "_Host") == 0;
  }
  
@@ -213,7 +215,7 @@ index a28fb94c24..55ead69695 100644
  void ggml_backend_sched_wait_input_uploads(ggml_backend_sched_t sched) {
      for (int b = 0; b < sched->n_backends; b++) {
          if (sched->input_up_pending[b]) {
-@@ -3465,9 +3545,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3472,9 +3552,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
          if (sched_input_stage(sched, split_backend_id, split_backend, input, input_cpy)) {
              return;
          }
@@ -228,7 +230,7 @@ index a28fb94c24..55ead69695 100644
              input_cpy->buffer != NULL && !ggml_backend_buffer_is_host(input_cpy->buffer) &&
              split_backend->iface.set_tensor_async != NULL && split_backend->iface.event_record != NULL &&
              split_backend->iface.event_wait != NULL) {
-@@ -3809,6 +3892,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3816,6 +3899,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                  !sched_async_large_host_input();
              if (host_src && dev_dst && sched_input_stage(sched, split_backend_id, split_backend, input, input_cpy)) {
                  // pipeline copies: snapshot through the pinned ring (any size up to the ring), uploaded on this stream
@@ -241,7 +243,7 @@ index a28fb94c24..55ead69695 100644
              } else if (host_src && dev_dst && !host_large && split_backend->iface.set_tensor_async != NULL &&
                  split_backend->iface.event_wait != NULL) {
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-@@ -3859,6 +3948,9 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
+@@ -3866,6 +3955,9 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
      if (split_id + 1 >= sched->n_splits) {
          return;
      }
@@ -251,7 +253,7 @@ index a28fb94c24..55ead69695 100644
      struct ggml_backend_sched_split * split = &sched->splits[split_id];
      struct ggml_backend_sched_split * next  = &sched->splits[split_id + 1];
      const int backend_id = split->backend_id;
-@@ -4001,6 +4093,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -4008,6 +4100,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
  
          sched_stage_issue(sched, split);
  
@@ -262,7 +264,7 @@ index a28fb94c24..55ead69695 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -4123,6 +4219,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -4130,6 +4226,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
              }
          }
          sched->lazy_events = sched_lazy_events(meta || n_gpu > 1);
@@ -270,7 +272,7 @@ index a28fb94c24..55ead69695 100644
      }
  
      // initialize hash table
-@@ -4244,6 +4341,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -4251,6 +4348,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
      if (sched == NULL) {
          return;
      }
@@ -279,7 +281,7 @@ index a28fb94c24..55ead69695 100644
      for (int b = 0; b < sched->n_backends; b++) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
-@@ -4343,8 +4442,12 @@ void ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched) {
+@@ -4350,8 +4449,12 @@ void ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched) {
  
  bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      GGML_ASSERT(sched);
@@ -294,7 +296,7 @@ index a28fb94c24..55ead69695 100644
      GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
      GGML_ASSERT(!sched->is_alloc);
  
-@@ -4404,6 +4507,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+@@ -4411,6 +4514,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
      }
  }
  
@@ -343,10 +345,10 @@ index 140ecbb81f..a88be37902 100644
      }
      CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 8becae7737..6683e2065d 100644
+index 600081fe67..12f2e3e166 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -3393,6 +3393,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3402,6 +3402,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                  ggml_backend_dev_slab_compute_plain(d.dev, sched_alt_in_use);
              }
          }
@@ -361,7 +363,7 @@ index 8becae7737..6683e2065d 100644
          const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
          if (is_draft) {
              for (const auto & d : model.devices) {
-@@ -3414,6 +3422,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3423,6 +3431,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          //const auto t_start_us = ggml_time_us();
  
          // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated

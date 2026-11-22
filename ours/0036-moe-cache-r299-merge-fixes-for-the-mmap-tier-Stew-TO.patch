@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 17 Nov 2026 02:28:28 +0000
-Subject: [PATCH 36/52] moe cache: r299 merge fixes for the mmap tier (Stew
+Subject: [PATCH 36/49] moe cache: r299 merge fixes for the mmap tier (Stew
  TODO #327 / #335 / #336)
 
 fusion_serve passes our gate routing copy and stands the fused prefill down (MIXED) when the gate and up
@@ -13,16 +13,18 @@ release repair never re-fills a sparse table copy from the mmap master.
 (cherry picked from commit db4b275abf990e555f40796b2d8c16030dd761c0)
 (cherry picked from commit f6ae8d5fc9575b0b8b13b5560ef0e1e4184653bd)
 (cherry picked from commit 804554246bcd5648f3d2d7114fa03d3aae52fc89)
+(cherry picked from commit 59b7856c66849ff373d8bebd4d1ed0939a32dc62)
+(cherry picked from commit 1f6cdfef4bd5210d6b2a06faef389f0f0f225818)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 15 +++++++++++++--
  ggml/src/ggml-cuda/moe-expert-tier.inc |  7 +++++++
  2 files changed, 20 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 276e126089..3e0b37a1fb 100644
+index 8f8b6537e3..c86d534e20 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -12010,7 +12010,11 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -12026,7 +12026,11 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          // prefill-in-place arena (TODO #317 P1) below serves the other tables.
          if (t.host_sparse) {
              t.remap_prefill = false;
@@ -35,7 +37,7 @@ index 276e126089..3e0b37a1fb 100644
          }
          // TODO #317 (wip/prefill-in-place-arena P1): serve this table's USED set in place out of the arena --
          // admit what is missing, publish the slot-remapped routing, and let `MUL_MAT_ID` read the arena.  A
-@@ -12987,7 +12991,14 @@ moe_cache_serve_status moe_cache_fusion_serve(const ggml_tensor * op, const ggml
+@@ -13003,7 +13007,14 @@ moe_cache_serve_status moe_cache_fusion_serve(const ggml_tensor * op, const ggml
      }
      // Both lanes are served: build the shallow arena/remap copies.  The redirect re-resolves under the
      // lock, so a table that flips unserveable in between lands as MIXED (the caller stands down).

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 04:20:06 +0000
-Subject: [PATCH 24/52] moe cache: a table is pool-backed only when the pool
+Subject: [PATCH 24/49] moe cache: a table is pool-backed only when the pool
  was requested
 
 moe_cache_table_is_pool now also requires g_pool_requested, as
@@ -19,15 +19,17 @@ Production model: KLD 0 vs the r261 candidate, server hashes unchanged
 (cherry picked from commit 4dbfa749136a8bcae13d4f664bc9e20a2fce9004)
 (cherry picked from commit e0891d735d34d15916b02c350561cdbd42cf6972)
 (cherry picked from commit bcc3995a079f24d847571e47548693b8831256c8)
+(cherry picked from commit cb88ebdda4932c860df0634df4c74ce3de43d14e)
+(cherry picked from commit 6b84de9e719073fe96cbaaf3a599b95b4dcd38ed)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 7 ++++++-
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 6fc1cf83ed..171dcf456b 100644
+index e940c520fb..02376a59a2 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -9089,7 +9089,12 @@ bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device) {
+@@ -9105,7 +9105,12 @@ bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device) {
      std::lock_guard<std::mutex> lock(g_mutex);
      for (const table_t & t : g_tables) {
          if (t.device == device && t.host == (const void *) weight->data) {
