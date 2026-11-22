@@ -24,7 +24,7 @@ records it points at (`WORKLOG.md`, the campaign, the `benchmarks/` or `archive/
 still means the same subject after that item is closed and removed from this file.  New items append.
 
 **Current state:** the **18-patch default set** (17 official blocks `0000`-`0016` + the temporary `0300`)
-at fork point **`4f9dfa0e3`** (the 2026-11-13 r278 re-base); read `.release` in `release.json` for the
+at fork point **`919794500`** (the 2026-11-21 r328 re-base); read `.release` in `release.json` for the
 release id -- it is the source of truth, not this line.  Block 14 is the **streamed KV** (the resident
 window, the attendance pool and the MTP draft window -- all three opt-in, default off); block 15 is the UMA
 GTT expert store.  The **mixed K/V cache types** are **optional block `0101`** since the r288 block-number
@@ -41,18 +41,28 @@ left in this file.  The r236 re-base
 
 ## The open list
 
+**`r333` housekeeping (2026-11-21):** three rows left the list at r333 and none is tracked any more -- `#349`
+(gate-server-arms' two-slot text was a `--kv-unified` artifact, `GREEDY-PURITY.md` §38; fixed and its anchor
+restored), `#351` (the `flint` / `-sm tensor` question: **retired by the maintainer's decision**, the temporary
+block `0300` and its drop condition are theirs to re-test at a re-base, and no TODO row is owed for it) and
+`#353` (Inkling-2: the support is upstream now and is picked up at the next re-base, so no reminder is kept).
+The rows that remain are the standing items (`#116` parked, `#273`, `#358`, `#359`): each carries its own
+re-entry condition.  A green gate ladder is still not permission to skip a row.
+
 | # | subject | kind | status |
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
-| **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
-| **347** | PR #334 item 2 (HIP graph replay up to 16 tokens, `GGML_CUDA_GRAPH_MAX_TOKENS`): needs its own PR plus the multi-slot and 4B arms, because it is inert at the delivery's default draft depth and the delivery's text is not stable above the 8-row purity band | contribution / waiting on the submitter (`PR #334` declined for now) | **WAITING** -- separate PR requested; requirements in the PR review and §347 |
-| **348** | PR #334 item 3 (one FA KV-group bitmap per graph evaluation, `GGML_CUDA_FA_KQ_BLOCKS_REUSE`): correct as designed (`built=1 reused=15`) but worth nothing measurable on this box, unreachable in every single-sequence arm, and it leaks a per-context `cudaMalloc` behind a raw context pointer | contribution / waiting on the submitter (`PR #334` declined for now) | **WAITING** -- separate PR requested with a census, a context teardown and a Windows/launch-bound measurement; §348 |
-| **349** | `scripts/gate-server-arms.sh`'s `35b10` arm is not bit-reproducible on its **second slot** even with both of r324's fixes (a `MOE_EXPERT_HEATMAP=load` pin and a fixed-order admission): slot 0 is stable, slot 1 reads three different texts at three acceptances, because a 0.5 s stagger lands at a *variable* point in slot 0's prefill | tooling / gate (`TODO` #295's gate, gate 24 step 5c) | **OPEN** -- admit slot 1 on slot 0's first STREAMED TOKEN instead of on a clock; until then that arm's text is reported, not asserted (its acceptance checks stay hard, which is the collapse detector the arm exists for); §349 |
+| **358** | a re-base rung can silently drop a file: block 00's `ggml-alloc.c` half was missing from r328/r329 while its text, docs and its own unit test still described it (issue #345, fixed r331) | tooling / gate (re-base flow) | **OPEN** -- reconcile each rung's changed-file set against the patch it replaces and fail on a file the old patch touched and the new one does not; the 18/18 ladder cannot see it; §358 |
+| **359** | `gate-fusion-alias-copy.sh`'s arm A oracle (`fused == GGML_CUDA_DISABLE_FUSION=1` text at `-ub 14`) broke at the r328 re-base: the UNFUSED chain moved, the fused arm still reproduces the r239 anchor `3fab4da87774` | tooling / gate (issue #287 gate) | **OPEN** -- re-derive the oracle (a logit/KLD compare at that shape rather than text): r329 and r331 both read `a_chain` 194/`dfe59c9c5257` vs `a_fused` 193/`3fab4da87774`, and pinning `GGML_GLU_INPLACE=0` changes neither arm, so neither the r331 restore nor the allocator is the cause; §359 |
+| **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; **it should also confirm that PR #339's BF16 `RMS_NORM + MUL (+ ADD)` abort is gone there** (fixed at r328 by the re-base, `archive/work/can-fuse-bf16-rms-norm-r324/` -- `RMS_NORM_MUL_ADD` now includes `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` arms); §361 |
+| **362** | §44's doctrine rests on a per-start hipBLASLt solution lottery that ROCm 10.2 should no longer have (`c50ea60130f` ships as hipBLASLt 1.5), and the delivery has never verified that on the 10.2 line -- `README.md`, `GREEDY-PURITY.md` §44 and the r336 note all still say "pin below 10.2" without a 10.2 arm | validation (ROCm line) | **OPEN** -- on `/opt/rocm-10.2.0-gfx120X`, run the two documented call sites from §44 (a gemma-4-26B-A4B F32 MoE-router MTP config and the 35B-A3B GDN `ssm_alpha`/`ssm_beta` GEMM) over N fresh starts with hipBLASLt **left enabled**: one logits/greedy class over N (N >= 18 and N >= 8 respectively, the r-2026-10-21 counts) retires the pin from the *tester's* doctrine on that line, and a spread means the fix is not in 10.2 as assumed.  Also decide whether 10.2 becomes a **validated line** (a `baseline`-style note in `BASELINE.md` + a build script sibling of `~/bin/build-llama-rocm`), which is what would let a 10.2 arm be quoted rather than a one-off; §362 |
+| **363** | `-of`/`--optional-features` exists with ONE tag (`tp-ffn-even`); the delivery's other env-only opt-in features are still environment-only, so a user who reads `--help` still cannot find them | tooling / docs (delivery) | **OPEN** -- migrate them one at a time: add the row to `common_optional_features()` with its switch, confirm the tag produces exactly what the env var produces (the arm `gate-ffn-even-split.sh` C-section runs), and delete the row if the feature gets a first-class option; candidates are the opt-in switches `ENVIRONMENT.md` already marks as such (§4 `LLAMA_KV_N_PAD_MIN`, §7.6 `--wmma-verify`-adjacent switches are options already, §1.2's arena knobs, block 14's `LLAMA_KV_SPILL_RAM_PCT`); §363 |
+
 
 ## Handle numbering
 
-**New handles append after `#350`, the highest issued so far, so the next free handle is `#351`; a number is
+**New handles append after `#362`, the highest issued so far, so the next free handle is `#363`; a number is
 never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
@@ -74,6 +84,13 @@ subject after that item has closed and left this file.  The recent ones, so the 
 * **`#338`-`#340`** retired at r301, **`#341`** (issued r303) retired at r309 (`WORKLOG.md` 261117.008).
 * **`#335`/`#336`** retired at r298 — an alias ROLE gap in the expert cache, `WORKLOG.md` 261116.005;
   **`#282`** at r299 — the mid-run latch's mixture is gated on the logits, `WORKLOG.md` 261116.006.
+* **`#349`** retired at **r333** (`WORKLOG.md` 261121.012): the arm was asserting a concurrent two-slot text
+  hash under `--kv-unified`, which `GREEDY-PURITY.md` **§38** forbids; the fix is `--no-kv-unified` plus a
+  deterministic admission (pinned `id_slot` + a warm-up request that holds the scheduler while both real
+  requests queue), and the item's own prescribed fix (release slot 1 on slot 0's first streamed token) was
+  implemented and **refuted by measurement** first.  `#351` and `#353` were retired at the same time (no
+  reminder owed for either: the `flint`/`0300` question is a maintainer call at each re-base, and Inkling-2
+  support is upstream and arrives with the next re-base).
 * **`#342`** (r303) and **`#343`** (r304) are the newest still tracked; `#342` is WAITING on upstream, `#343`
   is an accepted limitation.
 
@@ -184,92 +201,42 @@ arena is now read IN PLACE at any width (`MOE_EXPERT_PREFILL_IN_PLACE`: 1489.6 -
 `-sm tensor`, 3588.8 -> 4072.4 on the pool mirror).  Consolidating the three transports for a **partly resident**
 table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2026-11-10-prefill-in-place.md`.
 
-## 342. A broken upstream UI asset bundle breaks every fresh configure
+## 362. Verify (or refute) §44's per-start hipBLASLt lottery on ROCm 10.2, and decide whether 10.2 is a validated line
 
-**Waiting on upstream** (r303). The llama-ui bucket's `latest` archive (75 files, 3.3 MB, 2026-11-17) has no
-`workbox[hash].js`, and `scripts/ui-assets.cmake:137` validates that file, so a configure with no
-`tools/ui/dist` aborts with `UI: missing required asset(s): workbox[hash].js`.  Incremental builds never see it
-(`build-rocm`'s stamp caches the resolved bundle), so it appears exactly where a source tree is configured
-fresh: `gate-per-block-build.sh` (wipes its build dir per commit), a clean checkout, the hosted CI tiers.
+**Why it matters.**  `GREEDY-PURITY.md` §44 tells every tester to pin `ROCBLAS_USE_HIPBLASLT=0` before comparing
+fresh processes, and `README.md` says the pin is only needed below the `rocm-libraries` fix `c50ea60130f` — which
+ships as hipBLASLt 1.5, i.e. **ROCm 10.2**.  That mapping has never been measured here: the doctrine's numbers
+are ROCm 10.1.0 (and the reporter's Windows/ROCm 10), and `/opt/rocm-10.2.0-gfx120X` is installed but unbuilt.
 
-**The container release path is NOT affected, verified on `radiance` for r303**: `.devops/rdna-rocm.Dockerfile`
-builds the UI in its own `web` stage (`npm ci` + `npm run build`) and copies it in before the cmake step
-(`COPY --from=web /app/tools/ui/dist tools/ui/dist`), which is `ui-assets.cmake`'s Priority 1 -- pre-built
-assets win over both npm and the HF fetch, so that build never downloads or validates the bucket's bundle.
-Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
+**What one run would settle it.**  On a 10.2 build, with hipBLASLt **left enabled** (that is the whole point — the
+delivery never pins it itself), repeat §44's two recorded call sites over fresh starts:
 
-Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
-validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
+* a gemma-4-26B-A4B F32 MoE-router (`ffn_gate_inp`, `m=128 n=375 k=2816 T,N`) MTP config, N >= 18 starts — the
+  r-2026-10-21 arm read **3 logit classes in 18**;
+* the 35B-A3B GDN `ssm_alpha`/`ssm_beta` GEMM (`F32 2048x32 x N`), N >= 8 starts — that arm read **3 in 8**.
 
-## 347. PR #334 item 2 — HIP graph replay for 9..16-token graphs (separate PR requested)
+**Arms already run (2026-11-21, r336 — do not re-derive).**  With hipBLASLt enabled, the width probe's
+`row0` logits hash read **10/10 identical** on 35B-A3B UD-Q4_K_M at `P=4096` (ROCm 10.1 **and** 10.2) and
+**6/6 identical** on Flash-Next GSQ IQ3_S at `P=4096` with `MOE_EXPERT_HEATMAP=load` (10.1 and 10.2): no
+spread on either line, so those arms are **vacuous** -- §44's own rule is that stability is config-dependent.
+Two reasons, both recorded in `benchmarks/2026-11-21-mmb-bf16-pinned.md` §8.1: (a) a config that does not flip
+says nothing about the mechanism; (b) in the delivery the two call sites below are no longer served by
+hipBLASLt at all -- `mmf32` (block 06, §47) claims the `m <= 256` F32 GDN and router shapes by construction,
+so a fresh-start arm on them cannot flip whatever the library does.  What is still owed is a shape hipBLASLt
+*does* serve and that is known to flip on 10.1: the gemma4-26B-A4B MTP arm recorded in §44 (3 logit classes
+in 18 starts) is the candidate.
 
-**Waiting on the submitter** (r323).  `GGML_CUDA_GRAPH_MAX_TOKENS` (default 16) makes a 9..16-token verify
-graph replayable, on the argument that those widths "keep a fixed shape from step to step like the <=
-`MMVQ_MAX_BATCH_SIZE` widths".  Measured here on r322+r323:
+**One class over those counts** retires the pin from the *tester's* doctrine on the 10.2 line (the pin stays a
+valid control on 10.1, and r336 makes it nearly free there — `ENVIRONMENT.md` §10.2).  A spread means the fix is
+not in 10.2 as assumed, and §44 and `README.md` both still stand unchanged.
 
-* at the delivery's **default** drafting (`--spec-draft-n-max 7`, so at most an 8-row verify) it is **inert**:
-  `GGML_CUDA_GRAPH_TRACE=1` reads `direct=7554 replay=37482 capture=819 properties_changed=858` at `=8` and at
-  `=16` alike (no 9..16-token graph exists there), and plain decode likewise;
-* where 9..16-row verifies do occur it moves most steps onto replay (`direct` 45783 -> 8490) and pays a capture
-  per distinct width (`capture` 138 -> 924, `properties_changed` 183 -> 1002) -- which is the wrong trade for
-  block 02's per-sequence *adaptive* depth and the n-gram family's variable draft length;
-* "bit for bit" cannot be asserted there: above the 8-row band the delivery's own text is not run-to-run stable
-  (`GREEDY-PURITY.md` §11).  The same binary at `--spec-draft-n-max 15` read three different texts in three runs.
+**The second question is a policy one and is the maintainer's.**  A one-off 10.2 arm quotes an unvalidated
+toolchain; quoting it as a *line* needs a build path (`~/bin/build-llama-rocm-102`, `BUILD_DIR=build-rocm-102`, a
+separate base recording per line — `gate-prefill-logits.sh` already refuses a base recorded on another ROCm
+line) and a `BASELINE.md` note saying 10.2 is validated.  Until then a 10.2 result here is one arm on one box.
 
-**What it needs**: a multi-slot arm measured with the repo's own instrument (`LLAMA_SPEC_ALIGN` makes those
-verifies a fixed 16 rows; run-to-run spread at 4 slots is ±7 %, so several reps), a **4 B** arm (WORKLOG
-260928.003 measured verify graphs ~2.5 % slower there and left a size gate unshipped), a `llama-batched-bench
--npl 1,4,8` arm, and the `ENVIRONMENT.md` + gate + record treatment any block owes.  Review:
-`https://github.com/stew675/llama-cpp-rdna-boosts/pull/334#issuecomment-7025668812`.
-
-## 348. PR #334 item 3 — one FA KV-group bitmap per graph evaluation (separate PR requested)
-
-**Waiting on the submitter** (r323).  The mechanism is sound and was verified here with a temporary census: in
-its best-case shape (2-slot `--kv-unified` server, 27B, q8_0 KV, `-c 65536`, a parked 10.5 k-token slot) the
-packed bitmap is built **once** per evaluation and reused 15 times, i.e. every replayed decode step carries one
-memset + prepass instead of sixteen.  It is worth **nothing measurable on gfx1201**: 31.90/31.88/31.85 t/s with
-the reuse against 31.83/31.86/31.86 without (~31 ms/step).  It is also unreachable in every single-sequence arm
-(a single-sequence batch takes the *derived* bitmap; the packed form needs a multi-sequence ubatch or the RDNA4
-band at depth, which itself has a work floor `K->ne[1]*saving >= 20000`).
-
-**Two defects**: `fattn_eval`/`fattn_kq_blocks` are process-global maps keyed by
-`const ggml_backend_cuda_context *`, with nothing erased at `ggml_backend_cuda_free` and a 64 KiB `cudaMalloc`
-never freed — the address is routinely reused (`llama-bench` over several models, `test-backend-ops` across
-devices), and if the new context is on a **different device** the stale pointer is handed to that device's
-kernel.  Key the entry on `ctx.device` as well, and erase + free in the context destructor.
-
-**What it needs**: a `-lv 4` census (`built= reused= fallback=`, otherwise no arm can be told from the pre-change
-behaviour), the teardown above, a comment saying the reuse key must be re-audited whenever the band's split
-changes (r319/#330 and r322/#333 both moved it), and a **measured** win.  The argument is 15 removed *launches*
-per step, so Windows/WDDM — where this repo's own #58 measurement showed verify graphs worth +16-19 % — is the
-platform to make it on; a feature that only pays on a platform this repo does not validate belongs in
-`optional/<name>/` (or `beta/` for a tester) until one of its own configurations shows a win.
-
-## 349. `gate-server-arms.sh`'s `35b10` arm: slot 1 is not bit-reproducible
-
-**Open** (r324, found while re-recording the gate's anchors for the MoE reduction re-baseline).  The arm's
-purpose (R13's silent failure: with host-resident experts and two sequences in one decode step, draft
-acceptance collapses to ~0 while the text stays correct) is still covered -- that is what the acceptance
-checks measure and they are unchanged -- but its **text** check cannot be a fixed hash set for this arm today.
-
-Two defects were fixed on the way, both verified: the gate never pinned `MOE_EXPERT_HEATMAP`, so each run
-started from the prior the *previous* run wrote back into the model directory's `.moe-heatmap` (r323 unpinned
-read `9e1a1221c30d e29d01e5edca` against its recorded `b337648c3ef9 b73aa781bca5`); and it fired both slots'
-requests **simultaneously**, so the server's admission order was a race that selected between two states of
-both the text and the acceptance (r324 before the fix: 3 of 4 runs one state, 1 the other).  With
-`MOE_EXPERT_HEATMAP=load` and a 0.5 s stagger, `fn24`/`fn10` are reproducible (verified twice on each of r323
-and r324) and are now exact anchors.
-
-`35b10` still moves, slot 1 only (slot 0 is stable at `1b2dac950888`): three further r324 runs read
-`1bb3415d743a`, `2cd90f70be03` and `50f29e574939` at acceptance 0.71074/0.75214, 0.68548/0.72269 and
-0.60741/0.73729.  **Cause**: a fixed-*time* stagger is a fixed point in a *variable* process -- slot 1 arrives
-somewhere inside slot 0's ~1-2 s prefill, and its KV/arena cell placement (hence a near tie) depends on how far
-that got.  An order race became a timing race.
-
-**What it needs**: admit slot 1 on slot 0's **first streamed token** (request slot 0 with `"stream": true`,
-release slot 1 on the first chunk) instead of on the clock; verify two runs on each of two builds reproduce;
-then restore an exact anchor.  Do not serialise the two requests -- with one sequence decoding at a time the
-arm cannot reach the shape it exists for.
+No emoji, no per-run numbers in this file: the arm and its counts go in the `WORKLOG.md` entry that closes this
+item.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
@@ -437,3 +404,19 @@ wrong `qk`/`vdr` in the ksplit body for that type (the arithmetic is the body's,
 per-row dot product is unchanged by construction).  Do not add a KLD arm for it before the mechanism line is
 observed: an arm that never fires passes vacuously.  The same gap is recorded in the r304 release entry and in
 the PR #322 reply, so it is a stated limitation, not a claim.
+
+## 363. `-of` / `--optional-features` has one tag; migrate the rest of the env-only opt-in switches
+
+The tag layer exists (`common/common.cpp`, `common_optional_features()`; documented in `ENVIRONMENT.md` §4.1) and
+carries exactly one tag, `tp-ffn-even` (r338, `WORKLOG.md` 261121.017).  Every other opt-in delivery feature is
+still reached only by an environment variable, which `--help` cannot show.
+
+**The migration is a table row, not a new mechanism**: `{ "tag", "ENV", "1", "one paragraph" }`, then confirm the
+tag produces exactly what the variable produces (the C section of `scripts/gate-ffn-even-split.sh` is the shape:
+all spellings must read one text).  Do **not** add a second switch or a second code path; when a feature earns a
+first-class option, delete its row instead.
+
+Candidates (all already documented as opt-in in `ENVIRONMENT.md`): `LLAMA_KV_N_PAD_MIN` (§4), the block-14
+spill/window budgets (`LLAMA_KV_SPILL_RAM_PCT`, §1.2's `MOE_EXPERT_CACHE_MIB`-adjacent knobs are tuning, not
+opt-in -- check the row's class before migrating), and the `GGML_CUDA_*` opt-ins §7 lists as "opt-in, default
+OFF".  A tag is only for a feature that is **off by default**; a kill-switch is not a tag.

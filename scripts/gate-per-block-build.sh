@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
-# Per-block build gate -- the r2 "every one of the 16 commits builds the `all`
-# target" standard.
+# Per-block build walker -- a BISECTION TOOL, NOT A RELEASE GATE (r332).
+#
+# The delivery's contract is that the WHOLE SET applies and builds: `scripts/apply-all.sh` applies all the
+# blocks and one `all` build at the tip proves the artifact.  A block is a LAYER on the blocks before it; there
+# is NO expectation that any single block applies or builds alone.  That was the r2 rule, and it was retired by
+# the maintainer's decision of 2026-11-21 (`WORKLOG.md` 261121.011): it cost 35-55 min per re-base, weeks of
+# wall time over the project's life, and it never covered the failure it was meant to (a block that is
+# *uncompilable in the applied set* is caught by the set build, which is the thing consumers compile; a file a
+# re-base silently dropped is caught by the file-set reconciliation, `TODO` #358, not by a build at all).
+#
+# Keep this script for the one job it is good at: localising WHICH block introduced a breakage.
+#   - `--changed-from <previous release tip>` builds only the blocks whose delta moved, plus the tip (minutes).
+#   - a full walk is for a bisect that needs it; it is never a release or per-push step.
+#
+# The historical header follows, because the method (a FRESH build dir per commit) is still the right one when
+# the tool is used:
 #
 # WHY THIS EXISTS:
 #   The default delivery (16 official blocks + the temporary 0300) is bisected and reviewed block by block, so every block
@@ -39,12 +53,22 @@
 #   ladder: 2101s cold, 95s once every block tree is in ccache.
 #
 #   Two profiles, both honest:
-#     * GATE_TARGETS_FAST (release flow): the libraries + the shipped binaries.  The op tests are
-#       run separately at the tip (`test-backend-ops -o ...`), which is where they can actually
-#       fail, so nothing is lost except "the test TU compiles in every intermediate tree".
-#     * `all` (the r2 standard, the default here): use it when a commit touches tests/ or a
-#       shared header, or once for a re-base when you want the strongest statement.
+#     * --fast (**the DEFAULT since r327**): the libraries + the shipped binaries.  The op tests are
+#       RUN separately at the tip (`test-backend-ops -o ...`), which is where they can actually fail, so
+#       nothing is lost except "a test/example/tool binary compiles in every intermediate tree" -- and
+#       that claim is carried by ONE `all` build at the tip, which the release flow does anyway
+#       (`~/bin/build-llama-rocm` builds `all`).
+#     * --all (the r2 standard): every target in every intermediate tree.  Use it for a RE-BASE, or for
+#       a commit that edits a `tests/` TU or the build graph (CMakeLists / *.cmake).  A shared header
+#       (`common.cuh`, `ggml-impl.h`) is NOT a reason on its own: it recompiles every shipped binary in
+#       every rung anyway, i.e. the TUs that carry the delivery code; what `--all` alone adds is the
+#       test/example/tool binaries, and one `all` build at the tip covers those.
 #   Do NOT read a fast-profile pass as "every target builds in every block" — it is not that claim.
+#
+#   WHY THE DEFAULT MOVED (r327): the old rule named "a change that touches a shared header" as an
+#   `all` case, so an ordinary contributor-PR integration that amended block 10 (~`common.cuh`) took a
+#   ~70 min ladder instead of ~11 min -- and the only thing the extra hour bought was the other test
+#   executables compiling in each intermediate tree.  The rule now matches what the gate measures.
 #
 # This gate has NO kernel-journal fault check, by design: it only compiles (it never loads a model or
 # dispatches a kernel), so it cannot record a GPU fault.  The runs that can are the block gates (#294).
@@ -70,23 +94,24 @@
 #                                subject in BASE..REV (release speedup: pass the
 #                                previous release tip); the tip is always built so
 #                                the final combination stays compiler-verified
-#   HF_UI_VERSION=b12387         NOT a gate option: an upstream breakage workaround.  Every commit here is
-#                                configured FRESH, so a broken `ggml-org/llama-ui` `latest` bundle aborts the
-#                                configure at `ui-assets.cmake:137` (missing `workbox[hash].js`) -- see `TODO.md`
-#                                #342 / `INVARIANTS.md` r303 item 6.  Export the pin for the gate window
-#                                (`HF_UI_VERSION=b12387 ./scripts/gate-per-block-build.sh ...`); incremental
-#                                builds never see it, which is why it bites exactly here.  Drop it when the
-#                                bundle validates again.
-#   --fast                       build the release profile per commit instead of
-#                                `all`: ggml-hip, llama, llama-cli, llama-server,
-#                                llama-bench, llama-perplexity.  Drops the test and
-#                                example/tool binaries; their coverage is the tip's
-#                                own gates (the release flow builds the tip with
-#                                `all` once and runs `test-backend-ops -o ...`
-#                                there).  See the COST note for the measured reason
-#                                (one test TU is 5m13s cold, and a re-base gives it
-#                                ~4 distinct contents, i.e. ~21 of ~35 minutes)
-#   --targets "T1 T2 ..."        an explicit target list (default: `all`)
+#   HF_UI_VERSION=<tag>         NOT a gate option and no longer needed: every rung configures with
+#                                LLAMA_USE_PREBUILT_UI=OFF, so no UI bundle is fetched and a broken
+#                                `ggml-org/llama-ui` `latest` cannot abort a configure.  It remains
+#                                upstream's knob for a *manual* configure that wants a real embedded UI
+#                                (`ui-assets.cmake` validates the bundle; a `latest` with no `workbox*.js`
+#                                is rejected).  The delivery's own answer is not a pin but an off switch
+#                                -- `TODO` #342, `WORKLOG.md` 261120.006, `INVARIANTS.md` r303 item 6.
+#   --fast                       build the release profile per commit (the DEFAULT since r327):
+#                                ggml-hip, llama, llama-cli, llama-server, llama-bench,
+#                                llama-perplexity.  Drops the test and example/tool binaries; their
+#                                coverage is ONE `all` build at the tip
+#                                (the release flow does that anyway) plus `test-backend-ops -o ...`.
+#                                See the COST note for the measured reason (one test TU is 5m13s cold
+#                                and a re-base gives it ~4 distinct contents, i.e. ~21 of ~35 minutes)
+#   --all                        build EVERY target in every rung (the r2 standard).  For a re-base,
+#                                or a commit that edits a `tests/` TU or the build graph -- not for a
+#                                shared header alone
+#   --targets "T1 T2 ..."        an explicit target list (overrides the profile)
 #   --list-only                  print the commits that would be built, then exit
 #
 #   PROGRESS_SECS=N              heartbeat period, in seconds, while a rung is COMPILING (default 30,
@@ -97,14 +122,14 @@
 #                                on that rung and the cumulative gate time; a finish line after each
 #                                rung adds the rungs still to go, so the end of the ladder is visible.
 #
-#   HF_UI_VERSION=<tag>          upstream's own knob (tools/ui/CMakeLists.txt) for the llama-ui
-#                                asset bundle a fresh configure downloads.  Unset (the default) it
-#                                resolves `latest`.  Set it when upstream publishes a bundle that
-#                                llama.cpp's validator rejects -- measured 2026-11-17: `latest`
-#                                (75 files) has no `workbox[hash].js`, so every block's configure dies
-#                                in ui-assets.cmake:137, while `HF_UI_VERSION=b12387` carries
-#                                `workbox-b3c04f83.js` and validates.  This gate wipes the build dir
-#                                per commit, so a broken upstream bundle hits it first.
+#   HF_UI_VERSION=<tag>          upstream's own knob (ui/apps/chat/CMakeLists.txt) for the llama-ui
+#                                asset bundle a fresh configure downloads.  NOT needed by this gate and
+#                                harmless when set: every rung configures with LLAMA_USE_PREBUILT_UI=OFF,
+#                                so no bundle is fetched at all and the server is built without the
+#                                embedded web UI.  It stays documented because a *manual* configure that
+#                                wants a real UI is the one place an upstream bundle problem (a `latest`
+#                                archive with no `workbox*.js`, which ui-assets.cmake rejects) can still
+#                                abort a configure -- measured 2026-11-17.
 #
 # Exit: 0 = every commit built, 1 = at least one failed, 2 = usage/prereq error.
 #
@@ -128,7 +153,8 @@ PROGRESS_SECS="${PROGRESS_SECS:-30}"
 # test and example/tool binaries, whose coverage is the tip's own gates (the release flow builds the
 # tip with `all` once, and `test-backend-ops -o ...` runs there).
 GATE_TARGETS_FAST="ggml-hip llama llama-cli llama-server llama-bench llama-perplexity"
-TARGETS="${GATE_TARGETS:-all}"
+# The release profile is the DEFAULT since r327 (see the header): `--all` asks for the r2 standard.
+TARGETS="${GATE_TARGETS:-$GATE_TARGETS_FAST}"
 TARGETS_GIVEN=0
 BASE=""
 TIP=""
@@ -149,6 +175,7 @@ while [ $# -gt 0 ]; do
         --changed-from) CHANGED_FROM="$2"; shift 2 ;;
         --targets)    TARGETS="$2"; TARGETS_GIVEN=1; shift 2 ;;
         --fast)       TARGETS="$GATE_TARGETS_FAST"; TARGETS_GIVEN=1; shift ;;
+        --all)        TARGETS="all"; TARGETS_GIVEN=1; shift ;;
         --list-only)  LIST_ONLY=1; shift ;;
         -h|--help)    usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 2 ;;
@@ -211,9 +238,42 @@ fi
 
 LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rboosts-per-block.XXXXXX")"
 ORIG_REF="$(git -C "$REPO" symbolic-ref -q --short HEAD || git -C "$REPO" rev-parse HEAD)"
-echo "==> per-block build gate: $BASE..$TIP in $REPO (targets: $TARGETS)"
+
+# SIGNAL SAFETY (r331).  A killed gate must not leave a build running: `timeout 3600 ./gate-per-block-build.sh`
+# killed only the script, its `cmake --build`/`clang` children kept going, and a second gate started into the
+# same build dir then fought them for an hour (rungs read 8-11 min on a box whose honest rung is 60 s, and the
+# ccache misses that follow look like a cache defect).  Each child runs in its own session (`setsid`), so the
+# trap can kill the whole tree, and the checkout is restored on the way out.
+CHILD_PGID=""
+cleanup_gate() {
+    if [ -n "$CHILD_PGID" ] && kill -0 "$CHILD_PGID" 2>/dev/null; then
+        kill -TERM -- "-$CHILD_PGID" 2>/dev/null || true
+        sleep 2
+        kill -KILL -- "-$CHILD_PGID" 2>/dev/null || true
+    fi
+    git -C "$REPO" checkout -q "$ORIG_REF" 2>/dev/null || true
+}
+trap 'cleanup_gate; exit 130' INT TERM HUP
+
+# UI ASSETS: nothing to provision.  The embedded web UI is OFF for every rung (the configure below passes
+# LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF), so `ui-assets.cmake` never fetches from HuggingFace and
+# never runs npm: it emits an empty asset table.  That is deliberate and it is why there is no asset cache
+# any more -- the previous `scripts/ui-dist-cache.sh` mirror existed only to stop each rung (whose build dir
+# this gate wipes) refetching the bundle inside its compile time, and a gate arm that wants the embedded UI
+# is not one of the things this gate measures (TODO #342; the retired cache is recorded in WORKLOG.md).
+echo "==> per-block build walker (bisect tool, NOT a release gate): $BASE..$TIP in $REPO (targets: $TARGETS)"
 echo "    logs: $LOG_DIR   build dir: $REPO/$BUILD_DIR   jobs: $JOBS"
-echo "    progress: a heartbeat every ${PROGRESS_SECS}s while a rung compiles (PROGRESS_SECS=0 disables)"
+echo "    progress: a heartbeat every ${PROGRESS_SECS}s while a rung CONFIGURES or compiles (PROGRESS_SECS=0 disables)"
+echo "    ui assets: embedded UI off -- no HuggingFace fetch, no npm, no asset cache (LLAMA_USE_PREBUILT_UI=OFF)"
+if [ "$TARGETS" = "all" ]; then
+    echo "    profile: --all (the r2 standard) -- measured ~35 min cold / ~55 min from a partial cache, because"
+    echo "             tests/test-backend-ops.cpp is one ~5 min TU with several distinct contents.  Reserve it"
+    echo "             for a re-base or a tests/-or-build-graph change; a shared header alone does not need it."
+else
+    echo "    profile: --fast (the release flow, default since r327): shipped binaries only; tests/ and"
+    echo "             the examples are covered by ONE 'all' build at the tip, not by every rung."
+    echo "             NOTE: ~30 s of each rung is the fresh configure, i.e. ~9 min of the ~11 min floor."
+fi
 [ -n "$CHANGED_FROM" ] && echo "    changed-from: $CHANGED_FROM (blocks whose own delta is unchanged are skipped; the tip is always built)"
 
 # --changed-from: map subject -> patch-id for the reference chain.  Block subjects are
@@ -264,9 +324,10 @@ for c in "${selected[@]}"; do
     git -C "$REPO" checkout -q "$c" || { echo "    CHECKOUT FAILED"; failed=$((failed+1)); fail_list+=("$c checkout"); [ "$KEEP_GOING" = 0 ] && break; continue; }
 
     rm -rf "$REPO/$BUILD_DIR"
+    t_cfg0="$(date +%s)"
     echo "    configuring (fresh build dir) ..."
-    if ! HIPCXX="$ROCM_DIR/lib/llvm/bin/clang" HIP_PATH="$ROCM_DIR" \
-        cmake -S "$REPO" -B "$REPO/$BUILD_DIR" \
+    HIPCXX="$ROCM_DIR/lib/llvm/bin/clang" HIP_PATH="$ROCM_DIR" \
+        setsid cmake -S "$REPO" -B "$REPO/$BUILD_DIR" \
             -DGGML_RPC=1 -DGGML_HIP=ON -DGGML_NATIVE=1 -DGGML_HIP_RCCL=1 \
             -DHIP_PLATFORM=amd -DGGML_HIP_GRAPHS=ON -DGPU_TARGETS="$GPU_TARGETS" \
             -DCMAKE_C_COMPILER="$ROCM_DIR/lib/llvm/bin/clang" \
@@ -274,8 +335,20 @@ for c in "${selected[@]}"; do
             -DCMAKE_CXX_COMPILER="$ROCM_DIR/lib/llvm/bin/clang++" \
             -DCMAKE_INSTALL_RPATH="\$ORIGIN:$ROCM_DIR/lib" \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_HIP_FLAGS="$ISYSTEM" \
+            -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF \
             "${CCACHE_LAUNCHERS[@]}" \
-            > "$LOG_DIR/${total}.configure.log" 2>&1; then
+            > "$LOG_DIR/${total}.configure.log" 2>&1 &
+    cp=$!; CHILD_PGID="$cp"
+    if [ "$PROGRESS_SECS" -gt 0 ] 2>/dev/null; then
+        while kill -0 "$cp" 2>/dev/null; do
+            sleep "$PROGRESS_SECS"
+            kill -0 "$cp" 2>/dev/null || break
+            echo "    ... still configuring rung $total/$n_sel: $(( $(date +%s) - t_cfg0 ))s on this rung, $(( $(date +%s) - t_gate0 ))s total"
+        done
+    fi
+    wait "$cp"; cfgrc=$?; CHILD_PGID=""
+    echo "    configured ($(( $(date +%s) - t_cfg0 ))s)"
+    if [ "$cfgrc" -ne 0 ]; then
         echo "    CONFIGURE FAILED (log: $LOG_DIR/${total}.configure.log)"
         tail -5 "$LOG_DIR/${total}.configure.log" | sed 's/^/      /'
         failed=$((failed+1)); fail_list+=("$c configure")
@@ -295,9 +368,9 @@ for c in "${selected[@]}"; do
     # every rung reports its elapsed time and how many rungs are left.
     echo "    building $TARGETS ..."
     t_build0="$(date +%s)"
-    cmake --build "$REPO/$BUILD_DIR" --target $TARGETS -j "$JOBS" -- -k \
+    setsid cmake --build "$REPO/$BUILD_DIR" --target $TARGETS -j "$JOBS" -- -k \
         > "$LOG_DIR/${total}.build.log" 2>&1 &
-    bp=$!
+    bp=$!; CHILD_PGID="$bp"
     if [ "$PROGRESS_SECS" -gt 0 ] 2>/dev/null; then
         while kill -0 "$bp" 2>/dev/null; do
             sleep "$PROGRESS_SECS"
@@ -305,7 +378,7 @@ for c in "${selected[@]}"; do
             echo "    ... still building rung $total/$n_sel: $(( $(date +%s) - t_build0 ))s on this rung, $(( $(date +%s) - t_gate0 ))s total"
         done
     fi
-    wait "$bp"; brc=$?
+    wait "$bp"; brc=$?; CHILD_PGID=""
     if [ "$brc" -eq 0 ]; then
         ok=$((ok+1))
         echo "    BUILD OK ($(( $(date +%s) - t_blk0 ))s)  -- rung $total/$n_sel done, $(( n_sel - total )) rung(s) left, $(( $(date +%s) - t_gate0 ))s of gate time so far"
@@ -325,9 +398,9 @@ if [ "$TARGETS" = "all" ]; then
     echo "==> result: $ok/$total built, $failed failed in $(( $(date +%s) - t_gate0 ))s (build dir wiped per commit)"
 else
     echo "==> result: $ok/$total built, $failed failed in $(( $(date +%s) - t_gate0 ))s (build dir wiped per commit)"
-    echo "    profile: --fast (NOT the r2 'all' standard): tests/ and the example/tool binaries are"
-    echo "    not built here -- the tip's own release gates cover them (build the tip with 'all' once"
-    echo "    and run test-backend-ops there)"
+    echo "    profile: --fast (NOT the r2 'all' standard): tests/ and the example/tool binaries are not"
+    echo "    built here -- ONE 'all' build at the tip covers them (the release flow builds the tip with"
+    echo "    'all' anyway)"
 fi
 echo "    (a first block that took minutes on an otherwise unchanged tree means ccache has never seen"
 echo "     this --repo path: rerun on the long-lived checkout, see the COST note in this script)"

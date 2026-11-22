@@ -112,6 +112,9 @@ configure_and_build() {
     local -a tgts
     if [ "$FAST" = 1 ]; then tgts=("${TARGETS_FAST[@]}"); else tgts=("${TARGETS_ALL[@]}"); fi
     if [ ! -f "$SCRATCH/$BUILD_DIR/CMakeCache.txt" ]; then
+        # The embedded web UI is OFF (see the configure below): `ui-assets.cmake` then fetches nothing from
+        # HuggingFace and runs no npm, so a fresh build dir is hermetic.  Nothing is provisioned (the
+        # retired `ui-dist-cache.sh` mirror is recorded in WORKLOG.md, TODO #342).
         echo "==> configure $SCRATCH/$BUILD_DIR"
         HIPCXX="$ROCM_DIR/lib/llvm/bin/clang" HIP_PATH="$ROCM_DIR" \
         cmake -S "$SCRATCH" -B "$SCRATCH/$BUILD_DIR" \
@@ -122,6 +125,7 @@ configure_and_build() {
                 -DCMAKE_CXX_COMPILER="$ROCM_DIR/lib/llvm/bin/clang++" \
                 -DCMAKE_INSTALL_RPATH="\$ORIGIN:$ROCM_DIR/lib" \
                 -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_HIP_FLAGS="$ISYSTEM" \
+                -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF \
                 "${CCACHE_LAUNCHERS[@]}" > "$SCRATCH/$BUILD_DIR.configure.log" 2>&1 \
             || { echo "    CONFIGURE FAILED (log: $SCRATCH/$BUILD_DIR.configure.log)"; tail -5 "$SCRATCH/$BUILD_DIR.configure.log"; exit 1; }
     fi

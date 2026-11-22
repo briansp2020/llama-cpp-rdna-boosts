@@ -372,15 +372,21 @@
    the divergence predates r303 and gate 9's hard-arm invariant (r148, `GREEDY-PURITY.md`) does not currently
    hold on that class.  PPL is identical in both arms (2.1640), so it is ULP-class, not degenerate: it needs
    an owner (`TODO` #341) rather than a waiver, and the class's arms must not be quoted as a pass until then.
-6. **An upstream UI asset bundle can break every fresh SOURCE configure -- and only that one.**  On
-   2026-11-17 `ggml-org/llama-ui`'s `latest` (75 files) has no `workbox[hash].js`, so `ui-assets.cmake:137`
-   aborts a configure that has no `tools/ui/dist`: `gate-per-block-build.sh` (it wipes the build dir per
-   commit), a clean checkout, the hosted CI tiers.  Incremental builds never see it (the stamp caches the
-   resolved bundle) and **the container images are NOT affected**: `.devops/rdna-rocm.Dockerfile` builds the UI
-   in its `web` stage and `COPY --from=web /app/tools/ui/dist tools/ui/dist` runs BEFORE the cmake step, which
-   is `ui-assets.cmake`'s Priority 1 (pre-built assets win over npm and over the HF fetch, so a container build
-   neither downloads that bundle nor validates it).  The workaround where it does bite is
-   `HF_UI_VERSION=b12387` (the bundle `build-rocm` had stamped; it carries `workbox-b3c04f83.js`).
+6. **An upstream UI asset bundle can break every fresh SOURCE configure -- and only that one -- so the
+delivery no longer fetches one at all.**  On 2026-11-17 `ggml-org/llama-ui`'s `latest` (75 files) had no
+`workbox[hash].js`, so `ui-assets.cmake:137` aborted a configure that had no pre-built asset tree:
+`gate-per-block-build.sh` (it wipes the build dir per commit), a clean checkout, the hosted CI tiers.
+Incremental builds never saw it (the stamp caches the resolved bundle).  **Corrected at r328:** the delivery
+builds with `LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF` everywhere it does not ship a UI (the per-block
+gate, `scripts/scratch-tree.sh`, `~/bin/build-llama-rocm`, `UI=1` opts back in), so `ui-assets.cmake` fetches
+nothing and runs no npm -- it emits `UI: embedded 0 assets` and a 1.8 KB `libllama-ui.a` (an embedded-UI
+build of the same tree is 3.1 MB from a 13.5 MB generated `ui.cpp`).  The `scripts/ui-dist-cache.sh` mirror and
+the `HF_UI_VERSION` pin are retired with it: the failure mode is gone by construction rather than cached
+around.  **The container images remain the one place a real UI is built** -- `.devops/rdna-rocm.Dockerfile`
+builds it in a `web` stage (npm) and copies the result in before the cmake step, which is
+`ui-assets.cmake`'s Priority 1, so a container build neither downloads nor validates the upstream bundle.
+That stage still targets the pre-r328 `tools/ui/` layout and moves to `ui/apps/chat` when the re-base lands
+(`TODO` #352).
 
 ## r304 (2026-11-17, `WORKLOG.md` 261117.003)
 
@@ -1350,3 +1356,383 @@ Record: `WORKLOG.md` 261119.008, `benchmarks/2026-11-19-mwr-exact.md`, `patches/
 Record: `WORKLOG.md` 261120.002, `benchmarks/` — measured in the retired campaign
 `archive/work/prefill-transfer-overlap/` (pass 9 + the r325 re-measurement), `patches/README.md` block 09,
 `ENVIRONMENT.md` §2.
+
+## r326 (2026-11-20, `WORKLOG.md` 261120.003) — the graph-replay width band is a TOKEN COUNT, not "a verify"; a moving width pays a capture per width, and a captured graph may no longer grow the FA staging arena (block 10, contributor PR #336)
+
+1. **The band `ggml_cuda_graph_is_multi_token()` compares against was `MMVQ_MAX_BATCH_SIZE` (8) by accident of
+   r20's argument, not by measurement.**  r20's rule was "only a true PRE-FILL (a varying ubatch) skips capture,
+   because capture never amortises there" and it used 8 as the prefill/verify boundary.  That boundary is wrong
+   for the one shape that matters more than any other on a server: **4 slots x `draft-mtp n3` under
+   `LLAMA_SPEC_ALIGN` is a fixed 16-row verify every step**.  Measured r326 (gfx1201, ROCm 10.1.0, 27B
+   UD-Q4_K_XL, 8 interleaved runs per arm): **178.1 -> 184.3 t/s (+3.5 %)**, with every run of one arm above
+   every run of the other; 4B Q8_0 +1.8 %; `llama-batched-bench -npl 16` +1.2 % on both models with npl 1/4/8
+   untouched (+-0.1 %).  `GGML_CUDA_GRAPH_MAX_TOKENS` (default 16) is that band.
+2. **The delivery default is provably untouched, and that is a text claim, not a rate claim.**
+   `--spec-draft-n-max 7` can produce at most an 8-row verify, so at the default the `GGML_CUDA_GRAPH_TRACE`
+   census is **identical** at `=8` and `=16` (1 GPU `direct=53 replay=1713 capture=18 properties_changed=14`,
+   3 GPU `-sm tensor` `3657/21819/813`) and the same-seed text is byte-identical; `ngram-mod` likewise.  A change
+   to this predicate therefore owes a *census-identity* arm, not a throughput arm, for the default path.
+3. **"It pays where the width repeats" is exact, and it is why a bare width threshold is only safe because the
+   delivery default cannot reach it.**  A moving width captures once per new width: 3 devices `-sm tensor`,
+   `--spec-draft-n-max 15`, captures **150-240 -> 1350-1430 (9x)**, `properties_changed` 279 -> 1053-1926.
+   That shape's **rate is bimodal in BOTH arms** (9 runs span 46.5-57.6 t/s, acceptance 0.1395 vs 0.166-0.168),
+   because above an 8-row verify the text is not run-to-run stable (§11) and the draft depth follows the
+   acceptance the drifting text produces — so neither a win nor a regression can be attributed to the band
+   there.  A "only capture when the width repeated" rule does NOT fix it (the depth saturates, so the width stays
+   16 while the FA mask extent moves each step).  Recorded as an accepted limitation: it needs `n_max >= 8`,
+   i.e. a user already outside the purity band, and `=8` restores r325 bit for bit.
+4. **A token count is not a verify: 9..16-row PRE-FILL ubatches are captured too.**  A short prompt, a prefill
+   tail, or a small `-ub` produces 9..16-row prefill graphs; `-ub 12` over a 5298-token prompt captures **21**
+   graphs at `n_tokens=12` and reads **+1.2 %** prefill.  The r20 comment ("only a true pre-fill skips") is
+   therefore no longer the whole story, and any future argument about prefill graph capture must be made on the
+   *token count*, not on the word "prefill".
+5. **A captured graph must never grow the FA staging arena — the old justification is retired.**  The arena's
+   scratch is deliberately outside the node allocation, outside the pool budget and outside `--fit`, and
+   `fattn-common.cuh` argued it was safe "because a multi-token graph is never CUDA-graph captured".  With the
+   band at 16 that is false: above the 8-row band a native-capable K/V cache STAGES, so a 9..16-row staged FA op
+   can be inside a capture (measured: the `-ub 12` arm logs the capture-time staged call once).  The rule is now
+   `ggml_backend_cuda_context::capturing`: no growth from inside a capture (on CUDA `cudaMalloc`/`cudaFree`
+   return `cudaErrorStreamCaptureUnsupported`; HIP's relaxed mode tolerates them, which would be a per-runtime
+   difference), so that call reads the K/V cache natively — same arithmetic, same tokens, no scratch.  A growth
+   *between* calls still frees the old arena only after `ggml_cuda_graph_mem_freed()`, so a capture that baked
+   the old pointer is re-made before it is read.
+6. **The gate's negative test is part of the evidence.**  `scripts/gate-graph-replay-width.sh` PASSes on the
+   r326 build and **fails 3 of its 5 checks on the shipped r325 binary** (no 9..16 capture in the default arm,
+   the kill switch changes nothing, no pre-fill capture) — a graph-decision change that cannot fail on the
+   previous build is not testing the decision.
+
+Record: `WORKLOG.md` 261120.003, `benchmarks/2026-11-20-graph-replay-16-tokens.md`,
+`patches/README.md` block 10, `ENVIRONMENT.md` §7.4, `MANIFESTS.md` gate 38.
+
+## r327 (2026-11-20, `WORKLOG.md` 261120.004) — one FA KV-group bitmap per graph evaluation: exact, worth nothing on this box, and OPT-IN (block 10, contributor PR #337)
+
+1. **The packed bitmap is a function of the mask's CONTENTS and the producer's arguments, so one graph evaluation
+   needs one build, not one per attention layer.**  With a unified KV cache every layer of a decode step classifies
+   the same cells: on a dense 27B with 16 attention layers, 16 `cudaMemsetAsync` + 16 `flash_attn_mask_to_KV_blocks`
+   launches per step become one, and the census reads `built=1 reused=15` in the shape that reaches it.  It is
+   **bit-identical** by construction — the reused words are the same words, so the kernel sees nothing new — and
+   measured so: the same greedy text as the previous build in both arms, `test-backend-ops -o FLASH_ATTN_EXT`
+   7381/7381 with the switch ON.
+2. **It is worth NOTHING on gfx1201, and that is the reason it ships off.**  2-slot `--kv-unified` server, 27B
+   UD-Q4_K_XL, q8_0 K/V, a 25.7 k-token parked slot, 3 greedy decodes: **31.89 t/s on, 31.85 off, 31.87 on the
+   release build** — the 15 launches it removes per step are free on Linux.  Its whole case is launch COST
+   (Windows/WDDM, where this repo's own measurements put launch-bound moves at +16-19 %), i.e. a platform the
+   delivery does not validate.  So: a first-class, always-present switch whose default is OFF, not a "beneficial
+   feature turned off" — the promotion test is a measured win on a supported configuration, nothing else.
+   A default-on candidate for this shape is the r20-era `MMVQ_MAX_BATCH_SIZE` class of mistake in reverse: an
+   argument about launch count is not a measurement.
+3. **Reach is narrower than "every attention layer".**  A single-sequence batch takes the *DERIVED* bitmap
+   (`kq_block_skip_derived`, host-classified) and never reaches the packed form; the packed form needs a
+   multi-sequence ubatch or the RDNA4 band at depth (its own work floor `K->ne[1]*saving >= 20000`).  So
+   `test-backend-ops` (one attention node per graph) and `llama-bench` (`-p`/`-n`, one sequence) read `built=0`,
+   and an arm built on them is vacuous about this feature by construction.  The reachable shapes are a server
+   with a resident second slot, and a co-batched prefill (`built=10 reused=150` measured).
+4. **A per-graph-evaluation cache keyed on the producer's ARGUMENTS is safe only while those arguments ARE the
+   inputs.**  The key is `n_kv`, `n_tps`, `s31`, `s33`, `n_tiles`, `n_streams`, `n_mask_streams` and the template
+   parameter `ncols1`, plus the mask tensor + its `data` pointer (`n_groups` follows from `n_kv` and
+   `FATTN_KQ_STRIDE`).  A band tile/KV-split change that reaches the producer through those moves the key with it
+   (r319/#330 and r322/#333 did, and needed no change here); a change to what the producer *computes from* them must
+   extend the key.  This is the maintenance contract, and it is written at the declaration and in `patches/README.md`
+   block 10 — a silent extension of what the producer reads is exactly how a shared cache goes wrong.
+5. **A decline must be counted, and the OFF arm must not read all zeros.**  One shared 64 KiB buffer per context
+   means four legitimate declines (another stream of the same evaluation, a bitmap over 16384 words, an allocation
+   that would land inside a capture, a failed allocation) and a fifth (no evaluation started).  Each has its own
+   census counter, and `calls` is incremented **before** the switch is read, so `reuse=off calls=16` proves the arm
+   reached the code — the contributor's first form reported `built=0 reused=0 fallback=0` when off, i.e. an arm
+   indistinguishable from one that never ran.  A failed 64 KiB allocation DECLINES rather than aborting: a cache may
+   not turn a fit run into a crash.  A replayed graph repeats its captured decisions and is not counted, so a
+   captured 16-layer step reports `built=1 reused=15`, not one per step.
+
+Record: `WORKLOG.md` 261120.004, `patches/README.md` block 10, `ENVIRONMENT.md` §7.4, `MANIFESTS.md` gate 10.
+
+## r328 — an anchor row is only as good as the arm it calls "the reference"
+
+**An HC-class generated text is not portable across a numerics change, and a gate that does not anchor its
+reference arm cannot tell a moved chain from a moved fused op.**  `gate-hc-fusions.sh` graded `chain_chain`
+as "the true chain" and anchored only the five numeric arms; the two `fusedmixer` rows were recorded at r308.
+The class's text then moved for *every* arm somewhere in **r290..r319** (`bin-r289` still reads the r308 row,
+`bin-r320` already reads the current one), so the numeric arms' anchors went stale and the gate went red — on
+the released r327 exactly as on the r328 tree, with byte-identical numbers (`local`: chain 444
+`a512ee68c4b3`, pre 443 `c8db61d5dcc8`, post 449 `6a102dbc62d6`; `meta`: chain 449 `6a102dbc62d6`, pre 444
+`a512ee68c4b3`).  With no anchor on the chain the only visible symptom was "three numeric arms left their
+anchors", which reads exactly like "the re-base moved the HC chain" — and that is how R11.2 came to be
+carried as a release blocker for a whole rung, and then to be blamed on the re-base.
+
+Rules:
+
+1. **Anchor the reference arm.**  A row of anchors is a *relative* statement; the reference is the absolute
+   one, and it is the one that tells you the row is stale.  A gate that leaves its reference unanchored can
+   only report "an arm moved", never "the world moved".
+2. **Re-derive a row together.**  Re-anchoring one arm to the current text is how a real move gets erased;
+   re-anchoring the whole row (chain included) is a dated statement of the shipped behaviour.
+3. **Suspect the gate before the re-base.**  A red gate on a re-based tree needs the previous release's own
+   binaries run on the same arm set *first* — `LLAMA_CLI=…/bin-r327/llama-cli ./scripts/gate-….sh`.  Two
+   minutes of that refuted a carried blocker here.
+
+Record: `RUNGS.md` R18.4, `archive/work/upstream-rebase-261120/COLD-START.md` §8, `WORKLOG.md` 261121.003.
+
+## r329 — a census assertion cannot fail on a binary that predates it: anchor the binary too
+
+**A gate that asserts a *census line* has no way to go red on a stale binary — it reads a run that never
+emitted the print, and reports the absence as a mechanism defect.**  `gate-uma-experts.sh` and
+`gate-prefill-server-slots.sh` both defaulted to `~/llama-scratch/build-rocm` (the `apu-expert-gtt` campaign
+tree, from before that campaign became block 15), and the 2026-11-21 arch validation on `halo` launched them
+with no `LLAMA_CLI`/`LLAMA_SERVER`.  So the r328 release certified a **2026-11-12** build of `7efb30ae5`:
+`gate-uma-experts` reported 48/49 with `FAIL ref: the GTT sizing fills did not report the placement queue`,
+because that build's `apply_heat_seed_locked` prints `… ranked by the %s band)` and the r277 transport tail
+(`, X MiB in Y ms (Z MiB/s, queue|serial)`) did not exist yet — the `strings` check that "proved" the format was
+present had been run against **the other binary** (`build-r328/bin/libggml-hip.so`), which is the r328 one.  With
+the delivery binary the same gate reads **49/49** and 120 placement-queue seed lines, and the slots gate reads
+3 checks / 0 failures.  Both gates now print `<binary>` + its own `--version` (build + commit) as their first
+line, and default to `~/llama.cpp/build-rocm`.
+
+Rules:
+
+1. **A gate prints the binary it certifies.**  `<path>` and `--version` on line 1, always — a census arm cannot
+   detect a stale anchor for you, and the arm's own numbers look plausible either way.
+2. **`strings`/`nm` evidence is evidence about *that file*.**  A format string found in one build says nothing
+   about the build that produced the log being explained; check the log's own `build NNNNN (sha)` line first
+   (llama-cli/llama-server print one at `-lv 4`, and `--version` prints one cheaply).
+3. **A default that points at a campaign tree outlives the campaign.**  When a campaign is promoted into a block,
+   its gate's default path and its header comment are part of the promotion — this is the delivery-side twin of
+   the `wip/` no-stub rule.
+
+Two facts this session established alongside it:
+
+* **`align_draft_caps()` already equalizes the band-derived caps inside the call.**  `TODO` #356's premise (the
+  arena band replaces the width band, so the caps can differ at a step boundary) is wrong on a `-ncmoe` host-pool
+  shape: `llama_model_moe_cache_band()` answers **0** there (a full-residency pool is not an arena), so
+  `LLAMA_SPEC_ALIGN_WIDTH_BAND` (16) is the bound in force and every two-drafting call logs one width —
+  `aligned draft depth seq N: 3 -> 5 (width band 16, drafting 2, hard 5)`.  The 2 surviving split steps are
+  **prefill/decode boundary** steps (one slot's last prompt chunk cannot merge with the other's verify batch,
+  and padding it would advance the recurrent state), which no cap policy can align.  `NCMOE_SPLIT_MAX=2` stays.
+* **The `>RAM` arena's ceiling on a 123 GiB APU is the budget.**  `gate-prefill-server-slots.sh`'s default
+  `-lme 90` on the 122B-A10B Q8_0 (~200 GB) puts a 90 GiB anonymous store on top of a >RAM mapping: measured
+  94 GiB anon → the kernel OOM-killed `llama-server` and 7 desktop tasks.  At **`-lme 85`** with the default
+  `--lazy-mode auto` both arms complete and the in-place band engages (159 calls × 75 tables, 3351 slot
+  admissions, 1113 landing / 2238 reclaiming a non-routed resident), A's text identical `ee7c607ad86e` and A
+  *faster* with the knob on (2.28 → 2.47 tok/s).
+
+Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `logs/`).
+
+* **A generated file is a delivery artifact, and its check belongs next to the generator.**  `tools/cli/README.md`,
+  `tools/completion/README.md` and `tools/server/README.md` are written by `llama-gen-docs` from `common/arg.cpp`,
+  so every block that adds an option silently owes a regeneration.  The r328 set shipped them last regenerated at
+  **block 02**: `llama-gen-docs` rewrites all three on the released tree (`34 insertions(+), 14 deletions(-)`), and
+  a consumer reading the delivered CLI docs cannot see `--kv-window`, `--kv-attendance-pool`, `-lme`,
+  `--wmma-verify`, `-ib`, `--spec-draft-mtp-vocab`, the `-ncmoe` LAST-N wording, `--load-mode buffered` or
+  `relaxed-tensor`.  The obligation was written down (the re-base's R18 checklist) and skipped, and **no gate
+  compares the committed docs against the generator** — the same shape as the stale-anchor rule above: a check
+  that cannot fail is not a check.  Fixed by regenerating into block 16 (the last OFFICIAL block touching
+  `common/arg.cpp`) and by `scripts/check-gen-docs.sh`, which runs the generator built from the tree under test and
+  fails on a rewrite.  Rule: when a file is generated, the generator run is part of the block's change, and the
+  drift check runs before a tag.
+
+* **A re-base rung that lands fewer files than the patch it replaces has dropped something until proven otherwise, and the per-block build ladder cannot see it (r331, issue #345).**  Block 00's
+  `ggml/src/ggml-alloc.c` half (+121/−2: `GGML_GLU_INPLACE` with the `n_src_inplace` gate-only rule, W4's
+  unused-view release, and the `layout_fp` graph fingerprint that `ggml_gallocr_needs_realloc()` requires for
+  issue #183) was dropped by the r328 re-base's R00 cherry-pick (`37 files → 34 files`) with no decision row and
+  no fixup-ledger row, so r328 and r329 shipped without it while the block's own text, `ENVIRONMENT.md`, the
+  per-block gate table and `tests/test-alloc.cpp`'s `test_glu_inplace` still described it — and **r329's
+  `test-alloc` aborts at `test-alloc.cpp:704`**.  Two facts make it a class:
+  (1) `scripts/gate-per-block-build.sh` proves each rung *compiles*, and a missing file's hunks inside other
+  files compile fine, so an 18/18 `--all` ladder is green over it — only the block's own behavioural gate runs
+  the rule, and neither release's gate table ran `gate-glu-inplace.sh` (the block-00 row of `MANIFESTS.md`'s
+  per-block table names it for "every release that touches block 00", and a re-base touches all 18);
+  (2) the deliverable is reproducible from the previous release: restoring the r325 chain's file gave a r331 tree
+  whose `ggml-alloc.c` is **byte-identical at every one of the 18 rungs** (`git show <rung>:…` compared pairwise),
+  which is what proves the restore reintroduced exactly the lost content and nothing else.  Rule: reconcile each
+  rung's changed-file set against the patch it replaces (same subject, previous release), and treat a shrunk set
+  as a defect until a decision row names the retirement — `TODO` #358.  Record: `WORKLOG.md` 261121.010.
+
+* **An undefined `GGML_CUDA_CC_*` name in `#if __CUDA_ARCH__ == …` reads as 0: the guard is silently false, the block compiles out with no warning, and only the target arch notices (r331).**
+  Upstream renamed `GGML_CUDA_CC_DGX_SPARK` → `GGML_CUDA_CC_GB10` (both `1210`, `ggml/src/ggml-cuda/common.cuh`)
+  between the r325 fork point `4f9dfa0e3` and the r328 base `919794500`.  Block 10's `mmvq-ksplit-body.inc`
+  carried the old spelling through the re-base, so its early weight-load prefetch was compiled out on GB10
+  (`mmvq-ksplit-body.inc:169`, issue #345's second finding) — **inert on every HIP target**, which is exactly why
+  no gate here can see it, and why the check is a source audit instead: every `GGML_CUDA_CC_` token used in the
+  tree must be `#define`d in `common.cuh`, and the grep must include `*.inc` (`.cu`/`.cuh`/`.h` alone misses a
+  body file).  Audited clean at r331 apart from this one site, which now says `GGML_CUDA_CC_GB10`.  The same
+  re-base pass also lost `ggml_cuda_should_fuse_rope_set_rows()`'s `GGML_CUDA_DISABLE_ROPE_SET_ROWS` kill switch
+  (restored; a bisect knob only, `ENVIRONMENT.md` §7.3).  Record: `WORKLOG.md` 261121.010.
+
+
+* **Per-block independent buildability is NOT a delivery property (r332, maintainer's decision 2026-11-21).**  The
+  set is the artifact: `apply-all.sh` applies every block and ONE `all` build of the applied tip proves it (6-10 min
+  cold, ~10 s warm).  A block is a LAYER on its predecessors — it owns its functionality but has no standalone
+  build/apply guarantee — and the r2 rule ("every block commit builds the `all` target on its own") was retired
+  after it cost **35-55 min per re-base and weeks of wall time over the project's life**: the per-rung configure
+  alone is ~30 s x 18, the FA template-instance set recompiles per rung when a widely included header moves, and
+  on a 16-core box a re-base ladder measured 31 min even fully warm.  What the rule was credited with, it did not
+  cover: a block that is uncompilable **in the applied set** fails the set build (the only thing a consumer
+  compiles), and a file a re-base silently dropped is invisible to *any* build — that is the file-set
+  reconciliation's job (`TODO` #358), which is what would have caught r328's `ggml-alloc.c` loss.  The walker
+  (`scripts/gate-per-block-build.sh`) is kept as a bisection tool (`--changed-from <previous release tip>`) and is
+  called by nothing in the release or per-push flows.  Cost of the decision: a regression that makes an intermediate
+  tree uncompilable while the tip compiles is no longer detected by construction (the r305-r307 class); a bisect
+  that needs it runs the walker on demand.  Record: `WORKLOG.md` 261121.011, `MANIFESTS.md` gate 5, `AGENTS.md`
+  -> *Build the fork*.
+
+
+* **An RDNA2-only change is INVISIBLE to this box's default build, and the narrow `RMS_NORM` is bit-identical by
+  reduction order, not by luck (r334, contributor PR #338 → blocks 05/08/10).**  Three facts, each of which cost a
+  wrong conclusion before it was written down:
+  (1) **`GPU_TARGETS=gfx1201` does not compile the RDNA2 device pass at all.**  `RDNA2` is `#define`d in
+  `ggml-cuda/vendors/hip.h` from `__gfx1030__`, so `#if defined(RDNA2)` code is excluded from every gfx1201 code
+  object — a normal `all` build proves nothing about it (it will happily accept a `#error` inside such a block).  A
+  change that lives in one therefore needs a second configure with `gfx1030` in the target list, and the
+  gate itself is proved by putting a `#error` inside it and checking the two builds disagree (done here for both
+  `norm.cu`'s narrow branch and `mmvq-moe.cu`'s rows-abreast loop).
+  (2) **The one-warp narrow `RMS_NORM` reproduces the wide launch's bits because `block_reduce`'s multi-warp path
+  is a 5-step warp butterfly with `+0` in the upper lanes, not a pairwise tree over the warp sums.**  Warp `w`'s
+  sum lands in lane `w`, lanes `n_warps..31` hold `+0`, and the butterfly over 32 lanes therefore collapses to
+  `(s0+s2)+(s1+s3)` — for 4 warps and for 8 warps (warps 4..7 are exactly `+0` at `ncols <= 128`, and adding
+  `+0` is exact).  Any change to `block_reduce` or `warp_reduce_sum` breaks the identity; so does writing the
+  square as `fmaf(x, x, 0.0f)` instead of `x*x`, because the compiler's contraction into the first butterfly add is
+  part of the order.
+  (3) **The RDNA2 FA tile caps were a workaround for `launch_fattn`'s `GGML_ASSERT(max_blocks_per_sm > 0)`, and
+  that assert is only unreachable while the manual RDNA2 occupancy figure is non-zero.**  `launch_fattn` computes
+  it as `4*waves_per_simd/waves_per_block` (integer division) and only replaces HIP's 0 when its own value is
+  larger, so a kernel wide enough that `4*waves_per_simd < waves_per_block` still aborts.  The caps were removed
+  on the contributor's full `FLASH_ATTN_EXT` suite; that suite, not the removal, is the fact.
+  Record: `WORKLOG.md` 261121.013, `patches/README.md` blocks 05/08/10, `ENVIRONMENT.md` §7.4.
+
+
+* **A block's MOVED COPY of an upstream function can drift from its own fork point, and no build or gate here
+  sees it: the next re-base is what reconciles it (r335, contributor PR #339).**  Block 10 splits the fusion
+  dispatcher out of `ggml-cuda.cu` into `ggml-cuda-try-fuse.cu`, so the delivery carries a *copy* of
+  `ggml_cuda_can_fuse`.  Upstream `31953bcf7` ("ggml : add BF16 support to RMS_NORM (CPU, CUDA)", #32135)
+  relaxed that matcher's `RMS_NORM` type checks **in the hub**, and the block's copy was taken before it, so on
+  **r324-r327** a BF16 `RMS_NORM` + `MUL` graph hit `GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32)` -- an
+  abort on **every** HIP/CUDA device -- while each of those releases' own base accepted an F32 or BF16 norm.  The
+  block's *removal* hunk in `ggml-cuda.cu` kept applying across the re-cuts, so nothing flagged it, and every
+  gate in the fleet is blind to it (no RDNA2/`gfx1030` device; the text arms use F32 norms; the code is
+  reachable on any device only from a BF16-norm graph).  Two consequences worth keeping:
+  (1) **a default-set defect can be introduced by an upstream commit between re-bases and removed by the next
+  re-base with no patch at all**, so a repro against a stale tree is a report about the past -- re-run it on the
+  current release before cutting a fix, and name the release revision;  (2) the check is cheap and should be part
+  of a re-base's reconciliation alongside the file-set rule (r331): for each region a block *moved* rather than
+  edited, diff the block's copy against `git show <base>:<upstream-file>` and treat a difference as a defect
+  until a decision row explains it.  On r334 the `RMS_NORM + MUL (+ ADD)` branch and the `RMS_NORM + SCALE` arm
+  are byte-identical (2944 bytes) to `919794500:ggml/src/ggml-cuda/ggml-cuda.cu`, `RMS_NORM + MUL + ROPE` is
+  F32-only on both, and `test-backend-ops -o RMS_NORM_MUL_ADD` reads 124/124 with the BF16 and BF16-residual
+  arms passing (gfx1201).  Record: `WORKLOG.md` 261121.014, `archive/work/can-fuse-bf16-rms-norm-r324/`.
+
+* **The `ROCBLAS_USE_HIPBLASLT=0` pin is now nearly free on qwen4exp, because the BF16 dense GEMMs are MMB's
+  while the pin is set — and a *version* gate for it would be the wrong switch (r336, contributor PR #340).**
+  Facts, all gfx1201 / ROCm 10.1 / 2-GPU `-sm tensor` / Flash-Next GSQ IQ3_S (host experts `-ncmoe 47 -lme 47`):
+  (1) **The gate is the user's pin, not a ROCm version.**  `mmb_hipblaslt_off()` reads `ROCBLAS_USE_HIPBLASLT`
+  and the arch default is an RDNA4 field gated on it, so with hipBLASLt enabled the census is **0** BF16 dense
+  launches and the default path is bit-identical (prefill-logit `-0.000000 / 100.000 %`, identical greedy text
+  both on the 4B 3-GPU arm (`7e6229b260f6`) and on Flash-Next (`c75182eb1697`)).  With the pin, 80+ launches
+  (the log caps at 80) and `GGML_CUDA_MMB_BF16_DENSE=0` returns to 0.  The pin is only *needed* below the
+  `c50ea60130f` fix (hipBLASLt 1.5 = ROCm 10.2), so a version check would remove the win from a 10.2 user who
+  pinned for another reason (e.g. a hipBLASLt OOM at a tight slab headroom, `runme`'s own documented
+  workaround) and give a sub-10.2 user who did not pin nothing — there is no cost to recover while hipBLASLt is
+  dispatching.  The honest limitation is the other direction: a box where hipBLASLt is *absent* (rocBLAS falls
+  back with the variable unset) is not detected, and `GGML_CUDA_MMB_BF16_DENSE=1` is the escape hatch.
+  (2) **The pin's prefill cost drops 13-23 % -> 1-4 %**: 1691 -> **2196 t/s (+29.9 %)** on a 5.2k-token prompt,
+  which is above the hipBLASLt-enabled arm's 2027; decode flat (55.2/55.9 -> 55.0/56.1 t/s at `-n 128`).
+  (3) **The change is provably prefill-only**: the W=1..8 width probe on the same (pinned) model reads
+  `width_purity=PASS (worst maxdiff 0)` on both its flat and boundary arms and every per-width
+  `row0/row1` hash is identical to the base build's.  That is the general fact — a BF16 dense path with a
+  33-token floor cannot reach the decode band, and the probe is what demonstrates it rather than asserting it.
+  (4) **Three of its four pieces are bit-identical by construction, and that is checkable**: `SMALL_TILE`
+  (geometry only, the K sum order is unchanged), `PRODUCER_BF16` (the producer's RNE copy == the conversion it
+  replaces) and `HC16=1` (the reverted slot write) each read **0.000000 / 100.000 %** on the pinned
+  prefill-logit point; `TINY_BF16_XH` alone moves numerics (**0.014143 / 96.402 %** against the F32-read arm)
+  because reading the activation's bf16 copy rounds it, which is the one piece that must be judged at the
+  logit level.
+  (5) **The pinned-mode family switch is smaller than the library gap it sits inside**, which is what makes it
+  decidable rather than a regression: pinned-vs-r334-pinned **0.013781 / 96.427 %**, while r334's own
+  default-vs-pinned pair is **0.015033 / 96.24 %** and r336's is **0.014772 / 96.41 %** — the pinned arm moves
+  marginally *towards* the default.  A pinned base therefore needs one re-record on landing, never a
+  cross-release hash identity claim (`GREEDY-PURITY.md` §44 addendum).
+  (6) **The hc gate's BF16 side copy was dead on RDNA4 and it was 84 MB per call** (`2*T*10240` at `T 4096`):
+  its readers only take it where a graph marks the output BF16-only and every marking pass is
+  `GGML_CUDA_CC_IS_RDNA3_5`-gated, so turning `hc16` off on RDNA4 is output-neutral (`HC16=1` A/B
+  0.000000 / 100.000 %) and worth **+0.4 %** prefill with hipBLASLt **on** (2594 -> 2604 t/s, 3 reps) — the
+  only part of r336 a consumer gets by default.  A dead write is worth removing even when it is only 0.4 %.
+  (7) **The same facts hold on ROCm 10.2, and the effect is larger there**: both builds were remade against
+  `/opt/rocm-10.2.0-gfx120X` (the canonical build's new line), and 10.2-vs-10.2 gives the same coherence hash as
+  10.1 (`7e6229b260f6`), prefill-logit **-0.000000 / 100.000 %**, the same census `0/80/0/0`, and pinned prefill
+  **+33.3 %** (1553/1662/1648 -> 2146/2169/2164 t/s) against +29.9 % on 10.1.  And a *method* fact worth not
+  re-deriving: **a fresh-start arm on the two shapes §44 names is now vacuous by construction**, because
+  `mmf32` (this block, §47) claims the `m <= 256` F32 GDN `ssm_alpha`/`ssm_beta` and router shapes — measured
+  10/10 and 6/6 one class on **both** ROCm lines with hipBLASLt enabled, which is "no spread", i.e. no evidence
+  about the library rather than evidence about it (`TODO` #362 keeps the arm map and names the decisive
+  candidate).
+  Record: `WORKLOG.md` 261121.015, `benchmarks/2026-11-21-mmb-bf16-pinned.md`,
+  `archive/work/mmb-bf16-pinned-r325/`, `ENVIRONMENT.md` §10.2, `patches/README.md` block 06.
+
+
+* **A tier's own hole set is not the only way its master can be mapping-backed: an arm that is REFUSED a plan
+  still has to declare its holes (r337, GitHub issue #347, block 15).**  Since r294 the host experts' master is
+  the read-only model mapping whenever the tier has holes (`host_expert_master_mapped()`), and `--load-mode` has
+  no say in it.  The APU GTT **arena** arm is the counter-example that rule did not cover: it records
+  `host_experts_store_arena` and deliberately leaves `host_experts_plan_done` false (it has no pinned tier to
+  balance, so `-lme`'s hole set is not its plan), so the predicate read "not mapped" and `llama-model.cpp`
+  allocated a **pageable full copy of the whole expert set**, on every `--load-mode`, from r294 to r336.
+  Numbers (gfx1151 `halo`, 35B-A3B Q4_K_M, `-lme 4`, 18 662.5 MiB expert set): one `ROCm_HostMap` buffer of
+  **18 662.00 MiB** and peak `RssAnon` **23 649 MiB** before, per-range host-pointer buffers over the mapping
+  (176/144 MiB) and **4 987 MiB** after -- text identical (`627b2ebd7792`) either way; the reporter's Flash-Next
+  set (40 925.6 MiB, `-lme 28`) was a **46 800 MiB** copy on a 780M.  Rules:
+  (1) **A predicate that answers "is this tier mapping-backed" must be satisfied by EVERY arm that keeps
+  tensors in the mapping**, including one that has no plan; the arena now records its tables in
+  `host_experts_holes` and the predicate accepts `host_experts_store_arena` as a hole source, so there is still
+  exactly one decision.
+  (2) **An `mlock` must not pin a tier's fill source** (TODO #333's rule) -- the arena's holes are now
+  `host_expert_is_hole()`s too, so `--load-mode mlock|mmap+mlock` skips them and counts the bytes instead of
+  sweeping the whole set.
+  (3) **`use_mmap` is not a storage decision, and neither is a plan.**  r294's rule was "the load mode does not
+  decide where the master lives"; its twin is that the master predicate has to be keyed on the TIER, and the
+  arena tier's forced mapping was necessary but never sufficient (the arm's own comment claimed the copy was
+  avoided; it was not).
+  (4) **The tier's census must not name the other tier**: on the arena the pageable-master line said
+  "pool-backed `--host-experts pool`" and a `host pool PLACEMENT reads` line was printed where the preflight
+  says the pool does not apply.  Both now say the arena / stay silent.
+  Gates: `gate-uma-experts.sh` **49/0** (12 arms one text, `pfverify` spans still equal to the mapping, the
+  `>RAM` arm 85 861.7 MiB / 2 919 evictions), `gate-prefill-server-slots.sh` **3/3** (159 in-place calls at
+  `LME=85`; also 120 at `LME=60 -ub 512`), prefill-logit **-0.000000 / 100.000 %** on the arena arm and
+  **0.000000 / 99.990 %** on the default point (bases from the pre-fix build, same ROCm line), coherence 4B
+  `7e6229b260f6`.  The discrete host pool is unaffected by construction (an `IGPU`-only flag).  The slots gate's
+  other fact: at a tight budget its `ip` arm fails as "the scenario did not exercise the change" because the
+  in-place admission's bound is `|used| <= slots` and a ~3548-token ubatch routes nearly every expert
+  (`LME=60` default ubatch = 564 declines / 0 calls against 120 calls at `-ub 512`), so `LME=85` is the arm to
+  run.  Record: `WORKLOG.md` 261121.016, `patches/README.md` block 15.
+
+## r338 — an FFN split granularity is a reduction order; the delivery default stays at `lcm(blck_size,128)` and the even split is opt-in (block 09, contributor PR #342)
+
+**`-sm tensor` splits an FFN tensor at `lcm(blck_size, 128)`, and at 2 devices that floors a 640-wide expert
+set's share from 320 to 256 (256/384).**  Lowering the granularity to `lcm(blck_size, 64)` when the size divides
+evenly gives 320/320 and measured **+7 % `draft-mtp` decode / +4 % prefill** on 2-device Flash-Next; it is
+`-of tp-ffn-even` (`LLAMA_TP_FFN_EVEN=1`), **default OFF**.
+
+Rules:
+
+1. **The granularity is the grouping, so it is a reduction-order change and must be judged as one.**  On the
+   2-device Flash-Next point it reads mean KLD **0.013963 / 96.467 %** against the recorded base — 2.8x the
+   prefill-logit limit — but the same point's `-ub 4096` vs `-ub 3840` reordering control reads
+   **0.015248 / 96.516 %** and moves base PPL +1.21 % against the change's +0.59 %.  A reordering, not an
+   approximate path; still far above "rounding level", so it is opt-in (`GREEDY-PURITY.md` §104).
+2. **The 64 floor is MMB's, not a preference.**  `mmb_supported_mm`/`_mmid` decline `K % 64 != 0`, so a lower
+   floor would silently drop MMB on the down projection.  At the *affected* MoE shapes MMB is not on the down
+   anyway (`routed=0`; the census shows only the F32 routers), so the floor currently protects dense shapes.
+3. **The reach is arithmetic and must be enumerated, never assumed to be one model.**  On this box it fires for
+   every Flash-Next quant and its MTP drafts at **2** devices, `gpt-oss-20B-MXFP4_MOE` at **3**, and
+   gemma-4-26B-A4B / Inkling-2-Mini at 3-4.  It is **inert** for every 3-GPU shape the delivery validates
+   (35B-A3B 512-wide, 27B 17408-wide, 4B/9B/122B, DeepSeek-V4, Gemma4 12B/31B/E4B) and for Flash-Next at 3 and
+   4 devices (640 % 3 != 0; 160 % 64 != 0).
+4. **The tag layer is the discoverable spelling of an env-only switch.**  `-of <tag>` sets the switch the
+   feature already reads; the table in `common/common.cpp` is the single place a tag exists, and giving a
+   feature a real option later means deleting its row.  A tag ENABLES only — there is no "off" form, because
+   every tag's feature is off by default — and `LLAMA_ARG_OPTIONAL_FEATURES` is the arg's own env form.
+5. **A default run must remain bit-identical, and that is the gate.**  After promotion the prefill-logit point
+   reads **-0.000000 / 100.000 %** and the 2-device greedy text is unchanged (`c420dfe04c42`).  The enabled
+   arm's text is a *separate* per-device-count reference (`cbdb63954bbb`), never a both-arms-equal claim.
+6. **The generated docs are owed by the block that adds the option, and land in the last official block that
+   touches `common/arg.cpp` (block 16), never in the temporary `0300`.**  `scripts/check-gen-docs.sh` is the
+   check (r329).
+
+Record: `WORKLOG.md` 261121.017; `benchmarks/2026-11-21-ffn-even-split.md`; `scripts/gate-ffn-even-split.sh`
+(`MANIFESTS.md` gate 37); `GREEDY-PURITY.md` §104; `ENVIRONMENT.md` §4.1.

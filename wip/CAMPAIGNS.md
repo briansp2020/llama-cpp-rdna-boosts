@@ -797,3 +797,19 @@ staging arena (`GGML_CUDA_FA_STAGE_CHUNK=<rows>` and `GGML_CUDA_FA_STAGE_PREALLO
 `TODO` #113).  Their records now live under `archive/work/fa-stage-chunking/` and
 `archive/work/fa-stage-peak/`; the one piece of the beta that did not survive (`DRAFT_MB`, which was not a
 cap) was dropped rather than shipped.  See `WORKLOG.md` 261027.011 (r159).
+**Closed (r329, 2026-11-21).**  `r328-followups/` — the r328 release's six follow-up rows (`TODO` #352, #354,
+#356, #357, R06.2's routed half and the phi-4 gate) — is done: `gate-uma-experts` **49/49** on gfx1151 after the
+stale-binary anchor was found, the `>RAM` two-slot arm **3/0** at `-lme 85`, per-box prefill-logit bases recorded
+on both gfx11 boxes, `gate-spec-align` PASS on gfx1100, `gate-node-budget` PASS on a freshly fetched phi-4, and
+the routed-MMB A/B reads the control hash.  The record moved to `archive/work/r328-followups/` (its `HANDOVER.md`
+carries a closure banner per row); the `wip/` entry was deleted with no stub.  See `WORKLOG.md` 261121.007.
+
+**Closed (r328/r329, 2026-11-21).**  `upstream-rebase-261120/` — the r328 re-base — released as
+**`v17-919794500-r328`** and left `wip/`: all 18 rungs landed, R11.2 was refuted (stale gate anchors), R06.2's
+routed arm closed, block 15's APU gates passed on `halo`, both gfx11 arches were validated, `gate-node-budget` passed
+on a freshly fetched phi-4, and the two arch follow-ups (`TODO` #352/#354/#356/#357) closed in the r329 session.  Its
+record — `README.md` with a per-obligation closure banner, `RUNGS.md`, `DECISIONS.md`, `COLD-START.md`,
+`CONFLICT-MAP.md`, `REMOTE-VALIDATION.md`, the probe scripts — moved to `archive/work/upstream-rebase-261120/`.  The
+one obligation it did NOT close (regenerate the generated docs) and one item it named but never gave a handle (two
+test TUs on the deprecated batch API) are now `TODO` #358/#359.  See `WORKLOG.md` 261121.005 and 261121.007.
+

@@ -10,8 +10,8 @@ support, and an attention-memory campaign that frees several GiB of VRAM.
 [`ENVIRONMENT.md`](ENVIRONMENT.md) documents every variable the set adds or repoints: its default, and
 whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
 
-It ships as **17 default patches** for a clean llama.cpp checkout at the fork point **`4f9dfa0e3`**
-(upstream master): the **17 official supported blocks `0000`-`0016`** plus the **temporary block
+It ships as **18 default patches** for a clean llama.cpp checkout at the fork point **`919794500`**
+(upstream master, the 2026-11-20 re-base): the **17 official supported blocks `0000`-`0016`** plus the **temporary block
 `0300`**, which is applied last.  Each block is one `git am` commit, and the series is linear (a block
 assumes its predecessors), so the set is applied whole.  **Block `0300` is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
@@ -20,7 +20,7 @@ and treat it as a stop-gap, not a feature.  Two further blocks are **optional** 
 default set: `0100` (two-lane prefill) and `0101` (mixed K/V cache types), applied only with
 `--include-optional` (see [`optional/README.md`](optional/README.md)).  The release `v<N>-...` prefix is
 the **official** block count (`N` = 17); `0300` and the optional blocks are not counted.  The current
-release is **`v17-4f9dfa0e3-r323`** (read `.release` in `release.json` -- it is the source of truth, not this
+release is **`v17-919794500-r336`** (read `.release` in `release.json` -- it is the source of truth, not this
 line): the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
@@ -29,15 +29,15 @@ not the changelog.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 4f9dfa0e3
-bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (17 commits)
+git checkout 919794500
+bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (18 commits)
 
 # OPT-IN, not part of the delivery: optional artifacts on top (NOT the release tree)
 bash <path-to-this-repo>/scripts/apply-all.sh --include-optional .       # asks [y/N] per artifact
 bash <path-to-this-repo>/scripts/apply-all.sh --include-optional-all .   # every artifact, no prompt
 
 # OPT-IN, not part of the delivery: a beta candidate on top (NOT the release tree -- beta testing only)
-bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 17 default blocks + beta/*/*.patch
+bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 18 default blocks + beta/*/*.patch
 ```
 
 - One-line summary of each block: [The blocks](#the-blocks)
@@ -86,7 +86,10 @@ The set targets the **RDNA3 / RDNA3.5 / RDNA4** GPU families, with RDNA2 as best
 > runtime.  As of **r76** the set also folds `@slavap`'s tuned RDNA2 tile-FA and
 > k-quant work (PR #165: per-DKQ tile config, launch caps, WGP-aware occupancy,
 > the kv=113 partial-batch load fix and the wide-kernel Q-from-global path;
-> Navi21 MMVQ rows/warps + MMQ float scale).  All of it is gated to RDNA2, so
+> Navi21 MMVQ rows/warps + MMQ float scale).  **r334** folds `@jstamagal`'s three RDNA2 items
+> (PR #338: the one-warp narrow `RMS_NORM`, the `H * n_seqs` GDN chunked gate, the lift of the
+> r76-era tile caps now that `launch_fattn` computes the RDNA2 occupancy itself, and the
+> `mul_mat_vec_q_moe` rows-abreast K-block walk into blocks 05/08/10).  All of it is gated to RDNA2, so
 > gfx1100/gfx1151/gfx1201 keep their previous numerics.  **External validation
 > (TODO #66, closed):** a Radeon Pro V620 (`gfx1030`) passed `test-backend-ops`
 > (`FLASH_ATTN_EXT` 6389/6389, `MUL_MAT` 2444/2444) and generated coherently with
@@ -146,7 +149,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── scripts/               # apply / regenerate / validate / publish tooling; index: scripts/README.md
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift; --include-beta)
 │   ├── gate-prefill-logits.sh  # prefill-logit KLD release gate (issue #113)
-│   ├── gate-per-block-build.sh # a clean `all` build per block commit
+│   ├── gate-per-block-build.sh # bisect only (r332): which block broke a build
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── prompts/               # versioned, hash-stable test prompts (sha256-recorded; never edited in place)
@@ -234,7 +237,7 @@ artifact and review: `archive/work/mixed-kv/`.
 | `0006` | **MMB quantized prefill GEMM** | old-08 MMB |
 | `0007` | **k-quant boosts** (mmvq VDR, Q6_K MMQ, Q1_0, grid pad) | old-10 + old-04 MMQ + old-15 Q1_0/grid/PR57; + the RDNA3_0 per-shape mmvq `nwarps` (r93) |
 | `0008` | **fused kernels** (conv1d/RMS/top-k MoE/verify fusions + fused MoE gate+up+GLU) | old-08 fusions + old-13 fused MoE + old-15 PR63/114; + `topk_moe` sorted-key argmax (r52); + the RDNA3_0 per-shape mmvq `nwarps` (r93) |
-| `0009` | **host-resident MoE** (iface, scheduler, Meta, movable-boundary slab, cache engine, prefill cache staging) | old-06 MoE + old-09b + old-11 + old-13 engine + old-15 hooks/arena; + the arena-host staging engine and its residency snapshot (r83); + the slab drop reference (r85); + the slab transient absorption common half and the derived draft reserve (r86); + the complete device-iface fills and the pre-loaded draft-model handoff (r94 block-boundary repair); + the batched f32 CPY run on RDNA3_0 (r95, PR #193); + the restored copy callback, so the upstream `--moe-cache-mib` engine works (r99, TODO #56); + the split-state walk's per-thread scratch arena, so a graph re-allocation stops allocating one heap node per visited tensor (r100, issue #184); + the `--fit` draft reserve charged only to the KV layers a drafter owns (r101), and a loaded-but-unused draft model is not loaded or given a context (r101); + the cache's traffic report divides a decode-band op census by the sizing-time table count (r144), and `GGML_CUDA_GRAPH_TRACE` reports how every `graph_compute` call was served (r144); + the decode band no longer reads the routing back to the host: a device-side slot remap (`GGML_MOE_DEVREMAP`, host policy one call late) and a `--host-experts pool` resident miss read in place (`MOE_HOST_POOL_COLD`) — +8.4 % TG pinned / +4.8 % pool, byte-identical text and MTP acceptance (r203, PR #266); + the remap is **tensor-split and covering-pool aware** (r221, TODO #269): the Meta backend forwards it per device (+16.1 % / +28.4 % decode at 2 / 3 devices) and a host pool that covers its tensor is a cold source (+9.9 % on the default `-lme auto` mirror) |
+| `0009` | **host-resident MoE** (iface, scheduler, Meta, movable-boundary slab, cache engine, prefill cache staging) | old-06 MoE + old-09b + old-11 + old-13 engine + old-15 hooks/arena; + the arena-host staging engine and its residency snapshot (r83); + the slab drop reference (r85); + the slab transient absorption common half and the derived draft reserve (r86); + the complete device-iface fills and the pre-loaded draft-model handoff (r94 block-boundary repair); + the batched f32 CPY run on RDNA3_0 (r95, PR #193); + the restored copy callback, so the upstream `--moe-cache-mib` engine works (r99, TODO #56); + the split-state walk's per-thread scratch arena, so a graph re-allocation stops allocating one heap node per visited tensor (r100, issue #184); + the `--fit` draft reserve charged only to the KV layers a drafter owns (r101), and a loaded-but-unused draft model is not loaded or given a context (r101); + the cache's traffic report divides a decode-band op census by the sizing-time table count (r144), and `GGML_CUDA_GRAPH_TRACE` reports how every `graph_compute` call was served (r144); + the decode band no longer reads the routing back to the host: a device-side slot remap (`GGML_MOE_DEVREMAP`, host policy one call late) and a `--host-experts pool` resident miss read in place (`MOE_HOST_POOL_COLD`) — +8.4 % TG pinned / +4.8 % pool, byte-identical text and MTP acceptance (r203, PR #266); + the remap is **tensor-split and covering-pool aware** (r221, TODO #269): the Meta backend forwards it per device (+16.1 % / +28.4 % decode at 2 / 3 devices) and a host pool that covers its tensor is a cold source (+9.9 % on the default `-lme auto` mirror) |; **+ r338: the opt-in `-of tp-ffn-even` even FFN split** — `-sm tensor` floors a 640-wide expert set's 2-device share to 256 (256/384); with the tag (or `LLAMA_TP_FFN_EVEN=1`) the granularity drops toward `lcm(blck_size,64)` and it splits **320/320** (**+7 % `draft-mtp` decode, +4 % prefill** there).  OFF by default because the granularity IS the reduction's grouping (2-device Flash-Next mean KLD 0.0140, below that point's own `-ub` reorder control of 0.0152 but 2.8x the prefill-logit limit), inert on every 3-GPU shape the delivery validates; **`-of`/`--optional-features`** is the new discoverable spelling for an opt-in switch that would otherwise be environment-only.  `ENVIRONMENT.md` §4.1, `GREEDY-PURITY.md` §104, `benchmarks/2026-11-21-ffn-even-split.md` |
 | `0010` | **infrastructure** — slab, fusion dispatcher, async input ring, GDN/rope fusions | the translation units split out of `ggml-cuda.cu` (`try-fuse`, slab/arena/vmm, MoE cache hooks) + short-K MoE rows-per-block (r52); + the `stage_from_cache` hook (r83); + the slab narrow band (r85); + the slab transient absorption CUDA/slab half (r86); + the async graph-input ring and its r90 split-input snapshot fix (default-on); + the fixed-D sequential GDN snapshot tail (r91, `GGML_CUDA_GDN_TAIL=0`); + the work-boundary shrink invalidates captured graphs (r94, issue #187); + the verify-band Q8_1 fusions and the GDN conv verify path on RDNA3_0 (r95, PR #192 + #193); + gemma4 dense `-sm tensor` (the Meta split state accepts an empty-or-whole slice for per-row ops, the rotated-K `mul_mat` and flash-attention K/V), the expert cache sizing / multi-slice tables / segmented async upload, the iSWA `q, v, k` KV-builder order and the per-origin async-input ring (r101); + the GDN/attention-gate decode fusions (r102, PR #200) with the r108 multi-sequence fix, the bf16 RoPE destinations (r103), and the r183 GDN decode folds with the shared-expert gate fold (PR #256) plus the 2-D copy guard; + the `q4_0` K/V cache write fold in the rope + FWHT kernel (r199, PR #262, `GGML_CUDA_KV_FOLD_Q4_0=0`), +10.8 % tg128 on a `q4_0`-KV 30B-A3B; + the fusion-gate oracle's 33-case `{BF16,1024}`/`{Q8_0,1024}`/`{Q8_0,5120}` matrix (r202, tests only) |
 | `0011` | **qwen4exp** (model, hyper-connections, lazy reader, QSA/indexer) | old-14 + old-15 HC16/policy/QSA; the model graph, the QSA/indexer/HC ops and kernels, the managed lazy reader and the keys-only indexer cache, the qwen4exp tensor-split arch gate, and the qwen4exp fusion arms; split out of `0010` in r109 (tree-identical)  **+ r303: both GGUF layouts** -- the post-#31028 merged `hc_*_down_inject` file (upstream's converter) now builds at all (it segfaulted at `sched_reserve`, contributor PR #321) and keeps the fused hyper-connection mixer, by feeding the op two row views of the merged tensor; the merged shape has a synthetic fixture (`scripts/make-merged-hc-gguf.py`) and a CI arm in `test-llama-archs`. |
 | `0012` | **campaign remainder** (CPU wins, DFlash, FA build grouping, mmap reclaim, batched state copy; **+ r207: host-pool-speed** — a POOL-backed table gathers in the prefill band by default, the `RAM_PCT` ceiling scales every table, `MOE_HOST_POOL_SIZING=1` (opt-in), the pool's diagnostics report the run, `MOE_HOST_POOL_PREFETCH` removed) | old-15 W1-W3 + old-06/15 mmap reclaim + old-16; + the expected `--fit` `ctx_other` probe failure logs as a warning, and the draft-context creation is gated on an enabled type that uses it (r101); + the batched state save/restore, the pipelined copy over it, and the threaded streaming host copy (r152, PR #235); + the DFlash draft's compute reserve split over its injection and noise-block graphs (r162, issue #239); + the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they stop being graph outputs and the host rows are reserved only when the host path runs (r163, issue #240) |; **+ r291: qwen4exp sequence parallelism** — the hyper-connection chain runs on each device's own token slice of a 2+-device `-sm tensor` prefill (`LLAMA_SEQPAR`, **default on**, `=0` off; `LLAMA_SEQPAR_MIN` 512, clamped to 128).  +7 % copy-engine / +2.2 % default-chain prefill at 31.5k, MTP prefill +15 %; a batch-width rounding change (`GREEDY-PURITY.md` §92), off-path bit-inert, gate [`scripts/gate-seqpar.sh`](scripts/gate-seqpar.sh)
@@ -428,7 +431,7 @@ Applying the 17 default patches to the fork point in [`release.json`](release.js
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 4f9dfa0e3          # the base recorded in release.json
+git checkout 919794500          # the base recorded in release.json
 bash <path-to-this-repo>/scripts/apply-all.sh .   # 17/17 strict, tree checked against release.json
 ```
 
@@ -659,6 +662,18 @@ rather than pinning it now ships as **block 06's `mmf32`** (`GREEDY-PURITY.md` �
 shortcuts and the in-code pin prototype that was *not* shipped, is
 [`archive/work/hipblaslt-bypass/`](archive/work/hipblaslt-bypass/README.md).
 
+**The pin is now cheap (r336, contributor PR #340) — and it is only needed below ROCm 10.2.**  The fix above
+is a `rocm-libraries` commit (`c50ea60130f`) that ships as hipBLASLt 1.5, i.e. **ROCm 10.2**: on 10.2 you do
+not need the pin for reproducibility at all.  On **ROCm ≤ 10.1**, where this section's pin is the only
+control, its prefill cost was 13-23 % on a qwen4exp model because the BF16 dense GEMMs (the hc mixer, the BF16
+router, the shared-expert gate) fell back to rocBLAS's Tensile kernels.  Block 06 now takes those GEMMs on MMB
+**only while `ROCBLAS_USE_HIPBLASLT=0`**, which brings the cost to 1-4 % — measured on a GSQ Flash-Next IQ3_S
+(2x gfx1201, 5.2k-token prompt): pinned prefill **1691 → 2196 t/s (+29.9 %)**, now *above* the
+hipBLASLt-enabled arm's 2027 t/s, with decode flat.  Nothing changes with hipBLASLt enabled (0 launches,
+prefill logits bit-identical), so a default run is unaffected; the delivery still never pins the variable
+itself.  If you pin for an unrelated reason on 10.2 (a hipBLASLt OOM at a tight slab headroom, say) you keep
+the speed as well.  Knobs: [`ENVIRONMENT.md`](ENVIRONMENT.md) §10.2.
+
 ## Concurrent serving with `--kv-unified` is not deterministic (issue #134)
 
 Mixing `-np > 1` with `--kv-unified` does **not** give run-to-run reproducible greedy output: a
@@ -718,6 +733,7 @@ following users for the assistance in finding issues and offering solutions!
 - https://github.com/burnoutIA  (PR #317: the 2..8-column speculative-verify matvec family in WMMA `iu8` — Q4_K/Q5_K/Q6_K/IQ4_XS read in their GGUF layout on the existing q8_1 activations, each weight dequantized once for all the verified columns, plus the design notes and the min-term pitfall (`d.SUM(xq)`, not `ds.y`).  Folded into block 07 in r290 as an opt-in (`--wmma-verify N|auto`, `GGML_CUDA_WMMA_MMVQ` kept as the A/B alias) with the Q8_0 case and the per-format stride unit added here; the band and end-to-end numbers are in `WORKLOG.md` 261115.002 and `ENVIRONMENT.md` §7.6.  r312 made `auto` a per-type floor from a DRAM-cold sweep (5 for Q4_K/Q5_K, 8 for Q6_K/IQ4_XS/Q8_0) and refuted the "narrow low-band arm" follow-up: at 2..4 columns the K-split kernel is at 92-98 % of the memory roof — `WORKLOG.md` 261118.005)
 - https://github.com/briansp2020  (block-13 moe_weighted_reduction float4 remainder fix + block-14 MUL_MAT_ID pair-fusion layout gate, issues #19 and #18; PR #213: the split-state cache hit returns instead of copying the state, folded into block 09 in r132); PR #326: the Q8_0 hyper-connection mixer path for UD quants (persistent `down_dots` counters, planar output, a Q8_1 epilogue, the combine+norm+Q8_1 kernel, a weight-preloading up band, an up+collapse launch and the F32 inject rows on the down grid) -- folded into block 11 in r313, output byte-identical on `UD-Q4_K_XL` across all ten hc-fusion arms, +7.1 % decode, with the redundant `_Q8` sub-switches folded into the switches that already covered the class (`WORKLOG.md` 261118.007); PR #315: sequence parallelism for the qwen4exp hyper-connection work -- the residual streams stay token-split through a 2+-device `-sm tensor` prefill, a new `GGML_OP_TOKEN_SCATTER` and a copy-engine reduce-scatter / token all-gather pair on the all-reduce's own scratch, default ON (`LLAMA_SEQPAR=0` off), +7 % copy-engine and +2.2 % default-chain prefill at 31.5k; reviewed, reproduced to the digit and extended to 3 cards here)
 - https://github.com/eoprede
+- https://github.com/jstamagal  (PR #338: three RDNA2-`gfx1030` improvements, folded into the delivery as RDNA2-gated code in r334 — a one-warp `RMS_NORM` launch for `ncols <= 128` with a `dst16`-free kernel specialization, a `GATED_DELTA_NET` chunked-prefill gate keyed on `H * n_seqs` (gfx1030 has no BF16 WMMA, so the FP32 chunked kernel only wins on a low-head long prefill), the removal of block 05's stale RDNA2 `cols_per_block`/`ncols2` caps (the RDNA2 occupancy is computed by `launch_fattn` itself now), and a `mul_mat_vec_q_moe` K-block walk with the rows side by side — bit-identical, 1.26-1.32x on quantized `MUL_MAT_ID` at `n = 1..8`; every piece is compile-gated to the RDNA2 device pass and armed at run time from the device's `cc`, so gfx1201/gfx1151/gfx1100 keep their numerics, `ENVIRONMENT.md` §7.4)
 - https://github.com/mjohanning99  (PR #312: the mixed K/V cache types — a q8_0 K with a q4_0 / q5_0 / q5_1 V read natively through a second tile type parameter, head 256 only, with the QSA refusal and the one-V-type-function contract; promoted as block 17 in r287, moved to optional block `0101` in the r288 block-number re-org, `scripts/gate-mixed-kv.sh`)
 - https://github.com/overdoingism  (issue #45: the RDNA4 head-256 GQA-6 decode/verify flash-attention band, reported with the diagnosis, op-level data, the round-robin KV split idea and a working opt-in patch; the r4 block-15 band is built on that submission.  PR #223: the fully-masked KV-group skip extended to the band itself, so a resident idle conversation no longer taxes the active one's decode — folded into block 05 in r133.  Issue #224: the r126 row change left widths 5..8 on a different per-column KV split, so greedy decode with a draft diverged from plain decode; the band's own 64-column instantiation is back in r134, with a build-time guard and a width probe that reaches it)
 - https://github.com/pwilkin  (the `strix-halo` fork at https://github.com/pwilkin/llama.cpp/commits/strix-halo/, heavily adapted for the MMB bf16-WMMA dequant-weight GEMM work, now folded into the delivery — formerly `archive/work/mmb-general/`)
@@ -743,4 +759,9 @@ Many thanks to the llama.cpp team
 
 ## License
 
-Same as llama.cpp (MIT).
+Same as llama.cpp (MIT), with one documented exception: block 03's chunked Gated DeltaNet kernels
+(`gated_delta_net_chunked_bf16.cu`, `gated_delta_net_chunked_bf16_gfx11.cu`) are ports of libr4d kernels,
+and libr4d ships inside [radiance](https://codeberg.org/StillDeadcode/radiance) under **Apache-2.0**.  Those
+parts stay Apache-2.0; radiance's `LICENSE` and `NOTICE` are reproduced unchanged in
+[`third_party/radiance/`](third_party/radiance/).  See [`NOTICE`](NOTICE) for the exact scope — it matters
+if you redistribute the applied tree.

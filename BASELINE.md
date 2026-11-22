@@ -16,7 +16,39 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 | canonical chain | `release.json .tip` / `.tree` |
 | release identity | `release.json .release` (`v<blocks>-<base>-r<N>`) |
 
-**The base is fixed by a re-base.**  The last one is **`v17-4f9dfa0e3-r278`** (2026-11-13): it replayed the
+**The base is fixed by a re-base.**  The last re-base is **`v17-919794500-r328`** (2026-11-21);
+`v17-919794500-r329` amends three blocks on that same base and moves no fork point, and
+`v17-919794500-r331` amends blocks 00 and 10 on it — block 00's `ggml-alloc.c` half (the GLU-in-place rule,
+W4's unused-view release and the issue-#183 `layout_fp` guard) is **restored** after the re-base dropped it
+(issue #345; the r328 rung landed 34 of the old block's 37 files), and block 10 renames the stale
+`GGML_CUDA_CC_DGX_SPARK` to upstream's `GGML_CUDA_CC_GB10` and restores the `GGML_CUDA_DISABLE_ROPE_SET_ROWS`
+bisect switch.  `v17-919794500-r332` retired the per-block build ladder (policy only, no patch change) and
+`v17-919794500-r333` is the tooling/records revision on the same tree (`TODO` #349 closed, `scripts/gate-server-arms.sh`
+re-anchored under `--no-kv-unified`; no fork point, block or artifact change), and `v17-919794500-r334` amends
+blocks 05, 08 and 10 on it with three RDNA2 (`gfx1030`) items from contributor PR #338 — the FA tile caps
+lifted (block 05), the one-warp narrow `RMS_NORM` (block 08), and the GDN chunked gate plus the rows-abreast
+MoE K walk (block 10).  Every piece is compiled only in the RDNA2 device pass and armed at run time from the
+device's `cc`, so no supported arch's numerics move; the optional artifacts `0100`/`0101` are re-cut against
+the new default tree (they are rebased on every release) and `0101` needed a two-line merge for the deleted
+caps.  `v17-919794500-r335` is records-only (PR #339 closed as already fixed by the r328 re-base) and
+`v17-919794500-r336` amends **block 06** with contributor PR #340's six patches: a qwen4exp model's BF16 dense
+GEMMs (hc mixer, BF16 router, shared-expert gate) take MMB's bf16-WMMA tile **only while
+`ROCBLAS_USE_HIPBLASLT=0`** (the §44 pin -- its prefill cost drops from 13-23 % to 1-4 %), plus an RDNA4
+`hc16` dead-write removal (the hc gate's BF16 side copy had no reader on RDNA4, since every marking pass is
+RDNA3_5-gated; +0.4 % prefill, output bit-identical).  Every new default is a field of the RDNA4 row of
+`mmb_arch_defaults`, so RDNA3_5/RDNA3_0 are unchanged by construction, and the default path with hipBLASLt
+enabled is **bit-identical** (prefill-logit `-0.000000 / 100.000 %`, same greedy text) -- the pinned arm is a
+documented kernel-family switch (`GREEDY-PURITY.md` §44 addendum, `INVARIANTS.md` r336,
+`benchmarks/2026-11-21-mmb-bf16-pinned.md`).  The optional artifacts are re-cut again (both applied strictly,
+no hunks moved).  The re-base itself replayed the set
+from `4f9dfa0e3` onto **`919794500`** — 228 upstream commits, 1944 files, +147 k / −41 k — as a **ladder climb**
+(one rung per block, each resolved, built and coherent before the next), with the three rung repairs squashed
+into their owning blocks (00's top-k gather, 05's `nb32`, 16's sign-compare).  The ladder, the per-rung conflict
+map and the decisions are in `archive/work/upstream-rebase-261120/` (`RUNGS.md`, `DECISIONS.md`); the narrative and gate
+numbers are `WORKLOG.md` 261121.005.  **Block contents are unchanged by it** — the tree is the same delivery
+re-expressed on a new base — and the earlier r278 note below is kept as the previous record.
+
+**The previous re-base was `v17-4f9dfa0e3-r278`** (2026-11-13): it replayed the
 set from `a691b2345` (the 2026-11-08 base) onto **`4f9dfa0e3`** — 164 upstream commits, 751 files, +40 612 /
 −24 226 — as a **ladder climb** (one rung per block, each resolved, built and coherent before the next), and
 re-cut it as exactly 17 block commits with **both rung-repairs squashed into their owning blocks** (block 05's

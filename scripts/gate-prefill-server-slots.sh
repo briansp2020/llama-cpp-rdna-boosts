@@ -29,14 +29,34 @@
 #   the whole request, because an average can hide a stall.
 #
 # Usage:  ./gate-prefill-server-slots.sh [--quick] [--tol-pct N] [--keep]
-#   LLAMA_SERVER, MODEL, LME, N_PREDICT, A_PROMPT_FILE, B_PROMPT_FILE, GPU, and the mlock/AS barriers are
-#   environment overrides (see below).  Exit: 0 = pass, 1 = fail, 2 = usage/prerequisite error.
+#   LLAMA_SERVER, MODEL, LME, N_PREDICT, A_PROMPT_FILE, B_PROMPT_FILE, GPU, EXTRA_ARGS, and the mlock/AS
+#   barriers are environment overrides (see below).  Exit: 0 = pass, 1 = fail, 2 = usage/prerequisite error.
+#
+#   The gate prints the server binary's own `--version` (build + commit) at the top: a census assertion cannot
+#   fail on a stale binary, it silently reads a run that predates the print it asserts (2026-11-21 on `halo`,
+#   TODO #357).  `-lme 90` (the default below) is what the 122B-A10B wants on a 128 GiB APU, but it is anon
+#   memory on top of a >RAM mapping: on a 123 GiB box it OOM-kills the server (measured: 94 GiB anon, plus 8
+#   kernel OOM kills), so `LME=60..85` is the range that box can hold.  `EXTRA_ARGS` is how an arm reaches for
+#   anything else, e.g. `EXTRA_ARGS='--lazy-mode auto'`.
+#
+#   On that box `LME=85` is the arm the r329 record used and it is the one to run (both arms complete, the
+#   in-place band engages).  At a TIGHTER budget the `ip` arm also needs a smaller prefill ubatch
+#   (`LME=60 EXTRA_ARGS='-ub 512 -b 512'`): the in-place admission has a documented hard bound -- one routed pass
+#   must fit the arena's slots for the tables it touches (`|used| <= slots`) -- and the server's own ~3548-token
+#   prefill ubatch routes (nearly) every one of the 122B's 256 experts per table, so the whole pass declines to
+#   the per-expert copy and the run fails with "no in-place prefill call happened -- the scenario did not
+#   exercise the change", which is a config limit, not a defect.  Measured 2026-11-21 on `halo` (gfx1151,
+#   123 GiB): `LME=60` at the default ubatch = 564 declines / 0 calls; `LME=60 EXTRA_ARGS='-ub 512 -b 512'` =
+#   120 calls x 117 tables, 3384 slot admissions, both arms' text identical, A's decode 1.23 against 1.17 t/s
+#   (`ip` against `copy`); `LME=85` at the default ubatch = 159 calls x 75 tables, 3351 slot admissions, A 3.24
+#   against 3.01 t/s.
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama-scratch/build-rocm/bin/llama-server}"
+LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}"
 MODEL="${MODEL:-/llm/models/Qwen3.5/122B-A10B/Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf}"
 LME="${LME:-90}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 GPU="${GPU:-0}"
 PORT="${PORT:-8137}"
 N_PREDICT="${N_PREDICT:-160}"
@@ -64,6 +84,10 @@ export LD_LIBRARY_PATH="/opt/rocm-10.1.0-gfx1151/lib:${LD_LIBRARY_PATH:-}"
 export HIP_VISIBLE_DEVICES="$GPU"
 export MOE_EXPERT_HEATMAP=load        # the frozen prior: every arm starts from the same arena
 
+# the ANCHOR: which binary this run certifies (see the header)
+echo "==> slotsgate: $LLAMA_SERVER"
+echo "    $("$LLAMA_SERVER" --version 2>&1 | head -1)"
+
 DIR="$(mktemp -d)"
 CHECKS=0
 FAILED=0
@@ -81,7 +105,7 @@ run_arm() {
     mkdir -p "$dir"
     echo "==> arm $arm (MOE_EXPERT_PREFILL_IN_PLACE=$ip)"
     MOE_EXPERT_PREFILL_IN_PLACE="$ip" "$LLAMA_SERVER" -m "$MODEL" -lme "$LME" -ngl all --fit off \
-        -ub 4096 -b 4096 -c "$CTX" -np 2 -fa on --host 127.0.0.1 --port "$PORT" -lv 4 \
+        -ub 4096 -b 4096 -c "$CTX" -np 2 -fa on $EXTRA_ARGS --host 127.0.0.1 --port "$PORT" -lv 4 \
         > "$dir/server.log" 2>&1 &
     local pid=$!
     local up=0
