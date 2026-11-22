@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 14 Nov 2026 17:15:00 +0000
+Subject: [PATCH 30/38] moe cache: a sparse table staged fill at sizing takes
+ the heat map hottest experts (GGML_MOE_STAGE_HEAT_RANK=0: off)
+
+With a persisted heat map, the eager per-expert heat seed of a sparse (mmap) table registered each expert and
+took ~75 s more load.  The staged fill at sizing already fills the arena through a pinned staging buffer without
+registration; it now takes the experts in the rank order of the prior (as apply_heat_seed_locked ranks them)
+instead of 0..k-1, and the heat seed leaves sparse tables to it.  No map: 0..k-1 as before.
+
+(cherry picked from commit 503fd28fdf54c505703e79ffec3e444fb33e2ec6)
+(cherry picked from commit 0bbfdd9ccf5d54b16259d0c3fd2613c6d17b0e88)
+(cherry picked from commit 369771474807ef789f7c60ed4835234e750d1a20)
+(cherry picked from commit c075d68b21ac73affae05f356a0a57f15a1095e1)
+(cherry picked from commit 7406f646f9af7fdd78fa84035f77803ca4d322fd)
+(cherry picked from commit 64eb7cb7085edeef11c4e61ab2882129c2e9ba34)
+(cherry picked from commit fd159a436ef9fb429d6541c040dde857cd53676b)
+(cherry picked from commit 720a43167ad8ba4c0a996aad04323f112f203fd3)
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 13 +++++++
+ ggml/src/ggml-cuda/moe-expert-tier.inc | 48 ++++++++++++++++++++------
+ 2 files changed, 51 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 35ace29558..33a1836112 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -320,6 +320,16 @@ struct table_t : moe_tier_fields {
+ 
+ // TODO #88: the band a heat-driven arena decision ranks by (defined with the heat-map code below).
+ static const std::vector<uint32_t> & heat_rank_vec(const table_t & t);
++// GGML_MOE_STAGE_HEAT_RANK (default on): a sparse (mmap) table's staged arena fill at sizing takes the persisted heat
++// map's hottest experts, and the per-expert heat seed leaves sparse tables to it.  =0: experts 0..k-1 and the seed.
++static bool stage_heat_rank_on() {
++    static const bool v = [] {
++        const char * e = getenv("GGML_MOE_STAGE_HEAT_RANK");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return v;
++}
++static int64_t g_stage_heat_tables = 0;   // sparse tables whose staged fill was ranked by the heat map
+ 
+ std::mutex                          g_mutex;
+ std::vector<table_t>                g_tables;
+@@ -5529,6 +5539,9 @@ void apply_heat_seed_locked(table_t & t) {
+         !heat_seed_above_floor(t)) {
+         return;
+     }
++    if (t.host_sparse && !t.sparse_off && stage_heat_rank_on()) {
++        return;   // the staged fill at sizing (tier_table_sized_locked) places the prior's hottest experts
++    }
+     if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
+         return;
+     }
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index 5c925517ba..3bb0ccdee8 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -218,9 +218,10 @@ static void sparse_pack_expert(const table_t & t, int32_t e, char * dst) {
+         memcpy(dst, src, t.expert_bytes);
+     }
+ }
+-// Copy experts 0..k-1 of a sparse table into arena slots 0..k-1 through a pinned staging buffer: the master stays
+-// unregistered (registering, then dropping, what the arena holds costs a register call per expert).
+-static bool sparse_stage_fill_locked(const table_t & t, int k) {
++// Copy experts order[0..k-1] (nullptr: 0..k-1) of a sparse table into arena slots 0..k-1 through a pinned staging
++// buffer: the master stays unregistered (registering, then dropping, what the arena holds costs a register call per
++// expert).
++static bool sparse_stage_fill_locked(const table_t & t, int k, const int32_t * order = nullptr) {
+     static char *  stage     = nullptr;
+     static size_t  stage_cap = 0;
+     const bool     do2d = t.split_axis == 0 && t.host_pitch != 0;
+@@ -247,7 +248,7 @@ static bool sparse_stage_fill_locked(const table_t & t, int k) {
+     for (int e0 = 0; e0 < k; e0 += per) {
+         const int n = std::min(per, k - e0);
+         for (int j = 0; j < n; j++) {
+-            sparse_pack_expert(t, e0 + j, stage + (size_t) j * t.expert_bytes);
++            sparse_pack_expert(t, order != nullptr ? order[e0 + j] : e0 + j, stage + (size_t) j * t.expert_bytes);
+         }
+         if (cudaMemcpy((char *) t.arena + (size_t) e0 * t.expert_bytes, stage, (size_t) n * t.expert_bytes,
+                        cudaMemcpyHostToDevice) != cudaSuccess) {
+@@ -3787,17 +3788,44 @@ static void tier_table_sized_locked(table_t & t) {
+         sparse_populate((uintptr_t) t.host_dev, (uintptr_t) t.host_dev + (size_t) t.n_experts * t.host_bytes);
+         if (!t.identity && t.expert_slot.empty()) {
+             const int k = std::min(t.slots, t.n_experts);
+-            if (k > 0 && sparse_stage_fill_locked(t, k)) {
++            // With a persisted heat map, the staged fill takes the prior's hottest experts (ranked as
++            // apply_heat_seed_locked ranks them) instead of 0..k-1: a warm start at the staged fill's cost.
++            std::vector<int32_t> order;
++            if (stage_heat_rank_on() && heat_seed_above_floor(t) && (int) t.heat.size() == t.n_experts) {
++                uint64_t total = 0;
++                for (uint32_t v : t.heat) {
++                    total += v;
++                }
++                if (total > 0) {
++                    const std::vector<uint32_t> & rank_by = heat_rank_vec(t);
++                    order.resize((size_t) t.n_experts);
++                    for (int e = 0; e < t.n_experts; e++) {
++                        order[(size_t) e] = e;
++                    }
++                    std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
++                        if (rank_by[(size_t) a] != rank_by[(size_t) b]) {
++                            return rank_by[(size_t) a] > rank_by[(size_t) b];
++                        }
++                        return a < b;
++                    });
++                }
++            }
++            const int32_t * ord = order.empty() ? nullptr : order.data();
++            if (k > 0 && sparse_stage_fill_locked(t, k, ord)) {
+                 for (int i = 0; i < k; i++) {
+-                    t.slot_expert[i] = i;
+-                    t.expert_slot[i] = i;
++                    const int32_t e = ord != nullptr ? ord[i] : i;
++                    t.slot_expert[i] = e;
++                    t.expert_slot[e] = i;
+                     slot_seq_set_locked(t, i, 0);   // synchronous staged fill
+                     if (i < (int) t.slot_prov.size()) {
+                         t.slot_prov[i] = 1;
+                     }
+-                    t.count[i] = 0;
+-                    t.ghost[i] = 0;
+-                    t.last[i]  = 0;
++                    t.count[e] = 0;
++                    t.ghost[e] = 0;
++                    t.last[e]  = 0;
++                }
++                if (ord != nullptr) {
++                    g_stage_heat_tables++;
+                 }
+                 t.fills     += k;
+                 t.slot_dirty = true;
+-- 
+2.53.0
+

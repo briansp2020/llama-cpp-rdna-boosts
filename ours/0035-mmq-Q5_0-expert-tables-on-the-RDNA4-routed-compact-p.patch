@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 21 Nov 2026 05:52:08 +0000
+Subject: [PATCH 35/38] mmq: Q5_0 expert tables on the RDNA4 routed-compact
+ path with the IQ4_NL bands (prefill reads experts in place, no whole-table
+ gather; GGML_MMQ_Q5_0_COMPACT=0: plain path)
+
+(cherry picked from commit 9efbe1e3924e62a08bb196568bb86652719c1922)
+(cherry picked from commit 5b399966c4bfcf2f156299d3e3d3db72245fcc13)
+(cherry picked from commit beddf93dc0c8b7709a13292d55d005ae0bf6cd74)
+(cherry picked from commit 6e880e98a461e7fa61d1a71dc1dd0ed40c7015a1)
+---
+ ggml/src/ggml-cuda/mmq.cu  |  5 ++++-
+ ggml/src/ggml-cuda/mmq.cuh | 20 +++++++++++++++++++-
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index f0e2aa52fe..cb55a5d53a 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -219,6 +219,9 @@ static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, co
+             const int64_t rows_per_expert = (ncols_dst + nchannels_y - 1) / nchannels_y;
+             const bool use_j48_128e = mmq_rdna3_5_id_use_j48_128e(type, nchannels_y, rows_per_expert);
+             int J_rdna3_5 = use_j48_128e ? 48 : mmq_rdna3_5_id_get_J(type, rows_per_expert, GGML_CUDA_CC_IS_RDNA4(cc));
++            if (type == GGML_TYPE_Q5_0 && !mmq_q5_0_compact_on()) {
++                J_rdna3_5 = 0;
++            }
+             // read once: this runs for every MUL_MAT(_ID) and getenv() is expensive on Windows
+             static const int q6_compact_j = [] {
+                 const char * env = getenv("GGML_Q6_COMPACT_J");
+@@ -236,7 +239,7 @@ static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, co
+             }();
+             const bool iq_band_type = type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS ||
+                 type == GGML_TYPE_IQ2_S || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL ||
+-                type == GGML_TYPE_IQ4_XS;
++                type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0;
+             if (iq_j64_wide && iq_band_type && GGML_CUDA_CC_IS_RDNA4(cc) && !use_j48_128e && J_rdna3_5 == 128 &&
+                     rows_per_expert > 64 && rows_per_expert <= 96) {
+                 J_rdna3_5 = MMQ_IQ_ID_J_MID;
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 8868bbff5f..aab19af2bd 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1592,6 +1592,14 @@ static constexpr bool mmq_rdna3_5_id_n_experts_ok(const int64_t n_experts) {
+ // Routed-compact arch set: RDNA3_5 (source-of-record B) + RDNA4 (2026-09-06 gfx1201 validation,
+ // see the section comment above for numbers/coherence).  Arch-gated per-kernel; other archs keep
+ // the plain path.
++// Q5_0 expert tables (the Unsloth qwen4exp UD down experts) on the routed-compact path with the IQ4_NL bands (FINDINGS
++// 1050): the plain path made the prefill expert cache gather the whole 512-expert table first (moe_cache_pf_fill,
++// ~1.1 ms per layer per 4096-token ubatch); compact reads the experts in place.  GGML_MMQ_Q5_0_COMPACT=0: plain path.
++static inline bool mmq_q5_0_compact_on() {
++    static const bool on = [] { const char * e = getenv("GGML_MMQ_Q5_0_COMPACT"); return e == nullptr || atoi(e) != 0; }();
++    return on;
++}
++
+ static inline bool mmq_routed_compact_arch_ok(const int cc) {
+     return GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
+ }
+@@ -1612,6 +1620,11 @@ static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t ro
+                 return 0;
+             }
+             [[fallthrough]];
++        case GGML_TYPE_Q5_0:   // RDNA4 only, as the IQ types above (runtime gate: mmq_q5_0_compact_on)
++            if (!rdna4) {
++                return 0;
++            }
++            [[fallthrough]];
+         case GGML_TYPE_IQ3_S:
+         case GGML_TYPE_IQ4_NL:
+         case GGML_TYPE_IQ4_XS:
+@@ -1640,6 +1653,11 @@ static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int
+                 return false;
+             }
+             [[fallthrough]];
++        case GGML_TYPE_Q5_0:
++            if (!rdna4) {
++                return false;
++            }
++            [[fallthrough]];
+         case GGML_TYPE_IQ3_S:
+         case GGML_TYPE_IQ4_NL:
+         case GGML_TYPE_IQ4_XS:
+@@ -1869,7 +1887,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     const bool use_compact_routed = args.ids_dst != nullptr && args.expert_bounds != nullptr &&
+         mmq_rdna3_5_id_n_experts_ok(n_experts_ids) && mmq_routed_compact_arch_ok(cc) &&
+         !has_gate && !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc, prec_src1) && mmq_rdna3_5_id_use_compact(type, J, GGML_CUDA_CC_IS_RDNA4(cc)) &&
+-        !routed_disabled;
++        (type != GGML_TYPE_Q5_0 || mmq_q5_0_compact_on()) && !routed_disabled;
+     mmq_routed_src routed_src = {};
+     // Prefill in place: resolve the expert-cache fill the hook prepared for this op's expert table.
+     if (ctx.mmq_src0_cur != nullptr && args.ids_dst != nullptr) {
+-- 
+2.53.0
+

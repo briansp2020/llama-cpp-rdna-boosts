@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 10 Nov 2026 15:28:45 +0000
+Subject: [PATCH 14/38] moe cache: a device-remap call does not re-batch a
+ sibling already taken over in this round (GGML_MOE_DEVREMAP_REBATCH)
+
+A layer whose down (or up) table was not served by the first remap call of
+the layer makes its own call, and that call re-added the gate/up tables the
+first call had already published.  Any decline of that launch -- a sibling
+prep that declines, or a failed batched fill flush -- reset remap_n_used on
+every job, so the already-published tables lost their take-over after the
+scheduler had skipped their input_cpy copy: their ops read an input_cpy that
+was never filled (one decode step computed with stale weights).
+
+Skip a sibling already published in the current round.  With
+GGML_MOE_FILL_BATCH_FAULT at 45/47/50/51 (and 50 + VERIFY_EVERY) the logits
+are now bit-identical to the fault-free run; fault-free output unchanged.
+GGML_MOE_DEVREMAP_REBATCH=1 restores the old re-batch.
+
+(cherry picked from commit 387e8239c57389b5c85d19990aee9c5255879ce5)
+(cherry picked from commit 72b8f5f4765245c6a2bbfe49609616c46fe456cd)
+(cherry picked from commit 7702c3ae405a90da572bf3b9ce321c6425e996dc)
+(cherry picked from commit 48a96da19bd41180c23725602736b0e77fc8208a)
+(cherry picked from commit 5a8fb304c5b2dde5e0ecb5290e255676e4991d85)
+(cherry picked from commit 0993a86cff52c493ca7faa00b18afdd99801aab7)
+(cherry picked from commit 8b580d144493539d40c35419ea45f2afb1f1c918)
+(cherry picked from commit f7645e065268c3c6f80b261981aed0a3ceac1df1)
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index d0199cfe9e..fa71b2c602 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -12549,6 +12549,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+     return true;
+ }
+ 
++// GGML_MOE_DEVREMAP_REBATCH=1: a remap call also re-batches sibling tables already taken over in this round.
++static bool devremap_rebatch() {
++    static const bool v = [] { const char * e = getenv("GGML_MOE_DEVREMAP_REBATCH"); return e != nullptr && atoi(e) != 0; }();
++    return v;
++}
++
+ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids,
+                          void * stream, int device, bool check_only) {
+     bool pf_ret = false;
+@@ -12645,6 +12651,13 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+                 !devremap_ok_locked(u, n_used, n_tok, device)) {
+                 continue;
+             }
++            // A sibling already taken over in this round (its own call published the remap, so the scheduler skipped
++            // its input_cpy) must not join this launch: a decline below (its prep, or a failed flush) would reset its
++            // remap_n_used and its consumer would then read the input_cpy that was never filled.
++            // GGML_MOE_DEVREMAP_REBATCH=1: re-batch it anyway (the previous behaviour).
++            if (!devremap_rebatch() && u.remap_n_used > 0 && u.remap_round == remap_round_locked(device)) {
++                continue;
++            }
+             if (!devremap_prep_locked(u, stream)) {
+                 fence_flush_locked(u);
+                 u.remap_n_used  = 0;
+-- 
+2.53.0
+

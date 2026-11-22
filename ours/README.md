@@ -3,7 +3,7 @@
 This branch holds the patch series we run in production, on top of the latest rdna-boosts release. It is
 regenerated for each new release; patches the release has taken are dropped. It is not a PR.
 
-**Base:** `v17-919794500-r338` (upstream llama.cpp `919794500` + this repo's release).
+**Base:** `v17-919794500-r339` (upstream llama.cpp `919794500` + this repo's release).
 The rest of this branch is that release as published; only `ours/` is added.
 
 **New layout (2026-11-08).** Up to r228 this was a 55-patch series (0000-0054) that replaced the release's
@@ -17,11 +17,11 @@ The old series is kept as the tag `ours-r228-series`; the mapping table below sh
 
 ```
 git checkout 919794500
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r338 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 49 patches (0001-0049)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r339 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 38 patches (0001-0038)
 ```
 
-Result: tree `2f3f3bb7f65a`. This is the production build from the evening of 2026-11-21 (2 GPUs, `-sm tensor`, ROCm 10.2).
+Result: tree `4bdbc897a481`. This is the production build from 2026-11-22 (2 GPUs, `-sm tensor`, ROCm 10.2).
 
 ## Patches
 
@@ -40,65 +40,73 @@ r328 re-based the release onto upstream `919794500`.  r331 restored block 00's `
 interim restore is dropped).  r336 took our BF16 dense GEMMs on MMB while hipBLASLt is off (PR #340, r325 0040-0045, with
 r325 0047's producer-copy fix), and r338 our even FFN / shared-expert split (PR #342, r325 0048-0049) as an OPT-IN
 (`-of tp-ffn-even` / `LLAMA_TP_FFN_EVEN=1`; production sets it); they are dropped here and the later patches move up.
-The numbers below are the r338 series: the r325 series rebased onto r338 (r334's RDNA2-only rows-abreast K loop in
-`mmvq-moe.cu` is carried into our MoE kernel by 0049), plus 0044-0049.
+r339 took our Q8_0 hc mixer down-dots / up per-row gate (PR #344, r338 0041-0042); they are dropped here.
+The r339 series is also cleaned up.  hipBLASLt now follows the release: on by default (ROCm 10.2 ships hipBLASLt 1.5.0,
+whose solution order is stable), `ROCBLAS_USE_HIPBLASLT=0` is the user's determinism switch, and our BF16 MMB path
+(#340) runs only then.  Our F32 split floor + default-off (r338 0039) and hipBLASLt version gate (r338 0040) are
+dropped; the router GEMMs of 33-511-token batches go to hipBLASLt again (KLD 0.011 at `-ub 256`, 0 at `-ub 4096`).
+Also dropped: the decline-unfuse workaround and its removal (r338 0005, 0009, 0010, and 0006's down-fold part; the
+release's fusion overlap check fixes the cause), the 0007 header comment, the protect bitmap (r338 0044, +0-1 %), and the
+opt-in `LLAMA_CKPT_NEAR_SKIP` / `LLAMA_CKPT_TAIL_MIN` (r338 0046 and their code in 0045).  The r334 RDNA2 rows-abreast
+port (r338 0049) is folded into 0001.
 
 | | what | env switch (off) |
 |---|---|---|
-| 0001 | everything of the r228 series outside `moe-expert-cache.cu`, squashed (scheduler, server, MoE / GDN / shared-expert fusions, dedup, slab, KV lending hooks in llama, ...; see the mapping table) | per feature, as before |
+| 0001 | everything of the r228 series outside `moe-expert-cache.cu`, squashed (scheduler, server, MoE / GDN / shared-expert fusions, dedup, slab, KV lending hooks in llama, the r334 RDNA2 rows-abreast K loop in our MoE kernel (`GGML_CUDA_MOE_ROWS_ABREAST=0`), ...; see the mapping table) | per feature, as before |
 | 0002 | our mmap expert-cache code in `moe-expert-tier.inc` / `moe-expert-tier-state.inc`, not yet called | - |
 | 0003 | the hooks: the release's `moe-expert-cache.cu` calls the tier code for sparse (mmap) tables | per feature, as before |
 | 0004 | the device remap declines when a fill failed during its own policy pass | - |
-| 0005 | a declined decode-band sparse gate+up+GLU runs unfused | `GGML_MOE_FUSED_DECLINE_UNFUSE=0` |
-| 0006 | review fixes: the tier remap predicate refuses a `fill_failed` table; the down fold also runs unfused for a declined sparse table | - |
-| 0007 | header comment | - |
-| 0008 | layer split with pipeline parallelism overlaps the devices on ROCm: prompt ubatches rebuild their graph instead of reusing it, and host inputs go through a pinned per-(backend, copy) ring uploaded on the split's stream; opt-in `GGML_GALLOC_FP_SHAPES=0` and `LLAMA_KV_N_PAD_PREFILL_POW2=1` | `LLAMA_PP_PREFILL_NO_REUSE=0`, `GGML_SCHED_INPUT_STAGE=0` |
-| 0009 | a table whose fill failed also runs gate+up+GLU unfused | - |
-| 0010 | drops the 0005 workaround (`GGML_MOE_FUSED_DECLINE_UNFUSE`): the release's fusion overlap check fixes the cause | - |
-| 0011 | the dual-output mmvq fusion skips weights that live in a compute buffer | `GGML_CUDA_FUSION_CHECK_LEAVES=0` |
-| 0012 | the checkpoint pool uses `common_state_data` (no-init allocator); the pool thread still touches every page | - |
-| 0013 | CUDA graph eviction counts active time only (idle gaps capped at 1 s), and keeps the rule that the looked-up graph is never evicted | - |
-| 0014 | qwen4exp: PLE page hints (`MADV_WILLNEED`) only when a `mincore` sample says the table is cold (~13 ms per 4096-token ubatch saved) | `LLAMA_PLE_ADVISE=1` (always advise) |
-| 0015 | multi-device: `alloc_splits` skips the drain when no buffer grows | `GGML_SCHED_DEFER_ALLOC_SYNC=0` |
-| 0016 | `-sm tensor`: graph inputs in pinned memory (the meta device's first child host buffer type) and uploaded asynchronously per device; host compute buffers kept across the drop | `LLAMA_META_HOST_BUFT=0`, `GGML_SCHED_ASYNC_USER_INPUT=0`, `GGML_GALLOC_DROP_HOST=1` |
-| 0017 | meta: the split-input copy of a split host weight is sized at the largest device slice, not the whole tensor | `GGML_META_SLICE_ALLOC=0` |
-| 0018 | moe cache: a device-remap call does not re-batch a sibling already taken over in the same round | `GGML_MOE_DEVREMAP_REBATCH=1` |
-| 0019 | qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy; the gate copy runs before attention on prefill-sized graphs | `LLAMA_QSA3_DIRECT_F16=0`, `LLAMA_GATE_EARLY=0` |
-| 0020 | qwen4exp qsa3: the packs read the Q8_0 cache views directly, no F16 copies in the graph | `LLAMA_QSA3_PACK_Q8=0` |
-| 0021 | `-sm tensor` ubatch overlap: asynchronous graph-input views, asynchronous CPU-split output upload, deferred input wait | `GGML_SCHED_ASYNC_INPUT_VIEWS=0`, `GGML_SCHED_ASYNC_CPU_OUT=0`, `LLAMA_DEFER_INPUT_WAIT=0` |
-| 0022 | decode MoE gate+up+GLU fusion when the GLU output overlaps only the unfilled weight copy (41 of 47 layers were blocked) | `GGML_MOE_FUSE_COPY_ALIAS=0` |
-| 0023 | moe cache: identity (fully resident) tables are served in place above the band in mmap mode too; fixes NaN at small ubatches since r258, with a warn-once `MOE_INPLACE_MISS` tripwire | `MOE_EXPERT_PREFILL_IN_PLACE=0` |
-| 0024 | moe cache: a table is pool-backed only when the pool was requested | `GGML_MOE_POOL_TABLE_REQ=0` |
-| 0025 | mmq: RDNA4 IQ routed-compact experts with 65-96 rows per expert use J=64 (+1-2 % prefill at `-ub 4096`, bit-identical) | `GGML_MMQ_IQ_J64_WIDE=0` |
-| 0026 | moe cache: the release's in-place prefill stands down when a sparse table exists (only reachable with a GTT arena and mixed tables; inert on discrete GPUs) | - |
-| 0027 | moe cache: KV segment -- under `GGML_MOE_KV_LEND=1`, the lent KV rows past the context in use are an expert-cache tier below the arena (heat-seeded, then demand-filled from the RAM tier; the arena evolves as without it); every device lends its own K/V slices under `-sm tensor` | opt-in `GGML_MOE_KV_SEG=1` (production sets it) |
-| 0028 | KV segment: one take-back per request (the server hints the prompt length) instead of stepwise takes during long prefills | `GGML_MOE_KV_SEG_TAKE1=0` |
-| 0029 | KV segment: small prefill ubatches (decode band < n < 512) read non-resident experts from their KV copies | `GGML_MOE_KV_SEG_PF=0` |
-| 0030 | KV segment: review fixes (source counters, the hint returns to 0 when idle) | - |
-| 0031 | KV segment: 0029 on by default with the segment | `GGML_MOE_KV_SEG_PF=0` |
-| 0032 | loader: open the MoE heat map in `--host-experts mmap` mode (the map was never loaded or saved there: the only opener ran after mmap mode had returned) | `LLAMA_MMAP_HEAT_OPEN=0` |
-| 0033 | expert cache: the persisted-heat seed of a sparse (mmap) table fills through the tier code (it used a pageable copy from the mapping; a warm start took more than 15 min) | - |
-| 0034 | expert cache: a sparse table's staged fill at sizing takes the heat map's hottest experts; the per-expert heat seed leaves sparse tables to it | `GGML_MOE_STAGE_HEAT_RANK=0` |
-| 0035 | r292's arena settle skips layers that hold an mmap-tier table (re-sizing such a layer frees the table, which turned our RAM tier off for the rest of the process) | `GGML_MOE_SETTLE_SPARSE=1` (release behaviour) |
-| 0036 | r299 merge fixes for the mmap tier: our prefill resolve runs only when the fused prefill serves nothing in place; our in-place-miss check only when the release's repair copied nothing; gate/up lanes with different tier remaps count as mixed (the fused kernels read one ids copy); our tier serves and take-overs clear the release's take-over promise | - |
-| 0037 | our namespace-scope env-flag initializers are named functions instead of lambdas (see the r299 validation) | - |
-| 0038 | the Q8_1 copy of a layer's input quantized for the attention / shared-expert matvecs is carried across the routed-MoE graph split, so the routed experts do not quantize the same input again; bit-identical | `GGML_CUDA_Q8_1_CARRY=0` |
-| 0039 | prompt GEMMs off hipBLASLt: on ROCm, rocBLAS hands GEMMs to hipBLASLt by default, and hipBLASLt returned one of two results for bit-identical inputs, chosen once per process (the same prompt gave two different outputs across server starts). The F32 split tile of our MMB GEMM gets its own token floor (33 on RDNA4, above the matvec band) so the MoE router's whole prompt band runs on it, and `ggml_cuda_init` sets `ROCBLAS_USE_HIPBLASLT=0` (rocBLAS's own Tensile path) unless the variable is already set. Changes output at rounding level | `GGML_CUDA_HIPBLASLT=1`, `GGML_CUDA_MMB_F32SPLIT_MIN_T=512` (old floor) |
-| 0040 | hipBLASLt by version: `ggml_cuda_init` reads hipBLASLt's version (already-loaded `libhipblaslt.so.1`, one temporary handle). 1.5.0 and later (ROCm 10.2) keep a stable solution order (ROCm/rocm-libraries PR #11340: an untuned shape fell back to a solution list ordered by heap address), so hipBLASLt stays on there; older or unreadable versions get 0041's `ROCBLAS_USE_HIPBLASLT=0`, and 0042's MMB BF16 path applies only then. One log line states the decision. Source builds of hipBLASLt between 2026-09-09 and the fix also report 1.5.0 | `GGML_CUDA_HIPBLASLT=0` / `=1` (force off / on) |
-| 0041 | Q8_0 hc mixer: the down dots serve every token of the verify band from one block per row (`w_down` read once per call, not once per token); per token the same arithmetic order; bit-identical | `GGML_CUDA_HC_DOWN_MT=0` |
-| 0042 | Q8_0 hc mixer: up + collapse computes each row's gate directly as the reference mmvq butterfly's two chunk partials, instead of emulating eight reference blocks per fused block; bit-identical | `GGML_CUDA_HC_UP_ROWS=0` |
-| 0043 | mmq: Q5_0 expert tables (the production model's routed down) on the RDNA4 routed-compact path with the IQ4_NL bands, so prefill reads experts in place instead of gathering the whole 512-expert table per layer; bit-identical | `GGML_MMQ_Q5_0_COMPACT=0` |
-| 0044 | expert cache (mmap tier): the "is this one of the call's routed experts" test in the victim / candidate searches reads a per-call bitmap instead of scanning the protect list per slot; decisions unchanged (host time of the decode policy -57 %, ~+1 %) | `GGML_MOE_PROTECT_BITMAP=0` |
-| 0045 | server: when the last prompt chunk is the checkpoint tail and has the verify width (draft n_max + 1), all its rows are outputs, so the first verify reuses the tail's graph instead of rebuilding (agent-style 2K extensions -3.4 %, extensions with a reply -1.8 %); every hash identical in our runs | `LLAMA_CKPT_TAIL_OUTPUTS=0` |
-| 0046 | server: opt-in `LLAMA_CKPT_NEAR_SKIP=K` (no checkpoint within K tokens of the newest) and `LLAMA_CKPT_TAIL_MIN=K` (no tail for a short uncached remainder); both off by default (they force longer rewinds on chat follow-ups) | (off by default) |
-| 0047 | mmvq: the dense gate/up + GLU fusion at the verify width (2-8 tokens, RDNA4; was 1 token only), the launch also publishing the down projection's Q8_1 input (one counter per 32-row group, quantized exactly as the GLU's own Q8_1 kernel); the shared expert's 3 launches per layer become 1, bit-identical | `GGML_CUDA_DENSE_GLU_VERIFY=0` |
-| 0048 | mmvq-moe (RDNA4): rows per block 8 (8-10 K-blocks) or 4 (11-15) where a 2-row block's (row, K-block) items leave the last pass partly idle; the per-device Q5_0 MoE down at K 320 48 -> 34 us at 4 tokens. Changes output at rounding level (KLD ~0) | `GGML_CUDA_MOE_RPB_K=0` |
-| 0049 | mmvq-moe: the release's r334 RDNA2 rows-abreast K loop carried into our MoE kernel (the rebase took our side of that file); RDNA2 only, compiled out elsewhere | `GGML_CUDA_MOE_ROWS_ABREAST=0` |
-
-0005, 0006 (down-fold part) and 0009 were workarounds for the bug the release's fusion overlap check fixes at the source;
-0010 removes 0005. The others only run after a decline or a failed fill.
+| 0005 | the tier remap predicate refuses a `fill_failed` table | - |
+| 0006 | layer split with pipeline parallelism overlaps the devices on ROCm: prompt ubatches rebuild their graph instead of reusing it, and host inputs go through a pinned per-(backend, copy) ring uploaded on the split's stream; opt-in `GGML_GALLOC_FP_SHAPES=0` and `LLAMA_KV_N_PAD_PREFILL_POW2=1` | `LLAMA_PP_PREFILL_NO_REUSE=0`, `GGML_SCHED_INPUT_STAGE=0` |
+| 0007 | the dual-output mmvq fusion skips weights that live in a compute buffer | `GGML_CUDA_FUSION_CHECK_LEAVES=0` |
+| 0008 | the checkpoint pool uses `common_state_data` (no-init allocator); the pool thread still touches every page | - |
+| 0009 | CUDA graph eviction counts active time only (idle gaps capped at 1 s), and keeps the rule that the looked-up graph is never evicted | - |
+| 0010 | qwen4exp: PLE page hints (`MADV_WILLNEED`) only when a `mincore` sample says the table is cold (~13 ms per 4096-token ubatch saved) | `LLAMA_PLE_ADVISE=1` (always advise) |
+| 0011 | multi-device: `alloc_splits` skips the drain when no buffer grows | `GGML_SCHED_DEFER_ALLOC_SYNC=0` |
+| 0012 | `-sm tensor`: graph inputs in pinned memory (the meta device's first child host buffer type) and uploaded asynchronously per device; host compute buffers kept across the drop | `LLAMA_META_HOST_BUFT=0`, `GGML_SCHED_ASYNC_USER_INPUT=0`, `GGML_GALLOC_DROP_HOST=1` |
+| 0013 | meta: the split-input copy of a split host weight is sized at the largest device slice, not the whole tensor | `GGML_META_SLICE_ALLOC=0` |
+| 0014 | moe cache: a device-remap call does not re-batch a sibling already taken over in the same round | `GGML_MOE_DEVREMAP_REBATCH=1` |
+| 0015 | qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy; the gate copy runs before attention on prefill-sized graphs | `LLAMA_QSA3_DIRECT_F16=0`, `LLAMA_GATE_EARLY=0` |
+| 0016 | qwen4exp qsa3: the packs read the Q8_0 cache views directly, no F16 copies in the graph | `LLAMA_QSA3_PACK_Q8=0` |
+| 0017 | `-sm tensor` ubatch overlap: asynchronous graph-input views, asynchronous CPU-split output upload, deferred input wait | `GGML_SCHED_ASYNC_INPUT_VIEWS=0`, `GGML_SCHED_ASYNC_CPU_OUT=0`, `LLAMA_DEFER_INPUT_WAIT=0` |
+| 0018 | decode MoE gate+up+GLU fusion when the GLU output overlaps only the unfilled weight copy (41 of 47 layers were blocked) | `GGML_MOE_FUSE_COPY_ALIAS=0` |
+| 0019 | moe cache: identity (fully resident) tables are served in place above the band in mmap mode too; fixes NaN at small ubatches since r258, with a warn-once `MOE_INPLACE_MISS` tripwire | `MOE_EXPERT_PREFILL_IN_PLACE=0` |
+| 0020 | moe cache: a table is pool-backed only when the pool was requested | `GGML_MOE_POOL_TABLE_REQ=0` |
+| 0021 | mmq: RDNA4 IQ routed-compact experts with 65-96 rows per expert use J=64 (+1-2 % prefill at `-ub 4096`, bit-identical) | `GGML_MMQ_IQ_J64_WIDE=0` |
+| 0022 | moe cache: the release's in-place prefill stands down when a sparse table exists (only reachable with a GTT arena and mixed tables; inert on discrete GPUs) | - |
+| 0023 | moe cache: KV segment -- under `GGML_MOE_KV_LEND=1`, the lent KV rows past the context in use are an expert-cache tier below the arena (heat-seeded, then demand-filled from the RAM tier; the arena evolves as without it); every device lends its own K/V slices under `-sm tensor` | opt-in `GGML_MOE_KV_SEG=1` (production sets it) |
+| 0024 | KV segment: one take-back per request (the server hints the prompt length) instead of stepwise takes during long prefills | `GGML_MOE_KV_SEG_TAKE1=0` |
+| 0025 | KV segment: small prefill ubatches (decode band < n < 512) read non-resident experts from their KV copies | `GGML_MOE_KV_SEG_PF=0` |
+| 0026 | KV segment: review fixes (source counters, the hint returns to 0 when idle) | - |
+| 0027 | KV segment: 0025 on by default with the segment | `GGML_MOE_KV_SEG_PF=0` |
+| 0028 | loader: open the MoE heat map in `--host-experts mmap` mode (the map was never loaded or saved there: the only opener ran after mmap mode had returned) | `LLAMA_MMAP_HEAT_OPEN=0` |
+| 0029 | expert cache: the persisted-heat seed of a sparse (mmap) table fills through the tier code (it used a pageable copy from the mapping; a warm start took more than 15 min) | - |
+| 0030 | expert cache: a sparse table's staged fill at sizing takes the heat map's hottest experts; the per-expert heat seed leaves sparse tables to it | `GGML_MOE_STAGE_HEAT_RANK=0` |
+| 0031 | r292's arena settle skips layers that hold an mmap-tier table (re-sizing such a layer frees the table, which turned our RAM tier off for the rest of the process) | `GGML_MOE_SETTLE_SPARSE=1` (release behaviour) |
+| 0032 | r299 merge fixes for the mmap tier: our prefill resolve runs only when the fused prefill serves nothing in place; our in-place-miss check only when the release's repair copied nothing; gate/up lanes with different tier remaps count as mixed (the fused kernels read one ids copy); our tier serves and take-overs clear the release's take-over promise | - |
+| 0033 | our namespace-scope env-flag initializers are named functions instead of lambdas (see the r299 validation) | - |
+| 0034 | the Q8_1 copy of a layer's input quantized for the attention / shared-expert matvecs is carried across the routed-MoE graph split, so the routed experts do not quantize the same input again; bit-identical | `GGML_CUDA_Q8_1_CARRY=0` |
+| 0035 | mmq: Q5_0 expert tables (the production model's routed down) on the RDNA4 routed-compact path with the IQ4_NL bands, so prefill reads experts in place instead of gathering the whole 512-expert table per layer; bit-identical | `GGML_MMQ_Q5_0_COMPACT=0` |
+| 0036 | server: when the last prompt chunk is the checkpoint tail and has the verify width (draft n_max + 1), all its rows are outputs, so the first verify reuses the tail's graph instead of rebuilding (agent-style 2K extensions -3.4 %, extensions with a reply -1.8 %); every hash identical in our runs | `LLAMA_CKPT_TAIL_OUTPUTS=0` |
+| 0037 | mmvq: the dense gate/up + GLU fusion at the verify width (2-8 tokens, RDNA4; was 1 token only), the launch also publishing the down projection's Q8_1 input (one counter per 32-row group, quantized exactly as the GLU's own Q8_1 kernel); the shared expert's 3 launches per layer become 1, bit-identical | `GGML_CUDA_DENSE_GLU_VERIFY=0` |
+| 0038 | mmvq-moe (RDNA4): rows per block 8 (8-10 K-blocks) or 4 (11-15) where a 2-row block's (row, K-block) items leave the last pass partly idle; the per-device Q5_0 MoE down at K 320 48 -> 34 us at 4 tokens. Changes output at rounding level (KLD ~0) | `GGML_CUDA_MOE_RPB_K=0` |
 
 Production also sets `LLAMA_TP_FFN_EVEN=1` (the release's opt-in even FFN split, our PR #342) and `MOE_HOST_POOL_TRANSPORT=map` (pins the host-read transport the r262 adaptive mode would otherwise pick). It no longer sets `GGML_HIP_FA_BAND_WMMA_SPLIT=32`: r322 fixed the band fixup period (issue #333), and r325 without it gives the same hashes.
+
+## Validation on r339 (2026-11-21/22, Radeon AI PRO R9700 x 2, ROCm 10.2)
+
+On the production configuration unless another model is named.
+
+- hipBLASLt per the release, measured on the production model: KLD 0.0113 at `-ub 256` (same top token 96.6 %, PPL ratio
+  1.0011 +- 0.0016), 0 at `-ub 4096`; hipBLASLt 1.5.0 gave the same output on 10 of 10 server starts.
+- The cleaned series against the uncleaned r339 rebase with the same hipBLASLt handling: ggml-cuda sources differ only in
+  host code; every hash identical (greedy, 512-token prompt set, 4.3k and 30k-token prompts, 259.6k needle 6,358).
+- Nightly validation: the 7-model comparison with the release passes (KLD 0 on 6 of 6, and every multi-turn model /
+  config pair now matches the release exactly), fault arms, depth, 2-GPU layer and tensor arms as expected, 0 problems.
+  test-backend-ops: the two known `MUL_MAT_PREC_SRC1_BF16` NaN cases (the release fails them identically) and one
+  `MUL_MAT` f16 case.
+- Stress (2 h: 1 GPU, 2-GPU tensor, 2-GPU pipelined layer split, production): greedy mismatches 0, faults 0.
+- Production since 2026-11-22 12:45 AM: greedy 147 t/s, 512-token prompt set 150 t/s.
 
 ## Validation on r338 (2026-11-21, Radeon AI PRO R9700 x 2, ROCm 10.2)
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 04:39:19 +0000
-Subject: [PATCH 03/49] moe cache: hook our mmap tier into Stew
+Subject: [PATCH 03/38] moe cache: hook our mmap tier into Stew
  moe-expert-cache.cu
 
 (cherry picked from commit 7266f388524bc7866805d6b754ddc889eb03d77c)
@@ -10,6 +10,8 @@ Subject: [PATCH 03/49] moe cache: hook our mmap tier into Stew
 (cherry picked from commit 44c44c7b6f86e2b913d1efaeb89b56150cc2aa9d)
 (cherry picked from commit 0be6614a2c6a54cd36592d6492f71d9718e76211)
 (cherry picked from commit 301c7c8d511af7b1131f8565138af524151650cd)
+(cherry picked from commit aab61f33d8af793cc636dbebfd1fe5a6173515ac)
+(cherry picked from commit 4b45cf727c0fd9aca4897b70c33126932cf76f24)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu       | 145 +++-
  ggml/src/ggml-cuda/moe-expert-tier-state.inc |  34 +

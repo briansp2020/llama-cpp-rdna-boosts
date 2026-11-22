@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 21 Nov 2026 20:41:03 +0000
+Subject: [PATCH 36/38] server: checkpoint tail with the verify shape
+ (LLAMA_CKPT_TAIL_OUTPUTS)
+
+When the last prompt chunk is the checkpoint tail and has the verify width (draft n_max + 1), all its rows are outputs, so the first verify reuses the tail graph instead of rebuilding (FINDINGS 1058).
+
+(cherry picked from commit 2854334c119d6fed0319b199f927f33e5d4885f8, without the opt-in LLAMA_CKPT_NEAR_SKIP / LLAMA_CKPT_TAIL_MIN; FINDINGS 1068)
+---
+ tools/server/server-context.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 99e98a9905..78956e6b0a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -5234,6 +5234,23 @@ private:
+                         // extract the logits only for the last token
+                         batch.set_output(batch.size() - 1, true);
+ 
++                        // LLAMA_CKPT_TAIL_OUTPUTS (local, on unless 0): when this last chunk is the checkpoint tail and has
++                        // the verify width (draft n_max + 1), mark all its rows as outputs.  The tail graph then has the
++                        // first verify's shape (same n_tokens and n_outputs), so the verify reuses it instead of rebuilding
++                        // (~26 ms under -sm tensor, FINDINGS 991 / 1054).  Only the last row's logits are read.
++                        static const bool ckpt_tail_outputs = [] {
++                            const char * e = getenv("LLAMA_CKPT_TAIL_OUTPUTS");
++                            return e == nullptr || atoi(e) != 0;
++                        }();
++                        if (ckpt_tail_outputs && slot.spec != nullptr && slot.task->decision.label_pos.empty() &&
++                                (int32_t) n_tokens_cur > 1 &&
++                                (int32_t) n_tokens_cur == common_speculative_n_max(slot.spec) + 1 &&
++                                (int32_t) n_tokens_cur < slot.task->n_tokens()) {
++                            for (int32_t k = 1; k < (int32_t) n_tokens_cur; k++) {
++                                batch.set_output(batch.size() - 1 - k, true);
++                            }
++                        }
++
+                         // and at the answer of each packed question
+                         for (const int32_t pos : slot.task->decision.label_pos) {
+                             batch.set_output(batch.size() - slot.task->n_tokens() + pos, true);
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 02:13:28 +0000
-Subject: [PATCH 01/49] our series outside moe-expert-cache.cu (patches
+Subject: [PATCH 01/38] our series outside moe-expert-cache.cu (patches
  0000-0054 of stack-r228, squashed for the merge)
 
 (cherry picked from commit 7be306cc9478b190c9daaf3677ff1665bd79c5e1)
@@ -10,6 +10,8 @@ Subject: [PATCH 01/49] our series outside moe-expert-cache.cu (patches
 (cherry picked from commit ee598de4b38c25811851d919bc06da898866e660)
 (cherry picked from commit df4ca8b3204f76857df5af6dbbecfdb9beca4326)
 (cherry picked from commit 469b0d992234cc9ddef42ec3be4616b8412341e0)
+(cherry picked from commit e2d044c21afdb5473f89d56a6c00d2ace1373d5f)
+(cherry picked from commit 9244dbfd6dc1eb51075eeef712cdf45d1bd83682)
 ---
  common/arg.cpp                                |  12 +-
  common/common.cpp                             | 146 +++-
@@ -17,7 +19,7 @@ Subject: [PATCH 01/49] our series outside moe-expert-cache.cu (patches
  ggml/include/ggml-backend.h                   |  17 +
  ggml/src/ggml-backend-impl.h                  |   9 +-
  ggml/src/ggml-backend-meta.cpp                | 146 ++--
- ggml/src/ggml-backend.cpp                     | 186 ++++-
+ ggml/src/ggml-backend.cpp                     | 186 +++++-
  ggml/src/ggml-cpu/ggml-cpu.c                  |  24 +-
  ggml/src/ggml-cuda/common.cuh                 |  20 +
  ggml/src/ggml-cuda/fattn-tile.cuh             |  80 ++-
@@ -31,7 +33,7 @@ Subject: [PATCH 01/49] our series outside moe-expert-cache.cu (patches
  ggml/src/ggml-cuda/graph.cuh                  |   3 +
  ggml/src/ggml-cuda/mmq.cu                     |   2 +
  ggml/src/ggml-cuda/mmq.cuh                    |  44 +-
- ggml/src/ggml-cuda/mmvq-moe.cu                | 638 ++++++++++++++----
+ ggml/src/ggml-cuda/mmvq-moe.cu                | 625 +++++++++++++++---
  ggml/src/ggml-cuda/mmvq.cu                    |  56 +-
  ggml/src/ggml-cuda/moe-expert-cache.h         |  50 +-
  ggml/src/ggml-cuda/topk-rows.cu               | 175 +++++
@@ -50,7 +52,7 @@ Subject: [PATCH 01/49] our series outside moe-expert-cache.cu (patches
  src/models/qwen4exp.cpp                       |  21 +-
  tools/llama-bench/llama-bench.cpp             |   6 +-
  tools/server/server-context.cpp               |  33 +-
- 39 files changed, 2258 insertions(+), 328 deletions(-)
+ 39 files changed, 2280 insertions(+), 293 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/topk-rows.cu
  create mode 100644 ggml/src/ggml-cuda/topk-rows.cuh
 
@@ -2121,7 +2123,7 @@ index 568b0877c3..8868bbff5f 100644
          const int max_descriptors = (args.ncols_dst + J - 1) / J + n_experts_ids;
          ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
-index b9781da1ba..8a533d329d 100644
+index b9781da1ba..964e0fbfa9 100644
 --- a/ggml/src/ggml-cuda/mmvq-moe.cu
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -8,6 +8,173 @@
@@ -2451,25 +2453,10 @@ index b9781da1ba..8a533d329d 100644
  
      // split (row, kblock) items across the 8 thread groups: the K-split loop
      // leaves most groups idle on short-K MoE GEMMs (down K=512 -> 2 K-blocks)
-@@ -137,60 +384,151 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -137,17 +384,161 @@ static __global__ void mul_mat_vec_q_moe(
      const int n_items    = rows_valid * blocks_per_row_x;
      const int n_groups = warp_size / (qi/vdr);
      const int kqs      = vdr * (threadIdx.x % (qi/vdr));
--#if defined(RDNA2)
--    // RDNA2: the item loop below costs a divide per (row, K-block) item and keeps one dot product in flight.
--    // Walk the K-blocks with the rows of the block side by side instead.  A thread group g takes the items
--    // it == g (mod n_groups), so in row i it takes the K-blocks kbx == g - i*blocks_per_row_x (mod n_groups), in
--    // rising order: each row's partial sum is built from the same K-blocks in the same order as the item loop
--    // builds it, so the result is bit-identical.  GGML_CUDA_MOE_ROWS_ABREAST=0: off.
--    const bool rows_abreast = fusion.moe_rows_abreast;
--#else
--    constexpr bool rows_abreast = false;
--#endif
--    static_assert((n_groups & (n_groups - 1)) == 0, "the thread group count must be a power of two");
--    if (rows_abreast && blocks_per_row_x % n_groups == 0) {
--        // every row keeps the same K-blocks: one y block serves all rows
--        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += n_groups) {
--            const int kby = kbx * (qk/QK8_1);
 +    // Two items in flight per thread for IQ2_XS / IQ2_XXS (ALU/latency bound here); gfx1201, Flash-Next MUL_MAT_ID shapes:
 +    // IQ2_XS -3 .. -7 %, IQ2_XXS -6 .. -8 % at K 1280 (+1 .. +5 % at K 2560, m 1280); the other types gain nothing.
 +    constexpr int n_unroll = (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS) ? 2 : 1;
@@ -2479,13 +2466,7 @@ index b9781da1ba..8a533d329d 100644
 +            moe_iq_raw<type> rg[c_pfu];
 +            // the owner's activation is loaded ahead with the weights; the other pair's with its use (registers: occupancy)
 +            moe_q8_raw       ry[c_pfu];
- #pragma unroll
--            for (int i = 0; i < c_rows_per_block; ++i) {
--                if (i < rows_valid) {
--                    tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
--                    if constexpr (has_fusion) {
--                        if (use_gate) {
--                            tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++#pragma unroll
 +            for (int u = 0; u < c_pfu; ++u) {
 +                const int it = it0 + u*n_groups;
 +                if (it < n_items) {
@@ -2518,25 +2499,18 @@ index b9781da1ba..8a533d329d 100644
 +                            if (use_gate) {
 +                                tmpgd[k][i] += moe_iq_dot<type>(rg[u], ryk, kqs);
 +                            }
-                         }
-                     }
-                 }
-             }
-         }
--    } else if (rows_abreast && type != GGML_TYPE_IQ2_XS) {
--        // the group's first K-block shifts from row to row; a row past the last valid one gets none
--        // (IQ2_XS stays on the item loop here: its two items in flight are faster, k=2560 n=1 15.6 vs 16.5 us)
--        const int g = threadIdx.x / (qi/vdr);
--        int kb0[c_rows_per_block];
++                        }
++                    }
++                }
++            }
++        }
 +    } else
 +    if constexpr (c_dd && c_pf && type == GGML_TYPE_IQ4_NL && !has_fusion) {
 +        constexpr int PU0 = c_rows_per_block > MOE_PF_U ? c_rows_per_block : MOE_PF_U;
 +        for (int it0 = threadIdx.x / (qi/vdr); it0 < n_items; it0 += PU0*n_groups) {
 +            constexpr int PU = c_rows_per_block > MOE_PF_U ? c_rows_per_block : MOE_PF_U;
 +            moe_iq4nl_raw r[PU][DDK];
- #pragma unroll
--        for (int i = 0; i < c_rows_per_block; ++i) {
--            kb0[i] = i < rows_valid ? ((g - i*blocks_per_row_x) & (n_groups - 1)) : blocks_per_row_x;
++#pragma unroll
 +            for (int u = 0; u < PU; ++u) {
 +                const int it = it0 + u*n_groups;
 +                if (it < n_items) {
@@ -2566,29 +2540,23 @@ index b9781da1ba..8a533d329d 100644
 +                    }
 +                }
 +            }
-         }
--        for (int k0 = 0; k0 < blocks_per_row_x; k0 += n_groups) {
++        }
 +    } else
 +    if constexpr (c_pfu > 0 && moe_pfiq_ok<type>::v && has_fusion) {
 +        for (int it0 = threadIdx.x / (qi/vdr); it0 < n_items; it0 += c_pfu*n_groups) {
 +            moe_iq_raw<type> ru[c_pfu];
 +            moe_iq_raw<type> rg[c_pfu];
 +            moe_q8_raw       ry[c_pfu];
- #pragma unroll
--            for (int i = 0; i < c_rows_per_block; ++i) {
--                const int kbx = kb0[i] + k0;
--                if (kbx < blocks_per_row_x) {
++#pragma unroll
 +            for (int u = 0; u < c_pfu; ++u) {
 +                const int it = it0 + u*n_groups;
 +                if (it < n_items) {
 +                    const int i   = it / blocks_per_row_x;
 +                    const int kbx = it % blocks_per_row_x;
-                     const int kby = kbx * (qk/QK8_1);
--                    tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
++                    const int kby = kbx * (qk/QK8_1);
 +                    moe_iq_load<type>(ru[u], vx_use, kbx_offset + i*stride_row_x_use + kbx, kqs);
-                     if constexpr (has_fusion) {
-                         if (use_gate) {
--                            tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
 +                            moe_iq_load<type>(rg[u], vgate_use, kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
 +                        }
 +                    }
@@ -2604,14 +2572,11 @@ index b9781da1ba..8a533d329d 100644
 +                    if constexpr (has_fusion) {
 +                        if (use_gate) {
 +                            tmp_gate[i] += moe_iq_dot<type>(rg[u], ry[u], kqs);
-                         }
-                     }
-                 }
-             }
-         }
--    } else {
--    // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
--#pragma unroll type == GGML_TYPE_IQ2_XS ? 2 : 1
++                        }
++                    }
++                }
++            }
++        }
 +    } else
 +    if constexpr (c_pf && type == GGML_TYPE_IQ4_NL && !has_fusion) {
 +        constexpr int PU0 = c_rows_per_block > MOE_PF_U ? c_rows_per_block : MOE_PF_U;
@@ -2635,16 +2600,38 @@ index b9781da1ba..8a533d329d 100644
 +                }
 +            }
 +        }
-+    } else
++    } else {
+ #if defined(RDNA2)
+     // RDNA2: the item loop below costs a divide per (row, K-block) item and keeps one dot product in flight.
+     // Walk the K-blocks with the rows of the block side by side instead.  A thread group g takes the items
+     // it == g (mod n_groups), so in row i it takes the K-blocks kbx == g - i*blocks_per_row_x (mod n_groups), in
+     // rising order: each row's partial sum is built from the same K-blocks in the same order as the item loop
+-    // builds it, so the result is bit-identical.  GGML_CUDA_MOE_ROWS_ABREAST=0: off.
++    // builds it, so the result is bit-identical.  GGML_CUDA_MOE_ROWS_ABREAST=0: off.  (release r334, block 10)
+     const bool rows_abreast = fusion.moe_rows_abreast;
+ #else
+     constexpr bool rows_abreast = false;
+ #endif
+-    static_assert((n_groups & (n_groups - 1)) == 0, "the thread group count must be a power of two");
++    static_assert(((warp_size / (qi/vdr)) & ((warp_size / (qi/vdr)) - 1)) == 0, "the thread group count must be a power of two");
+     if (rows_abreast && blocks_per_row_x % n_groups == 0) {
+         // every row keeps the same K-blocks: one y block serves all rows
+         for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += n_groups) {
+@@ -189,8 +580,7 @@ static __global__ void mul_mat_vec_q_moe(
+             }
+         }
+     } else {
+-    // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
+-#pragma unroll type == GGML_TYPE_IQ2_XS ? 2 : 1
 +#pragma unroll n_unroll
      for (int it = threadIdx.x / (qi/vdr); it < n_items; it += n_groups) {
          const int i   = it / blocks_per_row_x;
          const int kbx = it % blocks_per_row_x;
-@@ -202,10 +540,23 @@ static __global__ void mul_mat_vec_q_moe(
-             }
+@@ -203,9 +593,24 @@ static __global__ void mul_mat_vec_q_moe(
          }
      }
--    }
+     }
++    }
  
      ggml_cuda_pdl_lc();
  
@@ -2665,7 +2652,7 @@ index b9781da1ba..8a533d329d 100644
      // Warp-level reduction only - no shared memory needed
  #pragma unroll
      for (int i = 0; i < c_rows_per_block; ++i) {
-@@ -266,50 +617,7 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -266,50 +671,7 @@ static __global__ void mul_mat_vec_q_moe(
          dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
      }
  
@@ -2717,7 +2704,7 @@ index b9781da1ba..8a533d329d 100644
      // GLU output -> Q8_1 for the down projection (fusion.glu_q8, 1 token, routed lanes): the 32 rows of a Q8_1 block come from
      // 32/rpb blocks, so each block adds its rows to the (slot, group) counter and the block that completes the group quantizes
      // it with one warp exactly as quantize_q8_1 does (same 32-lane reductions and rounding), then resets the counter.
-@@ -317,8 +625,9 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -317,8 +679,9 @@ static __global__ void mul_mat_vec_q_moe(
          if (warp_size == 32 && use_gate && (shared_expert ? fusion.shared_glu_q8 != nullptr : fusion.glu_q8 != nullptr)) {
              const int g = row0 / QK8_1;
              // the shared lane counts after the routed lanes (its channel_dst is 0, like the first routed lane's)
@@ -2728,7 +2715,7 @@ index b9781da1ba..8a533d329d 100644
              __threadfence();
              int prev = 0;
              if (threadIdx.x == 0) {
-@@ -328,14 +637,15 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -328,14 +691,15 @@ static __global__ void mul_mat_vec_q_moe(
              if (prev + rows_valid == QK8_1) {
                  __threadfence();
                  if (threadIdx.x < QK8_1) {
@@ -2746,7 +2733,7 @@ index b9781da1ba..8a533d329d 100644
                      const uint32_t ystr = shared_expert ? fusion.shared_glu_q8_stride : fusion.glu_q8_stride_channel;
                      block_q8_1 * y = ybase + g;
                      y->qs[threadIdx.x] = q;
-@@ -358,6 +668,53 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -358,6 +722,53 @@ static __global__ void mul_mat_vec_q_moe(
          }
      }
  
@@ -2800,7 +2787,7 @@ index b9781da1ba..8a533d329d 100644
      if constexpr (!has_fusion) {
          GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
      } else if constexpr (type != GGML_TYPE_NVFP4) {
-@@ -388,11 +745,19 @@ void mul_mat_vec_q_moe_launch(
+@@ -388,11 +799,19 @@ void mul_mat_vec_q_moe_launch(
      int64_t cold_gate_n_res    = 0;
      size_t  cold_gate_channel_bytes = 0;
      size_t  cold_gate_row_bytes     = 0;
@@ -2820,7 +2807,7 @@ index b9781da1ba..8a533d329d 100644
          }
      }
      // The kernel indexes in type-block units; the cold geometry is reported in bytes.
-@@ -437,19 +802,34 @@ void mul_mat_vec_q_moe_launch(
+@@ -437,19 +856,34 @@ void mul_mat_vec_q_moe_launch(
      // (768 rows x 8 experts) 24.1 -> 19.2 us; Qwen3.6-35B-A3B gate/up (512 rows x 9) stays at 2 (4 measured 15.4 -> 17.3 us).
      // Bit-identical: with blocks_per_row_x % n_groups == 0 every row keeps its K-blocks in the same thread group and order, and
      // the per-row warp reduction does not depend on rows per block.  GGML_CUDA_MOE_RPB_WIDE=0: off.
@@ -2865,15 +2852,11 @@ index b9781da1ba..8a533d329d 100644
      }
      const int64_t nblocks_rows = (nrows_x + rpb - 1) / rpb;
      // Upstream's fused shared-expert lane is the last blockIdx.y column.
-@@ -464,21 +844,45 @@ void mul_mat_vec_q_moe_launch(
+@@ -464,21 +898,48 @@ void mul_mat_vec_q_moe_launch(
                              fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
                              fusion.red_dst != nullptr;
  
 -    // RDNA2: rows side by side in the kernel's K loop (see mul_mat_vec_q_moe).  GGML_CUDA_MOE_ROWS_ABREAST=0: off.
--    static const bool rows_abreast_on = [] { const char * e = getenv("GGML_CUDA_MOE_ROWS_ABREAST"); return e == nullptr || atoi(e) != 0; }();
--    ggml_cuda_mm_fusion_args_device fusion_k = fusion;
--    fusion_k.moe_rows_abreast = rows_abreast_on && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[dev].cc);
--
 +    static const bool pf4nl = getenv("GGML_CUDA_MOE_PF4NL") == nullptr || atoi(getenv("GGML_CUDA_MOE_PF4NL")) != 0;
 +    // Expert dedup at verify widths (2-4 tokens): only on the raw-load paths (IQ2_S / IQ3_XXS / IQ3_S gate/up, IQ4_NL down)
 +    // and not with the 1-token down + weighted reduction fold, whose epilogue assumes one pair per warp (the GLU -> Q8_1
@@ -2883,6 +2866,12 @@ index b9781da1ba..8a533d329d 100644
 +    static const bool dedup_on   = dedup_mode != 0;
 +    ggml_cuda_mm_fusion_args_device fusion_dd = fusion;
 +    fusion_dd.moe_dd_all = dedup_mode == 2;
++    // RDNA2: rows side by side in the kernel's K loop (see mul_mat_vec_q_moe).  GGML_CUDA_MOE_ROWS_ABREAST=0: off.  (release r334)
+     static const bool rows_abreast_on = [] { const char * e = getenv("GGML_CUDA_MOE_ROWS_ABREAST"); return e == nullptr || atoi(e) != 0; }();
+-    ggml_cuda_mm_fusion_args_device fusion_k = fusion;
+-    fusion_k.moe_rows_abreast = rows_abreast_on && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[dev].cc);
+-
++    fusion_dd.moe_rows_abreast = rows_abreast_on && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
 +    const bool dedup = dedup_on && ncols_dst >= 2 && ncols_dst <= 4 && (int64_t) nchannels_dst*ncols_dst <= 64 &&
 +                       warp_size == 32 && fusion.red_dst == nullptr;
      const auto launch = [&](auto rpb_c, auto fusion_c) {

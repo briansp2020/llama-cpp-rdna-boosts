@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 13 Nov 2026 14:46:49 +0000
+Subject: [PATCH 27/38] moe cache: KV segment -- GGML_MOE_KV_SEG_PF on by
+ default with the segment
+
+The A/B on the production config (FINDINGS 943) gave small-prompt prefill
++3..4 % and midpf prefill +0.8 %, decode unchanged, output identical
+(GGML_MOE_VERIFY 0 differ).  GGML_MOE_KV_SEG_PF=0 turns it off.
+
+(cherry picked from commit 27111eb7b06356d00ce17bb980de343595a12515)
+(cherry picked from commit ee8477f8b2272a30351bb5117c2e5a0caafc1e23)
+(cherry picked from commit 5eff711b23353148a7973f3c04beba3ee6b4f00d)
+(cherry picked from commit 584c46a00c254a34cd2f630cea2bea037e839852)
+(cherry picked from commit ce82ee03545c12475e47cff020b32e7c050aff57)
+(cherry picked from commit b51f2e19fb36d47709876522b7bb9d63dd6a8b1f)
+(cherry picked from commit 49963471e5c1761bae4bc1d85d33917c145f44fc)
+(cherry picked from commit c510489d9358a64902ebbfbc10ad3953caf9c0a8)
+---
+ ggml/src/ggml-cuda/moe-expert-tier.inc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
+index ac1f4f4b75..5c925517ba 100644
+--- a/ggml/src/ggml-cuda/moe-expert-tier.inc
++++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
+@@ -2355,14 +2355,14 @@ static __global__ void moe_cache_route_kernel(char * __restrict__ dst, const cha
+ // Where a device-side copy reads expert `e`: its arena slot, its RAM-tier slot (both contiguous, cold 0), or the
+ // registered alias of the sparse master with the host geometry (cold 1, registered here).  False: a RAM-tier table
+ // without a slot for `e`, or an alias that cannot be registered.
+-// GGML_MOE_KV_SEG_PF=1 (default off; needs the KV segment): a small prefill ubatch, which passes the `stream` its copy
++// GGML_MOE_KV_SEG_PF (default on with the KV segment, =0 off): a small prefill ubatch, which passes the `stream` its copy
+ // runs on, reads an expert's KV-segment copy (contiguous, cold 0, the same bytes) before the RAM tier or the file: a
+ // device-to-device copy.  Only on the stream that writes and reuses those slots, so the read is ordered against them,
+ // and not a slot a queued fill job still writes or a fill has pinned.  Nothing of the policy's state is touched.
+ // n_src (optional) counts the expert by source: arena, KV copy, RAM tier, file.  A usable KV copy counts as one with
+ // the switch off too (the source is then the RAM tier / file as before), so the report sizes what the switch would move.
+ static bool kvl_seg_pf_on() {
+-    static const bool v = kvl_seg_on() && getenv("GGML_MOE_KV_SEG_PF") != nullptr && atoi(getenv("GGML_MOE_KV_SEG_PF")) > 0;
++    static const bool v = kvl_seg_on() && (getenv("GGML_MOE_KV_SEG_PF") == nullptr || atoi(getenv("GGML_MOE_KV_SEG_PF")) > 0);
+     return v;
+ }
+ static int64_t g_pf_src_n[4] = {};   // small prefill ubatches: experts staged from the arena, a KV copy, the RAM tier, the file
+-- 
+2.53.0
+

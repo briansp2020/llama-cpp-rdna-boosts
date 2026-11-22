@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 14:24:54 +0000
-Subject: [PATCH 04/49] moe cache: device remap declines when a fill failed
+Subject: [PATCH 04/38] moe cache: device remap declines when a fill failed
  during its policy pass
 
 The remap took the input over although the consumer then refuses a table with fill_failed: the op read an input_cpy nobody filled.
@@ -12,10 +12,12 @@ The remap took the input over although the consumer then refuses a table with fi
 (cherry picked from commit 40d74be157fd48b612e56a72855ee5d12e10abe8)
 (cherry picked from commit 9bcad978d4e219790cdbe5b75957781053e59054)
 (cherry picked from commit 2a5294e493669cc14e08c022e78b66efd0a2f858)
+(cherry picked from commit a053d85833912145dcb35f349d6942b6ec87bffd)
+(cherry picked from commit 74d5aaee6918ca082cd2a616dda3791efea0ad55)
 ---
- ggml/src/ggml-cuda/moe-expert-cache.cu |  4 ++--
- ggml/src/ggml-cuda/moe-expert-tier.inc | 23 ++++++++++++++++++++++-
- 2 files changed, 24 insertions(+), 3 deletions(-)
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 4 ++--
+ ggml/src/ggml-cuda/moe-expert-tier.inc | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 index 94c55af355..d0199cfe9e 100644
@@ -33,38 +35,10 @@ index 94c55af355..d0199cfe9e 100644
      }
      // 2. The device map, re-uploaded only after a residency change.
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index 2455f3c3e8..577e25eda9 100644
+index 2455f3c3e8..881c641328 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
-@@ -3091,6 +3091,27 @@ uint64_t moe_cache_redirect_sig(const ggml_cgraph * cgraph, int device) {
- }
- namespace {
- } // namespace
-+// GGML_MOE_FUSED_DECLINE_UNFUSE=0: the fused read of the copies, as before.
-+bool moe_cache_fused_declined_sparse(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate, int device) {
-+    static const bool on = [] {
-+        const char * e = getenv("GGML_MOE_FUSED_DECLINE_UNFUSE");
-+        return e == nullptr || atoi(e) != 0;
-+    }();
-+    if (!on || !g_enabled || !g_any_sparse || op == nullptr || op->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
-+        return false;
-+    }
-+    std::lock_guard<std::mutex> lock(g_mutex);
-+    for (const ggml_tensor * w : { src0, gate }) {
-+        if (w == nullptr) {
-+            continue;
-+        }
-+        const auto sit = g_sem_to_id.find(std::make_tuple(name_layer(op), sem_role(w), device));
-+        if (sit != g_sem_to_id.end() && g_tables[sit->second].host_sparse) {
-+            return true;
-+        }
-+    }
-+    return false;
-+}
- // After a failed `moe_cache_redirect_fused`: true when the cache took over either lane anyway (one lane declined, or a
- // remap shape the fused kernel cannot take).  The scheduler skipped the copy of every taken-over input, so the original
- // tensors are stale for that lane: the caller must not fuse, and each op reads its own table through the per-op
-@@ -3662,7 +3683,7 @@ static bool tier_devremap_prep_locked(table_t & t, void * stream) {
+@@ -3662,7 +3662,7 @@ static bool tier_devremap_prep_locked(table_t & t, void * stream) {
              (void) access_locked(t, t.dr_lag_host[i], stream, t.dr_lag_host, n, &cold);
          }
          g_kvl_in_decode = false;
