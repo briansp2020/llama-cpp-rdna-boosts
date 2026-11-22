@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 19:06:53 +0000
-Subject: [PATCH 12/38] sched/llama: pinned graph inputs under -sm tensor,
+Subject: [PATCH 09/29] sched/llama: pinned graph inputs under -sm tensor,
  uploaded asynchronously per device; keep host compute buffers across the drop
 
 - llama-context: a tensor-split (meta) device has no single host buffer type when its GPUs report per-device
@@ -29,6 +29,8 @@ review (M1-M4 applied), code reviews no must-fix (FINDINGS 861).
 (cherry picked from commit 2efb33e3ba657c92fc298366454a653c9b35faf6)
 (cherry picked from commit 15bc02106a52e90cb1e772752cb3b4ee962778ad)
 (cherry picked from commit f5907e732bb13b001ba78c610bfc4f5b1b067f96)
+(cherry picked from commit fb7481e4d71e16fa194da7b4cd01027826a9714d)
+(cherry picked from commit 72376236339b6cee9ba9665780fb372180680805)
 ---
  ggml/include/ggml-backend.h    |  3 ++
  ggml/src/ggml-alloc.c          | 13 +++++++

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 03:54:06 +0000
-Subject: [PATCH 02/38] moe cache: stage 0: our mmap code in
+Subject: [PATCH 02/29] moe cache: stage 0: our mmap code in
  moe-expert-tier*.inc, not yet hooked in
 
 (cherry picked from commit 53eab4bce495c8fabb6fd1ac58f82a8023d4a43a)
@@ -12,17 +12,21 @@ Subject: [PATCH 02/38] moe cache: stage 0: our mmap code in
 (cherry picked from commit 410631dd47e6942389b8c1338f74149ceab95b17)
 (cherry picked from commit 98f19122b5a9b5aefdb175a1ce104c6c31a3622c)
 (cherry picked from commit 81191e0fa5312b69a5bfca6e74e8ebb4278172dc)
+(cherry picked from commit 04c7ac36ddeeffc8d832c12157c21eee1f6d84fc)
+(cherry picked from commit 33aae52e9aa310beb6bcb31b7d28e9531c5fd897)
+
+Folded in: moe tier: namespace-scope env flags initialized by named functions, not lambdas
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu       |   15 +-
  ggml/src/ggml-cuda/moe-expert-tier-state.inc |   72 +
- ggml/src/ggml-cuda/moe-expert-tier.inc       | 3210 ++++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-tier.inc       | 3217 ++++++++++++++++++
  src/llama-model-loader.cpp                   |    8 +-
- 4 files changed, 3298 insertions(+), 7 deletions(-)
+ 4 files changed, 3305 insertions(+), 7 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/moe-expert-tier-state.inc
  create mode 100644 ggml/src/ggml-cuda/moe-expert-tier.inc
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index fe5337a9e5..6ecfa1fccd 100644
+index 1713a03fba..a8f6eb38c7 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -103,7 +103,8 @@ struct bounce_t {
@@ -35,7 +39,7 @@ index fe5337a9e5..6ecfa1fccd 100644
      int         layer       = -1;
      std::string role;
      int         n_experts   = 0;
-@@ -12977,7 +12978,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -13110,7 +13111,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
  
  bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate,
                                const ggml_tensor * ids, int device, void * stream,
@@ -45,7 +49,7 @@ index fe5337a9e5..6ecfa1fccd 100644
      if (!g_enabled || ids == nullptr || src0 == nullptr) {
          return false;
      }
-@@ -13024,6 +13026,13 @@ bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0,
+@@ -13157,6 +13159,13 @@ bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0,
          *gate_cpy = *gate;
          gate_cpy->data   = gate_arena;
          gate_cpy->buffer = nullptr;
@@ -59,7 +63,7 @@ index fe5337a9e5..6ecfa1fccd 100644
      }
      return true;
  }
-@@ -13767,3 +13776,5 @@ void moe_cache_selftest() {
+@@ -13901,3 +13910,5 @@ void moe_cache_selftest() {
          (void) cudaSetDevice(prev);
      }
  }
@@ -145,10 +149,10 @@ index 0000000000..af315d4d79
 +};
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
 new file mode 100644
-index 0000000000..b4cc7cc8b3
+index 0000000000..a2b4e15fee
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
-@@ -0,0 +1,3210 @@
+@@ -0,0 +1,3217 @@
 +// moe-expert-tier.inc: included at the end of moe-expert-cache.cu.  Our --host-experts mmap code.
 +#include <thread>
 +
@@ -431,10 +435,11 @@ index 0000000000..b4cc7cc8b3
 +// GGML_MOE_FILL_FENCE (default on): a decode take-over's swaps and map upload are marked done by the remap kernel's lag
 +// flag instead of an event record each (every record is a marker packet the GPU spends ~4-6 us on, FINDINGS 745).
 +// =0: an event after every swap and map upload, as before.
-+static const bool g_fill_fence = [] {
++static bool g_fill_fence_init() {
 +    const char * e = getenv("GGML_MOE_FILL_FENCE");
 +    return e == nullptr || atoi(e) != 0;
-+}();
++}
++static const bool g_fill_fence = g_fill_fence_init();
 +static const void * g_defer_tab = nullptr;   // the table whose decode take-over defers its markers (else none)
 +static int64_t g_fence_commits = 0, g_fence_flushes = 0;
 +static int64_t g_pc_polev = 0;   // precopy plans that still waited on the compute stream (pol_ev)
@@ -442,16 +447,18 @@ index 0000000000..b4cc7cc8b3
 +static int32_t slot_seq_get_locked(const table_t & t, int slot);
 +static int64_t g_pc_waited = 0;   // admissions whose precopy had not completed yet (the GPU waited for it)
 +// GGML_MOE_TIER_PRECOPY=0: no copy-back ahead (each swap copies its victim back on the compute stream, as before).
-+static const bool g_precopy = [] {
++static bool g_precopy_init() {
 +    const char * e = getenv("GGML_MOE_TIER_PRECOPY");
 +    return e == nullptr || atoi(e) != 0;
-+}();
++}
++static const bool g_precopy = g_precopy_init();
 +// GGML_MOE_TIER_SPARES=K: spare RAM slots per tier table (K - 1 can hold precopies, one stays free for the in-stream
 +// fallback).  Default 8 with precopy, 1 without (the previous layout).
-+static const int g_tier_spares = [] {
++static int g_tier_spares_init() {
 +    const char * e = getenv("GGML_MOE_TIER_SPARES");
 +    return e != nullptr && atoi(e) > 0 ? atoi(e) : (g_precopy ? 8 : 1);
-+}();
++}
++static const int g_tier_spares = g_tier_spares_init();
 +// GGML_MOE_TIER_TOUCH=N: the `touch` admission threshold for RAM-tier tables (MOE_EXPERT_CACHE_TOUCH for the others).
 +// With several spares a tier table can admit every re-touched expert, and a short detour of the routing then evicts the
 +// hot set; admitting from the 3rd touch damps that churn.  Default 3 with precopy, else MOE_EXPERT_CACHE_TOUCH.
@@ -536,7 +543,8 @@ index 0000000000..b4cc7cc8b3
 +};
 +static fill_batch_t g_fb;
 +static int64_t g_fb_flushes = 0, g_fb_jobs = 0, g_fb_late = 0, g_fb_failed = 0;
-+static const bool g_fill_batch = [] { const char * e = getenv("GGML_MOE_FILL_BATCH"); return e == nullptr || atoi(e) != 0; }();
++static bool g_fill_batch_init() { const char * e = getenv("GGML_MOE_FILL_BATCH"); return e == nullptr || atoi(e) != 0; }
++static const bool g_fill_batch = g_fill_batch_init();
 +static bool fb_flush_locked();   // launches what is queued; false: a launch failed, the tier is dropped
 +static inline bool fb_on(const table_t & t) {
 +    return g_fill_batch && g_defer_tab == &t;
@@ -1957,10 +1965,11 @@ index 0000000000..b4cc7cc8b3
 +// route, filled from the mapping through the pinned bounce (no registration).  The bytes are the file's, as on every
 +// other path.  Returns the slot, or -1 (no slot, or a copy error: the admission is undone and the call declines).
 +// GGML_MOE_FORCE_ADMIT=0: off (the call declines, as before).
-+static bool g_force_admit = [] {
++static bool g_force_admit_init() {
 +    const char * e = getenv("GGML_MOE_FORCE_ADMIT");
 +    return e == nullptr || atoi(e) != 0;
-+}();
++}
++static bool g_force_admit = g_force_admit_init();
 +// A victim of force_admit_locked leaving VRAM on a tier table: with a copy-back ahead the fill waited for, it keeps that
 +// exact RAM copy (as tier_swap_locked does); otherwise (a partial tier, no tier_swap) its cold pointer, which may still
 +// name the RAM slot it was admitted from, goes back to the file alias.  On the compute stream, before the op.
@@ -2328,16 +2337,18 @@ index 0000000000..b4cc7cc8b3
 +    }
 +    return owner;
 +}
-+static const bool g_pf_prefetch = [] {
++static bool g_pf_prefetch_init() {
 +    const char * e = getenv("GGML_MOE_PF_PREFETCH");
 +    return e != nullptr && atoi(e) != 0;
-+}();
++}
++static const bool g_pf_prefetch = g_pf_prefetch_init();
 +// bumped by every decode-band policy call: residency (arena slots, RAM-tier slots) may have moved since a prefetch
 +static std::atomic<uint64_t> g_pf_policy_seq{0};
-+static bool g_prefill_inplace = [] {
++static bool g_prefill_inplace_init() {
 +    const char * e = getenv("GGML_MOE_PREFILL_INPLACE");
 +    return e != nullptr && atoi(e) != 0;
-+}();
++}
++static bool g_prefill_inplace = g_prefill_inplace_init();
 +// Remap freshness.  A published remap (remap_n_used > 0) is only valid for the split whose input hook published it:
 +// a later split can consume the same table without any hook call (e.g. qwen4exp's last layer in a prompt chunk, where
 +// the deferred MTP export gives the table two MUL_MAT_ID consumers and the scheduler copies the whole table), and the

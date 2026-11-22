@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 23:32:10 +0000
-Subject: [PATCH 06/38] sched: let layer-split pipeline parallelism overlap the
+Subject: [PATCH 04/29] sched: let layer-split pipeline parallelism overlap the
  devices on ROCm
 
 Layer split with pipeline parallelism (several devices, no -ot) ran the GPUs
@@ -40,6 +40,8 @@ layer split identical to the base-vs-base control at 8k and 32k. Full
 (cherry picked from commit 6d67dc91a3bcc33579d7e3cf49d773d2b04f6d23)
 (cherry picked from commit de3f27a17f123d2d5a211acf3d39af5650d3f996)
 (cherry picked from commit 8122cc9a7997fc5221e20351d8ef30e6da7cdda3)
+(cherry picked from commit d382653e15ba0aa443d67a54a344c270f3c88493)
+(cherry picked from commit 857c8c3347fa1a801f5d5381ec87cee2d73e1713)
 ---
  ggml/src/ggml-backend.cpp | 82 ++++++++++++++++++++++++++++++++++++++-
  src/llama-context.cpp     |  8 +++-

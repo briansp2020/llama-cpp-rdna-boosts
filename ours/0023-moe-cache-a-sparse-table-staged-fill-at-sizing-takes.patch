@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 17:15:00 +0000
-Subject: [PATCH 30/38] moe cache: a sparse table staged fill at sizing takes
+Subject: [PATCH 23/29] moe cache: a sparse table staged fill at sizing takes
  the heat map hottest experts (GGML_MOE_STAGE_HEAT_RANK=0: off)
 
 With a persisted heat map, the eager per-expert heat seed of a sparse (mmap) table registered each expert and
@@ -17,13 +17,15 @@ instead of 0..k-1, and the heat seed leaves sparse tables to it.  No map: 0..k-1
 (cherry picked from commit 64eb7cb7085edeef11c4e61ab2882129c2e9ba34)
 (cherry picked from commit fd159a436ef9fb429d6541c040dde857cd53676b)
 (cherry picked from commit 720a43167ad8ba4c0a996aad04323f112f203fd3)
+(cherry picked from commit 5efffd213febe9cfc40c527e6413169a2dac6ae7)
+(cherry picked from commit 9af5c001de443017b8b18d759fa0dd258eb408c5)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 13 +++++++
  ggml/src/ggml-cuda/moe-expert-tier.inc | 48 ++++++++++++++++++++------
  2 files changed, 51 insertions(+), 10 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 35ace29558..33a1836112 100644
+index ac1246e3dd..d67ae8e646 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -320,6 +320,16 @@ struct table_t : moe_tier_fields {
@@ -43,7 +45,7 @@ index 35ace29558..33a1836112 100644
  
  std::mutex                          g_mutex;
  std::vector<table_t>                g_tables;
-@@ -5529,6 +5539,9 @@ void apply_heat_seed_locked(table_t & t) {
+@@ -5556,6 +5566,9 @@ void apply_heat_seed_locked(table_t & t) {
          !heat_seed_above_floor(t)) {
          return;
      }
@@ -54,7 +56,7 @@ index 35ace29558..33a1836112 100644
          return;
      }
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index 5c925517ba..3bb0ccdee8 100644
+index 2f581c0ceb..172af09ce4 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
 @@ -218,9 +218,10 @@ static void sparse_pack_expert(const table_t & t, int32_t e, char * dst) {
@@ -80,7 +82,7 @@ index 5c925517ba..3bb0ccdee8 100644
          }
          if (cudaMemcpy((char *) t.arena + (size_t) e0 * t.expert_bytes, stage, (size_t) n * t.expert_bytes,
                         cudaMemcpyHostToDevice) != cudaSuccess) {
-@@ -3787,17 +3788,44 @@ static void tier_table_sized_locked(table_t & t) {
+@@ -3801,17 +3802,44 @@ static void tier_table_sized_locked(table_t & t) {
          sparse_populate((uintptr_t) t.host_dev, (uintptr_t) t.host_dev + (size_t) t.n_experts * t.host_bytes);
          if (!t.identity && t.expert_slot.empty()) {
              const int k = std::min(t.slots, t.n_experts);

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 10 Nov 2026 15:28:45 +0000
-Subject: [PATCH 14/38] moe cache: a device-remap call does not re-batch a
+Subject: [PATCH 11/29] moe cache: a device-remap call does not re-batch a
  sibling already taken over in this round (GGML_MOE_DEVREMAP_REBATCH)
 
 A layer whose down (or up) table was not served by the first remap call of
@@ -25,15 +25,17 @@ GGML_MOE_DEVREMAP_REBATCH=1 restores the old re-batch.
 (cherry picked from commit 0993a86cff52c493ca7faa00b18afdd99801aab7)
 (cherry picked from commit 8b580d144493539d40c35419ea45f2afb1f1c918)
 (cherry picked from commit f7645e065268c3c6f80b261981aed0a3ceac1df1)
+(cherry picked from commit 0a7010341c3da7932ba933a249f26ab64c523e09)
+(cherry picked from commit aeb654a75573fb8c3e1171489f6060be716900d1)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 13 +++++++++++++
  1 file changed, 13 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index d0199cfe9e..fa71b2c602 100644
+index c4fbaa3664..2afbe0ab63 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -12549,6 +12549,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+@@ -12691,6 +12691,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
      return true;
  }
  
@@ -46,7 +48,7 @@ index d0199cfe9e..fa71b2c602 100644
  bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids,
                           void * stream, int device, bool check_only) {
      bool pf_ret = false;
-@@ -12645,6 +12651,13 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -12787,6 +12793,13 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
                  !devremap_ok_locked(u, n_used, n_tok, device)) {
                  continue;
              }

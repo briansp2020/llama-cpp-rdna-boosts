@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 02:28:14 +0000
-Subject: [PATCH 23/38] moe cache: KV segment -- lent KV rows as an
+Subject: [PATCH 18/29] moe cache: KV segment -- lent KV rows as an
  expert-cache tier below the arena
 
 GGML_MOE_KV_LEND=1 + GGML_MOE_KV_SEG=1 (default off; unset GGML_MOE_KV_SEG = off).
@@ -35,6 +35,8 @@ Fable design + logic reviews (no open must-fix).  Production config,
 (cherry picked from commit 4750599adca0bd69d09fcc3d48ee61d8ea73403c)
 (cherry picked from commit 32bfd794383a58f03e04e3d94006745632f0d377)
 (cherry picked from commit 5afd1759d4468418c0a059c82d9daa52f75fc957)
+(cherry picked from commit 1a61dfe14bcd45be329d624cd169c4e69aa67cf9)
+(cherry picked from commit caacab6464de156e70696deeb0617ee9c1d867c8)
 ---
  ggml/include/ggml-backend.h            |   3 +
  ggml/src/ggml-backend-meta.cpp         |   8 +
@@ -76,10 +78,10 @@ index e5cd14987f..c91a1c29b8 100644
  static size_t ggml_backend_meta_inner_extent(const struct ggml_tensor * tensor, int skip_dim) {
      size_t extent = 0;
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index c3ac5880f0..4d9fcf6b8c 100644
+index 638d0b8a34..08814e1e83 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
-@@ -310,6 +310,12 @@ static int64_t tier_touch() {
+@@ -313,6 +313,12 @@ static int64_t tier_touch() {
      }();
      return v;
  }
@@ -92,7 +94,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
  static __global__ void moe_cache_set_ptr_kernel(uintptr_t * ptrs, int32_t e, uintptr_t v) {
      ptrs[e] = v;
  }
-@@ -431,8 +437,8 @@ static bool fb_push_fill_locked(int device, cudaStream_t s, char * dst, const ch
+@@ -435,8 +441,8 @@ static bool fb_push_fill_locked(int device, cudaStream_t s, char * dst, const ch
          return false;
      }
      for (int k = 0; k < g_fb.n_fill; k++) {
@@ -103,7 +105,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
          }
      }
      g_fb.fill.j[g_fb.n_fill++] = { dst, src, ptrs, n, v, e, 0 };
-@@ -473,6 +479,7 @@ struct kvl_tensor_t {
+@@ -477,6 +483,7 @@ struct kvl_tensor_t {
      size_t  bytes;
      size_t  row_bytes;
      bool    pf = false;   // a prefill-prefetch staging buffer (GGML_MOE_PF_LEND), lent while g_pf_lent
@@ -111,7 +113,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
  };
  struct kvl_slot_t {
      int     tensor;
-@@ -485,13 +492,20 @@ static std::vector<kvl_tensor_t> g_kvl_tensors;
+@@ -489,13 +496,20 @@ static std::vector<kvl_tensor_t> g_kvl_tensors;
  static std::vector<kvl_slot_t>   g_kvl_slots;           // a fixed grid over every tensor's lendable range
  static int64_t g_kvl_rows       = 0;                    // the KV's cells (every registered tensor has them)
  static int64_t g_kvl_line       = 0;                    // first lent row (g_kvl_rows: nothing lent)
@@ -136,7 +138,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
  static int     g_kvl_pin        = -1;                   // a slot the next fill reads: not reused meanwhile
  static int64_t g_kvl_fills = 0;
  static int64_t g_kvl_stays = 0;                         // misses served from a victim instead of evicting a resident                         // admissions filled from a victim slot (device to device)
-@@ -544,7 +558,7 @@ static bool kvl_avail(const kvl_slot_t & sl) {
+@@ -548,7 +562,7 @@ static bool kvl_avail(const kvl_slot_t & sl) {
      return (int64_t) sl.off >= g_kvl_line * (int64_t) kt.row_bytes;
  }
  static bool kvl_eligible(const table_t & t) {
@@ -145,7 +147,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
             t.ram_base != nullptr && t.host_dev != nullptr && !t.identity && t.slots > 0 &&
             (g_kvl_slot_bytes == 0 || t.expert_bytes <= g_kvl_slot_bytes);
  }
-@@ -560,7 +574,7 @@ static void kvl_build_locked() {
+@@ -564,7 +578,7 @@ static void kvl_build_locked() {
      }
      size_t eb = 0;
      for (const table_t & t : g_tables) {
@@ -154,7 +156,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
              eb = std::max(eb, t.expert_bytes);
          }
      }
-@@ -583,6 +597,33 @@ static void kvl_build_locked() {
+@@ -587,6 +601,33 @@ static void kvl_build_locked() {
                    g_kvl_slots.size(), g_kvl_slot_bytes / 1048576.0, g_kvl_tensors.size(),
                    g_kvl_slots.size() * (double) g_kvl_slot_bytes / 1048576.0);
  }
@@ -188,7 +190,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
  // Drop a slot's expert: its cold pointer back to the fallback, on `s` (ordered before the slot's reuse), or into
  // `sync_out` when the caller writes it after a device synchronize.
  static void kvl_release_locked(kvl_slot_t & sl, cudaStream_t s, std::vector<std::pair<uintptr_t *, uintptr_t>> * sync_out) {
-@@ -601,18 +642,24 @@ static void kvl_release_locked(kvl_slot_t & sl, cudaStream_t s, std::vector<std:
+@@ -605,18 +646,24 @@ static void kvl_release_locked(kvl_slot_t & sl, cudaStream_t s, std::vector<std:
              moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, sl.expert, v);
          }
      }
@@ -214,7 +216,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
          if (!kvl_avail(sl) || (int) i == g_kvl_pin || fb_kv_busy((int) i)) {
              continue;
          }
-@@ -631,25 +678,39 @@ static int kvl_alloc_locked(cudaStream_t s, std::vector<std::pair<uintptr_t *, u
+@@ -635,25 +682,39 @@ static int kvl_alloc_locked(cudaStream_t s, std::vector<std::pair<uintptr_t *, u
  }
  // The arena evicts `victim`, whose bytes are still at `src`: keep a copy in a victim slot (the copy is on `s`, before
  // the caller's fill overwrites `src`).  Returns the slot, or -1; the caller points cold_ptrs at it after the tier swap.
@@ -265,7 +267,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
          return -1;
      }
      kvl_build_locked();
-@@ -664,7 +725,7 @@ static int kvl_keep_locked(table_t & t, int32_t victim, const char * src, cudaSt
+@@ -668,7 +729,7 @@ static int kvl_keep_locked(table_t & t, int32_t victim, const char * src, cudaSt
          return i;   // still holds it (kept while the expert was resident)
      }
      std::vector<std::pair<uintptr_t *, uintptr_t>> rel;
@@ -274,7 +276,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
      if (i < 0) {
          return -1;
      }
-@@ -697,12 +758,311 @@ static void kvl_note_cold_locked(const table_t & t, int32_t expert) {
+@@ -701,12 +762,311 @@ static void kvl_note_cold_locked(const table_t & t, int32_t expert) {
          g_kvl_misses++;
      }
  }
@@ -586,7 +588,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
      sl.table  = -1;
      sl.expert = -1;
      sl.ref    = false;
-@@ -710,6 +1070,7 @@ static void kvl_forget_locked(table_t & t, int32_t e) {
+@@ -714,6 +1074,7 @@ static void kvl_forget_locked(table_t & t, int32_t e) {
  }
  // Forget every victim (the caller rewrote or is about to rewrite the cold pointers it touched).
  static void kvl_forget_all_locked() {
@@ -594,7 +596,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
      for (kvl_slot_t & sl : g_kvl_slots) {
          sl.table  = -1;
          sl.expert = -1;
-@@ -1238,7 +1599,7 @@ static bool tier_fill_through_locked(table_t & t, const std::vector<int32_t> & u
+@@ -1242,7 +1603,7 @@ static bool tier_fill_through_locked(table_t & t, const std::vector<int32_t> & u
          // a victim copy of either is still exact: point back at it (VRAM) on the victims' stream, else forget it
          for (const int32_t x : { v, e }) {
              if (x >= 0 && x < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) x] >= 0) {   // v is -1 when a spare took e
@@ -603,7 +605,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
                      moe_cache_set_ptr_kernel<<<1, 1, 0, s>>>(t.cold_ptrs, x, (uintptr_t) kvl_ptr(g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) x]]));
                  } else {
                      kvl_forget_locked(t, x);
-@@ -2631,7 +2992,8 @@ struct pf_dev_t {
+@@ -2638,7 +2999,8 @@ struct pf_dev_t {
  pf_dev_t g_pf[16];
  static size_t pf_align(size_t x) { return (x + 255) & ~(size_t) 255; }
  static bool pf_lend_on() {
@@ -613,7 +615,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
      return v;
  }
  // Add the two staging buffers to the KV-lending grid (not lent until the first decode steps after this prefill).
-@@ -2654,7 +3016,8 @@ static void pf_lend_add_locked(pf_dev_t & P, int device) {
+@@ -2661,7 +3023,8 @@ static void pf_lend_add_locked(pf_dev_t & P, int device) {
      }
      for (int b = 0; b < 2; b++) {
          kvl_tensor_t kt = { P.buf[b], P.buf_bytes, 0 };
@@ -623,7 +625,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
          g_kvl_tensors.push_back(kt);
          if (!g_kvl_slots.empty()) {   // the grid exists already: this buffer's slots go after it
              for (size_t off = 0; off + g_kvl_slot_bytes <= kt.bytes; off += g_kvl_slot_bytes) {
-@@ -2692,7 +3055,7 @@ static void pf_take_back_locked() {
+@@ -2699,7 +3062,7 @@ static void pf_take_back_locked() {
  // The decode policy, on the stream that makes victims: lend the staging after a few steps without a prefetch.  The
  // staging's last writer (the copy stream) and readers (the prefetched ops) are ordered before the victims' copies.
  static void pf_lend_maybe_locked(cudaStream_t s) {
@@ -632,7 +634,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
          return;
      }
      pf_dev_t & P = g_pf[g_kvl_device];
-@@ -3135,17 +3498,82 @@ bool moe_cache_kv_register(void * data, size_t bytes, size_t row_bytes, int64_t
+@@ -3149,17 +3512,82 @@ bool moe_cache_kv_register(void * data, size_t bytes, size_t row_bytes, int64_t
          return false;
      }
      std::lock_guard<std::mutex> lock(g_mutex);
@@ -718,7 +720,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
  // Move the lend line: the next batch reads or writes rows [0, rows).  Taking rows back synchronises the device, points
  // the victims there back at their fallback and zeroes the rows (attention reads masked cells up to n_kv, and expert
  // bytes there could turn into NaN); giving rows back is bookkeeping.  A margin above the need, and a hysteresis of 4
-@@ -3160,36 +3588,63 @@ void moe_cache_kv_need(int64_t rows) {
+@@ -3174,36 +3602,63 @@ void moe_cache_kv_need(int64_t rows) {
      }
      const int64_t step = kvl_step();
      rows = std::max<int64_t>(0, std::min(rows, g_kvl_rows));
@@ -789,7 +791,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
          const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
          g_kvl_ms += ms;
          if (kvl_log()) {
-@@ -3199,6 +3654,7 @@ void moe_cache_kv_need(int64_t rows) {
+@@ -3213,6 +3668,7 @@ void moe_cache_kv_need(int64_t rows) {
      } else if (want + 4 * step <= old) {
          g_kvl_line = want;
          g_kvl_gives++;
@@ -797,7 +799,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
          if (kvl_log()) {
              GGML_LOG_WARN("moe_cache KV lending: KV needs %lld rows, line %lld -> %lld (lent)\n", (long long) rows,
                            (long long) old, (long long) want);
-@@ -3224,9 +3680,12 @@ void moe_cache_kv_unregister() {
+@@ -3238,9 +3694,12 @@ void moe_cache_kv_unregister() {
      }
      g_kvl_rows = g_kvl_line = 0;
      g_kvl_device     = -1;
@@ -811,7 +813,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
  }
  namespace {
  
-@@ -3342,6 +3801,23 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+@@ -3356,6 +3815,23 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
          g_acc_hits++;
          return { (char *) t.arena + (size_t) hit_it->second * t.expert_bytes, true };
      }
@@ -835,7 +837,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
  
      t.misses++;
      // Every miss is a touch of an expert we do NOT hold, i.e. demand we are not serving.  The
-@@ -3372,7 +3848,7 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+@@ -3386,7 +3862,7 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
      }
      // KV lending: with no free slot, an expert whose victim copy cold_ptrs already names is read from VRAM as it is
      // (no eviction, no fill); the victims' stream only, so its cold pointer is ordered with this call's kernel.
@@ -844,7 +846,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
          expert >= 0 && expert < (int32_t) kvl_kvv(t).size() && kvl_kvv(t)[(size_t) expert] >= 0) {
          g_kvl_slots[(size_t) kvl_kvv(t)[(size_t) expert]].ref = true;
          g_kvl_hits++;
-@@ -3430,6 +3906,8 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+@@ -3444,6 +3920,8 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
              g_cold_bytes += (int64_t) t.expert_bytes;
              *out_cold = true;
              kvl_note_cold_locked(t, expert);
@@ -853,7 +855,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
              return { nullptr, false };
          }
          if (slot >= 0) {
-@@ -3475,6 +3953,8 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+@@ -3489,6 +3967,8 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
              g_acc_colds++;
              g_cold_bytes += (int64_t) t.expert_bytes;
              kvl_note_cold_locked(t, expert);
@@ -862,7 +864,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
          }
          return { nullptr, false };
      }
-@@ -3521,7 +4001,7 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
+@@ -3535,7 +4015,7 @@ static moe_cache_alias tier_access_locked(table_t & t, int32_t expert, void * st
              local_src = true;
              // the incoming expert's victim copy (if any) is the fill source: pinned so keeping the outgoing one cannot
              // take its slot first
@@ -871,7 +873,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
              g_kvl_pin = kv_src;
              const int kv_keep = kvl_keep_locked(t, victim, dst, (cudaStream_t) stream);
              g_kvl_pin = -1;
-@@ -3658,10 +4138,14 @@ static bool tier_devremap_prep_locked(table_t & t, void * stream) {
+@@ -3672,10 +4152,14 @@ static bool tier_devremap_prep_locked(table_t & t, void * stream) {
          route_log_locked(t, 'C', t.dr_lag_host, n);
          pf_lend_maybe_locked(s);
          g_kvl_in_decode = true;   // victims only from the decode policy, on the stream that reads cold_ptrs
@@ -886,7 +888,7 @@ index c3ac5880f0..4d9fcf6b8c 100644
          g_kvl_in_decode = false;
          if (g_tier_off || t.ram_base == nullptr || t.arena == nullptr || t.slots <= 0 || t.fill_failed) {
              return false;   // an admission failed and dropped the tier: the host path takes over from here
-@@ -3833,10 +4317,19 @@ static void tier_report_locked() {
+@@ -3847,10 +4331,19 @@ static void tier_report_locked() {
                  held += sl.table >= 0;
              }
              GGML_LOG_WARN("%s: KV lending: %zu victim slots (%lld held), line %lld of %lld rows; %lld kept, %lld cold reads served "

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 10 Nov 2026 05:46:38 +0000
-Subject: [PATCH 13/38] meta: size the split-input copy of a split weight at
+Subject: [PATCH 10/29] meta: size the split-input copy of a split weight at
  the largest device slice
 
 Under -sm tensor the scheduler copy of a host-resident split weight
@@ -22,6 +22,8 @@ whole-tensor size.
 (cherry picked from commit e82a0bad167f56830b09c600f69e1db16c48a392)
 (cherry picked from commit d167affce4ad61509a4106fcefc7f08f5af28203)
 (cherry picked from commit a4c41685aa0239f51cdfb117864ede92459ddb1f)
+(cherry picked from commit 512fa7dd5132169e76b11173395be4d8742bb308)
+(cherry picked from commit 06a77f59709cb10d124610b3f1a14f98ad253484)
 ---
  ggml/src/ggml-backend-meta.cpp | 61 ++++++++++++++++++++++++++++++++++
  1 file changed, 61 insertions(+)

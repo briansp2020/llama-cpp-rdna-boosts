@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 13:42:02 +0000
-Subject: [PATCH 17/38] sched: overlap ubatches under -sm tensor -- async
+Subject: [PATCH 14/29] sched: overlap ubatches under -sm tensor -- async
  graph-input views, async CPU-split output, deferred input wait
 
 The host waited on every split for a view of a graph input (96 waits, ~1 s per 4096-token prefill ubatch:
@@ -32,6 +32,8 @@ Same bytes, ordering only (FINDINGS 882).
 (cherry picked from commit d6c2ad23ec8af887563cb4b1079a61d33e0f4f70)
 (cherry picked from commit 026fe5bf3410beaca6e86627b00c020f791432cb)
 (cherry picked from commit 65e12940905564f9914a18e9c9059c4afe02829f)
+(cherry picked from commit 1109a951554626019697ccae95ef637168f4ad21)
+(cherry picked from commit 281b6a8dd064557c33f0aa20af46044391d83c01)
 ---
  ggml/include/ggml-backend.h                   |   3 +
  ggml/src/ggml-backend-meta.cpp                |  17 +++

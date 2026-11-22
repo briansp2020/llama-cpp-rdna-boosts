@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:09:29 +0000
-Subject: [PATCH 24/38] moe cache: KV segment -- one take per request
+Subject: [PATCH 19/29] moe cache: KV segment -- one take per request
  (GGML_MOE_KV_SEG_TAKE1)
 
 With the KV segment the lend line follows the cells in use, so a long
@@ -37,19 +37,23 @@ synchronise, to show where a take spends it.
 (cherry picked from commit 72d1c13596b982306edb7964dee46592143b7494)
 (cherry picked from commit f4e86a149693c27807673a3fca41cb2d89c953ec)
 (cherry picked from commit cec8d72a47506e33ae4a4970d41e4017e069958c)
+(cherry picked from commit e2fe67d9a743354856dd49763c809cdc58c7490a)
+(cherry picked from commit ca9c27f2645cb9933e3be5630dbd716e5eef2e9d)
+
+Folded in: moe cache: KV segment phase 2 -- review fixes (source counters, idle hint)
 ---
  ggml/src/ggml-cuda/moe-expert-tier.inc | 13 +++++++++++--
  src/llama-ext.h                        |  8 ++++++++
  src/llama-kv-cache.cpp                 | 24 +++++++++++++++++++++++-
  src/llama-kv-cache.h                   |  1 +
- tools/server/server-context.cpp        | 15 +++++++++++++++
- 5 files changed, 58 insertions(+), 3 deletions(-)
+ tools/server/server-context.cpp        | 19 +++++++++++++++++++
+ 5 files changed, 62 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-tier.inc b/ggml/src/ggml-cuda/moe-expert-tier.inc
-index 4d9fcf6b8c..c6b13c8c49 100644
+index 08814e1e83..6f1100c9d3 100644
 --- a/ggml/src/ggml-cuda/moe-expert-tier.inc
 +++ b/ggml/src/ggml-cuda/moe-expert-tier.inc
-@@ -3607,6 +3607,7 @@ void moe_cache_kv_need(int64_t rows) {
+@@ -3621,6 +3621,7 @@ void moe_cache_kv_need(int64_t rows) {
                  (void) cudaDeviceSynchronize();
              }
          }
@@ -57,7 +61,7 @@ index 4d9fcf6b8c..c6b13c8c49 100644
          g_kvl_line = want;
          std::vector<std::pair<uintptr_t *, uintptr_t>> w;
          int64_t n_drop = 0;
-@@ -3626,6 +3627,7 @@ void moe_cache_kv_need(int64_t rows) {
+@@ -3640,6 +3641,7 @@ void moe_cache_kv_need(int64_t rows) {
              }
          }
          kvl_write_ptrs_locked(w);
@@ -65,7 +69,7 @@ index 4d9fcf6b8c..c6b13c8c49 100644
          for (const kvl_tensor_t & kt : g_kvl_tensors) {
              const size_t a = (size_t) old * kt.row_bytes, b = std::min(kt.bytes, (size_t) want * kt.row_bytes);
              if (b > a) {
-@@ -3633,12 +3635,14 @@ void moe_cache_kv_need(int64_t rows) {
+@@ -3647,12 +3649,14 @@ void moe_cache_kv_need(int64_t rows) {
                  (void) cudaMemset(kt.data + a, 0, b - a);
              }
          }
@@ -80,7 +84,7 @@ index 4d9fcf6b8c..c6b13c8c49 100644
          (void) cudaGetLastError();
          for (const kvl_slot_t & sl : g_kvl_slots) {
              GGML_ASSERT(sl.table < 0 || kvl_avail(sl));   // no victim may stay in a row the KV now owns
-@@ -3648,8 +3652,13 @@ void moe_cache_kv_need(int64_t rows) {
+@@ -3662,8 +3666,13 @@ void moe_cache_kv_need(int64_t rows) {
          const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
          g_kvl_ms += ms;
          if (kvl_log()) {
@@ -183,7 +187,7 @@ index 281b580ce1..44dc19d4a6 100644
      //
      // input API
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a8fb22d09d..a0f08ec0a6 100644
+index a8fb22d09d..99e98a9905 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -24,6 +24,7 @@
@@ -194,12 +198,23 @@ index a8fb22d09d..a0f08ec0a6 100644
  
  #include <algorithm>
  #include <cstddef>
-@@ -4158,6 +4159,20 @@ private:
+@@ -4099,6 +4100,8 @@ private:
+ 
+                 metrics_flush_idle();
+ 
++                llama_kv_lend_hint(0); // no prompt in progress: the KV lend line follows the cells in use again
++
+                 return; // skip further processing
+ 
+             } else {
+@@ -4158,6 +4161,22 @@ private:
              llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
          }
  
-+        // KV lending: the cells the prompts in progress still need (this batch + what is left of them), every iteration,
-+        // so the rows are taken back from the MoE expert cache once per request and a cancelled prompt corrects itself
++        // KV lending: the cells the prompts in progress still need (this batch + what is left of every slot still in
++        // PROCESSING_PROMPT), sent every iteration, so a long prompt takes its rows back from the MoE expert cache in one
++        // take and a cancelled one stops holding them (0 here or on the all-idle return above).  A prompt that fits one
++        // batch is DONE_PROMPT already and sends 0: its ubatches report their own need, as without the hint.
 +        {
 +            int32_t n_prompt = 0;
 +            bool    any      = false;

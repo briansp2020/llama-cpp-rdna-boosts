@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 21:53:43 +0000
-Subject: [PATCH 37/38] mmvq: dense gate/up + GLU fusion at the verify width
+Subject: [PATCH 28/29] mmvq: dense gate/up + GLU fusion at the verify width
  (2-8 tokens, RDNA4), publishing the down projection Q8_1 from the ksplit
  launch (GGML_CUDA_DENSE_GLU_VERIFY=0: off)
 
@@ -9,6 +9,8 @@ Subject: [PATCH 37/38] mmvq: dense gate/up + GLU fusion at the verify width
 (cherry picked from commit c7febda8c385a5413234035dee9c678b1f6462a2)
 (cherry picked from commit cee9f690eea6e2da10400a0722a16d11080c0025)
 (cherry picked from commit 0949f7ab655eb092b15eb8390942c329b67143cf)
+(cherry picked from commit 95c38bf3a37ba4004ab4b1073a5c9b3c758bb802)
+(cherry picked from commit 01aadd7cb03807b297d8f22f1de556417e97047f)
 ---
  ggml/src/ggml-cuda/common.cuh            |  3 ++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 36 +++++++++++++++++-

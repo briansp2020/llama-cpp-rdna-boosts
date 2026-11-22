@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 18 Nov 2026 07:33:10 +0000
-Subject: [PATCH 34/38] cuda: carry the Q8_1 cache entry of the layer input
+Subject: [PATCH 25/29] cuda: carry the Q8_1 cache entry of the layer input
  into the routed-MoE split
 
 Decode/verify layers run as three graph computes per device; the scheduler
@@ -25,6 +25,8 @@ counts carry-only recaptures. Bit-identical (FINDINGS 1011).
 (cherry picked from commit 2e03bac3d8dd31185404219e4fca4620fe731002)
 (cherry picked from commit 6df38d08c9537059d5b5959c02167ee18513be9e)
 (cherry picked from commit 0c4c043b65a109501bb803892b1879e9cdc7d9a1)
+(cherry picked from commit eae5fc08fefa2033fabbe50a4afdd10ba041e935)
+(cherry picked from commit e7926f6f7612f63348bac293e554433f6df7dc65)
 ---
  ggml/src/ggml-cuda/common.cuh   |  18 ++++-
  ggml/src/ggml-cuda/ggml-cuda.cu | 126 +++++++++++++++++++++++++++++++-

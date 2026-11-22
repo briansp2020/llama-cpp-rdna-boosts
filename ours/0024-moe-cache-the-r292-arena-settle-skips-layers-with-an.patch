@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 16 Nov 2026 01:42:16 +0000
-Subject: [PATCH 31/38] moe cache: the r292 arena settle skips layers with an
+Subject: [PATCH 24/29] moe cache: the r292 arena settle skips layers with an
  mmap-tier table (GGML_MOE_SETTLE_SPARSE=1 = Stew behaviour)
 
 Re-sizing such a layer frees its tables, and free_table_buffers_locked then calls
@@ -15,12 +15,14 @@ tier_drop_all_locked("re-size"), which latches the RAM tier off for the process
 (cherry picked from commit d78a1d1e511f8dbada84660626c4b22de097d9d3)
 (cherry picked from commit 82f7638c3f2be461f88a33cd2ee60c3338836cef)
 (cherry picked from commit 5675d84a747c306cc891b2dabaeb3bd6a49111ab)
+(cherry picked from commit a3b9343eb0fcb1a393afb391cdced8dcfa476f9f)
+(cherry picked from commit e305c43da30234f04eb0b17b4894e2326cef6d7b)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 7 +++++++
  1 file changed, 7 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 33a1836112..8f8b6537e3 100644
+index d67ae8e646..d4dbfca62d 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -740,6 +740,9 @@ int64_t                             g_arena_releases = 0;
@@ -41,7 +43,7 @@ index 33a1836112..8f8b6537e3 100644
      {
          // the prior-mass gain (percentage points) that makes taking the prefill band worth its eviction
          const char * e = getenv("MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP");
-@@ -8562,6 +8566,9 @@ static int settle_slots_locked(int layer, const std::vector<int> & ids, int base
+@@ -8626,6 +8630,9 @@ static int settle_slots_locked(int layer, const std::vector<int> & ids, int base
          if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES || !ggml_cuda_slab_enabled()) {
              return base;
          }

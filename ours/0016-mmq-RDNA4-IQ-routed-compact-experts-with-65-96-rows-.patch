@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 06:25:22 +0000
-Subject: [PATCH 21/38] mmq: RDNA4 IQ routed-compact experts with 65-96 rows
+Subject: [PATCH 16/29] mmq: RDNA4 IQ routed-compact experts with 65-96 rows
  per expert use J=64
 
 At -ub 4096 with 10 of 512 experts (80 rows per expert) the IQ / Q2_0
@@ -21,6 +21,8 @@ for RDNA4. Kill switch GGML_MMQ_IQ_J64_WIDE=0 (FINDINGS 914-915).
 (cherry picked from commit 8f4b123f5d0c25645d4a3608a38a654567c15123)
 (cherry picked from commit 8ad5a14ac90b15601daf19f56e433ae024d507e6)
 (cherry picked from commit f7884889dcb6efb116888a56a66bd329d2dba927)
+(cherry picked from commit 9a75ab64a53d3996dfdf5a7262f1de6cfb90f0ff)
+(cherry picked from commit e3875ba1edf828936d4734c2986b1233dbe5273d)
 ---
  ggml/src/ggml-cuda/mmq.cu | 14 ++++++++++++++
  1 file changed, 14 insertions(+)

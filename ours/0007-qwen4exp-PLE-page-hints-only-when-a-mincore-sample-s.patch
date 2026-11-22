@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 17:04:25 +0000
-Subject: [PATCH 10/38] qwen4exp: PLE page hints only when a mincore sample
+Subject: [PATCH 07/29] qwen4exp: PLE page hints only when a mincore sample
  says the table is cold (LLAMA_PLE_ADVISE)
 
 One MADV_WILLNEED per page costs ~13 ms per 4096-token ubatch (~60k pages on the main thread while the GPUs
@@ -19,6 +19,8 @@ LLAMA_PLE_ADVISE=1: always advise (old), 0: never.
 (cherry picked from commit 9c88ac540800e0f56a42f12c82a227d5a9f485dd)
 (cherry picked from commit f0643803da723a28776e1e41957b478833aa5745)
 (cherry picked from commit 540dd52c7865dad1ddacf022709be848d8defb02)
+(cherry picked from commit e7d662e7549eef8037e4aa1959a9f295fc35d599)
+(cherry picked from commit 6a1e5fd40f8edd3806360dbb496f0ba4df3f2ef0)
 ---
  src/models/qwen4exp.cpp | 48 +++++++++++++++++++++++++++++++++--------
  1 file changed, 39 insertions(+), 9 deletions(-)

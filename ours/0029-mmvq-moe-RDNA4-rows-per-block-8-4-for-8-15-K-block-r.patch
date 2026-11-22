@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 23:59:22 +0000
-Subject: [PATCH 38/38] mmvq-moe: RDNA4 rows per block 8 / 4 for 8-15 K-block
+Subject: [PATCH 29/29] mmvq-moe: RDNA4 rows per block 8 / 4 for 8-15 K-block
  rows whose last (row, K-block) pass runs partly idle (GGML_CUDA_MOE_RPB_K=0:
  off)
 
@@ -9,6 +9,8 @@ Subject: [PATCH 38/38] mmvq-moe: RDNA4 rows per block 8 / 4 for 8-15 K-block
 (cherry picked from commit 820c7da754ef07e449f30d1fe8c6eded428e2a86)
 (cherry picked from commit 4abf12898d1a52b5bf0029b790cb27742467c653)
 (cherry picked from commit a2b3f8612d2f3274092f88c49c1741966581f1fc)
+(cherry picked from commit 94ceb389eaa7b4a2cfa9dd1ed3ed24a6f80c45f1)
+(cherry picked from commit f817f4779e62cd6104241bd06bbabda2028635ac)
 ---
  ggml/src/ggml-cuda/mmvq-moe.cu | 18 ++++++++++++++++++
  1 file changed, 18 insertions(+)
