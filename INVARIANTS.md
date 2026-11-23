@@ -1921,7 +1921,7 @@ it is drawn on by *every allocation made after the extension* — including one 
 prefill transient at all.
 
 **Why it moved, measured.**  A **second context's graph** comes up mid-run (a draft context;
-`wip/prefill-decode-arms`' decode arm) and its reserve is a single large allocation.  The two-arm server's **2-row
+`archive/work/prefill-decode-arms`' decode arm) and its reserve is a single large allocation.  The two-arm server's **2-row
 decode graph asks for 741.48 MiB in ONE allocation**; at 1280 it failed with `ggml_cuda_device_malloc: 741.48 MiB
 allocation failed ... the movable-boundary slab holds the VRAM; the arena cannot yield physical back to the driver`
 → `failed to reserve graph buffers` → `ret = -2`, on the *first 2-row step* (a 1-row decode step had run for 5.5 s
@@ -1936,7 +1936,7 @@ appear then (a second/third context's graph reserve, per active-slot width), not
 `ret = -2` from `llama_process` on the first step that changes a context's batch WIDTH is this class; raising
 `GGML_CUDA_SLAB_HEADROOM_MIB` is the lever that does not cost arena on a budgeted shape.
 
-Record: `WORKLOG.md` 261122.005; `ENVIRONMENT.md` §1.3; `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 5 §4.
+Record: `WORKLOG.md` 261122.005; `ENVIRONMENT.md` §1.3; `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 5 §4.
 
 ## r344 — on an APU GTT **arena**, the read transport is the page-cache decision, `dio` keeps the mapping, and the warning that should have named it never fired (block 15, issue #347 follow-up)
 
@@ -2007,3 +2007,199 @@ Record: `WORKLOG.md` 261122.004; `ENVIRONMENT.md` §20; `patches/README.md` bloc
 
 Record: `WORKLOG.md` 261122.005, `benchmarks/2026-11-22-gather-bitmap.md`, `patches/README.md` block 09,
 `ENVIRONMENT.md` §2 (`MOE_GATHER_MASK`, `MOE_GATHER_NSPLIT`), `GREEDY-PURITY.md` §104, issue #350.
+
+## r346 (2026-11-22, `WORKLOG.md` 261122.027) — the two-arm server: a memory module that does not implement the shared view is SILENTLY blind, a second context's reserve must be DECLARED, and the pair's residency class is the arena's (block 17)
+
+Promoted the `prefill-decode-arms` campaign as official **block 17** (`--prefill-decode-arms`,
+`--prefill-decode-arms-mode off|on|auto`, **default OFF / opt-in only**).  The engineering facts:
+
+1. **Every memory module must implement the shared view, or the pair is blind — and the failure is SILENT
+   GARBAGE, not an error.**  `create_memory()` gave the decode arm a shared view of the plain KV and the plain
+   hybrid memory; `llama_memory_hybrid_idx` (qwen4exp: attention KV + recurrent state + lightning indexer KV)
+   and `llama_kv_cache_iswa` (gemma4, sliding window) did not, while the server still printed
+   `KV shared, one allocation owner`.  The decode arm then ran on an **empty** attention cache and an empty
+   indexer cache, so an **82 615-token** request answered as if only its tail were present ("the model cannot
+   see the files") and gemma4 emitted `COCOCOCO…` on **1, 2 and 3 GPUs**.  Both are one bug class, found twice
+   (the second time by the coverage matrix, not by any gate).  The engine's
+   `W create_memory: ... implements no shared view -- this context has its OWN cache` line existed and **nothing
+   read it**; it is load-bearing now, and `mem_other_used` makes it impossible for it to lie.  A co-owner also
+   has to be **forwarded to both children** of a composite memory (an iswa pair has one allocation owner PER
+   cache, so the request-boundary handshake must ask both) and an existing **mirror** path (gemma4's assistant)
+   must keep passing `other_coowner = false`, because a mirror that touches the source's bookkeeping reads
+   garbage.  After the fix: 30 shared layers in the log, `h-on` == `h-off`, content byte-identical to the
+   single-context server.
+2. **A second context's graph reserve must be DECLARED before the arena claims the space, and a PARTIAL
+   declaration fails.**  The movable-boundary slab is created at load; the decode context's graph reserve arrives
+   after it.  On a host-expert tier that made the arena refuse the second context (`the decode arm's step
+   failed`, `SLAB_INIT ... aux=0`).  The reserve is now declared up front the same way an embedded MTP head's
+   draft context declares its own, with **no KV term** (the pair shares one cache): a flat **3584 MiB** via
+   `MOE_EXPERT_CACHE_AUX_RESERVE_MIB`, and a manually set `GGML_CUDA_SLAB_RESERVE_MIB` still wins.  It is
+   **never charged when a speculator is configured** — the pair refuses a speculator, so the reservation would
+   be pure waste (that bug would have cost an MTP run 3.5 GiB).  Measured need for the *derived* form (a
+   follow-up, `TODO` #366): 1792 MiB Flash-Next, 9.52 MiB on the 4B.
+3. **A BUDGETED arena puts both arms in one RESIDENCY CLASS; an `auto` arena does not.**  A text reference is
+   per device count, per split **and per residency class** (§89): with `MOE_EXPERT_CACHE_MIB=13653` (40 GiB
+   total) the expert cache's hit rate is **identical between arms** (`h` 0.9352 / 0.9352) and the pair's text
+   equals the single context's; against an `auto` arena the two arms land in different classes and the
+   comparison is not an oracle at all.  So a host-tier text claim must name the budget, and the maintainer's
+   `-c 204800 --parallel 3` 3-GPU tensor shape passes there too.
+4. **The indexer pool is laid out from CELLS and is PER CONTEXT, so a restore or a handover must stale it.**
+   A checkpoint restore moves a sequence's attention cells behind the pair's derived indexer pool, so a
+   `cache_prompt` repeat could not see the prefix it had just reused even after the shared view was fixed.  The
+   handover therefore re-derives it; a memory whose second cache MIRRORS the attention cells must also never be
+   told to park the attention cache alone (block 12's r146 rule, restated here because the pair reaches it).
+5. **Default OFF is bit-identical, and the oracle for that is a REPRODUCTION of the previous release's
+   record, not just an A/B.**  Flag off, both ROCm lines: prefill-logit KLD **0.000000 / 100.000 %** and the
+   same `base_sha256` as the r343-era reference (`ce8bb26f…`), 4/4 shipped shapes byte-identical, and the MTP
+   four-axis protocol reproduces the **r328 record's text hashes and acceptances exactly**
+   (`218515b89b31`/`a87c4318b649`/`27d74f92ec5c`/`6fa43035b8d9`, acceptance `0.34306`/`0.96652`/`0.63593`/
+   `0.73478`, q8_0 `3a70dd34be92`/`b29f3176fa31`/`45f5e6db9dc2`/`a87c4318b649`).  A block that touches
+   `create_memory()`, the KV allocator and the memory modules the *draft* context also uses owes all of that —
+   the MTP arm is a real risk, not a formality.
+6. **The pair's own contract, so it is not re-litigated:** the prefill/decode overlap costs **-21…-24 %**
+   prefill (flat from `-ub 2048` up; `-ub 4096` is the sweet spot) to hold a decoder at 47-49 ms p50 / 64-78 ms
+   p95 through a 2-5 s prefill where the single context stalls 300-880 ms; a `-sm tensor` hybrid state boundary
+   takes the **serialised** move (~74.6 ms, 112.57 MiB) because a meta-aware device copy is a follow-up
+   (**superseded by r347**: it is a 1.4-1.9 ms device copy); a
+   co-batched two-slot pair is **stress only, never a text oracle** (§63); `-ib` and `LLAMA_SERVER_PREFILL_DUTY`
+   are **deprecated and inert** on this path (both bound a stall inside a SHARED step); and the pair refuses
+   `--spec-type`, so speculative decoding with the arms is a separate campaign.
+
+Record: `WORKLOG.md` 261122.027, `patches/README.md` block 17, `ENVIRONMENT.md` §23,
+`archive/work/prefill-decode-arms/` (`RESULTS-2026-11-22.md` passes 2-18), `MANIFESTS.md` block-17 row.
+
+## r347 (2026-11-22, `WORKLOG.md` 261122.036) — the two-arm server becomes SAFE to run: five structures it shares from two threads, a reserve it creates TWICE, and a state handover the Meta buffer can finally copy (block 17 amendment)
+
+The block-17 amendment (same block, no new block, no renumbering).  `TODO` #373, #365 and #366 all shipped with it.
+The engineering facts, in the order they were learned:
+
+1. **The pair runs two `llama_process()` calls on structures that were never shared before, and every one of them
+   had to be given a lock or an owner.**  Five, all reproduced before they were fixed
+   (`wip/prefill-decode-arms-followups/repro-373/`): the **KV cell map** (`apply()` and `init_batch()`'s rollback
+   snapshot — the qwen4exp `qwen4exp.cpp:1138` abort with the children ~1078 cells apart, and a libstdc++
+   red-black-tree SIGSEGV inside `llama_kv_cache::prepare()`); the **Meta split-state cache** (per *buffer*, hence
+   shared through the KV cache's buffer: the released build's SIGSEGV in `ggml-backend-meta.cpp`); the
+   **async-input ring** (`cudaDeviceSynchronize()` on its wrap path); the **VMM pool's peer grant** (all peer
+   descriptors in ONE `cuMemSetAccess` + `CU_CHECK`); and the **synchronous host paths** (`cudaStreamPerThread` is
+   HIP's sentinel for the legacy default stream, which a peer context's graph capture claims).  The fixes:
+   `llama_memory_i::apply_mutex()` (one lock per memory **GROUP**, shared through `create_memory()` — a take reads
+   the PEER's map, so a lock there would have to span two groups, which is why `seq_state_take()` and
+   `alloc_sync()` are deliberately unlocked and rely on the server's quiet window); the split-state cache per
+   **view slot** (`[4][8]`) with the slot bound for every graph build/alloc (`meta_bind_view_slot()`); the ring
+   waiting on each **origin's own** stream; the pool grant best effort with a per-pool mask and
+   `ggml_cuda_peer_copy_ok()` answering for pools as well as slabs; and `ggml_cuda_host_stream()`, one private
+   non-blocking stream per **(thread, device)**, for every synchronous host path.  **A lock per memory INSTANCE
+   would not have been enough**: the pair shares one map, so the lock has to live with the group.
+2. **A second context's graph reserve has to cover TWO late narrow views, because the pair creates the post-prefill
+   re-reserve as well as the decode context's first one.**  The flat 3584 MiB (`r346`) covered one.  Measured on
+   Flash-Next `-ncmoe 48 -c 131072`, arena 13.3 GiB, 3 slots, 71k + 23k + 800: **3584 fails, 4096 fails, 5120
+   clean**, both views 1430.2 / 1430.6 MiB — hence `common_arms_dec_reserve()` = flat floor + a **width-keyed
+   tier** (`0` at `-ub <= 1024`, 1536 MiB at `>= 2048`, +256 per doubling).  A *reserve* is capacity, not state:
+   too small and the arena refuses a graph (a hard failure), too large and VRAM is wasted, and the width is what
+   predicts it.
+3. **The Meta buffer had no copy hook, so a `-sm tensor` hybrid paid a full host round trip at EVERY request
+   boundary — and it is now a device copy.**  `seq_state_take()`'s 2-D row views are built **out of graph**, so no
+   `simple_tensor` container knows them and the host paths cannot resolve them; that is why `cpy_tensor`/
+   `cpy_tensor_n` were null and `can_take_batched()` refused.  The hook is per **child**: the split state of the
+   view's ROOT (which IS registered) says which byte range of a row belongs to which child.
+   **The non-obvious half: both sides of the copy are children of the SAME layout, so a child's covered rows are
+   ONE contiguous range even when the split state is segmented/repeated** — the state of Qwen3.8-Flash-Next is one
+   segment **repeated 3 or 5 times** (interleaved inside the row, identically on both sides), and walking that
+   interleaving costs `nr[0]` copies per row per child: a planner that walked it measured **3.5 ms**, and one that
+   copies the child's range measured **1.4-1.9 ms**.  Against **72-77 ms** serialised (112.57 MiB).
+   `LLAMA_RS_VERIFY_TAKE=1` on the batched arm: **0 of 118 039 420 bytes differ**, cell metadata included; and the
+   same turn driven once per arm, serially and greedily, gives **byte-identical** per-take destination dumps
+   (`LLAMA_RS_VERIFY_TAKE_DUMP=`) and identical text.  A shape the planner cannot express is staged through the
+   host via the root — **never partially copied**, because a half-moved recurrent state is fluent-but-wrong text
+   (§89).  `cpy_tensor` (singular) stays null on purpose: `can_copy_tensor()` is satisfied by either hook, and
+   adding it would silently reroute the KV-park and state-staging copies that take the host path today.
+4. **A sequential arms oracle cannot see a request-boundary defect; that is a gate gap, not an oracle choice.**
+   Every arms oracle the campaign had (the 16/16 coverage matrix, the soak, the reuse gate) drove requests **one at
+   a time**, so nothing ever ran two arms' prefills at once — the shape the reported P0 lived in.  The arm that
+   does is `scripts/gate-arms-soak.sh boundary` (gate 17b): two prefills in flight plus a decode, pad buckets
+   shrunk to 256, `BB_ROUNDS >= 3`, and a fourth **sequential fresh** request compared against a single-context
+   server.  **A text claim about the pair is only valid on a serial, greedy arm** (§63/§38): at the runme's
+   temp 0.7 two arms differ in sampled tokens from kernel-shape noise alone, and their per-take dumps differ
+   because the cell placement follows the interleaving.
+5. **A small model over a 3-way split is NOT a shape anyone runs, and it faults on the released build too** — a
+   4B on 3 devices `-sm tensor` with the pair dies in `llama_kv_cache::find_slot()` (a null deref at `+0x6a0`,
+   `segfault at 25 ip … libllama.so[3561d0]`) with or without the fix set.  So the boundary arm must **not**
+   default to the fast 1-GPU soak model; it defaults to the validated 35B-A3B hybrid split.  General form: a gate
+   arm's *shape* has to come from a validated configuration, and "it crashes" is not a finding until the shape is
+   one the repo supports.
+6. **`TEMP` in the environment breaks the ROCm 10.1 runtime at LOAD, inside its LLVM-based JIT.**  A harness
+   variable named `TEMP=0` (hipBLASLt's Tensile cache path) made every model load die with a stack-write fault in
+   `libLLVM.so` (`segfault at <addr> ip … libLLVM[…815cd9] error 6`, i.e. a write at `sp`), reproducibly, and a
+   64 MB stack made it *survive* — so it is a stack exhaustion in the JIT, not a bounds bug we can fix.  Recorded
+   because it reads as a defect in the change under test: the harness variable is `ARM_TEMP` (`WORKLOG.md`
+   261122.014 had the `hipStreamCreateWithFlags` face of the same landmine).
+
+Record: `WORKLOG.md` 261122.036, `patches/README.md` block 17, `ENVIRONMENT.md` §23, `MANIFESTS.md` gates 17/17b,
+`wip/prefill-decode-arms-followups/` (§W2/§W9 + `repro-373/`).
+
+## r348 (2026-11-22, `WORKLOG.md` 261122.038) — a cross-model `ctx_other` is a DRAFT, never a memory co-owner: block 17's generic arm threw on every separate MTP head (block 17 amendment, issue #351)
+
+The block-17 amendment (same block, no new block, no renumbering).  GitHub issue #351, reproduced and fixed on
+this box with the reporter's own shape.
+
+1. **`ctx_other` has TWO meanings and only one of them needs the same model.**  Block 17's generic arm lifts the
+   gate so that a second context of the SAME model can view the first one's memory (that is the one place a decode
+   can be submitted from while `llama_process()` is open).  A context of a DIFFERENT model is the other meaning:
+   a DRAFT head.  The external shared-NextN MTP GGUF (`-md` / `--spec-draft-model`) loads as its **own
+   `llama_model`**, borrows the target's `token_embd` / `lm_head`, and `common_speculative_init_result` sets
+   `cparams.ctx_other = ctx_tgt` **unconditionally** (`common/speculative.cpp`) -- so the r346 same-model check in
+   `llama_context` threw at the draft context's construction:
+   `ctx_other must be a context of the same model`, then `failed to create MTP context`, and the server never
+   reached readiness (also with `--prefill-decode-arms` off, because the check is in the constructor, not the
+   pair's code).  The arch-gated arms above it (gemma4-assistant, eagle3, dflash, qwen4exp) are exactly the
+   drafts that ASK for a cross-model `ctx_other`; a plain NextN MTP head is not one of them, so it fell through
+   into the generic arm.  **The rule now: the generic arm adopts a same-model `ctx_other` only; a cross-model one
+   is declined (its own cache, which is what the pre-r346 tree did) and `ctx_other_share_memory` with a
+   cross-model `ctx_other` is refused, because another model's cells belong to ITS layer layout.**
+   Deliberately NOT "adopt it anyway": adopting it flips every `cparams.ctx_other != nullptr` site in the fork
+   (`sched_alt_for()`'s second scheduler, the slab's narrow-2 draft routing, `params_mem.kv_pool`) for a shape
+   that has run without it since the block existed, i.e. an unvalidated behaviour change on hardware this repo
+   does not validate (the reporter's 780M).  A future "an external head is a draft too" change is a measured
+   change, not a regression fix.
+2. **The draft really drafts, and it changes no token.**  Flash-Next GSQ-RCO IQ3_S + the Unsloth shared Q8_0 MTP
+   head, `--spec-type draft-mtp --spec-draft-n-max 2`, `-ncmoe 48`, pins `MOE_EXPERT_HEATMAP=load` +
+   `ROCBLAS_USE_HIPBLASLT=0`: `--spec-type none` and `draft-mtp` read the SAME greedy text, byte for byte, on
+   1 device (`552 chars e7aae6034b4f`) and on 3 devices `-sm tensor` (`645 chars af9171d90336` -- a
+   device-count-specific text, as any tensor split is), repeated; draft acceptance **0.77-0.85**, mean accepted
+   length 2.5-2.7, and decode **34.0 -> 48.0 t/s** (1 GPU) / **40.0 -> 65.3 t/s** (3 GPU tensor).  The external
+   head is inert to the target's text and worth +41..+63 % decode on this shape.
+3. **A gate that can take an external head and defaults to an embedded one cannot see this class.**  `DRAFT=` /
+   `-md` is optional in `gate-state-pipe.sh`, `gate-ckpt-reuse.sh`, `gate-park-idle-slots.sh` and
+   `gate-spec-ckpt-device.sh`, so the r346 gate ladder drove them all with an embedded head and stayed green
+   while every separate-MTP-head server was dead at load.  `scripts/gate-draft-ctx.sh` is the missing arm: the
+   external head must load, its text must equal `--spec-type none`, the `-lv 4` census must show the constructor's
+   DECLINE line and a non-zero acceptance, and no same-model refusal may appear.  Negative-tested on the r347
+   build: **8 of 11 checks fail** (exit 1).
+
+Record: `WORKLOG.md` 261122.038, `patches/README.md` block 17, `MANIFESTS.md` gates 17 (TIER A) / the block-17
+row, `scripts/gate-draft-ctx.sh`, `GREEDY-PURITY.md` §106.
+
+## r349 (2026-11-22, `WORKLOG.md` 261122.039) -- a diagnostic log line is COMPILED code on every platform: `ssize_t` is a type, so a portability lint that only knows calls and keyword macros cannot see it (block 17 amendment 2, PR #352)
+
+1. **The Windows build break was in a `LLAMA_LOG_INFO` argument list, behind an opt-in diagnostic.**  Block 17's
+   serialised state-move VERIFY prints a differing byte offset with `"first at %zd"` through `(ssize_t)`; MSVC/UCRT
+   never declares `ssize_t`, so the Windows HIP toolchain stops at `src/CMakeFiles/llama.dir/llama-context.cpp.obj`
+   with `error: use of undeclared identifier 'ssize_t'`.  Nothing on this box can compile that: every r348 gate ran
+   on Linux/ROCm, where the line is fine.  Fixed as `(long long)` / `%lld` (the offset is never negative, and the
+   `(size_t) -1` "no difference" sentinel still prints `-1` -- verified on the boundary arm with
+   `LLAMA_RS_VERIFY_TAKE=1`).
+2. **`check-windows-portability.sh` was blind to it by construction, not by an oversight in its list.**  It had a
+   CALL rule (POSIX functions), a keyword-MACRO rule (`near`/`far`/`pascal`/`cdecl` from `<windows.h>`) and the
+   separate include-closure check; `(ssize_t) first` is neither a call nor a macro, it is a *type name in a cast*.
+   So the script now carries a third rule on the same Windows-compiled lines: **POSIX-only type names**
+   (`ssize_t` today, the tuple is where a second one goes), with comments/literals already stripped (its own
+   explanatory comment is not a hit) and `pool_ssize_t` untouched (no word boundary).  Negative control: on the
+   **r348** tree it reports exactly one site (`src/llama-context.cpp:7284`); on r349 it is clean.
+3. **A "verify-only" or "log-only" line is not exempt from the build.**  The general rule this records: a change
+   review should not classify a hunk as "unreachable" because it needs an env var -- the compiler reads it on every
+   platform the file is compiled for, and the only instrument for the Windows half is
+   `scripts/check-windows-portability.sh` (run by `validate-set.sh`, checks 7/10) or a reporter's build log
+   (`issue #231`, `#306`, `#310`, now `PR #352`).
+
+Record: `WORKLOG.md` 261122.039, `scripts/check-windows-portability.sh`, `scripts/README.md`, `MANIFESTS.md`
+(the portability-gate row), `AGENTS.md` scripts row, `patches/README.md` block 17.

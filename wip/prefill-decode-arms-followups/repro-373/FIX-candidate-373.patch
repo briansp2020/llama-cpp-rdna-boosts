@@ -1,0 +1,1797 @@
+From 00a568fba2e756f3d4a36e9f5598f90e4d168584 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 22 Nov 2026 16:04:47 -0600
+Subject: [PATCH 1/5] crash #373 fix (candidate): one apply lock per memory
+ GROUP -- the pair's two arms mutate one KV cell map from two threads, which
+ is the qwen4exp n_kv abort AND a std::set/tree corruption in
+ llama_kv_cache::prepare()'s rollback snapshot; plus set the meta view slot on
+ every sched_alt_select (hardening, unproven)
+
+---
+ src/llama-context.cpp           | 17 ++++++++++++++---
+ src/llama-kv-cache.cpp          | 20 --------------------
+ src/llama-kv-cache.h            |  6 ------
+ src/llama-memory-hybrid-idx.cpp | 29 -----------------------------
+ tools/server/server.cpp         | 20 --------------------
+ 5 files changed, 14 insertions(+), 78 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7faad42b6..153105d6b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -24,6 +24,8 @@
+ #include "llama.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdio>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -1555,6 +1557,18 @@ void llama_context::sched_new(const sched_params & params) {
+ }
+ 
+ void llama_context::sched_alt_select(bool alt) {
++    // a CO-OWNER context (the decode arm) takes the second pair of view slots, so two contexts computing at the
++    // same time never share a meta view container (wip/prefill-decode-arms).
++    //
++    // crash #373: set it on EVERY call, not only when the alt state changes.  `g_meta_view_slot` is thread_local and
++    // starts at 0, and `sched_alt_in_use` starts false -- so a context that never switches schedulers returned below
++    // on its first graph and kept slot 0, i.e. the SAME slot as its co-owner.  Both arms then registered and looked
++    // up the per-graph VIEWS of their shared KV cache (an external view uses the buffer of its view source, see
++    // ggml_backend_meta_buffer_context) in one rotating container, each clearing it under the other: measured as a
++    // SIGSEGV inside libstdc++/libggml-base on `std::set`/`std::unordered_map` nodes, and as the `simple_tensor ==
++    // null` / `tensor write out of bounds` aborts the process-global slot used to cause.
++    ggml_backend_meta_set_view_slot((cparams.ctx_other != nullptr ? 2 : 0) + (alt ? 1 : 0));
++
+     if (alt == sched_alt_in_use) {
+         return;
+     }
+@@ -1571,9 +1585,6 @@ void llama_context::sched_alt_select(bool alt) {
+     std::swap(sched, sched_alt);
+     std::swap(gf_res_prev_active, gf_res_prev_active_alt);
+     sched_alt_in_use = alt;
+-    // a CO-OWNER context (the decode arm) takes the second pair of view slots, so two contexts computing at the
+-    // same time never share a meta view container (wip/prefill-decode-arms)
+-    ggml_backend_meta_set_view_slot((cparams.ctx_other != nullptr ? 2 : 0) + (alt ? 1 : 0));
+ }
+ 
+ bool llama_context::sched_alt_for(const llama_ubatch & ubatch) const {
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index ca4698b32..9949dafd4 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -5270,26 +5270,6 @@ uint32_t llama_kv_cache_context::get_n_kv_rows() const {
+     return n_kv_rows;
+ }
+ 
+-// TEMP DEBUG (crash #373, remove before commit)
+-uint32_t llama_kv_cache_context::dbg_n_kv_used() const {
+-    if (kv == nullptr || ubatches.empty() || i_cur >= sinfos.size()) {
+-        return 0;
+-    }
+-    return kv->get_n_kv_used(sinfos[i_cur]);
+-}
+-
+-uint32_t llama_kv_cache_context::dbg_size() const {
+-    return kv == nullptr ? 0 : kv->get_size();
+-}
+-
+-uint32_t llama_kv_cache_context::dbg_n_tokens() const {
+-    return (ubatches.empty() || i_cur >= ubatches.size()) ? 0 : ubatches[i_cur].n_tokens;
+-}
+-
+-uint32_t llama_kv_cache_context::dbg_n_seqs_unq() const {
+-    return (ubatches.empty() || i_cur >= ubatches.size()) ? 0 : (uint32_t) ubatches[i_cur].n_seqs_unq;
+-}
+-
+ ggml_type llama_kv_cache_context::type_k() const {
+     return kv->type_k();
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 242910412..ac03e10be 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -676,12 +676,6 @@ public:
+     uint32_t get_n_kv() const;
+     uint32_t get_n_kv_rows() const;
+ 
+-    // TEMP DEBUG (crash #373, remove before commit)
+-    uint32_t dbg_n_kv_used() const;
+-    uint32_t dbg_size() const;
+-    uint32_t dbg_n_tokens() const;
+-    uint32_t dbg_n_seqs_unq() const;
+-
+     // wip/kv-residency (TODO #118) B2: see llama_kv_cache::is_streaming
+     bool is_streaming(uint32_t n_kv_asked) const;
+ 
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index c3515d4b8..62847bae2 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -8,12 +8,9 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cmath>
+-#include <cstdio>
+ #include <iterator>
+-#include <pthread.h>
+ #include <stdexcept>
+ #include <type_traits>
+-#include <unistd.h>
+ 
+ //
+ // llama_memory_hybrid_idx
+@@ -1289,36 +1286,10 @@ bool llama_memory_hybrid_idx_context::next() {
+ }
+ 
+ bool llama_memory_hybrid_idx_context::apply() {
+-    // TEMP DEBUG (crash #373, remove before commit)
+-    static const int  dbg_widen_us = getenv("LLAMA_DBG_APPLY_WIDEN_US") ? atoi(getenv("LLAMA_DBG_APPLY_WIDEN_US")) : 0;
+-    static const bool dbg_all      = getenv("LLAMA_DBG_APPLY_CELLS") != nullptr;
+-
+     bool res = llama_memory_hybrid_context::apply();
+ 
+-    // TEMP DEBUG: the attention child has read its n_kv by now; widen the suspect window if asked
+-    const uint32_t dbg_nkv_attn = get_attn() ? get_attn()->get_n_kv() : 0;
+-    if (dbg_widen_us > 0) {
+-        usleep(dbg_widen_us);
+-    }
+-
+     if (ctx_idx) {
+         res = res & ctx_idx->apply();
+-
+-        // TEMP DEBUG (crash #373)
+-        const llama_kv_cache_context * dbg_idx = static_cast<const llama_kv_cache_context *>(ctx_idx.get());
+-        if (dbg_all || dbg_nkv_attn != dbg_idx->get_n_kv()) {
+-            const uint32_t used_attn = get_attn()->dbg_n_kv_used();
+-            const uint32_t used_idx  = dbg_idx   ->dbg_n_kv_used();
+-            fprintf(stderr,
+-                    "[DBG_APPLY] %s tid=%lu n_tok=%u n_seqs_unq=%u | attn n_kv=%u used=%u size=%u | idx n_kv=%u used=%u size=%u | %s\n",
+-                    dbg_nkv_attn == dbg_idx->get_n_kv() ? "agree" : "MISMATCH",
+-                    (unsigned long) pthread_self(),
+-                    dbg_idx->dbg_n_tokens(), dbg_idx->dbg_n_seqs_unq(),
+-                    dbg_nkv_attn, used_attn, get_attn()->dbg_size(),
+-                    dbg_idx->get_n_kv(), used_idx, dbg_idx->dbg_size(),
+-                    used_attn == used_idx ? "used-equal" : "USED-DIFFER");
+-            fflush(stderr);
+-        }
+     }
+ 
+     // Extend the pool layout with this ubatch's cells, then pick what it must re-pool.
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 7d1b577c2..fabf0a041 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -26,25 +26,6 @@
+ #include <windows.h>
+ #endif
+ 
+-// TEMP DEBUG (crash #373): dump a backtrace on a fatal signal, then die.  ggml_print_backtrace() is the
+-// project's own helper (fork + gdb), so no new machinery.  Remove before commit.
+-#include <execinfo.h>
+-static void dbg_fatal_signal_handler(int sig) {
+-    void * trace[96];
+-    const int n = backtrace(trace, 96);
+-    backtrace_symbols_fd(trace, n, STDERR_FILENO);
+-    _exit(128 + sig);
+-}
+-static void dbg_install_backtrace_handlers() {
+-    static const bool on = getenv("LLAMA_DBG_BT_ON_FATAL") != nullptr;
+-    if (!on) {
+-        return;
+-    }
+-    signal(SIGSEGV, dbg_fatal_signal_handler);
+-    signal(SIGBUS,  dbg_fatal_signal_handler);
+-    signal(SIGILL,  dbg_fatal_signal_handler);
+-}
+-
+ static std::function<void(int)> shutdown_handler;
+ static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+ 
+@@ -354,7 +335,6 @@ static bool server_setup_features(
+ 
+ static void server_install_signal_handlers() {
+ #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+-    dbg_install_backtrace_handlers(); // TEMP DEBUG (crash #373)
+     struct sigaction sigint_action;
+     sigint_action.sa_handler = signal_handler;
+     sigemptyset (&sigint_action.sa_mask);
+-- 
+2.56.1
+
+
+From 7ea83092273d0e738f544949e0dcb3ab0e832c04 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 22 Nov 2026 16:40:11 -0600
+Subject: [PATCH 2/5] crash #373 fix (candidate), part 2: the Meta split-state
+ cache is per VIEW SLOT (two co-owner contexts resolved the shared KV's views
+ through one rotating unordered_map -- the released build's SIGSEGV in
+ ggml-backend-meta.cpp), the view slot is bound for EVERY graph build/alloc
+ (not only on an alt-state change), and the async-input ring waits per ORIGIN
+ stream instead of cudaDeviceSynchronize (illegal while a peer arm captures a
+ graph -- measured 'operation not permitted when stream is capturing')
+
+Validated: the 71k/23k/800 three-slot shape, 3 rounds clean (0 asserts, 0 ROCm errors, 0 segfaults);
+pair OFF clean; gate-arms-soak.sh soak --quick PASS 11/11 including the class-matched text oracle.
+Still blocked on the host tier (-ncmoe 48): a pre-existing abort in ggml_cuda_pool_vmm::alloc's peer grant
+(cuMemSetAccess 'invalid argument'), pair-only, needs the best-effort-grant treatment the slab already has.
+---
+ ggml/src/ggml-backend-meta.cpp  | 53 +++++++++++++++++++++------------
+ ggml/src/ggml-cuda/ggml-cuda.cu | 23 +++++++++++++-
+ src/llama-context.cpp           | 27 ++++++++++++-----
+ src/llama-context.h             |  2 ++
+ 4 files changed, 77 insertions(+), 28 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 6ded91b14..fd41e635d 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -890,10 +890,21 @@ struct ggml_backend_meta_buffer_context {
+             return std::hash<const void *>()(k.first) ^ (size_t) k.second;
+         }
+     };
+-    std::unordered_map<std::pair<const ggml_tensor *, bool>, split_state_entry, split_state_key_hash> split_state_cache[n_split_state_caches];
+-    int      split_state_cache_cur = 0;
+-    uint64_t split_state_cache_used[n_split_state_caches] = {0};
+-    uint64_t split_state_cache_tick = 0;
++    // crash #373 (TODO #373): the cache is per VIEW SLOT, not per buffer.  A co-owner pair (two `llama_context`s of
++    // one model on two threads) resolves the split state of the VIEWS OF THEIR SHARED KV CACHE through the SAME buffer
++    // context -- ~10k lookups per decode step each -- and the rotation below mutates `cur`, `used` and `tick` and
++    // CLEARS a whole version.  Two threads doing that to one `unordered_map` corrupts the hash table: measured as a
++    // SIGSEGV inside `ggml_backend_meta_get_split_state` and inside `set_tensor_async`'s lookup, on the 3-device
++    // `-sm tensor` pair, in the released build.  The simple-tensor containers next door keep one container per view
++    // slot for exactly the same reason, so the slot (`g_meta_view_slot`) is the discriminator here too: the owner's
++    // graphs use slot 0/1, the co-owner's 2/3, and no version of any slot is visible to the other arm.
++    // A single context never leaves slot 0 (sched_alt_for() is false without ctx_other), so it keeps the rotation
++    // across its own graph shapes exactly as before.
++    using split_state_map = std::unordered_map<std::pair<const ggml_tensor *, bool>, split_state_entry, split_state_key_hash>;
++    split_state_map split_state_cache     [n_view_slots][n_split_state_caches];
++    int             split_state_cache_cur [n_view_slots] = {0};
++    uint64_t        split_state_cache_used[n_view_slots][n_split_state_caches] = {0};
++    uint64_t        split_state_cache_tick[n_view_slots] = {0};
+ 
+     ggml_backend_meta_buffer_context(
+             ggml_backend_meta_simple_tensor_container & stc_static,
+@@ -2083,9 +2094,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+ 
+     // Current-version cache test, used only to prune the walk (a false negative just visits a node that
+     // the nested lookup then resolves from another version, so pruning is always safe).
++    // crash #373: this lookup resolves through the slot of the CONTEXT doing the work, never the peer's
++    const int ss_slot = g_meta_view_slot;
++    GGML_ASSERT(ss_slot >= 0 && ss_slot < ggml_backend_meta_buffer_context::n_view_slots);
++
+     auto ss_cached = [&](const ggml_tensor * t) -> bool {
+         const std::pair k = std::make_pair(t, true);
+-        const auto & c = buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++        const auto & c = buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+         const auto itc = c.find(k);
+         return itc != c.end() && memcmp(itc->second.bytes, (const char *) t, sizeof(itc->second.bytes)) == 0;
+     };
+@@ -2094,10 +2109,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     // other versions for an entry byte-identical to the tensor, else a recycle of the least recently used
+     // one; under the pin a nested lookup only invalidates its own stale entry instead.
+     const std::pair key = std::make_pair(tensor, assume_sync);
+-    auto * cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++    auto * cache = &buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+     auto it = cache->end();
+     auto ss_resolve = [&]() {
+-        cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++        cache = &buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+         it = cache->find(key);
+         if (it == cache->end() || memcmp(it->second.bytes, (const char *) tensor, sizeof(it->second.bytes)) == 0) {
+             return;
+@@ -2111,27 +2126,27 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+         }
+         // the tensor changed: switch to the cache version in which it is unchanged, else recycle the least recently used one
+         int k_new = -1;
+-        for (int k = 0; k < buf_ctx->n_split_state_caches && k_new < 0; k++) {
+-            if (k == buf_ctx->split_state_cache_cur) {
++        for (int k = 0; k < ggml_backend_meta_buffer_context::n_split_state_caches && k_new < 0; k++) {
++            if (k == buf_ctx->split_state_cache_cur[ss_slot]) {
+                 continue;
+             }
+-            auto it_k = buf_ctx->split_state_cache[k].find(key);
+-            if (it_k != buf_ctx->split_state_cache[k].end() && memcmp(it_k->second.bytes, (const char *) tensor, sizeof(it_k->second.bytes)) == 0) {
++            auto it_k = buf_ctx->split_state_cache[ss_slot][k].find(key);
++            if (it_k != buf_ctx->split_state_cache[ss_slot][k].end() && memcmp(it_k->second.bytes, (const char *) tensor, sizeof(it_k->second.bytes)) == 0) {
+                 k_new = k;
+             }
+         }
+         if (k_new < 0) {
+-            for (int k = 0; k < buf_ctx->n_split_state_caches; k++) {
+-                if (k != buf_ctx->split_state_cache_cur &&
+-                        (k_new < 0 || buf_ctx->split_state_cache_used[k] < buf_ctx->split_state_cache_used[k_new])) {
++            for (int k = 0; k < ggml_backend_meta_buffer_context::n_split_state_caches; k++) {
++                if (k != buf_ctx->split_state_cache_cur[ss_slot] &&
++                        (k_new < 0 || buf_ctx->split_state_cache_used[ss_slot][k] < buf_ctx->split_state_cache_used[ss_slot][k_new])) {
+                     k_new = k;
+                 }
+             }
+-            buf_ctx->split_state_cache[k_new].clear();
++            buf_ctx->split_state_cache[ss_slot][k_new].clear();
+         }
+-        buf_ctx->split_state_cache_cur = k_new;
+-        buf_ctx->split_state_cache_used[k_new] = ++buf_ctx->split_state_cache_tick;
+-        cache = &buf_ctx->split_state_cache[k_new];
++        buf_ctx->split_state_cache_cur[ss_slot] = k_new;
++        buf_ctx->split_state_cache_used[ss_slot][k_new] = ++buf_ctx->split_state_cache_tick[ss_slot];
++        cache = &buf_ctx->split_state_cache[ss_slot][k_new];
+         it = cache->find(key);
+     };
+     ss_resolve();
+@@ -2200,7 +2215,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             ss_verify_active = false;
+         }
+         // the calculation recurses into the sources and may have switched the current version
+-        cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++        cache = &buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+         auto & entry = (*cache)[key];
+         entry.set(ss, n_bufs);
+         memcpy(entry.bytes, tensor, sizeof(entry.bytes));
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 965b43981..ec5569136 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2187,7 +2187,28 @@ static bool ggml_cuda_async_input_set(int device, void * dst, const void * src,
+                 ggml_cuda_async_input_drain_locked(d, e);
+             }
+         }
+-        CUDA_CHECK(cudaDeviceSynchronize());
++        // crash #373: wait on the ORIGINS' own streams, never the whole device.  The ring bytes can only be read by
++        // an origin's own uploads -- its `ev`/`flush_ev` are recorded on its stream -- so a `cudaStreamSynchronize`
++        // of each origin's stream is exactly the guarantee the wrap needs, and unlike `cudaDeviceSynchronize()` it is
++        // not a device-wide barrier (it does not also wait for this context's graph compute, nor a peer's).
++        //
++        // Why that matters: the two-arm server (`--prefill-decode-arms`, block 17) captures a graph on ONE arm while
++        // the other arm stages inputs, and a host-side device sync is ILLEGAL while any capture is in flight on the
++        // device.  Measured on the 3-device `-sm tensor` pair: `ROCm error: operation not permitted when stream is
++        // capturing` from this very line, then every launch on the device failed (`operation failed due to a previous
++        // error during capture`) and the request died.  If even the per-origin wait is refused, clear the error, leave
++        // the ring untouched and report "not staged": the caller then takes the synchronous upload path for this copy,
++        // and a later wrap (after the capture ends) resets the ring.
++        for (auto & kv : d.origins) {
++            ggml_cuda_async_input_origin & e = kv.second;
++            if (e.stream == nullptr) {
++                continue;
++            }
++            if (cudaStreamSynchronize(e.stream) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return false;
++            }
++        }
+         for (auto & kv : d.origins) {
+             kv.second.pending   = false;
+             kv.second.has_flush = false;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 153105d6b..92ec39c84 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1556,18 +1556,22 @@ void llama_context::sched_new(const sched_params & params) {
+     sched_params_cur = params;
+ }
+ 
++// crash #373: tell the meta backend which view slot THIS context's graphs belong to.  The owner of a shared cache
++// uses 0/1, a co-owner (block 17's decode arm) 2/3, and `alt` picks within the pair so a context's main and alternate
++// graph never share a container with each other either.  `g_meta_view_slot` is `thread_local` (`ggml-backend-meta.cpp`):
++// a process-global let the other arm flip it mid-graph and register a view in one container while looking it up in
++// another.  It is therefore bound from the arm's OWN thread, at every point that builds or allocates a graph.
++void llama_context::meta_bind_view_slot(bool alt) const {
++    ggml_backend_meta_set_view_slot((cparams.ctx_other != nullptr ? 2 : 0) + (alt ? 1 : 0));
++}
++
+ void llama_context::sched_alt_select(bool alt) {
+     // a CO-OWNER context (the decode arm) takes the second pair of view slots, so two contexts computing at the
+     // same time never share a meta view container (wip/prefill-decode-arms).
+     //
+-    // crash #373: set it on EVERY call, not only when the alt state changes.  `g_meta_view_slot` is thread_local and
+-    // starts at 0, and `sched_alt_in_use` starts false -- so a context that never switches schedulers returned below
+-    // on its first graph and kept slot 0, i.e. the SAME slot as its co-owner.  Both arms then registered and looked
+-    // up the per-graph VIEWS of their shared KV cache (an external view uses the buffer of its view source, see
+-    // ggml_backend_meta_buffer_context) in one rotating container, each clearing it under the other: measured as a
+-    // SIGSEGV inside libstdc++/libggml-base on `std::set`/`std::unordered_map` nodes, and as the `simple_tensor ==
+-    // null` / `tensor write out of bounds` aborts the process-global slot used to cause.
+-    ggml_backend_meta_set_view_slot((cparams.ctx_other != nullptr ? 2 : 0) + (alt ? 1 : 0));
++    // crash #373: bind the context's Meta view slot on EVERY call, not only when the alt state changes (see
++    // meta_bind_view_slot() and graph_reserve()).
++    meta_bind_view_slot(alt);
+ 
+     if (alt == sched_alt_in_use) {
+         return;
+@@ -4539,6 +4543,13 @@ static void ubatch_prepare_reserve(
+ ggml_cgraph * llama_context::graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs_l, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+         bool packed_kq_mask, bool reserve_injection) {
++    // crash #373: EVERY graph construction/allocation runs under this context's Meta view slot.  The slot decides which
++    // per-context containers the meta backend registers a graph's VIEWS in, and which version of its split-state cache
++    // it resolves them through -- so a graph built under the peer's slot is a corrupted (and corrupting) lookup.  It is
++    // bound here rather than only in sched_alt_select() because a reserve can happen without an alt-state change (the
++    // first graph of a context, sched_reserve(), a new ubatch shape) and the slot is thread_local.
++    meta_bind_view_slot();
++
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
+     GGML_ASSERT(n_outputs_l >= 1);
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 9ab266537..d96b8ec91 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -362,6 +362,8 @@ private:
+ 
+     // swap the second scheduler (and its graph-reuse state) in or out of `sched`, creating it on first use
+     void sched_alt_select(bool alt);
++    // crash #373: bind this context's Meta view slot (thread_local) before any graph build/alloc; see the definition
++    void meta_bind_view_slot(bool alt = false) const;
+ 
+     // whether this ubatch is the draft context's second graph (the draft step) rather than its ingest /
+     // KV-injection graph; the batch kind, not `n_outputs`, is the discriminator for DFlash/DFlash2
+-- 
+2.56.1
+
+
+From eae8c79c09ad68aa3e27ab6ce0d8124ac1dc0aef Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 22 Nov 2026 17:07:27 -0600
+Subject: [PATCH 3/5] crash #373 fix (candidate), part 3: A -- the VMM pool's
+ peer grant is BEST EFFORT, exactly as the slab's already is
+
+cuMemSetAccess over all peer descriptors in ONE call meant a single refused descriptor (the driver cannot build a
+peer mapping once the MoE arena has taken the VRAM) poisoned the grant and aborted the process; it was invisible
+while one context existed because its pools are grown during load, and the pair adds a SECOND context whose pools
+grow at request time -- measured 'HipVMM Failure: invalid argument' in ggml_cuda_pool_vmm::alloc from mul_mat_q,
+~2 s in, only with the arena on and only with the pair.  Now: grant the OWNER's descriptor alone (located
+explicitly -- the list is in device order, so the owner is not always first), then each peer alone, keep the mask of
+what was granted and the ranges in a registry, and let the copy predicate answer for pool destinations too
+(ggml_cuda_slab_peer_copy_ok -> ggml_cuda_peer_copy_ok, slab AND pool).  A refused peer stages through host memory.
+
+Also: the async-input origin uploads on a private non-blocking stream instead of the cudaStreamPerThread sentinel
+(HIP couples that to the legacy default stream, so a peer arm's capture refuses it: measured as a failed set_input in
+llm_graph_input_ple on the host tier).  Ordering was already carried by events, never by the handle.
+
+Host tier now clean end to end (2 rounds of 71k + 23k + 800-token generation, -ncmoe 48) with the decode context's
+declared reserve raised (MOE_EXPERT_CACHE_AUX_RESERVE_MIB=6144; the flat 3584 MiB is not enough there -- TODO #366
+is a hard blocker for the host tier, not a cost item).  Resident config unchanged: 2 rounds clean, soak gate 11/11.
+---
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu |  11 +-
+ ggml/src/ggml-cuda/ggml-cuda-vmm.h   |  17 +--
+ ggml/src/ggml-cuda/ggml-cuda.cu      | 154 +++++++++++++++++++++++++--
+ 3 files changed, 167 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index 01087b511..d35b157a9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -84,7 +84,7 @@ static bool ggml_cuda_vmm_map_phys(int device, CUdeviceptr addr, size_t aligned,
+     // second and third ~29 GiB slab (no free VRAM left in the peers for the driver to build a 29 GiB peer
+     // mapping), the owner-only retry papered over it, and every peer copy into those slabs then either
+     // returned `invalid argument` or faulted the GPU.  A refused peer keeps owner access only, and copies
+-    // between those devices stage through host memory (see `ggml_cuda_slab_peer_copy_ok`).
++    // between those devices stage through host memory (see `ggml_cuda_peer_copy_ok`).
+     if (cuMemSetAccess(addr, aligned, &access.front(), 1) != cudaSuccess) {
+         (void) cudaGetLastError();
+         (void) cuMemUnmap(addr, aligned);
+@@ -232,7 +232,7 @@ struct ggml_cuda_slab {
+     // grant is best effort: with three ~29 GiB slabs there is no free VRAM left in the peers for the driver
+     // to grant a range that large, and `cuMemSetAccess` refuses it.  A peer copy into a range that was NOT
+     // granted FAULTS the GPU (`HSA_STATUS_ERROR_MEMORY_FAULT`, `__amd_rocclr_copyBuffer`, "Page not
+-    // present"), it does not return an error, so every cross-device copy asks `ggml_cuda_slab_peer_copy_ok`
++    // present"), it does not return an error, so every cross-device copy asks `ggml_cuda_peer_copy_ok`
+     // first and stages through pinned host memory when the grants are incomplete.
+     uint32_t                 peer_mask     = 0;
+     std::map<size_t, size_t> arena_free;        // arena free runs: offset -> size (chunk-aligned)
+@@ -669,10 +669,15 @@ bool ggml_cuda_slab_active(int device) {
+ // a copy fails while ANY live slab's grants are incomplete -- even between two fully granted devices.  A
+ // destination outside every slab is always fine (plain memory peer copies stage inside the driver).
+ // false => stage the copy through pinned host memory.
+-bool ggml_cuda_slab_peer_copy_ok(const void * dst, size_t nbytes) {
++bool ggml_cuda_peer_copy_ok(const void * dst, size_t nbytes) {
+     if (dst == nullptr || nbytes == 0) {
+         return true;
+     }
++    // crash #373: the VMM POOL is the second user of the same grant machinery (a per-context allocation pool is
++    // not part of a slab), so its ranges answer too.  Both answers are required.
++    if (!ggml_cuda_pool_peer_copy_ok(dst, nbytes)) {
++        return false;
++    }
+     std::lock_guard<std::mutex> lock(g_slab_mutex);
+     int      n_live  = 0;
+     uint32_t pending = 0;                         // device ids that have a live slab
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index 7570a3b06..b2253eba7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -26,13 +26,18 @@ bool   ggml_cuda_slab_configured();
+ // Is the slab live on THIS device?  (The gate can be on while a device failed to create one.)  Used to
+ // keep the generic OOM path from churning the arena, which cannot help under the slab.
+ bool   ggml_cuda_slab_active    (int device);
+-// May `[dst, dst+nbytes)` be the destination of a raw cross-device peer copy?  A peer copy into a slab range
+-// the driver's grants do not cover FAULTS the GPU instead of returning an error (the grant is best effort:
+-// three ~29 GiB slabs leave the peers no free VRAM to build it), and the slab check is process-wide because
+-// a copy fails while ANY live slab's grants are incomplete -- even between two fully granted devices.  A
+-// destination outside every slab is always fine (plain memory peer copies stage inside the driver).
++// May `[dst, dst+nbytes)` be the destination of a raw cross-device peer copy?  A peer copy into a slab OR POOL
++// range the driver's grants do not cover FAULTS the GPU instead of returning an error (the grant is best effort:
++// three ~29 GiB slabs leave the peers no free VRAM to build it), and the check is process-wide because a copy
++// fails while ANY live range's grants are incomplete -- even between two fully granted devices.  A destination
++// outside every slab and pool is always fine (plain memory peer copies stage inside the driver).
++// Covers both VMM users: the movable-boundary slab (ggml-cuda-slab.cu) and the per-context allocation pool
++// (ggml-cuda.cu, crash #373 -- two co-owner contexts own a pool each and grant peers best effort, exactly like
++// the slab, so the same query must know their ranges).
+ // false => stage the copy through pinned host memory.
+-bool   ggml_cuda_slab_peer_copy_ok(const void * dst, size_t nbytes);
++bool   ggml_cuda_peer_copy_ok(const void * dst, size_t nbytes);
++// The pool half of `ggml_cuda_peer_copy_ok` (implemented in ggml-cuda.cu, where the pool lives).
++bool   ggml_cuda_pool_peer_copy_ok(const void * dst, size_t nbytes);
+ // The slab declined because `work estimate + cache floor` does not fit.  The expert cache must then stream
+ // the experts from the host instead of building an arena a wide prefill would have to evict wholesale.
+ bool   ggml_cuda_slab_cache_unusable(int device);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ec5569136..6a45735ed 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1318,6 +1318,87 @@ static ggml_cuda_pool_trace_map & ggml_cuda_pool_trace() {
+     return t;
+ }
+ 
++//
++// crash #373: the VMM POOL's peer-access grants, and the query the cross-device copy paths use.
++//
++// A pool mapping is granted READWRITE to its own device and, BEST EFFORT, to every peer -- the same rule the
++// movable-boundary slab already follows (`ggml_cuda_vmm_map_phys` in ggml-cuda-slab.cu), and for the same measured
++// reason: on a box whose MoE arena has taken nearly all VRAM the driver can refuse to build a peer mapping, and
++// `cuMemSetAccess` then returns `invalid argument`.  The slab learned this the hard way -- granting every descriptor
++// in ONE call meant a single refused peer poisoned the whole grant -- so the rule there is: grant the owner alone,
++// then each peer on its own, keep the mask of what was actually granted, and let the copy path STAGE the pairs the
++// driver refused.  The pool did not do any of that: it granted all descriptors in one call and wrapped it in a
++// CU_CHECK, so a refused grant ABORTED the process.  It was invisible while one context existed (its pools are
++// created and grown during load and the first reserve, before the arena fills); the two-arm server (block 17) adds a
++// SECOND context whose pools grow at request time, when the arena is full -- measured: `HipVMM Failure: invalid
++// argument` in `alloc()` from `mul_mat_q`, ~2 s into the first request, and only with the arena on
++// (`MOE_EXPERT_CACHE_MIB=0` clean) and only with the pair (pair OFF clean).
++//
++// The registry below lets `ggml_cuda_peer_copy_ok()` answer for pool destinations exactly as it does for slabs.
++struct ggml_cuda_pool_peer_range {
++    const void * pool;
++    uintptr_t    base;
++    size_t       size;
++    uint32_t     mask;   // physical devices that hold READWRITE on this range
++};
++
++static std::mutex                            g_pool_peer_mutex;
++static std::vector<ggml_cuda_pool_peer_range> g_pool_peer_ranges;
++
++// Register (or update) one pool's range and grant mask.  `mask` is the intersection of every grant the pool has
++// ever made, so it is pessimistic on purpose: a wrong "yes" faults the GPU, which nothing can catch.
++static void ggml_cuda_pool_peer_register(const void * pool, uintptr_t base, size_t size, uint32_t mask) {
++    std::lock_guard<std::mutex> lock(g_pool_peer_mutex);
++    for (auto & r : g_pool_peer_ranges) {
++        if (r.pool == pool) {
++            r.base = base;
++            r.size = size;
++            r.mask = mask;
++            return;
++        }
++    }
++    g_pool_peer_ranges.push_back({ pool, base, size, mask });
++}
++
++static void ggml_cuda_pool_peer_unregister(const void * pool) {
++    std::lock_guard<std::mutex> lock(g_pool_peer_mutex);
++    for (size_t i = 0; i < g_pool_peer_ranges.size(); i++) {
++        if (g_pool_peer_ranges[i].pool == pool) {
++            g_pool_peer_ranges.erase(g_pool_peer_ranges.begin() + (ptrdiff_t) i);
++            return;
++        }
++    }
++}
++
++// Pool destinations: process-wide and pessimistic, like the slab's answer -- a peer copy fails while ANY live
++// range's grants are incomplete, so every live pool's mask is intersected.
++bool ggml_cuda_pool_peer_copy_ok(const void * dst, size_t nbytes) {
++    if (dst == nullptr || nbytes == 0) {
++        return true;
++    }
++    std::lock_guard<std::mutex> lock(g_pool_peer_mutex);
++    uint32_t pending = 0;
++    uint32_t common  = ~0u;
++    bool     in_pool = false;
++    const uintptr_t lo = (uintptr_t) dst;
++    const uintptr_t hi = lo + nbytes - 1;
++    for (const auto & r : g_pool_peer_ranges) {
++        if (r.base == 0 || r.size == 0) {
++            continue;
++        }
++        pending |= r.mask;
++        common  &= r.mask;
++        if (hi >= r.base && lo <= r.base + r.size - 1) {
++            in_pool = true;
++        }
++    }
++    if (!in_pool) {
++        // outside every pool: nothing here can fault, the slab (or the driver) decides
++        return true;
++    }
++    return (common & pending) == pending;
++}
++
+ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
+ 
+@@ -1330,6 +1411,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+ #if defined(GGML_USE_HIP)
+     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
+ #endif
++    // crash #373: intersection of every peer grant this pool has made (bit per PHYSICAL device).  A refused peer
++    // keeps owner access only; the copy path then stages the copies that pair cannot make (see the registry above).
++    uint32_t peer_mask = ~0u;
+ 
+     explicit ggml_cuda_pool_vmm(int device) :
+         device(device),
+@@ -1338,6 +1422,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+     }
+ 
+     ~ggml_cuda_pool_vmm() {
++        ggml_cuda_pool_peer_unregister(this);
+         if (pool_addr != 0) {
+             if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+                 g_pool_mapped[device].fetch_sub(pool_size, std::memory_order_relaxed);
+@@ -1426,16 +1511,58 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+                     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                     access_descs.push_back(access);
+                 }
+-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size()));
++                // crash #373: grant the OWNER first, then each peer ON ITS OWN -- the slab's rule, for the reason the
++                // slab records: one refused peer descriptor poisons a single all-descriptors call, which used to read
++                // as "the pool is broken" and now reads as "stage the copies between these two devices".  A refused
++                // peer keeps owner access only and the mask drops that device (see ggml_cuda_peer_copy_ok).
++                {
++                    GGML_ASSERT(!access_descs.empty());
++                    // the OWNER's descriptor is located explicitly: the list is in device order, so for device 1 and 2
++                    // the owner is not at the front (a peer is), and granting "the front" would grant a peer first --
++                    // and CU_CHECK it, which is the very abort this change removes.
++                    size_t i_own = 0;
++                    for (size_t i = 0; i < access_descs.size(); i++) {
++                        if ((int) access_descs[i].location.id == physical_device) {
++                            i_own = i;
++                            break;
++                        }
++                    }
++                    // owner access is not optional: a range nobody may write is not a range we can serve
++                    CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access_descs[i_own], 1));
++                    uint32_t granted = 1u << (uint32_t) physical_device;
++                    for (size_t i = 0; i < access_descs.size(); i++) {
++                        if (i == i_own) {
++                            continue;
++                        }
++                        if (cuMemSetAccess(start_ptr, reserve_size, &access_descs[i], 1) != cudaSuccess) {
++                            (void) cudaGetLastError();
++                            static std::set<std::pair<int,int>> warned;
++                            const int peer_phys = (int) access_descs[i].location.id;
++                            if (warned.insert({ device, peer_phys }).second) {
++                                GGML_LOG_WARN("%s: device %d: peer access to a %.1f MiB pool mapping on device %d was "
++                                        "refused (the arena has taken the VRAM), so copies that pair stages through host "
++                                        "memory; the grant stays best effort, exactly as for the slab\n",
++                                        __func__, device, (double) reserve_size / 1048576.0, peer_phys);
++                            }
++                            continue;
++                        }
++                        granted |= 1u << (uint32_t) access_descs[i].location.id;
++                    }
++                    peer_mask &= granted;
++                }
+             } else {
+-                // set access for non P2P
++                // set access for non P2P: owner only, so no peer copy may target this range (see the registry)
+                 CUmemAccessDesc access = {};
+                 access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                 access.location.id = physical_device;
+                 access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                 CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access, 1));
++                peer_mask &= 1u << (uint32_t) physical_device;
+             }
+ 
++            // crash #373: register what was actually granted, before the range becomes allocatable
++            ggml_cuda_pool_peer_register(this, (uintptr_t) pool_addr, pool_size + reserve_size, peer_mask);
++
+             // add to the pool
+             pool_size += reserve_size;
+             if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+@@ -2028,7 +2155,6 @@ static ggml_cuda_async_input_origin & ggml_cuda_async_input_origin_locked(ggml_c
+     auto it = d.origins.find(key);
+     if (it == d.origins.end()) {
+         it = d.origins.emplace(key, ggml_cuda_async_input_origin()).first;
+-        it->second.stream = cudaStreamPerThread;
+         if (g_async_input_dbg) {
+             fprintf(stderr, "AIN origin: dev=%d key=%llx thread=%llx origins=%zu\n", device,
+                     ggml_cuda_ain_tid(key), ggml_cuda_ain_tid(std::this_thread::get_id()), d.origins.size());
+@@ -2058,6 +2184,22 @@ static bool ggml_cuda_async_input_arm_locked(ggml_cuda_async_input_dev & d, ggml
+             }
+         }
+     }
++    // crash #373: this origin's uploads go on a stream of its OWN, not on `cudaStreamPerThread`.
++    //
++    // The ordering does not depend on the handle: `ev`/`flush_ev` are recorded where the work is issued and every
++    // consumer waits on the EVENT (see the note on `ggml_cuda_async_input_origin`).  What the sentinel DID do is
++    // couple these uploads to the legacy default stream, and HIP refuses an operation on that stream while ANOTHER
++    // thread has a capture in flight -- the two-arm server (`--prefill-decode-arms`, block 17) captures on one arm
++    // while the other arm stages inputs, and the failure surfaces as `operation not permitted when stream is
++    // capturing` -> `operation failed due to a previous error during capture` on the next kernel launch.  Measured
++    // on the 3-device `-sm tensor` pair (host tier, `-ncmoe 48`, ~86 s in) as a failed `set_input` in
++    // `llm_graph_input_ple`.  A private non-blocking stream is invisible to the peer's capture.
++    // Leaked at exit like this origin's events (there is no origin teardown; bounded by the thread count).
++    if (o.stream == nullptr && cudaStreamCreateWithFlags(&o.stream, cudaStreamNonBlocking) != cudaSuccess) {
++        (void) cudaGetLastError();
++        o.stream = nullptr;
++        return false;
++    }
+     if (o.ev == nullptr && cudaEventCreateWithFlags(&o.ev, cudaEventDisableTiming) != cudaSuccess) {
+         (void) cudaGetLastError();
+         o.ev = nullptr;
+@@ -2643,7 +2785,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+ #ifdef GGML_CUDA_NO_PEER_COPY
+             return false;
+ #else
+-            if (!ggml_cuda_slab_peer_copy_ok(dst->data, ggml_nbytes(src))) {
++            if (!ggml_cuda_peer_copy_ok(dst->data, ggml_nbytes(src))) {
+                 ggml_cuda_peer_copy_staged(src_ctx->device, cudaStreamPerThread,
+                                            dst_ctx->device, cudaStreamPerThread,
+                                            dst->data, src->data, ggml_nbytes(src));
+@@ -8550,7 +8692,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+ // peer mapping, and `cuMemSetAccess` returns `invalid argument`).  The failure is not catchable: without
+ // peer access enabled HIP returns an error host-side, and with `GGML_CUDA_P2P=1` the copy is issued and the
+ // GPU FAULTS (`HSA_STATUS_ERROR_MEMORY_FAULT` in `__amd_rocclr_copyBuffer`, "Page not present"), which
+-// kills the process.  So the copy path asks `ggml_cuda_slab_peer_copy_ok` first and stages the copy through
++// kills the process.  So the copy path asks `ggml_cuda_peer_copy_ok` first and stages the copy through
+ // pinned host memory for the pairs the driver refused.
+ //
+ // One grow-only buffer and one done-event per (src, dst) pair.  The D2H runs on the source stream and the
+@@ -8665,7 +8807,7 @@ static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src,
+             return false;
+ #else
+             // a peer copy the driver's grants do not cover faults the GPU, so ask first
+-            if (!ggml_cuda_slab_peer_copy_ok(dst->data, ggml_nbytes(dst))) {
++            if (!ggml_cuda_peer_copy_ok(dst->data, ggml_nbytes(dst))) {
+                 ggml_cuda_peer_copy_staged(cuda_ctx_src->device, cuda_ctx_src->stream(),
+                                            cuda_ctx_dst->device, cuda_ctx_dst->stream(),
+                                            dst->data, src->data, ggml_nbytes(dst));
+-- 
+2.56.1
+
+
+From 431365ec5574cde39da2e3b75aa36d9a001f1257 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 22 Nov 2026 17:36:43 -0600
+Subject: [PATCH 4/5] crash #373 fix (candidate), part 4 + TODO #366: the
+ synchronous host paths stop using the cudaStreamPerThread sentinel, and the
+ pair's slab reserve is derived from the ubatch width
+
+(1) ggml_cuda_host_stream(): one private non-blocking stream per (thread, device) for every SYNCHRONOUS host<->device
+path (set/get tensor, memset, the bounce and peer-staging copies, the KV-region row moves) -- 53 sites.  HIP maps
+cudaStreamPerThread onto the legacy DEFAULT stream, which a peer context's graph capture claims device-wide, so a host
+copy from the other arm of the pair is refused: measured as 'operation not permitted when stream is capturing' in
+llm_graph_input_ple::set_input on the host tier, i.e. the same class as the async-input ring.  The async ring's origin
+now uses that same stream, so the ordering the sentinel used to provide (a get_tensor syncs the stream a queued upload
+will run on) is preserved.
+
+(2) #366: common_arms_dec_reserve() derives the pair's slab reserve instead of returning the flat 3584 MiB -- the flat
+floor plus a WIDTH-keyed tier (0 at -ub <= 1024, 1536 MiB at >= 2048, +256 per doubling) for the prefill arm's
+post-prefill narrow re-reserve, which is the second late narrow view the pair creates.  Measured (Flash-Next, -ncmoe 48,
+-c 131072, arena 13.3 GiB, 3 slots, 71k+23k+800, 2 rounds): 3584 fails, 4096 fails, 5120 CLEAN -- and 5120 is what the
+derivation now prints ('aux=5.00 GiB'), so the host tier needs no knob.  Resident config and the soak gate unaffected.
+
+Also found: the gate's 'pool' arm is VACUOUS (no expert-access census) both with and without this change -- recorded as
+a gate defect, not accepted.
+---
+ common/common.cpp               |  48 ++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu | 148 ++++++++++++++++++--------------
+ 2 files changed, 130 insertions(+), 66 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index be1c1afda..83ad3687f 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1335,15 +1335,59 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
+ // margin this file's other reserves take.  `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` overrides it for both cases.
+ #define LLAMA_ARMS_DEC_RESERVE_MIB_DEFAULT 3584  // the same flat second-context reserve an embedded MTP head gets
+ 
++// TODO #366: the pair creates a SECOND late narrow (decode/verify-width) compute view as well -- the prefill arm
++// re-reserves one after every wide prefill (`process_ubatch`'s post-prefill drop), and it lands after the arena has
++// been re-armed.  That view is the same tier as the decode context's own (`-ub 2048` on the largest model here:
++// 1430.16 and 1430.63 MiB, i.e. the same layout), so the flat reserve is charged ONE MORE of it.  The tier is a
++// measured FLOOR, rounded up to the reserve granularity this file uses, and the direction of the rounding is
++// deliberately upward: over-estimating costs little (the surplus is reclaimed into the arena by `slab_extend` when
++// the late views leave more than `headroom` outside), while under-estimating aborts a request
++// (`graph_reserve: failed to allocate compute buffers` -> `failed to allocate graph`).
++//
++// Measured on the host tier (`-ncmoe 48`, `-c 131072`, arena 13.3 GiB, 3 x R9700, 3 slots, 71k + 23k + an 800-token
++// generation, two rounds):
++//     aux  3584 (flat)  -> fails, ~88 s in, on the post-prefill narrow re-reserve
++//     aux  4096 (+512)  -> fails, same place
++//     aux  5120 (+1536) -> CLEAN, `SLAB_INIT ... aux=5.00 GiB`
++//     6144              -> CLEAN (the manual workaround `WORKLOG.md` 261122.034 recorded)
++// so the derived total is the flat floor plus this tier, which is 5120 on that shape.
++static size_t common_arms_late_narrow_bytes(uint32_t n_ubatch) {
++    // KEYED ON THE WIDTH (TODO #366): a graph at a narrow width is small enough that the flat reserve already covers
++    // both of the pair's late views -- that is the pre-#366 behaviour and it is kept, so a small model or a narrow
++    // ubatch is not charged for VRAM it does not use (a flat charge would take 1.5 GiB of arena from a 4B run).
++    // From `-ub 2048` up the two views together exceed the flat reserve and the extra tier is charged; above 2048 the
++    // ubatch term adds the same +256 MiB per doubling the draft path measured for a wider graph.
++    if (n_ubatch <= 1024) {
++        return 0;
++    }
++    size_t bytes = (size_t) 1536 << 20;
++    for (uint32_t ub = 2048; ub < n_ubatch; ub = ub * 2) {
++        bytes += (size_t) 256 << 20;
++    }
++    return bytes;
++}
++
+ static common_draft_reserve common_arms_dec_reserve(const common_params & params) {
+     common_draft_reserve r;
+     if (params.prefill_decode_arms == 0) {
+         return r;
+     }
+     const char * e = getenv("MOE_EXPERT_CACHE_AUX_RESERVE_MIB");
+-    r.total = (e != nullptr ? (size_t) atoll(e) : (size_t) LLAMA_ARMS_DEC_RESERVE_MIB_DEFAULT) * 1024 * 1024;
++    if (e != nullptr) {
++        r.total = (size_t) atoll(e) * 1024 * 1024;
++        r.ok    = true;
++        r.note  = "prefill-decode arms: MOE_EXPERT_CACHE_AUX_RESERVE_MIB (the decode context's graph reserve plus "
++                  "the prefill arm's post-prefill narrow re-reserve; no KV -- it shares the prefill arm's)";
++        return r;
++    }
++    const size_t late = common_arms_late_narrow_bytes(params.n_ubatch);
++    r.total = ((size_t) LLAMA_ARMS_DEC_RESERVE_MIB_DEFAULT << 20) + late;
+     r.ok    = true;
+-    r.note  = "prefill-decode arms: the decode context's graph reserve (no KV: it shares the prefill arm's)";
++    r.note  = "prefill-decode arms: the decode context's graph reserve (" +
++              std::to_string(LLAMA_ARMS_DEC_RESERVE_MIB_DEFAULT) + " MiB, no KV: it shares the prefill arm's)" +
++              (late != 0 ? " plus " + std::to_string(late >> 20) +
++                           " MiB for the prefill arm's post-prefill narrow re-reserve (#366, derived from the "
++                           "ubatch width)" : "");
+     return r;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6a45735ed..07239afc1 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -181,6 +181,29 @@ int ggml_cuda_get_device() {
+     return id;
+ }
+ 
++// crash #373: the stream the SYNCHRONOUS host <-> device paths use (set_tensor, get_tensor, memset, the bounce and
++// peer-staging copies, the KV-region row moves).  It is NOT `cudaStreamPerThread`: HIP maps that sentinel onto the
++// legacy DEFAULT stream, and a graph capture claims the device's default stream, so a host copy issued by the other
++// arm of a co-owner pair (block 17) is refused -- measured on the 3-device `-sm tensor` pair as
++// `operation not permitted when stream is capturing` from `llm_graph_input_ple::set_input`, after which every launch
++// on the device failed.  A private non-blocking stream per (thread, device) is invisible to a peer's capture, and the
++// two arms then stop serialising each other's uploads as a bonus.  Every caller below SYNCHRONISES before returning,
++// so the stream choice carries no ordering; it only decides who is allowed to issue the copy.
++static cudaStream_t ggml_cuda_host_stream() {
++    static thread_local cudaStream_t streams[GGML_CUDA_MAX_DEVICES] = {};
++    const int device = ggml_cuda_get_device();
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return ggml_cuda_host_stream();   // never expected: keep the old behaviour rather than crash
++    }
++    if (streams[device] == nullptr) {
++        if (cudaStreamCreateWithFlags(&streams[device], cudaStreamNonBlocking) != cudaSuccess) {
++            (void) cudaGetLastError();
++            streams[device] = ggml_cuda_host_stream();
++        }
++    }
++    return streams[device];
++}
++
+ static bool ggml_cuda_env_flag(const char * name) {
+     const char * env = getenv(name);
+     return env != nullptr && std::atoi(env) != 0;
+@@ -2001,8 +2024,8 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+ 
+         if (padded_size > original_size) {
+             ggml_cuda_set_device(ctx->device);
+-            CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
+-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++            CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, ggml_cuda_host_stream()));
++            CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         }
+     }
+     return GGML_STATUS_SUCCESS;
+@@ -2013,8 +2036,8 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+ 
+     ggml_cuda_set_device(ctx->device);
+     ggml_cuda_async_input_drain(ctx->device);
+-    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ // GGML_CUDA_ASYNC_INPUT=1: graph inputs (small host -> device writes into a compute buffer) are staged through a
+@@ -2044,7 +2067,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+ // The ring BYTES stay per device, so they are guarded separately: a slot is reused only after every origin's
+ // issued copies have drained AND every origin's queued (not yet issued) uploads have been issued and drained.
+ struct ggml_cuda_async_input_origin {
+-    cudaStream_t stream       = nullptr;   // the issuing stream (`cudaStreamPerThread`: a sentinel, not an identity)
++    cudaStream_t stream       = nullptr;   // the issuing stream (`ggml_cuda_host_stream()`: a sentinel, not an identity)
+     cudaEvent_t  ev           = nullptr;   // recorded after the last per-copy upload on `stream`
+     bool         pending      = false;
+     cudaEvent_t  done_ev      = nullptr;   // recorded on `done_stream` when that graph_compute returns
+@@ -2184,21 +2207,18 @@ static bool ggml_cuda_async_input_arm_locked(ggml_cuda_async_input_dev & d, ggml
+             }
+         }
+     }
+-    // crash #373: this origin's uploads go on a stream of its OWN, not on `cudaStreamPerThread`.
++    // crash #373: this origin's uploads go on the private per-(thread, device) stream, NOT on `cudaStreamPerThread`.
+     //
+-    // The ordering does not depend on the handle: `ev`/`flush_ev` are recorded where the work is issued and every
+-    // consumer waits on the EVENT (see the note on `ggml_cuda_async_input_origin`).  What the sentinel DID do is
+-    // couple these uploads to the legacy default stream, and HIP refuses an operation on that stream while ANOTHER
+-    // thread has a capture in flight -- the two-arm server (`--prefill-decode-arms`, block 17) captures on one arm
+-    // while the other arm stages inputs, and the failure surfaces as `operation not permitted when stream is
+-    // capturing` -> `operation failed due to a previous error during capture` on the next kernel launch.  Measured
+-    // on the 3-device `-sm tensor` pair (host tier, `-ncmoe 48`, ~86 s in) as a failed `set_input` in
+-    // `llm_graph_input_ple`.  A private non-blocking stream is invisible to the peer's capture.
+-    // Leaked at exit like this origin's events (there is no origin teardown; bounded by the thread count).
+-    if (o.stream == nullptr && cudaStreamCreateWithFlags(&o.stream, cudaStreamNonBlocking) != cudaSuccess) {
+-        (void) cudaGetLastError();
+-        o.stream = nullptr;
+-        return false;
++    // It is the SAME stream `ggml_cuda_host_stream()` hands the synchronous host paths, which keeps the ordering the
++    // old code got from the sentinel (a `get_tensor` after a queued upload syncs the stream that will carry it).  What
++    // the sentinel also did -- and must not -- is couple these copies to the legacy DEFAULT stream, which HIP refuses
++    // an operation on while another thread has a capture in flight: the two-arm server captures on one arm while the
++    // other stages inputs.  A private non-blocking stream is invisible to a peer's capture.
++    if (o.stream == nullptr) {
++        o.stream = ggml_cuda_host_stream();
++        if (o.stream == nullptr) {
++            return false;
++        }
+     }
+     if (o.ev == nullptr && cudaEventCreateWithFlags(&o.ev, cudaEventDisableTiming) != cudaSuccess) {
+         (void) cudaGetLastError();
+@@ -2568,13 +2588,13 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+         for (size_t done = 0; done < size; done += ggml_cuda_pin_chunk_bytes) {
+             const size_t n = std::min(ggml_cuda_pin_chunk_bytes, size - done);
+             memcpy(pin, (const char *) data + done, n);
+-            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + done, pin, n, cudaMemcpyHostToDevice, cudaStreamPerThread));
+-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + done, pin, n, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
++            CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         }
+         return;
+     }
+-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+@@ -2589,14 +2609,14 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+         (pin = ggml_cuda_pin_chunk(ctx->device, lock)) != nullptr) {
+         for (size_t done = 0; done < size; done += ggml_cuda_pin_chunk_bytes) {
+             const size_t n = std::min(ggml_cuda_pin_chunk_bytes, size - done);
+-            CUDA_CHECK(cudaMemcpyAsync(pin, (const char *) tensor->data + offset + done, n, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync(pin, (const char *) tensor->data + offset + done, n, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++            CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+             memcpy((char *) data + done, pin, n);
+         }
+         return;
+     }
+-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ // Load-path 2-D staging: a grow-only pinned buffer per device, reused across the tensors of a model
+@@ -2666,20 +2686,20 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+             for (size_t e = 0; e < n_copies; ++e) {
+                 memcpy((char *) pin + e * size, (const char *) data + e * stride_data, size);
+             }
+-            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, pin, compact, cudaMemcpyHostToDevice, cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, pin, compact, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
+         } else {
+             memcpy(pin, data, full);
+             CUDA_CHECK(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, pin, stride_data, size, n_copies,
+-                    cudaMemcpyHostToDevice, cudaStreamPerThread));
++                    cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
+         }
+-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         if (one_shot) {
+             CUDA_CHECK(cudaFreeHost(pin));   // a cached staging buffer is kept for the next tensor
+         }
+         return;
+     }
+-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
+@@ -2699,8 +2719,8 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+         for (size_t e0 = 0; e0 < n_copies; e0 += rows) {
+             const size_t n = std::min(rows, n_copies - e0);
+             CUDA_CHECK(cudaMemcpy2DAsync(pin, size, (const char *) tensor->data + offset + e0 * stride_tensor, stride_tensor,
+-                    size, n, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++                    size, n, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++            CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+             for (size_t e = 0; e < n; ++e) {
+                 memcpy((char *) data + (e0 + e) * stride_data, pin + e * size, size);
+             }
+@@ -2708,8 +2728,8 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+         return;
+     }
+     CUDA_CHECK(cudaMemcpy2DAsync(
+-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+@@ -2731,10 +2751,10 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer,
+             data[i],
+             sizes[i],
+             cudaMemcpyHostToDevice,
+-            cudaStreamPerThread));
++            ggml_cuda_host_stream()));
+     }
+ 
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer, const struct ggml_tensor * const * tensors, void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+@@ -2756,10 +2776,10 @@ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer,
+             (const char *) tensors[i]->data + offsets[i],
+             sizes[i],
+             cudaMemcpyDeviceToHost,
+-            cudaStreamPerThread));
++            ggml_cuda_host_stream()));
+     }
+ 
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ // defined further down: the staged (pinned host bounce) cross-device copy, used for the slab peer pairs the
+@@ -2780,21 +2800,21 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
+         if (src_physical == dst_physical) {
+-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, ggml_cuda_host_stream()));
+         } else {
+ #ifdef GGML_CUDA_NO_PEER_COPY
+             return false;
+ #else
+             if (!ggml_cuda_peer_copy_ok(dst->data, ggml_nbytes(src))) {
+-                ggml_cuda_peer_copy_staged(src_ctx->device, cudaStreamPerThread,
+-                                           dst_ctx->device, cudaStreamPerThread,
++                ggml_cuda_peer_copy_staged(src_ctx->device, ggml_cuda_host_stream(),
++                                           dst_ctx->device, ggml_cuda_host_stream(),
+                                            dst->data, src->data, ggml_nbytes(src));
+             } else {
+-                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
++                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), ggml_cuda_host_stream()));
+             }
+ #endif
+         }
+-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         return true;
+     }
+     return false;
+@@ -2836,17 +2856,17 @@ static bool ggml_backend_cuda_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer,
+         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx_i->device);
+         if (src_physical == dst_physical) {
+-            CUDA_CHECK(cudaMemcpyAsync(dsts[i]->data, srcs[i]->data, ggml_nbytes(srcs[i]), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync(dsts[i]->data, srcs[i]->data, ggml_nbytes(srcs[i]), cudaMemcpyDeviceToDevice, ggml_cuda_host_stream()));
+         } else {
+ #ifdef GGML_CUDA_NO_PEER_COPY
+             GGML_ABORT("peer copy not supported");
+ #else
+-            CUDA_CHECK(cudaMemcpyPeerAsync(dsts[i]->data, dst_physical, srcs[i]->data, src_physical, ggml_nbytes(srcs[i]), cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyPeerAsync(dsts[i]->data, dst_physical, srcs[i]->data, src_physical, ggml_nbytes(srcs[i]), ggml_cuda_host_stream()));
+ #endif
+         }
+     }
+ 
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+     return true;
+ }
+ 
+@@ -2855,8 +2875,8 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
+ 
+     ggml_cuda_set_device(ctx->device);
+     ggml_cuda_async_input_drain(ctx->device);
+-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
+@@ -3900,8 +3920,8 @@ static char * ggml_cuda_kv_region_dev_stage(int device, size_t need, std::unique
+ static void ggml_backend_cuda_kv_region_rows_to_host(ggml_backend_cuda_buffer_context * ctx, const char * src, void * data,
+         size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     if (stride_tensor == size && stride_data == size) {
+-        CUDA_CHECK(cudaMemcpyAsync(data, src, (n_copies - 1) * stride_tensor + size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        CUDA_CHECK(cudaMemcpyAsync(data, src, (n_copies - 1) * stride_tensor + size, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++        CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         return;
+     }
+     if (size * n_copies >= ggml_cuda_bounce_min()) {   // GGML_CUDA_BOUNCE_MIN=0 keeps the per-row arm selectable
+@@ -3915,9 +3935,9 @@ static void ggml_backend_cuda_kv_region_rows_to_host(ggml_backend_cuda_buffer_co
+                     ggml_cuda_kv_region_stage_max) / size);
+             for (size_t e0 = 0; e0 < n_copies; e0 += rows) {
+                 const size_t n = std::min(rows, n_copies - e0);
+-                ggml_cuda_cpy_2d_rows(stage, src + e0 * stride_tensor, size, n, stride_tensor, size, cudaStreamPerThread);
+-                CUDA_CHECK(cudaMemcpyAsync(pin, stage, n * size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++                ggml_cuda_cpy_2d_rows(stage, src + e0 * stride_tensor, size, n, stride_tensor, size, ggml_cuda_host_stream());
++                CUDA_CHECK(cudaMemcpyAsync(pin, stage, n * size, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++                CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+                 for (size_t e = 0; e < n; ++e) {
+                     memcpy((char *) data + (e0 + e) * stride_data, pin + e * size, size);
+                 }
+@@ -3927,9 +3947,9 @@ static void ggml_backend_cuda_kv_region_rows_to_host(ggml_backend_cuda_buffer_co
+     }
+     for (size_t e = 0; e < n_copies; ++e) {
+         CUDA_CHECK(cudaMemcpyAsync((char *) data + e * stride_data, src + e * stride_tensor, size, cudaMemcpyDeviceToHost,
+-                cudaStreamPerThread));
++                ggml_cuda_host_stream()));
+     }
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ // the write direction is the mirror image: pack the host rows into the pinned chunk, one 1-D H2D per chunk, then
+@@ -3941,8 +3961,8 @@ static void ggml_backend_cuda_kv_region_rows_from_host(ggml_backend_cuda_buffer_
+         size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data, size_t offset) {
+     if (stride_tensor == size && stride_data == size) {
+         CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, (n_copies - 1) * stride_data + size,
+-                cudaMemcpyHostToDevice, cudaStreamPerThread));
+-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++                cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
++        CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         return;
+     }
+     if (size * n_copies >= ggml_cuda_bounce_min() && ggml_cuda_stage_pin_on) {
+@@ -3959,10 +3979,10 @@ static void ggml_backend_cuda_kv_region_rows_from_host(ggml_backend_cuda_buffer_
+                 for (size_t e = 0; e < n; ++e) {
+                     memcpy(pin + e * size, (const char *) data + (e0 + e) * stride_data, size);
+                 }
+-                CUDA_CHECK(cudaMemcpyAsync(stage, pin, n * size, cudaMemcpyHostToDevice, cudaStreamPerThread));
++                CUDA_CHECK(cudaMemcpyAsync(stage, pin, n * size, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
+                 ggml_cuda_cpy_2d_rows((char *) tensor->data + offset + e0 * stride_tensor, stage, size, n, size,
+-                        stride_tensor, cudaStreamPerThread);
+-                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++                        stride_tensor, ggml_cuda_host_stream());
++                CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+             }
+             return;
+         }
+@@ -3976,9 +3996,9 @@ static void ggml_backend_cuda_kv_region_rows_from_host(ggml_backend_cuda_buffer_
+     }
+     for (size_t e = 0; e < n_copies; ++e) {
+         CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + e * stride_tensor, (const char *) data + e * stride_data,
+-                size, cudaMemcpyHostToDevice, cudaStreamPerThread));
++                size, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
+     }
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static void ggml_backend_cuda_kv_region_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+-- 
+2.56.1
+
+
+From fdc58fc7890fab1a05a64e4ac5eb30e091b33293 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 22 Nov 2026 18:34:19 -0600
+Subject: [PATCH 5/5] TODO #365: the Meta buffer gets a per-child, split-aware
+ `cpy_tensor_n` -- a `-sm tensor` hybrid's state handover is a device copy
+ (1.4-3.3 ms) instead of a 112.57 MiB host round trip (72-77 ms)
+
+`llama_memory_recurrent::seq_state_take()` hands one sequence's recurrent rows between the two arms of the
+prefill/decode pair as ONE `ggml_backend_tensor_copy_n()` over 2-D row views it builds OUT OF GRAPH; those views are
+registered in no simple-tensor container, and the Meta buffer exposed neither `cpy_tensor` nor `cpy_tensor_n`, so
+`can_take_batched()` refused the batched take and every boundary on a `-sm tensor` hybrid took the serialised
+fallback (`state_write()` -> host -> `state_read()`): 112.57 MiB, 72-77 ms, in TTFT.
+
+The hook is per CHILD: the split state of the view's ROOT (the tensor the memory allocated, which IS registered) says
+which byte range of a row belongs to which child, and each child's own buffer takes a plain copy of its rows --
+both sides are children of the SAME layout, so a child's covered rows are one contiguous range even when the split
+state is segmented/repeated (Qwen3.8-Flash-Next's state is one segment repeated 3 or 5 times, i.e. the chunks are
+interleaved inside the row on both sides, identically).  A shape the planner cannot express that way is staged
+through the host via the root, never partially copied.  `cpy_tensor` (the single-tensor hook) stays null on purpose:
+`can_copy_tensor()` is satisfied by either hook, the take only uses the batched one, and the single-tensor hook would
+silently reroute the KV-park and state-staging copies that take the host path today.
+
+`LLAMA_RS_VERIFY_TAKE=1` now instruments WHICHEVER arm runs (it used to see only the serialised fallback), and
+`LLAMA_RS_VERIFY_TAKE_DUMP=<file>` appends each verified destination blob so two arms can be compared with cmp(1).
+
+Measured (Qwen3.8-Flash-Next IQ4_NL, 3 devices, `-sm tensor`, the maintainer's shape):
+  * take 1.4-1.9 ms interleaved (3.0-3.3 ms with the verify capture), first take in a process ~5.5 ms, against
+    72-77 ms serialised -- 40-50x, and it no longer lands in TTFT;
+  * VERIFY: 0 of 118 039 420 byte(s) differ (cell metadata included) -- FAITHFUL;
+  * the same turn driven SERIAL + ARM_TEMP=0 once per arm: the per-take destination dumps are BYTE-IDENTICAL
+    (708 236 592 B, 6 takes) and all three requests' generated text is byte-identical;
+  * `gate-ckpt-reuse.sh` PASS on 1 GPU `-sm layer` and on 3 GPUs `-sm tensor`, `gate-state-pipe.sh` PASS,
+    `gate-arms-soak.sh soak --quick` PASS 11/11 with the text oracle.
+---
+ ggml/src/ggml-backend-meta.cpp | 343 ++++++++++++++++++++++++++++++++-
+ src/llama-context.cpp          | 161 ++++++++++------
+ 2 files changed, 444 insertions(+), 60 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index fd41e635d..86d851a25 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2972,6 +2972,347 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
+     }
+ }
+ 
++// TODO #365: the Meta buffer's per-child, split-aware device copy (`cpy_tensor_n`).
++//
++// The recurrent handover of the two-arm server (block 17) moves one sequence's state from one context's memory to
++// the other's with ONE `ggml_backend_tensor_copy_n()` over 2-D row views that `llama_memory_recurrent::
++// seq_state_take()` builds OUT OF GRAPH.  Those views carry `buffer`/`data` by hand and are registered in NO
++// simple-tensor container, so the host paths here (`set_tensor`/`get_tensor`) cannot resolve them at all -- and
++// because this buffer exposed no copy hook, `llama_memory_recurrent::can_take_batched()` refused the batched take
++// and every handover on a `-sm tensor` hybrid was a host round trip of the whole state (112.57 MiB, ~74 ms, in
++// TTFT; the fallback is still the A/B control `LLAMA_RS_FORCE_SERIALISED=1`).
++//
++// A Meta copy has to be per CHILD: the split state of the view's ROOT -- the tensor the memory allocated, which IS
++// registered -- says which byte range of a row belongs to which child, and each child's own buffer then takes a
++// plain copy of its rows.  (Both sides of a copy are children of the SAME layout, so a child's covered rows are one
++// contiguous range even when the split state is segmented/repeated: the interleaving is INSIDE that range,
++// identically on both sides.)  A shape the planner cannot express that way -- a per-device/partial split, a padded
++// child row, a non-contiguous view -- is staged through the host via the ROOT, i.e. what the serialised arm does for
++// those bytes.  It is NEVER partially copied: a half-moved recurrent state is fluent-but-wrong text, the worst
++// outcome this repo allows.
++//
++// `cpy_tensor` (the single-tensor hook) stays null deliberately.  `ggml_backend_buffer_can_copy_tensor()` is
++// satisfied by either hook and the take only ever uses the batched one; adding the single-tensor hook would
++// silently reroute the KV-park and state-staging copies that take the host path today (they have their own gates and
++// are not part of this change), so this buffer advertises exactly the capability it implements.
++static bool ggml_backend_meta_copy_root_range(const struct ggml_tensor * tensor,
++        struct ggml_tensor ** root, size_t * off, size_t * len) {
++    if (tensor == nullptr || tensor->data == nullptr) {
++        return false;
++    }
++    // the chain root: the take's views are `ggml_view_2d()` over the memory's own tensor, with `buffer`/`data`
++    // assigned by hand, so the root -- not the view -- is what every container knows about
++    struct ggml_tensor * r = const_cast<struct ggml_tensor *>(tensor);
++    for (int guard = 0; guard < 64 && r->view_src != nullptr; ++guard) {
++        r = r->view_src;
++    }
++    if (r->data == nullptr || r->buffer == nullptr) {
++        return false;
++    }
++    const size_t base = (size_t) r->data;
++    const size_t addr = (size_t) tensor->data;
++    if (addr < base) {
++        return false;
++    }
++    const size_t o = addr - base;
++    const size_t n = ggml_nbytes(tensor);
++    if (n > ggml_nbytes(r) || o > ggml_nbytes(r) - n) {
++        return false;
++    }
++    // the copied bytes have to be ONE range of the root: a view of packed whole rows is, a permuted view is not
++    if (n > 0 && !ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    *root = r;
++    *off  = o;
++    *len  = n;
++    return true;
++}
++
++struct ggml_backend_meta_copy_chunk {
++    size_t child; // index of the child buffer the bytes live in
++    size_t off;   // byte offset inside that child's simple tensor
++    size_t len;   // contiguous bytes
++};
++
++struct ggml_backend_meta_copy_side {
++    struct ggml_tensor * root = nullptr; // the allocated tensor the copied range lives in (nullptr: unresolved)
++    size_t off = 0;                      // where the range starts inside `root`
++    size_t len = 0;
++    bool   device = false;               // `chunk` is usable: one contiguous range per child
++    // diagnostics only (GGML_META_DEBUG_CPY), so a staged copy says WHY it was not per child
++    int      axis = GGML_BACKEND_SPLIT_AXIS_NONE;
++    uint32_t n_segments = 0;
++    uint32_t nr0 = 0;
++    size_t   n_bufs = 0;
++    const char * why = "ok";
++    std::vector<ggml_backend_meta_copy_chunk> chunk;
++};
++
++// TODO #365: the per-child plan for ONE side of a copy.  `false` means the range is not resolvable at all (the
++// caller declines); `true` with `device == false` means "staged through the host", never "partly copied".
++static bool ggml_backend_meta_copy_plan(struct ggml_tensor * tensor, ggml_backend_meta_copy_side & side) {
++    side = ggml_backend_meta_copy_side();
++
++    struct ggml_tensor * root = nullptr;
++    if (!ggml_backend_meta_copy_root_range(tensor, &root, &side.off, &side.len)) {
++        return false;
++    }
++    side.root = root;
++
++    if (!ggml_backend_buffer_is_meta(root->buffer) || side.len == 0) {
++        side.why = "a host/other root, or nothing to copy";
++        return true;
++    }
++
++    // whole rows of a contiguous root only: the row is the smallest unit the split state describes
++    const size_t row_stride = root->nb[1];
++    if (!ggml_is_contiguous(root) || row_stride == 0 ||
++            tensor->ne[0] != root->ne[0] || tensor->nb[1] != row_stride ||
++            side.off % row_stride != 0 || side.len % row_stride != 0) {
++        side.why = "not whole packed rows of a contiguous root";
++        return true;
++    }
++    const size_t r0    = side.off / row_stride;
++    const size_t nrows = side.len / row_stride;
++
++    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(root->buffer);
++    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(root, /*assume_sync =*/ false);
++    side.axis = (int) ss.axis;
++    side.n_segments = ss.n_segments;
++    side.nr0 = ss.nr[0];
++    side.n_bufs = n_bufs;
++
++    auto child = [&](size_t j) { return ggml_backend_meta_buffer_simple_tensor(root, j); };
++
++    if (ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
++        // every child holds the whole tensor: the same byte range in each
++        for (size_t j = 0; j < n_bufs; ++j) {
++            struct ggml_tensor * c = child(j);
++            if (c == nullptr || c->nb[1] != row_stride) {
++                side.why = "mirrored, but a child is missing or has a different row stride";
++                side.chunk.clear();
++                return true;
++            }
++            side.chunk.push_back({j, side.off, side.len});
++        }
++        side.device = true;
++        return true;
++    }
++
++    if (ss.axis != GGML_BACKEND_SPLIT_AXIS_0 && ss.axis != GGML_BACKEND_SPLIT_AXIS_1) {
++        // a per-device / partial / unknown split: stage it (the host paths serve a registered root)
++        side.why = "a per-device, partial or non-row split";
++        return true;
++    }
++
++    if (ss.axis == GGML_BACKEND_SPLIT_AXIS_0) {
++        // A row is dealt to the children in chunks -- for the recurrent state of a `-sm tensor` hybrid, one segment
++        // repeated `nr[0]` times (3 and 5 on Qwen3.8-Flash-Next) -- and each child PACKS its own chunks in its own
++        // row.  Both sides of this copy are children of the SAME layout, so a child's covered rows are ONE
++        // contiguous range on each side: the interleaving lives inside that range, identically on both, and does
++        // not have to be walked (walking it costs `nr[0]` copies per row per child, which is what made the first
++        // cut of this hook 3.5 ms instead of ~1 ms).  What must hold is that the children's rows tile the root's
++        // row exactly, and that no child row is padded.
++        size_t row_total = 0;
++        for (size_t j = 0; j < n_bufs; ++j) {
++            struct ggml_tensor * c = child(j);
++            if (c == nullptr || c->nb[1] != ggml_row_size(c->type, c->ne[0]) ||
++                    (int64_t) (r0 + nrows) > c->ne[1]) {
++                side.why = "axis 0, but a child row is padded or the row range leaves the child";
++                side.chunk.clear();
++                return true;
++            }
++            row_total += (size_t) c->nb[1];
++            side.chunk.push_back({j, r0*(size_t) c->nb[1], nrows*(size_t) c->nb[1]});
++        }
++        if (row_total != row_stride) {
++            side.why = "axis 0, but the children's rows do not tile the root's row";
++            side.chunk.clear();
++            return true;
++        }
++        side.device = true;
++        return true;
++    }
++
++    // axis 1: whole rows are dealt to the children in bands, so each child takes its overlap with the row range
++    if (ss.n_segments != 1 || ss.nr[0] != 1) {
++        side.why = "axis 1 with segments/repeats";
++        return true;
++    }
++    int64_t row_base = 0;
++    for (size_t j = 0; j < n_bufs; ++j) {
++        struct ggml_tensor * c = child(j);
++        if (c == nullptr || c->nb[1] != row_stride) {
++            side.why = "axis 1, but a child is missing or has a different row stride";
++            side.chunk.clear();
++            return true;
++        }
++        const int64_t rows_j = ss.ne[j];
++        const int64_t lo = std::max<int64_t>((int64_t) r0, row_base);
++        const int64_t hi = std::min<int64_t>((int64_t) (r0 + nrows), row_base + rows_j);
++        if (hi > lo) {
++            side.chunk.push_back({j, (size_t) (lo - row_base)*(size_t) c->nb[1], (size_t) (hi - lo)*(size_t) c->nb[1]});
++        }
++        row_base += rows_j;
++    }
++    if (row_base != root->ne[1]) {
++        side.why = "axis 1, but the child bands do not add up to the root";
++        side.chunk.clear();
++        return true;
++    }
++    side.device = true;
++    return true;
++}
++
++static const char * ggml_backend_meta_copy_debug(void) {
++    return getenv("GGML_META_DEBUG_CPY");
++}
++
++static bool ggml_backend_meta_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer,
++        const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors) {
++    GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
++    if (n_tensors == 0) {
++        return true;
++    }
++
++    static const bool dbg = ggml_backend_meta_copy_debug() != nullptr;
++
++    std::vector<ggml_backend_meta_copy_side> sside(n_tensors);
++    std::vector<ggml_backend_meta_copy_side> dside(n_tensors);
++    std::vector<bool> per_child(n_tensors, false);
++
++    size_t n_device = 0, n_staged = 0, bytes_device = 0, bytes_staged = 0;
++
++    for (size_t i = 0; i < n_tensors; ++i) {
++        if (!ggml_backend_meta_copy_plan(const_cast<struct ggml_tensor *>(srcs[i]), sside[i]) ||
++            !ggml_backend_meta_copy_plan(dsts[i], dside[i])) {
++            // not resolvable: decline and let the caller's own fallback own this shape (nothing copied here)
++            if (dbg) {
++                GGML_LOG_INFO("%s: decline '%s' -> '%s' (no resolvable root range)\n", __func__,
++                        srcs[i] != nullptr ? srcs[i]->name : "null", dsts[i] != nullptr ? dsts[i]->name : "null");
++            }
++            return false;
++        }
++
++        // the two sides only pair up when they resolve to the SAME children with the same extents (one model, two
++        // contexts: they should, and a mismatch is staged rather than guessed)
++        bool device = sside[i].device && dside[i].device &&
++                      sside[i].len == dside[i].len &&
++                      sside[i].chunk.size() == dside[i].chunk.size();
++        for (size_t c = 0; device && c < sside[i].chunk.size(); ++c) {
++            device = sside[i].chunk[c].child == dside[i].chunk[c].child &&
++                     sside[i].chunk[c].len   == dside[i].chunk[c].len;
++        }
++        per_child[i] = device;
++
++        if (device) {
++            ++n_device;
++            bytes_device += sside[i].len;
++        } else {
++            ++n_staged;
++            bytes_staged += sside[i].len;
++        }
++        if (dbg) {
++            GGML_LOG_INFO("%s: %s '%s' -> '%s': %zu B, %zu child chunk(s); src axis %d/%u seg/%zu bufs (%s), "
++                    "dst axis %d/%u seg (%s); src nr0 %u\n", __func__,
++                    device ? "device" : "staged(host)", srcs[i]->name, dsts[i]->name, sside[i].len,
++                    device ? sside[i].chunk.size() : 0,
++                    sside[i].axis, sside[i].n_segments, sside[i].n_bufs, sside[i].why,
++                    dside[i].axis, dside[i].n_segments, dside[i].why, sside[i].nr0);
++        }
++    }
++
++    if (dbg || n_staged > 0) {
++        GGML_LOG_INFO("%s: %zu tensor(s) copied per child (%.2f MiB), %zu staged through the host (%.2f MiB)\n",
++                __func__, n_device, (double) bytes_device/1024.0/1024.0, n_staged,
++                (double) bytes_staged/1024.0/1024.0);
++    }
++
++    // the staged pairs first: a host round trip of the pair's whole range through the ROOT (the registered tensor)
++    if (n_staged > 0) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("%s: %zu tensor(s) (%.2f MiB) of this Meta copy have no contiguous per-child plan, so they are "
++                    "staged through the host (correct, but a round trip).  GGML_META_DEBUG_CPY=1 names the shapes\n",
++                    __func__, n_staged, (double) bytes_staged/1024.0/1024.0);
++        }
++        std::vector<uint8_t> blob;
++        for (size_t i = 0; i < n_tensors; ++i) {
++            if (per_child[i] || sside[i].len == 0) {
++                continue;
++            }
++            if (blob.size() < sside[i].len) {
++                blob.resize(sside[i].len);
++            }
++            ggml_backend_tensor_get(sside[i].root, blob.data(), sside[i].off, sside[i].len);
++            ggml_backend_tensor_set(dside[i].root, blob.data(), dside[i].off, dside[i].len);
++        }
++    }
++
++    if (n_device == 0) {
++        return true;
++    }
++
++    // the device pairs: ONE batched copy over per-child views, so the child backends group it per device and each
++    // device pays one synchronisation for all of its chunks
++    size_t n_chunks = 0;
++    for (size_t i = 0; i < n_tensors; ++i) {
++        if (per_child[i]) {
++            n_chunks += sside[i].chunk.size();
++        }
++    }
++
++    std::vector<const struct ggml_tensor *> csrc;
++    std::vector<struct ggml_tensor *>       cdst;
++    csrc.reserve(n_chunks);
++    cdst.reserve(n_chunks);
++
++    struct ggml_init_params vparams = {
++        /*.mem_size   =*/ 2*n_chunks*ggml_tensor_overhead() + ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    struct ggml_context * vctx = ggml_init(vparams);
++    if (vctx == nullptr) {
++        return false;
++    }
++
++    // a child range as a 1-D view of the child's own simple tensor: `ggml_nbytes()` of the view is exactly the
++    // contiguous range the child backend copies, which is how the CUDA hook already serves the take's own views
++    auto child_view = [&](struct ggml_tensor * c, size_t off, size_t len) -> struct ggml_tensor * {
++        const size_t es   = ggml_type_size(c->type);
++        const size_t blck = ggml_blck_size(c->type);
++        GGML_ASSERT(len % es == 0);
++        const int64_t ne0 = (int64_t) (len/es*blck);
++        struct ggml_tensor * v = ggml_view_1d(vctx, c, ne0, off);
++        GGML_ASSERT(ggml_nbytes(v) == len);
++        return v;
++    };
++
++    for (size_t i = 0; i < n_tensors; ++i) {
++        if (!per_child[i]) {
++            continue;
++        }
++        for (size_t c = 0; c < sside[i].chunk.size(); ++c) {
++            const ggml_backend_meta_copy_chunk & sc = sside[i].chunk[c];
++            const ggml_backend_meta_copy_chunk & dc = dside[i].chunk[c];
++            struct ggml_tensor * src_child = ggml_backend_meta_buffer_simple_tensor(sside[i].root, sc.child);
++            struct ggml_tensor * dst_child = ggml_backend_meta_buffer_simple_tensor(dside[i].root, dc.child);
++            GGML_ASSERT(src_child != nullptr && dst_child != nullptr);
++            csrc.push_back(child_view(src_child, sc.off, sc.len));
++            cdst.push_back(child_view(dst_child, dc.off, dc.len));
++        }
++    }
++
++    ggml_backend_tensor_copy_n(csrc.data(), cdst.data(), csrc.size());
++
++    ggml_free(vctx);
++
++    return true;
++}
++
+ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
+     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
+     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
+@@ -2986,7 +3327,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
+     /* .reset           = */ ggml_backend_meta_buffer_reset,
+     /* .set_tensor_n    = */ NULL,
+     /* .get_tensor_n    = */ NULL,
+-    /* .cpy_tensor_n    = */ NULL,
++    /* .cpy_tensor_n    = */ ggml_backend_meta_buffer_cpy_tensor_n,
+ };
+ 
+ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 92ec39c84..9309da6fd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -5551,8 +5551,10 @@ public:
+                 }
+             }
+             if (!llama_state_copy_staged(lctx, jobs)) {
+-                // upstream's batched copy is the fallback (a meta buffer has no cpy_tensor_n, so it lands on the
+-                // per-tensor path - which is why the staged band above exists)
++                // upstream's batched copy is the fallback.  The staged band above is what a meta buffer takes on
++                // purpose (one pageable allocation + a synchronise per piece is the cliff r157 removed); this call
++                // serves the pieces whose window did not fit, and since TODO #365 the meta buffer HAS a
++                // `cpy_tensor_n`, so those land on per-child device copies instead of per-tensor host copies
+                 std::vector<const ggml_tensor *> srcs(mbuf_cur.org.begin(), mbuf_cur.org.end());
+                 std::vector<ggml_tensor *> dsts(mbuf_cur.cpy.begin(), mbuf_cur.cpy.end());
+                 ggml_backend_tensor_copy_n(srcs.data(), dsts.data(), mbuf_cur.org.size());
+@@ -7188,6 +7190,96 @@ bool llama_memory_seq_state_take(
+         return e != nullptr && atoi(e) != 0;
+     }();
+ 
++    // wip/prefill-decode-arms (diagnostic, LLAMA_RS_VERIFY_TAKE=1): is the transfer FAITHFUL?  This runs for
++    // WHICHEVER arm performs the take -- the batched device copy or the serialised state move -- because it is the
++    // only instrument that can tell a correct handover from a fluent-but-wrong one (`GREEDY-PURITY.md` §89).  The
++    // source's state is captured BEFORE the take (the take releases the source's rows), the destination's is read
++    // back after it, and the two are diffed: a difference inside the cell metadata (the first 4 + 8*cell_count
++    // bytes) is placement, not state; a difference in the rows means the destination is not the source's state.
++    // `LLAMA_RS_VERIFY_TAKE_DUMP=<file>` additionally appends each verified destination blob (with its seq id and
++    // length), so the same turn driven once per arm can be compared BYTE FOR BYTE with cmp(1).
++    static const bool verify_take = [] {
++        const char * e = getenv("LLAMA_RS_VERIFY_TAKE");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    static const char * const verify_dump = getenv("LLAMA_RS_VERIFY_TAKE_DUMP");
++
++    auto state_blob = [seq_id](llama_memory_recurrent * recr) {
++        llama_io_write_dummy dummy(/* skip_tensors = */ false);
++        recr->state_write(dummy, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++        std::vector<uint8_t> blob(dummy.n_bytes());
++        if (!blob.empty()) {
++            llama_io_write_host wio(blob.data(), blob.size());
++            recr->state_write(wio, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++        }
++        return blob;
++    };
++
++    auto verify_move = [seq_id](llama_memory_recurrent * dst_recr, const std::vector<uint8_t> & blob) {
++        const size_t size = blob.size();
++        llama_io_write_dummy dummy2(/* skip_tensors = */ false);
++        dst_recr->state_write(dummy2, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++        const size_t size2 = dummy2.n_bytes();
++
++        std::vector<uint8_t> blob2(size2);
++        if (size2 != 0) {
++            llama_io_write_host wio2(blob2.data(), blob2.size());
++            dst_recr->state_write(wio2, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++        }
++
++        if (verify_dump != nullptr) {
++            if (FILE * f = fopen(verify_dump, "ab")) {
++                const uint32_t sid = (uint32_t) seq_id;
++                const uint64_t n   = (uint64_t) size2;
++                fwrite(&sid, sizeof(sid), 1, f);
++                fwrite(&n,   sizeof(n),   1, f);
++                if (size2 != 0) {
++                    fwrite(blob2.data(), 1, size2, f);
++                }
++                fclose(f);
++            }
++        }
++
++        // the metadata a RECR_ONLY write emits: u32 cell_count, then (i32 pos, u32 n_seq_id) per cell
++        uint32_t n_cells = 0;
++        if (size >= sizeof(n_cells)) {
++            memcpy(&n_cells, blob.data(), sizeof(n_cells));
++        }
++        const size_t meta_size = std::min(size, sizeof(uint32_t) + (size_t) n_cells * (sizeof(int32_t) + sizeof(uint32_t)));
++
++        size_t n_diff = 0, n_diff_meta = 0, first = (size_t) -1;
++        if (size2 != size) {
++            LLAMA_LOG_ERROR("%s: VERIFY size mismatch: source %zu, destination %zu\n", __func__, size, size2);
++        } else {
++            for (size_t i = 0; i < size; ++i) {
++                if (blob[i] != blob2[i]) {
++                    if (first == (size_t) -1) {
++                        first = i;
++                    }
++                    ++n_diff;
++                    if (i < meta_size) {
++                        ++n_diff_meta;
++                    }
++                }
++            }
++        }
++        LLAMA_LOG_INFO("%s: VERIFY seq %d: %zu of %zu byte(s) differ (%zu in the %zu-byte cell metadata), "
++                "first at %zd; the source rows are %s\n",
++                __func__, (int) seq_id, n_diff, size, n_diff_meta, meta_size, (ssize_t) first,
++                n_diff == 0 ? "FAITHFUL" : (n_diff == n_diff_meta ? "re-placed (metadata only)" : "NOT the source's state"));
++
++        if (n_diff > n_diff_meta) {
++            char lines[512];
++            size_t pos = 0;
++            int shown = 0;
++            for (size_t i = first; i < size && shown < 8; i += 4096) { // one sample per 4 KiB window
++                pos += snprintf(lines + pos, sizeof(lines) - pos, " %zu:%02x/%02x", i, blob[i], blob2[i]);
++                ++shown;
++            }
++            LLAMA_LOG_INFO("%s: VERIFY bytes (offset:src/dst):%s\n", __func__, lines);
++        }
++    };
++
+     // wip/prefill-decode-arms: a handover can move a sequence's CELLS (the reverse handover and a checkpoint
+     // restore the peer performed both re-place them), while qwen4exp's derived indexer pool is laid out FROM
+     // those cells (`kpool_by_order` pools consecutive cells).  The raw indexer keys are shared and authoritative,
+@@ -7201,9 +7293,15 @@ bool llama_memory_seq_state_take(
+     };
+ 
+     if (!force_serialised && dst_recr->can_take_batched(*src_recr)) {
++        // captured before the take: the take releases the source's rows
++        const std::vector<uint8_t> blob_src =
++            (verify_take || verify_dump != nullptr) ? state_blob(src_recr) : std::vector<uint8_t>();
+         if (!dst_recr->seq_state_take(*src_recr, seq_id)) {
+             return false;
+         }
++        if (verify_take || verify_dump != nullptr) {
++            verify_move(dst_recr, blob_src);
++        }
+         note_idx();
+         return true;
+     }
+@@ -7249,63 +7347,8 @@ bool llama_memory_seq_state_take(
+ 
+     src_recr->seq_rm(seq_id, -1, -1);
+ 
+-    // wip/prefill-decode-arms (diagnostic, LLAMA_RS_VERIFY_TAKE=1): is the transfer FAITHFUL?  Re-read the
+-    // destination's state into a second blob and diff it against the source's.  A difference inside the cell
+-    // metadata (the first 4 + 8*cell_count bytes) is placement, not state; a difference in the rows means the
+-    // destination is not the source's state and the decode arm is decoding from something else.
+-    static const bool verify_take = [] {
+-        const char * e = getenv("LLAMA_RS_VERIFY_TAKE");
+-        return e != nullptr && atoi(e) != 0;
+-    }();
+-    if (verify_take) {
+-        llama_io_write_dummy dummy2(/* skip_tensors = */ false);
+-        dst_recr->state_write(dummy2, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
+-        const size_t size2 = dummy2.n_bytes();
+-
+-        std::vector<uint8_t> blob2(size2);
+-        {
+-            llama_io_write_host wio2(blob2.data(), blob2.size());
+-            dst_recr->state_write(wio2, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
+-        }
+-
+-        // the metadata a RECR_ONLY write emits: u32 cell_count, then (i32 pos, u32 n_seq_id) per cell
+-        uint32_t n_cells = 0;
+-        if (size >= sizeof(n_cells)) {
+-            memcpy(&n_cells, blob.data(), sizeof(n_cells));
+-        }
+-        const size_t meta_size = std::min(size, sizeof(uint32_t) + (size_t) n_cells * (sizeof(int32_t) + sizeof(uint32_t)));
+-
+-        size_t n_diff = 0, n_diff_meta = 0, first = (size_t) -1;
+-        if (size2 != size) {
+-            LLAMA_LOG_ERROR("%s: VERIFY size mismatch: source %zu, destination %zu\n", __func__, size, size2);
+-        } else {
+-            for (size_t i = 0; i < size; ++i) {
+-                if (blob[i] != blob2[i]) {
+-                    if (first == (size_t) -1) {
+-                        first = i;
+-                    }
+-                    ++n_diff;
+-                    if (i < meta_size) {
+-                        ++n_diff_meta;
+-                    }
+-                }
+-            }
+-        }
+-        LLAMA_LOG_INFO("%s: VERIFY seq %d: %zu of %zu byte(s) differ (%zu in the %zu-byte cell metadata), "
+-                "first at %zd; the source rows are %s\n",
+-                __func__, (int) seq_id, n_diff, size, n_diff_meta, meta_size, (ssize_t) first,
+-                n_diff == 0 ? "FAITHFUL" : (n_diff == n_diff_meta ? "re-placed (metadata only)" : "NOT the source's state"));
+-
+-        if (n_diff > n_diff_meta) {
+-            char lines[512];
+-            size_t pos = 0;
+-            int shown = 0;
+-            for (size_t i = first; i < size && shown < 8; i += 4096) { // one sample per 4 KiB window
+-                pos += snprintf(lines + pos, sizeof(lines) - pos, " %zu:%02x/%02x", i, blob[i], blob2[i]);
+-                ++shown;
+-            }
+-            LLAMA_LOG_INFO("%s: VERIFY bytes (offset:src/dst):%s\n", __func__, lines);
+-        }
++    if (verify_take || verify_dump != nullptr) {
++        verify_move(dst_recr, blob);
+     }
+ 
+     LLAMA_LOG_INFO("%s: took seq %d as a serialised state move (%.2f MiB: %.2f ms out, %.2f ms in, %.2f ms total)\n",
+-- 
+2.56.1
+

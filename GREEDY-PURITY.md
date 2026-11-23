@@ -3081,3 +3081,79 @@ because a granularity change moves the logits of every shape it reaches.
 **Record.**  This entry; `benchmarks/2026-11-21-ffn-even-split.md`; `scripts/gate-ffn-even-split.sh`;
 `patches/README.md` block 09; `WORKLOG.md` 261121.017; §3 (the per-device-count text reference) and §46 (the
 point-sensitivity calibration this extends from a kernel family to a split granularity).
+
+## 105 (r346, block 17) — a BUDGETED arena is the residency class; an `auto` arena makes a two-arm text claim vacuous, and "same text across three regimes" is an observation
+
+**Claim.**  A text comparison between the two-arm server and the single-context server is an oracle **only
+when both arms sit in the SAME residency class**.  On a host-expert tier the expert cache's admission is a
+prior-dependent, capacity-dependent STATE (§89): an `auto` arena lets the pair and the single context land in
+different classes (the pair's decode context reserves graph memory the single context does not), so the two
+texts differ for a reason that has nothing to do with the change under test.  A **budgeted** arena
+(`MOE_EXPERT_CACHE_MIB`, MiB **per device**, floor 2048) pins both arms into one class, and then the comparison
+is exact.
+
+**Rule.**  Any host-tier text claim for the pair names the arena budget and reports the **cache hit census of
+both arms**.  If the two arms' `h` differs, the pair of texts is not an oracle — re-run with a budget that puts
+them in one class (or say the claim is about a different class).  Never compare across an `auto` arena.
+
+**Numbers** (gfx1201, 3 GPU `-sm tensor`, maintainer's shape incl. `-c 204800 --parallel 3`):
+
+* **budgeted** `MOE_EXPERT_CACHE_MIB=13653` (40 GiB total): `h` **0.9352 / 0.9352** (single / pair), text
+  **identical** `121ff7b5af176297` — PASS on all 3 capped arms;
+* the same shapes with an `auto` arena: the arms differ in residency class, so the text pair is **not**
+  decidable and was recorded as such, not as a failure;
+* `-ncmoe 48` on one GPU, four models, default arena: `h` **0.6235/0.6295** (35B-A3B),
+  **0.3489/0.3492** (Flint), **0.4815/0.4840** (Gemma4 26B-A4B), **0.3413/0.3414** (Flash-Next IQ4_NL) — every
+  row non-vacuous (a `h` of 0.0000 would mean nothing was gathered and the arm proved nothing) and text
+  identical in each row.
+
+**Also recorded here:** **a co-batched two-slot pair is not a text oracle.**  Two resident conversations on
+`--kv-unified` that are *never* co-batched in one step are a valid oracle (`TWO_SLOT=1`), but two slots resuming
+**concurrently** in the same step are `CONCURRENT=1`: **stress only, no text claim** — the same rule as §63, and
+the reuse gate states it in its own help.
+
+**And a weaker one, because it will be quoted as if it were stronger:** *the same text across three residency
+regimes is an observation, not a claim.*  The campaign saw identical text at full residency, at a 40 GiB
+budgeted host tier and on a streamed shape.  Three regimes agreeing is evidence that nothing gross moved; it
+is **not** a per-regime reference, because each regime is its own class (§38, §89, this entry).  A per-regime
+claim needs the base build's own text **in that regime**.
+
+**Record.**  This entry; `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` passes 12/17;
+`patches/README.md` block 17; `MANIFESTS.md` block-17 row; `WORKLOG.md` 261122.027; §38, §63, §89.
+
+## 106 (r348, block 17) — an external draft head keeps its own cache and moves no token, and "the same model" is the wrong test for `ctx_other`
+
+**Claim.**  A speculative draft that is a **separate GGUF** (the shared-NextN MTP head) is its own `llama_model`
+object, and `ctx_other` is how it names its target.  Two things follow, and both are purity rules:
+
+1. it is **not** a memory co-owner.  `ctx_other_share_memory` needs a context of the SAME model; sharing a
+   different model's cells is silent garbage because a cell belongs to its own model's layer layout.  The
+   constructor therefore adopts a same-model `ctx_other`, **declines** a cross-model one (the draft keeps its own
+   cache, exactly as before block 17's generic arm existed) and refuses only the contradictory combination.
+2. it **moves no token**.  A drafter that changes the target's greedy text is a defect, not a speed: the
+   comparison `--spec-type none` vs `--spec-type draft-mtp` on the same seed must be byte-identical, and the
+   draft acceptance must be non-zero so the comparison is not two plain runs wearing different flags.
+
+**Rule.**  Any change to the context constructor's `ctx_other` adoption, or to `common/speculative.cpp`'s draft
+context, runs `scripts/gate-draft-ctx.sh`: the external head loads, `none == draft-mtp` byte for byte (repeated,
+pinned), the census shows the DECLINE line and a non-zero acceptance, and no same-model refusal.  **A gate that
+can take an external head but defaults to an embedded one does not cover this class** — that is exactly how
+r346 shipped a build where every separate-MTP-head server died at load while the ladder was green.
+
+**Numbers** (gfx1201, Flash-Next GSQ-RCO IQ3_S + the Unsloth shared Q8_0 MTP head, `-ncmoe 48`,
+`MOE_EXPERT_HEATMAP=load`, `ROCBLAS_USE_HIPBLASLT=0`, `--spec-draft-n-max 2`, `-n 128`, seed 42, temp 0):
+
+* 1 device `-sm layer`: `none` == `draft-mtp` == `552 chars e7aae6034b4f`, two repeats; acceptance **0.80-0.85**
+  (mean len 2.6-2.7); decode **34.0 -> 48.0 t/s**;
+* 3 devices `-sm tensor`: `none` == `draft-mtp` == `645 chars af9171d90336`, two repeats; acceptance **0.77**;
+  decode **40.0 -> 65.3 t/s**.  The two device counts read different texts, which is a tensor split's own
+  property, not a drafter's (a greedy text is a per-device-count reference, `AGENTS.md`);
+* the r347 build fails the gate at construction (`ctx_other must be a context of the same model`), 8 of 11 checks.
+
+**Also recorded here:** the **embedded** head is unaffected by the rule and still takes the generic same-model
+arm (`-lv 4`: `this context is the draft of the named context (generic)`), with Protocol A on both affected axes
+at `-n 3000` reading `none` == `draft-mtp` (`6468 chars 6ed44a2da7b3` prose, `13121 chars 166f7d8b97bc` code) and
+acceptance 0.824 / 0.876 — i.e. the amendment is bit-neutral for it.
+
+**Record.**  This entry; `scripts/gate-draft-ctx.sh` (its header carries the arms and the negative control);
+`INVARIANTS.md` r348; `WORKLOG.md` 261122.038; `patches/README.md` block 17; issue #351.
