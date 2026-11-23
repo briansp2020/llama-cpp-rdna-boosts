@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 00:12:06 +0000
-Subject: [PATCH 12/29] qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy
+Subject: [PATCH 12/30] qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy
  (LLAMA_QSA3_DIRECT_F16); gate copy before attention on prefill-sized graphs
  so Qcur_full dies early (LLAMA_GATE_EARLY)
 
@@ -15,6 +15,8 @@ Subject: [PATCH 12/29] qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy
 (cherry picked from commit 370df4b340385aef697ae4b57190a5d3d6235a6b)
 (cherry picked from commit fc98741dab43d6a21a4e8aae614e9e1ea8f7aaeb)
 (cherry picked from commit 9be82c283b877ae643736e49bc2f988e595c903a)
+(cherry picked from commit 525be6e7511a28e7483b449e6e8ae7cd01f98e61)
+(cherry picked from commit 998b82208f5f60a6721dc2fa3ec8d11a1e96ccd1)
 ---
  ggml/src/ggml-cuda/cpy.cu       | 29 +++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda.cu |  3 +++
@@ -76,10 +78,10 @@ index 6e1fda1127..5a3dca7936 100644
          ggml_cpy_f32_q4_0_cuda
                  (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d103fd5c21..c5c0b6f6e8 100644
+index 83625908b7..46f229585f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -11523,6 +11523,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -11706,6 +11706,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                  if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
                      return true;
                  }

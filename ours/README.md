@@ -1,19 +1,19 @@
-# ours: our production stack on top of the current rdna-boosts release (r345)
+# ours: our production stack on top of the current rdna-boosts release (r349)
 
 This branch holds the patch series we run on top of the latest rdna-boosts release: 2x Radeon AI PRO R9700,
 ROCm 10.2, Qwen3.8-Flash-Next UD-IQ4_XS with `-sm tensor` and `--host-experts mmap`. It is regenerated for each
 release, and patches the release has taken are dropped. It is not a PR. Everything else on this branch is the
 release as published; only `ours/` is added.
 
-**Base:** `v17-919794500-r345` (upstream llama.cpp `919794500` + this repo's release).
+**Base:** `v18-919794500-r349` (upstream llama.cpp `919794500` + this repo's release).
 
 ```
 git checkout 919794500
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r345 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 29 patches (0001-0029)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r349 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 30 patches (0001-0030)
 ```
 
-Result: tree `1e5f79108063`. This is the production build since 2026-11-22 2:15 PM PST.
+Result: tree `5ccd8f34b2ce`. This is the production build since 2026-11-22 8:40 PM PST.
 
 ## How the series is organised
 
@@ -22,7 +22,7 @@ Result: tree `1e5f79108063`. This is the production build since 2026-11-22 2:15 
   Our code lives in two included files, `moe-expert-tier.inc` and `moe-expert-tier-state.inc`, and runs only for
   sparse (mmap) tables. Pool and pinned tables run the release's own code. The tier code covers the RAM tier, the
   pin budget, KV lending, the fill fence, batched admissions and the device remap for sparse tables.
-- **0004-0029** are one feature each, in the order they were added.
+- **0004-0029** are one feature each, in the order they were added. **0030** is a build fix for the release.
 - A fix to one of our patches goes into that patch, not into a new one. A later patch that touches an earlier
   one's code adds a feature of its own, with its own switch.
 - Every behaviour change has an environment switch. The table gives the value that turns it off (or the opt-in).
@@ -32,7 +32,7 @@ Result: tree `1e5f79108063`. This is the production build since 2026-11-22 2:15 
 
 | | what | switch (off) |
 |---|---|---|
-| 0001 | everything outside `moe-expert-cache.cu`: scheduler, server, MoE / GDN / shared-expert fusions, dedup, slab allocator, the KV lending hooks in llama, the checkpoint pool (`common_state_data`, pages touched by the pool thread), and the RDNA2 rows-abreast K loop in our MoE kernel | per feature; `GGML_CUDA_MOE_ROWS_ABREAST=0` |
+| 0001 | everything outside `moe-expert-cache.cu`: scheduler, server, MoE / GDN / shared-expert fusions, dedup, slab allocator, the KV lending hooks in llama, the checkpoint pool (`common_state_data`, pages touched by the pool thread), and the RDNA2 rows-abreast K loop in our MoE kernel. Our strided-upload fallback uses the release's host stream (`ggml_cuda_host_stream()`) | per feature; `GGML_CUDA_MOE_ROWS_ABREAST=0` |
 | 0002 | the mmap expert-cache tier code in `moe-expert-tier.inc` / `moe-expert-tier-state.inc`, not yet called. Its namespace-scope env flags are initialised by named functions, not lambdas: clang can give lambdas in different reopened anonymous namespaces of one TU the same symbol, so one flag would read another's variable | per feature |
 | 0003 | the hooks: the release's `moe-expert-cache.cu` calls the tier code for sparse tables. Also: the device remap and the tier remap predicate refuse a table whose fill failed; identity (fully resident) tables are served in place above the band (warn-once `MOE_INPLACE_MISS` tripwire); a table counts as pool-backed only when the pool was requested; the release's fused prefill and take-over promise work with tier tables (gate/up lanes with different remaps count as mixed) | per feature; `MOE_EXPERT_PREFILL_IN_PLACE=0`, `GGML_MOE_POOL_TABLE_REQ=0` |
 | 0004 | layer split with pipeline parallelism overlaps the devices on ROCm: prompt ubatches rebuild their graph, and host inputs go through a pinned per-(backend, copy) ring uploaded on the split's stream; opt-in `GGML_GALLOC_FP_SHAPES=0`, `LLAMA_KV_N_PAD_PREFILL_POW2=1` | `LLAMA_PP_PREFILL_NO_REUSE=0`, `GGML_SCHED_INPUT_STAGE=0` |
@@ -61,6 +61,7 @@ Result: tree `1e5f79108063`. This is the production build since 2026-11-22 2:15 
 | 0027 | server: when the last prompt chunk is the checkpoint tail and has the verify width (draft n_max + 1), all its rows are outputs, so the first verify reuses the tail's graph (agent-style 2K extensions -3.4 % time) | `LLAMA_CKPT_TAIL_OUTPUTS=0` |
 | 0028 | mmvq: the dense gate/up + GLU fusion at the verify width (2-8 tokens, RDNA4), the launch also publishing the down projection's Q8_1 input; the shared expert's 3 launches per layer become 1; bit-identical | `GGML_CUDA_DENSE_GLU_VERIFY=0` |
 | 0029 | mmvq-moe (RDNA4): rows per block 8 (8-10 K-blocks) or 4 (11-15) where 2-row blocks leave the last pass partly idle; the Q5_0 MoE down at K 320 goes 48 -> 34 us at 4 tokens; output changes at rounding level (KLD ~0) | `GGML_CUDA_MOE_RPB_K=0` |
+| 0030 | build fix: `ggml_cuda_pool_peer_copy_ok()` for builds without VMM. The release defines it only under `GGML_USE_VMM` but the slab calls it always, so `-DGGML_HIP_NO_VMM=ON` (the HIP default, and our build) fails to link; without VMM there is no pool range, so it answers true (rdna-boosts issue #353) | - |
 
 ## Production configuration
 
@@ -83,25 +84,26 @@ Settings on top of the defaults that matter for this series:
 
 With 57.6 GiB of host experts, the expert cache holds 68.2 % in VRAM.
 
-## Validation (r345, 2026-11-22)
+## Validation (r349, 2026-11-22)
 
 - The 7-model comparison with the release passes: KLD 0 on 6 of 6, and every multi-turn model / config pair matches
   the release exactly.
 - test-backend-ops: 24106 of 24109. The failures are the two `MUL_MAT_PREC_SRC1_BF16` NaN cases, which the release
   fails identically, and one `MUL_MAT` f16 case.
 - The fault, depth, and 2-GPU layer and tensor arms behave as expected. The expert-cache byte verifier finds 0 differing slots.
-- Production configuration: output identical to the r339 series and to the r343 rebase on every check: greedy,
-  512-token prompt set, 4.3k and 30k-token prompts, and the 259.6k-token needle (6,358).
+- Production configuration: output identical to the r345 series on every check: greedy, 512-token prompt set,
+  4.3k and 30k-token prompts, and the 259.6k-token needle (6,358).
+- The release's two-arm server (`--prefill-decode-arms`, off by default) with KV lending: lending ends when the
+  decode arm attaches to the shared KV, 0 faults.
 - Speed (production configuration, single runs):
 
   | measure | t/s |
   |---|---|
-  | greedy decode | 133-149 |
-  | 512-token prompt set | 141 |
-  | 31.5k prefill | 3677 |
-  | 259.6k prefill | 3315 |
-  | 4.3k prompts, prefill / decode | 2913 / 154 |
+  | greedy decode | 139-154 |
+  | 512-token prompt set | 147 |
+  | 259.6k prefill | 3306 |
+  | 4.3k prompts, prefill / decode | 2901 / 156 |
 
-  All are equal to r343 within noise. The r345 gather bitmap (`MOE_GATHER_MASK`) makes no measurable difference on this configuration.
+  All are equal to r345 within noise.
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.

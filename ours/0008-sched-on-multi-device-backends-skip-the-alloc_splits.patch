@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 17:56:22 +0000
-Subject: [PATCH 08/29] sched: on multi-device backends, skip the alloc_splits
+Subject: [PATCH 08/30] sched: on multi-device backends, skip the alloc_splits
  drain when no buffer grows (GGML_SCHED_DEFER_ALLOC_SYNC)
 
 Every prompt ubatch re-reserves its graph (the KV views grow), and with more than one device (or a META
@@ -22,15 +22,17 @@ GGML_SCHED_DEFER_ALLOC_SYNC=0 restores the drain; 2 = drain right after the new 
 (cherry picked from commit c23d9590d0848b5ff7a066f3f4929f639dcc6702)
 (cherry picked from commit dc8ee8ad4097fa20c2c5dd8f1602bfa89564d78a)
 (cherry picked from commit e237fd66190d3f33aec567604c3ae39988871b98)
+(cherry picked from commit 52ee95727cd090666529ba01b62430a3d90ce3f1)
+(cherry picked from commit 9281c74ffcd3536f19afdab504a17f10927f1655)
 ---
  ggml/src/ggml-backend.cpp | 22 +++++++++++++++++++---
  1 file changed, 19 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 0cce3d6200..a4632f6ef5 100644
+index 8cc506299a..5540001791 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -2844,11 +2844,22 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2848,11 +2848,22 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
          // be using.
          const bool buffers_grown = ggml_gallocr_reserve_n_probe(
                  sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
@@ -56,7 +58,7 @@ index 0cce3d6200..a4632f6ef5 100644
              }
  
              if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-@@ -2860,6 +2871,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2864,6 +2875,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
              GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              return false;
          }

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 20:41:03 +0000
-Subject: [PATCH 27/29] server: checkpoint tail with the verify shape
+Subject: [PATCH 27/30] server: checkpoint tail with the verify shape
  (LLAMA_CKPT_TAIL_OUTPUTS)
 
 When the last prompt chunk is the checkpoint tail and has the verify width (draft n_max + 1), all its rows are outputs, so the first verify reuses the tail graph instead of rebuilding (FINDINGS 1058).
@@ -9,15 +9,17 @@ When the last prompt chunk is the checkpoint tail and has the verify width (draf
 (cherry picked from commit 2854334c119d6fed0319b199f927f33e5d4885f8, without the opt-in LLAMA_CKPT_NEAR_SKIP / LLAMA_CKPT_TAIL_MIN; FINDINGS 1068)
 (cherry picked from commit 3e2894acfd0bdbe1254c390ddced77cf3bb7bc73)
 (cherry picked from commit cd7f7dd5d780171d4e399437228874ca56157f8f)
+(cherry picked from commit d2d29415df3febab3735c1e6b99b44f595f83ba3)
+(cherry picked from commit aba969471dd29923eaf33bd9bfacc5204b50c2b1)
 ---
  tools/server/server-context.cpp | 17 +++++++++++++++++
  1 file changed, 17 insertions(+)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 99e98a9905..78956e6b0a 100644
+index cb036de511..0988fb8627 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -5234,6 +5234,23 @@ private:
+@@ -6017,6 +6017,23 @@ private:
                          // extract the logits only for the last token
                          batch.set_output(batch.size() - 1, true);
  

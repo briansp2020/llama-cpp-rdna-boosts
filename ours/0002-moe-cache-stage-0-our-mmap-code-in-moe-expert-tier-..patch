@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 03:54:06 +0000
-Subject: [PATCH 02/29] moe cache: stage 0: our mmap code in
+Subject: [PATCH 02/30] moe cache: stage 0: our mmap code in
  moe-expert-tier*.inc, not yet hooked in
 
 (cherry picked from commit 53eab4bce495c8fabb6fd1ac58f82a8023d4a43a)
@@ -16,6 +16,9 @@ Subject: [PATCH 02/29] moe cache: stage 0: our mmap code in
 (cherry picked from commit 33aae52e9aa310beb6bcb31b7d28e9531c5fd897)
 
 Folded in: moe tier: namespace-scope env flags initialized by named functions, not lambdas
+
+(cherry picked from commit 5208a3ccc5510538ec98901263d5da6ce64da718)
+(cherry picked from commit 6df269756bb4061984aa1bf49fec61bba5ac377e)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu       |   15 +-
  ggml/src/ggml-cuda/moe-expert-tier-state.inc |   72 +

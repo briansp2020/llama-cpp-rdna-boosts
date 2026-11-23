@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:09:29 +0000
-Subject: [PATCH 19/29] moe cache: KV segment -- one take per request
+Subject: [PATCH 19/30] moe cache: KV segment -- one take per request
  (GGML_MOE_KV_SEG_TAKE1)
 
 With the KV segment the lend line follows the cells in use, so a long
@@ -41,6 +41,9 @@ synchronise, to show where a take spends it.
 (cherry picked from commit ca9c27f2645cb9933e3be5630dbd716e5eef2e9d)
 
 Folded in: moe cache: KV segment phase 2 -- review fixes (source counters, idle hint)
+
+(cherry picked from commit 6f762fb30e47a45a3e4dd631222ab6d3772f3a25)
+(cherry picked from commit ab249bf1180f7ce59ed7f6b4cbbf4a637567dea3)
 ---
  ggml/src/ggml-cuda/moe-expert-tier.inc | 13 +++++++++++--
  src/llama-ext.h                        |  8 ++++++++
@@ -120,7 +123,7 @@ index 860a4281a7..4edd0ea0d2 100644
  // no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
  // attention cells, that cache as well.  A memory without an attention cache: true.
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 4e3c17dca7..f1f80c3599 100644
+index 9512643e72..168fe6a766 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -500,6 +500,7 @@ typedef void (*llama_kv_lend_unregister_t)();
@@ -131,7 +134,7 @@ index 4e3c17dca7..f1f80c3599 100644
  
  //
  // llama_kv_cache
-@@ -1389,13 +1390,33 @@ void llama_kv_cache::lend_need(uint32_t at_least) const {
+@@ -1442,13 +1443,33 @@ void llama_kv_cache::lend_need(uint32_t at_least) const {
          return;
      }
      const auto & cells = v_cells[0];
@@ -166,7 +169,7 @@ index 4e3c17dca7..f1f80c3599 100644
  void llama_kv_cache::init_rotation(const char * name_tag) {
      if (!(n_rot_k || n_rot_v) || layers.empty()) {
          return;
-@@ -2797,6 +2818,7 @@ llama_kv_cache::~llama_kv_cache() {
+@@ -3099,6 +3120,7 @@ llama_kv_cache::~llama_kv_cache() {
          g_kv_lend_owner      = nullptr;
          g_kv_lend_need       = nullptr;
          g_kv_lend_unregister = nullptr;
@@ -175,10 +178,10 @@ index 4e3c17dca7..f1f80c3599 100644
      // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
      // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 281b580ce1..44dc19d4a6 100644
+index a81eaa4336..168dbc1b4e 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
-@@ -309,6 +309,7 @@ public:
+@@ -383,6 +383,7 @@ public:
      void lend_follow(const llama_kv_cache & owner);   // keys-only cache on owner's slot layout: lent by owner's line
      bool lend_follower = false;
      void lend_need(uint32_t at_least) const;   // the next write or read reaches up to row `at_least`
@@ -187,7 +190,7 @@ index 281b580ce1..44dc19d4a6 100644
      //
      // input API
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a8fb22d09d..99e98a9905 100644
+index 9a6351622e..cb036de511 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -24,6 +24,7 @@
@@ -198,7 +201,7 @@ index a8fb22d09d..99e98a9905 100644
  
  #include <algorithm>
  #include <cstddef>
-@@ -4099,6 +4100,8 @@ private:
+@@ -4265,6 +4266,8 @@ private:
  
                  metrics_flush_idle();
  
@@ -207,7 +210,7 @@ index a8fb22d09d..99e98a9905 100644
                  return; // skip further processing
  
              } else {
-@@ -4158,6 +4161,22 @@ private:
+@@ -4324,6 +4327,22 @@ private:
              llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
          }
  

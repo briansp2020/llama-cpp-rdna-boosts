@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 05:52:08 +0000
-Subject: [PATCH 26/29] mmq: Q5_0 expert tables on the RDNA4 routed-compact
+Subject: [PATCH 26/30] mmq: Q5_0 expert tables on the RDNA4 routed-compact
  path with the IQ4_NL bands (prefill reads experts in place, no whole-table
  gather; GGML_MMQ_Q5_0_COMPACT=0: plain path)
 
@@ -11,6 +11,8 @@ Subject: [PATCH 26/29] mmq: Q5_0 expert tables on the RDNA4 routed-compact
 (cherry picked from commit 6e880e98a461e7fa61d1a71dc1dd0ed40c7015a1)
 (cherry picked from commit aed48be3fb903aff974d8a07d295c79dd030c3d9)
 (cherry picked from commit 548649f981950c8ac21fd94e8445d8f748e656a8)
+(cherry picked from commit ed8b12619b59ee276aee768cbe2125b3e5b0cd43)
+(cherry picked from commit 6848017d2a396556cb081c84ee580eaf006bdd52)
 ---
  ggml/src/ggml-cuda/mmq.cu  |  5 ++++-
  ggml/src/ggml-cuda/mmq.cuh | 20 +++++++++++++++++++-

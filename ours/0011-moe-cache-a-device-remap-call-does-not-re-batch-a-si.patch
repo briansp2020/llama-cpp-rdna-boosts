@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 10 Nov 2026 15:28:45 +0000
-Subject: [PATCH 11/29] moe cache: a device-remap call does not re-batch a
+Subject: [PATCH 11/30] moe cache: a device-remap call does not re-batch a
  sibling already taken over in this round (GGML_MOE_DEVREMAP_REBATCH)
 
 A layer whose down (or up) table was not served by the first remap call of
@@ -27,6 +27,8 @@ GGML_MOE_DEVREMAP_REBATCH=1 restores the old re-batch.
 (cherry picked from commit f7645e065268c3c6f80b261981aed0a3ceac1df1)
 (cherry picked from commit 0a7010341c3da7932ba933a249f26ab64c523e09)
 (cherry picked from commit aeb654a75573fb8c3e1171489f6060be716900d1)
+(cherry picked from commit 8d8b84dab55806c7f5027d910e53007f7db69f9d)
+(cherry picked from commit 2a85394f7ebb73d8139e18c67626373856639882)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 13 +++++++++++++
  1 file changed, 13 insertions(+)

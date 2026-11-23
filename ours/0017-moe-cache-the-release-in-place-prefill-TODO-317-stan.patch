@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 18:02:50 +0000
-Subject: [PATCH 17/29] moe cache: the release in-place prefill (TODO #317)
+Subject: [PATCH 17/30] moe cache: the release in-place prefill (TODO #317)
  stands down when a sparse table exists
 
 With any sparse (mmap) table, moe_cache_get_table answers from the tier code, which
@@ -17,6 +17,8 @@ Only reachable with a GTT arena (APU) and mixed tables; inert on discrete GPUs.
 (cherry picked from commit 0a919918fbe9e4a2bc67ae611fdabca029b50f63)
 (cherry picked from commit c5c7086f007aaa84aa9311cf145a652f166d3d92)
 (cherry picked from commit 1053caf036ac734c752c760c184d4049ba7e7476)
+(cherry picked from commit 8b078140f8e8e47be44a5f1d501672f5c6f5147f)
+(cherry picked from commit 0ab7583b552f28d4d596a0691117cfcba516e93d)
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 5 ++++-
  1 file changed, 4 insertions(+), 1 deletion(-)
