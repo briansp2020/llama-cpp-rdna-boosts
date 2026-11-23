@@ -2033,10 +2033,10 @@ Promoted the `prefill-decode-arms` campaign as official **block 17** (`--prefill
    after it.  On a host-expert tier that made the arena refuse the second context (`the decode arm's step
    failed`, `SLAB_INIT ... aux=0`).  The reserve is now declared up front the same way an embedded MTP head's
    draft context declares its own, with **no KV term** (the pair shares one cache): a flat **3584 MiB** via
-   `MOE_EXPERT_CACHE_AUX_RESERVE_MIB`, and a manually set `GGML_CUDA_SLAB_RESERVE_MIB` still wins.  It is
-   **never charged when a speculator is configured** — the pair refuses a speculator, so the reservation would
-   be pure waste (that bug would have cost an MTP run 3.5 GiB).  Measured need for the *derived* form (a
-   follow-up, `TODO` #366): 1792 MiB Flash-Next, 9.52 MiB on the 4B.
+   `MOE_EXPERT_CACHE_AUX_RESERVE_MIB`, and a manually set `GGML_CUDA_SLAB_RESERVE_MIB` still wins.  Measured
+   need for the *derived* form (a follow-up, `TODO` #366): 1792 MiB Flash-Next, 9.52 MiB on the 4B.
+   *(Superseded in part by r350: the pair accepts a speculator now, so the derivation charges the decode arm's
+   reserve PLUS the draft context's — two separate late contexts — instead of keeping the larger of the two.)*
 3. **A BUDGETED arena puts both arms in one RESIDENCY CLASS; an `auto` arena does not.**  A text reference is
    per device count, per split **and per residency class** (§89): with `MOE_EXPERT_CACHE_MIB=13653` (40 GiB
    total) the expert cache's hit rate is **identical between arms** (`h` 0.9352 / 0.9352) and the pair's text
@@ -2203,3 +2203,93 @@ row, `scripts/gate-draft-ctx.sh`, `GREEDY-PURITY.md` §106.
 
 Record: `WORKLOG.md` 261122.039, `scripts/check-windows-portability.sh`, `scripts/README.md`, `MANIFESTS.md`
 (the portability-gate row), `AGENTS.md` scripts row, `patches/README.md` block 17.
+
+## r350 (2026-11-22, `WORKLOG.md` 261122.040) — a speculator ON the two-arm server: the drafter reads the hidden rows of the context that RAN the batch, a verify batch is a co-batched shape, and the pair's text oracle also needs the SAME idle-slot parking policy (block 17, `TODO` #364)
+
+1. **A drafter's target side is per-CONTEXT, not per-model.**  Block 17 refused `--spec-type` because the pair
+   evaluates generation on `ctx_dec` while every drafter read `params.ctx_tgt` (the context the speculator was
+   constructed with).  The rows a drafter consumes (`llama_get_embeddings_nextn`, `..._ith`, `..._rows`, the
+   eagle3/dflash layer inputs) exist only in the context that just ran the batch, so `common_batch` now carries
+   its `ctx` and `common_speculative_process()` reads the rows from it; a second target context is registered with
+   `common_speculative_add_target_ctx()`, which is also what enables the nextn output there.  A batch from an
+   unregistered context is REFUSED with a warning (drafting degrades, the text cannot) rather than read stale.
+   The rule: **a hidden-row read is only valid on the context that produced the last batch** — a second target
+   context is not an optimisation, it is what makes the read well defined.
+2. **The verify width is a DECODE-ARM property, and it must be declared twice.**  `ctx_dec` was sized
+   `n_batch = n_ubatch = n_parallel` (a 1-row-per-slot decode).  A speculative step is a verify batch of
+   `n_parallel × (n_draft + 1)` rows (3 slots at `n_max 3` = 12 rows), so the context is now sized for that and
+   its output limits are raised to the whole width (every verify row is an output).  The slab reserve must follow
+   in the SAME change: `common_arms_dec_reserve()` is the decode arm's own graph reserve, so a speculator on the
+   pair is charged the **sum** of that and the draft context's reserve — before r350 the two were disjoint and
+   the code deliberately kept the larger, which under-charges by a whole draft context now that both exist.
+3. **The draft context's own `llama_process()` is a second DECODE-band context.**  Block 17's rule ("never two
+   decode-band contexts: the per-table `GGML_MOE_DEVREMAP` map is process-wide") was written for two arms; on the
+   pair with a drafter there are three contexts, and the prefill arm's prompt-ingest runs the draft's heads on the
+   main thread *while the decode arm steps*.  That is now bracketed by the same `arms_quiet` handshake a request
+   boundary uses (the decode arm enters no step until the ingest ends).  Measured cost: once per prompt ubatch,
+   bounded by one draft ingest.
+4. **A speculative slot's state does not cross the request boundary.**  The draft, the draft candidates, the
+   target checkpoint and `spec_is_replay` all describe the batch the OTHER arm ran, so the forward handover and
+   the reverse take both clear them (`spec_slot_reset()`), and the prefill arm's `post_decode()` accept loop skips
+   any slot the decode arm owns (it would otherwise read a `spec_i_batch` that thread is writing).
+5. **The pair-vs-single text claim is only an oracle under the SAME placement policy.**  Measured 2026-11-22
+   (27B Q8_0, `-ctk q8_0 -ctv q8_0`, 3 devices `-sm tensor`, `-np 3 --kv-unified`, three cold requests in one
+   process): the pair read `38169dcc3325` on the second request and the single-context server `c3bf1df7aa1d`.
+   The mechanism was **not** the pair and not the speculator: `LLAMA_SERVER_PARK_IDLE_SLOTS` is ON in the single
+   server, so it parked the finished slot's cells and placed the next sequence at cell 0, while the **co-owner
+   guard declines parking on the pair** (`idle slot parking: not supported by this KV cache`) and the sequence
+   was appended at cell 5309.  The `LLAMA_KV_DEBUG_CELLS` census names it exactly (`seq=1 ... runs=0-528` against
+   `runs=5309-5837`), and the SAME single context with `LLAMA_SERVER_PARK_IDLE_SLOTS=0` reads `38169dcc3325`.
+   The rule: **a pair-vs-single text pair must pin the parking policy** (or compare first-request-per-process
+   only) — `GREEDY-PURITY.md` §38's placement artifact, reached through block 16/17's parking guard.
+6. **What the pair still refuses, and why (each is a per-context binding, not a missing feature).**  The
+   layer-input drafters (eagle3/dflash/dspark/dflash2/lilicorr) read the target's per-layer inputs through a
+   device buffer bound to ONE context and to a warm-up decode; a gemma4 assistant shares the target's KV instead
+   of keeping its own, and that cache already has two co-owners.  Both are refused at start-up with a message.
+
+Record: `WORKLOG.md` 261122.040, `scripts/gate-arms-spec.sh`, `MANIFESTS.md` gate 39, `patches/README.md`
+block 17, `ENVIRONMENT.md` §23, `GREEDY-PURITY.md` §107.
+
+## r351 (2026-11-23, `WORKLOG.md` 261123.001) — a shared library LINKS with a symbol nobody defines, and which linker refuses differs: a guarded DEFINITION with an unguarded CALLER is a consumer-side break no build here sees (block 17 amendment 3, issues #353/#354)
+
+1. **A `.so` may carry undefined symbols, so "the library target built" is not a link proof.**  r347's crash-#373
+   work added `ggml_cuda_pool_peer_copy_ok()` to `ggml-cuda-vmm.h`, DEFINED it inside
+   `#if defined(GGML_USE_VMM)` in `ggml-cuda.cu`, and called it unconditionally from `ggml_cuda_peer_copy_ok()`
+   in `ggml-cuda-slab.cu` (a backend-shared file, so the call is in every configuration).  `GGML_USE_VMM` is off
+   for `GGML_HIP_NO_VMM=ON` — the HIP **default** — so from r347 to r350 a stock `-DGGML_HIP=ON` build produced a
+   `libggml-hip.so` that linked (a shared library is allowed to carry undefined symbols) and then failed every
+   executable linking it: `ld.bfd: libggml-hip.so.1.0.0: undefined reference to ggml_cuda_pool_peer_copy_ok`
+   (issue #353, gfx1103 / ROCm 7.16 / GCC 15.2; `test-backend-ops`, `test-sleep`, ... all of them).  The same
+   break existed on the NVIDIA `GGML_CUDA_NO_VMM=ON` path.  The fix is the reporter's: a no-VMM definition that
+   answers "fine" (no pool, so no pool range can hold the destination — the answer the slab already gives for a
+   destination outside every range), defined unconditionally instead of inside the VMM arm.
+2. **WHICH LINKER refuses is a property of the box, and ours does not refuse.**  GNU ld.bfd checks a shared
+   library's undefined symbols by default; lld (what ROCm's clang drives here) does **not**.  Measured on the
+   pre-fix tree, both arms of one no-VMM build: `nm -DC libggml-hip.so` reads `U ggml_cuda_pool_peer_copy_ok`,
+   `clang -fuse-ld=bfd` on a `int main()` against it FAILS with the reporter's exact message, and the same link
+   with the default (lld) **succeeds** — and `cmake --build` of the whole set returned 0 because the library
+   target was simply relinked (the executables were up to date).  So a green ladder on this box is not evidence
+   that a consumer's link works, and the class needs the loader's own report: `scripts/check-shlib-symbols.sh`
+   runs `ldd -r` (linker-independent) over every shipped library and fails on any `undefined symbol:`.  After
+   the fix every library in both builds (default VMM and no-VMM) resolves every symbol; the same check names the
+   symbol on the pre-fix tree (the negative control).
+3. **A guard that is ASYMMETRIC is a link break; a guard that is symmetric is invisible to any build.**  The
+   caller here was unconditional, which is why one configuration's build (and `ldd -r`) sees it.  A caller and a
+   definition both behind the same `#if` compile out together and no build of either configuration can notice:
+   that class still owes a build of the OTHER configuration whenever a guard, a header-declared API or a
+   configuration predicate changes (`MANIFESTS.md` gate 40).
+4. **A "never expected" fallback that returns the function it is in is a stack overflow, not a fallback.**  Both
+   of `ggml_cuda_host_stream()`'s fallbacks (an out-of-range device id, a failed `cudaStreamCreateWithFlags`)
+   returned `ggml_cuda_host_stream()` — the pre-r347 behaviour they meant to keep is `cudaStreamPerThread`, and
+   the comment even said so (issue #354).  They now return the sentinel directly, and the failed-create arm
+   CACHES it (`streams[device] = cudaStreamPerThread`) because a failed stream create is not transient: retrying
+   it on every host copy costs more than the stream it replaces.
+5. **Both r351 changes are unreachable in a default run, which is why the numbers are identical.**  The no-VMM
+   definition is not compiled in the delivery's own build (`GGML_HIP_NO_VMM=OFF`), and the fallback streams are
+   only reached where the old code recursed.  Measured: prefill-logit **mean KLD 0.000000 / same-top-p 100.000 %**
+   against the recorded 10.2 base, same-seed greedy text unchanged (`111 chars sha=7e6229b260f6` before and
+   after), and the no-VMM build reads the same text as the default build — so the fix can be judged on its own
+   terms (link + symbol) rather than against a moving number.
+
+Record: `WORKLOG.md` 261123.001, `scripts/check-shlib-symbols.sh`, `MANIFESTS.md` gate 40, `patches/README.md`
+block 17.
