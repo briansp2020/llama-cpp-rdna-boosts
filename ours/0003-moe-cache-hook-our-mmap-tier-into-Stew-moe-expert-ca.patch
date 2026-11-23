@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 04:39:19 +0000
-Subject: [PATCH 03/30] moe cache: hook our mmap tier into Stew
+Subject: [PATCH 03/29] moe cache: hook our mmap tier into Stew
  moe-expert-cache.cu
 
 (cherry picked from commit 7266f388524bc7866805d6b754ddc889eb03d77c)
@@ -36,10 +36,10 @@ Folded in: moe cache: r299 merge fixes for the mmap tier (Stew TODO #327 / #335 
  5 files changed, 894 insertions(+), 30 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index c186e96bd3..daaf997c7d 100644
+index cba7efcf32..cb4f1a1d6b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -7866,7 +7866,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -7883,7 +7883,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
          // TODO #335/#336: the cache declined this table.  If a take-over hook had told the scheduler to skip
          // `input_cpy` for it (and the slab then took its arena before this launch), that buffer holds stale or
          // uninitialised bytes; re-fill it from the host master.  No promise outstanding -> no work.

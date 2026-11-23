@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 05:52:08 +0000
-Subject: [PATCH 26/30] mmq: Q5_0 expert tables on the RDNA4 routed-compact
+Subject: [PATCH 26/29] mmq: Q5_0 expert tables on the RDNA4 routed-compact
  path with the IQ4_NL bands (prefill reads experts in place, no whole-table
  gather; GGML_MMQ_Q5_0_COMPACT=0: plain path)
 

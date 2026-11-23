@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 23:32:10 +0000
-Subject: [PATCH 04/30] sched: let layer-split pipeline parallelism overlap the
+Subject: [PATCH 04/29] sched: let layer-split pipeline parallelism overlap the
  devices on ROCm
 
 Layer split with pipeline parallelism (several devices, no -ot) ran the GPUs
@@ -186,10 +186,10 @@ index 979c58d84d..8cc506299a 100644
      ggml_backend_sched_split_graph(sched, graph);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ff354ff1b0..5f5d290a1f 100644
+index b3074c3f07..ade2c849eb 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -3402,7 +3402,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3405,7 +3405,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
      const auto gparams = graph_params(res, ubatch, mctx, gtype);
  
