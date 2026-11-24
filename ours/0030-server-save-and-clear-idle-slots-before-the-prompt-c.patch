@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 23 Nov 2026 17:57:05 +0000
+Subject: [PATCH 30/31] server: save and clear idle slots before the
+ prompt-cache restore, not after the launch (LLAMA_SERVER_IDLE_CLEAR_FIRST=0:
+ off)
+
+With cache_idle_slots on a unified KV cache and the lazy idle slots off, process_single_task restored the launching
+slot's prompt (update_prompt_cache) while the other idle slots still held their cells, and saved + cleared them only
+after the launch.  The restored sequence then started above those cells (cell 534 behind a 534-token idle slot) and kept
+the offset for its whole life, so the QSA indexer top-k regular-layout fast path (cell j at position j) declined on every
+ubatch.  Now the idle slots other than the launching slot and its children are saved and cleared first, with the entry
+to be restored held out of the cache while they are saved (as update_prompt_cache does on the lazy path).
+
+232k needle after other requests: 79 -> 71 s (2938 -> 3280 t/s), and its output now matches a cold run; prod-config
+references unchanged.
+---
+ tools/server/server-context.cpp | 41 +++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index bf959ac983..c4965057e1 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1328,6 +1328,18 @@ private:
+         return e == nullptr || atoi(e) != 0;
+     }();
+ 
++    // LLAMA_SERVER_IDLE_CLEAR_FIRST (on unless 0): with cache_idle_slots on a unified KV cache and the lazy idle slots off,
++    // save the idle slots to the prompt cache and clear them BEFORE the launching slot restores its prompt, instead of after
++    // the launch.  Otherwise the new prompt is restored above the idle slots' cells, those cells are cleared
++    // a moment later, and the sequence keeps the offset for its whole life: cell j holds position j - offset, so a layout
++    // check that wants cell j at position j (the QSA indexer top-k regular fast path in indexer-topk.cu) declines on every
++    // ubatch of it (FINDINGS 1089: a 232k prompt behind a 534-token idle slot, 7-8 s slower).  Only the update_cache path
++    // (a slot that takes a prompt from the cache) does this; child slots of an n > 1 task are left as they are.
++    const bool idle_clear_first = [] {
++        const char * e = getenv("LLAMA_SERVER_IDLE_CLEAR_FIRST");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
+     // LLAMA_SERVER_PARK_IDLE_SLOTS (on unless 0, with the lazy idle slots above): when a task starts, the resident idle
+     // slots are parked at the top of the KV cache (llama_memory_seq_park, a device copy) and the slots that run are moved
+     // to the low cells.  A sequence that runs alone then sits in the same cells and attends over the same range as when
+@@ -2352,6 +2364,31 @@ private:
+         //  upstream #32154's refactor -- D7; the parking policy feeds it through get_slot_infos()/select().)
+     }
+ 
++    // LLAMA_SERVER_IDLE_CLEAR_FIRST: save and clear every idle slot except the launching one and its children before the
++    // launching slot's restore.  The entry it will restore is held out of the cache while the others are saved (as
++    // update_prompt_cache() does on the lazy path), so their saving cannot evict it.  The after-launch pass still runs and
++    // finds these slots empty.
++    void save_clear_idle_slots_before_restore(const server_slot & keep, const std::vector<server_slot *> & children,
++            const server_task & task) {
++        std::list<server_prompt_cache_state> held;
++        auto it = prompt_cache->find(keep.prompt, task.tokens, get_task_lora(task));
++        if (it != prompt_cache->states.end()) {
++            held.splice(held.begin(), prompt_cache->states, it);
++        }
++        for (auto & other : slots) {
++            if (&other == &keep || other.is_processing() || other.prompt.n_tokens() == 0 ||
++                    std::find(children.begin(), children.end(), &other) != children.end()) {
++                continue;
++            }
++            SLT_TRC(other, "%s", "saving idle slot to prompt cache before the restore\n");
++            if (other.prompt_save(*prompt_cache)) {
++                prompt_cache->update();
++            }
++            other.prompt_clear();
++        }
++        prompt_cache->states.splice(prompt_cache->states.end(), held);
++    }
++
+     // a restore can fail for want of KV cells that another idle slot holds (unified KV cache): move idle slots to the prompt
+     // cache one at a time, with the entry being restored kept out of the eviction that their saving may cause, and retry
+     bool prompt_load_with_room(server_slot & slot, const server_tokens & tokens,
+@@ -3757,6 +3794,10 @@ private:
+                     }
+ 
+                     // the task is not deferred past this point
++                    if (idle_clear_first && plan.update_cache && prompt_cache && params_base.cache_idle_slots &&
++                            !lazy_idle_slots && params_base.kv_unified) {
++                        save_clear_idle_slots_before_restore(*slot, child_slots, task);
++                    }
+                     if (plan.update_cache && prompt_cache) {
+                         update_prompt_cache(*slot, task);
+                     }
+-- 
+2.53.0
+

@@ -1,0 +1,324 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 23 Nov 2026 23:44:09 +0000
+Subject: [PATCH 31/31] cuda: hc_combine_norm writes the Q8_1 MMQ activation of
+ its dense consumer (GGML_CUDA_HC_CN_MMQ_Q8=0: off)
+
+In a qwen4exp prefill the fused hyper-connection combine + norm writes xn (F32, [n_embd*hc, T]), and the dense MUL_MAT
+that reads it next (hc_down, a Q8_0 / D4-layout weight on MMQ) re-read all of it in quantize_mmq_q8_1 (~270 us per call
+at T = 2048).  The combine kernel now also writes that MUL_MAT's block_q8_1_mmq activation in the same pass, with
+quantize_mmq_q8_1<D4>'s expressions (a warp holds one 32-value scale group; amax, 127/amax, roundf, 1/d_inv), into a
+single-slot handoff (mmq_q8_handoff, a pool-stack block reused while big enough and dropped at graph start / end like
+bf16_src1_cache).  The consumer is found at fuse time and keyed by its node, src1 data, shape and stream; ggml_cuda_mul_mat_q
+takes the block only on its plain dense path (no fusion, no swiglu, no FP4, D4 layout, unpadded contiguous src1) and
+invalidates the key either way, so every other dispatch quantizes as before.  Scalar RMS mode only (the vec4 mode groups
+8 lanes per scale group), multi-token (T >= 64), warp 32.  GGML_CUDA_HC_CN_MMQ_Q8=2 also runs the reference quantize and
+compares the bytes on the host (debug; skipped inside a stream capture).
+
+Prod config (2x R9700, -sm tensor): 31.5k prefill 3694 -> 3765 t/s (+1.9 %), 232k needle 3279 -> 3326 t/s (+1.4 %);
+mode 2: 16,800 compares, 0 differ; prod-config references unchanged.
+---
+ ggml/src/ggml-cuda/common.cuh    | 41 ++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu  |  2 +
+ ggml/src/ggml-cuda/hyperconn.cu  | 64 +++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/hyperconn.cuh |  2 +
+ ggml/src/ggml-cuda/mmq.cu        | 48 ++++++++++++++++++++++--
+ 5 files changed, 152 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index d3163d9c1c..7c4eaa4ad4 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2841,6 +2841,41 @@ struct ggml_backend_cuda_context {
+     static void bf16_src1_buf_del(void * p) {
+         delete (ggml_cuda_pool_alloc<nv_bfloat16> *) p;
+     }
++    // hc_combine_norm -> dense MMQ Q8_1 handoff (GGML_CUDA_HC_CN_MMQ_Q8): the fused combine+norm writes the one
++    // consuming MUL_MAT's block_q8_1_mmq (D4) activation in the same pass, and that MUL_MAT (keyed by its node,
++    // src1 data and shape) skips quantize_mmq_q8_1.  One block, reused while big enough, dropped at graph start/end
++    // like bf16_src1_cache; the consumer invalidates the key when it takes it.
++    struct mmq_q8_handoff_entry {
++        const ggml_tensor * dst = nullptr;   // the consuming MUL_MAT
++        const void * data = nullptr;         // its src1 data (the norm output)
++        int64_t ne10 = 0, ne11 = 0;
++        int stream_no = 0;
++        size_t cap = 0;
++        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
++    } mmq_q8_handoff;
++    static void mmq_q8_handoff_del(void * p) {
++        delete (ggml_cuda_pool_alloc<char> *) p;
++    }
++    void mmq_q8_handoff_clear() {
++        pool_stack_kill(mmq_q8_handoff.buf.release());
++        mmq_q8_handoff.dst  = nullptr;
++        mmq_q8_handoff.data = nullptr;
++        mmq_q8_handoff.cap  = 0;
++    }
++    void * mmq_q8_handoff_put(const ggml_tensor * dst, const void * data, int64_t ne10, int64_t ne11, size_t nbytes) {
++        auto & h = mmq_q8_handoff;
++        if (h.buf == nullptr || h.stream_no != curr_stream_no || h.cap < nbytes) {
++            mmq_q8_handoff_clear();
++            auto * buf = new ggml_cuda_pool_alloc<char>(pool(), nbytes);
++            pool_stack_push(buf, mmq_q8_handoff_del, nbytes, POOL_STACK_BF16);
++            h.buf       = std::unique_ptr<ggml_cuda_pool_alloc<char>>(buf);
++            h.stream_no = curr_stream_no;
++            h.cap       = nbytes;
++        }
++        h.dst = dst; h.data = data; h.ne10 = ne10; h.ne11 = ne11;
++        return h.buf->get();
++    }
++
+     void bf16_src1_cache_clear() {
+         pool_stack_kill(bf16_src1_cache.buf.release());
+         bf16_src1_cache.src1 = nullptr;
+@@ -2901,6 +2936,12 @@ int  ggml_cuda_get_physical_device(int device);
+ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+ 
+ 
++// hc_combine_norm -> dense MMQ Q8_1 handoff: 1 (default) on, 0 off, 2 on + the consumer also quantizes and compares (debug, slow).
++static inline int ggml_cuda_hc_cn_mmq_q8_mode() {
++    static const int m = [] { const char * e = getenv("GGML_CUDA_HC_CN_MMQ_Q8"); return e == nullptr ? 1 : atoi(e); }();
++    return m;
++}
++
+ // BF16 src1 cache (GGML_CUDA_BF16_SRC1_CACHE=0: off), shared by the MMB / HC producers.
+ static inline bool ggml_cuda_bf16_src1_cache_on() {
+     static const bool on = [] { const char * e = getenv("GGML_CUDA_BF16_SRC1_CACHE"); return e == nullptr || atoi(e) != 0; }();
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7d2bda798f..154d25f29c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -10068,6 +10068,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     const char * const q8_arena0 = cuda_ctx->q8_1_arena;
+     cuda_ctx->mwr_done_graph = nullptr;
+     cuda_ctx->bf16_src1_cache_clear();
++    cuda_ctx->mmq_q8_handoff_clear();
+     ggml_cuda_mmb_set_active_ctx(cuda_ctx);
+     ggml_cuda_mmb_begin_graph();
+ 
+@@ -10084,6 +10085,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+             c->pool_stack_census();
+             ggml_cuda_mmb_yield_caches(c);
+             c->bf16_src1_cache_clear();
++            c->mmq_q8_handoff_clear();
+             // every per-graph pool block is now marked dead; drain the pool stack top-first (a VMM pool
+             // asserts LIFO on free, and the caches evict/grow in an order it cannot accept)
+             c->pool_stack_release_all();
+diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
+index b88443081b..121c5d8e15 100644
+--- a/ggml/src/ggml-cuda/hyperconn.cu
++++ b/ggml/src/ggml-cuda/hyperconn.cu
+@@ -1,6 +1,7 @@
+ #include "hyperconn.cuh"
+ #include "ggml-backend-impl.h"
+ #include "mmb.cuh"
++#include "quantize.cuh"
+ 
+ // Explicitly rounded mul/add: keeps the fused kernels from being contracted into FMAs so that
+ // the results match the separate MUL and ADD kernels of the unfused graph bit for bit.
+@@ -200,7 +201,8 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
+         const uint16_t * __restrict__ res_in_bf16, uint16_t * __restrict__ res_out_bf16,
+         const uint16_t * __restrict__ blk_in_bf16,
+         const int n_embd, const bool bo_hc, const bool rms_vec,
+-        const float s1, const float b1, const float s2, const float b2, const float eps) {
++        const float s1, const float b1, const float s2, const float b2, const float eps,
++        block_q8_1_mmq * __restrict__ out_q8 = nullptr) {
+     __shared__ float s_sum[32];
+ 
+     const int c   = blockIdx.x;   // stream
+@@ -301,6 +303,20 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
+                 const float v = hc_mul_rn(hc_mul_rn(scale, xs[k][0]), g[col]);
+                 if (store_xn_f32) xn[col] = v;
+                 if (xh) xh[col] = hc_f2bf32(v);
++                if (out_q8) {
++                    // quantize_mmq_q8_1<D4> for the consumer's [n_embd*hc, T] src1: a warp holds 32 consecutive
++                    // columns (col < n_embd is warp-uniform, n_embd % 128 == 0), i.e. exactly one D4 scale group;
++                    // the same amax (fmaxf is exact in any order), d_inv, roundf and d expressions
++                    const float amax  = warp_reduce_max(fabsf(v));
++                    const float d_inv = 127.0f / amax;
++                    const char  q     = roundf(v*d_inv);
++                    const int64_t C   = (int64_t) c * n_embd + col;
++                    block_q8_1_mmq * yb = out_q8 + (C / QK8_1_MMQ) * gridDim.y + t;
++                    yb->qs[C % QK8_1_MMQ] = q;
++                    if (C % 32 == 0) {
++                        yb->d4[(C % QK8_1_MMQ) / 32] = 1.0f / d_inv;
++                    }
++                }
+             }
+         }
+     }
+@@ -456,7 +472,8 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
+         (const float *) a.block_out->data, (const float *) a.gamma->data,
+         (float *) a.out_res->data, (float *) a.out_xn->data,
+         a.out_xn_bf16, a.store_xn_f32, a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
+-        (int) n_embd, a.block_out_hc, ggml_cuda_rms_norm_vec(), a.s1, a.b1, a.s2, a.b2, a.eps);
++        (int) n_embd, a.block_out_hc, ggml_cuda_rms_norm_vec(), a.s1, a.b1, a.s2, a.b2, a.eps,
++        (block_q8_1_mmq *) a.out_xn_q8);
+ }
+ // try and fuse nodes and return the number of nodes to skip
+ int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_cuda_hc_mix_args & args, enum ggml_op * ops) {
+@@ -702,6 +719,47 @@ void ggml_cuda_hc_combine_norm_set_bf16_src1(ggml_backend_cuda_context & ctx, gg
+     args.out_xn_bf16 = (uint16_t *) ctx.bf16_src1_cache_put(xn, ggml_nelements(xn));
+ }
+ 
++// Multi-token combine+norm whose xn feeds a dense Q8_0-class (D4) MUL_MAT that takes MMQ: also write that MUL_MAT's
++// block_q8_1_mmq activation (GGML_CUDA_HC_CN_MMQ_Q8).  Scalar RMS mode only (the vec4 mode groups 8 lanes per
++// 32 columns); the consumer re-checks node, data, shape, layout and stream and quantizes itself on any mismatch.
++void ggml_cuda_hc_combine_norm_set_mmq_q8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i_last,
++                                          ggml_cuda_hc_combine_norm_args & args) {
++    const ggml_tensor * xn = args.out_xn;
++    const int64_t n_embd = args.out_res->ne[0];
++    const int64_t T      = args.out_res->ne[2] * args.out_res->ne[3];
++    if (ggml_cuda_hc_cn_mmq_q8_mode() == 0 || args.single_block || !args.store_xn_f32 || ggml_cuda_rms_norm_vec() ||
++            ggml_cuda_info().devices[ctx.device].warp_size != 32 || n_embd % QK8_1_MMQ != 0 || T < 64 ||
++            xn->view_src != nullptr || !ggml_is_contiguous(xn)) {
++        return;
++    }
++    for (int j = i_last + 1; j < cgraph->n_nodes && j <= i_last + 64; ++j) {
++        const ggml_tensor * mm = cgraph->nodes[j];
++        if (mm->op != GGML_OP_MUL_MAT) {
++            continue;
++        }
++        const ggml_tensor * s1 = mm->src[1];
++        const ggml_tensor * root = s1;
++        while (root->view_src) {
++            root = root->view_src;
++        }
++        if (root != xn) {
++            continue;
++        }
++        const ggml_tensor * s0 = mm->src[0];
++        const int64_t ne10 = s1->ne[0];
++        if (!ggml_is_quantized(s0->type) || mmq_get_q8_1_ds_layout(s0->type) != MMQ_Q8_1_DS_LAYOUT_D4 ||
++                s1->data != xn->data || !ggml_is_contiguous(s1) || ne10 != n_embd * args.out_res->ne[1] ||
++                s1->ne[1] != T || s1->ne[2] != 1 || s1->ne[3] != 1 || ne10 % MATRIX_ROW_PADDING != 0 ||
++                !ggml_cuda_mul_mat_takes_mmq(ctx, s0, s1, mm)) {
++            return;   // the first MUL_MAT reading xn is not a plain D4 MMQ: leave it to quantize
++        }
++        // the activation + a full tile's over-read (J <= 256 columns, rounded to 1 KiB loads)
++        const size_t nbytes = (size_t) T * ne10 / QK8_1_MMQ * sizeof(block_q8_1_mmq) + 256 * sizeof(block_q8_1_mmq) + 1024;
++        args.out_xn_q8 = ctx.mmq_q8_handoff_put(mm, xn->data, ne10, T, nbytes);
++        return;
++    }
++}
++
+ // qwen4exp hyper-connection combine + next grouped RMS norm fusion (repeat-anchored and A-chain).
+ // Returns the number of graph nodes to skip, 0 otherwise.  Opt-outs:
+ // GGML_CUDA_DISABLE_HC_FUSION=1 (all), GGML_CUDA_DISABLE_HC_COMB=1.
+@@ -927,6 +985,7 @@ int ggml_cuda_hc_combine_norm_try_fuse(ggml_backend_cuda_context & ctx, const gg
+                                     if (alias_ok && supp && canf) {
+                                         ggml_cuda_hc_combine_norm_set_bf16(ctx, args);
+                                         ggml_cuda_hc_combine_norm_set_bf16_src1(ctx, args);
++                                        ggml_cuda_hc_combine_norm_set_mmq_q8(ctx, cgraph, g, args);
+                                         // The base copy is made AFTER the set_bf16*() pushes so that it is the
+                                         // newest pool block (see the note above), and killed after the launch.
+                                         // set_bf16*() only READ block_out, so the copy is taken from the same,
+@@ -1143,6 +1202,7 @@ int ggml_cuda_hc_combine_norm_try_fuse(ggml_backend_cuda_context & ctx, const gg
+                             if (alias_ok && supp && canf) {
+                                 ggml_cuda_hc_combine_norm_set_bf16(ctx, args);
+                                 ggml_cuda_hc_combine_norm_set_bf16_src1(ctx, args);
++                                ggml_cuda_hc_combine_norm_set_mmq_q8(ctx, cgraph, g, args);
+                                 ggml_cuda_op_hc_combine_norm(ctx, args);
+                                 return g - i;
+                             }
+diff --git a/ggml/src/ggml-cuda/hyperconn.cuh b/ggml/src/ggml-cuda/hyperconn.cuh
+index ff09450393..5648a9383c 100644
+--- a/ggml/src/ggml-cuda/hyperconn.cuh
++++ b/ggml/src/ggml-cuda/hyperconn.cuh
+@@ -64,6 +64,7 @@ struct ggml_cuda_hc_combine_norm_args {
+     const uint16_t *    res_in_bf16   = nullptr;  // `residual` is BF16 in place (marked bf16-only)
+     uint16_t *          res_out_bf16  = nullptr;  // write out_res as BF16 in place (marked bf16-only)
+     const uint16_t *    blk_in_bf16   = nullptr;  // `block_out` is BF16 in place (marked bf16-only)
++    void *              out_xn_q8     = nullptr;  // block_q8_1_mmq (D4) copy of out_xn for its dense MMQ consumer (scalar mode)
+ };
+ 
+ bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);
+@@ -72,6 +73,7 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
+ bool ggml_cuda_hc_combine_norm_identify(const ggml_cgraph * cgraph, const int i, ggml_cuda_hc_combine_norm_args & args);
+ void ggml_cuda_hc_combine_norm_set_bf16(ggml_backend_cuda_context & ctx, ggml_cuda_hc_combine_norm_args & args);
+ void ggml_cuda_hc_combine_norm_set_bf16_src1(ggml_backend_cuda_context & ctx, ggml_cuda_hc_combine_norm_args & args);
++void ggml_cuda_hc_combine_norm_set_mmq_q8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i_last, ggml_cuda_hc_combine_norm_args & args);
+ int  ggml_cuda_hc_combine_norm_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ 
+ int ggml_cuda_hc_gate_mix_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index cb55a5d53a..dd2a927f10 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -643,13 +643,41 @@ void ggml_cuda_mul_mat_q(
+         const int ntj = (ne1 + J_best - 1) / J_best;
+ 
+         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
+-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
++        // hc_combine_norm already wrote this MUL_MAT's D4 activation (GGML_CUDA_HC_CN_MMQ_Q8): take it, once
++        const char * src1_q8_1_handoff = nullptr;
++        {
++            auto & h = ctx.mmq_q8_handoff;
++            if (h.dst != nullptr && h.dst == dst && fusion == nullptr && !use_native_fp4 && !swiglu &&
++                    h.data == src1->data && h.stream_no == ctx.curr_stream_no && h.ne10 == ne10 && h.ne11 == ne11 &&
++                    ne10 == ne10_padded && ne12 == 1 && ne13 == 1 && src1->nb[1] == (size_t) ne10*sizeof(float) &&
++                    mmq_get_q8_1_ds_layout(src0->type) == MMQ_Q8_1_DS_LAYOUT_D4 && h.cap >= nbytes_src1_q8_1) {
++                src1_q8_1_handoff = (const char *) h.buf->get();
++            }
++            h.dst = nullptr;
++            h.data = nullptr;
++        }
++        bool hc_q8_verify = src1_q8_1_handoff != nullptr && ggml_cuda_hc_cn_mmq_q8_mode() == 2;
++        if (hc_q8_verify) {   // the host compare synchronizes: not inside a stream capture (mode 1 is capture-safe)
++#if defined(GGML_USE_HIP)
++            hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
++            CUDA_CHECK(hipStreamIsCapturing(stream, &cs));
++            hc_q8_verify = cs == hipStreamCaptureStatusNone;
++#else
++            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
++            CUDA_CHECK(cudaStreamIsCapturing(stream, &cs));
++            hc_q8_verify = cs == cudaStreamCaptureStatusNone;
++#endif
++        }
++        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
++        if (src1_q8_1_handoff == nullptr || hc_q8_verify) {
++            src1_q8_1.alloc(nbytes_src1_q8_1);
++        }
+         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
+             src1_scale.alloc(ne13*ne12*ne11);
+         }
+ 
+-        {
++        if (src1_q8_1_handoff == nullptr || hc_q8_verify) {
+             const int64_t s11 = src1->nb[1] / ts_src1;
+             const int64_t s12 = src1->nb[2] / ts_src1;
+             const int64_t s13 = src1->nb[3] / ts_src1;
+@@ -680,6 +708,20 @@ void ggml_cuda_mul_mat_q(
+                                        ne11, ne12, ne13, q8_1_chunks, stream);
+             }
+             CUDA_CHECK(cudaGetLastError());
++            if (hc_q8_verify) {
++                // debug: the handoff must equal the quantize it replaces, byte for byte (padding excluded)
++                const size_t n = (size_t) ne11*ne10_padded / QK8_1_MMQ * sizeof(block_q8_1_mmq);
++                std::vector<char> a(n), b(n);
++                CUDA_CHECK(cudaMemcpyAsync(a.data(), src1_q8_1.get(), n, cudaMemcpyDeviceToHost, stream));
++                CUDA_CHECK(cudaMemcpyAsync(b.data(), src1_q8_1_handoff, n, cudaMemcpyDeviceToHost, stream));
++                CUDA_CHECK(cudaStreamSynchronize(stream));
++                static int n_ok = 0, n_bad = 0;
++                if (memcmp(a.data(), b.data(), n) == 0) { n_ok++; } else { n_bad++; }
++                if (n_bad == 1 || (n_ok + n_bad) % 200 == 0) {
++                    GGML_LOG_WARN("HC_CN_MMQ_Q8 verify: %d equal, %d DIFFER (%s)\n", n_ok, n_bad, dst->name);
++                }
++                src1_q8_1_handoff = nullptr;   // run on the reference quantize
++            }
+         }
+ 
+         // Stride depends on quantization format
+@@ -689,7 +731,7 @@ void ggml_cuda_mul_mat_q(
+         const int64_t s13 = ne12*s12;
+ 
+         const mmq_args args = {
+-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
++            src0_d, src0->type, (const int *) (src1_q8_1_handoff ? src1_q8_1_handoff : src1_q8_1.ptr), nullptr, nullptr, dst_d,
+             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr, nullptr,
+             ne00, ne01, ne1, s01, ne11, s1,
+             ne02, ne12, s02, s12, s2,
+-- 
+2.53.0
+

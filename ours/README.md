@@ -10,10 +10,10 @@ release as published; only `ours/` is added.
 ```
 git checkout 919794500
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r351 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 29 patches (0001-0029)
+git am <path-to-this-repo>/ours/*.patch              # 31 patches (0001-0031)
 ```
 
-Result: tree `0a842ef12d4f`. This is the production build since 2026-11-23 7:50 AM PST.
+Result: tree `79a10d037737`. This is the production build since 2026-11-23 9:10 PM PST.
 
 ## How the series is organised
 
@@ -22,7 +22,7 @@ Result: tree `0a842ef12d4f`. This is the production build since 2026-11-23 7:50 
   Our code lives in two included files, `moe-expert-tier.inc` and `moe-expert-tier-state.inc`, and runs only for
   sparse (mmap) tables. Pool and pinned tables run the release's own code. The tier code covers the RAM tier, the
   pin budget, KV lending, the fill fence, batched admissions and the device remap for sparse tables.
-- **0004-0029** are one feature each, in the order they were added.
+- **0004-0031** are one feature each, in the order they were added.
 - A fix to one of our patches goes into that patch, not into a new one. A later patch that touches an earlier
   one's code adds a feature of its own, with its own switch.
 - Every behaviour change has an environment switch. The table gives the value that turns it off (or the opt-in).
@@ -61,6 +61,8 @@ Result: tree `0a842ef12d4f`. This is the production build since 2026-11-23 7:50 
 | 0027 | server: when the last prompt chunk is the checkpoint tail and has the verify width (draft n_max + 1), all its rows are outputs, so the first verify reuses the tail's graph (agent-style 2K extensions -3.4 % time) | `LLAMA_CKPT_TAIL_OUTPUTS=0` |
 | 0028 | mmvq: the dense gate/up + GLU fusion at the verify width (2-8 tokens, RDNA4), the launch also publishing the down projection's Q8_1 input; the shared expert's 3 launches per layer become 1; bit-identical | `GGML_CUDA_DENSE_GLU_VERIFY=0` |
 | 0029 | mmvq-moe (RDNA4): rows per block 8 (8-10 K-blocks) or 4 (11-15) where 2-row blocks leave the last pass partly idle; the Q5_0 MoE down at K 320 goes 48 -> 34 us at 4 tokens; output changes at rounding level (KLD ~0) | `GGML_CUDA_MOE_RPB_K=0` |
+| 0030 | server: idle slots are saved to the prompt cache and cleared before the restore of the new request, not after its launch, so a long prompt after other requests starts with the KV room free (259.6k needle after other requests 79 -> 71 s, +11.6 %); output unchanged | `LLAMA_SERVER_IDLE_CLEAR_FIRST=0` |
+| 0031 | hyperconn: hc_combine_norm also writes the Q8_1 MMQ activation of its dense consumer, so that matmul skips its own quantize (prefill, 64+ tokens); 31.5k prefill +1.9 %, 259.6k needle +1.4 %; bit-identical | `GGML_CUDA_HC_CN_MMQ_Q8=0` |
 
 ## Production configuration
 
@@ -80,26 +82,21 @@ Settings on top of the defaults that matter for this series:
   all-reduce, with a timeout long enough for KFD queue stops.
 - Slab and pool sizing: `GGML_CUDA_SLAB_HEADROOM_MIB=3072`, `GGML_CUDA_SLAB_WORK_MIN_MIB=2304`,
   `GGML_CUDA_SLAB_RING_PREFILL=0`, `GGML_CUDA_POOL_CACHE_MB=128`, `GGML_COMPUTE_BUFFER_MARGIN_PCT=3`.
+- `LLAMA_SERVER_PREFILL_DUTY=32`: up to 31 decode-only steps between prefill steps, so a slot that is decoding runs
+  about 1.6x faster while another slot prefills a long prompt (that prompt's first token comes about 20 % later).
+  It only matters when requests overlap.
 
 With 57.6 GiB of host experts, the expert cache holds 68.2 % in VRAM.
 
-## Validation (r351, 2026-11-23)
+## Validation (r351 + 0030-0031, 2026-11-23)
 
-- The 7-model comparison with the release passes (nightly gate: 0 problems, 0 warnings), with speeds equal to the
-  release.
-- test-backend-ops: 24106 of 24109, the same three known failures as r349.
-- The fault, depth, and 2-GPU layer and tensor arms behave as expected. The expert-cache byte verifier finds 0 differing slots.
-- Production configuration: output identical to the r349 series on every check: greedy, 512-token prompt set,
-  4.3k and 30k-token prompts, and the 259.6k-token needle (6,358).
-- Speed (production configuration, single runs):
-
-  | measure | t/s |
-  |---|---|
-  | greedy decode | 138-154 |
-  | 512-token prompt set | 146 |
-  | 259.6k prefill | 3315 |
-  | 4.3k prompts, prefill / decode | 2884 / 155 |
-
-  All are equal to r349 within noise.
+- The 7-model comparison with the release passes (nightly gate: 0 problems, 0 warnings, 0 failed loads), with
+  speeds equal to the release.
+- Production configuration: output identical to the r351 series on every check: greedy, 512-token prompt set,
+  4.3k and 30k-token prompts, and the 259.6k-token needle (6,358). A prompt restored from the cache after 0030
+  gives the same output as a cold start.
+- 0031 is bit-identical: in its verify mode every handed-over activation equals the one the matmul quantizes itself.
+- Speed (production configuration, single runs): 31.5k prefill +1.9 %, 259.6k needle +1.4 % over the r351 series;
+  decode unchanged (512-token prompt set 151 t/s).
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.

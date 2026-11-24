@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 15:57:29 +0000
-Subject: [PATCH 21/29] loader: open the MoE heat map in --host-experts mmap
+Subject: [PATCH 21/31] loader: open the MoE heat map in --host-experts mmap
  mode (LLAMA_MMAP_HEAT_OPEN=0: off)
 
 The mmap mode returned from plan_host_expert_placement before the heat-map open, the only call site, so
