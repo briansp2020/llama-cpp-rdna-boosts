@@ -10,10 +10,10 @@ release as published; only `ours/` is added.
 ```
 git checkout 919794500
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r351 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 31 patches (0001-0031)
+git am <path-to-this-repo>/ours/*.patch              # 32 patches (0001-0032)
 ```
 
-Result: tree `79a10d037737`. This is the production build since 2026-11-23 9:10 PM PST.
+Result: tree `fa393c6d3159`. This is the production build since 2026-11-24 6:40 AM PST.
 
 ## How the series is organised
 
@@ -22,7 +22,7 @@ Result: tree `79a10d037737`. This is the production build since 2026-11-23 9:10 
   Our code lives in two included files, `moe-expert-tier.inc` and `moe-expert-tier-state.inc`, and runs only for
   sparse (mmap) tables. Pool and pinned tables run the release's own code. The tier code covers the RAM tier, the
   pin budget, KV lending, the fill fence, batched admissions and the device remap for sparse tables.
-- **0004-0031** are one feature each, in the order they were added.
+- **0004-0032** are one feature each, in the order they were added.
 - A fix to one of our patches goes into that patch, not into a new one. A later patch that touches an earlier
   one's code adds a feature of its own, with its own switch.
 - Every behaviour change has an environment switch. The table gives the value that turns it off (or the opt-in).
@@ -63,6 +63,7 @@ Result: tree `79a10d037737`. This is the production build since 2026-11-23 9:10 
 | 0029 | mmvq-moe (RDNA4): rows per block 8 (8-10 K-blocks) or 4 (11-15) where 2-row blocks leave the last pass partly idle; the Q5_0 MoE down at K 320 goes 48 -> 34 us at 4 tokens; output changes at rounding level (KLD ~0) | `GGML_CUDA_MOE_RPB_K=0` |
 | 0030 | server: idle slots are saved to the prompt cache and cleared before the restore of the new request, not after its launch, so a long prompt after other requests starts with the KV room free (259.6k needle after other requests 79 -> 71 s, +11.6 %); output unchanged | `LLAMA_SERVER_IDLE_CLEAR_FIRST=0` |
 | 0031 | hyperconn: hc_combine_norm also writes the Q8_1 MMQ activation of its dense consumer, so that matmul skips its own quantize (prefill, 64+ tokens); 31.5k prefill +1.9 %, 259.6k needle +1.4 %; bit-identical | `GGML_CUDA_HC_CN_MMQ_Q8=0` |
+| 0032 | llama-batch: ubatch data blocks that no ubatch references any more are reused instead of freshly allocated (capped at 256 MiB, `LLAMA_UBATCH_REUSE_MIB`), so the MTP draft no longer zero-fills and page-faults ~100 MiB of state rows after every long prompt; server-thread page faults -92 %, 4.2k-token request -20..27 ms; output unchanged | `LLAMA_UBATCH_REUSE=0` |
 
 ## Production configuration
 
@@ -88,15 +89,17 @@ Settings on top of the defaults that matter for this series:
 
 With 57.6 GiB of host experts, the expert cache holds 68.2 % in VRAM.
 
-## Validation (r351 + 0030-0031, 2026-11-23)
+## Validation (r351 + 0030-0032, 2026-11-23/24)
 
 - The 7-model comparison with the release passes (nightly gate: 0 problems, 0 warnings, 0 failed loads), with
   speeds equal to the release.
 - Production configuration: output identical to the r351 series on every check: greedy, 512-token prompt set,
-  4.3k and 30k-token prompts, and the 259.6k-token needle (6,358). A prompt restored from the cache after 0030
+  4.2k and 30k-token prompts, and the 259.6k-token needle (6,358). A prompt restored from the cache after 0030
   gives the same output as a cold start.
 - 0031 is bit-identical: in its verify mode every handed-over activation equals the one the matmul quantizes itself.
+- Overnight stress (2 h, 2 GPUs, three configurations, 58 rounds): 0 output mismatches, 0 GPU faults, needle
+  correct in every round; cold and heat-map-seeded starts give the production outputs.
 - Speed (production configuration, single runs): 31.5k prefill +1.9 %, 259.6k needle +1.4 % over the r351 series;
-  decode unchanged (512-token prompt set 151 t/s).
+  decode unchanged (512-token prompt set 151 t/s); a 4.2k-token request finishes 20-27 ms sooner with 0032.
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.

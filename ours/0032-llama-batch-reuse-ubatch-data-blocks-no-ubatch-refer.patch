@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 24 Nov 2026 07:47:30 +0000
+Subject: [PATCH 32/32] llama-batch: reuse ubatch data blocks no ubatch
+ references any more (LLAMA_UBATCH_REUSE=0: off)
+
+ubatch_add() made a fresh llama_ubatch::data_t per ubatch.  When the MTP draft takes in a 4096-token prompt
+tail, the value-initialising resize of embd_state (n_tokens x n_embd_state floats, ~100 MiB per tail) zero-filled
+the rows and faulted every page in on the server thread (25,600 minor faults in one 20 ms window) while both GPUs
+waited.  The allocator now keeps a pool of blocks and reuses one that only the pool holds (use_count() == 1): the
+smallest free block whose float capacity fits, its other vectors cleared and rebuilt exactly as before; embd and
+embd_state are resized without a fill because ubatch_add() writes every row of them.  When no free block fits, a
+free block gets fresh float vectors (no stale-row copy on growth).  The pool keeps at most LLAMA_UBATCH_REUSE_MIB
+(default 256) of float rows and 256 blocks.
+
+Production config, 8 fresh 4.2k-token prompts: server-thread minor faults 302k -> 24k, first token -20 ms, request
+-27 ms (-1.6 %); short prompts, decode and concurrent decode unchanged; outputs identical (greedy, 512-token prompt
+set, both first-token sets).
+---
+ src/llama-batch.cpp | 64 +++++++++++++++++++++++++++++++++++++++++++--
+ src/llama-batch.h   |  4 +++
+ 2 files changed, 66 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 08e45c746b..1db10bdf10 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -7,6 +7,7 @@
+ #include "llama-model.h"
+ #include "llama-context.h"
+ 
++#include <atomic>
+ #include <cassert>
+ #include <cstring>
+ #include <algorithm>
+@@ -919,13 +920,70 @@ void llama_batch_allocr::clear() {
+     std::fill(seq_idx.begin(), seq_idx.end(), -1);
+ }
+ 
++// A ubatch's data block used to be a fresh allocation every time.  The MTP draft taking in a prompt tail builds
++// ubatches whose state rows (embd_state, n_tokens x n_embd_state floats) total ~100 MiB per 4096 tokens: the
++// value-initialising resize zero-filled them and the first touch faulted every page in (25,600 minor faults in one
++// 20 ms window on the server thread, FINDINGS 1101).  A block that no ubatch references any more (only the pool
++// holds it) is reused instead.  Every field is rebuilt in ubatch_add() exactly as for a fresh block: the vectors are
++// cleared first, except embd / embd_state, which are resized without a fill because ubatch_add() overwrites every
++// element of them (one full row per token).  The free block with the smallest float capacity that fits is taken; when
++// none fits, a free block gets fresh float vectors (no copy of stale rows on growth).  The float capacity the pool
++// keeps is capped at LLAMA_UBATCH_REUSE_MIB (default 256; counted at the size each block is taken for), and at most
++// 256 blocks.  LLAMA_UBATCH_REUSE=0: a fresh block per ubatch, as before.
++std::shared_ptr<llama_ubatch::data_t> llama_batch_allocr::ubatch_data_take(size_t n_embd_all, size_t n_state_all) {
++    static const bool   on    = [] { const char * e = getenv("LLAMA_UBATCH_REUSE"); return e == nullptr || atoi(e) != 0; }();
++    static const size_t cap_b = [] {
++        const char * e = getenv("LLAMA_UBATCH_REUSE_MIB");
++        return (size_t) (e ? std::max(0, atoi(e)) : 256) << 20;
++    }();
++    if (!on) {
++        return std::make_shared<llama_ubatch::data_t>();
++    }
++    const auto fbytes = [](const llama_ubatch::data_t & d) {
++        return (d.embd.capacity() + d.embd_state.capacity()) * sizeof(float);
++    };
++    const size_t need_b = (n_embd_all + n_state_all) * sizeof(float);
++    std::shared_ptr<llama_ubatch::data_t> * best = nullptr; // free and large enough, smallest
++    std::shared_ptr<llama_ubatch::data_t> * any  = nullptr; // free
++    size_t pool_b = 0;
++    for (auto & p : udata_pool) {
++        pool_b += fbytes(*p);
++        if (p.use_count() != 1) {
++            continue;
++        }
++        any = &p;
++        if (p->embd.capacity() >= n_embd_all && p->embd_state.capacity() >= n_state_all &&
++                (best == nullptr || fbytes(*p) < fbytes(**best))) {
++            best = &p;
++        }
++    }
++    std::shared_ptr<llama_ubatch::data_t> * pick = best;
++    if (pick == nullptr && any != nullptr && pool_b - fbytes(**any) + need_b <= cap_b) {
++        pick = any;
++        std::vector<float>().swap((*pick)->embd);       // fresh float vectors: a too-small one would copy stale rows
++        std::vector<float>().swap((*pick)->embd_state); // when it grows
++    }
++    if (pick != nullptr) {
++        // only the pool holds it: the last ubatch that used it is gone
++        std::atomic_thread_fence(std::memory_order_acquire);
++        auto & d = **pick;
++        d.token.clear(); d.embd_row.clear(); d.embd_state_row.clear(); d.pos.clear(); d.n_seq_id.clear();
++        d.seq_id.clear(); d.seq_id_unq.clear(); d.seq_idx.clear(); d.output.clear(); d.type.clear();
++        d.batch_idxs.clear(); d.decision_order.clear(); d.decision_group.clear(); d.seq_id_data.clear();
++        return *pick;
++    }
++    auto p = std::make_shared<llama_ubatch::data_t>();
++    if (pool_b + need_b <= cap_b && udata_pool.size() < 256) {
++        udata_pool.push_back(p);
++    }
++    return p;
++}
++
+ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {
+     const uint32_t n_tokens = idxs.size();
+ 
+     assert(n_tokens%n_seqs == 0);
+ 
+-    auto udata = std::make_shared<llama_ubatch::data_t>();
+-
+     const bool mixed_batch = !is_embd_vec.empty();
+ 
+     // a ubatch with a single kind of rows is emitted as a plain token or embd ubatch
+@@ -946,6 +1004,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+     const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
+     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
+ 
++    auto udata = ubatch_data_take(n_embd_all, n_state_all);
++
+     udata->token     .resize(n_tokens);
+     udata->embd      .resize(n_embd_all);
+     udata->embd_state.resize(n_state_all);
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index 3875c56f93..d566b2720d 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -249,6 +249,10 @@ private:
+     std::vector<int32_t>        decision_order; // empty if no entry has one
+     std::vector<int32_t>        decision_group; // empty if no entry has one
+ 
++    // ubatch data blocks kept for reuse (LLAMA_UBATCH_REUSE, see ubatch_data_take())
++    std::vector<std::shared_ptr<llama_ubatch::data_t>> udata_pool;
++    std::shared_ptr<llama_ubatch::data_t> ubatch_data_take(size_t n_embd_all, size_t n_state_all);
++
+     using pos_set_t = std::set<llama_pos>;
+     using seq_cpl_t = std::vector<bool>;
+ 
+-- 
+2.53.0
+

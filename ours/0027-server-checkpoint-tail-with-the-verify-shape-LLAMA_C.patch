@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 20:41:03 +0000
-Subject: [PATCH 27/31] server: checkpoint tail with the verify shape
+Subject: [PATCH 27/32] server: checkpoint tail with the verify shape
  (LLAMA_CKPT_TAIL_OUTPUTS)
 
 When the last prompt chunk is the checkpoint tail and has the verify width (draft n_max + 1), all its rows are outputs, so the first verify reuses the tail graph instead of rebuilding (FINDINGS 1058).

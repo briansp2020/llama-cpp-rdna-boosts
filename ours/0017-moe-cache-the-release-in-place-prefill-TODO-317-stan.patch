@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 18:02:50 +0000
-Subject: [PATCH 17/31] moe cache: the release in-place prefill (TODO #317)
+Subject: [PATCH 17/32] moe cache: the release in-place prefill (TODO #317)
  stands down when a sparse table exists
 
 With any sparse (mmap) table, moe_cache_get_table answers from the tier code, which
