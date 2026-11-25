@@ -22,10 +22,10 @@ Subject: [PATCH 28/35] mmvq: dense gate/up + GLU fusion at the verify width
  5 files changed, 123 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index fc518f1991..d3163d9c1c 100644
+index b3495d99de..8050b730fc 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -2952,6 +2952,9 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+@@ -2984,6 +2984,9 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                     const ggml_tensor * ffn_gate_scale = nullptr);
  
  struct ggml_cuda_mm_fusion_args_host {
@@ -36,10 +36,10 @@ index fc518f1991..d3163d9c1c 100644
      const ggml_tensor * gate = nullptr;
      // MUL_MAT_ID gate lane with its own expert ids (an expert-cache gate table: its own slot remap); nullptr = the up ids
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index bd3b18c9e7..215d186742 100644
+index 0808aa428c..45570c4631 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2886,11 +2886,45 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -3042,11 +3042,45 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                  break;
              }
  
@@ -136,7 +136,7 @@ index 9cb9f8b8c7..5cc82895b4 100644
          GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_dst_gate, use_conv_input, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, dst_gate, conv_input, conv_states, conv_kernel_size);
      }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index f93131d819..0f5cf48cca 100644
+index 6309435d7f..69d930f0b8 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1200,6 +1200,15 @@ static void mul_mat_vec_q_switch_fusion(

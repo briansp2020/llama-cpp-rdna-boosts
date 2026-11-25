@@ -30,11 +30,11 @@ GGML_MOE_FUSE_COPY_ALIAS=0 disables it (default on).
  1 file changed, 55 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index e52bf0a870..bd3b18c9e7 100644
+index 9e1a283a61..0808aa428c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -2150,6 +2150,50 @@ static const ggml_tensor * ggml_cuda_get_mul_mat_id_scale(const ggml_tensor * re
-     return scale;
+@@ -2305,6 +2305,50 @@ static int ggml_cuda_tq_try_fuse(ggml_backend_cuda_context * ctx, const ggml_cgr
+     return last - i;
  }
  
 +// GGML_MOE_FUSE_COPY_ALIAS (FINDINGS 904): the routed gate+up+GLU check of ggml_cuda_can_fuse, except that the GLU
@@ -84,7 +84,7 @@ index e52bf0a870..bd3b18c9e7 100644
  int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      if (ggml_cuda_fusion_disabled()) {
-@@ -2771,7 +2815,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2927,7 +2971,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                  fused_node_count  = 5;
                  break;
              }
@@ -94,7 +94,7 @@ index e52bf0a870..bd3b18c9e7 100644
              ggml_tensor * glu  = cgraph->nodes[i + 2];
              ggml_tensor * gate = glu->src[0];
              ggml_tensor * up   = glu->src[1];
-@@ -2782,13 +2827,16 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2938,13 +2983,16 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
              if (!ok) {
                  continue;
              }
@@ -112,7 +112,7 @@ index e52bf0a870..bd3b18c9e7 100644
                      ggml_cuda_mmb_supported_glu(gate->src[0], up->src[0], src1, ids, glu)) {
                  // TODO #327: the in-place contract.  A cache-served (in-place identity) table lives ONLY in the
                  // arena -- the scheduler skipped its copy -- so the fused kernel must read the same arena base
-@@ -2816,7 +2864,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2972,7 +3020,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                  fused_node_count  = 3;
                  break;
              }
@@ -121,7 +121,7 @@ index e52bf0a870..bd3b18c9e7 100644
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
                  fusion_data.glu_op    = ggml_get_glu_op(glu);
-@@ -2857,7 +2905,11 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -3013,7 +3061,11 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                      moe_cache_fusion_launched(MOE_CACHE_SERVE_IN_PLACE, 5);
                      fusion_local.gate     = &gate_c;
                      fusion_local.gate_ids = &gate_ids_c;

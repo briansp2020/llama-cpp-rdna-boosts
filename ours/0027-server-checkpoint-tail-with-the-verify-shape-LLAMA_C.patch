@@ -16,10 +16,10 @@ When the last prompt chunk is the checkpoint tail and has the verify width (draf
  1 file changed, 17 insertions(+)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 368326206b..bf959ac983 100644
+index 7d0900832b..1d280a54d4 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -6241,6 +6241,23 @@ private:
+@@ -5247,6 +5247,23 @@ private:
                          // extract the logits only for the last token
                          batch.set_output(batch.size() - 1, true);
  

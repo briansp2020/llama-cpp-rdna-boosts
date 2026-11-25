@@ -13,10 +13,10 @@ Subject: [PATCH 35/35] llama: a state copy larger than the stage limit
  1 file changed, 113 insertions(+), 3 deletions(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index b4a23c106c..1a1aebb9ed 100644
+index a15b546a6f..ebe28a1ac2 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -5139,13 +5139,67 @@ private:
+@@ -5095,13 +5095,67 @@ private:
  // 16 MiB, so a context holds the checkpoint size (never more than LLAMA_STATE_ASYNC_MAX_MIB) in pinned host memory
  // for its lifetime.  It is ONE buffer per context, so state saves and restores on the same context must not run
  // concurrently; the llama state API is not documented as thread-safe, and this makes that concrete.
@@ -87,7 +87,7 @@ index b4a23c106c..1a1aebb9ed 100644
  }
  
  // Pipelined batched state copies (fold r151, PR #233).  The batched copy ran the host memcpy into/out of the
-@@ -5522,6 +5576,43 @@ public:
+@@ -5478,6 +5532,43 @@ public:
          if (winfos.empty()) {
              return;
          }
@@ -131,7 +131,7 @@ index b4a23c106c..1a1aebb9ed 100644
  
          std::vector<ggml_tensor *> tensors;
          std::vector<size_t> offsets;
-@@ -5655,6 +5746,25 @@ public:
+@@ -5611,6 +5702,25 @@ public:
          if (rinfos.empty()) {
              return;
          }

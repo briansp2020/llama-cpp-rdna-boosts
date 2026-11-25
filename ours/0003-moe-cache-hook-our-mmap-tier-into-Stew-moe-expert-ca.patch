@@ -36,10 +36,10 @@ Folded in: moe cache: r299 merge fixes for the mmap tier (Stew TODO #327 / #335 
  5 files changed, 894 insertions(+), 30 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index cba7efcf32..cb4f1a1d6b 100644
+index e6adbf9f67..e4dc8bd853 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -7883,7 +7883,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -7708,7 +7708,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
          // TODO #335/#336: the cache declined this table.  If a take-over hook had told the scheduler to skip
          // `input_cpy` for it (and the slab then took its arena before this launch), that buffer holds stale or
          // uninitialised bytes; re-fill it from the host master.  No promise outstanding -> no work.

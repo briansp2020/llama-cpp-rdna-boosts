@@ -1,19 +1,19 @@
-# ours: our production stack on top of the current rdna-boosts release (r351)
+# ours: our production stack on top of the current rdna-boosts release (r359)
 
 This branch holds the patch series we run on top of the latest rdna-boosts release: 2x Radeon AI PRO R9700,
 ROCm 10.2, Qwen3.8-Flash-Next UD-IQ4_XS with `-sm tensor` and `--host-experts mmap`. It is regenerated for each
 release, and patches the release has taken are dropped. It is not a PR. Everything else on this branch is the
 release as published; only `ours/` is added.
 
-**Base:** `v18-919794500-r351` (upstream llama.cpp `919794500` + this repo's release).
+**Base:** `v18-919794500-r359` (upstream llama.cpp `919794500` + this repo's release).
 
 ```
 git checkout 919794500
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r351 release, branch rdna-boosts
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r359 release, branch rdna-boosts
 git am <path-to-this-repo>/ours/*.patch              # 35 patches (0001-0035)
 ```
 
-Result: tree `5604f4408284`. This is the production build since 2026-11-25 2:11 AM PST.
+Result: tree `4a159b343d4e`. This is the production build since 2026-11-25 8:56 AM PST.
 
 ## How the series is organised
 
@@ -92,16 +92,15 @@ Settings on top of the defaults that matter for this series:
 
 With 57.6 GiB of host experts, the expert cache holds 68.2 % in VRAM.
 
-## Validation (r351 + 0030-0035, 2026-11-24/25)
+## Validation (r359, 2026-11-25)
 
+- Rebased from r351 onto r359. r352 withdrew the two-arm server (block 17), so 0001, 0015, 0033 and 0034 lost the
+  lines that only served it (its locks, its KV allocation handshake, the per-slot split-state cache, the end of KV
+  lending when a co-owner formed); everything else is unchanged.
 - The 7-model comparison with the release passes (nightly gate: 0 problems, 0 warnings, 0 failed loads).
-- Production configuration: greedy and 512-token prompt-set outputs identical to the r351 series; the 259.6k-token
-  needle answers 6,358 in every round.
-- 0033 and 0035 are byte-identical in their verify modes (every deferred checkpoint copy and every rounds save
-  compared with the plain copy: 0 differ); 0034 leaves outputs unchanged (its verify mode recomputes each state).
-- Overnight stress (2 GPUs, 46 rounds over 2 h): 0 output mismatches, 0 GPU faults; cold and heat-map-seeded
-  starts give the production outputs.
-- Speed (production configuration, single runs): agent turns with checkpoints -11..-12 ms (0033), agent-turn
-  prompt time -10 % (0034), prompt-cache saves above 256 MiB 35-60 % faster (0035); decode unchanged.
+- Production configuration: output identical to the r351 series on every check: greedy, 512-token prompt set,
+  4.3k and 30k-token prompts, agent turns with checkpoint restores (r357's tool-text change leaves them
+  unchanged), and the 259.6k-token needle (6,358); KV lending, 0 GPU faults. Speed equal within run-to-run noise.
+- The same series on r351 passed an overnight stress run (2 GPUs, 46 rounds: 0 output mismatches, 0 GPU faults).
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.

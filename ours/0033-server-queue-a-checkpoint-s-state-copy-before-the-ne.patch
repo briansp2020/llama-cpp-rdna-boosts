@@ -30,10 +30,10 @@ prompts, agent turns with checkpoint-restore branches); agent turns -11..-12 ms 
  6 files changed, 152 insertions(+), 18 deletions(-)
 
 diff --git a/common/common.cpp b/common/common.cpp
-index 22b7525979..0214033637 100644
+index 8fa386aecb..9c4e708ae9 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -3225,7 +3225,8 @@ void common_prompt_checkpoint::update_pos(
+@@ -3083,7 +3083,8 @@ void common_prompt_checkpoint::update_pos(
  void common_prompt_checkpoint::update_tgt(
          llama_context * ctx,
          llama_seq_id seq_id,
@@ -43,7 +43,7 @@ index 22b7525979..0214033637 100644
      if (ctx == nullptr) {
          return;
      }
-@@ -3236,7 +3237,8 @@ void common_prompt_checkpoint::update_tgt(
+@@ -3094,7 +3095,8 @@ void common_prompt_checkpoint::update_tgt(
          data_tgt.resize(ckpt_size);
      }
  
@@ -54,10 +54,10 @@ index 22b7525979..0214033637 100644
          GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
      }
 diff --git a/common/common.h b/common/common.h
-index fb5e5badd8..1b78cf3744 100644
+index 727840f63c..73c356ad71 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -1538,10 +1538,12 @@ struct common_prompt_checkpoint {
+@@ -1516,10 +1516,12 @@ struct common_prompt_checkpoint {
              llama_pos pos_min,
              llama_pos pos_max);
  
@@ -72,10 +72,10 @@ index fb5e5badd8..1b78cf3744 100644
      void update_dft(
              llama_context * ctx,
 diff --git a/include/llama.h b/include/llama.h
-index a8dfae4b0e..4952ce7413 100644
+index 44f2e76f0f..9dd76f7d33 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -1143,6 +1143,23 @@ extern "C" {
+@@ -1091,6 +1091,23 @@ extern "C" {
                      llama_seq_id   dest_seq_id,
             llama_state_seq_flags   flags);
  
@@ -100,10 +100,10 @@ index a8dfae4b0e..4952ce7413 100644
      // Decoding
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 14c7db210e..b4a23c106c 100644
+index f476237310..a15b546a6f 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1272,6 +1272,7 @@ llama_context::llama_context(
+@@ -1274,6 +1274,7 @@ llama_context::llama_context(
  }
  
  llama_context::~llama_context() {
@@ -111,7 +111,7 @@ index 14c7db210e..b4a23c106c 100644
      for (auto & be : state_pipe_evs) {
          for (ggml_backend_event_t ev : be.second) {
              if (ev != nullptr) {
-@@ -5479,22 +5480,38 @@ public:
+@@ -5435,22 +5436,38 @@ public:
              stage_off += winfos[i].size;
          }
          const int n_copy_threads = llama_state_copy_threads(total);
@@ -163,7 +163,7 @@ index 14c7db210e..b4a23c106c 100644
          return true;
      }
  
-@@ -6127,7 +6144,17 @@ private:
+@@ -6081,7 +6098,17 @@ private:
      llama_context * lctx = nullptr;
  };
  
@@ -181,7 +181,7 @@ index 14c7db210e..b4a23c106c 100644
      if (buf_state_stage == nullptr || ggml_backend_buffer_get_size(buf_state_stage.get()) < size) {
          buf_state_stage.reset();
          // the pinned type of the output device (the first simple device of a meta device), as for the outputs
-@@ -7840,6 +7867,22 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+@@ -7525,6 +7552,22 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
      return ctx->state_seq_set_data(seq_id, src, size, flags);
  }
  
@@ -205,7 +205,7 @@ index 14c7db210e..b4a23c106c 100644
      ctx->synchronize();
  
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 977467c65c..6f59c473b3 100644
+index 7bb303ae40..5ae0622eae 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -13,6 +13,7 @@
@@ -229,10 +229,10 @@ index 977467c65c..6f59c473b3 100644
  
      bool state_load_file(
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index c4965057e1..ac9d21475c 100644
+index 2be0a863a1..e131f788aa 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1484,6 +1484,48 @@ private:
+@@ -1408,6 +1408,48 @@ private:
          }
      }
  
@@ -281,7 +281,7 @@ index c4965057e1..ac9d21475c 100644
      // a spare of exactly n bytes: no new allocation and no zero fill when the checkpoint is written into it
      common_state_data ckpt_take(size_t n) {
          for (auto it = ckpt_spare.begin(); it != ckpt_spare.end(); ++it) {
-@@ -3498,7 +3540,23 @@ private:
+@@ -3330,7 +3372,23 @@ private:
                  cur.data_dft = ckpt_take(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
              }
          }
@@ -306,7 +306,7 @@ index c4965057e1..ac9d21475c 100644
          cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          // stash the draft's speculative state with the checkpoint
          common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
-@@ -4294,6 +4352,7 @@ private:
+@@ -4124,6 +4182,7 @@ private:
      }
  
      void update_slots() {
@@ -314,10 +314,10 @@ index c4965057e1..ac9d21475c 100644
  #ifdef DEBUG_TIMINGS
          static int64_t t_prev = 0;
          int64_t t_start = ggml_time_us();
-@@ -6455,7 +6514,12 @@ private:
-             // handshake holds it out for the duration (a no-op when the pair is not running)
-             arm_step_guard guard(*this, /* main_arm = */ true);
- 
+@@ -5457,7 +5516,12 @@ private:
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
+         queue_tasks.yield_to_queue([&]() {
 -            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
 +            {
 +                // a deferred checkpoint copy (LLAMA_CKPT_ASYNC) completes once this batch is queued, also when the
