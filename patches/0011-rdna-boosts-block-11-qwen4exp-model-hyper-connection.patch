@@ -1,4 +1,4 @@
-From 2e90437066267e013a076c4e5b139d5d04e95d30 Mon Sep 17 00:00:00 2001
+From 20c7954fc1ec2795b0be39312b1aba1a232e1106 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/18] rdna-boosts: block 11: qwen4exp (model,
@@ -168,7 +168,7 @@ Co-authored-by: brian <bsp2020@gmail.com>
  ggml/src/ggml-cuda/fattn-qsa.cu          |  756 +++++++
  ggml/src/ggml-cuda/fattn-qsa.cuh         |   28 +
  ggml/src/ggml-cuda/fattn-qsa3.cu         |  774 +++++++
- ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |  166 +-
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |  164 +-
  ggml/src/ggml-cuda/ggml-cuda.cu          |  234 ++
  ggml/src/ggml-cuda/hc-mix.cu             | 2180 +++++++++++++++++++
  ggml/src/ggml-cuda/hc-mix.cuh            |    8 +
@@ -206,7 +206,7 @@ Co-authored-by: brian <bsp2020@gmail.com>
  tests/test-backend-ops.cpp               |  503 +++++
  tests/test-lazy-reader.cpp               |  264 +++
  tests/test-llama-archs.cpp               |  146 +-
- 52 files changed, 13871 insertions(+), 508 deletions(-)
+ 52 files changed, 13870 insertions(+), 507 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -1298,7 +1298,7 @@ index 3a4fa0707..07c960329 100644
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 530f91749..c44fdc40f 100644
+index 086c5db8e..f7d49b8dc 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1765,6 +1765,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
@@ -1337,7 +1337,7 @@ index 530f91749..c44fdc40f 100644
      // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
      // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
      // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
-@@ -2863,6 +2878,29 @@ static inline bool ggml_cuda_bf16_src1_cache_on() {
+@@ -2868,6 +2883,29 @@ static inline bool ggml_cuda_bf16_src1_cache_on() {
      return on;
  }
  
@@ -2961,7 +2961,7 @@ index 000000000..e17d4bf60
 +    CUDA_CHECK(cudaGetLastError());
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 26fad7df2..679a7a265 100644
+index 20e7052d2..d2c043ff2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -31,6 +31,9 @@
@@ -2991,7 +2991,7 @@ index 26fad7df2..679a7a265 100644
  #include "ggml-cuda/ggml-cuda-try-fuse.cuh"
  #include "ggml.h"
  #include <algorithm>
-@@ -565,7 +571,7 @@ static const struct {
+@@ -566,7 +572,7 @@ static const struct {
  // tokens), when the CONCAT is the gather's only reader and nothing but the folded snapshot CPYs writes the cache before
  // the conv.  GGML_CUDA_FUSE_GDN_CONV_GATHER=0: off.
  bool ggml_cuda_gdn_conv_gather_deferrable(const ggml_cgraph * cgraph, int node_idx, const ggml_cuda_gdn_gather_index & idx) {
@@ -3000,7 +3000,7 @@ index 26fad7df2..679a7a265 100644
      const ggml_tensor * gr = cgraph->nodes[node_idx];
      const auto g = idx.gathers.find(gr);
      if (!fuse || g == idx.gathers.end() || g->second.n_gdn != 0 || g->second.n_concat != 1 || g->second.other_reader ||
-@@ -600,8 +606,10 @@ static bool ggml_cuda_topk_moe_fusion_disabled() {
+@@ -601,8 +607,10 @@ static bool ggml_cuda_topk_moe_fusion_disabled() {
      // A/B kill-switch for the fused MoE router.  The fused kernel is bit-identical to the generic
      // softmax -> argsort -> get_rows -> norm chain (both the softmax reduction/normalization and
      // the argsort tie-break are matched), so this only exists to compare the two execution paths.
@@ -3013,7 +3013,7 @@ index 26fad7df2..679a7a265 100644
      return disabled;
  }
  
-@@ -988,16 +996,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph * cgraph, int node_idx,
+@@ -989,16 +997,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph * cgraph, int node_idx,
  // primary device): the q4_0 / q5_0 / iq4_nl group quantizers ballot and shuffle over one 32-lane wave, so a wave64
  // device keeps its separate launches.  q8_0's shuffle width is wave-size agnostic.
  static bool ggml_cuda_kv_fold_type_ok(const ggml_type t, const int warp_size) {
@@ -3034,7 +3034,7 @@ index 26fad7df2..679a7a265 100644
      if (!on || i + 3 > cgraph->n_nodes) {
          return 0;
      }
-@@ -1099,7 +1107,7 @@ static int ggml_cuda_rope_fwht_count(const ggml_cgraph * cgraph, const int i, co
+@@ -1100,7 +1108,7 @@ static int ggml_cuda_rope_fwht_count(const ggml_cgraph * cgraph, const int i, co
  // cache row the K chain writes) may write over them or over the Q output, and nothing in between may read the Q chain.
  // GGML_CUDA_ROPE_QK_PAIR=0: off.
  static int ggml_cuda_qk_pair_k_at(const ggml_cgraph * cgraph, const int i, const bool allow) {
@@ -3043,7 +3043,7 @@ index 26fad7df2..679a7a265 100644
      if (!on || !allow) {
          return 0;
      }
-@@ -1165,7 +1173,7 @@ static int ggml_cuda_qk_pair_k_at(const ggml_cgraph * cgraph, const int i, const
+@@ -1166,7 +1174,7 @@ static int ggml_cuda_qk_pair_k_at(const ggml_cgraph * cgraph, const int i, const
  // VIEW and SET_ROWS into a cache of the same type with the same row length: the fused kernel's per-head blocks also write
  // the V row (k_set_rows' cast), so the V set_rows launch goes away.  GGML_CUDA_ROPE_SET_ROWS_V=0: off.
  static bool ggml_cuda_rope_set_rows_v_ok(const ggml_cgraph * cgraph, const int i) {
@@ -3052,7 +3052,7 @@ index 26fad7df2..679a7a265 100644
      if (!on || i + 7 > cgraph->n_nodes) {
          return false;
      }
-@@ -1332,7 +1340,7 @@ static int ggml_cuda_fwht_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const g
+@@ -1333,7 +1341,7 @@ static int ggml_cuda_fwht_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const g
  // not run (one parallel block), the FWHT runs as usual.  Returns the index offset of the last node done, or 0 (FA not
  // run).  1-token graphs.  GGML_CUDA_FA_COMBINE_FWHT=0: off.
  static int ggml_cuda_fa_had_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
@@ -3061,7 +3061,7 @@ index 26fad7df2..679a7a265 100644
      ggml_tensor * fa = cgraph->nodes[i];
      if (!on || fa->op != GGML_OP_FLASH_ATTN_EXT || fa->src[0]->ne[1] != 1 || fa->type != GGML_TYPE_F32 ||
              ctx.curr_stream_no != 0 || !ctx.stream_context().concurrent_events.empty()) {
-@@ -1375,7 +1383,7 @@ static int ggml_cuda_fa_had_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+@@ -1376,7 +1384,7 @@ static int ggml_cuda_fa_had_try_fuse(ggml_backend_cuda_context & ctx, const ggml
  // whose V VIEW reads that RESHAPE (the QK rotate's order with a quantized KV cache): the fused K kernel can rotate the
  // V row itself.  GGML_CUDA_FUSE_V_FWHT=0: off.
  static bool ggml_cuda_v_fwht_fold_at(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
@@ -3070,7 +3070,7 @@ index 26fad7df2..679a7a265 100644
      if (!v_fwht_on || i < 0 || i + 12 > cgraph->n_nodes) {
          return false;
      }
-@@ -1715,6 +1723,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -1716,6 +1724,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
  
@@ -3088,7 +3088,7 @@ index 26fad7df2..679a7a265 100644
  // wip/moe-expert-cache (H1): while the cache is active, only the fusions that read a routed
  // expert table in the cache band stand down; every other backend fusion (router/topk, GDN, QSA,
  // rope, norms, and the *prefill* MoE fusions) stays on.  The decode/verify MoE must run through
-@@ -1881,7 +1900,7 @@ static int ggml_cuda_count_uses(const ggml_cgraph * cgraph, const ggml_tensor *
+@@ -1902,7 +1921,7 @@ static void ggml_cuda_count_uses3(const ggml_cgraph * cgraph, const ggml_tensor
  // the gate -> Q8_1 kernel reads the row-strided view itself, so the CONT launches nothing.  The CONT is an exact
  // copy, so the result is bit-identical.  GGML_CUDA_FUSE_CONT_GATE_Q8_1=0: off.  Returns the extra nodes consumed.
  static int ggml_cuda_cont_gate_q8_1_try_fuse(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
@@ -3097,16 +3097,7 @@ index 26fad7df2..679a7a265 100644
      const ggml_tensor * c = cgraph->nodes[i];
      if (!fuse || c->op != GGML_OP_CONT || c->type != GGML_TYPE_F32 || i + 2 >= cgraph->n_nodes) {
          return 0;
-@@ -1913,7 +1932,7 @@ static int ggml_cuda_cont_gate_q8_1_try_fuse(ggml_backend_cuda_context * cuda_ct
- // GDN output: RMS_NORM(xn) -> MUL(w) at r, r+1, and later UNARY(sigmoid)(z) -> MUL(norm, .) -> decode matmul at s, s+1.
- // Returns r when the gate -> Q8_1 kernel at s can compute the norm itself (same decision at both nodes), -1 otherwise.
- static int ggml_cuda_gdn_norm_gate_match(const ggml_cgraph * cgraph, int s) {
--    static const bool fuse = getenv("GGML_CUDA_FUSE_GDN_NORM_GATE") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_NORM_GATE")) != 0;
-+    static const bool fuse = [] { const char * e = getenv("GGML_CUDA_FUSE_GDN_NORM_GATE"); return e == nullptr || atoi(e) != 0; }();
-     if (!fuse || s < 2 || s + 1 >= cgraph->n_nodes) {
-         return -1;
-     }
-@@ -2171,12 +2190,16 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2248,12 +2267,16 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      }
  
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
@@ -3124,7 +3115,7 @@ index 26fad7df2..679a7a265 100644
  
      // GDN snapshot CPYs already written by the direct conv kernel (GGML_CUDA_DISABLE_GDN_CONV_SNAP=1: off)
      if (ggml_cuda_gdn_conv_snap_try_fuse(cgraph, i)) {
-@@ -2199,6 +2222,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2276,6 +2299,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
          return n_shared_expert;
      }
  
@@ -3135,7 +3126,7 @@ index 26fad7df2..679a7a265 100644
  
      // Depthwise causal conv1d fusions (qwen4exp GDN + PLE), ported from the halo-box
      // reference: the CONCAT(state, x) materialization and the SSM_CONV / tap-mul-add
-@@ -2304,7 +2331,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2381,7 +2408,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      }
  
      //RoPE + view + set-rows
@@ -3144,7 +3135,7 @@ index 26fad7df2..679a7a265 100644
      if (!disable_rope_setrows && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
          ggml_tensor * rope     = cgraph->nodes[i];
          ggml_tensor * set_rows = cgraph->nodes[i + 2];
-@@ -2315,7 +2342,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2392,7 +2419,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
  
      // Snake activation: y = x + sin(a*x)^2 * inv_b
      // Naive 5-op decomposition emitted by frontends: mul -> sin -> sqr -> mul -> add
@@ -3153,7 +3144,7 @@ index 26fad7df2..679a7a265 100644
      if (!disable_snake && ggml_can_fuse_subgraph(cgraph, i,
              { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML_OP_MUL, GGML_OP_ADD },
              { i + 4 })) {
-@@ -2362,7 +2389,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2439,7 +2466,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      }
  
      // multi-(add or mul)
@@ -3162,7 +3153,7 @@ index 26fad7df2..679a7a265 100644
      if (!disable_fused_addmul && (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL)) {
          int     n_fuse = 0;
          ggml_op ops[8];
-@@ -3248,7 +3275,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -3325,7 +3352,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
          // Defer Q to j and run both in one launch (rms_norm_mul_rope_f32_qk_pair<.., fwht_n, true>): each block runs the
          // single launch's body, so the results are the same.  Nothing runs in between; the pair kernel's writes (Q's
          // rotation, the K / V cache rows) must not touch what the other half reads.  GGML_CUDA_QK_PAIR_FWHT=0: off.
@@ -3171,7 +3162,7 @@ index 26fad7df2..679a7a265 100644
          const int j = i + 7;
          if (pair_fwht_on && kv_allow_v && cuda_ctx->qk_pend_graph == nullptr && j + 12 <= cgraph->n_nodes &&
                  ggml_cuda_is_view_or_noop(cgraph->nodes[i + 5]) && ggml_cuda_is_view_or_noop(cgraph->nodes[i + 6]) &&
-@@ -3365,7 +3392,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -3442,7 +3469,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
          // a second RMS_NORM + SCALE over a view of the same tensor with the same shape, strides, eps and scale (the GDN
          // q / k l2 norm), separated only by no-op nodes: both in one launch.  GGML_CUDA_DISABLE_NORM_PAIR=1: off.
@@ -3180,7 +3171,7 @@ index 26fad7df2..679a7a265 100644
          const ggml_tensor * x0 = node->src[0];
          int j = i + 2;
          while (!norm_pair_off && j < cgraph->n_nodes && (cgraph->nodes[j]->op == GGML_OP_VIEW || cgraph->nodes[j]->op == GGML_OP_RESHAPE ||
-@@ -3415,6 +3442,107 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -3492,6 +3519,107 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      // then read inject's data as block_out. It now reads the live REPEAT output (mul operand).
      // Opt-outs: GGML_CUDA_DISABLE_HC_FUSION=1 (all), GGML_CUDA_DISABLE_HC_MIX=1 / GGML_CUDA_DISABLE_HC_COMB=1.
  
@@ -3289,7 +3280,7 @@ index 26fad7df2..679a7a265 100644
      // UNARY(sigmoid) -> MUL -> ADD with a per-row gate (GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0: off): one kernel
      if (const int n_sig_mul_add = ggml_cuda_sigmoid_mul_add_try_fuse(*cuda_ctx, cgraph, i)) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3d7ab187c..1804a7207 100644
+index c029d1732..d84d91906 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -29,6 +29,9 @@
@@ -3321,7 +3312,7 @@ index 3d7ab187c..1804a7207 100644
      if (moe_glu_q8_cnt != nullptr) {
          CUDA_CHECK(cudaFree(moe_glu_q8_cnt));
      }
-@@ -4470,6 +4478,43 @@ struct cuda_gc_timer {
+@@ -4481,6 +4489,43 @@ struct cuda_gc_timer {
  
  // GGML_CUDA_BF16_SRC1_CACHE=0 disables the per-graph BF16 src1 reuse (bf16_src1_cache in common.cuh).
  
@@ -3365,7 +3356,7 @@ index 3d7ab187c..1804a7207 100644
  template<ggml_type compute_type>
  
  static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-@@ -4576,6 +4621,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -4587,6 +4632,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
      if constexpr (compute_type == GGML_TYPE_BF16) {
          // reserved (and, on a miss, converted) above -- see the pool-order note there
          if (src1_bf16 != nullptr) {
@@ -3377,7 +3368,7 @@ index 3d7ab187c..1804a7207 100644
              if (src1_bf16_new) {
                  const auto convert_func = traits::convert(src1->type);
                  GGML_ASSERT(convert_func != nullptr);
-@@ -5786,6 +5836,19 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5797,6 +5847,19 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_FLASH_ATTN_EXT:
              ggml_cuda_flash_attn_ext(ctx, dst);
              break;
@@ -3397,7 +3388,7 @@ index 3d7ab187c..1804a7207 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
              break;
-@@ -5810,6 +5873,12 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5821,6 +5884,12 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -3410,7 +3401,7 @@ index 3d7ab187c..1804a7207 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -7493,12 +7562,152 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7504,12 +7573,152 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -3563,7 +3554,7 @@ index 3d7ab187c..1804a7207 100644
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
-@@ -8946,8 +9155,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8957,8 +9166,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -10153,10 +10144,10 @@ index 1c90b2180..aa98ef377 100644
              return true;
      }
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 48b2c0c4f..f653a9620 100644
+index bf5b44a00..36bc7b778 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -982,6 +982,10 @@ llama_context::llama_context(
+@@ -1023,6 +1023,10 @@ llama_context::llama_context(
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
              /*.no_alloc  =*/ model.no_alloc(),
          };

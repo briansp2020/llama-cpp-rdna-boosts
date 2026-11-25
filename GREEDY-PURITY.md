@@ -3200,3 +3200,88 @@ f16, plus `draft-mtp-adaptive`, plus the MTP protocol's four axes and a concurre
 **Record.**  This entry; `scripts/gate-arms-spec.sh` (header carries the arms and the negative reasoning);
 `INVARIANTS.md` r350; `WORKLOG.md` 261122.040; `patches/README.md` block 17; `ENVIRONMENT.md` §23; `TODO` #364
 (retired).
+
+## 108 (r353, block 10) — a fold's GATE OP is a matcher dimension, not a kernel one: the kernel was templated on it all along, so the widening moves no hash, and the instruments are a CENSUS plus the exact-fallback KLD
+
+**Claim.**  Block 10's GDN output-norm fold skips a GDN layer's `RMS_NORM -> MUL(w)` pair and lets the
+`gate -> Q8_1` kernel compute the norm itself, which retires two launches per GDN layer per decode step (48 GDN
+layers on the 27B).  Its matcher accepted `GGML_UNARY_OP_SIGMOID` only, i.e. qwen4exp; the qwen35 / qwen35moe /
+qwen3next / clover-moe gate is `ggml_silu` (`build_norm_gated()`), so on the two GDN families the delivery
+validates the fold was **dead code** (census `fused sigmoid=0`), and the kernel it feeds was templated on the op
+all along (`unary_gated_q8_1_norm_kernel<op>`, `ggml_cuda_op_unary_mul_q8_1` dispatching `SILU -> op_silu`).
+`ggml_cuda_can_fuse({UNARY, MUL})` admitted SILU too, so the entire change is the matcher's op predicate.
+
+**Rule.**
+
+1. **A kernel that already carries an op template (or a dispatch arm) owes a matcher that can reach it.**  The
+   missing dimension is a defect in the *matcher*, and widening it is not a new kernel: it owes no new numerics
+   reference — but it owes §60's exact-fallback point at **every width the fold reaches**, because the fold's
+   input stops being materialized at all (the in-kernel norm must reduce exactly like `rms_norm_f32`'s strided
+   path, which is what makes the widening bit-identical instead of "close").
+2. **A dead matcher is invisible to every hash-based gate** — a fold that does not fire runs the chain and
+   produces the same text — so non-vacuity must be a **CENSUS taken where the host walks the graph**, and the
+   OFF arm needs its own non-zero counter or the switch arm proves nothing.  Count the DECLINE at the same node
+   as the ACCEPT: an earlier revision counted it at the `RMS_NORM` and paid a full match per norm in an A/B arm;
+   at the gate node it costs nothing when the census is off.
+3. **Do not gate on the two counters being EQUAL.**  A two-slot `--kv-unified` server walk measured
+   `fused=384` against `declined=672` (the arms capture different numbers of graphs per decode shape).  Non-zero
+   on both is the invariant; equality is an artefact of a one-shape `llama-cli` arm.
+4. **Reach is a model property, and the shape guard is part of the proof.**  Verify the census on every GDN
+   family the delivery validates (dense `qwen35` + MoE `qwen35moe`), at the DECODE width and in the VERIFY band,
+   and check the `xn->ne[3] != 1` guard is untouched: that guard is what keeps the fold out of a multi-sequence
+   ubatch, i.e. out of §49's class.
+5. **The A/B arm is the fold's own kill-switch**, not `GGML_CUDA_DISABLE_FUSION` (the sledgehammer also skips
+   the `graph_optimize` alloc-dependency pass and the shared-expert reorder, so it is a different graph).
+
+**Numbers** (r353, gfx1201, ROCm 10.2, `HIP_VISIBLE_DEVICES=0`).  Census: 27B UD-Q4_K_XL `fused sigmoid=0
+silu=96` at `-ub 1` and `528` at `-ub 8`, OFF `declined silu=528`; 35B-A3B UD-Q4_K_M `60` / `300`, OFF
+`declined silu=300`; a two-slot `--kv-unified` server `384` / `declined 672`.  Purity:
+`gate-prefill-logits.sh --ab "GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0"` **−0.000000 / 100.000 %** at `--ub 1`,
+`--ub 4` and the canonical point, and the canonical point against a base recorded from the r352 build on the
+same line **0.000000 / 100.000 %**.  Text (no `-lv`): 27B `1129 2d0d685256cf` and 35B-A3B `1002
+abed0bf40d87` identical r352 == default == switch-off; 3-GPU `-sm tensor` `406 9051286a12ae` identical; a
+two-slot unified server answered `209 5cc901c01994` / `316 6f84cc5be35a` in both arms.  Rate: tg128 **+0.5 %**
+(27B, d8192) and **+0.9 %** (35B-A3B, d8192), depth 0 within the run-to-run spread, `llama-batched-bench
+-npl 1,4,8` +1.1 / +0.1 / +0.05 %, pp512 flat.
+
+**Record.**  This entry; `scripts/gate-gdn-norm-gate.sh`; `patches/README.md` block 10; `DIAGNOSTIC.md` §7.1;
+`MANIFESTS.md` gate 41; `INVARIANTS.md` r353; `WORKLOG.md` 261123.004; §60 rule 2 (the fused-norm reduction
+contract this inherits) and §49 (the multi-sequence fusion class the `ne[3]` guard keeps it out of).
+
+## 109 (r356, block 17) — an "identical to the CPU" kernel matches the CPU's ROUNDING, not its source: an unfused CPU mul+add is not an fma, and the fused version moves no hash
+
+**Claim.**  Block 17 (TQ1_0 / TQ2_0 on the GPU, contributor PR #358) is designed to be **bit-identical to the CPU
+backend's x86 AVX2 path**, and the PR stated that `test-backend-ops … LLAMA_TEST_OP_NMSE=1` reported "every error
+exactly 0".  On the delivery's own build it did not: **25 of 61** `MUL_MAT` cases read NMSE ≈ 1e-14.
+
+**Rule.**  A kernel that reproduces a CPU dot product must reproduce the CPU's **arithmetic as compiled**, not the
+arithmetic in the source.  `ggml_vec_dot_tq{1,2}_0_q8_K` writes
+`sumf = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(sumi0), d), sumf)` and a Release clang build of `ggml-cpu`
+emits `vmulps` + `vaddps` for it — **no `vfmadd` in either function** (disassembled, `-march=native`, the delivery's
+own `build-llama-rocm`).  The kernel's per-block accumulation therefore has to be an unfused mul and add
+(`TQ_FADD(TQ_FMUL(dot, y.d*x.d), acc)`), not `fmaf`.  The difference is 1 ULP per 256-value block and it is
+**invisible to every instrument the repo normally uses**: the greedy text is identical in all three arms, the
+`TQ_FUSE` kill-switch arm matches byte for byte, and the CPU-vs-GPU text comparison matches — because a 1e-14
+relative logit shift cannot flip a near-tie.  Only the op oracle's NMSE column sees it.
+
+**The diagnostic.**  The failure has a shape, and the shape is the diagnosis: with `fmaf` every `k=256` case (one
+Q8_K block, one addition onto a zero accumulator) is exactly 0 and **every** `k>256` case is not.  When a future
+change re-fuses the accumulation, `scripts/gate-tq.sh` prints exactly that split before it fails.  Generalised: a
+reduction that accumulates over N blocks can only be judged at N > 1, so a bit-identity arm must include a
+multi-block length (the same reason `hsum_float_8`'s order is checked at K ≥ 512).
+
+**Numbers** (gfx1201, ROCm 10.2, the delivery build): before the fix 280 of 305 reported NMSE values were 0 and 25
+were ~1e-14, with all 36 `k=256` cases 0 and all 25 `k>256` cases nonzero; after it **305/305 and 84/84 exactly 0**
+(`GET_ROWS` was already exact — it is a dequantise, not a reduction).  Text was identical before and after
+(`e5a9bb20d861`, `a3a0ae855c37`), as it is across the default / `GGML_CUDA_TQ_FUSE=0` / `GGML_CUDA_TQ=0` arms on
+both models, on 1 GPU and on a 3-GPU `-sm layer`/`-sm tensor` split; the fix costs no rate (TQ2_0 tg128 181.5 →
+180.7, TQ1_0 198.2 → 197.7, noise).
+
+**Why it is worth a rule.**  The block's design is predicated on the identity — it is the reason the kernels carry the
+CPU's eight-lane split and `hsum_float_8`'s summation order at all — so a fused accumulation is not a 1e-14
+inaccuracy, it is the one property the block exists to provide, silently absent.  And the same class will recur:
+every fusion this repo adds is an invitation to take one rounding out of a chain that a CPU oracle had as two.
+
+**Record.**  This entry; `scripts/gate-tq.sh` (arm 1, with the `k=256`-vs-`k>256` diagnosis); `patches/README.md`
+block 17; `DIAGNOSTIC.md` §25; `MANIFESTS.md` gate 42; `INVARIANTS.md` r356; `WORKLOG.md` 261124.012;
+`archive/work/tq-hip/` (the campaign record and the submitted patch's own claim).

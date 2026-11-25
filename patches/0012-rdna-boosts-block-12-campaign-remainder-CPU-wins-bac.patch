@@ -1,9 +1,64 @@
-From 2c2e361a7b72f22e107804b3dfa0366e0fd4fb7b Mon Sep 17 00:00:00 2001
+From 9fb86c11b3f128ecf770cbab7a6a4b84cad25077 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/18] rdna-boosts: block 12: campaign remainder (CPU wins,
  backend iface fills, DFlash, FA build grouping, server prompt cache)
 
+The r357 amendment: the server keeps a tool result's special-token strings as TEXT
+(contributor PR #360, @overdoingism; server code only, no backend change).
+
+A tool result (role "tool" / "function"), the arguments of an assistant's tool call and an
+assistant's own content/reasoning are DATA: the parts of a request that came from outside
+the conversation.  The server rendered the chat template and tokenized the whole string with
+parse_special, so a "<|im_end|>" in a tool result became the real token and could forge a
+turn, a tool call or a tool result.  parse_special = false would not close it --
+llama_vocab's tokenizer_st_partition still matches USER_DEFINED tokens ("<think>",
+"<tool_call>", "<tool_response>") when it is false.
+
+  * LLAMA_SERVER_TOOL_TEXT (a kill switch, default on): the text of every CONTROL / UNKNOWN
+    token, and of the USER_DEFINED ones the chat template itself uses, is wrapped in two
+    noncharacter marks (U+FDD0 / U+FDD1) before the template is applied -- chosen by message
+    ROLE, never by searching the rendered prompt, so a forged closing tag cannot end the
+    protected region (Anthropic tool_result and Responses function_call_output arrive as
+    "tool" messages and are covered) -- and the prompt is then tokenized as before EXCEPT
+    that each marked string is ordinary text, cut after its first character so no piece can
+    hold a whole one.  Assistant content and reasoning take the CONTROL / UNKNOWN strings
+    only (a turn boundary; a USER_DEFINED one such as <think> can be a token the model
+    really generated), and --special empties that list, leaving assistant text alone.  User
+    and system text is not touched.
+  * A request without such strings is tokenized exactly as before, and a normal request's
+    text and prompt token count are identical to the previous release.  The strings come
+    from the vocab and the template at load, so nothing is set per model.
+  * LLAMA_SERVER_TOOL_TEXT_CENSUS=1 logs one line per request (mode, strings, tool results,
+    tool calls, assistant replies, prompt and special token counts); the OFF arm still
+    counts, so the switch-off arm is not vacuous.
+
+Three integration fixes against the submitted patch:
+
+  1. The space fallback is per REQUEST, not per server.  The submitted patch gated it on
+     opt.allow_image/audio/video -- the mmproj capability -- so every vision-capable server
+     silently mutated tool data on TEXT-ONLY requests ("< /tool_response>": measured on
+     Qwen3.6-35B-A3B + mmproj).  It is now gated on the request's own media, and the two
+     mtmd routing sites (handle_completions_impl, handle_count_tokens) accept the token
+     array a protected prompt becomes, so a text-only request on a vision server keeps the
+     marks path and its tool data reaches the model byte-identical.
+  2. The kill switch really restores the previous behaviour.  A client's own copy of the
+     marks was dropped unconditionally, so LLAMA_SERVER_TOOL_TEXT=0 still altered text that
+     held U+FDD0/U+FDD1; the strip is armed with the feature, and the OFF arm's prompt is
+     now byte-identical to stock (measured on all three probes, including the one carrying
+     both noncharacters).
+  3. The piecewise re-tokenization is VERIFIED, not assumed (tool_text_tokenize_ok -- the
+     check common_chat_input_tokenize() makes): the tokens must detokenize to the marked
+     prompt, and a vocab whose pre-tokenizer adds a prefix, normalizes a fragment or strips
+     one (metaspace_prepend_scheme "first", the SOPRANO / NEMOTRON_3_5_EMBD / MMBERT
+     pre-types, a <mask> LSTRIP) falls back to the space mode instead of moving the text the
+     model reads.  Non-vacuity is proved by a deliberate one-character change in the
+     re-tokenization, which reads "space (the tokenizer changed the text)".
+
+It is a correctness/security change, not a performance claim, and every backend runs it (no
+ggml, kernel or backend file is touched).  Gate: scripts/gate-tool-text.sh (gate 43).
+Knobs: DIAGNOSTIC.md section 26 (both are diagnostics -- a kill switch and a census).
+Record: archive/work/tool-text/ (the submitted patch is kept there as the reproduction).
 ---
  common/arg.cpp                                |   32 +-
  common/common.cpp                             |   11 +
@@ -66,11 +121,13 @@ Subject: [PATCH 12/18] rdna-boosts: block 12: campaign remainder (CPU wins,
  src/models/qwen4exp.cpp                       |  180 +-
  tests/test-llama-archs.cpp                    |   18 +-
  tools/llama-bench/llama-bench.cpp             |    4 +-
- tools/server/server-context.cpp               |  344 +-
+ tools/server/server-common.cpp                |  353 +-
+ tools/server/server-common.h                  |    8 +
+ tools/server/server-context.cpp               |  380 +-
  tools/server/server-slot-sched.cpp            |  114 +-
  tools/server/server-slot-sched.h              |   14 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 65 files changed, 10175 insertions(+), 1265 deletions(-)
+ 67 files changed, 10567 insertions(+), 1270 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index f36b39cf0..ebd7320eb 100644
@@ -3008,10 +3065,10 @@ index 5b72804a3..01087b511 100644
                            "target=%.1f MiB boundary=%.1f MiB limit=%.1f MiB armed=%d\n",
                            device, (double) size/1048576.0, (double) want/1048576.0,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 679a7a265..b36478105 100644
+index d2c043ff2..06521064f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -1760,7 +1760,7 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx,
+@@ -1761,7 +1761,7 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx,
      const ggml_tensor * node = cgraph->nodes[i];
  
      // gate+up+GLU, the routed pair, and the qwen4exp weighted-down all start at the routed
@@ -3021,10 +3078,10 @@ index 679a7a265..b36478105 100644
          if (node->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
              // TODO #133 / TODO #327: ABOVE the band an identity (fully resident) table is served IN PLACE -- the
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1804a7207..73ab4231b 100644
+index d84d91906..37d6aea0c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2846,6 +2846,10 @@ struct ggml_backend_cuda_comm_context {
+@@ -2857,6 +2857,10 @@ struct ggml_backend_cuda_comm_context {
      // re-attempting or re-logging.
      bool                        ce_grow_disabled  = false;
      bool                        ce_fallback_warned = false;
@@ -3035,7 +3092,7 @@ index 1804a7207..73ab4231b 100644
      // `GGML_CUDA_ALLREDUCE=q8ce` (r259): the copy-engine large-tensor arm sends its staged payload as
      // Walsh-Hadamard-rotated q8_0 blocks instead of bf16 (see the ce_q8 kernels).  Fixed for the life of
      // the context by the chain that created it; no env variable other than the algorithm name.
-@@ -3361,42 +3365,29 @@ static bool ggml_cuda_ar_ce_single() {
+@@ -3372,42 +3376,29 @@ static bool ggml_cuda_ar_ce_single() {
      return on;
  }
  
@@ -3098,7 +3155,7 @@ index 1804a7207..73ab4231b 100644
      if (comm_ctx->ce_bytes < need) {
          // Optional scratch budget (`GGML_CUDA_AR_CE_SCRATCH_MIB`; 0 = unlimited, the default): an
          // oversized prefill degrades to the internal pipeline instead of eating the slab reserve.  CE is
-@@ -3409,6 +3400,10 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3420,6 +3411,10 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
              // Issue #136 (item C): the scratch could not be grown (or exceeds the budget).  Return false
              // BEFORE any collective phase runs, so the dispatcher falls back cleanly to the internal
              // pipeline (`ggml_backend_cuda_comm_allreduce_tensor`).  Never a hard abort.
@@ -3109,7 +3166,7 @@ index 1804a7207..73ab4231b 100644
              if (!comm_ctx->ce_fallback_warned) {
                  comm_ctx->ce_fallback_warned = true;
                  GGML_LOG_WARN("%s: copy-engine all-reduce scratch %.2f MiB unavailable%s; falling back to the "
-@@ -3443,6 +3438,9 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3454,6 +3449,9 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
                      if (new_tmp [j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp [j] });
                      if (new_tmp2[j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp2[j] });
                  }
@@ -3119,7 +3176,7 @@ index 1804a7207..73ab4231b 100644
                  if (!comm_ctx->ce_fallback_warned) {
                      comm_ctx->ce_fallback_warned = true;
                      GGML_LOG_WARN("%s: could not allocate the copy-engine all-reduce scratch (%.2f MiB on "
-@@ -3462,8 +3460,57 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3473,8 +3471,57 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
              comm_ctx->ce_tmp [i] = new_tmp [i];
              comm_ctx->ce_tmp2[i] = new_tmp2[i];
          }
@@ -3177,7 +3234,7 @@ index 1804a7207..73ab4231b 100644
  
      to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
      to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-@@ -3756,6 +3803,348 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3767,6 +3814,348 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
      return true;
  }
  
@@ -3526,7 +3583,7 @@ index 1804a7207..73ab4231b 100644
  static bool ggml_backend_cuda_comm_init_ce(ggml_backend_cuda_comm_context * ret) {
      const size_t nb = ret->backends.size();
      if (nb < 2) {
-@@ -4307,6 +4696,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -4318,6 +4707,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -3604,7 +3661,7 @@ index 1804a7207..73ab4231b 100644
  //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
  //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
  //}
-@@ -5563,6 +6023,21 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5574,6 +6034,21 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_DUP:
              ggml_cuda_dup(ctx, dst);
              break;
@@ -3626,7 +3683,7 @@ index 1804a7207..73ab4231b 100644
          case GGML_OP_CPY:
              ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
              break;
-@@ -5961,6 +6436,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -5972,6 +6447,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
      }
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
@@ -3651,7 +3708,7 @@ index 1804a7207..73ab4231b 100644
      CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
  }
  
-@@ -6158,7 +6651,8 @@ static void ggml_cuda_peer_copy_staged(
+@@ -6169,7 +6662,8 @@ static void ggml_cuda_peer_copy_staged(
      ggml_cuda_set_device(src_device);
  }
  
@@ -3661,7 +3718,7 @@ index 1804a7207..73ab4231b 100644
      ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
      ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
  
-@@ -6212,16 +6706,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -6223,16 +6717,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
  #endif // GGML_CUDA_NO_PEER_COPY
          }
  
@@ -3694,7 +3751,7 @@ index 1804a7207..73ab4231b 100644
      } else {
          // src and dst are on the same backend
          CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
-@@ -6229,6 +6732,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -6240,6 +6743,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
      return true;
  }
  
@@ -3710,7 +3767,7 @@ index 1804a7207..73ab4231b 100644
  static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
      ggml_cuda_async_input_drain(cuda_ctx->device);
-@@ -8365,6 +8877,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8376,6 +8888,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -3719,7 +3776,7 @@ index 1804a7207..73ab4231b 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -8394,6 +8908,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -8405,6 +8919,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
      /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
@@ -3732,7 +3789,7 @@ index 1804a7207..73ab4231b 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8945,6 +9465,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8956,6 +9476,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -3743,7 +3800,7 @@ index 1804a7207..73ab4231b 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -9241,7 +9765,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -9252,7 +9776,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  // tier, and it is added by block 12, which defines that buffer type -- naming it here would leave blocks 09-11
  // uncompilable (`INVARIANTS.md` r307 fact 5).
  static bool ggml_backend_buft_is_cuda_host_expert(ggml_backend_buffer_type_t buft) {
@@ -3756,7 +3813,7 @@ index 1804a7207..73ab4231b 100644
  }
  
  // Issue #323: the host-expert offload relaxation, default ON.  `GGML_MOE_HOST_OFFLOAD=0` restores the
-@@ -9395,6 +9923,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
+@@ -9406,6 +9934,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
      return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
  }
  
@@ -3779,7 +3836,7 @@ index 1804a7207..73ab4231b 100644
  static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
      (void) dev;
-@@ -9414,6 +9958,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
+@@ -9425,6 +9969,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
  
  // wip/host-expert-tier: the persisted heat prior, so the loader can fill the pinned host-master tier in
  // descending hotness.  The prior is process-global in the cache, so any CUDA device serves.
@@ -3791,7 +3848,7 @@ index 1804a7207..73ab4231b 100644
  static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
      (void) dev;
      moe_cache_set_host_pool_budget(bytes);
-@@ -9437,6 +9986,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -9448,6 +9997,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
      moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
  }
  
@@ -3811,7 +3868,7 @@ index 1804a7207..73ab4231b 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -9571,11 +10133,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -9582,11 +10144,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
      /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
      /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,
@@ -3826,7 +3883,7 @@ index 1804a7207..73ab4231b 100644
  };
  
  // backend reg
-@@ -9690,6 +10254,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -9701,6 +10265,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
          return (void *)ggml_backend_cuda_comm_allreduce_tensor;
      }
@@ -10718,7 +10775,7 @@ index e6f4be6a2..3875c56f9 100644
  private:
      void clear();
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index f653a9620..98e6961b3 100644
+index 36bc7b778..1ab88e93d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,3 +1,6 @@
@@ -10743,7 +10800,7 @@ index f653a9620..98e6961b3 100644
  //
  // llama_context
  //
-@@ -544,6 +553,11 @@ llama_context::llama_context(
+@@ -553,6 +562,11 @@ llama_context::llama_context(
      cparams.embeddings_nextn_dev     = false;
      cparams.ctx_state_src            = nullptr;
      embd_layer_inp.resize(hparams.n_layer() + 1);
@@ -10755,7 +10812,7 @@ index f653a9620..98e6961b3 100644
  
      cparams.ctx_type          = params.ctx_type;
      cparams.rope_scaling_type = params.rope_scaling_type;
-@@ -1058,8 +1072,108 @@ llama_context::llama_context(
+@@ -1099,8 +1113,108 @@ llama_context::llama_context(
              moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
          }
  
@@ -10864,7 +10921,7 @@ index f653a9620..98e6961b3 100644
          if (!cparams.flash_attn) {
              if (ggml_is_quantized(params.type_v)) {
                  throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
-@@ -1079,10 +1193,14 @@ llama_context::llama_context(
+@@ -1120,10 +1234,14 @@ llama_context::llama_context(
  }
  
  llama_context::~llama_context() {
@@ -10882,7 +10939,7 @@ index f653a9620..98e6961b3 100644
      // wait for any pending asynchronous copies into the output buffers before they are freed
      synchronize();
  
-@@ -1124,7 +1242,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -1165,7 +1283,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
  
          auto * gf = graph_reserve(n_tokens_probe, n_seqs_probe, n_tokens_probe, mctx, true);
          if (!gf) {
@@ -10897,7 +10954,7 @@ index f653a9620..98e6961b3 100644
          }
  
          bool device_mismatch = false;
-@@ -1419,14 +1543,14 @@ bool llama_context::sched_alt_for(const llama_ubatch & ubatch) const {
+@@ -1460,14 +1584,14 @@ bool llama_context::sched_alt_for(const llama_ubatch & ubatch) const {
  
      if (model.arch == LLM_ARCH_DFLASH) {
          // A DFlash/DFlash2 draft context alternates two graphs and NEITHER marks outputs: the KV injection
@@ -10914,7 +10971,7 @@ index f653a9620..98e6961b3 100644
      }
  
      return n_outputs > 0;
-@@ -1487,6 +1611,17 @@ bool llama_context::kq_mask_packed_reachable() const {
+@@ -1528,6 +1652,17 @@ bool llama_context::kq_mask_packed_reachable() const {
      return model.hparams.use_alibi;
  }
  
@@ -10932,7 +10989,7 @@ index f653a9620..98e6961b3 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -1503,6 +1638,23 @@ void llama_context::sched_reserve() {
+@@ -1544,6 +1679,23 @@ void llama_context::sched_reserve() {
      const uint32_t n_seqs = cparams.n_seq_max;
      const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
  
@@ -10956,7 +11013,7 @@ index f653a9620..98e6961b3 100644
      // size the compute buffers for the packed kq mask when a batch the derived form cannot serve is
      // reachable in this context - see kq_mask_packed_reachable()
      const bool packed_kq_mask = kq_mask_packed_reachable();
-@@ -1558,12 +1710,13 @@ void llama_context::sched_reserve() {
+@@ -1599,12 +1751,13 @@ void llama_context::sched_reserve() {
      int n_input_tensors_tg = -1;
  
      const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
@@ -10971,7 +11028,7 @@ index f653a9620..98e6961b3 100644
          if (!gf) {
              if (cparams.pipeline_parallel) {
                  LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-@@ -1573,7 +1726,8 @@ void llama_context::sched_reserve() {
+@@ -1614,7 +1767,8 @@ void llama_context::sched_reserve() {
                      /*.parallel   =*/ false,
                      /*.op_offload =*/ cparams.op_offload,
                  });
@@ -10981,7 +11038,7 @@ index f653a9620..98e6961b3 100644
              }
              if (!gf) {
                  throw std::runtime_error("failed to allocate compute pp buffers");
-@@ -1594,7 +1748,10 @@ void llama_context::sched_reserve() {
+@@ -1635,7 +1789,10 @@ void llama_context::sched_reserve() {
          n_splits_tg = n_splits_pp;
          n_nodes_tg  = n_nodes_pp;
      } else {
@@ -10993,7 +11050,7 @@ index f653a9620..98e6961b3 100644
          if (!gf) {
              throw std::runtime_error("failed to allocate compute tg buffers");
          }
-@@ -1603,6 +1760,12 @@ void llama_context::sched_reserve() {
+@@ -1644,6 +1801,12 @@ void llama_context::sched_reserve() {
          n_nodes_tg         = ggml_graph_n_nodes(gf);
          n_inputs_tg        = get_gf_res_reserve()->inputs.size();
          n_input_tensors_tg = this->n_input_tensors;
@@ -11006,7 +11063,7 @@ index f653a9620..98e6961b3 100644
      }
  
      // reserve again with pp graph to avoid ggml-alloc reallocations during inference
-@@ -1619,7 +1782,10 @@ void llama_context::sched_reserve() {
+@@ -1660,7 +1823,10 @@ void llama_context::sched_reserve() {
                  gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc(), nullptr, packed_kq_mask);
                  break;
              default:
@@ -11018,7 +11075,7 @@ index f653a9620..98e6961b3 100644
          };
  
          if (!gf) {
-@@ -1627,6 +1793,12 @@ void llama_context::sched_reserve() {
+@@ -1668,6 +1834,12 @@ void llama_context::sched_reserve() {
          }
      }
  
@@ -11031,7 +11088,7 @@ index f653a9620..98e6961b3 100644
      for (size_t i = 0; i < backend_ptrs.size(); ++i) {
          ggml_backend_t             backend = backend_ptrs[i];
          ggml_backend_buffer_type_t buft    = backend_buft[i];
-@@ -2189,6 +2361,12 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+@@ -2230,6 +2402,12 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
  
      GGML_ASSERT(lid <= model.hparams.n_layer());
  
@@ -11044,7 +11101,7 @@ index f653a9620..98e6961b3 100644
      cparams.embeddings_layer_inp[lid] = enable;
  
      // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
-@@ -2273,6 +2451,20 @@ void llama_context::layer_inp_dev_alloc() {
+@@ -2314,6 +2492,20 @@ void llama_context::layer_inp_dev_alloc() {
      layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, cparams.n_batch);
      ggml_set_name(layer_inp_dev, "layer_inp_dev");
  
@@ -11065,7 +11122,7 @@ index f653a9620..98e6961b3 100644
      layer_inp_dev_dev = model.dev_output();
      auto * buft = layer_inp_dev_dev ? ggml_backend_dev_buffer_type(layer_inp_dev_dev) : ggml_backend_cpu_buffer_type();
  
-@@ -2450,6 +2642,17 @@ bool llama_context::get_causal_attn() const {
+@@ -2491,6 +2683,17 @@ bool llama_context::get_causal_attn() const {
      return cparams.causal_attn;
  }
  
@@ -11083,7 +11140,7 @@ index f653a9620..98e6961b3 100644
  bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
      if (!sampler && sampling.samplers.count(seq_id) == 0) {
          return true;
-@@ -2483,7 +2686,17 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+@@ -2524,7 +2727,17 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
  
          sampling.samplers[seq_id] = sampler;
  
@@ -11102,7 +11159,7 @@ index f653a9620..98e6961b3 100644
  
          return true;
      }
-@@ -2491,18 +2704,21 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+@@ -2532,18 +2745,21 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
      if (sampler && !can_offload) {
          LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
  
@@ -11127,7 +11184,7 @@ index f653a9620..98e6961b3 100644
  
      return true;
  }
-@@ -2669,6 +2885,43 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2710,6 +2926,43 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          }
      }
  
@@ -11171,7 +11228,7 @@ index f653a9620..98e6961b3 100644
      // wip/slab-ring-region: the H2D staging ring is one meta-unit with the WIDE (prefill) compute layout.
      // It is armed for a wide pass (>= the staging gate floor, 64 tokens) and disarmed for a narrow one, so
      // a decode-only stretch returns its hole to the arena.  This runs BEFORE the drop's cache re-arm, so a
-@@ -2677,14 +2930,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2718,14 +2971,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // while the ring is used on every wide pass.  `ring_set` is a no-op when the state already matches.
      if (!model.moe_host_expert_bytes.empty() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
          const bool ring_arm = ubatch.n_tokens >= 64;
@@ -11207,7 +11264,7 @@ index f653a9620..98e6961b3 100644
      }
      if (drop_now) {
          ggml_backend_sched_drop_buffers(sched.get());
-@@ -2698,9 +2972,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2739,9 +3013,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          // wip/slab-ring-region: measure the narrow (decode/verify) layout BEFORE allocating it, so the slab
          // can pin its narrow floor AHEAD of the cache's deferred sizing (which runs later in this same pass).
          // `split_only` + a `sizes` array is a size-only reserve (no allocation); the real reserve follows.
@@ -11221,7 +11278,7 @@ index f653a9620..98e6961b3 100644
                                narrow_sizes, kq_mask_packed_reachable()) != nullptr) {
                  size_t narrow_bytes = 0;
                  for (int i = 0; i < 16; i++) {
-@@ -2720,7 +2997,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2761,7 +3038,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                  }
              }
          }
@@ -11230,7 +11287,7 @@ index f653a9620..98e6961b3 100644
          if (!narrow_ok) {
              LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
                      " growth may not fit next to the MoE expert cache arena\n", __func__);
-@@ -3255,7 +3532,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -3296,7 +3573,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
      output_swaps.clear();
      embd_batch_idxs.clear();
@@ -11238,7 +11295,7 @@ index f653a9620..98e6961b3 100644
  
      // issue #238: a 2-D (M-RoPE) position can only come from a multimodal chunk, and the compute reserve
      // covers the packed kq mask for such a batch only when the caller declared it at context creation.
-@@ -3631,13 +3907,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -3672,13 +3948,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          // upload waits only for this graph's compute, not for the copies queued after it, and was observed (Windows, ROCm)
          // to overwrite a layer input before its copy had read it.
          static const bool readback_sync = getenv("GGML_READBACK_SYNC") == nullptr || atoi(getenv("GGML_READBACK_SYNC")) != 0;
@@ -11261,7 +11318,7 @@ index f653a9620..98e6961b3 100644
                  }
              }
              if (has_samplers) {
-@@ -3649,22 +3931,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -3690,22 +3972,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          }
      } while (true);
  
@@ -11284,7 +11341,7 @@ index f653a9620..98e6961b3 100644
      if (layer_inp_dev && ev_layer_inp_written) {
          ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
      }
-@@ -3757,7 +4023,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3798,7 +4064,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
  
      const auto n_batch    = cparams.n_batch;
      const auto n_vocab    = vocab.n_tokens();
@@ -11292,7 +11349,7 @@ index f653a9620..98e6961b3 100644
      const auto n_embd_out = hparams.n_embd_out();
  
      bool has_logits     = !cparams.embeddings || graph_has_logits;
-@@ -3772,7 +4037,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3813,7 +4078,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
  
      size_t backend_float_count = 0;
      size_t backend_token_count = 0;
@@ -11300,7 +11357,7 @@ index f653a9620..98e6961b3 100644
  
      logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
      embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
-@@ -3784,11 +4048,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3825,11 +4089,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
          embd_nextn.size = (size_t) n_embd_out * n_batch;
      }
  
@@ -11315,7 +11372,7 @@ index f653a9620..98e6961b3 100644
  
      // Allocate backend sampling output buffers if there are backend samplers configured.
      const bool has_sampling = !sampling.samplers.empty();
-@@ -3804,8 +4066,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3845,8 +4107,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
  
      const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
      const size_t new_size  =
@@ -11326,7 +11383,7 @@ index f653a9620..98e6961b3 100644
  
      // alloc only when more than the current capacity is required
      // TODO: also consider shrinking the buffer
-@@ -3822,27 +4084,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3863,27 +4125,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
              logits.data = nullptr;
              embd.data = nullptr;
              embd_nextn.data = nullptr;
@@ -11355,7 +11412,7 @@ index f653a9620..98e6961b3 100644
          buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
          if (buf_output == nullptr) {
              LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
-@@ -3865,15 +4109,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3906,15 +4150,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
      embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
      offset += embd_nextn.size * sizeof(float);
  
@@ -11371,7 +11428,7 @@ index f653a9620..98e6961b3 100644
      if (has_sampling) {
          sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
          offset += sampling.logits.size * sizeof(float);
-@@ -3920,132 +4155,84 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3961,132 +4196,84 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
      return n_outputs_max;
  }
  
@@ -11566,7 +11623,7 @@ index f653a9620..98e6961b3 100644
      for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
          if (!cparams.embeddings_layer_inp[il]) {
              continue;
-@@ -4146,8 +4333,7 @@ void llama_context::output_reorder() {
+@@ -4187,8 +4374,7 @@ void llama_context::output_reorder() {
                  }
              }
              for (auto & layer : embd_layer_inp) {
@@ -11576,7 +11633,7 @@ index f653a9620..98e6961b3 100644
                      for (size_t k = 0; k < n_embd; ++k) {
                          std::swap(layer.data[i*n_embd + k], layer.data[j*n_embd + k]);
                      }
-@@ -4180,6 +4366,13 @@ uint32_t llama_context::graph_max_nodes() const {
+@@ -4221,6 +4407,13 @@ uint32_t llama_context::graph_max_nodes() const {
          res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
      }
  
@@ -11590,7 +11647,7 @@ index f653a9620..98e6961b3 100644
      if (cparams.training) {
          res *= 4;
      }
-@@ -4261,7 +4454,7 @@ static void ubatch_prepare_reserve(
+@@ -4302,7 +4495,7 @@ static void ubatch_prepare_reserve(
  
  ggml_cgraph * llama_context::graph_reserve(
          uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs_l, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
@@ -11599,7 +11656,7 @@ index f653a9620..98e6961b3 100644
      LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
      GGML_ASSERT(n_outputs_l >= 1);
  
-@@ -4286,7 +4479,7 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -4327,7 +4520,7 @@ ggml_cgraph * llama_context::graph_reserve(
      this->n_outputs = n_outputs_l;
  
      llama_batch_allocr balloc_l(model.hparams.n_pos_per_embd());
@@ -11608,7 +11665,7 @@ index f653a9620..98e6961b3 100644
  
      ubatch_prepare_reserve(ubatch, n_outputs_l, sampling.samplers, cparams.n_outputs_max_per_seq);
  
-@@ -4313,6 +4506,21 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -4354,6 +4547,21 @@ ggml_cgraph * llama_context::graph_reserve(
  
      auto * gf = model.build_graph(gparams);
  
@@ -11630,7 +11687,7 @@ index f653a9620..98e6961b3 100644
      // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
      if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
          llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
-@@ -4507,12 +4715,382 @@ private:
+@@ -4548,12 +4756,382 @@ private:
      size_t size_written = 0;
  };
  
@@ -12014,7 +12071,7 @@ index f653a9620..98e6961b3 100644
          if (winfos.empty()) {
              return;
          }
-@@ -4577,13 +5155,75 @@ private:
+@@ -4618,13 +5196,75 @@ private:
          size_t offset;
      };
      std::vector<write_info> winfos;
@@ -12091,7 +12148,7 @@ index f653a9620..98e6961b3 100644
          if (rinfos.empty()) {
              return;
          }
-@@ -4641,6 +5281,7 @@ public:
+@@ -4682,6 +5322,7 @@ public:
  private:
      const uint8_t * ptr;
      const uint8_t * base_ptr;
@@ -12099,7 +12156,7 @@ index f653a9620..98e6961b3 100644
      size_t buf_size = 0;
      size_t size_read = 0;
  
-@@ -4705,7 +5346,8 @@ private:
+@@ -4746,7 +5387,8 @@ private:
  
  class llama_io_write_device : public llama_io_write_i {
  public:
@@ -12109,7 +12166,7 @@ index f653a9620..98e6961b3 100644
      }
  
      ~llama_io_write_device() {
-@@ -4795,9 +5437,30 @@ public:
+@@ -4836,9 +5478,30 @@ public:
                  }
              }
  
@@ -12143,7 +12200,7 @@ index f653a9620..98e6961b3 100644
          }
      }
  
-@@ -4834,11 +5497,13 @@ private:
+@@ -4875,11 +5538,13 @@ private:
      std::vector<write_info> winfos;
  
      llama_memory_buffers & mbufs;
@@ -12158,7 +12215,7 @@ index f653a9620..98e6961b3 100644
      }
  
      ~llama_io_read_device() {
-@@ -4894,10 +5559,16 @@ public:
+@@ -4935,10 +5600,16 @@ public:
                  }
  
                  if (same_chunking) {
@@ -12179,7 +12236,7 @@ index f653a9620..98e6961b3 100644
                      continue;
                  }
              }
-@@ -4906,6 +5577,12 @@ public:
+@@ -4947,6 +5618,12 @@ public:
              // with a byte cursor. Write and read enumerate the same logical data in the same order but may chunk
              // it differently (even with an equal number of tensors), so copy across tensor boundaries rather than
              // 1:1 by index.
@@ -12192,7 +12249,7 @@ index f653a9620..98e6961b3 100644
              const size_t total = mbuf_cur.total_size;
  
              ggml_init_params params_scratch = {
-@@ -4915,6 +5592,9 @@ public:
+@@ -4956,6 +5633,9 @@ public:
              };
              ggml_context * ctx_scratch = ggml_init(params_scratch);
  
@@ -12202,7 +12259,7 @@ index f653a9620..98e6961b3 100644
              size_t src_pos  = 0;
              size_t dst_pos  = 0;
              size_t src_j    = 0;
-@@ -4922,11 +5602,6 @@ public:
+@@ -4963,11 +5643,6 @@ public:
              size_t src_base = 0;
              size_t dst_base = 0;
  
@@ -12214,7 +12271,7 @@ index f653a9620..98e6961b3 100644
              while (src_pos < total) {
                  const auto & src_t = mbuf_cur.cpy[src_j];
                  const auto & dst_t = mbuf.org[dst_i];
-@@ -4939,16 +5614,14 @@ public:
+@@ -4980,16 +5655,14 @@ public:
  
                  const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
  
@@ -12237,7 +12294,7 @@ index f653a9620..98e6961b3 100644
  
                  src_pos += n_copy;
                  dst_pos += n_copy;
-@@ -4972,7 +5645,27 @@ public:
+@@ -5013,7 +5686,27 @@ public:
                  GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
              }
  
@@ -12266,7 +12323,7 @@ index f653a9620..98e6961b3 100644
  
              ggml_free(ctx_scratch);
          }
-@@ -5018,8 +5711,72 @@ private:
+@@ -5059,8 +5752,72 @@ private:
      std::vector<read_info> rinfos;
  
      const llama_memory_buffers & mbufs;
@@ -12339,7 +12396,7 @@ index f653a9620..98e6961b3 100644
  size_t llama_context::state_get_size() {
      llama_io_write_dummy io(false);
      try {
-@@ -5031,7 +5788,7 @@ size_t llama_context::state_get_size() {
+@@ -5072,7 +5829,7 @@ size_t llama_context::state_get_size() {
  }
  
  size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
@@ -12348,7 +12405,7 @@ index f653a9620..98e6961b3 100644
      try {
          return state_write_data(io);
      } catch (const std::exception & err) {
-@@ -5041,7 +5798,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+@@ -5082,7 +5839,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
  }
  
  size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
@@ -12357,7 +12414,7 @@ index f653a9620..98e6961b3 100644
      try {
          return state_read_data(io);
      } catch (const std::exception & err) {
-@@ -5069,9 +5826,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
+@@ -5110,9 +5867,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
  size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
      std::unique_ptr<llama_io_write_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
@@ -12369,7 +12426,7 @@ index f653a9620..98e6961b3 100644
      }
  
      try {
-@@ -5089,7 +5846,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -5130,7 +5887,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
      std::unique_ptr<llama_io_read_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
          // create a temporary io to read the magic and the src seq_id
@@ -12378,7 +12435,7 @@ index f653a9620..98e6961b3 100644
  
          uint32_t magic_read;
          io->read(&magic_read, sizeof(magic_read));
-@@ -5102,9 +5859,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -5143,9 +5900,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
  
          GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
  
@@ -12390,7 +12447,7 @@ index f653a9620..98e6961b3 100644
      }
  
      try {
-@@ -5935,7 +6692,16 @@ llama_context * llama_init_from_model(
+@@ -5976,7 +6733,16 @@ llama_context * llama_init_from_model(
  
          return ctx;
      } catch (const std::exception & err) {
@@ -12408,7 +12465,7 @@ index f653a9620..98e6961b3 100644
      }
  
      return nullptr;
-@@ -6118,26 +6884,6 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+@@ -6159,26 +6925,6 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
      return ctx->get_embeddings_nextn_ith(i);
  }
  
@@ -14651,8 +14708,405 @@ index 55ca26801..894191b7b 100644
                      } else {
                          invalid_param = true;
                          break;
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index eb5781e74..ac2c60fff 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1484,6 +1484,302 @@ server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context
+     return process_mtmd_prompt(mctx, prompt, files, init_opt);
+ }
+ 
++//
++// Tool text: a tool result (a "tool" / "function" message) or the arguments of an assistant's tool call is data that
++// came from outside -- a file, a web page, a database row, or text the model copied from one.  A special-token string
++// in it ("<|im_end|>", "</tool_call>", "<think>", ...) must stay that text: as a token it would end the tool result and
++// forge a turn, a tool call or a tool result of its own.  Before the template is applied every protected string there
++// is wrapped in two marks; after it, the tokenizer takes the marked strings as ordinary text (split after their first
++// character, so that no piece holds a whole one) and the rest of the prompt as before.  An assistant's own text (content
++// and reasoning) can carry such a string too -- the model can copy one from a tool result as ordinary characters -- so
++// there the control-token strings (the turn boundaries) stay text as well; a real control token never reaches the reply
++// text unless --special is given, and then assistant text is left alone.  The model reads the same characters, and a
++// request without such strings is tokenized exactly as before.  Where the marks cannot reach the
++// tokenizer (a multimodal prompt, a vocab that is not byte-level BPE, a template that rewrote them) the strings are
++// broken with a space after their first character instead.  LLAMA_SERVER_TOOL_TEXT=0: off.
++// LLAMA_SERVER_TOOL_TEXT_CENSUS=1: one line per request.
++//
++
++// U+FDD0 / U+FDD1: Unicode noncharacters, never part of interchanged text (a client's copy is dropped)
++static const std::string TOOL_TEXT_OPEN  = "\xEF\xB7\x90";
++static const std::string TOOL_TEXT_CLOSE = "\xEF\xB7\x91";
++
++std::vector<std::string> server_tool_text_protected(const llama_vocab * vocab, const common_chat_templates * tmpls, bool control_only) {
++    const std::string src = common_chat_templates_source(tmpls, "") + "\n" + common_chat_templates_source(tmpls, "tool_use");
++    std::vector<std::string> out;
++    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
++    for (llama_token t = 0; t < n_vocab; ++t) {
++        const llama_token_attr attr = llama_vocab_get_attr(vocab, t);
++        const bool special = attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN);
++        const bool user    = attr & LLAMA_TOKEN_ATTR_USER_DEFINED;
++        if (!special && (!user || control_only)) {
++            continue;
++        }
++        const char *      text = llama_vocab_get_text(vocab, t);
++        const std::string s    = text ? text : "";
++        if (s.find_first_not_of(" \t\r\n") == std::string::npos) {
++            continue; // empty or whitespace only
++        }
++        if (!special && src.find(s) == std::string::npos) {
++            continue; // a user-defined token the template does not use is vocabulary
++        }
++        out.push_back(s);
++    }
++    std::sort(out.begin(), out.end(), [](const std::string & a, const std::string & b) {
++        return a.size() != b.size() ? a.size() > b.size() : a < b;
++    });
++    out.erase(std::unique(out.begin(), out.end()), out.end());
++    return out;
++}
++
++// the protected strings by their first byte, longest first
++struct tool_text_matcher {
++    std::array<std::vector<const std::string *>, 256> by_first;
++
++    explicit tool_text_matcher(const std::vector<std::string> & prot) {
++        for (const auto & p : prot) {
++            by_first[(uint8_t) p[0]].push_back(&p);
++        }
++    }
++
++    // the length of the protected string at s[i], or 0
++    size_t at(const std::string & s, size_t i) const {
++        for (const std::string * p : by_first[(uint8_t) s[i]]) {
++            if (s.compare(i, p->size(), *p) == 0) {
++                return p->size();
++            }
++        }
++        return 0;
++    }
++};
++
++static size_t tool_text_char_len(const char c) {
++    const uint8_t b = (uint8_t) c;
++    return b < 0x80 ? 1 : (b >> 5) == 0x6 ? 2 : (b >> 4) == 0xE ? 3 : (b >> 3) == 0x1E ? 4 : 1;
++}
++
++static void tool_text_strip(std::string & s) {
++    for (const std::string * mark : { &TOOL_TEXT_OPEN, &TOOL_TEXT_CLOSE }) {
++        for (size_t pos = s.find(*mark); pos != std::string::npos; pos = s.find(*mark, pos)) {
++            s.erase(pos, mark->size());
++        }
++    }
++}
++
++enum tool_text_mode { TOOL_TEXT_COUNT, TOOL_TEXT_MARK, TOOL_TEXT_SPACE };
++
++// counts the protected strings in s and, unless counting, wraps each in the marks or breaks it with a space
++static size_t tool_text_apply(std::string & s, const tool_text_matcher & m, const tool_text_mode mode) {
++    size_t      n    = 0;
++    size_t      last = 0;
++    std::string out;
++    for (size_t i = 0; i < s.size();) {
++        const size_t len = m.at(s, i);
++        if (len == 0) {
++            ++i;
++            continue;
++        }
++        ++n;
++        if (mode != TOOL_TEXT_COUNT) {
++            out.append(s, last, i - last);
++            if (mode == TOOL_TEXT_MARK) {
++                out += TOOL_TEXT_OPEN;
++                out.append(s, i, len);
++                out += TOOL_TEXT_CLOSE;
++            } else {
++                const size_t c = std::min(tool_text_char_len(s[i]), len);
++                out.append(s, i, c);
++                out += ' ';
++                out.append(s, i + c, len - c);
++            }
++            last = i + len;
++        }
++        i += len;
++    }
++    if (mode != TOOL_TEXT_COUNT && n > 0) {
++        out.append(s, last, std::string::npos);
++        s = std::move(out);
++    }
++    return n;
++}
++
++struct tool_text_count {
++    size_t strings = 0; // protected strings found
++    size_t results = 0; // tool results that hold one
++    size_t args    = 0; // tool calls whose arguments hold one
++    size_t replies = 0; // assistant messages whose text holds a control-token string
++};
++
++// drops any client copy of the marks from every message and tool, so that a request cannot carry its own marks into the
++// region the template sees (called only while the protection is armed: the kill switch sends the request unchanged)
++static void tool_text_strip_inputs(common_chat_templates_inputs & inputs) {
++    for (auto & tool : inputs.tools) {
++        tool_text_strip(tool.name);
++        tool_text_strip(tool.description);
++        tool_text_strip(tool.parameters);
++    }
++    for (auto & msg : inputs.messages) {
++        tool_text_strip(msg.content);
++        tool_text_strip(msg.reasoning_content);
++        tool_text_strip(msg.tool_name);
++        tool_text_strip(msg.tool_call_id);
++        tool_text_strip(msg.extra_json);
++        for (auto & part : msg.content_parts) {
++            tool_text_strip(part.text);
++        }
++        for (auto & tc : msg.tool_calls) {
++            tool_text_strip(tc.name);
++            tool_text_strip(tc.arguments);
++            tool_text_strip(tc.id);
++        }
++    }
++}
++
++// treats the tool results and tool-call arguments (m: all protected strings) and the assistant text (mc: the
++// control-token strings); strip drops a client's own copy of the marks first, so the count sees what the template sees
++static tool_text_count tool_text_inputs(common_chat_templates_inputs & inputs, const tool_text_matcher & m,
++                                        const tool_text_matcher & mc, const tool_text_mode mode, const bool strip) {
++    tool_text_count c;
++    if (strip) {
++        tool_text_strip_inputs(inputs);
++    }
++    for (auto & msg : inputs.messages) {
++        if (msg.role == "tool" || msg.role == "function") {
++            size_t k = tool_text_apply(msg.content, m, mode);
++            for (auto & part : msg.content_parts) {
++                k += tool_text_apply(part.text, m, mode);
++            }
++            c.strings += k;
++            c.results += k > 0;
++        } else if (msg.role == "assistant") {
++            size_t k = tool_text_apply(msg.content, mc, mode) + tool_text_apply(msg.reasoning_content, mc, mode);
++            for (auto & part : msg.content_parts) {
++                k += tool_text_apply(part.text, mc, mode);
++            }
++            c.strings += k;
++            c.replies += k > 0;
++            for (auto & tc : msg.tool_calls) {
++                const size_t k = tool_text_apply(tc.arguments, m, mode);
++                c.strings += k;
++                c.args    += k > 0;
++            }
++        }
++    }
++    return c;
++}
++
++// the protected strings in s
++static size_t tool_text_count_in(const std::string & s, const tool_text_matcher & m) {
++    size_t n = 0;
++    for (size_t i = 0; i < s.size();) {
++        const size_t len = m.at(s, i);
++        n += len > 0;
++        i += len > 0 ? len : 1;
++    }
++    return n;
++}
++
++// whether the marks came through the template: every OPEN is closed before the next mark, and outside the marked strings
++// the prompt holds as many protected strings as prompt_space, the same request rendered with the strings broken (that
++// is, the template's own special tokens) -- a template that escaped, split or dropped a mark fails one of the two
++static bool tool_text_marks_intact(const std::string & prompt, const tool_text_matcher & m, const std::string & prompt_space) {
++    size_t outside = 0;
++    for (size_t i = 0; i < prompt.size();) {
++        if (prompt.compare(i, TOOL_TEXT_OPEN.size(), TOOL_TEXT_OPEN) == 0) {
++            const size_t b = i + TOOL_TEXT_OPEN.size();
++            const size_t e = prompt.find(TOOL_TEXT_CLOSE, b);
++            if (e == std::string::npos || prompt.substr(b, e - b).find(TOOL_TEXT_OPEN) != std::string::npos) {
++                return false;
++            }
++            i = e + TOOL_TEXT_CLOSE.size();
++            continue;
++        }
++        if (prompt.compare(i, TOOL_TEXT_CLOSE.size(), TOOL_TEXT_CLOSE) == 0) {
++            return false; // a CLOSE without its OPEN
++        }
++        const size_t len = m.at(prompt, i);
++        outside += len > 0;
++        i       += len > 0 ? len : 1;
++    }
++    return outside == tool_text_count_in(prompt_space, m);
++}
++
++// s as ordinary text: cut after the first character of every protected string in it, so that no piece holds a whole
++// one, and tokenize the pieces without special tokens (parse_special = false still matches USER_DEFINED ones)
++static void tool_text_tokenize_plain(const llama_vocab * vocab, const std::string & s, const tool_text_matcher & m, llama_tokens & out) {
++    size_t last = 0;
++    for (size_t i = 0; i < s.size(); ++i) {
++        if (m.at(s, i) > 0) {
++            const size_t cut = i + tool_text_char_len(s[i]);
++            const auto   t   = common_tokenize(vocab, s.substr(last, cut - last), false, false);
++            out.insert(out.end(), t.begin(), t.end());
++            last = cut;
++            i    = cut - 1;
++        }
++    }
++    const auto t = common_tokenize(vocab, s.substr(last), false, false);
++    out.insert(out.end(), t.begin(), t.end());
++}
++
++// the marked prompt with the marks taken out: the text the piecewise tokenization below has to give back
++static std::string tool_text_unmark(const std::string & prompt) {
++    std::string out;
++    for (size_t i = 0; i < prompt.size();) {
++        if (prompt.compare(i, TOOL_TEXT_OPEN.size(), TOOL_TEXT_OPEN) == 0) {
++            const size_t b = i + TOOL_TEXT_OPEN.size();
++            const size_t e = prompt.find(TOOL_TEXT_CLOSE, b);
++            out.append(prompt, b, e - b);
++            i = e + TOOL_TEXT_CLOSE.size();
++            continue;
++        }
++        out += prompt[i++];
++    }
++    return out;
++}
++
++// the marked prompt as common_tokenize(vocab, prompt, true, true) would tokenize it, except that each marked string is
++// ordinary text (a byte-level BPE vocab: a piece adds no prefix, so the pieces decode to the same characters)
++static llama_tokens tool_text_tokenize(const llama_vocab * vocab, const std::string & prompt, const tool_text_matcher & m) {
++    llama_tokens out;
++    if (llama_vocab_get_add_bos(vocab)) {
++        out.push_back(llama_vocab_bos(vocab));
++    }
++    for (size_t i = 0; i < prompt.size();) {
++        const size_t o = prompt.find(TOOL_TEXT_OPEN, i);
++        const auto   t = common_tokenize(vocab, prompt.substr(i, o == std::string::npos ? std::string::npos : o - i), false, true);
++        out.insert(out.end(), t.begin(), t.end());
++        if (o == std::string::npos) {
++            break;
++        }
++        const size_t b = o + TOOL_TEXT_OPEN.size();
++        const size_t e = prompt.find(TOOL_TEXT_CLOSE, b); // tool_text_marks_intact() checked the pairs
++        tool_text_tokenize_plain(vocab, prompt.substr(b, e - b), m, out);
++        i = e + TOOL_TEXT_CLOSE.size();
++    }
++    if (llama_vocab_get_add_eos(vocab)) {
++        out.push_back(llama_vocab_eos(vocab));
++    }
++    return out;
++}
++
++// whether the tokens give the prompt back as text.  tool_text_tokenize() re-derives llama_vocab::tokenize's BOS/EOS and
++// per-fragment behaviour, so a vocab whose pre-tokenizer adds a prefix, normalizes a fragment or strips one (a
++// metaspace_prepend_scheme "first", a SOPRANO / NEMOTRON_3_5_EMBD / MMBERT pre-type, a <mask> LSTRIP) can move the text
++// the model reads.  This is the check common_chat_input_tokenize() makes: on a mismatch the request keeps its strings
++// BROKEN (the space fallback) instead of taking a token array that does not decode to the prompt.
++static bool tool_text_tokenize_ok(const llama_vocab * vocab, const std::string & prompt, const llama_tokens & toks) {
++    size_t b = 0;
++    size_t e = toks.size();
++    if (llama_vocab_get_add_bos(vocab) && b < e && toks[b] == llama_vocab_bos(vocab)) {
++        ++b;
++    }
++    if (llama_vocab_get_add_eos(vocab) && b < e && toks[e - 1] == llama_vocab_eos(vocab)) {
++        --e;
++    }
++    const llama_tokens body(toks.begin() + b, toks.begin() + e);
++    return common_detokenize(vocab, body, true) == tool_text_unmark(prompt);
++}
++
+ // used by /chat/completions endpoint
+ json oaicompat_chat_params_parse(
+     const llama_vocab * vocab,
+@@ -1656,12 +1952,67 @@ json oaicompat_chat_params_parse(
+ 
+     inputs.force_pure_content = opt.force_pure_content;
+ 
++    // tool text (see above): count first, then mark (or break) only when there is something to protect
++    static const bool tool_text_on     = [] { const char * e = getenv("LLAMA_SERVER_TOOL_TEXT"); return e == nullptr || atoi(e) != 0; }();
++    static const bool tool_text_census = [] { const char * e = getenv("LLAMA_SERVER_TOOL_TEXT_CENSUS"); return e != nullptr && atoi(e) != 0; }();
++    const tool_text_matcher tt_match(opt.tool_text_protected);
++    const tool_text_matcher tt_control(opt.tool_text_control);
++    const tool_text_count   tt_count = tool_text_inputs(inputs, tt_match, tt_control, TOOL_TEXT_COUNT, tool_text_on);
++    // the marks reach the tokenizer only with a byte-level BPE vocab (a piece adds no prefix) and a TEXT prompt: a request
++    // that carries media keeps its prompt a string for mtmd, so only that request takes the space fallback.  A
++    // vision-capable server reading a text-only request is not a multimodal prompt and must not have its tool data broken.
++    const bool tt_marks = vocab != nullptr && llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_BPE && out_files.empty();
++    const char * tt_mode = tt_count.strings == 0 ? "none" : !tool_text_on ? "off" : tt_marks ? "text" : "space";
++    common_chat_templates_inputs inputs_plain;
++    if (tt_count.strings > 0 && tool_text_on) {
++        if (tt_marks) {
++            inputs_plain = inputs; // for the fallback
++        }
++        tool_text_inputs(inputs, tt_match, tt_control, tt_marks ? TOOL_TEXT_MARK : TOOL_TEXT_SPACE, true);
++    }
++
+     // Apply chat template to the list of messages
+     common_chat_session_params session_params;
+     session_params.echo = json_value(body, "echo", false);
+     out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
+ 
+-    llama_params["prompt"] = out_session.prompt().str();
++    std::string prompt = out_session.prompt().str();
++    if (tt_count.strings > 0 && tool_text_on && tt_marks) {
++        // the same request with the strings broken: the template's own special tokens, and the fallback
++        tool_text_inputs(inputs_plain, tt_match, tt_control, TOOL_TEXT_SPACE, false);
++        common_chat_session session_space(opt.tmpls.get(), vocab, inputs_plain, session_params);
++        const std::string   prompt_space = session_space.prompt().str();
++        llama_tokens        tt_toks;
++        if (!tool_text_marks_intact(prompt, tt_match, prompt_space)) {
++            // the template rewrote a mark (e.g. a tojson that escapes it): keep the strings broken instead
++            tt_mode = "space (the template changed the marks)";
++        } else {
++            tt_toks = tool_text_tokenize(vocab, prompt, tt_match);
++            if (!tool_text_tokenize_ok(vocab, prompt, tt_toks)) {
++                tt_toks.clear();
++                tt_mode = "space (the tokenizer changed the text)";
++            }
++        }
++        if (!tt_toks.empty()) {
++            llama_params["prompt"] = std::move(tt_toks);
++        } else {
++            out_session = std::move(session_space);
++            prompt      = prompt_space;
++            llama_params["prompt"] = prompt;
++        }
++    } else {
++        llama_params["prompt"] = prompt;
++    }
++    if (tool_text_census && vocab != nullptr) {
++        const llama_tokens toks = llama_params.at("prompt").is_array() ? llama_params.at("prompt").get<llama_tokens>()
++                                                                       : common_tokenize(vocab, prompt, true, true);
++        size_t n_special = 0;
++        for (const llama_token t : toks) {
++            n_special += (llama_vocab_get_attr(vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN | LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0;
++        }
++        SRV_INF("tool_text: mode=%s strings=%zu tool_results=%zu tool_args=%zu replies=%zu prompt_tokens=%zu special_tokens=%zu\n",
++                tt_mode, tt_count.strings, tt_count.results, tt_count.args, tt_count.replies, toks.size(), n_special);
++    }
+ 
+     // Reasoning budget: pass parameters through to sampling layer
+     {
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 911bb31d7..ce6c588c6 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -393,8 +393,16 @@ struct server_chat_params {
+     std::string media_path;
+     bool media_allow_private_urls = false;
+     bool force_pure_content = false;
++    std::vector<std::string> tool_text_protected; // server_tool_text_protected(), longest first
++    std::vector<std::string> tool_text_control;   // the CONTROL / UNKNOWN ones, for assistant text (empty with --special)
+ };
+ 
++// The special-token texts that a tool result or a tool call's arguments must not turn into tokens: every CONTROL and
++// UNKNOWN token, and the USER_DEFINED tokens the chat template itself uses (the rest are vocabulary, e.g. whitespace
++// runs); with control_only, only the CONTROL and UNKNOWN ones (for assistant text).  oaicompat_chat_params_parse()
++// keeps them as ordinary text there (LLAMA_SERVER_TOOL_TEXT=0: off).
++std::vector<std::string> server_tool_text_protected(const llama_vocab * vocab, const common_chat_templates * tmpls, bool control_only);
++
+ // used by /completions endpoint
+ json oaicompat_completion_params_parse(const json & body);
+ 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index c852e55c9..b14c0eb37 100644
+index c852e55c9..fde607ac3 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -307,6 +307,14 @@ struct server_slot {
@@ -14850,7 +15304,31 @@ index c852e55c9..b14c0eb37 100644
      server_metrics metrics;
  
      // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-@@ -1861,15 +2035,100 @@ private:
+@@ -1789,9 +1963,22 @@ private:
+                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
+                 /* media_path            */ params_base.media_path,
+                 /* media_allow_private   */ params_base.media_allow_private_urls,
+-                /* force_pure_content    */ params_base.force_pure_content_parser
++                /* force_pure_content    */ params_base.force_pure_content_parser,
++                /* tool_text_protected   */ {},
++                /* tool_text_control     */ {}
+             };
+ 
++            // the special-token strings kept as text in tool results and tool-call arguments, and the control-token
++            // strings kept as text in assistant text unless --special puts real ones there (oaicompat_chat_params_parse)
++            chat_params.tool_text_protected = server_tool_text_protected(vocab, chat_params.tmpls.get(), false);
++            if (!params_base.special) {
++                chat_params.tool_text_control = server_tool_text_protected(vocab, chat_params.tmpls.get(), true);
++            }
++            SRV_INF("tool text: %zu special-token strings are kept as text in tool results and tool-call arguments, "
++                    "%zu in assistant text%s\n",
++                    chat_params.tool_text_protected.size(), chat_params.tool_text_control.size(),
++                    [] { const char * e = getenv("LLAMA_SERVER_TOOL_TEXT"); return e == nullptr || atoi(e) != 0; }() ? "" : " (off: LLAMA_SERVER_TOOL_TEXT=0)");
++
+             {
+                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
+                 auto it = params_base.default_template_kwargs.find("preserve_reasoning");
+@@ -1861,15 +2048,100 @@ private:
  
          const int64_t t_start = ggml_time_us();
  
@@ -14952,7 +15430,7 @@ index c852e55c9..b14c0eb37 100644
      }
  
      // return true if at least one slot has been cleared
-@@ -1877,13 +2136,33 @@ private:
+@@ -1877,13 +2149,33 @@ private:
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -14987,7 +15465,7 @@ index c852e55c9..b14c0eb37 100644
          for (auto & slot : slots) {
              if (slot.is_processing()) {
                  continue;
-@@ -2690,6 +2969,28 @@ private:
+@@ -2690,6 +2982,28 @@ private:
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
@@ -15016,7 +15494,7 @@ index c852e55c9..b14c0eb37 100644
          // evict checkpoints within min-step of a previous checkpoint, unless they were
          // created by the current task
          // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-@@ -2702,6 +3003,7 @@ private:
+@@ -2702,6 +3016,7 @@ private:
                  SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                          cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
  
@@ -15024,7 +15502,7 @@ index c852e55c9..b14c0eb37 100644
                  it = slot.prompt.checkpoints.erase(it);
                  continue;
              }
-@@ -2712,7 +3014,8 @@ private:
+@@ -2712,7 +3027,8 @@ private:
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
              // make room for the new checkpoint, if needed
@@ -15034,7 +15512,7 @@ index c852e55c9..b14c0eb37 100644
  
              SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                      cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-@@ -2726,6 +3029,7 @@ private:
+@@ -2726,6 +3042,7 @@ private:
              for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                  if ((*it)->n_tokens == n_tokens_new) {
                      SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
@@ -15042,7 +15520,7 @@ index c852e55c9..b14c0eb37 100644
                      it = slot.prompt.checkpoints.erase(it);
                  } else {
                      ++it;
-@@ -2743,6 +3047,12 @@ private:
+@@ -2743,6 +3060,12 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -15055,7 +15533,7 @@ index c852e55c9..b14c0eb37 100644
          cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          // stash the draft's speculative state with the checkpoint
-@@ -3053,7 +3363,11 @@ private:
+@@ -3053,7 +3376,11 @@ private:
                          break; // drop the task
                      }
  
@@ -15068,7 +15546,7 @@ index c852e55c9..b14c0eb37 100644
                          for (auto & slot : slots) {
                              if (!slot.is_processing()) {
                                  SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-@@ -3877,7 +4191,14 @@ private:
+@@ -3877,7 +4204,14 @@ private:
                              slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                          }
  
@@ -15084,7 +15562,7 @@ index c852e55c9..b14c0eb37 100644
  
                          const bool spec_reject = slot.use_spec_rejection();
  
-@@ -3886,7 +4207,7 @@ private:
+@@ -3886,7 +4220,7 @@ private:
                              /* .n_max    = */ n_draft_max,
                              /* .pos0     = */ slot.prompt.tokens.pos_next(),
                              /* .id_last  = */ slot.sampled,
@@ -15093,7 +15571,7 @@ index c852e55c9..b14c0eb37 100644
                              /* .result   = */ &slot.spec_draft,
                              /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                              /* .temp     = */ slot.task->params.sampling.temp,
-@@ -3937,7 +4258,7 @@ private:
+@@ -3937,7 +4271,7 @@ private:
                  if (use_ckpt_tgt) {
                      //const int64_t t_start = ggml_time_us();
  
@@ -15102,7 +15580,7 @@ index c852e55c9..b14c0eb37 100644
  
                      //const int64_t t_total = ggml_time_us() - t_start;
                      //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-@@ -4009,6 +4330,8 @@ private:
+@@ -4009,6 +4343,8 @@ private:
  
                          slot.state = SLOT_STATE_PROCESSING_PROMPT;
  
@@ -15111,7 +15589,7 @@ index c852e55c9..b14c0eb37 100644
                          if (spec) {
                              common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->tokens.pos_next());
                          }
-@@ -4256,6 +4579,10 @@ private:
+@@ -4256,6 +4592,10 @@ private:
                                          // restore the draft's speculative state
                                          common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
  
@@ -15122,7 +15600,7 @@ index c852e55c9..b14c0eb37 100644
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
                                      }
                                  }
-@@ -4275,6 +4602,7 @@ private:
+@@ -4275,6 +4615,7 @@ private:
                                      const auto & cur = **it;
                                      if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                          SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
@@ -15130,7 +15608,7 @@ index c852e55c9..b14c0eb37 100644
                                          it = slot.prompt.checkpoints.erase(it);
                                      } else {
                                          ++it;
-@@ -4965,7 +5293,7 @@ private:
+@@ -4965,7 +5306,7 @@ private:
  
                          SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
  
@@ -15139,6 +15617,49 @@ index c852e55c9..b14c0eb37 100644
  
                          if (slot.ctx_dft) {
                              GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+@@ -5346,8 +5687,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+         // process prompt
+         std::vector<server_tokens> inputs;
+ 
+-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
++        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr && prompt.is_string()) {
+             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
++            // A chat prompt can also arrive as tokens (the tool-text protection of oaicompat_chat_params_parse): it carries
++            // no media, so it takes the generic path below instead of the mtmd one.
+             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+         } else {
+             // Everything else, including multimodal completions.
+@@ -6416,7 +6759,20 @@ void server_routes::init_routes() {
+             meta->chat_params,
+             files,
+             session);
+-        res->ok({{ "prompt", std::move(data.at("prompt")) }});
++        // a prompt with tool text kept as text comes back as tokens: show it as the text it is, without the BOS / EOS the
++        // tokenizer added (the rendered text never holds them)
++        json & prompt = data.at("prompt");
++        if (prompt.is_array()) {
++            llama_tokens toks = prompt.get<llama_tokens>();
++            if (!toks.empty() && llama_vocab_get_add_eos(ctx_server.vocab) && toks.back() == llama_vocab_eos(ctx_server.vocab)) {
++                toks.pop_back();
++            }
++            if (!toks.empty() && llama_vocab_get_add_bos(ctx_server.vocab) && toks.front() == llama_vocab_bos(ctx_server.vocab)) {
++                toks.erase(toks.begin());
++            }
++            prompt = common_detokenize(ctx_server.vocab, toks, true);
++        }
++        res->ok({{ "prompt", std::move(prompt) }});
+         return res;
+     };
+ 
+@@ -7275,7 +7631,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
+ 
+     // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
+     size_t n_tokens;
+-    if (ctx_server.mctx != nullptr) {
++    if (ctx_server.mctx != nullptr && !json_is_array_of_numbers(prompt)) {
+         if (!prompt.is_string()) {
+             throw std::runtime_error("for mtmd, input prompt must be a string.");
+         }
 diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
 index 9f9779348..c6e2738aa 100644
 --- a/tools/server/server-slot-sched.cpp

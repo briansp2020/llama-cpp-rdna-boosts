@@ -35,7 +35,27 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
 
 ## Current candidates
 
-**None.**  The `arena-steady-sizing` v2 candidate was **promoted into block 09 at r292** (2026-11-15);
+* **`prefill-decode-arms`** — **the two-arm server (the withdrawn delivery block 17), REBUILT as v2** (2026-11-24).
+  **ONE `llama_memory_i`, TWO `llama_context`s**: the prefill arm owns the memory and the decode arm borrows it
+  through `llama_context_params::ctx_memory`; nothing is copied between them.  This **replaces the earlier
+  artifact in its entirety** (the maintainer's decision of 2026-11-24 — the old design's second context that
+  *viewed* and *co-owned* the first's memory, and the recurrent state copied between two modules, are gone at
+  the root); on promotion it is **delivery block 17 as ONE self-contained patch**, a modification to the
+  lower-numbered blocks.  Applied on the **r355** default tree (`4244d077e`) it produces tree
+  **`dc9c657e60`** (no re-cut was needed: the patch files are unchanged, and every produced tree moved with
+  the default tree).  Files: [`prefill-decode-arms/README.md`](prefill-decode-arms/README.md) (what it is, the
+  measured numbers, the residuals, the shapes it refuses),
+  [`prefill-decode-arms/BETA-TESTING.md`](prefill-decode-arms/BETA-TESTING.md) (the apply, build and arm ladder)
+  and [`prefill-decode-arms/prefill-decode-arms.patch`](prefill-decode-arms/prefill-decode-arms.patch)
+  (**THREE** patch files, applied in filename order, one commit each: `prefill-decode-arms.patch` — block 17,
+  sha256 `a2badad1…e366fe3c`, 42 files, +3073/−741 — then two delivery-level fixes the candidate carries for
+  now, `state-split-2d-read.patch` (STEP 15, sha256 `b3f0645a…c2a7336b`, 1 file, +85/−46) and
+  `two-arm-drop-boundary.patch` (STEP 16, sha256 `fd50d736…d31030963`, 4 files, +97/−4)).
+  Campaign record:
+  [`../wip/prefill-decode-arms-v2/`](../wip/prefill-decode-arms-v2/README.md); its own gate set is
+  `wip/prefill-decode-arms-v2/gates/gate-arms-*.sh` (beta-only, never delivery gates).
+
+The `arena-steady-sizing` v2 candidate was **promoted into block 09 at r292** (2026-11-15);
 see *Recently promoted* below and `archive/work/arena-steady-sizing/`.
 `0016-host-experts-window` was **withdrawn 2026-11-02**: the mode is unimplementable on a
 no-XNACK GPU (a kernel read of a reclaimable registered page is a fatal fault, and holding it is pinning —

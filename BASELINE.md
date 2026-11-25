@@ -12,7 +12,7 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 | item | value |
 |---|---|
 | fork point (upstream `ggml-org/llama.cpp` master) | **`release.json .base`** |
-| delivery | **18 default patches**: 17 official blocks `0000`-`0016` + the temporary `0300` (`release.json .n_default`; `v<N>` names `.n_blocks` = 17).  Block 14 is the streamed KV window/pool, block 15 the UMA GTT expert store, block 16 the server's prompt admission policy (split out of block 12 at r301, `TODO` #339), **block `0300` is temporary**.  The optional blocks `0100` (two-lane prefill) and `0101` (mixed K/V cache types — block 17 of r287 until the r288 re-org) are under `optional/`, never in the default tree (`release.json .n_optional` / `.optional`) |
+| delivery | **19 default patches**: 18 official blocks `0000`-`0016` plus `0017` (the TQ1_0 / TQ2_0 ternary GPU path, r356) + the temporary `0300` (`release.json .n_default`; `v<N>` names `.n_blocks` = 18).  Block 14 is the streamed KV window/pool, block 15 the UMA GTT expert store, block 16 the server's prompt admission policy (split out of block 12 at r301, `TODO` #339), **block `0300` is temporary**.  The optional blocks `0100` (two-lane prefill) and `0101` (mixed K/V cache types — block 17 of r287 until the r288 re-org) are under `optional/`, never in the default tree (`release.json .n_optional` / `.optional`) |
 | canonical chain | `release.json .tip` / `.tree` |
 | release identity | `release.json .release` (`v<blocks>-<base>-r<N>`) |
 
@@ -27,7 +27,7 @@ determinism requirement (`GREEDY-PURITY.md` §44 addendum, r336).
 | line | install | build | status |
 |---|---|---|---|
 | **ROCm 10.2.0** – hipBLASLt 1.5.0 | `/opt/rocm-10.2.0-gfx120X` | `~/bin/build-llama-rocm` (default `BUILD_DIR=build-rocm`) | **canonical**: the tree every gate, every recorded arm and every `release.json` reference in this repo is measured on unless it says otherwise.  hipBLASLt's `getAllSolutions()` offers **one** solution per call on the F32 GDN shapes, so the §44 per-start lottery cannot fire there (`TODO #362` closed, `WORKLOG.md` 261121.021) |
-| ROCm 10.1.0 – hipBLASLt 1.4.1 | `/opt/rocm-10.1.0-gfx120X` | `~/bin/build-llama-rocm-101` (`BUILD_DIR=build-rocm-101`) | validated for build + coherence (whole `all` target, `test-backend-ops`, the same-seed text arms at r339).  The line §44's numbers of record were measured on; on this box its candidate list is **stable** across starts (18 candidates, one order), so a fresh-start flip cannot be witnessed here |
+| ROCm 10.1.0 – hipBLASLt 1.4.1 | `/opt/rocm-10.1.0-gfx120X` | `~/bin/build-llama-rocm-101` (`BUILD_DIR=build-rocm-101`) | **RETIRED 2026-11-23, and no longer used by anything here.**  Its hipBLASLt **1.4** is the pre-`c50ea60130f` library whose candidate container makes a fresh process pick its own solution -- the §44 mechanism -- and `scripts/` used to force this lib dir into `LD_LIBRARY_PATH` while the build linked 10.2, which turned every cross-process text comparison into a coin flip (`INVARIANTS.md` r359-wip).  Kept in this table as provenance: §44's numbers of record were measured on it |
 | ROCm 7.14.1 – hipBLASLt 1.4.1 | `/opt/rocm-7.14.1-gfx120X` | `~/bin/build-llama-rocm-714` (`BUILD_DIR=build-rocm-714`) | validated for build + coherence (whole `all` target and `test-backend-ops -o HC_MIX` 30/30 at r339) |
 
 `scripts/check-hipblaslt-lottery.sh` is the repeatable instrument for the per-line hipBLASLt question (class
