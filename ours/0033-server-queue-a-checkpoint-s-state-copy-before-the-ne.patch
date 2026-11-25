@@ -1,0 +1,333 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 24 Nov 2026 17:18:46 +0000
+Subject: [PATCH 33/35] server: queue a checkpoint's state copy before the next
+ batch, finish it after (LLAMA_CKPT_ASYNC=0: off)
+
+A context checkpoint is taken right before the next batch is queued, and its target state copy (112.6 MiB of
+recurrent rows on the production model) is device-to-host-link bound: ~7-9 ms with both GPUs idle, ~2 per request
+and per agent turn, while the server then spends 10-80 ms building and queueing that batch.
+
+llama_state_seq_get_data_deferred() queues the batched device copies and their per-group events as before and
+leaves the host half (event waits + stage -> buffer copy) in the context; llama_state_finish() runs it.  The server
+takes the target state of a checkpoint this way and finishes it right after llama_process() has queued the next
+batch, so the copies overlap that host work.  They sit on the streams the next graph runs on, so the graph overwrites
+the rows only after they are read.  A pending copy is also finished by the next batched state save or restore on the
+context (state_stage), at the end of every update_slots() pass (any exit path), and dropped when the context is
+freed; a failed read leaves nothing pending.
+
+LLAMA_CKPT_ASYNC_VERIFY=1 also takes a synchronous copy just before each deferred one and compares the bytes once
+it has landed: 85 checkpoints, all equal.  Outputs identical with the switch on and off (greedy, 4.2k and short
+prompts, agent turns with checkpoint-restore branches); agent turns -11..-12 ms median (~1.3 %), short prompts
+-3..-10 ms, 4.2k prompts -4..-6 ms.
+---
+ common/common.cpp               |  6 ++-
+ common/common.h                 |  4 +-
+ include/llama.h                 | 17 ++++++++
+ src/llama-context.cpp           | 69 ++++++++++++++++++++++++++-------
+ src/llama-context.h             |  6 +++
+ tools/server/server-context.cpp | 68 +++++++++++++++++++++++++++++++-
+ 6 files changed, 152 insertions(+), 18 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index 22b7525979..0214033637 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -3225,7 +3225,8 @@ void common_prompt_checkpoint::update_pos(
+ void common_prompt_checkpoint::update_tgt(
+         llama_context * ctx,
+         llama_seq_id seq_id,
+-        llama_state_seq_flags flags) {
++        llama_state_seq_flags flags,
++        bool defer) {
+     if (ctx == nullptr) {
+         return;
+     }
+@@ -3236,7 +3237,8 @@ void common_prompt_checkpoint::update_tgt(
+         data_tgt.resize(ckpt_size);
+     }
+ 
+-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
++    const size_t n = defer ? llama_state_seq_get_data_deferred(ctx, data_tgt.data(), ckpt_size, seq_id, flags)
++                           : llama_state_seq_get_data_ext     (ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+     if (n != ckpt_size) {
+         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+     }
+diff --git a/common/common.h b/common/common.h
+index fb5e5badd8..1b78cf3744 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1538,10 +1538,12 @@ struct common_prompt_checkpoint {
+             llama_pos pos_min,
+             llama_pos pos_max);
+ 
++    // defer: llama_state_seq_get_data_deferred (the bytes land at the next llama_state_finish on ctx)
+     void update_tgt(
+             llama_context * ctx,
+             llama_seq_id seq_id,
+-            llama_state_seq_flags flags);
++            llama_state_seq_flags flags,
++            bool defer = false);
+ 
+     void update_dft(
+             llama_context * ctx,
+diff --git a/include/llama.h b/include/llama.h
+index a8dfae4b0e..4952ce7413 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1143,6 +1143,23 @@ extern "C" {
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags);
+ 
++    // llama_state_seq_get_data_ext(), but the batched path may return as soon as the device-to-host copies are queued:
++    // the bytes reach `dst` at the next llama_state_finish(), at the next batched state save or restore on this
++    // context (the ones that go through its pinned staging buffer), or never if the context is freed first.  `dst` must
++    // stay valid and unread until llama_state_finish() returns; call it before reading or freeing `dst`.  The queued
++    // copies are ordered before later work on the same streams, so a following llama_decode() can overwrite the
++    // state without waiting for them.  Paths that cannot defer copy synchronously, as llama_state_seq_get_data_ext;
++    // on failure (0 returned) nothing is left pending.
++    LLAMA_API size_t llama_state_seq_get_data_deferred(
++            struct llama_context * ctx,
++                         uint8_t * dst,
++                          size_t   size,
++                    llama_seq_id   seq_id,
++           llama_state_seq_flags   flags);
++
++    // completes a copy left pending by llama_state_seq_get_data_deferred() (a no-op when none is pending)
++    LLAMA_API void llama_state_finish(struct llama_context * ctx);
++
+     //
+     // Decoding
+     //
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 14c7db210e..b4a23c106c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1272,6 +1272,7 @@ llama_context::llama_context(
+ }
+ 
+ llama_context::~llama_context() {
++    state_finish(/* copy = */ false);
+     for (auto & be : state_pipe_evs) {
+         for (ggml_backend_event_t ev : be.second) {
+             if (ev != nullptr) {
+@@ -5479,22 +5480,38 @@ public:
+             stage_off += winfos[i].size;
+         }
+         const int n_copy_threads = llama_state_copy_threads(total);
+-        const int64_t t_copy = ggml_time_us();
+-        for (size_t g = 0; g < n_grp; ++g) {
+-            if (piped) {
+-                for (const auto & be : grp_ev[g]) {
+-                    ggml_backend_event_synchronize(be.second);
++        // the host half: wait for each group's device copies, then copy it out of the stage
++        auto finish = [pcs, grp, grp_ev, piped, n_grp, n_copy_threads, t_enq, total, n_pcs = winfos.size()](bool copy, bool deferred) {
++            const int64_t t_copy = ggml_time_us();
++            for (size_t g = 0; g < n_grp; ++g) {
++                if (piped) {
++                    for (const auto & be : grp_ev[g]) {
++                        ggml_backend_event_synchronize(be.second);
++                    }
++                }
++                if (copy) {
++                    llama_state_copy_pieces(pcs, grp[g], grp[g + 1], n_copy_threads);
+                 }
+             }
+-            llama_state_copy_pieces(pcs, grp[g], grp[g + 1], n_copy_threads);
+-        }
+-        if (st_timing) {
+-            const int64_t t_end = ggml_time_us();
+-            LLAMA_LOG_INFO("state get: %zu pieces, %.1f MiB in %zu group(s): enqueue %.2f ms, copy+wait %.2f ms "
+-                           "(%.1f GiB/s), total %.2f ms\n", winfos.size(), total / 1048576.0, n_grp,
+-                           (t_copy - t_enq) / 1e3, (t_end - t_copy) / 1e3,
+-                           total / 1073741824.0 / std::max(1e-6, (t_end - t_copy) / 1e6), (t_end - t_enq) / 1e3);
++            if (st_timing) {
++                const int64_t t_end = ggml_time_us();
++                LLAMA_LOG_INFO("state get%s: %zu pieces, %.1f MiB in %zu group(s): enqueue %.2f ms, copy+wait %.2f ms "
++                               "(%.1f GiB/s), total %.2f ms\n", deferred ? " (deferred)" : "", n_pcs, total / 1048576.0, n_grp,
++                               deferred ? 0.0 : (t_copy - t_enq) / 1e3, (t_end - t_copy) / 1e3,
++                               total / 1073741824.0 / std::max(1e-6, (t_end - t_copy) / 1e6), (t_end - t_enq) / 1e3);
++            }
++        };
++        // llama_state_seq_get_data_deferred: only the piped path defers (its events fence each group); the queued
++        // device copies are ordered before any later work on these streams, so the next graph may overwrite the state
++        if (lctx->state_defer_next && piped) {
++            if (st_timing) {
++                LLAMA_LOG_INFO("state get: %zu pieces, %.1f MiB queued in %.2f ms, host copy deferred\n",
++                               winfos.size(), total / 1048576.0, (ggml_time_us() - t_enq) / 1e3);
++            }
++            lctx->state_pending = [finish](bool copy) { finish(copy, true); };
++            return true;
+         }
++        finish(true, false);
+         return true;
+     }
+ 
+@@ -6127,7 +6144,17 @@ private:
+     llama_context * lctx = nullptr;
+ };
+ 
++void llama_context::state_finish(bool copy) {
++    if (state_pending) {
++        auto f = std::move(state_pending);
++        state_pending = nullptr;
++        f(copy);
++    }
++}
++
+ uint8_t * llama_context::state_stage(size_t size) {
++    // every batched save or restore comes through here: a deferred copy still owns the stage and the pipe events
++    state_finish();
+     if (buf_state_stage == nullptr || ggml_backend_buffer_get_size(buf_state_stage.get()) < size) {
+         buf_state_stage.reset();
+         // the pinned type of the output device (the first simple device of a meta device), as for the outputs
+@@ -7840,6 +7867,22 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+     return ctx->state_seq_set_data(seq_id, src, size, flags);
+ }
+ 
++size_t llama_state_seq_get_data_deferred(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
++    ctx->synchronize();
++
++    ctx->state_defer_next = true;
++    const size_t n = ctx->state_seq_get_data(seq_id, dst, size, flags);   // catches internally, 0 on failure
++    ctx->state_defer_next = false;
++    if (n == 0) {
++        ctx->state_finish(/* copy = */ false);   // a failed read leaves nothing that could write into `dst` later
++    }
++    return n;
++}
++
++void llama_state_finish(llama_context * ctx) {
++    ctx->state_finish();
++}
++
+ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 977467c65c..6f59c473b3 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -13,6 +13,7 @@
+ #include "ggml-opt.h"
+ 
+ #include <array>
++#include <functional>
+ #include <map>
+ #include <vector>
+ 
+@@ -194,6 +195,11 @@ struct llama_context {
+     // events for the pipelined batched state copies (llama_state_pipe_groups): one per group, created on first use
+     static constexpr size_t n_state_pipe_events = 8;
+     ggml_backend_event_t state_pipe_event(ggml_backend_t backend, size_t group);
++    // deferred batched state read (llama_state_seq_get_data_deferred): the next batched save may leave its host copy
++    // in `state_pending`; state_finish() runs it (copy = false: wait for the device copies only and drop the bytes)
++    bool state_defer_next = false;
++    std::function<void(bool copy)> state_pending;
++    void state_finish(bool copy = true);
+     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+ 
+     bool state_load_file(
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c4965057e1..ac9d21475c 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1484,6 +1484,48 @@ private:
+         }
+     }
+ 
++    static bool ckpt_async() {
++        static const bool on = [] { const char * e = getenv("LLAMA_CKPT_ASYNC"); return e == nullptr || atoi(e) != 0; }();
++        return on;
++    }
++
++    // LLAMA_CKPT_ASYNC_VERIFY=1 (a check, off by default): each deferred checkpoint also takes a synchronous copy of the
++    // same state just before it, and the two are compared once the deferred copy has landed (ckpt_async_complete)
++    static bool ckpt_async_verify() {
++        static const bool on = [] { const char * e = getenv("LLAMA_CKPT_ASYNC_VERIFY"); return e != nullptr && atoi(e) != 0; }();
++        return on;
++    }
++    std::vector<std::pair<std::shared_ptr<const common_prompt_checkpoint>, std::vector<uint8_t>>> ckpt_verify;
++    int64_t n_ckpt_verify_ok = 0;
++    int64_t n_ckpt_verify_bad = 0;
++
++    // lands a deferred checkpoint copy (llama_state_finish) and runs the verify comparisons; also at the end of every
++    // update_slots(), so no exit path leaves a copy pending into a buffer that a later pass might free
++    void ckpt_async_complete() {
++        llama_state_finish(ctx_tgt);
++        for (auto & v : ckpt_verify) {
++            const auto & got = v.first->data_tgt;
++            const auto & ref = v.second;
++            size_t off = 0;
++            while (off < ref.size() && off < got.size() && got[off] == ref[off]) {
++                ++off;
++            }
++            if (got.size() == ref.size() && off == ref.size()) {
++                n_ckpt_verify_ok++;
++            } else {
++                n_ckpt_verify_bad++;
++                SRV_WRN("ckpt async verify: MISMATCH at byte %zu of %zu (got %zu bytes)\n", off, ref.size(), got.size());
++            }
++            SRV_WRN("ckpt async verify: %" PRId64 " equal, %" PRId64 " differ\n", n_ckpt_verify_ok, n_ckpt_verify_bad);
++        }
++        ckpt_verify.clear();
++    }
++
++    struct ckpt_async_guard {
++        server_context_impl * self;
++        ~ckpt_async_guard() { self->ckpt_async_complete(); }
++    };
++
+     // a spare of exactly n bytes: no new allocation and no zero fill when the checkpoint is written into it
+     common_state_data ckpt_take(size_t n) {
+         for (auto it = ckpt_spare.begin(); it != ckpt_spare.end(); ++it) {
+@@ -3498,7 +3540,23 @@ private:
+                 cur.data_dft = ckpt_take(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+             }
+         }
+-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        // LLAMA_CKPT_ASYNC (on unless 0): the checkpoint is taken right before the next batch is queued, and its
++        // target state copy is device-to-host-link bound (~7-9 ms for 112.6 MiB on 2 x Gen5 x8), with the GPUs idle
++        // until the server has built and queued that batch (10-80 ms of host work, FINDINGS 1108-1109).  So only the
++        // device copies are queued here; the host half (event waits + stage -> buffer) runs once the batch is queued,
++        // in update_slots() right after llama_process() (llama_state_finish), or earlier at the next state save or
++        // restore on ctx_tgt.  Nothing reads the checkpoint before that: a restore, a save to file and a recycle all
++        // happen in a later pass or after a state op that finishes it.  The copies sit on the streams the next graph
++        // runs on, so the graph overwrites the recurrent rows only after they are read.
++        std::vector<uint8_t> ckpt_ref;
++        if (ckpt_async() && ckpt_async_verify()) {
++            ckpt_ref.resize(llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++            ckpt_ref.resize(llama_state_seq_get_data_ext(ctx_tgt, ckpt_ref.data(), ckpt_ref.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++        }
++        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, ckpt_async());
++        if (!ckpt_ref.empty()) {
++            ckpt_verify.emplace_back(ckpt, std::move(ckpt_ref));
++        }
+         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+         // stash the draft's speculative state with the checkpoint
+         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+@@ -4294,6 +4352,7 @@ private:
+     }
+ 
+     void update_slots() {
++        ckpt_async_guard ckpt_guard { this };   // LLAMA_CKPT_ASYNC: nothing stays pending past this pass, on any exit path
+ #ifdef DEBUG_TIMINGS
+         static int64_t t_prev = 0;
+         int64_t t_start = ggml_time_us();
+@@ -6455,7 +6514,12 @@ private:
+             // handshake holds it out for the duration (a no-op when the pair is not running)
+             arm_step_guard guard(*this, /* main_arm = */ true);
+ 
+-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
++            {
++                // a deferred checkpoint copy (LLAMA_CKPT_ASYNC) completes once this batch is queued, also when the
++                // decode throws, so no later code sees a checkpoint whose bytes are still on their way
++                ckpt_async_guard finish_guard { this };
++                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
++            }
+             if (ret == 0 && has_output) {
+                 llama_synchronize(ctx_tgt);
+             }
+-- 
+2.53.0
+

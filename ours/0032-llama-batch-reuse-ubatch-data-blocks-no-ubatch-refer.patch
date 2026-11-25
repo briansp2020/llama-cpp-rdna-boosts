@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 24 Nov 2026 07:47:30 +0000
-Subject: [PATCH 32/32] llama-batch: reuse ubatch data blocks no ubatch
+Subject: [PATCH 32/35] llama-batch: reuse ubatch data blocks no ubatch
  references any more (LLAMA_UBATCH_REUSE=0: off)
 
 ubatch_add() made a fresh llama_ubatch::data_t per ubatch.  When the MTP draft takes in a 4096-token prompt

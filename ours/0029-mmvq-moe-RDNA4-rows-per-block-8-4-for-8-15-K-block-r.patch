@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 23:59:22 +0000
-Subject: [PATCH 29/32] mmvq-moe: RDNA4 rows per block 8 / 4 for 8-15 K-block
+Subject: [PATCH 29/35] mmvq-moe: RDNA4 rows per block 8 / 4 for 8-15 K-block
  rows whose last (row, K-block) pass runs partly idle (GGML_CUDA_MOE_RPB_K=0:
  off)
 

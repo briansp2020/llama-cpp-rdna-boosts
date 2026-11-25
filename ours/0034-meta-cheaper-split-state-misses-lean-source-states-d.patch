@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 24 Nov 2026 18:48:48 +0000
+Subject: [PATCH 34/35] meta: cheaper split-state misses -- lean source states,
+ derived assume_sync=false states, walk pruned per buffer (GGML_META_SS_LEAN /
+ _DERIVE / _PRUNE_XBUF=0: off)
+
+Every agent turn brings a new prompt length, so the graph allocation of each new ubatch shape misses the split-state
+cache on nearly every tensor, and the server thread spent 60-110 ms per second of turn activity in
+ggml_backend_meta_get_split_state while the GPUs waited (counters: up to 1.3M lookups, 20-66k misses and ~1M walk
+visits a second).  Three independent changes, each with its own switch, none changing any state:
+
+- GGML_META_SS_LEAN: a miss built its source states as a fresh heap vector of whole ~2.1 KiB states, zero-filled and
+  then overwritten by whole-struct copies -- most of the miss path's time.  Readers only ever touch the header and
+  the first max(n_segments, 1) x n_bufs entries (the rule the cache entries already follow), so the states now come
+  from a per-recursion-depth thread-local pool, an absent source fills its header and n_bufs entries, a looked-up
+  one copies its used part, and the miss branch no longer zero-fills a verify copy it does not use.
+- GGML_META_SS_DERIVE: allocation looks tensors up with assume_sync = true, graph_compute with false, so each new
+  shape was computed twice.  The flag only matters in handle_mul_mat (MUL_MAT / MUL_MAT_ID) and for a full-tensor
+  view (op NONE with a view source); for every other tensor a byte-identical true entry is copied.  Under
+  GGML_META_SS_VERIFY the copy is compared with a recomputation at once.
+- GGML_META_SS_PRUNE_XBUF: the pre-warm walk tested every source against the outer tensor's buffer cache, so sources
+  in other buffers (weights, KV cache) were walked again on every walk.  The source's own buffer decides now (for an
+  alias not yet given its buffer, the buffer at the end of its view chain): a non-meta one is a leaf, a meta one is
+  tested against its own current version.
+
+Production config, two on/off A/B pairs each in two runs: agent-turn prompt time 438-441 vs 486-495 ms (-10 %), turn
+median -20..-65 ms, 63k-token prefill -1.0 %, 4.2k first token -4..-19 ms; outputs identical in every arm (greedy,
+agent turns with checkpoint-restore branches, 4.2k and short prompts, 512-token decode); GGML_META_SS_VERIFY=1 arms:
+no stale entry, no derived entry differing.
+---
+ ggml/src/ggml-backend-meta.cpp | 116 +++++++++++++++++++++++++++++++--
+ 1 file changed, 110 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 64f4f05666..d39b6a27bc 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1145,6 +1145,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
+ // dense layer under `-sm tensor`, i.e. a --fit that reduced n_gpu_layers): the split-state walk then
+ // inspects the classic attention `ggml_view_4d` -> `ggml_permute` pair and aborted on the unallocated
+ // intermediate view (issue #170).
++// GGML_META_SS_LEAN (on unless 0; FINDINGS 1112), see the source states in calculate_split_state
++static bool ggml_backend_meta_ss_lean() {
++    static const bool on = [] { const char * e = getenv("GGML_META_SS_LEAN"); return e == nullptr || atoi(e) != 0; }();
++    return on;
++}
++
+ static ggml_backend_buffer_t ggml_backend_meta_view_chain_buffer(const struct ggml_tensor * tensor) {
+     while (tensor != nullptr && tensor->buffer == nullptr && tensor->view_src != nullptr) {
+         tensor = tensor->view_src;
+@@ -1789,13 +1795,56 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             return ret;
+         }
+ 
+-        std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
++        // GGML_META_SS_LEAN (on unless 0; FINDINGS 1112): a miss used to build its GGML_MAX_SRC source states as a
++        // fresh heap vector of whole ~2.1 KiB states (each zero-filled, then overwritten by a whole-struct copy), and
++        // those bulk fills were most of the miss path's time.  Every reader of a state indexes ne[s*n_bufs + j] with
++        // s < n_segments (and nr[s] alike), so only the header and the first max(n_segments, 1) x n_bufs entries are
++        // ever read -- the same rule the cache entries already follow (split_state_entry::get).  The lean path keeps
++        // one vector of states per recursion depth for the thread (a nested miss gets its own), fills an absent
++        // source's header and its first n_bufs entries only, and copies a looked-up state's used part only.
++        const bool ss_lean = ggml_backend_meta_ss_lean();
++        static thread_local std::vector<std::unique_ptr<std::vector<ggml_backend_meta_split_state>>> src_ss_pool;
++        static thread_local size_t src_ss_depth = 0;
++        struct src_ss_depth_guard {
++            bool on;
++            explicit src_ss_depth_guard(bool on) : on(on) { if (on) { src_ss_depth++; } }
++            ~src_ss_depth_guard() { if (on) { src_ss_depth--; } }
++        };
++        std::vector<ggml_backend_meta_split_state> src_ss_own;
++        if (ss_lean) {
++            while (src_ss_pool.size() <= src_ss_depth) {
++                src_ss_pool.emplace_back(new std::vector<ggml_backend_meta_split_state>(GGML_MAX_SRC));
++            }
++        } else {
++            src_ss_own.assign(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
++        }
++        std::vector<ggml_backend_meta_split_state> & src_ss = ss_lean ? *src_ss_pool[src_ss_depth] : src_ss_own;
++        const src_ss_depth_guard src_ss_depth_hold(ss_lean);
++        const size_t n_used_max = 16 * n_bufs <= sizeof(src_ss[0].ne) / sizeof(src_ss[0].ne[0]) ? 16 * n_bufs : sizeof(src_ss[0].ne) / sizeof(src_ss[0].ne[0]);
+         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+-                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
++                if (ss_lean) {
++                    ggml_backend_meta_split_state & d = src_ss[i];
++                    d.axis       = GGML_BACKEND_SPLIT_AXIS_UNKNOWN;
++                    d.n_segments = 1;
++                    d.nr[0]      = 1;
++                    std::fill(d.ne, d.ne + n_bufs, (int64_t) 0);
++                } else {
++                    src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
++                }
+                 continue;
+             }
+-            src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
++            if (ss_lean) {
++                const ggml_backend_meta_split_state r = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
++                ggml_backend_meta_split_state & d = src_ss[i];
++                d.axis       = r.axis;
++                d.n_segments = r.n_segments;
++                memcpy(d.nr, r.nr, sizeof(d.nr));
++                const size_t n_used = std::min(n_used_max, (size_t) std::max<uint32_t>(r.n_segments, 1) * n_bufs);
++                std::copy(r.ne, r.ne + n_used, d.ne);
++            } else {
++                src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
++            }
+             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+         }
+ 
+@@ -2174,9 +2223,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     const int ss_slot = g_meta_view_slot;
+     GGML_ASSERT(ss_slot >= 0 && ss_slot < ggml_backend_meta_buffer_context::n_view_slots);
+ 
++    // GGML_META_SS_PRUNE_XBUF (on unless 0; FINDINGS 1112): the test used this tensor's buffer cache for every node,
++    // so a source in ANOTHER buffer (the weights, the KV cache) never counted as cached and the walk visited it -- and
++    // its sources -- on every walk (~1M visits a second in agent turns against ~30k misses).  The source's own buffer
++    // decides instead -- for an alias not yet given its buffer, the buffer at the end of its view chain, as in the
++    // lookup itself ([TAG_META_UNALLOC_ALIAS]).  When that is not a meta buffer the lookup returns a constant without
++    // reading any source, so the node is a leaf here; otherwise it is tested against that buffer's own current
++    // version, which is where its lookup will go.  Pruning only decides what the walk pre-computes (and so how deep
++    // the C++ recursion can get); every state is still computed by the same code.
++    static const bool ss_prune_xbuf = [] { const char * e = getenv("GGML_META_SS_PRUNE_XBUF"); return e == nullptr || atoi(e) != 0; }();
+     auto ss_cached = [&](const ggml_tensor * t) -> bool {
+         const std::pair k = std::make_pair(t, true);
+-        const auto & c = buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
++        const ggml_backend_meta_buffer_context * bc = buf_ctx;
++        if (ss_prune_xbuf) {
++            const ggml_backend_buffer_t tb = t->buffer != nullptr ? t->buffer : ggml_backend_meta_view_chain_buffer(t);
++            if (tb == nullptr || !ggml_backend_buffer_is_meta(tb)) {
++                return true;
++            }
++            bc = (const ggml_backend_meta_buffer_context *) tb->context;
++        }
++        const auto & c = bc->split_state_cache[ss_slot][bc->split_state_cache_cur[ss_slot]];
+         const auto itc = c.find(k);
+         return itc != c.end() && memcmp(itc->second.bytes, (const char *) t, sizeof(itc->second.bytes)) == 0;
+     };
+@@ -2275,8 +2341,46 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     const bool verify_hit = it != cache->end() && ss_verify && !ss_verify_active;
+     if (it == cache->end() || verify_hit) {
+         ss_verify_active = ss_verify_active || verify_hit;   // the recomputation's own source lookups are not verified
+-        const ggml_backend_meta_split_state c = verify_hit ? it->second.get() : ggml_backend_meta_split_state{};   // copy: the recursion may recycle this version
+-        const ggml_backend_meta_split_state ss = calculate_split_state();
++        const bool ss_lean_miss = ggml_backend_meta_ss_lean();
++        ggml_backend_meta_split_state c;   // copy: the recursion may recycle this version (only read when verifying)
++        if (verify_hit) {
++            c = it->second.get();
++        } else if (!ss_lean_miss) {
++            c = ggml_backend_meta_split_state{};
++        }
++        // GGML_META_SS_DERIVE (on unless 0; FINDINGS 1112): allocation looks every tensor up with assume_sync = true
++        // and graph_compute with false, so a new graph shape was computed twice.  The flag changes a result in two
++        // places only: handle_mul_mat (MUL_MAT / MUL_MAT_ID: MIRRORED vs PARTIAL when both sources are split on axis 0)
++        // and a full-tensor view (op NONE with a view source), which passes it on to that source.  Sources are always
++        // looked up with true.  For every other tensor the false state is the true state, so a byte-identical true
++        // entry in this version is copied instead of recomputed.  GGML_META_SS_VERIFY recomputes such entries on a hit.
++        static const bool ss_derive = [] { const char * e = getenv("GGML_META_SS_DERIVE"); return e == nullptr || atoi(e) != 0; }();
++        auto it_true = cache->end();
++        if (ss_derive && !verify_hit && !assume_sync &&
++                tensor->op != GGML_OP_MUL_MAT && tensor->op != GGML_OP_MUL_MAT_ID &&
++                !(tensor->op == GGML_OP_NONE && tensor->view_src != nullptr)) {
++            it_true = cache->find(std::make_pair(tensor, true));
++            if (it_true != cache->end() && memcmp(it_true->second.bytes, (const char *) tensor, sizeof(it_true->second.bytes)) != 0) {
++                it_true = cache->end();
++            }
++        }
++        const bool derived = it_true != cache->end();
++        const ggml_backend_meta_split_state ss = derived ? it_true->second.get() : calculate_split_state();
++        if (derived && ss_verify && !ss_verify_active) {
++            ss_verify_active = true;
++            const ggml_backend_meta_split_state r = calculate_split_state();
++            bool same = r.axis == ss.axis && r.n_segments == ss.n_segments;
++            for (uint32_t sg = 0; same && sg < ss.n_segments; sg++) {
++                same = ss.nr[sg] == r.nr[sg];
++                for (size_t j = 0; same && j < n_bufs; j++) {
++                    same = ss.ne[sg*n_bufs + j] == r.ne[sg*n_bufs + j];
++                }
++            }
++            if (!same) {
++                GGML_ABORT("GGML_META_SS_VERIFY: derived split state differs for %s (op %s)", tensor->name, ggml_op_name(tensor->op));
++            }
++            ss_verify_active = false;
++        }
+         if (verify_hit) {
+             bool same = ss.axis == c.axis && ss.n_segments == c.n_segments;
+             for (uint32_t sg = 0; same && sg < ss.n_segments; sg++) {
+-- 
+2.53.0
+

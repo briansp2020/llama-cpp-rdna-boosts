@@ -10,10 +10,10 @@ release as published; only `ours/` is added.
 ```
 git checkout 919794500
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r351 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 32 patches (0001-0032)
+git am <path-to-this-repo>/ours/*.patch              # 35 patches (0001-0035)
 ```
 
-Result: tree `fa393c6d3159`. This is the production build since 2026-11-24 6:40 AM PST.
+Result: tree `5604f4408284`. This is the production build since 2026-11-25 2:11 AM PST.
 
 ## How the series is organised
 
@@ -22,7 +22,7 @@ Result: tree `fa393c6d3159`. This is the production build since 2026-11-24 6:40 
   Our code lives in two included files, `moe-expert-tier.inc` and `moe-expert-tier-state.inc`, and runs only for
   sparse (mmap) tables. Pool and pinned tables run the release's own code. The tier code covers the RAM tier, the
   pin budget, KV lending, the fill fence, batched admissions and the device remap for sparse tables.
-- **0004-0032** are one feature each, in the order they were added.
+- **0004-0035** are one feature each, in the order they were added.
 - A fix to one of our patches goes into that patch, not into a new one. A later patch that touches an earlier
   one's code adds a feature of its own, with its own switch.
 - Every behaviour change has an environment switch. The table gives the value that turns it off (or the opt-in).
@@ -64,6 +64,9 @@ Result: tree `fa393c6d3159`. This is the production build since 2026-11-24 6:40 
 | 0030 | server: idle slots are saved to the prompt cache and cleared before the restore of the new request, not after its launch, so a long prompt after other requests starts with the KV room free (259.6k needle after other requests 79 -> 71 s, +11.6 %); output unchanged | `LLAMA_SERVER_IDLE_CLEAR_FIRST=0` |
 | 0031 | hyperconn: hc_combine_norm also writes the Q8_1 MMQ activation of its dense consumer, so that matmul skips its own quantize (prefill, 64+ tokens); 31.5k prefill +1.9 %, 259.6k needle +1.4 %; bit-identical | `GGML_CUDA_HC_CN_MMQ_Q8=0` |
 | 0032 | llama-batch: ubatch data blocks that no ubatch references any more are reused instead of freshly allocated (capped at 256 MiB, `LLAMA_UBATCH_REUSE_MIB`), so the MTP draft no longer zero-fills and page-faults ~100 MiB of state rows after every long prompt; server-thread page faults -92 %, 4.2k-token request -20..27 ms; output unchanged | `LLAMA_UBATCH_REUSE=0` |
+| 0033 | server: a checkpoint's state copy is queued before the next batch and finished after it, so the host-side copy overlaps GPU work; byte-identical (verify mode compares every deferred copy with a synchronous one), agent turns -11..-12 ms | `LLAMA_CKPT_ASYNC=0` |
+| 0034 | meta (tensor split): cheaper split-state misses -- lean source states, states derived between the allocation and compute lookups, and a walk pruned per buffer; agent-turn prompt time -10 %, outputs identical | `GGML_META_SS_LEAN=0`, `GGML_META_SS_DERIVE=0`, `GGML_META_SS_PRUNE_XBUF=0` |
+| 0035 | llama: a state copy larger than the pinned stage (`LLAMA_STATE_ASYNC_MAX_MIB`, 256) runs the batched copy in rounds of the stage size instead of tensor by tensor through pageable memory; 350 MiB prompt-cache save 52-68 -> 20-37 ms, its load -26..-32 ms, same bytes | `LLAMA_STATE_ASYNC_ROUNDS=0` |
 
 ## Production configuration
 
@@ -89,17 +92,16 @@ Settings on top of the defaults that matter for this series:
 
 With 57.6 GiB of host experts, the expert cache holds 68.2 % in VRAM.
 
-## Validation (r351 + 0030-0032, 2026-11-23/24)
+## Validation (r351 + 0030-0035, 2026-11-24/25)
 
-- The 7-model comparison with the release passes (nightly gate: 0 problems, 0 warnings, 0 failed loads), with
-  speeds equal to the release.
-- Production configuration: output identical to the r351 series on every check: greedy, 512-token prompt set,
-  4.2k and 30k-token prompts, and the 259.6k-token needle (6,358). A prompt restored from the cache after 0030
-  gives the same output as a cold start.
-- 0031 is bit-identical: in its verify mode every handed-over activation equals the one the matmul quantizes itself.
-- Overnight stress (2 h, 2 GPUs, three configurations, 58 rounds): 0 output mismatches, 0 GPU faults, needle
-  correct in every round; cold and heat-map-seeded starts give the production outputs.
-- Speed (production configuration, single runs): 31.5k prefill +1.9 %, 259.6k needle +1.4 % over the r351 series;
-  decode unchanged (512-token prompt set 151 t/s); a 4.2k-token request finishes 20-27 ms sooner with 0032.
+- The 7-model comparison with the release passes (nightly gate: 0 problems, 0 warnings, 0 failed loads).
+- Production configuration: greedy and 512-token prompt-set outputs identical to the r351 series; the 259.6k-token
+  needle answers 6,358 in every round.
+- 0033 and 0035 are byte-identical in their verify modes (every deferred checkpoint copy and every rounds save
+  compared with the plain copy: 0 differ); 0034 leaves outputs unchanged (its verify mode recomputes each state).
+- Overnight stress (2 GPUs, 46 rounds over 2 h): 0 output mismatches, 0 GPU faults; cold and heat-map-seeded
+  starts give the production outputs.
+- Speed (production configuration, single runs): agent turns with checkpoints -11..-12 ms (0033), agent-turn
+  prompt time -10 % (0034), prompt-cache saves above 256 MiB 35-60 % faster (0035); decode unchanged.
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.
