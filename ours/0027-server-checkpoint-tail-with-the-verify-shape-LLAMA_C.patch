@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 20:41:03 +0000
-Subject: [PATCH 27/37] server: checkpoint tail with the verify shape
+Subject: [PATCH 27/40] server: checkpoint tail with the verify shape
  (LLAMA_CKPT_TAIL_OUTPUTS)
 
 When the last prompt chunk is the checkpoint tail and has the verify width (draft n_max + 1), all its rows are outputs, so the first verify reuses the tail graph instead of rebuilding (FINDINGS 1058).
@@ -16,10 +16,10 @@ When the last prompt chunk is the checkpoint tail and has the verify width (draf
  1 file changed, 17 insertions(+)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 7d0900832b..1d280a54d4 100644
+index 34a4dd5229..9b75cf1d80 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -5247,6 +5247,23 @@ private:
+@@ -5355,6 +5355,23 @@ private:
                          // extract the logits only for the last token
                          batch.set_output(batch.size() - 1, true);
  

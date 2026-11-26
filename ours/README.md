@@ -1,19 +1,19 @@
-# ours: our production stack on top of the current rdna-boosts release (r362)
+# ours: our production stack on top of the current rdna-boosts release (r366)
 
 This branch holds the patch series we run on top of the latest rdna-boosts release: 2x Radeon AI PRO R9700,
 ROCm 10.2, Qwen3.8-Flash-Next UD-IQ4_XS with `-sm tensor` and `--host-experts mmap`. It is regenerated for each
 release, and patches the release has taken are dropped. It is not a PR. Everything else on this branch is the
 release as published; only `ours/` is added.
 
-**Base:** `v18-919794500-r362` (upstream llama.cpp `919794500` + this repo's release).
+**Base:** `v18-919794500-r366` (upstream llama.cpp `919794500` + this repo's release).
 
 ```
 git checkout 919794500
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r362 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 37 patches (0001-0037)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r366 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 40 patches (0001-0040)
 ```
 
-Result: tree `9da8168e1a47`. This is our production build from 2026-11-26.
+Result: tree `2ff0e2404dee`. This is our production build from 2026-11-26.
 
 Also in `ours/`: `bench/llbench.py` (the benchmark below), `deploy/docker-compose.yaml` (our production
 compose file, local paths replaced by `./models`) and `tools/mkhead.py` (one step of the draft-head recipe).
@@ -139,7 +139,7 @@ results for several engines on R9700 cards with its own runner.
   Our code lives in two included files, `moe-expert-tier.inc` and `moe-expert-tier-state.inc`, and runs only for
   sparse (mmap) tables. Pool and pinned tables run the release's own code. The tier code covers the RAM tier, the
   pin budget, KV lending, the fill fence, batched admissions and the device remap for sparse tables.
-- **0004-0037** are one feature each, in the order they were added.
+- **0004-0040** are one feature each, in the order they were added.
 - A fix to one of our patches goes into that patch, not into a new one. A later patch that touches an earlier
   one's code adds a feature of its own, with its own switch.
 - Every behaviour change has an environment switch. The table gives the value that turns it off (or the opt-in).
@@ -184,8 +184,11 @@ results for several engines on R9700 cards with its own runner.
 | 0033 | server: a checkpoint's state copy is queued before the next batch and finished after it, so the host-side copy overlaps GPU work; byte-identical (verify mode compares every deferred copy with a synchronous one), agent turns -11..-12 ms | `LLAMA_CKPT_ASYNC=0` |
 | 0034 | meta (tensor split): cheaper split-state misses -- lean source states, states derived between the allocation and compute lookups, and a walk pruned per buffer; agent-turn prompt time -10 %, outputs identical | `GGML_META_SS_LEAN=0`, `GGML_META_SS_DERIVE=0`, `GGML_META_SS_PRUNE_XBUF=0` |
 | 0035 | llama: a state copy larger than the pinned stage (`LLAMA_STATE_ASYNC_MAX_MIB`, 256) runs the batched copy in rounds of the stage size instead of tensor by tensor through pageable memory; 350 MiB prompt-cache save 52-68 -> 20-37 ms, its load -26..-32 ms, same bytes | `LLAMA_STATE_ASYNC_ROUNDS=0` |
-| 0036 | server: KV admission. With a unified KV cache, a request whose prompt cannot fit next to the running slots (each counted with its prompt plus a 16384-cell generation reserve, `LLAMA_SERVER_KV_ADMIT_RESERVE`) waits until a slot is released, instead of being admitted and failing a generating slot when the cache fills mid-decode; with every slot idle, one waiting request is woken. Two 150K-token requests at 256K: one HTTP 500 before, both complete now (134 -> 87 s) | `LLAMA_SERVER_KV_ADMIT=0` |
-| 0037 | server: prompt cache -- a fresh large state buffer (64 MiB or more) gets n/16 of extra capacity, so the next saves of a growing conversation reuse it instead of mapping and faulting in a new one; 120-130K-token agent-turn saves 0.33-0.37 s -> 0.12-0.13 s | `LLAMA_SERVER_CACHE_SLACK=0` |
+| 0036 | server: prompt cache -- a fresh large state buffer (64 MiB or more) gets n/16 of extra capacity, so the next saves of a growing conversation reuse it instead of mapping and faulting in a new one; 120-130K-token agent-turn saves 0.33-0.37 s -> 0.12-0.13 s | `LLAMA_SERVER_CACHE_SLACK=0` |
+| 0037 | server: KV full stop. With a unified KV cache, a reply that outgrows its admission reserve ends with a length stop when the cache is full, instead of failing the decode of every generating request with HTTP 500 | `LLAMA_SERVER_KV_FULL_STOP=0` |
+| 0038 | cuda: queued (async) row-block reads without one copy per row. The device that allocated the pinned destination copies 2-D; another device gathers the rows on the device, copies each 16 MiB chunk once and scatters it from a stream callback. Since r364 these reads were one copy per row, which under `-sm tensor` made a ~2 GB agent prompt-cache save take 17-20 s; now 0.17-0.38 s | `GGML_CUDA_ROWS_ASYNC_GATHER=0` |
+| 0039 | server: the max-min prompt share divides the pass's budget, not what the earlier slots of the pass left (two prompts got 1365 + 682 of a 2048 window instead of 1024 + 1024); two concurrent fresh 39K + 34K / 59K + 59K prefills -17 % wall | `LLAMA_SERVER_SHARE_PASS_BUDGET=0` |
+| 0040 | cuda: GDN -- a prefill ubatch holding several sequences with snapshot slots (MTP) takes the chunked prefix + sequential tail per sequence, as a single sequence does, instead of the whole sequential kernel; two concurrent fresh prefills -2.5 to -3.5 % wall, single requests unchanged | `GGML_CUDA_GDN_MULTISEQ_TAIL=0` |
 
 ## Settings that matter for this series
 
@@ -194,7 +197,9 @@ results for several engines on R9700 cards with its own runner.
 - `LLAMA_SERVER_CACHE_HUGEPAGE=0`: 4 KiB pages for the prompt-cache save buffers. With transparent huge pages in
   `madvise` defrag mode and the page cache filling RAM (the mmapped host experts), huge pages made 120-130K-token
   saves stall 2-11 s in direct compaction on our 59 GB host; with 4 KiB pages they take 0.33-0.37 s (0.12-0.13 s
-  when 0037 lets them reuse a buffer).
+  when 0036 lets them reuse a buffer).
+- `LLAMA_SERVER_KV_ADMIT_RESERVE=16384`: the reply reserve per request of the release's KV admission (its default is
+  n_ctx / slots = 64K at 256K and 4 slots), so two long prompts still fit side by side.
 - `LLAMA_TP_FFN_EVEN=1`: the release's opt-in even FFN / shared-expert split.
 - `GGML_MOE_KV_LEND=1`, `GGML_MOE_KV_SEG=1`: the KV segment (0018-0020).
 - `GGML_MOE_PREFILL_INPLACE=1`, `GGML_MOE_PF_PREFETCH=1`: in-place prefill for tier tables, and RAM-tier experts staged one layer ahead.
@@ -209,16 +214,14 @@ results for several engines on R9700 cards with its own runner.
 
 With 57.6 GiB of host experts, the expert cache holds 68.2 % in VRAM.
 
-## Validation (r362, 2026-11-25 and 26)
+## Validation (r366, 2026-11-26)
 
-- Rebased from r359 onto r362; two conflicts in 0001, both with r360/r361 changes (the fast top-k sampler path
-  also requires no penalty state; the release's `fattn_stage_bound(backend, type_k, type_v)` kept). New: 0036, 0037.
-- The 7-model comparison with the release passes (nightly gate: 0 problems, 0 warnings, 0 failed loads).
-- Production configuration: output identical to the r359 series on every check: greedy, 512-token prompt set,
-  4.3k and 30k-token prompts, agent turns with checkpoint restores; 0 GPU faults. Speed equal within noise.
-- Concurrency: two ~100K requests run side by side; two ~150K requests, which do not fit in 256K together, now
-  run one after the other and both complete with the same output each time.
-- With 0037: the 7-model gate passes again, and an overnight stress run (46 rounds over two sessions, 11 of them
-  in the 2-GPU production configuration) has 0 output mismatches and 0 GPU faults.
+- Rebased from r362 onto r366; two conflicts (the slab seed floor in 0001 with the release's wide placement, and the
+  KV segment's idle-slot hint beside the release's deferred-task re-offer). Dropped: our KV admission, which the
+  release took in r365. New: 0037-0040.
+- The 7-model comparison with the release passes (gate: 0 problems, 0 warnings).
+- Production configuration: greedy and the 512-token prompt set give the same output as the r362 series; agent turns
+  with prompt-cache saves and restores give the same replies, with 0 GPU faults.
+- The overnight stress run has not been done on r366 yet.
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 23:32:10 +0000
-Subject: [PATCH 04/37] sched: let layer-split pipeline parallelism overlap the
+Subject: [PATCH 04/40] sched: let layer-split pipeline parallelism overlap the
  devices on ROCm
 
 Layer split with pipeline parallelism (several devices, no -ot) ran the GPUs
@@ -205,10 +205,10 @@ index c3b1e2db3a..a9bd735c3c 100644
  
          // with pipeline parallelism, the previous graph_compute_async may still be running
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 832ea8a954..b7ee12955c 100644
+index e10ef7f4dc..d679484813 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -3044,6 +3044,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
+@@ -3063,6 +3063,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
          const uint32_t used = parked.empty() ? cells.used_max_p1() : cells.used_max_p1_below(park_bound());
          const uint32_t pad  = prefill && GGML_PAD(used, n_pad_cur) > n_pad_prefill_from ? n_pad_prefill : n_pad_cur;
  

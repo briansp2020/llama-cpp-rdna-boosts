@@ -4,7 +4,7 @@
 # the settings that matter.  group_add "991" is our host's render gid: use yours (`stat -c %g /dev/kfd`).
 services:
   llama-cpp:
-    image: llama.cpp-rdna-ours-r362     # built from this branch (README: Build)
+    image: llama.cpp-rdna-ours-r366     # built from this branch (README: Build)
     container_name: llama.cpp
     network_mode: "host"
     devices:
@@ -87,6 +87,7 @@ services:
       - LLAMA_SERVER_LAZY_IDLE_SLOTS=0         # lazy idle slots cost decode -5 % and made greedy text load-dependent (finding 554)
       - LLAMA_SERVER_PREFILL_DUTY=32           # user 2026-11-23: up to 31 decode-only steps between prefill steps; decoding slot ~1.6x faster during a concurrent long prompt, its TTFT +20 % (finding 1084)
       - LLAMA_SERVER_CACHE_HUGEPAGE=0          # 4 KiB pages for prompt-cache save buffers: THP madvise direct compaction stalled 120-130K saves 2-11 s on this 59 GB box; 4 KiB = steady 0.33-0.37 s (finding 1146)
+      - LLAMA_SERVER_KV_ADMIT_RESERVE=16384    # 16K reply reserve per request (the release default n_ctx/slots = 64K): two long prompts side by side up to ~229K
       - LLAMA_CKPT_USER_MERGE=256
     volumes:
       - ./models:/models

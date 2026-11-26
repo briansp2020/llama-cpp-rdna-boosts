@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 26 Nov 2026 04:30:37 +0000
-Subject: [PATCH 37/37] server: prompt cache -- a fresh large state buffer gets
+Subject: [PATCH 36/40] server: prompt cache -- a fresh large state buffer gets
  n/16 extra capacity so a growing conversation's next saves reuse it instead
  of mapping and faulting in a new ~2 GiB buffer each turn (2x125K agents: 4
  KiB pages 0.33-0.37 s per save, THP 2-11 s of direct compaction once page
@@ -12,7 +12,7 @@ Subject: [PATCH 37/37] server: prompt cache -- a fresh large state buffer gets
  1 file changed, 29 insertions(+), 4 deletions(-)
 
 diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
-index c6e2738aaf..f6d954c24a 100644
+index bd2eed2a67..3c2fc0c950 100644
 --- a/tools/server/server-slot-sched.cpp
 +++ b/tools/server/server-slot-sched.cpp
 @@ -108,6 +108,19 @@ static bool prompt_cache_hugepage() {

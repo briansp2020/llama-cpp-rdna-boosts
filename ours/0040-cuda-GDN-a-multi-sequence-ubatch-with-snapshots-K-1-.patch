@@ -1,0 +1,578 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 26 Nov 2026 20:25:39 +0000
+Subject: [PATCH 40/40] cuda: GDN -- a multi-sequence ubatch with snapshots (K
+ > 1, MTP) takes the chunked prefix + sequential tail per sequence
+ (GGML_CUDA_GDN_MULTISEQ_TAIL=0: off)
+
+The chunked ops keep the full per-sequence row stride (seq_tokens) of g/beta/attn_out when they process a
+prefix, and the sequential kernel takes the attn rows' per-sequence stride (attn_seq_tokens), so the
+n_seqs == 1 prefix + tail split now also serves n_seqs > 1 with K > 1.  Before, such a ubatch ran the whole
+sequential kernel (~1.45 ms per call on a 2 x 34K concurrent prefill vs ~0.14 ms chunked).  Every existing
+call is unchanged (n_seqs == 1: sequence 0; K == 1 multi-seq: no limit, seq_tokens == n_tokens).
+
+Prod config (Flash-Next UD-IQ4_XS, MTP, -sm tensor, -ub/-b 4096), on / off: two fresh prompts at once
+39K + 34K 22.8 -> 22.0 s, 59K + 59K 37.4 -> 36.1 s, 2 x 34K 20.3 -> 19.8 s; greedy 1237e15cbaf5 and pdecs
+5c5fdcc9338a unchanged.  FINDINGS 1167/1169.
+---
+ ggml/src/ggml-cuda/gated_delta_net.cu         | 46 +++++++++++++------
+ ggml/src/ggml-cuda/gated_delta_net_chunked.cu | 32 +++++++------
+ .../src/ggml-cuda/gated_delta_net_chunked.cuh |  2 +-
+ .../ggml-cuda/gated_delta_net_chunked_bf16.cu | 42 +++++++++--------
+ .../gated_delta_net_chunked_bf16_gfx11.cu     | 42 +++++++++--------
+ 5 files changed, 95 insertions(+), 69 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 8ea066fdaa..21d8b3b815 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -20,6 +20,7 @@ gated_delta_net_cuda(const float * q,
+                                      int64_t       H,
+                                      int64_t       n_tokens,
+                                      int64_t       n_seqs,
++                                     int64_t       attn_seq_tokens,
+                                      int64_t       sq1,
+                                      int64_t       sq2,
+                                      int64_t       sq3,
+@@ -63,7 +64,7 @@ gated_delta_net_cuda(const float * q,
+     const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+     state += state_out_offset;
+-    attn_data += (sequence * n_tokens * H + h_idx) * S_v;
++    attn_data += (sequence * attn_seq_tokens * H + h_idx) * S_v;
+ 
+     float         s_shard[rows_per_lane];
+     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
+@@ -201,7 +202,11 @@ static void launch_gated_delta_net(
+         int64_t sb1,   int64_t sb2, int64_t sb3,
+         int64_t neqk1, int64_t rq3,
+         float scale, int64_t state_slot_stride, int K, int beta_sigmoid,
+-        const int32_t * s_ids, int64_t s_row_stride, cudaStream_t stream) {
++        const int32_t * s_ids, int64_t s_row_stride, cudaStream_t stream,
++        int64_t attn_seq_tokens = -1) {   // the attn rows' per-sequence stride in tokens (-1: n_tokens)
++    if (attn_seq_tokens < 0) {
++        attn_seq_tokens = n_tokens;
++    }
+     //TODO: Add chunked kernel for even faster pre-fill
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+     // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
+@@ -224,26 +229,26 @@ static void launch_gated_delta_net(
+         case 16:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                n_tokens, n_seqs, attn_seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride);
+             break;
+         case 32:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                n_tokens, n_seqs, attn_seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride);
+             break;
+         case 64: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                n_tokens, n_seqs, attn_seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride);
+             break;
+         }
+         case 128: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                n_tokens, n_seqs, attn_seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride);
+             break;
+         }
+@@ -451,8 +456,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     //
+     // The fused GDN->cpy (cache != nullptr) is still honoured: the chunked kernel writes the new
+     // state (slot 0) straight into the cache slot, so the cpy node can be skipped.  n_seqs > 1
+-    // keeps the whole-ubatch chunked path for K == 1 -- the chunked n_tokens override is also the
+-    // sequence stride, so only n_seqs == 1 may choose per-batch.  GGML_CUDA_GDN_CHUNKED=0 forces
++    // keeps the whole-ubatch chunked path for K == 1; with K > 1 it takes the prefix + tail split per
++    // sequence (the chunked ops keep the full per-sequence row stride when they process a prefix;
++    // GGML_CUDA_GDN_MULTISEQ_TAIL=0 gives the sequential kernel instead).  GGML_CUDA_GDN_CHUNKED=0 forces
+     // the sequential kernel everywhere (the A/B switch, and the fully-snapshot-safe fallback).
+     // The chunked ops report a synchronous launch rejection (ROCm: AQL dispatch refused, e.g. a
+     // code object carrying a hidden hostcall buffer on a platform without PCIe atomics ->
+@@ -521,7 +527,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
+                 return ggml_cuda_op_gated_delta_net_chunked(ctx, dst, state_d_ext, n_tokens_limit);
+             };
+ 
+-            if (n_seqs == 1) {
++            // A multi-sequence ubatch with snapshots (K > 1, e.g. MTP) takes the same chunked prefix + sequential
++            // tail as a single sequence, per sequence: the chunked ops take the prefix length while keeping the full
++            // per-sequence row stride, and the tail writes every sequence's slots 0..D-1 (D >= K).  Without it such a
++            // ubatch ran the whole sequential kernel (2 x 34K concurrent prefill: ~1.45 ms per call vs ~0.14 ms).
++            // GGML_CUDA_GDN_MULTISEQ_TAIL=0: off (the sequential kernel, as before).
++            static const bool multiseq_tail_on = [] {
++                const char * env = getenv("GGML_CUDA_GDN_MULTISEQ_TAIL");
++                return env == nullptr || strcmp(env, "0") != 0;
++            }();
++            if (n_seqs == 1 || (keep_rs && multiseq_tail_on)) {
+                 if (n_tokens > GDN_CHUNKED_MIN_TOKENS) {
+                     // The snapshot tail (see the long note above): chunk the PREFIX and run the
+                     // sequential kernel on the last `D = GDN_CHUNKED_MIN_TOKENS` tokens, in the SAME
+@@ -539,11 +554,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
+                     // fused, else the snapshot tail of the output (computed from the FULL n_tokens, which
+                     // the chunked op would otherwise shrink to the limit)
+                     float * const tail_base = cache ? cache->data : dst_d + S_v * H * n_tokens * n_seqs;
++                    // GGML_CUDA_GDN_TAIL=0 (n_head = 0): whole-batch chunked, slot 0 only -- for a multi-seq K > 1 ubatch too
++                    // (it ran the sequential kernel before GGML_CUDA_GDN_MULTISEQ_TAIL; =0 there restores that)
+                     const int64_t n_head = tail_on ? n_tokens - D : 0;
+                     if (launch_chunked(tail_base, n_head)) {
+                         if (n_head > 0) {
+                             // the tail: same kernel, last D tokens.  q/k/g/beta advance by sq2 per token,
+-                            // v by sv2, the attention scores by S_v*H (n_seqs == 1 here).  The input
++                            // v by sv2, the attention scores by S_v*H; a sequence's rows stay n_tokens apart
++                            // (attn_seq_tokens), and sq3/sv3/sb3 step the sequences.  The input
+                             // state is the prefix's final state (slot 0 of `tail_base`); the kernel reads
+                             // the state into registers before writing any slot, so aliasing it with the
+                             // slot output is safe, and slot 0 is written last.
+@@ -558,12 +576,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
+                                 launch_gated_delta_net<false, true>(q_t, k_t, v_t, g_t, b_t, tail_base,
+                                     dst_t, tail_base, S_v, H, D, n_seqs,
+                                     sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+-                                    scale, slot_stride, K, beta_sigmoid, s_ids, s_row_stride, stream);
++                                    scale, slot_stride, K, beta_sigmoid, s_ids, s_row_stride, stream, n_tokens);
+                             } else {
+                                 launch_gated_delta_net<false, false>(q_t, k_t, v_t, g_t, b_t, tail_base,
+                                     dst_t, tail_base, S_v, H, D, n_seqs,
+                                     sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+-                                    scale, slot_stride, K, beta_sigmoid, s_ids, s_row_stride, stream);
++                                    scale, slot_stride, K, beta_sigmoid, s_ids, s_row_stride, stream, n_tokens);
+                             }
+                         }
+                         static bool logged_free = false;
+@@ -584,7 +602,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
+                 // Multi-sequence ubatch: the kernel choice must not depend on how many sequences
+                 // share the ubatch, or a sequence's logits depend on its neighbours.  Use the same
+                 // per-token threshold as the single-sequence branch above; the whole-batch chunked
+-                // path is then only taken for batches a solo decode would also chunk.
++                // path is then only taken for batches a solo decode would also chunk.  (K == 1 only: K > 1
++                // takes the prefix + tail branch above unless GGML_CUDA_GDN_MULTISEQ_TAIL=0.  This K == 1 path
++                // has no tail, so it is still not the split a solo sequence gets.)
+                 if (n_tokens > GDN_CHUNKED_MIN_TOKENS) {
+                     if (launch_chunked(cache ? cache->data : nullptr, 0)) {
+                         return;
+diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
+index 56d7be2a51..ae484081ac 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
+@@ -108,7 +108,7 @@ gdn_chunked_kkt_cuda(
+         const float * __restrict__ beta,
+         float * __restrict__ A_sc,    // [n_chunks][H_v][n_seqs][PACKED_CS] fp32
+         float * __restrict__ KQ_sc,   // [n_chunks][H_k][n_seqs][PACKED_CS] fp32 (upper + diag)
+-        int64_t H_k, int64_t H_v, int64_t hg_ratio, int64_t n_tokens, int64_t n_seqs,
++        int64_t H_k, int64_t H_v, int64_t hg_ratio, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3,
+         float scale)
+ {
+@@ -129,7 +129,7 @@ gdn_chunked_kkt_cuda(
+ 
+     const float * kbase = k + (int64_t) seq * sq3 + (int64_t) c0 * sq2 + hg * sq1;
+     const float * qbase = q + (int64_t) seq * sq3 + (int64_t) c0 * sq2 + hg * sq1;
+-    const float * gbase = g + ((int64_t) seq * n_tokens + c0) * H_v + vh;
++    const float * gbase = g + ((int64_t) seq * seq_tokens + c0) * H_v + vh;
+ 
+     // gram tile ownership: 4x4 tiles, upper triangle only (i0 <= j0)
+     const int i0 = (tid & 15) * 4;
+@@ -168,7 +168,7 @@ gdn_chunked_kkt_cuda(
+     // ---- this block's v-head: A = (I + strict_upper(beta . G . decay))^-1, store -----------
+     // (grid is H_v wide, so there is no per-block v-head loop; the gates are this v-head's)
+     {
+-        const float * bb = beta + ((int64_t) seq * n_tokens + c0) * H_v + vh;
++        const float * bb = beta + ((int64_t) seq * seq_tokens + c0) * H_v + vh;
+ 
+         if (tid < GDN_CHUNKED_CS) {
+             if (tid < nval) {
+@@ -302,7 +302,7 @@ gdn_chunked_scan_cuda(
+         float * __restrict__ state_out,
+         const float * __restrict__ A_sc,    // [n_chunks][H_v][n_seqs][PACKED_CS]
+         const float * __restrict__ KQ_sc,   // [n_chunks][H_k][n_seqs][PACKED_CS]
+-        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
++        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3,
+         int64_t sv1, int64_t sv2, int64_t sv3,
+         const uint3 neqk1_magic, const uint3 rq3_magic,
+@@ -343,14 +343,14 @@ gdn_chunked_scan_cuda(
+         const float * kbase = k + iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
+         const float * qbase = q + iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
+         const float * vbase = v + (int64_t) seq * sv3 + (int64_t) c0 * sv2 + h * sv1;
+-        const float * gbase = g + ((int64_t) seq * n_tokens + c0) * H + h;
+-        const float * bbase = beta + ((int64_t) seq * n_tokens + c0) * H + h;
++        const float * gbase = g + ((int64_t) seq * seq_tokens + c0) * H + h;
++        const float * bbase = beta + ((int64_t) seq * seq_tokens + c0) * H + h;
+ 
+         const int64_t A_off = ((int64_t) c * H + h) * n_seqs * PACKED_CS
+                             + (int64_t) seq * PACKED_CS;
+         const int64_t KQ_off = ((int64_t) c * H_k + hq) * n_seqs * PACKED_CS
+                              + (int64_t) seq * PACKED_CS;
+-        float * obase = attn_out + ((int64_t) seq * n_tokens + c0) * H * S_v + h * S_v;
++        float * obase = attn_out + ((int64_t) seq * seq_tokens + c0) * H * S_v + h * S_v;
+ 
+         // ---- phase 1: gate, beta, chunk-local inclusive cumsum ------------------------------
+         if (tid < GDN_CHUNKED_CS) {
+@@ -601,7 +601,7 @@ static bool launch_gdn_chunked(
+         const float * g_d, const float * b_d, const float * s_d,
+         float * dst_d, float * state_d,
+         float * A_sc, float * KQ_sc,
+-        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
++        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3,
+         int64_t sv1, int64_t sv2, int64_t sv3,
+         int64_t neqk1, int64_t rq3,
+@@ -616,7 +616,7 @@ static bool launch_gdn_chunked(
+         const dim3 block(GDN_CHUNKED_NTHREADS);
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+         if (!ggml_cuda_kernel_launch_try(gdn_chunked_kkt_cuda<S_v>, launch_params,
+-                k_d, q_d, g_d, b_d, A_sc, KQ_sc, H_k, H, hg_ratio, n_tokens, n_seqs,
++                k_d, q_d, g_d, b_d, A_sc, KQ_sc, H_k, H, hg_ratio, n_tokens, n_seqs, seq_tokens,
+                 sq1, sq2, sq3, scale)) {
+             return false;
+         }
+@@ -630,7 +630,7 @@ static bool launch_gdn_chunked(
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+         return ggml_cuda_kernel_launch_try(gdn_chunked_scan_cuda<S_v>, launch_params,
+             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc, KQ_sc,
+-            H, H_k, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++            H, H_k, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+             neqk1_magic, rq3_magic, scale, state_seq_stride);
+     }
+ }
+@@ -655,6 +655,8 @@ bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_
+     const int64_t H        = nev1;
+     const int64_t n_tokens = (n_tokens_limit > 0 && n_tokens_limit < nev2) ? n_tokens_limit : nev2;
+     const int64_t n_seqs   = nev3;
++    // per-sequence row stride of g/beta/attn_out: n_tokens may be a truncated prefix (n_tokens_limit), the rows are not
++    const int64_t seq_tokens = nev2;
+ 
+     GGML_ASSERT(neq1 == nek1);
+     const int64_t neqk1 = neq1;
+@@ -670,7 +672,7 @@ bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_
+     float * dst_d     = (float *) dst->data;
+     // state_d_ext: fused-cache slot base when the GDN->cpy is fused (K == 1: single slot);
+     // nullptr keeps the default tail-of-output layout.
+-    float * state_d   = state_d_ext ? state_d_ext : dst_d + S_v * H * n_tokens * n_seqs;
++    float * state_d   = state_d_ext ? state_d_ext : dst_d + S_v * H * seq_tokens * n_seqs;
+ 
+     const int64_t sq1 = nbq1 / sizeof(float);
+     const int64_t sq2 = nbq2 / sizeof(float);
+@@ -691,13 +693,13 @@ bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_
+ 
+     switch (S_v) {
+         case 16:  return launch_gdn_chunked<16 >(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
+-                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
++                    H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
+         case 32:  return launch_gdn_chunked<32 >(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
+-                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
++                    H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
+         case 64:  return launch_gdn_chunked<64 >(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
+-                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
++                    H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
+         case 128: return launch_gdn_chunked<128>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
+-                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
++                    H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
+         default:
+             GGML_ABORT("fatal error");
+             return false;
+diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
+index ec0bea3149..3837d07dba 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
+@@ -40,7 +40,7 @@ static __inline__ bool ggml_cuda_kernel_launch_try(Kernel kernel, const ggml_cud
+ // GDN_DBG_* env hook) and false when a launch was rejected; the dispatcher then falls back
+ // to the sequential gated_delta_net kernel.
+ // n_tokens_limit > 0: process only the first n_tokens_limit tokens (MTP prefix).
+-// Safe only when n_seqs == 1 — n_tokens is also the sequence stride.
++// The per-sequence row stride stays the full n_tokens, so this also holds for n_seqs > 1.
+ bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
+ 
+ // bf16/WMMA tensor-core variant (S_v == 128 only). DEFAULT for S_v == 128 prefill on
+diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
+index 0a49ef4a87..2aade4d906 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
+@@ -221,7 +221,7 @@ gdn_bf16_kkt_cuda(
+         const float * __restrict__ g,       // [1, H, T, N] fp32
+         const float * __restrict__ beta,    // [1, H, T, N] fp32
+         unsigned short * __restrict__ A_sc, // [n_chunks][H][n_seqs][64][64] bf16
+-        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
++        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3, int dbg)
+ {
+     __shared__ gdn_bf16_kkt_smem s;
+@@ -265,7 +265,7 @@ gdn_bf16_kkt_cuda(
+ 
+         // ---- per-head gate and beta for this chunk (flat cumsum on the padding) -------------
+         if (tid < GDN_BF16_BT) {
+-            const int64_t o = ((int64_t) nq * n_tokens + c0 + (int64_t) min(tid, rows - 1)) * H + hv;
++            const int64_t o = ((int64_t) nq * seq_tokens + c0 + (int64_t) min(tid, rows - 1)) * H + hv;
+             if (tid < rows) {
+                 s.gb[tid] = g[o];
+                 s.bt[tid] = beta[o];
+@@ -432,7 +432,7 @@ gdn_bf16_scan_cuda(
+         float * __restrict__ attn_out,      // [S_v, H, T, N] fp32
+         float * __restrict__ state_out,     // [S_v, S_v, H, N] fp32
+         const unsigned short * __restrict__ A_sc,   // [n_chunks][H][n_seqs][64][64] bf16
+-        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
++        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3,
+         int64_t sv1, int64_t sv2, int64_t sv3,
+         const uint3 neqk1_magic, const uint3 rq3_magic,
+@@ -544,9 +544,9 @@ gdn_bf16_scan_cuda(
+         const size_t ars = (size_t) H * GDN_BF16_BT;
+         const float * qg = q + (int64_t) iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
+         const size_t qrs = (size_t) sq2;   // token stride of q (permuted-safe)
+-        const float * gbase = g + ((int64_t) nq * n_tokens + c0) * H + h;
+-        const float * bbase = beta + ((int64_t) nq * n_tokens + c0) * H + h;
+-        float * obase = attn_out + ((int64_t) nq * n_tokens + c0) * H * GDN_BF16_VD + (int64_t) h * GDN_BF16_VD;
++        const float * gbase = g + ((int64_t) nq * seq_tokens + c0) * H + h;
++        const float * bbase = beta + ((int64_t) nq * seq_tokens + c0) * H + h;
++        float * obase = attn_out + ((int64_t) nq * seq_tokens + c0) * H * GDN_BF16_VD + (int64_t) h * GDN_BF16_VD;
+ 
+         // ---- gates: chunk-local inclusive cumsum, then ge/gv/rs/bt (flat on padding) --------
+         if (tid < GDN_BF16_BT) {
+@@ -861,13 +861,13 @@ template <int HG_RATIO>
+ __global__ static void gdn_bf16_kkt_cuda(
+         const float * __restrict__ k, const float * __restrict__ g, const float * __restrict__ beta,
+         unsigned short * __restrict__ A_sc, int64_t H, int64_t H_k, int64_t n_tokens,
+-        int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3, int dbg) {}
++        int64_t n_seqs, int64_t seq_tokens, int64_t sq1, int64_t sq2, int64_t sq3, int dbg) {}
+ __global__ static void gdn_bf16_scan_cuda(
+         const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
+         const float * __restrict__ g, const float * __restrict__ beta, const float * __restrict__ state_in,
+         float * __restrict__ attn_out, float * __restrict__ state_out,
+         const unsigned short * __restrict__ A_sc, int64_t H, int64_t H_k, int64_t n_tokens,
+-        int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
++        int64_t n_seqs, int64_t seq_tokens, int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
+         uint3 neqk1_magic, uint3 rq3_magic, float scale, int64_t state_seq_stride, int dbg) {}
+ 
+ #endif // defined(RDNA4)
+@@ -878,21 +878,21 @@ __global__ static void gdn_bf16_scan_cuda(
+ template <int HG_RATIO>
+ static bool launch_gdn_bf16_kkt(
+         const float * k_d, const float * g_d, const float * b_d, unsigned short * A_sc,
+-        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
++        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3, cudaStream_t stream, int dbg) {
+     const int n_chunks = (int) ((n_tokens + GDN_BF16_BT - 1) / GDN_BF16_BT);
+     const dim3 grid((unsigned) n_chunks, (unsigned) H_k, (unsigned) n_seqs);
+     const dim3 block(GDN_BF16_KKT_NTHR);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+     return ggml_cuda_kernel_launch_try(gdn_bf16_kkt_cuda<HG_RATIO>, launch_params,
+-        k_d, g_d, b_d, A_sc, H, H_k, n_tokens, n_seqs, sq1, sq2, sq3, dbg);
++        k_d, g_d, b_d, A_sc, H, H_k, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, dbg);
+ }
+ 
+ static bool launch_gdn_bf16_scan(
+         const float * q_d, const float * k_d, const float * v_d,
+         const float * g_d, const float * b_d, const float * s_d,
+         float * dst_d, float * state_d, const unsigned short * A_sc,
+-        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
++        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3,
+         int64_t sv1, int64_t sv2, int64_t sv3,
+         int64_t neqk1, int64_t rq3,
+@@ -904,7 +904,7 @@ static bool launch_gdn_bf16_scan(
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+     return ggml_cuda_kernel_launch_try(gdn_bf16_scan_cuda, launch_params,
+         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc,
+-        H, H_k, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++        H, H_k, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+         neqk1_magic, rq3_magic, scale, state_seq_stride, dbg);
+ }
+ 
+@@ -927,6 +927,8 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx,
+     const int64_t H        = nev1;
+     const int64_t n_tokens = (n_tokens_limit > 0 && n_tokens_limit < nev2) ? n_tokens_limit : nev2;
+     const int64_t n_seqs   = nev3;
++    // per-sequence row stride of g/beta/attn_out: n_tokens may be a truncated prefix (n_tokens_limit), the rows are not
++    const int64_t seq_tokens = nev2;
+ 
+     GGML_ASSERT(neq1 == nek1);
+     const int64_t neqk1 = neq1;
+@@ -941,7 +943,7 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx,
+ 
+     float * dst_d     = (float *) dst->data;
+     // state_d_ext: fused-cache slot base when the GDN->cpy is fused (K == 1: single slot)
+-    float * state_d   = state_d_ext ? state_d_ext : dst_d + S_v * H * n_tokens * n_seqs;   // K == 1: single slot
++    float * state_d   = state_d_ext ? state_d_ext : dst_d + S_v * H * seq_tokens * n_seqs;   // K == 1: single slot
+ 
+     const int64_t sq1 = nbq1 / sizeof(float);
+     const int64_t sq2 = nbq2 / sizeof(float);
+@@ -965,12 +967,12 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx,
+     const int64_t hg_ratio = H / neqk1;
+     static const int dbg = getenv("GDN_DBG_P") != nullptr ? 1 : (getenv("GDN_DBG_ONES") != nullptr ? 2 : 0);
+     switch (hg_ratio) {
+-        case 1:  if (!launch_gdn_bf16_kkt<1>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+-        case 2:  if (!launch_gdn_bf16_kkt<2>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+-        case 3:  if (!launch_gdn_bf16_kkt<3>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+-        case 4:  if (!launch_gdn_bf16_kkt<4>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+-        case 6:  if (!launch_gdn_bf16_kkt<6>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+-        case 8:  if (!launch_gdn_bf16_kkt<8>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 1:  if (!launch_gdn_bf16_kkt<1>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 2:  if (!launch_gdn_bf16_kkt<2>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 3:  if (!launch_gdn_bf16_kkt<3>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 4:  if (!launch_gdn_bf16_kkt<4>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 6:  if (!launch_gdn_bf16_kkt<6>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 8:  if (!launch_gdn_bf16_kkt<8>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
+         default: GGML_ABORT("gated_delta_net_chunked_bf16: unsupported GQA ratio");
+     }
+     static const bool dbg_a = getenv("GDN_DBG_A") != nullptr;
+@@ -995,7 +997,7 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx,
+             }
+     }
+     return launch_gdn_bf16_scan(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(),
+-        H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3,
++        H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3,
+         scale, state_seq_stride, stream, dbg);
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
+index 192411a319..01dd4e06f6 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
+@@ -250,7 +250,7 @@ gdn_bf16_kkt_cuda(
+         const float * __restrict__ g,       // [1, H, T, N] fp32
+         const float * __restrict__ beta,    // [1, H, T, N] fp32
+         unsigned short * __restrict__ A_sc, // [n_chunks][H][n_seqs][64][64] bf16
+-        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
++        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3, int dbg)
+ {
+     __shared__ gdn_bf16_kkt_smem s;
+@@ -294,7 +294,7 @@ gdn_bf16_kkt_cuda(
+ 
+         // ---- per-head gate and beta for this chunk (flat cumsum on the padding) -------------
+         if (tid < GDN_BF16_BT) {
+-            const int64_t o = ((int64_t) nq * n_tokens + c0 + (int64_t) min(tid, rows - 1)) * H + hv;
++            const int64_t o = ((int64_t) nq * seq_tokens + c0 + (int64_t) min(tid, rows - 1)) * H + hv;
+             if (tid < rows) {
+                 s.gb[tid] = g[o];
+                 s.bt[tid] = beta[o];
+@@ -471,7 +471,7 @@ gdn_bf16_scan_cuda(
+         float * __restrict__ attn_out,      // [S_v, H, T, N] fp32
+         float * __restrict__ state_out,     // [S_v, S_v, H, N] fp32
+         const unsigned short * __restrict__ A_sc,   // [n_chunks][H][n_seqs][64][64] bf16
+-        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
++        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3,
+         int64_t sv1, int64_t sv2, int64_t sv3,
+         const uint3 neqk1_magic, const uint3 rq3_magic,
+@@ -575,9 +575,9 @@ gdn_bf16_scan_cuda(
+         const size_t ars = (size_t) H * GDN_BF16_BT;
+         const float * qg = q + (int64_t) iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
+         const size_t qrs = (size_t) sq2;   // token stride of q (permuted-safe)
+-        const float * gbase = g + ((int64_t) nq * n_tokens + c0) * H + h;
+-        const float * bbase = beta + ((int64_t) nq * n_tokens + c0) * H + h;
+-        float * obase = attn_out + ((int64_t) nq * n_tokens + c0) * H * GDN_BF16_VD + (int64_t) h * GDN_BF16_VD;
++        const float * gbase = g + ((int64_t) nq * seq_tokens + c0) * H + h;
++        const float * bbase = beta + ((int64_t) nq * seq_tokens + c0) * H + h;
++        float * obase = attn_out + ((int64_t) nq * seq_tokens + c0) * H * GDN_BF16_VD + (int64_t) h * GDN_BF16_VD;
+ 
+         // ---- gates: chunk-local inclusive cumsum, then ge/gv/rs/bt (flat on padding) --------
+         if (tid < GDN_BF16_BT) {
+@@ -882,13 +882,13 @@ template <int HG_RATIO>
+ __global__ static void gdn_bf16_kkt_cuda(
+         const float * __restrict__ k, const float * __restrict__ g, const float * __restrict__ beta,
+         unsigned short * __restrict__ A_sc, int64_t H, int64_t H_k, int64_t n_tokens,
+-        int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3, int dbg) {}
++        int64_t n_seqs, int64_t seq_tokens, int64_t sq1, int64_t sq2, int64_t sq3, int dbg) {}
+ __global__ static void gdn_bf16_scan_cuda(
+         const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
+         const float * __restrict__ g, const float * __restrict__ beta, const float * __restrict__ state_in,
+         float * __restrict__ attn_out, float * __restrict__ state_out,
+         const unsigned short * __restrict__ A_sc, int64_t H, int64_t H_k, int64_t n_tokens,
+-        int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
++        int64_t n_seqs, int64_t seq_tokens, int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
+         const uint3 neqk1_magic, const uint3 rq3_magic, float scale, int64_t state_seq_stride, int dbg) {}
+ 
+ #endif // defined(RDNA3)
+@@ -897,21 +897,21 @@ __global__ static void gdn_bf16_scan_cuda(
+ template <int HG_RATIO>
+ static bool launch_gdn_bf16_kkt(
+         const float * k_d, const float * g_d, const float * b_d, unsigned short * A_sc,
+-        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
++        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3, cudaStream_t stream, int dbg) {
+     const int n_chunks = (int) ((n_tokens + GDN_BF16_BT - 1) / GDN_BF16_BT);
+     const dim3 grid((unsigned) n_chunks, (unsigned) H_k, (unsigned) n_seqs);
+     const dim3 block(GDN_BF16_KKT_NTHR);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+     return ggml_cuda_kernel_launch_try(gdn_bf16_kkt_cuda<HG_RATIO>, launch_params,
+-        k_d, g_d, b_d, A_sc, H, H_k, n_tokens, n_seqs, sq1, sq2, sq3, dbg);
++        k_d, g_d, b_d, A_sc, H, H_k, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, dbg);
+ }
+ 
+ static bool launch_gdn_bf16_scan(
+         const float * q_d, const float * k_d, const float * v_d,
+         const float * g_d, const float * b_d, const float * s_d,
+         float * dst_d, float * state_d, const unsigned short * A_sc,
+-        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
++        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t seq_tokens,
+         int64_t sq1, int64_t sq2, int64_t sq3,
+         int64_t sv1, int64_t sv2, int64_t sv3,
+         int64_t neqk1, int64_t rq3,
+@@ -923,7 +923,7 @@ static bool launch_gdn_bf16_scan(
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+     return ggml_cuda_kernel_launch_try(gdn_bf16_scan_cuda, launch_params,
+         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc,
+-        H, H_k, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++        H, H_k, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+         neqk1_magic, rq3_magic, scale, state_seq_stride, dbg);
+ }
+ 
+@@ -946,6 +946,8 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
+     const int64_t H        = nev1;
+     const int64_t n_tokens = (n_tokens_limit > 0 && n_tokens_limit < nev2) ? n_tokens_limit : nev2;
+     const int64_t n_seqs   = nev3;
++    // per-sequence row stride of g/beta/attn_out: n_tokens may be a truncated prefix (n_tokens_limit), the rows are not
++    const int64_t seq_tokens = nev2;
+ 
+     GGML_ASSERT(neq1 == nek1);
+     const int64_t neqk1 = neq1;
+@@ -960,7 +962,7 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
+ 
+     float * dst_d     = (float *) dst->data;
+     // state_d_ext: fused-cache slot base when the GDN->cpy is fused (K == 1: single slot)
+-    float * state_d   = state_d_ext ? state_d_ext : dst_d + S_v * H * n_tokens * n_seqs;   // K == 1: single slot
++    float * state_d   = state_d_ext ? state_d_ext : dst_d + S_v * H * seq_tokens * n_seqs;   // K == 1: single slot
+ 
+     const int64_t sq1 = nbq1 / sizeof(float);
+     const int64_t sq2 = nbq2 / sizeof(float);
+@@ -984,12 +986,12 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
+     const int64_t hg_ratio = H / neqk1;
+     static const int dbg = getenv("GDN_DBG_P") != nullptr ? 1 : (getenv("GDN_DBG_ONES") != nullptr ? 2 : 0);
+     switch (hg_ratio) {
+-        case 1:  if (!launch_gdn_bf16_kkt<1>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+-        case 2:  if (!launch_gdn_bf16_kkt<2>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+-        case 3:  if (!launch_gdn_bf16_kkt<3>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+-        case 4:  if (!launch_gdn_bf16_kkt<4>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+-        case 6:  if (!launch_gdn_bf16_kkt<6>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+-        case 8:  if (!launch_gdn_bf16_kkt<8>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 1:  if (!launch_gdn_bf16_kkt<1>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 2:  if (!launch_gdn_bf16_kkt<2>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 3:  if (!launch_gdn_bf16_kkt<3>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 4:  if (!launch_gdn_bf16_kkt<4>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 6:  if (!launch_gdn_bf16_kkt<6>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 8:  if (!launch_gdn_bf16_kkt<8>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, stream, dbg)) return false; break;
+         default: GGML_ABORT("gated_delta_net_chunked_bf16_gfx11: unsupported GQA ratio");
+     }
+     static const bool dbg_a = getenv("GDN_DBG_A") != nullptr;
+@@ -1014,7 +1016,7 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
+             }
+     }
+     return launch_gdn_bf16_scan(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(),
+-        H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3,
++        H, neqk1, n_tokens, n_seqs, seq_tokens, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3,
+         scale, state_seq_stride, stream, dbg);
+ }
+ 
+-- 
+2.53.0
+

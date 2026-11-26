@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 14 Nov 2026 17:15:00 +0000
-Subject: [PATCH 23/37] moe cache: a sparse table staged fill at sizing takes
+Subject: [PATCH 23/40] moe cache: a sparse table staged fill at sizing takes
  the heat map hottest experts (GGML_MOE_STAGE_HEAT_RANK=0: off)
 
 With a persisted heat map, the eager per-expert heat seed of a sparse (mmap) table registered each expert and

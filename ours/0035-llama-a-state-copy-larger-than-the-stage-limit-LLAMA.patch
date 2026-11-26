@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 25 Nov 2026 06:03:48 +0000
-Subject: [PATCH 35/37] llama: a state copy larger than the stage limit
+Subject: [PATCH 35/40] llama: a state copy larger than the stage limit
  (LLAMA_STATE_ASYNC_MAX_MIB, 256) runs the batched pinned copy in rounds of
  the limit instead of tensor by tensor through pageable memory: 350 MiB
  prompt-cache save 52-68 -> 20-37 ms, its load -26..-32 ms, same bytes
