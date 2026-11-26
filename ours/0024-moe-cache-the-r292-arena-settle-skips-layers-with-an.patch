@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 16 Nov 2026 01:42:16 +0000
-Subject: [PATCH 24/35] moe cache: the r292 arena settle skips layers with an
+Subject: [PATCH 24/36] moe cache: the r292 arena settle skips layers with an
  mmap-tier table (GGML_MOE_SETTLE_SPARSE=1 = Stew behaviour)
 
 Re-sizing such a layer frees its tables, and free_table_buffers_locked then calls
@@ -24,7 +24,7 @@ tier_drop_all_locked("re-size"), which latches the RAM tier off for the process
  1 file changed, 7 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index d67ae8e646..d4dbfca62d 100644
+index 1d760f3476..2b187d953f 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -740,6 +740,9 @@ int64_t                             g_arena_releases = 0;
@@ -37,7 +37,7 @@ index d67ae8e646..d4dbfca62d 100644
  int64_t                             g_steady_raised   = 0;   // layers whose slot count grew at a drop
  int64_t                             g_steady_skipped  = 0;   // drops where the capacity did not grow (no-op)
  // wip/arena-steady-sizing: the settle is DEMAND-GATED.  Filling the band the next prefill reclaims is only
-@@ -1838,6 +1841,7 @@ void parse_env() {
+@@ -1848,6 +1851,7 @@ void parse_env() {
      // returns, rather than only restoring the count the sizing pass froze while the wide prefill view was
      // live.  Kill-switch only (the default-on policy): `=0` restores the frozen behaviour for an A/B.
      g_steady_rearm   = env_int("MOE_EXPERT_CACHE_STEADY_REARM", 1) != 0;
@@ -45,7 +45,7 @@ index d67ae8e646..d4dbfca62d 100644
      {
          // the prior-mass gain (percentage points) that makes taking the prefill band worth its eviction
          const char * e = getenv("MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP");
-@@ -8626,6 +8630,9 @@ static int settle_slots_locked(int layer, const std::vector<int> & ids, int base
+@@ -8636,6 +8640,9 @@ static int settle_slots_locked(int layer, const std::vector<int> & ids, int base
          if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES || !ggml_cuda_slab_enabled()) {
              return base;
          }

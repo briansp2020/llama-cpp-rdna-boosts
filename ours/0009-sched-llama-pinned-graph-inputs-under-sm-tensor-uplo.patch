@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 19:06:53 +0000
-Subject: [PATCH 09/35] sched/llama: pinned graph inputs under -sm tensor,
+Subject: [PATCH 09/36] sched/llama: pinned graph inputs under -sm tensor,
  uploaded asynchronously per device; keep host compute buffers across the drop
 
 - llama-context: a tensor-split (meta) device has no single host buffer type when its GPUs report per-device
@@ -217,7 +217,7 @@ index a4632f6ef5..5c373c13c9 100644
          // the rings keeps them from synchronizing on the host at every wrap in a long prefill.
          sched->copy_event_next[i] = 0;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index cc737cfc77..6516fbe62c 100644
+index a9bd735c3c..ca081735f6 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1076,6 +1076,15 @@ llama_context::llama_context(

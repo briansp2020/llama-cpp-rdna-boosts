@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 9 Nov 2026 06:08:29 +0000
-Subject: [PATCH 06/35] cuda: graph eviction on the active clock again
+Subject: [PATCH 06/36] cuda: graph eviction on the active clock again
  (FINDINGS 519), on top of r236; keep upstream never-evicting the looked-up
  key
 
@@ -44,7 +44,7 @@ index b8edb860e4..b6f926aef2 100644
      // Check if any CUDA graph is enabled for this context (used by kernels that need to know
      // if graphs are in use without having access to the specific graph key)
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e4dc8bd853..93f1a81160 100644
+index 9373cb2a25..c175e489a2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1581,16 +1581,19 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :

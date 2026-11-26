@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 03:54:06 +0000
-Subject: [PATCH 02/35] moe cache: stage 0: our mmap code in
+Subject: [PATCH 02/36] moe cache: stage 0: our mmap code in
  moe-expert-tier*.inc, not yet hooked in
 
 (cherry picked from commit 53eab4bce495c8fabb6fd1ac58f82a8023d4a43a)
@@ -29,7 +29,7 @@ Folded in: moe tier: namespace-scope env flags initialized by named functions, n
  create mode 100644 ggml/src/ggml-cuda/moe-expert-tier.inc
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 1713a03fba..a8f6eb38c7 100644
+index 407f9855f7..4543dc157e 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -103,7 +103,8 @@ struct bounce_t {
@@ -42,7 +42,7 @@ index 1713a03fba..a8f6eb38c7 100644
      int         layer       = -1;
      std::string role;
      int         n_experts   = 0;
-@@ -13110,7 +13111,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -13135,7 +13136,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
  
  bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate,
                                const ggml_tensor * ids, int device, void * stream,
@@ -52,7 +52,7 @@ index 1713a03fba..a8f6eb38c7 100644
      if (!g_enabled || ids == nullptr || src0 == nullptr) {
          return false;
      }
-@@ -13157,6 +13159,13 @@ bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0,
+@@ -13182,6 +13184,13 @@ bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0,
          *gate_cpy = *gate;
          gate_cpy->data   = gate_arena;
          gate_cpy->buffer = nullptr;
@@ -66,7 +66,7 @@ index 1713a03fba..a8f6eb38c7 100644
      }
      return true;
  }
-@@ -13901,3 +13910,5 @@ void moe_cache_selftest() {
+@@ -13970,3 +13979,5 @@ void moe_cache_selftest() {
          (void) cudaSetDevice(prev);
      }
  }

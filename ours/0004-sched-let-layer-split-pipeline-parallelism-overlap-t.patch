@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 23:32:10 +0000
-Subject: [PATCH 04/35] sched: let layer-split pipeline parallelism overlap the
+Subject: [PATCH 04/36] sched: let layer-split pipeline parallelism overlap the
  devices on ROCm
 
 Layer split with pipeline parallelism (several devices, no -ot) ran the GPUs
@@ -186,7 +186,7 @@ index 473c237587..0cce3d6200 100644
      ggml_backend_sched_split_graph(sched, graph);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index b9ed394490..cc737cfc77 100644
+index c3b1e2db3a..a9bd735c3c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3379,7 +3379,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll

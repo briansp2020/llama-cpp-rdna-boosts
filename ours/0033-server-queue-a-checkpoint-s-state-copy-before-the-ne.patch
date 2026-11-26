@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 24 Nov 2026 17:18:46 +0000
-Subject: [PATCH 33/35] server: queue a checkpoint's state copy before the next
+Subject: [PATCH 33/36] server: queue a checkpoint's state copy before the next
  batch, finish it after (LLAMA_CKPT_ASYNC=0: off)
 
 A context checkpoint is taken right before the next batch is queued, and its target state copy (112.6 MiB of
@@ -72,7 +72,7 @@ index 727840f63c..73c356ad71 100644
      void update_dft(
              llama_context * ctx,
 diff --git a/include/llama.h b/include/llama.h
-index 44f2e76f0f..9dd76f7d33 100644
+index 4bd042058e..93240eb162 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -1091,6 +1091,23 @@ extern "C" {
@@ -100,7 +100,7 @@ index 44f2e76f0f..9dd76f7d33 100644
      // Decoding
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index f476237310..a15b546a6f 100644
+index 92355bf478..86248a9c6a 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1274,6 +1274,7 @@ llama_context::llama_context(
@@ -181,7 +181,7 @@ index f476237310..a15b546a6f 100644
      if (buf_state_stage == nullptr || ggml_backend_buffer_get_size(buf_state_stage.get()) < size) {
          buf_state_stage.reset();
          // the pinned type of the output device (the first simple device of a meta device), as for the outputs
-@@ -7525,6 +7552,22 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+@@ -7533,6 +7560,22 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
      return ctx->state_seq_set_data(seq_id, src, size, flags);
  }
  

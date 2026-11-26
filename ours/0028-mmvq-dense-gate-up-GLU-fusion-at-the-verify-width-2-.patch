@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 21:53:43 +0000
-Subject: [PATCH 28/35] mmvq: dense gate/up + GLU fusion at the verify width
+Subject: [PATCH 28/36] mmvq: dense gate/up + GLU fusion at the verify width
  (2-8 tokens, RDNA4), publishing the down projection Q8_1 from the ksplit
  launch (GGML_CUDA_DENSE_GLU_VERIFY=0: off)
 

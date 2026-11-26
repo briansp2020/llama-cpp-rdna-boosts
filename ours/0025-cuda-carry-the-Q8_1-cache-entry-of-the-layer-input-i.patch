@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 18 Nov 2026 07:33:10 +0000
-Subject: [PATCH 25/35] cuda: carry the Q8_1 cache entry of the layer input
+Subject: [PATCH 25/36] cuda: carry the Q8_1 cache entry of the layer input
  into the routed-MoE split
 
 Decode/verify layers run as three graph computes per device; the scheduler
@@ -88,7 +88,7 @@ index b6f926aef2..b3495d99de 100644
      // source read range (the tensor's own ne/nb extent) must lie within the root tensor's
      // buffer allocation.  A compute buffer that is reallocated while a cache entry still
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 75e6e0833d..23ace93e21 100644
+index 28de106677..23d86afc6c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -9098,11 +9098,15 @@ static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {

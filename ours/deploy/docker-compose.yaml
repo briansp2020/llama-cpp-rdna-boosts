@@ -1,0 +1,96 @@
+# The compose file we run in production for the `ours` series (2x Radeon AI PRO R9700, -sm tensor,
+# Qwen3.8-Flash-Next UD-IQ4_XS, 256K context), with local paths replaced by ./models and our warm-up script removed.
+# "FINDINGS n" / "HANDOVER n" in the comments are our own lab-note numbers (not published); ours/README.md explains
+# the settings that matter.  group_add "991" is our host's render gid: use yours (`stat -c %g /dev/kfd`).
+services:
+  llama-cpp:
+    image: llama.cpp-rdna-ours-r362     # built from this branch (README: Build)
+    container_name: llama.cpp
+    network_mode: "host"
+    devices:
+      - "/dev/kfd:/dev/kfd"
+      - "/dev/dri:/dev/dri"
+    ipc: host                # host /dev/shm (shm_size is ignored with ipc: host, so it is not set)
+    group_add:
+      - video
+      - "991"                # host "render" gid of /dev/kfd and /dev/dri/renderD* (the image has no render group)
+    cap_add:
+      - SYS_PTRACE           # kept with seccomp=unconfined: debugging inside the container; host-memory pinning not re-verified without it
+    security_opt:
+      - seccomp=unconfined
+    # $$ escapes compose interpolation (the container shell expands these).
+    #   -ub/-b 4096: prefill (FINDINGS 776/783).  --reasoning-effort low: hermes sends none (template default = high).
+    #   --n-predict 32768: hermes sends no max_tokens; caps a looping generation (FINDINGS 952-953).
+    #   sampling temp 0.7 / top-k 20 / top-p 0.95 / min-p 0: Qwen defaults (hermes sends none).
+    #   MTP draft head mtp-head-expQ4K, n-max 3, KV q8_0 (FINDINGS 955).  -cram 10240: prompt-cache RAM for two agents swapping through RAM (FINDINGS 1132; 2048 before).
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        llama-server -m $${MODEL_PATH} -c $${CONTEXT_LENGTH} -ngl 99
+        -sm tensor --n-cpu-moe 48 --host-experts mmap
+        --host 0.0.0.0 --port $${PORT} -ctk q8_0 -ctv q8_0
+        -cram 10240 -ub 4096 -b 4096 --reasoning-effort low --n-predict 32768
+        --temp 0.7 --top-k 20 --top-p 0.95 --min-p 0
+        --spec-type draft-mtp -md /models/mtp-head-expQ4K.gguf
+        -ngld 99 --spec-draft-n-max 3 --spec-draft-p-min 0 -ctkd q8_0 -ctvd q8_0
+    environment:
+      # model: unsloth Qwen3.8-Flash-Next UD-IQ4_XS (UD 3.1), experts of 48 layers in host RAM (FINDINGS 953-955).  IQ3_S revert: .r277a
+      - MODEL_PATH=/models/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf
+      - CONTEXT_LENGTH=262144
+      - PORT=8080
+      # devices: clear any image-level HSA override (the gfx1036 iGPU rejects gfx12 and aborts ROCr init); expose the two R9700s only
+      - HSA_OVERRIDE_GFX_VERSION=
+      - ROCR_VISIBLE_DEVICES=0,1
+      - HIP_VISIBLE_DEVICES=0,1
+      # memory: slab headroom + work band (FINDINGS 829/833, 776, 967-970: do not lower the headroom), pool cache cap, compute margin
+      - GGML_CUDA_SLAB_HEADROOM_MIB=3072
+      - GGML_CUDA_SLAB_WORK_MIN_MIB=2304
+      - GGML_CUDA_SLAB_RING_PREFILL=0          # no above-ring prefill placement (it evicts the arena, FINDINGS 771/776)
+      - GGML_CUDA_POOL_CACHE_MB=128            # legacy pool keeps <= 128 MiB of freed buffers (long prompts OOM without it)
+      - GGML_COMPUTE_BUFFER_MARGIN_PCT=3       # default 10
+      - GGML_CUDA_FA_STAGE_PREALLOC=0          # lower VRAM peak at the 259.6k needle (HANDOVER 347)
+      - MTP_DRAFT_N_UBATCH=256                 # the draft context does not inherit -ub 4096
+      # MoE expert cache (host experts via mmap): admission, RAM-tier spares, KV lending + segment, prefill prefetch
+      - MOE_EXPERT_CACHE_TOUCH=3               # default 2 (FINDINGS 696)
+      - GGML_MOE_TIER_SPARES=8                 # (FINDINGS 696)
+      - MOE_EXPERT_CACHE_SIZE_AT_PRIME=0       # default 1
+      - MOE_HOST_POOL_TRANSPORT=map            # pin the host-read transport (FINDINGS 912)
+      - LLAMA_TP_FFN_EVEN=1                    # even FFN / shared-expert tensor split (320 / 320): opt-in since Stew r338 (our PR #342), FINDINGS 1042
+      - GGML_MOE_KV_LEND=1                     # lend idle KV rows past the context in use (FINDINGS 924)
+      - GGML_MOE_KV_SEG=1                      # ... as an expert-cache tier below the arena (FINDINGS 932-936, 943)
+      - GGML_MOE_PREFILL_INPLACE=1
+      - GGML_MOE_PF_PREFETCH=1                 # prefill: RAM-tier experts staged one layer ahead (HANDOVER 418/419)
+      # 2-GPU tensor split: all-reduce, sequence parallelism, hc_post chain
+      - GGML_CUDA_ALLREDUCE=ce                 # copy-engine BF16 all-reduce for large tensors (prefill, HANDOVER 506)
+      - GGML_CUDA_AR_P2P_LARGE=1
+      - GGML_CUDA_AR_SPIN_TIMEOUT_MS=20000     # default 2000: KFD queue stops can exceed 2 s (partial sums = wrong output, HANDOVER 303-311)
+      - LLAMA_SEQPAR=1                         # hc work sequence-parallel in prefill (FINDINGS 894-898)
+      - LLAMA_SEQPAR_GATHER_BF16=1             # bf16 wire for its all-gathers (FINDINGS 907)
+      - LLAMA_FUSED_DSV4_HC_POST=0             # the hc_post chain, not the op (prefill +6.4 %, HANDOVER 486)
+      # scheduler / graph inputs
+      - GGML_SCHED_UPFRONT_INPUTS=1
+      - GGML_SCHED_SYNC_GRAPH_INPUTS=1         # pins the current default
+      - GGML_CUDA_ASYNC_INPUT=1                # pins the current default (async graph-input ring, HANDOVER 274)
+      - GGML_CUDA_ASYNC_INPUT_BATCH=1          # pins the current default (one copy kernel per graph, HANDOVER 425)
+      - GGML_HIP_GRAPH_UPDATE_CAP=4
+      - GGML_OP_OFFLOAD_MIN_BATCH=9            # 9-31-token MoE batches on the GPU (HANDOVER 335)
+      # attention / KV
+      - LLAMA_KQ_MASK_DERIVED=0                # packed KQ mask (+1.7 % prefill at depth)
+      - LLAMA_KV_N_PAD_MIN=1024
+      - LLAMA_KV_N_PAD_PREFILL=8192
+      # MTP / server
+      - LLAMA_MTP_DRAFT_OP_OFFLOAD=0
+      - LLAMA_MTP_SPARSE=0
+      - LLAMA_MTP_INGEST_TAIL=4096
+      - LLAMA_SPEC_BATCH_BUDGET=6              # draft cap with several generating slots (FINDINGS 758)
+      - LLAMA_SERVER_LAZY_IDLE_SLOTS=0         # lazy idle slots cost decode -5 % and made greedy text load-dependent (finding 554)
+      - LLAMA_SERVER_PREFILL_DUTY=32           # user 2026-11-23: up to 31 decode-only steps between prefill steps; decoding slot ~1.6x faster during a concurrent long prompt, its TTFT +20 % (finding 1084)
+      - LLAMA_CKPT_USER_MERGE=256
+    volumes:
+      - ./models:/models
+    restart: unless-stopped
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1

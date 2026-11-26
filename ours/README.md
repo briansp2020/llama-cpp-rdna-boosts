@@ -1,19 +1,136 @@
-# ours: our production stack on top of the current rdna-boosts release (r359)
+# ours: our production stack on top of the current rdna-boosts release (r362)
 
 This branch holds the patch series we run on top of the latest rdna-boosts release: 2x Radeon AI PRO R9700,
 ROCm 10.2, Qwen3.8-Flash-Next UD-IQ4_XS with `-sm tensor` and `--host-experts mmap`. It is regenerated for each
 release, and patches the release has taken are dropped. It is not a PR. Everything else on this branch is the
 release as published; only `ours/` is added.
 
-**Base:** `v18-919794500-r359` (upstream llama.cpp `919794500` + this repo's release).
+**Base:** `v18-919794500-r362` (upstream llama.cpp `919794500` + this repo's release).
 
 ```
 git checkout 919794500
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r359 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 35 patches (0001-0035)
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r362 release, branch rdna-boosts
+git am <path-to-this-repo>/ours/*.patch              # 36 patches (0001-0036)
 ```
 
-Result: tree `4a159b343d4e`. This is the production build since 2026-11-25 8:56 AM PST.
+Result: tree `0a70f4f6dabf`. This is our production build from 2026-11-26.
+
+Also in `ours/`: `bench/llbench.py` (the benchmark below), `deploy/docker-compose.yaml` (our production
+compose file, local paths replaced by `./models`) and `tools/mkhead.py` (one step of the draft-head recipe).
+
+## Performance (r362 + 36, 2026-11-25)
+
+Everything below is one 2x R9700 box running the production configuration (see *Reproducing it*): 256K
+context, 4 slots, MTP speculative decoding (draft n-max 3), greedy requests.
+
+**Coding-agent depth curve.** This is our replica of the local-llm-benchmarks.dev protocol
+"deterministic-prime-extend-completions-v1" (`bench/llbench.py`). At each depth D, the first D tokens of a
+source-code corpus are put in the slot's cache (untimed). The request then sends those D tokens plus a fresh
+2048-token section and generates 256 tokens at temperature 0 with `ignore_eos`. PP is the 2048 uncached tokens
+over the time to the first token; TG is generated tokens over decode time. Each row is the mean of 2 measured
+runs after 1 warm-up, one slot, one request at a time.
+
+| depth | PP (t/s) | TTFT (s) | TG (t/s) |
+|---|---|---|---|
+| 0 | 2312 | 0.89 | 129 |
+| 8K | 2675 | 0.77 | 127 |
+| 16K | 2641 | 0.78 | 140 |
+| 24K | 2618 | 0.78 | 154 |
+| 32K | 2504 | 0.82 | 151 |
+| 40K | 2463 | 0.84 | 145 |
+| 48K | 2426 | 0.85 | 141 |
+| 56K | 2386 | 0.86 | 151 |
+| 64K | 2423 | 0.85 | 153 |
+| 128K | 2263 | 0.91 | 132 |
+| 192K | 2111 | 0.97 | 130 |
+| 240K | 2005 | 1.02 | 126 |
+
+TG is MTP-assisted, so it moves with draft acceptance (48-100 % of drafted tokens accepted per run on this corpus) more than
+with depth: single runs at the same depth range from 106 to 158 t/s. The site's own runner is not public; ours
+differs in three ways: it uses llama-server's native `/completion` with token-id prompts (not
+`/v1/completions`), it sets `ignore_eos`, and the corpus is this repository's source files.
+
+**Other measurements on the same server:**
+
+| | |
+|---|---|
+| one 150K-token prompt, cold | 3,580 t/s prefill (42 s), then 124 t/s decode |
+| one 4.3K-token prompt | 3,035 t/s prefill, 155 t/s decode |
+| greedy 512-token answer, short prompt | 132-153 t/s |
+| agent turn (append a tool result to a long conversation, short answer) | 773 ms median, 429 ms of it prompt |
+| two short requests at once | 100 + 109 t/s (one alone: 121 t/s) |
+
+## Reproducing it
+
+**Hardware.** 2x AMD Radeon AI PRO R9700 (32 GB each, gfx1201), each on PCIe 5.0 x8; AMD Ryzen 9 9900X;
+64 GB DDR5-6000 (2x 32 GB); Ubuntu, Linux 7.0. Most of the routed experts live in host RAM and are read through
+`--host-experts mmap`, so the model files should sit on a fast NVMe drive and RAM matters: with 64 GB, the
+page cache holds part of the 57.6 GiB of host experts.
+
+**Software.** ROCm 10.2.0. We build and run in `rocm/dev-ubuntu-24.04:10.2.0-full` containers:
+
+```
+cmake -S . -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201 -DCMAKE_BUILD_TYPE=Release -DGGML_HIP_GRAPHS=ON \
+  -DGGML_NATIVE=ON -DGGML_HIP_RCCL=1 -DGGML_CUDA_NCCL=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_MMQ_MFMA=ON -DLLAMA_OPENSSL=ON
+cmake --build build -j
+cmake --install build --prefix <stage>/usr/local
+```
+
+The production image is `FROM rocm/dev-ubuntu-24.04:10.2.0-full`, plus `curl` and `python3`, with
+`<stage>/usr/local` copied to `/usr/local`, `ldconfig`, and `LD_LIBRARY_PATH=/opt/rocm/lib`.
+
+**Model.** Unsloth `unsloth/Qwen3.8-Flash-Next-GGUF`, folder `UD-IQ4_XS` (4 shards, UD 3.1), unmodified:
+
+| file | sha256 |
+|---|---|
+| Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf | `93ff23a08e5cd7501f24fa16f5b415d5807d0175e04edd3ed6a7a41b601a4eef` |
+| Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00004.gguf | `13d5dc8b93d039e4cfade5a9af7037f10c97f7ec4e53f75bd2e9ae34aae54aeb` |
+| Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00004.gguf | `f6b9b5934908a2043732269dd740155d0f921d0763a1dcdd3452246311651f87` |
+| Qwen3.8-Flash-Next-UD-IQ4_XS-00004-of-00004.gguf | `5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36` |
+
+**MTP draft head.** The simplest choice is Unsloth's `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same
+repository (sha256 `5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6`), used as is. The
+numbers above use our variant of it, `mtp-head-expQ4K.gguf` (sha256
+`3a8cfd264da3969c2e872e5b1cacd95a80b7cdfa66cd551c43a9d8fda7851893`). In our tests it gives identical output and
+4-5 % faster decode, because the draft head's experts take less VRAM and leave more room for the expert cache.
+It was made in two steps from the Unsloth head:
+1. `tools/mkhead.py` adds a draft-only LM head (`blk.48.nextn.shared_head_head.weight`, the target's
+   `output.weight` requantized to Q4_0). Only draft passes use it; verification keeps the target's own head.
+2. `llama-quantize --allow-requantize --tensor-type ffn_gate_exps=q4_k --tensor-type ffn_up_exps=q4_k
+   --tensor-type ffn_down_exps=q4_k --tensor-type shared_head_head=q4_0 <step-1 file> mtp-head-expQ4K.gguf Q8_0`
+   (`ffn_down_exps` falls back to Q5_0: its 640-wide rows are not a multiple of 256).
+
+We made this file some weeks ago and have not re-run the recipe since, so check the sha256. If yours differs, the
+Unsloth head is the safe choice; with it, expect decode about 4-5 % lower than in the tables.
+
+**Launch.** `deploy/docker-compose.yaml` is our production service with every setting and environment variable.
+The command line is:
+
+```
+llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf -c 262144 -ngl 99 \
+  -sm tensor --n-cpu-moe 48 --host-experts mmap -ctk q8_0 -ctv q8_0 \
+  -cram 10240 -ub 4096 -b 4096 --reasoning-effort low --n-predict 32768 \
+  --temp 0.7 --top-k 20 --top-p 0.95 --min-p 0 \
+  --spec-type draft-mtp -md mtp-head-expQ4K.gguf -ngld 99 --spec-draft-n-max 3 --spec-draft-p-min 0 \
+  -ctkd q8_0 -ctvd q8_0
+```
+
+The environment variables in the compose file are part of the configuration: several of them turn on features
+that are off by default (KV lending, the even FFN split, the copy-engine all-reduce, prefill prefetch). Without
+them, the numbers above do not apply. The first requests after a start are slower while the expert cache sizes
+itself and fills; run a few requests before measuring.
+
+**Benchmark.** With the server up:
+
+```
+python3 ours/bench/llbench.py --url http://127.0.0.1:8080 --src <llama.cpp>/ggml/src --src <llama.cpp>/src \
+  --src <llama.cpp>/tools --src <llama.cpp>/common --src <llama.cpp>/examples --src <llama.cpp>/tests \
+  --depths 0,8192,16384,24576,32768,40960,49152,57344,65536,131072,196608,245760 --out res.json
+```
+
+It needs llama-server's `/tokenize` and `/completion` endpoints, so it runs against llama.cpp-based servers. To
+compare another engine, the depth/PP/TG definitions above are the protocol; local-llm-benchmarks.dev publishes
+results for several engines on R9700 cards with its own runner.
 
 ## How the series is organised
 
@@ -22,7 +139,7 @@ Result: tree `4a159b343d4e`. This is the production build since 2026-11-25 8:56 
   Our code lives in two included files, `moe-expert-tier.inc` and `moe-expert-tier-state.inc`, and runs only for
   sparse (mmap) tables. Pool and pinned tables run the release's own code. The tier code covers the RAM tier, the
   pin budget, KV lending, the fill fence, batched admissions and the device remap for sparse tables.
-- **0004-0035** are one feature each, in the order they were added.
+- **0004-0036** are one feature each, in the order they were added.
 - A fix to one of our patches goes into that patch, not into a new one. A later patch that touches an earlier
   one's code adds a feature of its own, with its own switch.
 - Every behaviour change has an environment switch. The table gives the value that turns it off (or the opt-in).
@@ -67,17 +184,12 @@ Result: tree `4a159b343d4e`. This is the production build since 2026-11-25 8:56 
 | 0033 | server: a checkpoint's state copy is queued before the next batch and finished after it, so the host-side copy overlaps GPU work; byte-identical (verify mode compares every deferred copy with a synchronous one), agent turns -11..-12 ms | `LLAMA_CKPT_ASYNC=0` |
 | 0034 | meta (tensor split): cheaper split-state misses -- lean source states, states derived between the allocation and compute lookups, and a walk pruned per buffer; agent-turn prompt time -10 %, outputs identical | `GGML_META_SS_LEAN=0`, `GGML_META_SS_DERIVE=0`, `GGML_META_SS_PRUNE_XBUF=0` |
 | 0035 | llama: a state copy larger than the pinned stage (`LLAMA_STATE_ASYNC_MAX_MIB`, 256) runs the batched copy in rounds of the stage size instead of tensor by tensor through pageable memory; 350 MiB prompt-cache save 52-68 -> 20-37 ms, its load -26..-32 ms, same bytes | `LLAMA_STATE_ASYNC_ROUNDS=0` |
+| 0036 | server: KV admission. With a unified KV cache, a request whose prompt cannot fit next to the running slots (each counted with its prompt plus a 16384-cell generation reserve, `LLAMA_SERVER_KV_ADMIT_RESERVE`) waits until a slot is released, instead of being admitted and failing a generating slot when the cache fills mid-decode; with every slot idle, one waiting request is woken. Two 150K-token requests at 256K: one HTTP 500 before, both complete now (134 -> 87 s) | `LLAMA_SERVER_KV_ADMIT=0` |
 
-## Production configuration
+## Settings that matter for this series
 
-```
-llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf -c 262144 -ngl 99 \
-  -sm tensor --n-cpu-moe 48 --host-experts mmap -ctk q8_0 -ctv q8_0 \
-  -cram 2048 -ub 4096 -b 4096 --reasoning-effort low --n-predict 32768
-```
-
-Settings on top of the defaults that matter for this series:
-
+- `-cram 10240`: 10 GiB of RAM for the prompt cache, so two long-context agents can take turns on the
+  GPU and swap their contexts through RAM instead of re-reading their prompts.
 - `LLAMA_TP_FFN_EVEN=1`: the release's opt-in even FFN / shared-expert split.
 - `GGML_MOE_KV_LEND=1`, `GGML_MOE_KV_SEG=1`: the KV segment (0018-0020).
 - `GGML_MOE_PREFILL_INPLACE=1`, `GGML_MOE_PF_PREFETCH=1`: in-place prefill for tier tables, and RAM-tier experts staged one layer ahead.
@@ -92,15 +204,16 @@ Settings on top of the defaults that matter for this series:
 
 With 57.6 GiB of host experts, the expert cache holds 68.2 % in VRAM.
 
-## Validation (r359, 2026-11-25)
+## Validation (r362, 2026-11-25)
 
-- Rebased from r351 onto r359. r352 withdrew the two-arm server (block 17), so 0001, 0015, 0033 and 0034 lost the
-  lines that only served it (its locks, its KV allocation handshake, the per-slot split-state cache, the end of KV
-  lending when a co-owner formed); everything else is unchanged.
+- Rebased from r359 onto r362; two conflicts in 0001, both with r360/r361 changes (the fast top-k sampler path
+  also requires no penalty state; the release's `fattn_stage_bound(backend, type_k, type_v)` kept). New: 0036.
 - The 7-model comparison with the release passes (nightly gate: 0 problems, 0 warnings, 0 failed loads).
-- Production configuration: output identical to the r351 series on every check: greedy, 512-token prompt set,
-  4.3k and 30k-token prompts, agent turns with checkpoint restores (r357's tool-text change leaves them
-  unchanged), and the 259.6k-token needle (6,358); KV lending, 0 GPU faults. Speed equal within run-to-run noise.
-- The same series on r351 passed an overnight stress run (2 GPUs, 46 rounds: 0 output mismatches, 0 GPU faults).
+- Production configuration: output identical to the r359 series on every check: greedy, 512-token prompt set,
+  4.3k and 30k-token prompts, agent turns with checkpoint restores; 0 GPU faults. Speed equal within noise.
+- Concurrency: two ~100K requests run side by side; two ~150K requests, which do not fit in 256K together, now
+  run one after the other and both complete with the same output each time.
+- The series on r351 passed an overnight stress run (2 GPUs, 46 rounds: 0 output mismatches, 0 GPU faults);
+  r362 has not had one yet.
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.
