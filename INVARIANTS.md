@@ -3430,8 +3430,18 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
    * Qwen3.8-27B-UD-Q5_K_XL, `-c 131072`, the prompt into slot 0 (row list == the whole extent): rows on pp 833.6 /
      tg 14.74 vs rows off pp 847.1 / **tg 23.41** (+59 %).  Then a 5246-token prompt into slot 1 while slot 0 stays
      resident (row list 18x shorter, the shape the rows form exists for): 1219.3 / 25.96 vs 1223.2 / **27.23** (+5 %).
-   * Flash-Next GSQ-RCO-IQ3_XXS (host experts, `-ncmoe 47 --host-experts pool`): 1998.9 / 14.80 vs 1994.9 /
-     **18.20** (+23 %), and 1654.4 / 31.98 vs 1664.2 / **34.34** (+7 %) on the compacted shape.
+   * Flash-Next GSQ-RCO-IQ3_XXS (host experts, `-ncmoe 47 --host-experts pool`), **2000 generated tokens** (the
+     length a host-expert decode must be measured at, see the note below): 1992.7 / 28.40 vs 1998.0 / **39.24**
+     (+38 %), and 1689.0 / 44.65 vs 1687.1 / **48.15** (+8 %) on the compacted shape.  A 32-token tail reads
+     14.80 / 18.20 on the same two arms: the first few dozen decode steps after a 94k prefill are still settling the
+     expert arena's resident set, so a short greedy arm understates this model's tg by ~2x and understates the LOSS
+     by 15 points.  Text: L1 identical across forms (`5e9cb91147dd`), S2 differs (`dc97a530611c` dense vs
+     `6379caff5414` rows) once the tail is long enough for a near-tie to reach a family switch -- a text comparison
+     ACROSS the two forms is not a purity claim (item 3).
+   * The same length check on the DENSE model (27B, no expert arena to settle): 23.41 / 27.25 dense and
+     14.76 / 25.99 rows at 2000 tokens against 23.41 / 27.24 and 14.73 / 25.95 at 32 -- unchanged, and text identical
+     on both shapes (`fa78a9826423`, `383dd3732894`).  Short arms are legitimate there; on a host-expert MoE they
+     are not (`WORKLOG.md` 261125.003).
    * Inside the MMA family alone (`GGML_HIP_FA_BAND_WMMA=0`, dense model): rows 14.74 vs dense 21.78 — the row list
      itself costs ~32 % at equal work (`use_indices` in the native q8_0 loader is a per-row gather where the dense
      arm reads tile rows contiguously).
@@ -3449,3 +3459,96 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
    now asks for it explicitly.  Measured (gfx1201, 3 GPUs `-sm layer`, Flash-Next GSQ-IQ3_XXS, bf16 KV,
    `-c 32768 -np 2`, 5246-token prefill + 48 greedy tokens): 7 arms, `default` + `rows-off` identical, every graph
    `splits = 4`, no CPU placement, no GPU fault.
+
+
+* **A `--fit` reserve that is charged for a code path the context cannot reach is not conservative, it is a LAYER
+  COUNT (r360, blocks 09+10, GitHub issue #367).**  The FA prefill staging arena is a raw device allocation outside
+  the compute-graph reserve, so `llama_context::memory_breakdown()`'s no_alloc (`--fit`) path charges a per-device
+  compute reserve for it.  Until r360 that reserve was a FLAT `2 * GGML_CUDA_FA_STAGE_MAX_MB` (1024 MiB at the
+  512 MiB default) for **every** device except RDNA3_5, gated only on `-fa` + a non-F16 K cache -- i.e. it was
+  charged on the delivery's own default `-ctk q8_0 -ctv q8_0`, where the kernels read the cache **natively**
+  (`ggml_cuda_fattn_tile_type` returns q8_0, so the launcher's `need_f16_K/V` are false) and the arena never grows
+  at all.  Four facts worth keeping:
+  (1) **The symptom is invisible on a roomy card and is the whole story on a tight one.**  `--fit` spends the
+  reserve on nothing, so it offloads fewer layers: at an ~11 GiB `--fit-target`-derived budget a 27B UD-IQ3_S
+  projects 1539 MiB of compute and `-ngl 55` against 515 MiB and `-ngl 62` without it (a same-tree upstream build
+  at the same base: 541 MiB / `-ngl 59`), and on the reporter's 12 GiB gfx1031 that layer difference is 4.0 t/s
+  against upstream's 15.5.  **A fit-accounting change is a placement change, so it needs a placement arm, not a
+  text arm** (the text is identical either way -- the accounting moves no byte).
+  (2) **The reserve must ask the LAUNCHER's predicate, not the arch.**  r360's bound calls
+  `ggml_cuda_fattn_kv_pair_native_host`, which is `ggml_cuda_fattn_tile_type` on a probe tensor -- literally the
+  `need_f16_K` test of `ggml_cuda_flash_attn_ext_get_f16_extra_data` -- so a policy switch
+  (`GGML_CUDA_FA_KV_NATIVE=0`) turns the conversion and the reserve on together and the pair cannot drift the way
+  the scratch sizing did before TODO 71.  A future KV type, a new staging arm or a change to
+  `ggml_cuda_fattn_tile_type` owes an arm in `scripts/gate-fit-staging.sh`.
+  (3) **The answer is the same on RDNA2.**  gfx1036 (a real RDNA2 device on this box) reads a q8_0 pair natively too:
+  its fit projects 495 MiB for both the f16 and the q8_0 arm and 1519 MiB for the `GGML_CUDA_FA_KV_NATIVE=0` arm.
+  So the "RDNA3_5 is the only arch that reads natively" special case was a leftover from when the native q8_0 arm
+  was RDNA3_5-only, and it under-charged nobody else while over-charging everyone.  The predicate really is per
+  device, and bf16 KV is the arm that shows it: `-ctk bf16 -ctv bf16` projects 515 MiB on gfx1201 (bf16 MMA, so the
+  tile type is BF16 and nothing is converted) and 1519 MiB on gfx1036 (no bf16 MMA, so the pair stages and the
+  reserve is the same 1024 MiB it was).  A roomy card is unaffected either way: at the default `--fit-target` the
+  same 27B reads `-ngl -1` on both r359 and r360.
+  (4) **What still costs a reserve, and how much risk the change carries.**  A pair that really stages (a mixed
+  K/V pair, bf16 where bf16 MMA is absent, `GGML_CUDA_FA_KV_NATIVE=0`, `GGML_CUDA_FA_STAGE_MAX_MB=0`) still
+  reserves the same way.  The accounting is an ESTIMATE of an allocation the compute buffer does not contain (a
+  live run's compute buffer reads 118.89 MiB at `-c 16384`/`-ub 512` on the 27B), so a native pair now fits up to
+  ~1 GiB tighter than before -- covered by the default `--fit-target` margin of 1024 MiB per device, and a too-thin
+  user target is what the reserve used to hide.  Gates: `scripts/gate-fit-staging.sh` (with the r359 build as its
+  negative control), `gate-prefill-logits.sh` 0.000000 / 100.000 %, byte-identical greedy text on 1 GPU, 3-GPU
+  `-sm tensor` and a 16K-context q8_0 prefill.  Record: `WORKLOG.md` 261125.004, `MANIFESTS.md` gate 44.
+
+* **(r361, block 12, GitHub issue #366) A PENALTY NO LONGER STANDS THE EXACT TOP-K FAST PATH DOWN — and the reason it
+  can be reproduced is that a penalty is a per-token transform over a BOUNDED, OBSERVABLE set.**  Three facts worth
+  keeping:
+  (1) **The set is the logit-bias set plus the penalties sampler's last-n window, and both are readable from the
+  chain.**  `llama_sampler_penalties_get_params()` / `..._get_window()` (read-only, added for this) expose the
+  sampler's parameters and its `(token, count)` entries, so the fast path reads the chain's own state instead of
+  keeping a second copy of the map — a second copy is a state machine that drifts (the `penalty_last_n` the
+  sampler clamps, the ring buffer's eviction, `llama_sampler_reset`).  The window is re-read once per sample, so an
+  `accept` between two samples is seen.
+  (2) **The ORDER is bias → penalty, and the adjusted value is computed on the BIASED logit.**  `common_sampler_init`
+  adds the logit-bias sampler before the user's sampler list, and `llama_sampler_penalties_apply` is the piecewise
+  `x <= 0 ? x * r : x / r` followed by `x -= count * freq + (count > 0) * present`.  Reproducing the transform on
+  the raw logit, or the penalty before the bias, moves the ranking by a hair — it does not crash.
+  (3) **The fast path hands the chain RAW logits, never the adjusted ones.**  The chain then re-applies the bias and
+  the penalty to the `k` survivors, so their values stay bit-identical and only the candidate array is smaller; a
+  fast path that hands over pre-adjusted logits would round every kept token twice.  Its own oracle is therefore
+  `GGML_LF_FAST_TOPK=0` (the pre-r361 arm for any penalised profile) and its census is
+  `GGML_LF_FAST_TOPK_CENSUS=1` — text identity alone is not evidence, because two arms can both have fallen back.
+  A window past 256 distinct tokens (a very large `--repeat-last-n`) falls back per sample and moves no token; a
+  penalty that runs AFTER top-k is deliberately not reproduced, and two penalties samplers in one chain stand the
+  fast path down.
+  Measured: +4.3 % MTP decode here (3× R9700 `-sm tensor`, 78.26 vs 75.00 t/s), the reporter's 5.7 % on a
+  gfx1201+gfx1100 pair, and byte-identical text against the full-vocabulary arm on 7 profiles including a 700-token
+  run that crossed the cap.  Gates: `scripts/gate-fast-topk-penalties.sh` (`MANIFESTS.md` gate 45); knobs
+  `DIAGNOSTIC.md` §27; rule `GREEDY-PURITY.md` §110; record `archive/work/fast-topk-penalties/`.
+
+* **(r362, block 10, GitHub issue #368) A POOL-BACKED HOST-EXPERT TIER GATHERS EVERY ROUTED TABLE AT EVERY WIDTH,
+  SO THE SLAB'S WHOLE-TABLE STAGING RING HOLDS NOTHING FOR IT — do not reserve its hole out of the expert arena.**
+  The delivery carries two independent statements that only contradict each other on a host-expert shape:
+  (1) `sched_input_gatherable`'s **mode 1** (`GGML_SCHED_DEVGATHER` unset, the default) says a POOL-backed routed
+  table is gathered at *every* prefill width, because that tier has no device-readable host master and whole-table
+  staging of it is the slow path by design (`wip/host-pool-speed` §18.2); (2) `h2d_stage_region_bytes()` sizes a
+  fixed, non-evictable H2D staging hole from the largest host-weight table and the ubatch — 6656 MiB at `-ub 8192`,
+  and it scales with the ubatch (`1800/n + ub/(1.7 n²)` MiB).  The hole sits *above* the narrow floor, so the wide
+  (prefill) compute view can only be placed behind it: the slab's work boundary moves from 3264 to 11776 MiB, the
+  arena hands `moe_cache_evict_slab_range` everything in that range, and **8500 MiB / 51 whole tables stand down at
+  every prefill** plus their 54-table re-arm at the drop — residency the prefill then re-reads from the host on
+  every ubatch.  Measured (1× R9700, Flash-Next GSQ-RCO-IQ3_XXS, `-ncmoe 47 --host-experts pool -c 131072 -ub 8192`,
+  an 89199-token prompt): 1895 t/s prefill / 34.18 t/s decode with the hole, 1958 / 34.94 without (+3.4 % / +2.2 %),
+  and the conversation's cache-hit revisit 728 -> 902 t/s because it no longer re-evicts 6778 MiB / 41 tables.
+  The hole is still reserved for a non-pool tier and for an explicit `GGML_SCHED_DEVGATHER=0`, where staging really
+  is the transport.  **A hole nothing reads is not free** — it is arena, and on a partial-arena tier it is exactly
+  the residency the prefill streams back from the host.  Knobs `DIAGNOSTIC.md` §28; record
+  `benchmarks/2026-11-25-issue-368-pool-tier-ring-hole.md`.
+* **(r362, measurement, GitHub issue #368) On this box the expert cache's RESIDENCY IS NOT A TEXT INPUT on a
+  pool-backed host-expert shape, and it is not the prefill's lever either.**  Nine fresh server starts at the
+  reporter's flags (`-c 131072 -np 2 --kv-unified -b 8192 -ub 8192`, 89199-token prompt) read ONE text
+  (`98c4f67d6ed9`) and ONE state: arena 20397 MiB of 40012.5 (51 % residency, `L1..L48 261/512`, no identity
+  table), pool `h=1.0000`, gather 1794 calls, and the same text with the arena at 0 / 512 / 12000 / 20397 / 26000
+  MiB, with the gather off (ring staging), with staging off (serial), with `GGML_CUDA_MMB=0`, with the slab off,
+  with the PLE resident, and with a pinned master.  So the reporter's two texts are **not** explained by which
+  experts the arena holds (§89's corrected doctrine reaches this shape), and the next things to compare on their
+  box are the BLAS state, the PLE's lazy reads and the *set* of tables standing down — which is why
+  `MOE_EXPERT_CACHE_TABLES=1` exists.  The one lever this box did show is the ring hole above.

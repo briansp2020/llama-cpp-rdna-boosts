@@ -1,5 +1,24 @@
 # The delivery patches — what each block is and what it does
 
+> **r360: `--fit` stops reserving the FA staging arena for a K/V pair the kernels never stage (GitHub issue #367), an
+> amendment to blocks 09 and 10.**  The arena is a raw device allocation outside the compute-graph reserve, so
+> `llama_context::memory_breakdown()`'s no_alloc (`--fit`) path charges a compute reserve for it, and the backend's
+> bound was a FLAT `2 * GGML_CUDA_FA_STAGE_MAX_MB` (1024 MiB at the 512 MiB default) for every device except
+> RDNA3_5 — gated only on `-fa` plus a non-F16 K cache.  That included the delivery's own default
+> `-ctk q8_0 -ctv q8_0`, where `ggml_cuda_fattn_tile_type` resolves the q8_0 pair natively, the launcher's
+> `need_f16_K/V` are false and the arena never grows: the reserve bought nothing and `--fit` paid for it in LAYERS
+> (at an ~11 GiB budget a 27B UD-IQ3_S read 1539 MiB of compute and `-ngl 55` against 515 MiB and `-ngl 62`, a
+> same-tree upstream build read 541 MiB / 59 — on the reporter's 12 GiB gfx1031 that is 4.0 t/s against 15.5).
+> The bound now takes the context's K/V types and answers with the launcher's own predicate
+> (`ggml_cuda_fattn_kv_pair_native_host` = `ggml_cuda_fattn_tile_type` on a probe tensor, both in block 10's
+> `fattn-rdna.cuh`), so a policy switch (`GGML_CUDA_FA_KV_NATIVE=0`) turns the conversion and the reserve on
+> together and they cannot drift; a pair that really stages (mixed, bf16 without bf16 MMA, the staged arm, an
+> unbounded cap) reserves exactly as before.  Blocks: the CUDA side is block 10 (`fattn-rdna.cuh`,
+> `ggml-cuda-moe-cache-hooks.{cu,cuh}`), the `--fit` accounting is block 09 (`src/llama-context.cpp`).  Gates:
+> `scripts/gate-fit-staging.sh` (new, `MANIFESTS.md` gate 44; the r359 build FAILS its A1/A2/B1 arms),
+> `gate-prefill-logits.sh` 0.000000 / 100.000 %, byte-identical greedy text on 1 GPU, 3-GPU `-sm tensor` and a
+> 16K-context q8_0 prefill, `validate-set.sh` green, the optional `0100`/`0101` re-cut onto the new tree.
+
 > **r356: a new official block 17 — TQ1_0 / TQ2_0 (ternary) weights on the GPU (contributor PR #358, `@overdoingism`).**
 > A ternary model (`BitNet` b1.58 and its conversions) had no CUDA/HIP path at all: `supports_op` refused the two
 > types, the weights stayed in host memory and the CPU backend ran every matmul, so `-ngl 99` decoded a TQ model at
@@ -72,6 +91,23 @@
 > **624.97 → 475.37 MiB**, text identical ON/OFF on both shapes), `scripts/gate-fusion-alias-copy.sh` PASS,
 > `scripts/gate-prefill-logits.sh` **0.000000 / 100.000 %**, coherence byte-identical, 18/18 rungs build.
 > Record: `WORKLOG.md` 261121.010, `INVARIANTS.md` r331, `TODO` #358 (the reconciliation check this exposed).
+>
+> **r362: the slab's whole-table H2D staging hole is NOT reserved on a POOL-backed host-expert tier -- it holds
+> nothing there, and its extent came out of the expert arena (GitHub issue #368), an amendment to block 10.**
+> `sched_input_gatherable`'s mode 1 (the default `GGML_SCHED_DEVGATHER`) gathers a pool-backed routed table at every
+> prefill width, so the 6656 MiB hole a `-ub 8192` reserve carves (`h2d_stage_region_bytes`, above the narrow floor)
+> is never read by anything: the wide prefill view can only be placed behind it, the work boundary moves 3264 ->
+> 11776 MiB, and **8500 MiB / 51 whole tables stand down at every prefill** plus a 54-table re-arm at the drop.
+> `slab_ring_region_bytes()` (ggml-cuda.cu) now returns 0 when the loader's tier is the pool
+> (`moe_cache_host_pool_requested()`, a new read-only query in block 09's cache) -- unless `GGML_CUDA_SLAB_RING_MIB`
+> names a size or `GGML_SCHED_DEVGATHER=0` asks for staging, both of which keep the hole.  Measured (1x R9700,
+> Flash-Next GSQ-RCO-IQ3_XXS, `-ncmoe 47 --host-experts pool -c 131072 -ub 8192`, 89199-token prompt): 1895 t/s
+> prefill / 34.18 t/s decode -> **1958 / 34.94**, the conversation's cache-hit revisit **728 -> 902 t/s**, no
+> stand-down and no re-arm in the run, text byte-identical (`98c4f67d6ed9`).  Gates: `gate-prefill-logits.sh`
+> **0.000000 / 100.000 %**, `gate-host-expert-text.sh --quick` 2/2 identical, `check-shlib-symbols.sh` 16/16,
+> no GPU faults.  Same block: `MOE_EXPERT_CACHE_TABLES=1` prints the per-layer residency map and this run's
+> per-layer stand-down / re-arm tally.  Record: `WORKLOG.md` 261125.008,
+> `benchmarks/2026-11-25-issue-368-pool-tier-ring-hole.md`, `DIAGNOSTIC.md` §28.
 >
 > **r326: the graph-replay width band is `GGML_CUDA_GRAPH_MAX_TOKENS` (default 16, was 8) -- a repeating 9..16-row verify or pre-fill ubatch is replayed (+3.5 % on a 4-slot server, +1.2 % at `llama-batched-bench -npl 16`), a moving width pays a capture per new width, and the FA staging arena is no longer grown from inside a capture (contributor PR #336, `@overdoingism`), an amendment to block 10.**
 >
@@ -1357,8 +1393,9 @@ almost all of them `template-instances/*.cu`.
   form/placement decision, not a numerics one): 27B UD-Q5_K_XL `-c 131072`, one resident slot -> rows on
   pp 833.6 / tg 14.74 against rows off pp 847.1 / **tg 23.41**; the same server with a 5246-token prompt on the
   second slot (a row list 18x shorter) -> 1219.3 / 25.96 against 1223.2 / **27.23**; Flash-Next GSQ-RCO-IQ3_XXS
-  (host experts) -> 1998.9 / 14.80 against 1994.9 / **18.20**, and 1654.4 / 31.98 against 1664.2 / **34.34** on the
-  compacted shape.  With the band disabled, i.e. inside the MMA family alone, the row list costs **~32 %** at equal
+  (host experts, and over **2000** generated tokens: a host-expert decode is not measurable on a 32-token tail, which
+  reads ~2x low while the expert arena settles) -> 1992.7 / 28.40 against 1998.0 / **39.24**, and 1689.0 / 44.65
+  against 1687.1 / **48.15** on the compacted shape.  With the band disabled, i.e. inside the MMA family alone, the row list costs **~32 %** at equal
   work (per-row `use_indices` gather vs contiguous tile rows).  An 18x compaction therefore does not pay for the
   kernel-family switch.  The second half is a coupling that is invisible in a text gate: a rows graph builds
   `flash_attn_ext_rows` and no plain `flash_attn_ext` node, so the **derived kq mask probe cannot observe its op and
@@ -4370,6 +4407,34 @@ cannot tell the two arms apart).  Record: `archive/work/qsa-topk-regular/`.
 
 ## Block 12 — campaign remainder
 
+> **r361 amendment (GitHub issue #366, `@mjohanning99`): THE S2 EXACT TOP-K FAST PATH NOW REPRODUCES A PENALTY
+> instead of standing down for one.**  `common_sampler_fast_topk_k()` returned 0 for any non-trivial penalties
+> sampler, so every profile with a presence / frequency / repeat penalty sampled from a FULL-vocabulary candidate
+> array — an array build plus a `token_count` hash lookup per candidate, for every sampled token, and with MTP
+> several per step.  It cost the reporter **5.7 %** of decode (a gfx1201 + gfx1100 pair, `-sm tensor`, MTP n5:
+> 69.7 → 73.7 t/s, acceptance unchanged) and this box **4.3 %** (3× R9700, `-sm tensor`, MTP, `top-k 20`, 300
+> tokens, `--presence-penalty 0.15`: **78.26 → 75.00 t/s** mean of 5 alternating rounds, text identical).
+>
+> * A penalty moves only the tokens in its last-n window, so it has the **logit bias's shape**: the affected set is
+>   the bias set plus that window (≤ **256** distinct tokens), the raw top `k + 1 + |affected|` still holds the top
+>   `k + 1` of the untouched tokens, and each affected token's adjusted logit is recomputed from its RAW logit with
+>   `llama_sampler_penalties_apply()`'s own arithmetic, in the chain's order (the bias sampler runs first, so the
+>   penalty applies to the biased value).  The k tokens handed to the chain still carry their raw logits — the chain
+>   re-applies the bias and the penalty itself — so the values are **bit-identical** and only the candidate array is
+>   smaller.  Everything else that moves a logit ahead of top-k still stands the path down (DRY, top-n-sigma, an
+>   unknown sampler, two penalties samplers in one chain), and a penalty that runs *after* top-k is not reproduced.
+> * Two **read-only** accessors, `llama_sampler_penalties_get_params()` and `llama_sampler_penalties_get_window()`,
+>   expose the sampler's parameters and its (token, count) window, so the fast path reads the chain's own state
+>   instead of keeping a second copy of the map.  The window is re-read once per sample (it moves as tokens are
+>   accepted); a window **past 256 distinct tokens** (a very large `--repeat-last-n`) falls back per sample and
+>   moves no token — the one configuration where a penalty still costs decode, and measured on a 700-token run
+>   (472 fast / 228 full, text identical to the full-path arm).
+> * Host-side C++ only (`common/sampling.cpp`, two accessors in `src/llama-sampler.cpp` and their declarations), so
+>   no ggml, kernel or backend file is touched and every backend runs it.  Gate:
+>   `scripts/gate-fast-topk-penalties.sh` (`MANIFESTS.md` gate 44) — the full-vocabulary arm is the oracle, the
+>   census is the non-vacuity check, and the self-check's rank-swap control proves the text arms are sensitive.
+>   Knobs: `DIAGNOSTIC.md` §27.  Record: `archive/work/fast-topk-penalties/`.
+
 > **r357 amendment (contributor PR #360, `@overdoingism`): the server keeps a tool result's special-token strings as
 > TEXT.**  A tool result (role `tool` / `function`), the arguments of an assistant's tool call and an assistant's own
 > content/reasoning are DATA — text that came from a file, a web page, a database row, or that the model copied out of
@@ -5343,7 +5408,8 @@ had no other home.
   can resolve to `buffered`; forcing either fill mode still works.  Reporter's log lines (92 GiB box,
   `MOE_HOST_POOL_FRAC` 80 vs 50) land on the two arms the rule predicts.
 
-**Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `LLAMA_DFLASH_DEV`, `GGML_LF_FAST_TOPK`,
+**Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `LLAMA_DFLASH_DEV`, `GGML_LF_FAST_TOPK`
+(and, r361, `GGML_LF_FAST_TOPK_CENSUS` / `GGML_LF_FAST_TOPK_SELFCHECK`),
 `LLAMA_DFLASH_INGEST_TAIL` (r130), `LLAMA_STATE_GET_MERGE_GAP`, `LLAMA_STATE_ASYNC`, `LLAMA_STATE_ASYNC_MAX_MIB`,
 `LLAMA_STATE_ASYNC_READ`, `LLAMA_STATE_PIPE_GROUPS` (r151), `LLAMA_STATE_COPY_THREADS` and
 `LLAMA_STATE_TIMING` (r152), `LLAMA_STATE_STAGE_MIB` (r157),

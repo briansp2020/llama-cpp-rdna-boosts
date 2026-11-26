@@ -1,17 +1,17 @@
 {
-  "release": "v18-919794500-r359",
+  "release": "v18-919794500-r362",
   "base": "919794500",
   "base_tree": "916941663346eb86004bed77f74e90fcf9c43126",
   "n_blocks": 18,
   "n_default": 19,
   "n_temporary": 1,
   "n_optional": 2,
-  "tip": "003c88e1f",
-  "tree": "3910c43846612385fbf120d6b8ae0f1b4ecf867a",
-  "optional_tree": "707eb474cbae5d01c130208e2ef6c2a39f2a74eb",
+  "tip": "ca149fbe6",
+  "tree": "45beb90c0ea0126d454753f4276bd06541934ba2",
+  "optional_tree": "95d40ba7d370e20516b2fd183f6da2c9378349f3",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "a747c8b77ddfdb033a9dd2351c38214fd8a58412285c20260f5f3ef3bd7870fe"
+    "sha256": "715621396f67c188adf853f9696edbfea6448d80824ad6b4456049a5ee09ed7f"
   },
   "patches": {
     "0000-rdna-boosts-block-00-foundation-band-uniformity-Meta.patch": "9774e903a21dbf725b442d4d4b1d54a2912f7a6230e4bb800b78f2a3a25ba0aa",
@@ -23,27 +23,27 @@
     "0006-rdna-boosts-block-06-MMB-quantized-prefill-GEMM.patch": "ced93f4b7d992aa61570ac59789aa4efa6fc81c2ae6a6b11ca284562aa0181ea",
     "0007-rdna-boosts-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM.patch": "0b3b41675b1b4bb9a51384fb58bba2cd8eb90a1069d7c2a5776702956833fd5b",
     "0008-rdna-boosts-block-08-fused-kernels-old-08-fusions-ol.patch": "4d8ce391bda23474ec5aea5dde35d07fad839e44b7ce899cf7d34cfb4f45f401",
-    "0009-rdna-boosts-block-09-host-resident-MoE-iface-schedul.patch": "399b7b439a59b1436b4b2faa801d3fd89c9fa0864c54ac5406130be33c0c2dc8",
-    "0010-rdna-boosts-block-10-slab-fusion-dispatcher-and-asyn.patch": "dc070beec899c6c819de9f56664145e12639b705314e3ce4851944917bce7389",
-    "0011-rdna-boosts-block-11-qwen4exp-model-hyper-connection.patch": "30f1422b806c146cda613a1aa651edfe340cbc478b9d64b4748c413dc5555d2f",
-    "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "e4dfb33459b0adbc0efcc1436fd6130e128092c84c4505c81261d53008d2c098",
-    "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "27caf6721cc00498a5321f8cdf14b358ef493e6fee9ba2cab853b155bc0bfa5a",
-    "0014-rdna-boosts-block-14-the-streamed-KV-a-fixed-VRAM-re.patch": "a638144c541275527757f989d23b1643870684fb5f5c5b5d0b68ee767c5c987c",
-    "0015-rdna-boosts-block-15-the-UMA-GTT-expert-store-an-APU.patch": "5d3f595ce25aa011d44889b99373d6a462e229738b50421c34b0bf2bce3b4a1f",
-    "0016-rdna-boosts-block-16-the-server-s-prompt-admission-p.patch": "481e72d070f6248cc93116d57827ddc6b3fde4933f1b83f84fb95691961fcef6",
-    "0017-rdna-boosts-block-17-TQ1_0-TQ2_0-ternary-weights-on-.patch": "3ecede9e800456f06a694fe01e758f770cda32d817b07d059a0fe212a5bbd638",
-    "0300-rdna-boosts-block-0300-relaxed-tensor-split-mode-TEM.patch": "fef433467afb960dae410fd40fc742e9658649a49511017e3cbe2d40a7876f62"
+    "0009-rdna-boosts-block-09-host-resident-MoE-iface-schedul.patch": "7d6f93970b42c858c70e56a8e905adaa455af9f2844e6da6beb7fd4ca46f2205",
+    "0010-rdna-boosts-block-10-slab-fusion-dispatcher-and-asyn.patch": "6266e7b2ae786a368ef67a5ea384f663f1d6b85bc09ad82dac68d3acfff31b72",
+    "0011-rdna-boosts-block-11-qwen4exp-model-hyper-connection.patch": "fb61cc847538c4f714d25c79a8c3de849fb8a79ab8864c018183918fade2bf68",
+    "0012-rdna-boosts-block-12-campaign-remainder-CPU-wins-bac.patch": "d24b2445e639eb9f86e74c7fa5e8e4830204d25e7724de3c4a940180ac13729e",
+    "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "f4fc76e1ee4af4fd8bcb90ba89d2ccf131280d618001a3b789c0ca410fe8e90d",
+    "0014-rdna-boosts-block-14-the-streamed-KV-a-fixed-VRAM-re.patch": "cf15df6bf48a1ca4d5e03610c0bb68976b95511d42fd4a08cb08bfbdd1d1409b",
+    "0015-rdna-boosts-block-15-the-UMA-GTT-expert-store-an-APU.patch": "14ea5d5a77bea9f6ca9a3c67c114797f2db97217af80a69c015108a7cc63973f",
+    "0016-rdna-boosts-block-16-the-server-s-prompt-admission-p.patch": "9c95cfc2e176b53897b82a62c40bf4bd88ee172bd0481ec130dc23f97c073b3a",
+    "0017-rdna-boosts-block-17-TQ1_0-TQ2_0-ternary-weights-on-.patch": "93fefa2f7545da97857671536c0b8c8422075b6fea620d9a73613147e5242472",
+    "0300-rdna-boosts-block-0300-relaxed-tensor-split-mode-TEM.patch": "85da375567b83e61aaec271a7c8e28fb652102645478c1fdcc14cfc1343c79be"
   },
   "optional": {
     "0100-two-lane-prefill.patch": {
       "dir": "two-lane-prefill",
-      "sha256": "771c05a2f9cc1c0e1ee5b2e33e46aa7fe7f88cc61e58662918320d74b359477d",
-      "tree": "0bf09806b4fe10d2b9b5897a7f4aa34d154d47a7"
+      "sha256": "33634cbcedf7c7ff5d19d6b70dd86517bb91f492a16542303ee7b44ffb7c9e57",
+      "tree": "0a189a09b70125bbb31351f405ee40f98b1c7ae4"
     },
     "0101-mixed-kv.patch": {
       "dir": "mixed-kv",
-      "sha256": "33bdf96cbe0b07c462f3dee41b268069a6dd0c03dea9aaa2d67b27c140221396",
-      "tree": "51de75b7b702a48d383e9537fdd38eed5e5571c4"
+      "sha256": "f861f9a36198a3c8bf46bdd2a15fac5b6a9ac0987833908e5a7dcb0d2f84594f",
+      "tree": "1a0ee3d93696bd48564c5c3ecd1b306fd3bc6d25"
     }
   }
 }

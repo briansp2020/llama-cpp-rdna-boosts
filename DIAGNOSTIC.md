@@ -675,6 +675,42 @@ and `INVARIANTS.md` r357.  Gate: `scripts/gate-tool-text.sh`.
 
 ---
 
+---
+
+## 27. The exact top-k fast path and its penalty arm (block 12, r361)
+
+The S2 fast path hands the chain only the k tokens top-k will keep instead of the whole vocabulary
+(`common_sampler_fast_topk_k()`, `common/sampling.cpp`).  Since r361 it also reproduces a **penalties** sampler
+exactly, instead of standing down for one: the affected set is the logit-bias set plus the penalty's last-n window
+(at most 256 distinct tokens), each affected token's adjusted logit is recomputed from its raw value with the
+sampler's own arithmetic, in the chain's order, and the k tokens handed to the chain still carry their raw logits
+so the chain re-applies the bias and the penalty itself.  All three variables are read once, on first use; the
+delivery runs with none of them set.  Contract: `patches/README.md` (block 12, r361) and `INVARIANTS.md` r361.
+Gate: `scripts/gate-fast-topk-penalties.sh`.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `GGML_LF_FAST_TOPK` | **`1` (on)** | **kill switch** | `0` takes the fast path away entirely, so every sample builds the full-vocabulary candidate array — the pre-#80 behaviour, and the arm any "what it used to be" comparison must use.  It is also this gate's oracle: with a penalty set, `0` IS the pre-fix arm (the r360 build stood down for a penalty), so the fast arm's text must match it byte for byte. |
+| `GGML_LF_FAST_TOPK_CENSUS` | `0` (off) | **diagnostic** | One INFO line when the sampler is freed: `fast = <n>, full = <n>, fast with a penalty window = <n>, affected tokens max = <n>, self-check mismatches = <n>`.  This is what makes a text arm non-vacuous: identical text proves nothing if both arms fell back, so the gate requires `fast > 0`, the same count carrying a non-empty window, and `full = 0`.  It also reports the >256-token window fallback, which is the one configuration where a penalty DOES still cost decode. |
+| `GGML_LF_FAST_TOPK_SELFCHECK` | `0` (off) | **diagnostic** | `1` scores the whole vocabulary the way the chain would, on every sample, and logs an error naming the rank, both token ids and both adjusted logits when the fast path's k disagree with it.  `2` is its CONTROL arm: it keeps the check and swaps the fast path's two best-ranked tokens, so the oracle must fire and the text must move — which is what makes "the text is identical" a sensitive claim rather than an inert one.  The check shares the fast path's value function, so the independent arithmetic oracle is the full-path text arm; the self-check localises a broken candidate set (the raw-top extension, the strictness rule) to a rank and a sample. |
+
+---
+
+## 28. Residency by layer, and the slab ring hole (block 10, r362)
+
+Two things a host-expert run needs to say out loud, both from GitHub issue #368.  The first is a diagnostic: the
+residency map is the one reading that tells two runs of the same config apart, because the exit census's `h`,
+`evictions` and `fills` are *totals* and two runs whose totals agree can still hold different layers.  The second
+is not a variable at all on the default path; it is recorded here because it is the arm any "is the ring hole
+worth its arena" comparison must use.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `MOE_EXPERT_CACHE_TABLES` | `0` (off) | **diagnostic** | At exit, one INFO line with the per-layer residency map (`L12 261/512`, `I` appended when a table of that layer is on the identity fast path) and one with this run's per-layer **slab-reclaim stand-downs** and **re-arms** (`L30x3 L31x3`).  The eviction and re-arm messages carry counts and bytes only, so a report that says "the same eviction sizes" can still hide a different *set*: read this first when comparing two runs of a host-expert shape, and change nothing until the two maps agree or the difference is explained.  Nothing is printed when the cache is off. |
+| `GGML_CUDA_SLAB_RING_MIB` | unset (auto) | tuning (pre-existing) | The whole-table H2D staging ring the slab reserves as a fixed hole above the narrow floor.  Since r362 it is **not reserved at all when the loader's host tier is the POOL** (`--host-experts pool`, or an `-lme` budget that resolves to the per-expert pool): that tier has no device-readable host master, so the default `GGML_SCHED_DEVGATHER` mode gathers a pool-backed table at every prefill width and the hole holds nothing for it.  An explicit value restores a hole of that size (the r361 behaviour is `GGML_CUDA_SLAB_RING_MIB=6144`), and an explicit `GGML_SCHED_DEVGATHER=0` also keeps it, because that arm really does stage.  Measured on the shape of issue #368: hole 6656 MiB -> work boundary 3264 -> 11776 MiB -> 8500 MiB / 51 tables stood down at every prefill, L1 prefill 1895 t/s / decode 34.18; without the hole, boundary 3328 MiB, no stand-down, 1958 / 34.94 (+3.4 % / +2.2 %) and the L2 revisit 728 -> 902 t/s. |
+
+---
+
 ## Maintaining this file
 
 The same recipe as [`ENVIRONMENT.md`](ENVIRONMENT.md) → *Maintaining this file* derives the names; this file is

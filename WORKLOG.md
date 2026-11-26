@@ -16,6 +16,259 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.008 (r362) -- the pool tier no longer pays the slab's ring hole out of the expert arena (GitHub issue #368), and a residency map that names which tables stand down
+
+**The report.**  GitHub issue #368 (`@DanoPTT`, 1 x R9700, Windows, ROCm 10.2, Flash-Next IQ3_XXS
+`-ncmoe 47 --host-experts pool -c 131072 -np 2 --kv-unified -b 8192 -ub 8192`, a 90k-token prompt): every fresh
+server lands in one of **two deterministic states**, good L1 prefill 2960-3000 / tg 52 against slow 1615-1620 /
+tg 30-32, two byte-stable but different texts, and `-ub 4096` never switches.  Startup, pool fill, arena size and
+eviction *sizes* are the same in both states; the slow one re-evicts once more at the L2 revisit.
+
+**Reproduced the shape, not the bimodality.**  Nine fresh starts at their flags read ONE state here (L1 1890-1900,
+tg 34.06-34.24, text `98c4f67d6ed9`), with their eviction pattern to within a few percent (6602 MiB / 40 tables
+then 8500 / 51, re-arm 42 then 54, against their 6811 / 41 and 8546 / 51).  Eleven one-variable arms (arena 0 / 512 /
+12000 / 26000 MiB, the gather off, staging off, serial, `GGML_CUDA_MMB=0`, slab off, headroom, `MOE_GATHER_NSPLIT`
+8/32, the PLE resident, `--host-experts pinned`/`-lme mirror`) all read the **same text**, so on this box the
+expert cache's residency is not a text input on this shape — their two texts need another carrier.
+
+**What did explain the cost of the state (the fix, block 10).**  Two delivery statements contradicted each other on
+a pool-backed tier: `sched_input_gatherable` mode 1 gathers a pool table at EVERY prefill width, yet
+`h2d_stage_region_bytes()` still carved a whole-table H2D ring hole — **6656 MiB at `-ub 8192`** (1800 at 4096, so
+4096 is exactly the width that never shows the state).  The hole sits above the narrow floor, so the wide prefill
+view can only be placed behind it: the work boundary moved 3264 -> 11776 MiB and `moe_cache_evict_slab_range` took
+**8500 MiB / 51 whole tables** at every prefill, plus their 54-table re-arm at the drop — residency the prefill then
+streams back from the host on every ubatch.  `slab_ring_region_bytes()` now returns 0 when the loader's tier is the
+pool (`moe_cache_host_pool_requested()`, a read-only query added to block 09's cache), still deferring to
+`GGML_CUDA_SLAB_RING_MIB` and to an explicit `GGML_SCHED_DEVGATHER=0`.
+
+**Measured, after.**  Four fresh visits, the same flags and a cold heat-map directory: L1 **1895 -> 1958.5 t/s**
+(+3.4 %), tg **34.18 -> 34.94** (+2.2 %), the cache-hit revisit **728 -> 902.5 t/s** (+24 %, it no longer re-evicts
+6778 MiB / 41 tables), S2 tg 46.1 -> 47.1, arena 20 397 MiB held through the whole run, `slab-reclaim stand-downs
+this run: none | re-arms: none`, text byte-identical (`98c4f67d6ed9`).
+
+**The instrument the issue asks for (question 3, new).**  `MOE_EXPERT_CACHE_TABLES=1` prints, at exit, the per-layer
+residency map (`L1..L48 261/512`, `I` for an identity table) and this run's per-layer slab-reclaim stand-down /
+re-arm tally (`L30x3 L31x3`).  The eviction and re-arm messages carry counts and bytes only, so two runs that agree
+on `h` and `evictions` can still hold different layers — which is the thing a "same eviction sizes" report cannot
+show.
+
+**Gates.**  `gate-prefill-logits.sh` **0.000000 / 100.000 %**, `gate-host-expert-text.sh --quick` 2/2 identical
+(and the flipped-library arm still moves, so the pin is live), `check-shlib-symbols.sh` 16/16, `check-gen-docs.sh`
+ok, `check-gpu-faults.sh` clean, `validate-set.sh` green with `0 unexplained` in the rung reconciliation (the two new
+env keys are additions).  Owned gap: the host-expert KLD point still has no base recorded on this box, so its `--kld`
+leg cannot run (the r361-vs-r362 text identity on this shape is the neutrality evidence instead).
+
+**The cut.**  `v18-919794500-r362` = `ca149fbe6` (fork re-cut tip), base `919794500`, tree
+`45beb90c0ea0126d454753f4276bd06541934ba2`; canonical re-cut tree matches, 18 official + 1 temporary = 19 default
+blocks; optional `0100` tree `0a189a09b`, `0101` tree `1a0ee3d93`, cumulative `95d40ba7d` (both still apply strictly
+on the new tree).  Record: `benchmarks/2026-11-25-issue-368-pool-tier-ring-hole.md`, `INVARIANTS.md` r362,
+`DIAGNOSTIC.md` §28, `ENVIRONMENT.md` §28.
+
+## 261125.007 (r361, release cut) -- tagged, pushed, the fork branch refreshed to the re-cut tip, the images verified, issue #366 answered and closed
+
+**The cut.**  `v18-919794500-r361` = `41b54afa`, base `919794500`, tree
+`8962b7a40ea7e509a60d763b96a2ceeb0902521a`, 18 official + 1 temporary = 19 default blocks, 2 optional (`0100` tree
+`35ab35cf5`, `0101` tree `30a57b9a2`, cumulative `ae4981eac`; both re-applied STRICTLY on the new default tree, so
+only their recorded trees were re-derived, not the patches).  `scripts/validate-set.sh` green on the committed set,
+the rung reconciliation at `0 unexplained` with the two new variables counted as additions, tier-1 CI green on both
+`main` and the tag, and the GitHub Release carries its 4 assets.
+
+**The fork.**  `scripts/fork-refresh.sh --build --gates --push` re-cut the branch deterministically (two re-cuts read
+the same tip), asserted tree `8962b7a40e…`, built it, ran `check-shlib-symbols.sh` (**16/16**), the coherence gate and
+`gate-prefill-logits.sh` (**0.000000 / 100.000 %**, no GPU faults), and pushed:
+`gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads **`c7a4f0b6c`**, which is what
+`release.json.tip` records.  The patches were re-exported FROM that re-cut chain, so their `From` lines name the
+commits the fork carries.
+
+**The images.**  The worker (`radiance`) picked up the tag and published both ROCm lines off-host;
+`scripts/build-containers.sh --verify-only` reads **all 23 tags resolve and every moving tag carries this release**
+(the check that issue #364 exists for: a push's exit status is not evidence).
+
+**The issue.**  GitHub issue #366 answered with the reproduction, the mechanism, the exactness evidence and the two
+caveats (a >256-token penalty window still falls back; an adaptive speculator cannot be gated for text), and closed as
+completed, asking the reporter to re-run their mixed gfx1100 + gfx1201 pair with `presence_penalty 1.5` if they get a
+chance.
+
+## 261125.006 (r361) -- a penalty no longer costs decode: the exact top-k fast path reproduces the penalties sampler (issue #366)
+
+**The report.**  GitHub issue #366 (`@mjohanning99`): a presence penalty of `0.15` cost **5.7 %** of MTP decode on
+their gfx1201 + gfx1100 pair (69.7 vs 73.7 t/s, acceptance unchanged), and their agent had traced it to the S2 fast
+path standing down for any non-trivial penalties sampler.  Reproduced on this box first, before touching anything:
+3x R9700, `-sm tensor`, Qwen3.8-27B UD-Q4_K_M, `--spec-type draft-mtp`, `top-k 20`, `--presence-penalty` the only
+difference, 300 tokens, 4 arms in one loop — **79.4 / 71.5 / 80.1 / 71.8 t/s**, i.e. -10 % and perfectly alternating.
+
+**The fix (block 12 amendment).**  A penalty is the logit bias's shape, not a reason to give up: it moves only the
+tokens in its last-n window, so the affected set is the bias set plus that window, the raw top `k + 1 + |affected|`
+still holds the top `k + 1` of the untouched tokens, and each affected token's adjusted logit is recomputed from its
+RAW logit with `llama_sampler_penalties_apply()`'s own arithmetic **in the chain's order** (the bias sampler runs
+first, so the penalty applies to the biased value).  The `k` tokens handed to the chain still carry their raw logits,
+so the chain re-applies the bias and the penalty itself and the values stay bit-identical — only the candidate array
+is smaller.  Two read-only accessors (`llama_sampler_penalties_get_params()`, `..._get_window()`) expose the
+sampler's parameters and its window, so the fast path reads the chain's own state instead of keeping a second copy
+of the map; the window is re-read once per sample.  Everything else still stands the path down (DRY, top-n-sigma,
+an unknown sampler, two penalties samplers), a penalty **after** top-k is deliberately not reproduced, and a window
+past 256 distinct tokens falls back per sample.
+
+**Measured, after.**  5 alternating rounds, same text in both arms: **78.26 t/s fast against 75.00 t/s with
+`GGML_LF_FAST_TOPK=0`** (+4.3 %), 3x R9700 `-sm tensor` MTP.  Exactness is the claim, so it was checked 7 ways
+against the full-vocabulary arm (presence / repeat / frequency / all three / a penalty combined with a logit bias /
+no penalty / a 4B model on one GPU) — every pair byte-identical, plus a 700-token `--top-k 60 --repeat-last-n 8192`
+run that grew the window past the cap (472 fast / 228 fallbacks) and still read the full arm's text.  Two traps hit
+on the way, both worth recording: hashing a `-lv 4` log (the census needs `-lv 4`, the hash needs none) invented a
+"mismatch" that the self-check then disproved, and comparing two *different* sampling profiles for rate is
+meaningless with MTP because the acceptance profile moves with the text.
+
+**Instruments (new).**  `GGML_LF_FAST_TOPK_CENSUS=1` — which path each sample took, how many carried a penalty
+window, the largest affected set and the self-check's mismatches; without it a text arm cannot tell a fast path
+from a quiet fallback.  `GGML_LF_FAST_TOPK_SELFCHECK=1` — the whole vocabulary scored the way the chain would and
+compared with the fast path's `k`, per sample, 0 mismatches over 400 samples; `=2` is its **control** (it swaps the
+two best-ranked tokens: 128/128 mismatches and the text moves), which is what makes "the text is identical" a
+sensitive claim.
+
+**Gates.**  `scripts/gate-fast-topk-penalties.sh` (`MANIFESTS.md` gate 45): 7/7 text pairs identical against the
+full-vocabulary arm, census 128 fast / 0 full with a penalty window on the penalised arm and 0 fast / 128 full on the
+kill switch, self-check 0 mismatches with its rank-swap control at 128 and a moved text, the 700-token cap arm
+472 fast / 228 full with identical text, no GPU faults.  Cross-build neutrality against the ACTUAL r360 binary
+(checked out `3be8b9bd1`, rebuilt, and back): 4B greedy `7e6229b260f6` on 1 GPU and on 3-GPU `-sm tensor`, identical
+on both builds, and — the one that matters — **27B 3-GPU `-sm tensor` + MTP + `--presence-penalty 0.15` reads
+`3651d4d825b9` on r360 (its full path) and r361 (its fast path)**, i.e. the whole fix in one line.  MTP Protocol A
+(dense 27B UD-Q4_K_XL, 1 GPU, prose prompt, `-n 2000`, `--presence-penalty 1.5`): plain **31.3 t/s**, `draft-mtp`
+**52.7 t/s**, acceptance **0.49092** (> the ~0.45 floor).  `check-gen-docs.sh` ok (no option is added),
+`check-shlib-symbols.sh` 16/16, `gate-prefill-logits.sh` **0.000000 / 100.000 %**, `validate-set.sh` green.
+
+**The cut.**  `v18-919794500-r361` = `c7a4f0b6c`, base `919794500`, tree
+`8962b7a40ea7e509a60d763b96a2ceeb0902521a`, 18 official + 1 temporary = 19 default blocks; optional `0100` tree
+`35ab35cf5`, `0101` tree `30a57b9a2`, cumulative `ae4981eac` (both re-applied strictly on the new default tree).
+`validate-set.sh` green, `0 unexplained` in the rung reconciliation with the two new variables counted as additions.
+Record: `archive/work/fast-topk-penalties/`, `GREEDY-PURITY.md` §110, `INVARIANTS.md` r361, `DIAGNOSTIC.md` §27.
+
+## 261125.005 (r360, release cut) -- tagged, pushed, the fork branch refreshed to the re-cut tip, the images are building on the worker
+
+**The cut.**  `v18-919794500-r360` = `07611562`, base `919794500`, tree `4674dd9f2e83894895d71b7e987a06d80fa70813`, 18
+official + 1 temporary = 19 default blocks, 2 optional (`0100` tree `831bc116a…`, `0101` tree `f455c3121…`, cumulative
+`8bd172df5…`).  `scripts/validate-set.sh` green on the committed set; the GitHub Release carries its 4 assets.
+
+**The fork.**  `scripts/fork-refresh.sh --build --gates --push` re-cut the branch deterministically, asserted the
+applied tree against `release.json`, built it, ran `check-shlib-symbols.sh` + coherence + `gate-prefill-logits.sh`
+(**0.000000 / 100.000 %**, no GPU faults) and pushed:
+`gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads **`3be8b9bd1`**, which is what
+`release.json.tip` records.  The patches were then re-exported FROM that re-cut chain (so their `From` lines name the
+commits the fork carries, and the 19 hashes in `release.json` are the re-exported set), and the optional `0100`/`0101`
+were re-cut on it: their produced trees are byte-identical to the pre-re-cut values, only the export ids moved.  A
+rebase onto `761fcb43` (`wip/pr362`) was needed first: the tag had been pushed from a tree that predated it.
+
+**One open item, by policy.**  The images are built off-host and were still building when this entry was written
+(the worker picked `r360` up at 14:00 worker time and was at the HIP compile stage).  `scripts/build-containers.sh
+--verify-only` on this tree is the check that finishes the release: a missing tag or a moving tag still carrying
+`r359`'s digest exits 1, and that is the only honest proof (`GitHub issue #364`).
+
+
+## 261125.004 (r360) -- `--fit` charged 1024 MiB of FA staging reserve on a q8_0 K/V cache the kernels read natively, and on a 12 GiB card that was eight layers of offload (GitHub issue #367, RDNA2)
+
+**The report.**  `@pkrasicki` runs an RX 6700 XT (`gfx1031`, 12 GiB) on a DDR3 platform and measured the r354/r355 tree
+(`91a8150`) **slower than upstream**, not faster, on two shapes: a Gemma-4 26A4B MoE with `-cmoe --moe-cache-mib 7000
+-lm none --spec-type draft-mtp` (**0.5 t/s prompt / 14.4 t/s tg** against upstream's 15.8 / 52.5) and a Qwen3.8 27B
+IQ3_S with `-sm tensor -mg 0 -c 16384 -fa on -ctk q8_0 -ctv q8_0` (**19.0 / 4.0** against 40.7 / 15.5).  No RDNA2
+device is in the fleet, and a 4x decode loss is not a tuning difference, so this was reproduced by MEASUREMENT on the
+shapes this box can reach rather than by inspection.
+
+**Root cause: `--fit`, not a kernel.**  `llama_context::memory_breakdown()`'s no_alloc (`--fit`) path charges a
+per-device compute reserve for the FA **prefill staging arena** (a raw device allocation outside the compute-graph
+reserve), and `ggml_backend_cuda_fattn_stage_bound()` answered with a FLAT `2 * GGML_CUDA_FA_STAGE_MAX_MB` = **1024
+MiB** for every device except RDNA3_5, gated only on `-fa` plus a non-F16 K cache.  That covers the delivery's own
+default `-ctk q8_0 -ctv q8_0`, where `ggml_cuda_fattn_tile_type()` resolves the pair **natively** (the launcher's
+`need_f16_K/V` are false) and the arena never grows at all: the reserve bought nothing and the fit paid for it in
+layers.  Measured with `llama-fit-params` on a 27B UD-IQ3_S at `-c 16384 -fa on -ctk q8_0 -ctv q8_0`, an ~11 GiB
+budget derived from the card's free VRAM:
+
+| arm | model | context | compute | `-ngl` |
+|---|---|---|---|---|
+| r359, f16 KV (control) | 10616 | 1173 | **515** | 59 |
+| r359, q8_0/q8_0 | 10616 | 697 | **1539** | **55** |
+| r360, q8_0/q8_0 (native) | 10616 | 697 | **515** | **62** |
+| r360, `GGML_CUDA_FA_KV_NATIVE=0` (staged) | 10616 | 697 | 1539 | 55 |
+| r360, staged + `GGML_CUDA_FA_STAGE_MAX_MB=0` | 10616 | 697 | 4675 | 34 |
+| same-tree **upstream** build, q8_0/q8_0 | 10616 | 697 | 541 | 59 |
+
+So the delivery offloaded **4 fewer layers than its own base** on the same flags and 8 fewer with the GSQ cut, and on
+a card whose model barely fits that is exactly the reported shape: the layers left on the host are streamed per token
+(11.28 GiB / 62 layers ≈ 186 MiB each), so ~750 MiB/token over DDR3 lands at 4 t/s while upstream's 59/62 reads 15.5.
+The fit's reserve is an ESTIMATE of an allocation the compute buffer does not contain -- a live run at `-c 16384
+-ub 512` prints a **118.89 MiB** compute buffer, and it grows linearly at 0.232 MiB per ubatch token (237.72 at
+`-ub 1024`, 475.37 at `-ub 2048`).
+
+**The fix (blocks 09 + 10).**  The bound now takes the context's K/V types and returns 0 for a pair the launcher does
+not convert, using the launcher's OWN predicate: `ggml_cuda_fattn_kv_pair_native_host(cc, type_k, type_v)` is
+`ggml_cuda_fattn_tile_type` applied to a probe tensor, i.e. literally the `need_f16_K/V` test in
+`ggml_cuda_flash_attn_ext_get_f16_extra_data`.  A policy switch (`GGML_CUDA_FA_KV_NATIVE=0`), a mixed pair, bf16
+without bf16 MMA, or `GGML_CUDA_FA_STAGE_MAX_MB=0` all keep the reserve exactly as before, and the RDNA3_5 special
+case is left alone.  Nothing about a kernel selection, a launch or a numerics path changed: this is a number the fit
+subtracts from a budget.
+
+**Two things checked because they are the obvious wrong turns.**  (1) *Is the reserve needed for a deep prefill?*  A
+16K-context q8_0 KV prefill (1315 tokens) reads `990793afb918` on both the r359 and the r360 build, and the same
+text on a `GGML_CUDA_FA_STAGE_MAX_MB=1` arm where the arena can never be charged for anything.  (2) *Is this
+RDNA2-only?*  It is not: the accounting is in `llama-context`, and `gfx1036` (a real RDNA2 device on this box) reads
+495 MiB of compute for BOTH its f16 and its q8_0 arm and 1519 for the staged arm, i.e. the same native answer as
+gfx1201 -- the old "only RDNA3_5 reads natively" special case was a leftover from when the native q8_0 arm was
+gfx1151-only, which under-charged nobody and over-charged everyone else.
+
+**Gates.**  New `scripts/gate-fit-staging.sh` (`MANIFESTS.md` gate 44, four `llama-fit-params` arms, no compute,
+~10 s) -- **NEGATIVE-TESTED**: on the same r359 build it FAILS A1 (+1024 MiB), A2 (`-ngl 55` < 59) and B1 (0 MiB over
+the native arm), and passes 6/6 on r360.  `gate-prefill-logits.sh` **0.000000 / 100.000 %** (no GPU faults).
+Byte-identical greedy text against the r359 build on 1 GPU (`1c5d32ac537d`), 3-GPU `-sm tensor` (`1c5d32ac537d`) and
+the 16K q8_0 prefill (`990793afb918`); a real q8_0-KV FA run on the RDNA2 `gfx1036` iGPU generates (`f33aec64cbab`,
+14.0/3.2 t/s on 2 CUs).  `validate-set.sh` green (19 default + 2 optional; release.json now records the r360 **re-cut** tip
+`3be8b9bd1`, tree `4674dd9f2e…`, i.e. what `fork-refresh.sh` printed and pushed -- the patches were re-exported from
+that chain so their `From` lines name the commits the fork carries), the optional
+`0100`/`0101` re-cut onto the r360 tree (`831bc116a…` / `f455c3121…`, cumulative `8bd172df5…`; 0101 needed one
+textual conflict resolved because block 10 owns `fattn-rdna.cuh`), the file-set reconciliation reads 0 unexplained.
+
+**What the report's FIRST shape still needs, and what it is not.**  Test 1's command is not comparable across the two
+builds: `-cmoe`, `--moe-cache-mib`, `-lm` and `-sm relaxed-tensor` do not exist upstream, so the upstream arm could not
+have run it -- its `-ngl 99` on a 16 GiB model in 12 GiB means something else entirely (page-cache-resident experts
+computed on the CPU, which is exactly what the delivery's `--moe-cache-mib 7000` replaces with a 7 GiB device cache
+and a pinned host master).  That arm is a *placement* question on a DDR3 box with no RDNA2 device here to measure it
+on, so it is not "fixed" by this entry: the reporter is asked for the exact upstream command, and `TODO` #361's
+V620 validation still covers the RDNA2-only block-05/08/10 items.
+
+**Where the RDNA2 story goes from here.**  The two block-05/08/10 items r334 folded in remain externally
+validated only (`TODO` #361, waiting on `@jstamagal`'s V620), and this fix is orthogonal to them: it removes a
+placement loss the fit was causing, not a kernel regression.  It also means the r360 tree is the first one where an
+RDNA2 owner can see the delivery's own `-ctk q8_0` default without paying a 1 GiB fit reserve for it.
+
+
+## 261125.003 (no release; record correction) -- the r359 entry's Flash-Next tg numbers were 32-token cold-start numbers: at 2000 tokens the model reads 39.24 t/s and the rows form's LOSS is bigger, not smaller
+
+**Why this exists.**  The r359 measurements above used a 32-token greedy tail on a fresh `--no-warmup` server.  That is
+fine for a dense model and wrong for a host-expert MoE: the first few dozen decode steps after a 94428-token prefill are
+still settling the expert arena's resident set, so the mean over 32 tokens is not the model's decode rate.  Re-measured at
+**2000 generated tokens** (same box, same shapes, same arms):
+
+| arm | 27B UD-Q5_K_XL L1 / S2 tg | Flash-Next GSQ-RCO-IQ3_XXS L1 / S2 tg |
+|---|---|---|
+| 32 tokens, default (dense) | 23.41 / 27.24 | 18.20 / 34.34 |
+| 32 tokens, rows form (`LLAMA_KV_ROWS_DISABLE=0`) | 14.73 / 25.95 | 14.80 / 31.98 |
+| **2000 tokens, default (dense)** | **23.41 / 27.25** | **39.24 / 48.15** |
+| **2000 tokens, rows form** | **14.76 / 25.99** | **28.40 / 44.65** |
+
+So the dense model's numbers stand exactly (nothing to settle), and Flash-Next's were ~2x low on tg and understated the
+rows form's loss (23 % -> **38 %** at L1, 7 % -> 8 % at S2).  The conclusion does not move, it gets stronger, and the
+reporter's own L1 readings (48.3 rows-on, 51.8 r345) are in the corrected band rather than the 32-token one.
+
+**One claim corrected with it.**  The r359 entry says the same-seed greedy text is identical in every arm and shape.  True
+for every 32-token arm and for the 27B at 2000 tokens (`fa78a9826423`, `383dd3732894`), but at 2000 tokens Flash-Next's
+compacted shape reads `dc97a530611c` dense and `6379caff5414` rows: over a long tail a near-tie reaches the kernel-family
+switch between the two forms.  A text comparison ACROSS the rows and dense forms is not a purity claim; within one form
+it still is (`INVARIANTS.md` r359 item 3).
+
+**Rule for future arms:** a host-expert MoE decode is measured at >= 1000 (preferably 2000) generated tokens; a dense
+model may use short tails.  The 32-token table is kept in the r359 entry above as the dated record it was.
+
+**Still open:** the block 05 source comment (`src/llama-context.cpp`) quotes the 32-token Flash-Next pair (14.80 /
+18.20).  It is a comment, so the code and every gate are unaffected, but it is stale and this repo does not hand-edit
+`patches/`; it goes into the next block 05 amendment/re-cut.
+
 ## 261125.002 (r359, release) -- the `--kv-unified` K/V-rows form is OPT-IN: it cost 17-59 % of decode at depth and silently disabled the derived (mask-free) kq mask (GitHub issue #365); `v18-919794500-r359`
 
 **Release v18-919794500-r359** -- base `919794500`, tip `003c88e1f`, default tree
@@ -85,6 +338,13 @@ gate was re-run on that final build (PASS) and the purity/KLD arms do not reach 
 The frozen beta candidate (`beta/prefill-decode-arms/`, three patches) was re-applied on the new default tree and still
 applies strictly, producing tree `a8f070fb2`; it is not re-cut (it is frozen as a code reproduction, `AGENTS.md`) and
 its README's recorded tree predates this release.
+
+**Containers.**  The `radiance` watcher built and pushed the six images for `7.14.1` and `10.2`;
+`scripts/build-containers.sh --verify-only` on this tree reads all **23 tags** PRESENT, with every moving tag (`latest`,
+`rocm-<line>`, `server-rocm-<line>`, `full-`/`light-rocm-<line>`) carrying this release's digest -- issue #364's check
+doing exactly its job.  One wrinkle worth recording: the watcher logged a single `ERROR: git fetch --tags --force origin
+failed` (`cannot lock ref 'refs/remotes/origin/main'`) on the poll right after the push, then fetched cleanly on the next
+poll and built on attempt 1/3; the r358 entry's fix (failures are filed, not just logged) is what made that visible.
 
 **Docs.**  `DIAGNOSTIC.md` §8 (the repointed opt-in, its default and why), `INVARIANTS.md` **r359** (four facts: the
 derived-mask coupling, the seven-arm form table, the family-switch caveat for text, and "the default is pinned by the
