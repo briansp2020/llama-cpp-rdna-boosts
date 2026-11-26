@@ -3552,3 +3552,114 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
   experts the arena holds (§89's corrected doctrine reaches this shape), and the next things to compare on their
   box are the BLAS state, the PLE's lazy reads and the *set* of tables standing down — which is why
   `MOE_EXPERT_CACHE_TABLES=1` exists.  The one lever this box did show is the ring hole above.
+* **(r363, block 14, GitHub PR #369) THE POOL'S WRITER RULE ONLY COVERED THE BATCHES THAT RESOLVE — a prefill
+  chunk writes the mirror and used to leave every resident page it touched STALE, so a second request over a
+  shared prefix read the FIRST request's K/V.**  The mirror is authoritative and the pool only ever holds copies,
+  so "a page is re-filled here when the batch that wrote it also resolves" (`wids` in
+  `kv_pool_mark_kernel`) covers the decode band and nothing else.  A prefill ubatch — and the QSA
+  dense/shortcut arm, `shortcut && n_kv <= width`, which covers the first ~2051 cells of *every* request — writes
+  cells whose blocks are still resident from the previous request and never queues them for re-fill; the block
+  table still says "resident", the map step hands the reader that slot, and the pool serves the old bytes.
+  Measured on the r362 build (2× R9700 `-sm layer`, Flash-Next GSQ-RCO-IQ3_XXS `-ncmoe 24 -c 65536`,
+  `--kv-attendance-pool on`, `LLAMA_KV_POOL_VERIFY=1`, an 18 140-token request then a 4 123-token request sharing
+  its prefix, `cache_prompt: false`): **225-228 M mismatching words**, a 90-entry prompt answered as "91 entries",
+  and the wrong text reproducible under `LLAMA_KV_POOL_DROP=0` — **and every arm of `gate-kv-residency.sh` was
+  green**, because each of its arms is ONE `llama-cli` request in one process and nothing in the gate ever
+  re-prefilled over a resident page.  `kv_pool_invalidate()` is not the missing piece (it is for in-place
+  rewriters: the K-shift and a state restore, and it is complete); the missing piece is the non-resolving
+  WRITER.  A non-resolving batch now **drops** the blocks it wrote (`ggml_kv_pool_drop`, the same
+  `GGML_OP_KV_POOL` with op param 1 = 1): the kernel stores `tbl[cell/page] = -1`, the next resolve claims and
+  fills them from the mirror, and the stale `inv[slot]` is harmless (a later claim clears `tbl[prev]` only
+  through `atomicCAS(&tbl[prev], cand, -1)`, which cannot fire once the block has moved).  It runs in-graph on the
+  compute stream, allocates nothing, and costs a `n_tokens`-wide launch per layer per prefill chunk (measured:
+  prompt 34.5 vs 34.9 t/s, decode 36.5 vs 36.5 t/s — noise; the pool's per-id hit rate does move, 89.5 % -> 84.3 %,
+  because the re-prefilled blocks must be claimed again — that is the cost of being correct).  With the drop the
+  pooled arm reads the **resident sparse arm's text byte for byte** (`5c4eb5da3364` == pool-off
+  `LLAMA_QSA_DENSE_DECODE_UNTIL=0`), `bad 0`; **the reference must force `LLAMA_QSA_DENSE_DECODE_UNTIL=0`** —
+  gfx1201's default decode arm is DENSE, so the default-dense text legitimately differs (`3a6ad0505fc6`) and
+  comparing against it would blame the pool for the arch policy.  Kill switch `LLAMA_KV_POOL_DROP=0`
+  (`DIAGNOSTIC.md` §17.1); gate `scripts/gate-kv-residency.sh`'s two-request section (`pstale_ref` / `pstale_res`
+  / `pstale_ctl`, whose control arm must read > 0 mismatches or the section is vacuous).
+* **(r364, block 14, GitHub PR #369 follow-up / `TODO` #376) A ROW-BLOCK DEVICE->HOST READ MUST NEVER BE A 2-D COPY
+  ON ROCm, because a 2-D D2H into host memory needs a PEER GRANT of the destination's pinned allocation to the
+  copying device's agent — and llama.cpp's pinned host buffers are allocated by ONE device and read by ALL devices
+  of a `-sm tensor` split.**  `hipMemcpy2DAsync` D2H asks the runtime for `hsa_amd_agents_allow_access` on the
+  destination (`hipMemSetAccess` for a VMM allocation); `ggml_backend_cuda_host_buffer_type()`'s buffers — the
+  context's output buffer (`output_host_buft`) and the state stage above all — are one device's allocation read from
+  every device, so a copy issued by a device that does not own it needs that grant.  On a box whose slabs leave the
+  driver no room it is REFUSED (`Allow p2p access failed - hsa_amd_agents_allow_access with err 4096`, the same
+  refusal `ggml_cuda_peer_copy_ok`/`ggml_cuda_slab_peer_copy_ok` exist for) and the copy returns `invalid argument` —
+  a hard abort of the request: measured on the two-arm beta campaign as `2-D read of 'result_output' failed (invalid
+  argument): 331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280 (ROCm1 buffer)`, where device 0's twin
+  copy of the same bytes (the allocation's owner) succeeded.  **The delivery had this too, and had diagnosed it
+  wrongly**: `TODO` #124's abort was recorded as "the arguments are what the caller got wrong" and answered with a
+  diagnostic that printed them.  `ggml_cuda_rows_to_host()` now serves all three sites (the CUDA buffer's synchronous
+  2-D read, the KV region's row helper, and `ggml_backend_cuda_get_tensor_2d_async`) with: ONE 1-D copy for a tight
+  block; the device-staged chunked form (2-D device-to-DEVICE gather into the reading device's own staging buffer,
+  one 1-D D2H per chunk into that device's own pinned chunk, host scatter) when the call may synchronize and the
+  block is above `ggml_cuda_bounce_min()`; one 1-D copy per row otherwise (the async form, which must not
+  synchronize, and blocks whose row exceeds the 64 MiB staging pair).  The async form also now selects its own
+  device (`ggml_cuda_set_device(cuda_ctx->device)`, which its write twin always did) — it issued the copy on its
+  context's stream without it.  Text-neutral: `gate-state-pipe` 1.48-1.62x of the synchronous arm, `gate-meta-seg-drain`
+  `e2dde701fc04` on both arms, the eight coherence arms unchanged.  Gate: `scripts/gate-state-pipe.sh` +
+  `scripts/gate-meta-seg-drain.sh`; the pair's own copy of these streams is `ggml_cuda_host_stream()`, which is pair
+  machinery and lives in the beta artifact.
+
+**r365 — a unified cache's admission is a PRE-LAUNCH decision, and it belongs to the scheduler's oracle, not to a new defer site.**
+The delivery's default server is `-np -1` ⇒ 4 slots and `kv_unified = true` (`server.cpp`), and with a unified cache every
+slot may use the WHOLE context — so "a slot is free" says nothing about whether a prompt fits.  Two prompts whose sum
+exceeds the context used to be launched together, and the failure lands in **decode**, where nothing can recover it: the
+retry loop can only clear IDLE slots (`try_clear_idle_slots` skips a processing one), so it halves `n_batch` to 1 and aborts
+a *running* slot (measured on r364, `-c 8192 -np 4 --kv-unified`, two ~4.8k prompts: both HTTP 500 "Context size has been
+exceeded."; the same two prompts alone: both 200).  Facts that follow, and that a later change must not re-derive:
+(a) the only point at which a request can be held back is BEFORE `launch_slot_with_task()`, which commits the prompt —
+so a fit check is a pre-launch veto, not a per-step budget (block 16's fair share divides the step and is orthogonal);
+(b) the veto must be SLOT-INDEPENDENT: the accounting sums the *running* slots' held cells, and the candidate is always an
+idle one, so `server_slot_sched::select()` can ask the context's oracle once, before choosing a candidate, and the refusal
+travels the existing `plan.id_slot == -1 → queue_tasks.defer()` path — one defer site, so `pop_deferred_task()` and
+`/metrics`' `n_tasks_deferred` cover it for free (a second `defer()` call site would have to re-earn both);
+(c) IDLE slots must not be charged: the launch path parks the residents and then `try_clear_idle_slots()` clears them for
+want of room, so an idle slot never has to be waited for — charging it would defer a request for room that is already
+there.  A realtime slot waiting for audio must not be charged either: it is `is_processing()` but holds no batch work
+(`update_slots()`' `all_idle` counts it idle for the same reason), and charging it defers a task no release can rescue;
+(d) the reply reserve is `min(n_ctx / n_parallel, n_ctx_slot())` cells — the per-sequence share a non-unified cache would
+give each slot — capped by the request's own `n_predict`; it is an admission HEURISTIC, not a bound (a reply that outgrows
+it can still fill the cache and fail as before);
+(e) the wake must be provably spin-free: a release wakes exactly one deferred task, and a task that is re-offered and
+refused again would wait for an unrelated request, so `update_slots()` re-offers one when **no** slot is processing — that
+condition is the proof (with nothing processing the popped task is always admitted, so the loop makes progress).  Counting
+an audio-waiting slot as busy on the admission side but idle on the wake side is exactly how a wake spins at 100 % CPU;
+(f) a task that was never launched is answered at **termination**: `server_context::terminate()` drains
+`queue_tasks_deferred` (`server_queue::take_deferred_tasks()`) and aborts the running slots.  Without it a SIGTERM issued
+while a deferred task existed never returned — the exit hung inside HIP's teardown (`__hip_module_dtor` → `amd_comgr_destroy_metadata`), because
+`server_http_context::join()` waits for an HTTP worker that is still waiting on a result nothing will produce.  This was
+PRE-EXISTING (the stock "no free slot" deferral escaped it only because the release path launches the task and then aborts
+it); making deferral ordinary made it reliable.
+Text: a deferred-then-admitted request produces the SAME tokens as when it runs alone (measured: `gate-kv-admit.sh`'s
+purity arm, both answers `1dfd5ced6f3e` with `cache_prompt: false`, the deferred request re-prefilling all 5246 tokens).
+Gate: `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46); knobs `ENVIRONMENT.md` §29 / `DIAGNOSTIC.md` §29; PR #370.
+
+**r366 -- the slab's WIDE (prefill) band is armed by the prefill PASS, never by the carved H2D ring hole.**
+`ring_armed` was `ring_region > 0 && wide_off > narrow_floor && boundary >= wide_off`, and it is what
+`ggml_cuda_slab_wide_available()` and `ggml_cuda_slab_wide_aux_alloc()` gate on, so a slab that carves NO ring
+hole -- which r362 made the pool-backed host-expert default (r362) -- had no wide band at all.  Two consequences,
+both silent: (a) every prefill-only transient that lives in the band (the FA staging arena, the CUDA pool's large
+allocations under `GGML_CUDA_POOL_WIDE`, the MMB activation cache, the chunked-GDN/QSA3 `wide_scratch`) falls
+outside the slab onto the outside headroom (~1536 MiB on one GPU), and a starved cushion is a slow path or an
+allocator failure, never a diagnostic; (b) `ring_wide` also required `ring_region > 0`, so a prefill view was
+classified NARROW and *learned* `narrow_floor` as its own size (measured 1792 -> 3328 MiB, which is the
+`compute buffer 1536 -> 2875 MiB` a reporter sees as a reallocation), permanently: the band could not be
+re-armed and the arena lost the difference at every decode.  So *"the hole is arena nothing reads"* (r362) is
+true of the RING and says nothing about the BAND -- the ring is one consumer of the band, not its definition.
+The rule now: `wide_armed` is `ring_requested && narrow_floor > 0 && boundary >= (placement + the view's extent)`,
+and `ggml_cuda_slab_wide_place()` is the ONE placement rule (`narrow_floor + ring_region` above a carved ring,
+base 0 when none is carved, the pre-hierarchy layout) used by both `work_alloc` and `ggml_cuda_slab_seed_floor`.
+The ring keeps its own gates (`ring_slot_capacity()`, `arena_alloc_transient()` require `ring_region > 0`), so a
+pool tier still stages nothing and r362's win stands.  A `SLAB_WIDE_AUX ... refused: slab=1 wide_armed=0` line
+that repeats every request is this defect, not a transient; `SLAB_STATS`' `aux_refused` and the `work=…(narrow=…)`
+field are the two numbers to read.  Measured on the reporter's shape (1x R9700 x8, Flash-Next GSQ-RCO-IQ3_XXS,
+`-ncmoe 47 --host-experts pool -ub 8192`, an 89182-token L1): 924 refusals and `narrow=3328` at the drop before,
+0 and `narrow=1792` after, +1.8 % prefill / +6 % decode against r365 and +6.4 % / +19 % against the hole layout,
+text identical; server visits L1 1959.5 t/s / 34.37 tg and stand-downs down from 51 tables to 2.  Gate ladder:
+`benchmarks/2026-11-26-issue-368-wide-band-coupling.md` §5. (r366, GitHub issue #368 -- the reporter's r365
+follow-up; `WORKLOG.md` 261126.001.)

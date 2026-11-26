@@ -12,25 +12,29 @@ and **nothing is copied between them**.
 > `release.json` or `rdna-boosts-all.patch`, and no default `apply-all.sh` checkout contains it.**  Promotion is a
 > block-structure decision and is asked first; a green gate ladder is not permission.
 
-**The candidate is TWO patch files**, applied in filename order by `apply-all.sh --include-beta` (`beta/*/*.patch`),
-one commit each.  They are split on purpose: `state-split-2d-read.patch` is a **delivery-level** fix that the
-candidate merely carries until it is cut into the delivery (a block-09 amendment, `TODO` #376), so at promotion that
-file is **dropped** and the block-17 patch is not touched; block 17's own patch is exactly the one that was already
-tested (its sha256 is unchanged through this split).
+**The candidate is ONE patch file** (r364).  `apply-all.sh --include-beta` applies `beta/*/*.patch` after the
+release blocks, one commit each, so a single file is a single commit.  It used to be three files split on purpose;
+both side files are now accounted for and are no longer carried here:
+
+* `state-split-2d-read.patch` (the 2-D device->host read fix) was a **delivery** defect, not a pair one: on ROCm a
+  2-D D2H into host memory needs a peer grant of the destination's pinned allocation, which is refused on a box whose
+  slabs leave the driver no room, and llama.cpp's output/state buffers are one device's allocation read by every
+  device of a `-sm tensor` split.  It **landed in the delivery** at `r364` as a **block-14 amendment**
+  (`ggml_cuda_rows_to_host()`, `TODO` #376 closed).  Only the conversion of those host-side streams to the pair's
+  per-(thread, device) host stream remains here, which is pair machinery.
+* `two-arm-drop-boundary.patch` (STEP 16: the pair keeps the prefill->decode compute-buffer drop, fenced by the
+  other arm's step boundary — it is what restores CUDA graph capture, pair decode **45.9 -> 88.4 t/s**) is pair-only
+  by construction (a single-context server installs no callback and is unchanged), so it is **folded into this one
+  patch**.
 
 | | |
 |---|---|
-| patch 1 (block 17) | `prefill-decode-arms.patch` — cut against the current `release.json` tree |
-| sha256 | `a2badad1933248a0a4660c77a846b471626e7fc5e31bf72202866808e366fe3c` |
-| size | 42 files, **+3073/−741** |
-| patch 2 (STEP 15, delivery-level) | `state-split-2d-read.patch` — cut **on top of patch 1** (it edits `ggml-cuda.cu`, which block 17 also edits) |
-| sha256 | `b3f0645abfe75c422ec4107a5ec21e38ff3ed9dbb00a39ec5196e204c2a7336b` |
-| size | 1 file, **+85/−46** |
-| patch 3 (STEP 16, delivery-level) | `two-arm-drop-boundary.patch` — the pair keeps the prefill→decode compute-buffer drop, fenced by the other arm's step boundary; it is what restores CUDA graph capture (pair decode **45.9 → 88.4 t/s** on the Flash-Next shape) |
-| sha256 | `fd50d736e4ee959175d5f99f98afd3a8c0f9c219e47ad0c2da4f301d31030963` |
-| size | 4 files, **+97/−4** |
-| cut against | `release.json` base `919794500`, tree **`27db9bfd4ef7f41c7df60f704410de28863beac3`** |
-| **applied tree** | **`dc9c657e6e9d0cd3af485153e69a7cbfaf5ef941`** (release tree + all three patches; verified below) |
+| patch (block 17, the whole candidate) | `prefill-decode-arms.patch` — cut against the current `release.json` tree |
+| sha256 | `4ba17090a1808f2159db1532d2e9e563ec94d643e27fd35a897052cf2a137ca5` |
+| size | 45 files, **+3379/−766** |
+| contains | the two-arm server, PLUS STEP 16 (the compute-buffer drop fence, `llama_context_set_drop_boundary()`) and the pair's per-(thread, device) host stream (`ggml_cuda_host_stream()`) |
+| cut against | `release.json` base `919794500`, default tree **`981f4ab89de3d0372509831b10e5734e7d6b70b8`** (r364) |
+| **applied tree** | **`c1d50b664e8f95e93590135074d8aca7595b30c5`** (release tree + this patch; identical to the three-file form's tree, so the artifact's own gates read the same numbers) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -40,21 +44,37 @@ tested (its sha256 is unchanged through this split).
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
-#   18 delivery blocks (tip 13df5e2c7, tree 4244d077e...), then 2 beta candidate patches:
-#     prefill-decode-arms.patch     (block 17, the two-arm server)
-#     state-split-2d-read.patch     (STEP 15, the 2-D read fix  -- delivery-level, dropped at promotion)
-#     two-arm-drop-boundary.patch   (STEP 16, the drop fence      -- delivery-level, dropped at promotion)
-#   applied tree: dc9c657e6e9d0cd3af485153e69a7cbfaf5ef941
+#   18 delivery blocks + 1 temporary (r364: tip 786bdfecd, tree 981f4ab89), then ONE beta candidate patch:
+#     prefill-decode-arms.patch     (block 17: the two-arm server + STEP 16's drop fence + the host stream)
+#   applied tree: c1d50b664e8f95e93590135074d8aca7595b30c5
 ```
 
-**Verified three ways on this box**, all reading tree **`dc9c657e6…`**: the tester path
-(`apply-all.sh --include-beta .` from `919794500`, which prints two applied patches and the tree); a `git am` of
-both files in filename order on a checkout already at `13df5e2c7`; and the squashed tree the two patches were cut
-from.  Patch 1 was cut from a canonical chain (`apply-all.sh` at `919794500`, then the campaign's `steps/` to
-STEP 14), patch 2 from one more `steps/` replay to STEP 15, with the generated docs regenerated — and the replayed
-trees equal the campaign's own trees exactly.
+**Verified on this box**, reading tree **`c1d50b664`**: the tester path (`apply-all.sh --include-beta .` from
+`919794500` on the r364 set, which prints ONE applied beta patch and the tree), and a fresh clone at the same base
+re-applied from scratch — both produce `c1d50b664` exactly.  That tree is byte-identical to the one the previous
+three-file form produced, which is the check that the squash changed no code: only the *stream token* inside the
+2-D read helper differs from the delivery's copy (`ggml_cuda_host_stream()` here, `cudaStreamPerThread` in
+`patches/`, because the host stream is pair machinery).
 
 ## KNOWN OPEN DEFECT — this candidate is NOT bug free
+
+> **RE-TEST THIS FIRST on r363+ (2026-11-25).**  The corruption below has a strong candidate explanation that was
+> found and FIXED in the delivery after this artifact was frozen: block 14's attendance pool served **stale K/V**
+> after any batch that wrote the KV mirror without resolving through the pool (a prefill chunk, the QSA
+> dense/shortcut arm) — i.e. exactly what a two-arm server under concurrent prefill + decode does all the time
+> when a slot's prompt re-prefills cells another slot left resident (`WORKLOG.md` 261125.010, `INVARIANTS.md`
+> r363, GitHub PR #369).  **The pool was ON in the maintainer's corruption run**: `LLAMA_KV_REGION_POOL=N` and
+> `--kv-region-pool N` are the same switch as `--kv-attendance-pool on` (the numeric size has been ignored since
+> r247, the placement is still enabled), and the Flash-Next IQ4_NL `runme` on this box sets
+> `LLAMA_KV_REGION_POOL=32768`.  Measured on the r362 tree at 1 GPU, `-ncmoe 48 -c 32768`, two sequential
+> requests sharing a prefix: 225 M mismatching words and a wrong answer, `0` with the fix — so the pool alone is
+> sufficient to corrupt an answer, without any pair-specific race.
+> **The experiment, and it is cheap:** `apply-all.sh --include-beta` (r363 tree), build, then run the load shape
+> with `--kv-attendance-pool on` **and `LLAMA_KV_POOL_VERIFY=1`** on both r362+beta and r363+beta.  If the r362
+> arm reports `bad > 0` (the counters line at teardown) and r363 reports `bad 0` with the same text as the pool-off
+> arm, `TODO` #378 is this defect and the pool can be cleared.  Until that run exists, #378 stays open **for both
+> suspects** — the pool (now fixed in the delivery, unverified on the pair) and the pair itself.
+
 
 **The maintainer reproduced a CORRUPTION under heavy concurrent load on 2026-11-24** (pair ON, pushing the server
 hard; the same build passes the crash, split-state, text-identity and gate ladders below).  There is no reproducer
@@ -226,7 +246,8 @@ allocation for the copying device's agent; this server's pinned output buffer is
 read from all three, and this box refuses that grant (as it refuses `hipMemSetAccess` — which is why
 `ggml_cuda_peer_copy_ok` exists).  The same bytes as 1-D copies are accepted from every device.
 
-**The fix (STEP 15, second patch here: `state-split-2d-read.patch`; campaign history `steps/STEP-15-0022-no-2d-d2h`):** the CUDA backend issues **no 2-D device->host copy into host
+**The fix (STEP 15 — now DELIVERY code: block 14's r364 amendment, `ggml_cuda_rows_to_host()`; campaign history
+`steps/STEP-15-0022-no-2d-d2h`):** the CUDA backend issues **no 2-D device->host copy into host
 memory**.  `ggml_cuda_rows_to_host()` serves a tight block or a single copy as ONE 1-D copy, a big synchronous block
 through the device-staged form (2-D device-to-**device** gather into the reading device's own staging buffer, one
 1-D D2H per chunk into that device's own pinned chunk, host scatter), and the async form / a small block as one 1-D
