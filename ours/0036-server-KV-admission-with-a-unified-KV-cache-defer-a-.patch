@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 25 Nov 2026 23:33:58 +0000
-Subject: [PATCH 36/36] server: KV admission -- with a unified KV cache, defer
+Subject: [PATCH 36/37] server: KV admission -- with a unified KV cache, defer
  a task whose prompt cannot fit next to the running slots (prompt + 16384-cell
  generation reserve each) until a slot is released, instead of admitting both
  and failing a generating slot mid-decode (2x150K at 256K: HTTP 500

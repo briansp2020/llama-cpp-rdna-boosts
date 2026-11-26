@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 26 Nov 2026 04:30:37 +0000
+Subject: [PATCH 37/37] server: prompt cache -- a fresh large state buffer gets
+ n/16 extra capacity so a growing conversation's next saves reuse it instead
+ of mapping and faulting in a new ~2 GiB buffer each turn (2x125K agents: 4
+ KiB pages 0.33-0.37 s per save, THP 2-11 s of direct compaction once page
+ cache fills RAM; FINDINGS 1146) (LLAMA_SERVER_CACHE_SLACK=0: exact capacity)
+
+---
+ tools/server/server-slot-sched.cpp | 33 ++++++++++++++++++++++++++----
+ 1 file changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
+index c6e2738aaf..f6d954c24a 100644
+--- a/tools/server/server-slot-sched.cpp
++++ b/tools/server/server-slot-sched.cpp
+@@ -108,6 +108,19 @@ static bool prompt_cache_hugepage() {
+ }
+ #endif
+ 
++// a long agent conversation saves a slightly larger state every turn (~25 MiB per 1.5K tokens at 128K), so a spare of the
++// previous size never fits and every save maps and faults in a fresh ~2 GiB buffer: 0.33-0.37 s in 4 KiB pages, and
++// 2-11 s of direct compaction with huge pages once the page cache fills RAM (FINDINGS 1146).  A fresh large buffer gets
++// n/16 of extra capacity (mapped, untouched until a later save grows into it), so the next turns' saves reuse it.  Once
++// recycled, its full capacity counts toward the cache size limit like any spare.  LLAMA_SERVER_CACHE_SLACK=0: exact capacity
++static bool prompt_cache_slack() {
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_SERVER_CACHE_SLACK");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return v;
++}
++
+ common_state_data server_prompt_cache::take(size_t n) {
+     // the smallest spare that holds n bytes; resizing it down keeps the memory, resizing it up zero-fills only the tail
+     size_t best = spare.size();
+@@ -117,7 +130,13 @@ common_state_data server_prompt_cache::take(size_t n) {
+         }
+     }
+     common_state_data buf;
+-    if (best < spare.size()) {
++    const bool   large = n >= (64u << 20);
++    const bool   reuse = best < spare.size();
++    const size_t cap   = large && prompt_cache_slack() ? n + n/16 : n;
++    if (reuse) {
++        if (large) {
++            SRV_TRC(" - state buffer of %.3f MiB: reusing a spare of %.3f MiB\n", n / (1024.0 * 1024.0), spare[best].capacity() / (1024.0 * 1024.0));
++        }
+         buf = std::move(spare[best]);
+         spare.erase(spare.begin() + best);
+     }
+@@ -125,18 +144,24 @@ common_state_data server_prompt_cache::take(size_t n) {
+     // the guard is the OS, never `defined(MADV_HUGEPAGE)`: with a guard on the macro a missing <sys/mman.h> silently
+     // compiles the whole branch out of every Linux build.  It did exactly that from r328 to r339 -- the include stayed in
+     // server-task.cpp when `take()` moved here, and LLAMA_SERVER_CACHE_HUGEPAGE did nothing (issue #348)
+-    else if (prompt_cache_hugepage() && n >= (64u << 20)) {
++    else if (prompt_cache_hugepage() && large) {
+         // reserve() only maps the buffer, so the advice is in place before the zero fill below touches a page; the huge
+         // pages cover the 2 MiB-aligned part of it (a failed madvise leaves 4 KiB pages, as before)
+-        buf.reserve(n);
++        buf.reserve(cap);
+         const uintptr_t huge = 2u << 20;
+         const uintptr_t beg  = ((uintptr_t) buf.data() + huge - 1) & ~(huge - 1);
+-        const uintptr_t end  = ((uintptr_t) buf.data() + n) & ~(huge - 1);
++        const uintptr_t end  = ((uintptr_t) buf.data() + cap) & ~(huge - 1);
+         if (end > beg) {
+             madvise((void *) beg, end - beg, MADV_HUGEPAGE);
+         }
+     }
+ #endif
++    else if (cap > n) {
++        buf.reserve(cap);
++    }
++    if (large && !reuse) {
++        SRV_TRC(" - state buffer of %.3f MiB: new buffer, capacity %.3f MiB\n", n / (1024.0 * 1024.0), buf.capacity() / (1024.0 * 1024.0));
++    }
+     buf.resize(n);
+     return buf;
+ }
+-- 
+2.53.0
+

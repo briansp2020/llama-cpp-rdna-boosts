@@ -86,6 +86,7 @@ services:
       - LLAMA_SPEC_BATCH_BUDGET=6              # draft cap with several generating slots (FINDINGS 758)
       - LLAMA_SERVER_LAZY_IDLE_SLOTS=0         # lazy idle slots cost decode -5 % and made greedy text load-dependent (finding 554)
       - LLAMA_SERVER_PREFILL_DUTY=32           # user 2026-11-23: up to 31 decode-only steps between prefill steps; decoding slot ~1.6x faster during a concurrent long prompt, its TTFT +20 % (finding 1084)
+      - LLAMA_SERVER_CACHE_HUGEPAGE=0          # 4 KiB pages for prompt-cache save buffers: THP madvise direct compaction stalled 120-130K saves 2-11 s on this 59 GB box; 4 KiB = steady 0.33-0.37 s (finding 1146)
       - LLAMA_CKPT_USER_MERGE=256
     volumes:
       - ./models:/models

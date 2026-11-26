@@ -10,10 +10,10 @@ release as published; only `ours/` is added.
 ```
 git checkout 919794500
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r362 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 36 patches (0001-0036)
+git am <path-to-this-repo>/ours/*.patch              # 37 patches (0001-0037)
 ```
 
-Result: tree `0a70f4f6dabf`. This is our production build from 2026-11-26.
+Result: tree `9da8168e1a47`. This is our production build from 2026-11-26.
 
 Also in `ours/`: `bench/llbench.py` (the benchmark below), `deploy/docker-compose.yaml` (our production
 compose file, local paths replaced by `./models`) and `tools/mkhead.py` (one step of the draft-head recipe).
@@ -139,7 +139,7 @@ results for several engines on R9700 cards with its own runner.
   Our code lives in two included files, `moe-expert-tier.inc` and `moe-expert-tier-state.inc`, and runs only for
   sparse (mmap) tables. Pool and pinned tables run the release's own code. The tier code covers the RAM tier, the
   pin budget, KV lending, the fill fence, batched admissions and the device remap for sparse tables.
-- **0004-0036** are one feature each, in the order they were added.
+- **0004-0037** are one feature each, in the order they were added.
 - A fix to one of our patches goes into that patch, not into a new one. A later patch that touches an earlier
   one's code adds a feature of its own, with its own switch.
 - Every behaviour change has an environment switch. The table gives the value that turns it off (or the opt-in).
@@ -185,11 +185,16 @@ results for several engines on R9700 cards with its own runner.
 | 0034 | meta (tensor split): cheaper split-state misses -- lean source states, states derived between the allocation and compute lookups, and a walk pruned per buffer; agent-turn prompt time -10 %, outputs identical | `GGML_META_SS_LEAN=0`, `GGML_META_SS_DERIVE=0`, `GGML_META_SS_PRUNE_XBUF=0` |
 | 0035 | llama: a state copy larger than the pinned stage (`LLAMA_STATE_ASYNC_MAX_MIB`, 256) runs the batched copy in rounds of the stage size instead of tensor by tensor through pageable memory; 350 MiB prompt-cache save 52-68 -> 20-37 ms, its load -26..-32 ms, same bytes | `LLAMA_STATE_ASYNC_ROUNDS=0` |
 | 0036 | server: KV admission. With a unified KV cache, a request whose prompt cannot fit next to the running slots (each counted with its prompt plus a 16384-cell generation reserve, `LLAMA_SERVER_KV_ADMIT_RESERVE`) waits until a slot is released, instead of being admitted and failing a generating slot when the cache fills mid-decode; with every slot idle, one waiting request is woken. Two 150K-token requests at 256K: one HTTP 500 before, both complete now (134 -> 87 s) | `LLAMA_SERVER_KV_ADMIT=0` |
+| 0037 | server: prompt cache -- a fresh large state buffer (64 MiB or more) gets n/16 of extra capacity, so the next saves of a growing conversation reuse it instead of mapping and faulting in a new one; 120-130K-token agent-turn saves 0.33-0.37 s -> 0.12-0.13 s | `LLAMA_SERVER_CACHE_SLACK=0` |
 
 ## Settings that matter for this series
 
 - `-cram 10240`: 10 GiB of RAM for the prompt cache, so two long-context agents can take turns on the
   GPU and swap their contexts through RAM instead of re-reading their prompts.
+- `LLAMA_SERVER_CACHE_HUGEPAGE=0`: 4 KiB pages for the prompt-cache save buffers. With transparent huge pages in
+  `madvise` defrag mode and the page cache filling RAM (the mmapped host experts), huge pages made 120-130K-token
+  saves stall 2-11 s in direct compaction on our 59 GB host; with 4 KiB pages they take 0.33-0.37 s (0.12-0.13 s
+  when 0037 lets them reuse a buffer).
 - `LLAMA_TP_FFN_EVEN=1`: the release's opt-in even FFN / shared-expert split.
 - `GGML_MOE_KV_LEND=1`, `GGML_MOE_KV_SEG=1`: the KV segment (0018-0020).
 - `GGML_MOE_PREFILL_INPLACE=1`, `GGML_MOE_PF_PREFETCH=1`: in-place prefill for tier tables, and RAM-tier experts staged one layer ahead.
@@ -204,16 +209,16 @@ results for several engines on R9700 cards with its own runner.
 
 With 57.6 GiB of host experts, the expert cache holds 68.2 % in VRAM.
 
-## Validation (r362, 2026-11-25)
+## Validation (r362, 2026-11-25 and 26)
 
 - Rebased from r359 onto r362; two conflicts in 0001, both with r360/r361 changes (the fast top-k sampler path
-  also requires no penalty state; the release's `fattn_stage_bound(backend, type_k, type_v)` kept). New: 0036.
+  also requires no penalty state; the release's `fattn_stage_bound(backend, type_k, type_v)` kept). New: 0036, 0037.
 - The 7-model comparison with the release passes (nightly gate: 0 problems, 0 warnings, 0 failed loads).
 - Production configuration: output identical to the r359 series on every check: greedy, 512-token prompt set,
   4.3k and 30k-token prompts, agent turns with checkpoint restores; 0 GPU faults. Speed equal within noise.
 - Concurrency: two ~100K requests run side by side; two ~150K requests, which do not fit in 256K together, now
   run one after the other and both complete with the same output each time.
-- The series on r351 passed an overnight stress run (2 GPUs, 46 rounds: 0 output mismatches, 0 GPU faults);
-  r362 has not had one yet.
+- With 0037: the 7-model gate passes again, and an overnight stress run (46 rounds over two sessions, 11 of them
+  in the 2-GPU production configuration) has 0 output mismatches and 0 GPU faults.
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.
