@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 26 Nov 2026 14:55:12 +0000
-Subject: [PATCH 37/41] server: KV full stop -- with a unified KV cache, end a
+Subject: [PATCH 37/42] server: KV full stop -- with a unified KV cache, end a
  reply that no longer fits with a length stop instead of failing the decode
  (LLAMA_SERVER_KV_FULL_STOP=0: off)
 

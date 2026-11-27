@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 23 Nov 2026 17:57:05 +0000
-Subject: [PATCH 30/41] server: save and clear idle slots before the
+Subject: [PATCH 30/42] server: save and clear idle slots before the
  prompt-cache restore, not after the launch (LLAMA_SERVER_IDLE_CLEAR_FIRST=0:
  off)
 

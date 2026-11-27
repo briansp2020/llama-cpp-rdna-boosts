@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 27 Nov 2026 21:23:03 +0000
+Subject: [PATCH 42/42] mmb: NVFP4 on MMB on RDNA4, dense and routed
+ (GGML_CUDA_MMB_NVFP4)
+
+---
+ ggml/src/ggml-cuda/mmb.cu | 21 +++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 8ff0c34249..e4b6415af6 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -2065,6 +2065,15 @@ bool mmb_iq3xxs_glu() { return mmb_policy<int>([](int d) { const char * e = gete
+ //
+ // GGML_CUDA_MMB_TYPES=<csv of type names, e.g. iq4_xs,iq3_xxs,q8_0> overrides the set, so a future
+ // gfx1201 per-type re-tune is validated without a rebuild (and without re-cutting the patch).
++// GGML_CUDA_MMB_NVFP4 (default 1): NVFP4 on MMB on RDNA4 too -- dense and routed (MUL_MAT_ID and the fused GLU), with
++// routed MMB otherwise off on RDNA4.  With the register-table dequant + weight prefetch (rdna-boosts PR #379), 1x R9700:
++// dense 27B NVFP4 pp512/pp2048 and Inkling-2-Mini NVFP4 experts beat the delivery MMQ path (FINDINGS 1176 / 1190).
++// Output changes at rounding level (bf16 activations instead of MMQ's q8_1).  0: NVFP4 stays on MMQ on RDNA4.
++// GGML_CUDA_MMB_ROUTED=0 no longer keeps NVFP4 experts on MMQ there: an A/B off arm needs GGML_CUDA_MMB_NVFP4=0.
++static bool mmb_nvfp4_rdna4() {
++    static const bool v = getenv("GGML_CUDA_MMB_NVFP4") == nullptr || atoi(getenv("GGML_CUDA_MMB_NVFP4")) != 0;
++    return v && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
++}
+ static uint64_t mmb_wtype_mask() {
+     const uint64_t IQ_FAMILY = (1ull << GGML_TYPE_IQ4_NL) | (1ull << GGML_TYPE_IQ3_S) |
+                                (1ull << GGML_TYPE_IQ4_XS) | (1ull << GGML_TYPE_IQ3_XXS);
+@@ -2099,7 +2108,8 @@ static uint64_t mmb_wtype_mask() {
+         fprintf(stderr, "MMB: GGML_CUDA_MMB_TYPES=%s -> %d weight type(s)\n", e, cnt);
+         return mask;
+     }
+-    const uint64_t RDNA4_SET = IQ_FAMILY | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0);
++    const uint64_t RDNA4_SET = IQ_FAMILY | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0) |
++                               (mmb_nvfp4_rdna4() ? (1ull << GGML_TYPE_NVFP4) : 0ull);
+     /* r121: per-device arch policy (was devices[0], frozen at the primary). */
+     return GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ? RDNA4_SET : (IQ_FAMILY | K_AND_Q8 | Q4Q5 | IQ2);
+ }
+@@ -2147,7 +2157,8 @@ static uint64_t mmb_dense_tmask() {
+     }
+     /* r121: per-device arch policy (was devices[0], frozen at the primary). */
+     if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+-        return (1ull << GGML_TYPE_IQ3_S) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0);
++        return (1ull << GGML_TYPE_IQ3_S) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0) |
++               (mmb_nvfp4_rdna4() ? (1ull << GGML_TYPE_NVFP4) : 0ull);
+     }
+     return ~0ull;   // elsewhere the pre-S10 behaviour stands: mmb_dense_flag() alone gates it
+ }
+@@ -2375,7 +2386,8 @@ bool ggml_cuda_mmb_reads_bf16_act(const ggml_tensor * src0, const ggml_tensor *
+ }
+ 
+ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+-    if (!mmb_enabled() || !mmb_routed_flag() || !src0 || !src1 || !ids || !dst) return false;
++    if (!mmb_enabled() || !src0 || !src1 || !ids || !dst) return false;
++    if (!mmb_routed_flag() && !(src0->type == GGML_TYPE_NVFP4 && mmb_nvfp4_rdna4())) return false;
+     const bool wtype = mmb_wtype_ok(src0->type);
+     if (!wtype || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
+     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
+@@ -2699,7 +2711,8 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
+ }
+ 
+ bool ggml_cuda_mmb_supported_glu(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
+-    if (!mmb_enabled() || !mmb_routed_flag() || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
++    if (!mmb_enabled() || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
++    if (!mmb_routed_flag() && !(gw->type == GGML_TYPE_NVFP4 && mmb_nvfp4_rdna4())) return false;
+         if (gw->type != uw->type) return false;
+     const bool wtype = mmb_wtype_ok_glu(gw->type);
+     if (!wtype) return false;
+-- 
+2.53.0
+
