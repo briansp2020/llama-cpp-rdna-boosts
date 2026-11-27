@@ -30,7 +30,7 @@ for RDNA4. Kill switch GGML_MMQ_IQ_J64_WIDE=0 (FINDINGS 914-915).
  1 file changed, 14 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 46bc3f3538..f0e2aa52fe 100644
+index e4bc8671cc..041eab621c 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -227,6 +227,20 @@ static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, co

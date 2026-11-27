@@ -1,19 +1,19 @@
-# ours: our production stack on top of the current rdna-boosts release (r366)
+# ours: our production stack on top of the current rdna-boosts release (r368)
 
 This branch holds the patch series we run on top of the latest rdna-boosts release: 2x Radeon AI PRO R9700,
 ROCm 10.2, Qwen3.8-Flash-Next UD-IQ4_XS with `-sm tensor` and `--host-experts mmap`. It is regenerated for each
 release, and patches the release has taken are dropped. It is not a PR. Everything else on this branch is the
 release as published; only `ours/` is added.
 
-**Base:** `v18-919794500-r366` (upstream llama.cpp `919794500` + this repo's release).
+**Base:** `v18-919794500-r368` (upstream llama.cpp `919794500` + this repo's release).
 
 ```
 git checkout 919794500
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r366 release, branch rdna-boosts
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r368 release, branch rdna-boosts
 git am <path-to-this-repo>/ours/*.patch              # 40 patches (0001-0040)
 ```
 
-Result: tree `2ff0e2404dee`. This is our production build from 2026-11-26.
+Result: tree `ccd3dcdab4ac`. This is our production build from 2026-11-26.
 
 Also in `ours/`: `bench/llbench.py` (the benchmark below), `deploy/docker-compose.yaml` (our production
 compose file, local paths replaced by `./models`) and `tools/mkhead.py` (one step of the draft-head recipe).
@@ -214,14 +214,13 @@ results for several engines on R9700 cards with its own runner.
 
 With 57.6 GiB of host experts, the expert cache holds 68.2 % in VRAM.
 
-## Validation (r366, 2026-11-26)
+## Validation (r368, 2026-11-26)
 
-- Rebased from r362 onto r366; two conflicts (the slab seed floor in 0001 with the release's wide placement, and the
-  KV segment's idle-slot hint beside the release's deferred-task re-offer). Dropped: our KV admission, which the
-  release took in r365. New: 0037-0040.
+- Rebased from r366 onto r368 with no conflicts; the 40 patches are unchanged. The release's r367 and r368 changes
+  (the RDNA3 verify band, the Q5_K VDR-4 dense kernel, the Q6_K MMQ opt-in) leave gfx1201 output unchanged by default.
 - The 7-model comparison with the release passes (gate: 0 problems, 0 warnings).
-- Production configuration: greedy and the 512-token prompt set give the same output as the r362 series; agent turns
-  with prompt-cache saves and restores give the same replies, with 0 GPU faults.
-- The overnight stress run has not been done on r366 yet.
+- Production configuration: greedy and the 512-token prompt set give the same output as the r366 series; two long
+  agents taking turns: 29.9 s for 3 rounds (r366: 29.8 s), 0 GPU faults.
+- The overnight stress run has not been done on r368 yet.
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.

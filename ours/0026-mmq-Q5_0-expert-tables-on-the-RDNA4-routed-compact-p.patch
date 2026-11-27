@@ -19,7 +19,7 @@ Subject: [PATCH 26/40] mmq: Q5_0 expert tables on the RDNA4 routed-compact
  2 files changed, 23 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index f0e2aa52fe..cb55a5d53a 100644
+index 041eab621c..f97d27b93a 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -219,6 +219,9 @@ static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, co
