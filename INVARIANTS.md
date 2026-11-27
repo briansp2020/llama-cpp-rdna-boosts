@@ -3663,3 +3663,89 @@ field are the two numbers to read.  Measured on the reporter's shape (1x R9700 x
 text identical; server visits L1 1959.5 t/s / 34.37 tg and stand-downs down from 51 tables to 2.  Gate ladder:
 `benchmarks/2026-11-26-issue-368-wide-band-coupling.md` §5. (r366, GitHub issue #368 -- the reporter's r365
 follow-up; `WORKLOG.md` 261126.001.)
+
+**r367 -- one lost boolean on `verify_band_arch` silently disabled five fusions AND two newer verify paths on every
+RDNA3_0 card.**  `ggml_cuda_should_fuse_mul_mat_vec_q(..., verify_band = true)` is the SINGLE gate a family of
+2..8-token fusions shares, so its arch term is a single point of failure for all of them, not for one kernel:
+the three Q8_1 pre-quantize fusions (`ADD` + `rms_norm`, plain `rms_norm`, gated unary), the `GLU` -> Q8_1 mark, and
+-- through the same predicate -- the newer `GGML_CUDA_FUSE_GATE_BETA_VERIFY` and r304's GDN gate/beta epilogue
+verify band (`mmvq.cu`'s `ok()`).  The r353 re-cut rebuilt the block from a chain that had **lost** the r95/r325
+`verify_band_arch = RDNA4 || RDNA3_0` term; `gdn-conv.cu`'s `verify_ok` and `cpy-batch.cu` kept their RDNA3_0
+halves, so only this predicate narrowed to RDNA4 -- and the function's doc comment was reflowed in the same release
+to say "RDNA4 and RDNA3_0", so prose and code disagreed and no gate could notice: a fusion that stops matching
+produces the same text and the same logits, only slower.  Two rules follow.  (1) **A gate that no census covers must
+be measured, not read**: the r95 acceptance evidence was a gfx1100 A/B against `GGML_CUDA_FUSE_Q8_1_VERIFY=0`, and it
+is the only thing that separates "the band runs" from "the band is unreachable".  r367 restores it and re-measures on
+gfx1100 (27B Q4_K_M, MTP `draft-mtp`, `-n 700`, 3 interleaved rounds): **77.4 / 77.4 / 77.3 t/s against
+74.7 / 74.9 / 74.9 with the switch off = +3.4 %**, text identical (`2cbc569a7a76`), width probe `W=1..8` identical
+hashes and `maxdiff 0`, `gdn_epi: verify q4_K tokens 2` present on the default arm and absent on `=0`, and the
+`GGML_CUDA_FUSE_GDN_EPI=0` arm's probe identical too.  (2) **A re-cut is the class that loses a boolean**: the r353
+loss was invisible to the build (the predicate compiles either way), to the text gates (it is a performance-only
+decision) and to `check-rung-file-sets.py` (no file, define, env var or option disappeared -- a *predicate term* is
+not an inventory row, gate 38's known blind spot).  A re-cut therefore owes the arch A/B of any default-on gate whose
+only evidence is a percentage, not only the coherence/text ladder.  Block 08 carries the amendment (it introduces
+the predicate; block 09's extraction carries it to `mmvq.cu`, where the delivered line lives).
+(r367, GitHub issue #373; `benchmarks/2026-11-26-issue-373-rdna3-verify-band.md`; `patches/README.md` block 10.)
+
+**r367 -- an optional artifact's tree must BUILD; "it applies and re-verifies" is not a compile.**  `0101-mixed-kv`
+carried a missing closing brace in `fattn-rdna.cuh` from the r360 re-cut to r366: r360 added
+`ggml_cuda_fattn_kv_pair_native_host` at exactly the spot where the artifact inserts `ggml_cuda_fattn_tile_type_V`,
+the rebase kept both functions, and the hunk ended at the outer function's `return` -- so the artifact's inserted
+function became a NESTED function definition (`97 open / 96 close`), which is illegal in C++ and which every
+FA template-instance TU reports as `function definition is not allowed here` at the first line after it.  It was
+invisible by construction: the patch applied STRICTLY, `validate-set.sh` check 8 compared the produced tree to
+`release.json.optional`, the tree matched (the broken content IS the recorded tree), and optional artifacts are
+outside the release gate ladder, so nothing compiled it.  Optional artifacts are shipped code a consumer builds, so
+a tree that applies is not evidence of anything: `scripts/gate-optional-build.sh` (gate 47) applies the default set,
+applies every artifact in numeric order, asserts `release.json.optional_tree`, and builds the `all` target.  The
+class is *content drift inside an artifact*, which no inventory reconciliation sees (the file, its define set and its
+options are unchanged), so the check has to be a build.  (r367, GitHub issue #371;
+`optional/mixed-kv/README.md`; `MANIFESTS.md` gate 47.)
+
+## r368 (2026-11-26, `WORKLOG.md` 261126.008) — a per-TYPE hole in a per-ARCH kernel table is invisible to every output gate, a kernel win's end-to-end size is set by where the weights live, and a text hash must be the GENERATED TEXT (blocks 07/08/10, GitHub issue #374)
+
+The reporter's Q5_K decode finding is real and was fixed by giving Q5_K the dense 32-element `VDR=4` dot product
+Q4_K already had (`vec_dot_q5_K_q8_1_vdr4_dense`, block 07; host VDR + dispatch in block 10) plus the two rows per
+block Q5_K and IQ4_XS were missing at the verify widths (block 08).  Their second finding — RDNA3_0's Q6_K prefill
+above 128 tokens going to rocBLAS — is real against upstream but **already covered by block 06 above 512 tokens**,
+so the deliverable part of it is an opt-in switch for the 129..511 band.
+
+1. **A type that is uniformly slower than its neighbours passes every gate the delivery has.**  Q5_K computed a
+   correct matvec; `test-backend-ops test`, the prefill-logit gate, the width probe and every text arm say "fine"
+   because they ask whether the *output* is right, never whether a type takes a kernel its bpw does not explain.
+   The instrument for this class is a **per-type µs/call sweep at the model's own shapes with the neighbouring
+   types as controls** (`test-backend-ops perf -o MUL_MAT`, and the reporter's per-type table is the same idea
+   done by hand).  Measured here: Q5_K `m 4096 k 14336` n = 1/2/5/8 `33.01/44.57/81.15/115.09 ->
+   22.23/27.20/51.08/70.21` µs (−33..−40 %), the model's own Q5_K shapes −29 % at n = 1, and the Q4_K/Q6_K
+   controls inside 0.5 %.
+2. **The dense form is an exact integer reordering, so it costs purity nothing — and the row count less than
+   nothing.**  Merging the MoE `VDR=4` kernel's two half-chains into one chain per sub-block uses the same scale
+   and the same `d8` (`|dot1| <= 16*31*127`, times a 6-bit scale < 2^22), and rows per block are a row-block
+   decomposition, so each row's accumulation is unchanged.  `test-logits-width-probe` PASS (worst `maxdiff` 0) on
+   `KV=f16 P=512 ub=1024`, `KV=q8_0 P=3584` and `KV=bf16 P=3584`, and `gate-prefill-logits.sh` reads 0.000000 /
+   100.000 %.  The *cross-build* greedy text does move on RDNA3_0 (the K partition; `GREEDY-PURITY.md` §111) —
+   2 of 6 prompt arms are unchanged and a Q8_0-only model is byte-identical, which is the same asymmetry class as
+   r170's upstream VDR bump.
+3. **A kernel's µs/call win is bounded by the cache residency of the shape it was measured on, and the same
+   kernel serves both regimes.**  The 39 % is measured on a 40 MB matrix that fits the 96 MiB Infinity Cache
+   (instruction bound); a 27B model's 15.3 GiB does not fit, single-stream decode sits at the ~800 GB/s DRAM roof
+   where the Q5_K tensors already were, and the end-to-end number is **tg128 +0.85 %**.  At `B = 8` (and in a
+   verify batch) eight columns share one weight read, the same shape returns to instruction bound, and the win
+   lands: `llama-batched-bench -npl 1,4,8` **+0.9 / +3.4 / +14.7 %** at B = 1 / 4 / 8, S_TG +8.5 %, MTP decode
+   neutral.  So **quote a kernel win with its shape class**, and never infer a single-stream decode win from a
+   cache-resident microbenchmark.
+4. **Read the DISPATCH, not the source line, before believing a path is taken.**  The Q6_K `ne11 <= 128` cap is
+   still in `ggml_cuda_should_use_mmq()` exactly as the reporter read it — and it is **unreachable above 512
+   tokens on the delivery**, because block 06's MMB dense tile is dispatched first: `GGML_CUDA_GCDBG=1` on the 27B
+   reports `mmb=7888 ... cublas` absent at `-ub 512` and `-ub 1024`, and 672 `cublas` GEMMs at `-ub 256`.  A
+   source-level reading of a threshold is a hypothesis; the branch census is the measurement.
+5. **A fresh-process text hash must be the generated text, and nothing else.**  The `[ Prompt: ... | Generation:
+   ... ]` footer is part of `llama-cli`'s STDOUT and its t/s figures differ every run, so `sha256sum` of a whole
+   capture reports a different hash for identical text (this session's first text matrix "found" six arm
+   differences that were six footers).  `scripts/extract-generated.py` is the only correct slice, and `-lv` must be
+   absent from a text arm for the same reason — with `-lv 4` the same extraction returned 194 KB of census lines
+   where the text was 7.8 KB.
+
+**Record.**  `archive/work/issue-374-kquant/README.md` (all tables, both builds, every gate);
+`GREEDY-PURITY.md` §111; `patches/README.md` blocks 07/08/10 (r368 amendments); `ENVIRONMENT.md` §14
+(`-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4`) and §30 (`GGML_CUDA_Q6K_MMQ`, opt-in); `DIAGNOSTIC.md` §30; GitHub issue #374.

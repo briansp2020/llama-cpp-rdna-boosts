@@ -22,6 +22,8 @@ fresh tarball (19/19, strict), tree equality, a conflict-marker/subject scan of 
 applied strictly and tree-checked, the Windows portability lint of the files the set adds — issue
 #231 — then the **file-set reconciliation** of every block against the release it replaces, `TODO` #358,
 which is what catches a re-base that landed fewer files than the patch it replaces carried — checks 1-9).
+The optional **build** is not in CI: `scripts/gate-optional-build.sh` (gate 47) compiles the cumulative
+optional-applied tree on a GPU box, once per release (issue #371).
 **The two-arm server (block 17 until r352) is WITHDRAWN from the delivery** and lives in
 `beta/prefill-decode-arms/` (apply with `--include-beta`); it is not in `patches/`, not counted in `v<N>`,
 and its gates (`gate-arms-spec.sh`, `gate-draft-ctx.sh`, `gate-arms-soak.sh`, and gate 17's TIER rows) are
@@ -44,8 +46,8 @@ supported feature) -- it is applied last, kept separate, and expected to be drop
 | 04 | `0004-…-block-04-BF16-KV-cache-…` | BF16 KV + native-BF16 FA | |
 | 05 | `0005-…-block-05-flash-attention-band-…` | FA band / native quantized K-V / derived kq mask | every kq-mask fill is guarded on `tensor && tensor->buffer` (r131, PR #222) — the derived form leaves the packed mask unallocated at one slot; the decode/verify band also takes the fully-masked group skip (r133, PR #223), with decode-width packed-hole op cases as its oracle; the packed kq mask is **reserved** only where a 2-D (M-RoPE) batch, or a batch the derived form cannot serve, is reachable (r160, issue #238) — `LLAMA_KQ_MASK_PACKED_RESERVE=1` is that reserve's A/B arm and every text-only arm must show identical greedy text with it on and off; the derived mask also covers batches of several sequences, so a `--parallel > 1 --kv-unified` context no longer reserves the packed mask (r172, PR #247) — `LLAMA_KQ_MASK_DERIVED_MULTISEQ=0` is its A/B arm (and its packed reserve), the cell-by-cell oracle must read 0 mismatches over a 4-sequence perplexity batch and the 2-slot server shape, and `gate-prefill-logits.sh --ub 2048 --ab` must read 0.000000 / 100.000 %; the derived input's `can_reuse()` looks through a hybrid memory context to the attention cache it was built from (r164, PR #242) — `LLAMA_KQ_MASK_DERIVED_REUSE=0` restores the rejection, and the iSWA wrapper must keep rejecting because it registers two derived inputs (base and SWA) |
 | 06 | `0006-…-block-06-MMB-quantized-prefill-GEMM` | MMB quantized prefill GEMM + `mmf32` (the F32 skinny prefill GEMM, r104; default-on for **RDNA4 and RDNA3_5** since r105, opt-in on RDNA3) | |
-| 07 | `0007-…-block-07-k-quant-boosts-…` | k-quant boosts (`mmvq` VDR, Q6_K MMQ, Q1_0, grid pad) | **the decode-numerics block** — see `GREEDY-PURITY.md` §2/§9 |
-| 08 | `0008-…-block-08-fused-kernels-…` | fused kernels | fusions + fused MoE gate+up+GLU + per-shape `mmvq` `nwarps`; also the `-sm tensor` **model-load staging buffer** (r116, TODO #90) |
+| 07 | `0007-…-block-07-k-quant-boosts-…` | k-quant boosts (`mmvq` VDR, Q6_K MMQ, Q1_0, grid pad) | **the decode-numerics block** — see `GREEDY-PURITY.md` §2/§9. **+ r368 (issue #374): the dense Q5_K VDR-4 dot product** (`vec_dot_q5_K_q8_1_vdr4_dense`, RDNA3_0 default, RDNA4 behind `-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4`) and the **opt-in** `GGML_CUDA_Q6K_MMQ=1` RDNA3_0 Q6_K prefill band; greedy text moves once on RDNA3_0 (`GREEDY-PURITY.md` §111, `archive/work/issue-374-kquant/`) |
+| 08 | `0008-…-block-08-fused-kernels-…` | fused kernels | fusions + fused MoE gate+up+GLU + per-shape `mmvq` `nwarps`; also the `-sm tensor` **model-load staging buffer** (r116, TODO #90); **+ r368 (issue #374): `calc_rows_per_block_weight` gives Q5_K and IQ4_XS the 2 rows per block the verify band already gave Q4_K/Q6_K** (bit-identical) |
 | 09 | `0009-…-block-09-host-resident-MoE-…` | host-resident MoE | slab, expert cache, prefill cache staging |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | infrastructure: slab, fusion dispatcher, async input ring | the TUs split out of `ggml-cuda.cu`; GDN/rope/MMB fusions; **the seven RDNA3 decode fusions (r175, PR #250)** — the FA/GLU Q8_1 publishes, the V row in the rope+SET_ROWS kernel, the Q/K norm+rope pair, MoE rpb 4 and the down+reduction fold, and the dense row concat — all bit-identical and default-on with a `=0` switch each (`benchmarks/2026-10-29-rdna3-decode-fusions.md`); **the GDN decode folds (r183, PR #256)** — the snapshot-tail fold, the conv-state gather fold, the gated 1-token direct conv and the shared-expert gate fold, plus the 2-D copy guard that fixes a Flash-Next `-sm tensor` load abort (`benchmarks/2026-10-30-gdn-decode-folds.md`); **the conv + q/k norm fold's overlap test follows the deferred gather (r320, PR #316)** — the state test is skipped exactly when the kernel reads the cache row instead, and the cache tensor takes its place; **the quantized-KV decode rotations (r187, PR #258)** and **the shared-expert lane's Q8_1 publish (r188, PR #259)** — both extend the r175 publish/rotate family (`benchmarks/2026-10-31-kv-rotation-decode.md`, `benchmarks/2026-10-31-shared-glu-q8.md`); **the r183 2-D copy guard's vectorised fallback (r189, from the KV campaign)** — `cpy_2d_vec16` for the padded block copies the guard refuses (`benchmarks/2026-10-31-cpy-2d-vec16.md`) |
 | 11 | `0011-…-block-11-qwen4exp-…` | qwen4exp | model, hyper-connections, QSA/indexer, lazy reader, indexer cache (r109 split of the old block 10; + r148: the HC inject logit is the chain's 1/hc-scaled scatter logit, so the fused mixer and the fused combine agree with the model's own chain, issue #228) |
@@ -97,6 +99,9 @@ silently drops hunks (measured: 30 files / 2483 lines instead of 35 / 6094).  Th
    `release.json.optional_tree`), on the freshly built default tree, and fails when one has drifted
    (`TODO` #324: both artifacts had gone stale for 40+ releases because "rebase it every release" was a
    policy with no instrument).
+   **And since r367 the cumulative tree must BUILD**: `scripts/gate-optional-build.sh` (gate 47) is a release
+   gate, because a tree that applies and re-verifies is not a tree that compiles -- issue #371 shipped a
+   non-compiling `0101` tree through r360-r366 with check 8 green.
 
 ## Release gates (all mandatory, recorded in the release's `WORKLOG.md` entry)
 
@@ -107,7 +112,7 @@ cheap:
 |---|---|---|---|
 | 1 | `.github/workflows/validate.yml` (hosted, no GPU) | `validate-set.sh`: strict apply on a fresh tarball, tree/count, per-artifact sha256, the Windows path + portability lints, a conflict-marker/subject scan of every block tree, and the file-set reconciliation when the clone has the previous release's tag | every push and PR, ~20 s |
 | 2 | `radiance` (`scripts/validate-gpu.sh`, cron every 30 min) | re-applies the set at `origin/main` from scratch, **reconciles every block against the release it replaces**, builds the **whole applied tree once**, the seven op oracles, then `gate-prefill-logits.sh` (records a base on a fresh box, compares after) | every new `origin/main` commit, unattended |
-| 3 | a GPU box, by hand | the release flow: `all` build, coherence, MTP Protocol A, arch sweeps, the generated-docs drift check (`scripts/check-gen-docs.sh`, r329) | before a tag |
+| 3 | a GPU box, by hand | the release flow: `all` build, coherence, MTP Protocol A, arch sweeps, the generated-docs drift check (`scripts/check-gen-docs.sh`, r329) and the optional-artifact build (`scripts/gate-optional-build.sh`, gate 47, r367) | before a tag |
 
 Tier 2 exists because almost every block is a CUDA/HIP kernel change and a hosted runner has no ROCm, so
 tier 1 cannot compile any of it.  It is the automation behind "a re-base is a decode AND prefill change"
@@ -1211,6 +1216,21 @@ in CI.  The model-level gates are manual:
     plus no `GGML_ASSERT`/abort in any arm's log and `check-gpu-faults.sh` clean.  Required for any change to
     `server_slot_sched::admit`/`select`, `kv_admit_ok`/`kv_admit_cells`, `LLAMA_SERVER_KV_ADMIT[_RESERVE]`, the
     wake logic in `update_slots`, or `server_queue::take_deferred_tasks`.
+47. **An optional artifact's tree must BUILD, not only apply** (r367, `optional/mixed-kv` `0101`, GitHub issue #371) --
+    `scripts/gate-optional-build.sh`.  `validate-set.sh` check 8 proves every `optional/*/01xx-*.patch` still applies
+    strictly and produces `release.json.optional`/`.optional_tree`, but **nothing compiled an optional-applied tree**:
+    the r360 re-cut rebased `0101` onto block 10's new `ggml_cuda_fattn_kv_pair_native_host` and kept both functions
+    while dropping the outer one's closing brace, so `fattn-rdna.cuh` (97 open / 96 close) put every later function
+    definition inside a function body.  The patch applied, the tree re-verified, every gate stayed green, and the tree
+    did not compile from r360 to r366 (`function definition is not allowed here` at `fattn-rdna.cuh:369` onwards,
+    first hit by the reporter on Windows/ROCm 10.2 with gfx1100 in the target set).  The gate applies the default set
+    at `release.json.base`, applies every artifact in **numeric order** (the `--include-optional-all` consumer path)
+    with `scripts/scratch-tree.sh`, asserts `release.json.optional_tree`, and builds the **`all` target once**; it
+    prints `OPTIONAL_BUILD=PASS`.  **Non-vacuity**: run the PRE-fix artifact through the same scratch path and the
+    build must fail (r367: the old `0101` reproduces the reporter's errors; the repaired one builds in 438 s).  The
+    artifact's own behaviour gate is separate and still `scripts/gate-mixed-kv.sh` on that build (`BUILD=<scratch>/bin`).
+    Required for any re-cut of an artifact, any block amendment that touches a file an artifact patches (the r360
+    collision class), and every release (`WORKLOG.md` 261126.005).
 
 
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
