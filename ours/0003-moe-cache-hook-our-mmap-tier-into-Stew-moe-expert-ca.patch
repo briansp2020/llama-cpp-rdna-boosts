@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 04:39:19 +0000
-Subject: [PATCH 03/40] moe cache: hook our mmap tier into Stew
+Subject: [PATCH 03/41] moe cache: hook our mmap tier into Stew
  moe-expert-cache.cu
 
 (cherry picked from commit 7266f388524bc7866805d6b754ddc889eb03d77c)

@@ -1,7 +1,8 @@
 # ours: our production stack on top of the current rdna-boosts release (r368)
 
 This branch holds the patch series we run on top of the latest rdna-boosts release: 2x Radeon AI PRO R9700,
-ROCm 10.2, Qwen3.8-Flash-Next UD-IQ4_XS with `-sm tensor` and `--host-experts mmap`. It is regenerated for each
+ROCm 10.2, Qwen3.8-Flash-Next UD-IQ4_XS with `-sm tensor` and `--host-experts mmap`. Since 0041 it also runs
+Inkling-2-Mini (see *Inkling-2-Mini* below). It is regenerated for each
 release, and patches the release has taken are dropped. It is not a PR. Everything else on this branch is the
 release as published; only `ours/` is added.
 
@@ -10,15 +11,15 @@ release as published; only `ours/` is added.
 ```
 git checkout 919794500
 bash <path-to-this-repo>/scripts/apply-all.sh .     # the r368 release, branch rdna-boosts
-git am <path-to-this-repo>/ours/*.patch              # 40 patches (0001-0040)
+git am <path-to-this-repo>/ours/*.patch              # 41 patches (0001-0041)
 ```
 
-Result: tree `ccd3dcdab4ac`. This is our production build from 2026-11-26.
+Result: tree `8ca87d91d190`. This is our production build from 2026-11-27.
 
 Also in `ours/`: `bench/llbench.py` (the benchmark below), `deploy/docker-compose.yaml` (our production
 compose file, local paths replaced by `./models`) and `tools/mkhead.py` (one step of the draft-head recipe).
 
-## Performance (r362 + 36, 2026-11-25)
+## Performance (r368 + 41, 2026-11-27)
 
 Everything below is one 2x R9700 box running the production configuration (see *Reproducing it*): 256K
 context, 4 slots, MTP speculative decoding (draft n-max 3), greedy requests.
@@ -32,21 +33,21 @@ runs after 1 warm-up, one slot, one request at a time.
 
 | depth | PP (t/s) | TTFT (s) | TG (t/s) |
 |---|---|---|---|
-| 0 | 2312 | 0.89 | 129 |
-| 8K | 2675 | 0.77 | 127 |
-| 16K | 2641 | 0.78 | 140 |
-| 24K | 2618 | 0.78 | 154 |
-| 32K | 2504 | 0.82 | 151 |
-| 40K | 2463 | 0.84 | 145 |
-| 48K | 2426 | 0.85 | 141 |
-| 56K | 2386 | 0.86 | 151 |
-| 64K | 2423 | 0.85 | 153 |
-| 128K | 2263 | 0.91 | 132 |
-| 192K | 2111 | 0.97 | 130 |
-| 240K | 2005 | 1.02 | 126 |
+| 0 | 2285 | 0.90 | 130 |
+| 8K | 2669 | 0.77 | 133 |
+| 16K | 2641 | 0.78 | 137 |
+| 24K | 2622 | 0.78 | 151 |
+| 32K | 2469 | 0.83 | 148 |
+| 40K | 2450 | 0.84 | 148 |
+| 48K | 2476 | 0.83 | 134 |
+| 56K | 2391 | 0.86 | 152 |
+| 64K | 2436 | 0.84 | 151 |
+| 128K | 2264 | 0.90 | 139 |
+| 192K | 2111 | 0.97 | 126 |
+| 240K | 2023 | 1.01 | 126 |
 
-TG is MTP-assisted, so it moves with draft acceptance (48-100 % of drafted tokens accepted per run on this corpus) more than
-with depth: single runs at the same depth range from 106 to 158 t/s. The site's own runner is not public; ours
+TG is MTP-assisted, so it moves with draft acceptance (54-100 % of drafted tokens accepted per run on this corpus) more than
+with depth: single runs at the same depth range from 120 to 156 t/s. The site's own runner is not public; ours
 differs in three ways: it uses llama-server's native `/completion` with token-id prompts (not
 `/v1/completions`), it sets `ignore_eos`, and the corpus is this repository's source files.
 
@@ -54,11 +55,14 @@ differs in three ways: it uses llama-server's native `/completion` with token-id
 
 | | |
 |---|---|
-| one 150K-token prompt, cold | 3,580 t/s prefill (42 s), then 124 t/s decode |
-| one 4.3K-token prompt | 3,035 t/s prefill, 155 t/s decode |
-| greedy 512-token answer, short prompt | 132-153 t/s |
-| agent turn (append a tool result to a long conversation, short answer) | 773 ms median, 429 ms of it prompt |
-| two short requests at once | 100 + 109 t/s (one alone: 121 t/s) |
+| one 31.5K-token prompt, cold | 3,744 t/s prefill (8.4 s) |
+| one 150K-token prompt, cold | 3,150-3,510 t/s prefill (43-48 s; varies between runs), then 125 t/s decode |
+| one 259.6K-token prompt (a needle question over the whole context) | 3,372 t/s prefill (77 s), then 125 t/s decode |
+| one 4.4K-token prompt | 2,884 t/s prefill, 155 t/s decode |
+| greedy 512-token answer, short prompt | 131-153 t/s |
+| agent turn (append a tool result to a long conversation, short answer) | 777 ms median, 432 ms of it prompt |
+| two short requests at once | 114 + 113 t/s (one alone: 125 t/s) |
+| two ~100K-token prompts at once | both done in 66 s (1,571-1,615 t/s prefill each) |
 
 ## Reproducing it
 
@@ -140,6 +144,8 @@ results for several engines on R9700 cards with its own runner.
   sparse (mmap) tables. Pool and pinned tables run the release's own code. The tier code covers the RAM tier, the
   pin budget, KV lending, the fill fence, batched admissions and the device remap for sparse tables.
 - **0004-0040** are one feature each, in the order they were added.
+- **0041** is the exception: Inkling-2 support, the upstream and Unsloth pieces it needs and our work on it, as one
+  patch. Its switches are listed per piece in the patch's commit message.
 - A fix to one of our patches goes into that patch, not into a new one. A later patch that touches an earlier
   one's code adds a feature of its own, with its own switch.
 - Every behaviour change has an environment switch. The table gives the value that turns it off (or the opt-in).
@@ -178,7 +184,7 @@ results for several engines on R9700 cards with its own runner.
 | 0027 | server: when the last prompt chunk is the checkpoint tail and has the verify width (draft n_max + 1), all its rows are outputs, so the first verify reuses the tail's graph (agent-style 2K extensions -3.4 % time) | `LLAMA_CKPT_TAIL_OUTPUTS=0` |
 | 0028 | mmvq: the dense gate/up + GLU fusion at the verify width (2-8 tokens, RDNA4), the launch also publishing the down projection's Q8_1 input; the shared expert's 3 launches per layer become 1; bit-identical | `GGML_CUDA_DENSE_GLU_VERIFY=0` |
 | 0029 | mmvq-moe (RDNA4): rows per block 8 (8-10 K-blocks) or 4 (11-15) where 2-row blocks leave the last pass partly idle; the Q5_0 MoE down at K 320 goes 48 -> 34 us at 4 tokens; output changes at rounding level (KLD ~0) | `GGML_CUDA_MOE_RPB_K=0` |
-| 0030 | server: idle slots are saved to the prompt cache and cleared before the restore of the new request, not after its launch, so a long prompt after other requests starts with the KV room free (259.6k needle after other requests 79 -> 71 s, +11.6 %); output unchanged | `LLAMA_SERVER_IDLE_CLEAR_FIRST=0` |
+| 0030 | server: with the release's lazy idle slots off (`LLAMA_SERVER_LAZY_IDLE_SLOTS=0`, as we run), idle slots are saved to the prompt cache and cleared before the restore of the new request, not after its launch, so the restore finds the KV room free instead of failing and re-processing the whole prompt; two ~130K-token agents taking turns: 190 s -> 30 s for 3 rounds; output unchanged | `LLAMA_SERVER_IDLE_CLEAR_FIRST=0` |
 | 0031 | hyperconn: hc_combine_norm also writes the Q8_1 MMQ activation of its dense consumer, so that matmul skips its own quantize (prefill, 64+ tokens); 31.5k prefill +1.9 %, 259.6k needle +1.4 %; bit-identical | `GGML_CUDA_HC_CN_MMQ_Q8=0` |
 | 0032 | llama-batch: ubatch data blocks that no ubatch references any more are reused instead of freshly allocated (capped at 256 MiB, `LLAMA_UBATCH_REUSE_MIB`), so the MTP draft no longer zero-fills and page-faults ~100 MiB of state rows after every long prompt; server-thread page faults -92 %, 4.2k-token request -20..27 ms; output unchanged | `LLAMA_UBATCH_REUSE=0` |
 | 0033 | server: a checkpoint's state copy is queued before the next batch and finished after it, so the host-side copy overlaps GPU work; byte-identical (verify mode compares every deferred copy with a synchronous one), agent turns -11..-12 ms | `LLAMA_CKPT_ASYNC=0` |
@@ -189,6 +195,7 @@ results for several engines on R9700 cards with its own runner.
 | 0038 | cuda: queued (async) row-block reads without one copy per row. The device that allocated the pinned destination copies 2-D; another device gathers the rows on the device, copies each 16 MiB chunk once and scatters it from a stream callback. Since r364 these reads were one copy per row, which under `-sm tensor` made a ~2 GB agent prompt-cache save take 17-20 s; now 0.17-0.38 s | `GGML_CUDA_ROWS_ASYNC_GATHER=0` |
 | 0039 | server: the max-min prompt share divides the pass's budget, not what the earlier slots of the pass left (two prompts got 1365 + 682 of a 2048 window instead of 1024 + 1024); two concurrent fresh 39K + 34K / 59K + 59K prefills -17 % wall | `LLAMA_SERVER_SHARE_PASS_BUDGET=0` |
 | 0040 | cuda: GDN -- a prefill ubatch holding several sequences with snapshot slots (MTP) takes the chunked prefix + sequential tail per sequence, as a single sequence does, instead of the whole sequential kernel; two concurrent fresh prefills -2.5 to -3.5 % wall, single requests unchanged | `GGML_CUDA_GDN_MULTISEQ_TAIL=0` |
+| 0041 | Inkling-2 (`inkling2`, `inkling2_loop`) support and our work on it, as one patch. From upstream llama.cpp: #32694 (Inkling 2 Mini) with #32669, #32763, #32704, #32799, #32855, #32940, #32897, #32751 (tensor split, open), #32218 (DSpark drafter), #33073 (DFlash2). From Unsloth's llama.cpp fork: #385, #395, #396 and the fusions #401, #402, #411, #412, #414. Ours: a leaner Inkling graph, decode fusions (control gate, multi-GEMV, depth mix, conv chain, K/V store, sibling GEMVs), a per-tile skip bitmap and a GQA-3 fold in the flash-attention decode, NVFP4 MMB dequant with register tables and prefetch (as rdna-boosts PR #379), RDNA3-only GEMV changes (not active on RDNA4), and an opt-in KV type for the non-SWA cache. Inkling output differs from mainline llama.cpp at rounding level (KLD 0.0021). Flash-Next output is unchanged (*Validation*) | `LLAMA_INKLING_*`, `GGML_CUDA_FA_DERIVED_TILED=0`, `GGML_CUDA_FA_TILE_GQA3=0`, `GGML_CUDA_MMB_FP4_PERM=0`, more in the commit message; opt-in `LLAMA_KV_BASE_TYPE` |
 
 ## Settings that matter for this series
 
@@ -198,6 +205,8 @@ results for several engines on R9700 cards with its own runner.
   `madvise` defrag mode and the page cache filling RAM (the mmapped host experts), huge pages made 120-130K-token
   saves stall 2-11 s in direct compaction on our 59 GB host; with 4 KiB pages they take 0.33-0.37 s (0.12-0.13 s
   when 0036 lets them reuse a buffer).
+- `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`: the release's lazy idle slots cost 4-6 % decode here; with them off, 0030 keeps
+  long agents taking turns from re-processing their prompts.
 - `LLAMA_SERVER_KV_ADMIT_RESERVE=16384`: the reply reserve per request of the release's KV admission (its default is
   n_ctx / slots = 64K at 256K and 4 slots), so two long prompts still fit side by side.
 - `LLAMA_TP_FFN_EVEN=1`: the release's opt-in even FFN / shared-expert split.
@@ -214,13 +223,51 @@ results for several engines on R9700 cards with its own runner.
 
 With 57.6 GiB of host experts, the expert cache holds 68.2 % in VRAM.
 
-## Validation (r368, 2026-11-26)
+## Inkling-2-Mini
 
-- Rebased from r366 onto r368 with no conflicts; the 40 patches are unchanged. The release's r367 and r368 changes
+Same box and build; `-sm tensor` over both GPUs, all weights in VRAM.
+
+**Model.** Unsloth `unsloth/Inkling-2-Mini-GGUF`, unmodified: `Inkling-2-Mini-UD-Q8_K_XL.gguf` (sha256 `2da51788d43a17e1f033bec420fa83ba9cb87ac1f0130dc9135a4d2ed2678b68`)
+and, for speculative decoding, the DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf` from the repository root
+(sha256 `3da00cf7c31bbe5662b3c0d373ecf782d74d32ef43990acc158ce60c2add72e0`).
+
+**Launch.**
+
+```
+llama-server -m Inkling-2-Mini-UD-Q8_K_XL.gguf -c 135168 -ngl 99 -sm tensor -fa on -ub 2048 -b 2048 --jinja -np 1
+# with DSpark, add:
+  -md dspark-Inkling-2-Mini-Q8_0.gguf --spec-type draft-dspark --spec-draft-n-max 2
+```
+
+No environment variables are needed: the Inkling settings in 0041 are on by default. KV cache F16.
+
+**Depth curve** (`bench/llbench.py`, same protocol as above, one slot):
+
+| depth | PP (t/s) | TG (t/s) | PP with DSpark | TG with DSpark |
+|---|---|---|---|---|
+| 0 | 2253 | 69.7 | 2112 | 116.0 |
+| 8K | 2126 | 69.1 | 2010 | 116.0 |
+| 16K | 1976 | 68.0 | 1865 | 117.1 |
+| 32K | 1712 | 65.9 | 1625 | 117.6 |
+| 64K | 1369 | 62.4 | 1315 | 109.3 |
+| 128K | 981 | 56.1 | 951 | 89.6 |
+
+VRAM peak 15.9 + 15.5 GB (17.5 + 17.1 GB with DSpark). With `-ub 512`, prefill is 18-27 % lower; decode is the same.
+Greedy text with DSpark is not byte-identical to greedy text without it: the drafted tokens are verified in one batch,
+which rounds differently from one token at a time (on a 7900 XTX: next-token KLD 0.0015, 98.6 % same top token), so
+compare the two by KLD, not by hashes.
+
+## Validation (r368 + 41, 2026-11-26 and 27)
+
+- Rebased from r366 onto r368 with no conflicts; 0001-0040 are unchanged. The release's r367 and r368 changes
   (the RDNA3 verify band, the Q5_K VDR-4 dense kernel, the Q6_K MMQ opt-in) leave gfx1201 output unchanged by default.
-- The 7-model comparison with the release passes (gate: 0 problems, 0 warnings).
-- Production configuration: greedy and the 512-token prompt set give the same output as the r366 series; two long
-  agents taking turns: 29.9 s for 3 rounds (r366: 29.8 s), 0 GPU faults.
+- 0041 was made on r366 and applied to r368 with one conflict: the release's r367 already carries its RDNA3 verify-band
+  change.
+- The 7-model comparison with the release passes (gate: 0 problems, 0 warnings), with and without 0041.
+- Production configuration (Flash-Next), with and without 0041: greedy and the 512-token prompt set give the same
+  output as the r366 series; two long agents taking turns: 30.0 s for 3 rounds (r366: 29.8 s), 0 GPU faults.
+- Inkling-2-Mini on the R9700 (`-sm layer`, `-sm tensor`, `-sm tensor` with DSpark): the same output and speed as 0041
+  on r366, 0 GPU faults. On a 7900 XTX, the same greedy and DSpark output as 0041 on r366.
 - The overnight stress run has not been done on r368 yet.
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.

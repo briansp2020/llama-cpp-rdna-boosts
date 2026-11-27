@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 18 Nov 2026 07:33:10 +0000
-Subject: [PATCH 25/40] cuda: carry the Q8_1 cache entry of the layer input
+Subject: [PATCH 25/41] cuda: carry the Q8_1 cache entry of the layer input
  into the routed-MoE split
 
 Decode/verify layers run as three graph computes per device; the scheduler

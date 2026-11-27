@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 02:28:14 +0000
-Subject: [PATCH 18/40] moe cache: KV segment -- lent KV rows as an
+Subject: [PATCH 18/41] moe cache: KV segment -- lent KV rows as an
  expert-cache tier below the arena
 
 GGML_MOE_KV_LEND=1 + GGML_MOE_KV_SEG=1 (default off; unset GGML_MOE_KV_SEG = off).
