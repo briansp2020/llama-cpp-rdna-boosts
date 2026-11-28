@@ -1,4 +1,4 @@
-From 49eaac610cad4b40b41e1f89b42ca77f6064ee53 Mon Sep 17 00:00:00 2001
+From 9ad9339e402f94c9353ee855392eed29b3c6152b Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/18] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -169,6 +169,10 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
   so a pool tier keeps staging nothing.  Text byte-identical (`c9da1e69a0b5` on the shape above,
   `461ca8cd0e88` on 35B-A3B Q8_0 with and without a ring); measured 2107 t/s prefill / 32.5 t/s decode
   against 2075 / 30.7 for r365's default and 1982 / 27.3 for the `GGML_CUDA_SLAB_RING_MIB=6144` layout.
+Co-authored-by: briansp2020 <bsp2020@gmail.com>
+Co-authored-by: jstamagal <jstamagal@users.noreply.github.com>
+Suggested-by: Nyshone <Nyshone@users.noreply.github.com>
+Reported-by: DanoPTT <DanoPTT@users.noreply.github.com>
 ---
  ggml/include/ggml-alloc.h                     |   13 +
  ggml/include/ggml-cuda.h                      |   14 +
@@ -3720,10 +3724,10 @@ index 410f29752..e6687996b 100644
      CUDA_CHECK(cudaGetLastError());
  }
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 2e716c67f..ab842fe07 100644
+index 6633f7415..11fc7ce53 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -1890,6 +1890,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1925,6 +1925,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
          const int zt_gqa,
          const int kb0_start,
          const int kb0_stop, const kq_derived_t derived, const fattn_kv_native_t kv_native,
@@ -3735,7 +3739,7 @@ index 2e716c67f..ab842fe07 100644
          // > 1 only in the decode/verify band, where the block processes the KV iterations
          // kb0_start, kb0_start + kb0_step, ... (< kb0_stop) and may own none of them.
          const int kb0_step = 1) {
-@@ -2082,7 +2087,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2117,7 +2122,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              // the bitmap is produced only where that pipeline does not exist (AMD has no cp_async),
              // so every block can take last_iter=false and the accumulation is unchanged.
              for (; kb0 < kb0_stop; kb0 += kb0_step) {
@@ -3744,7 +3748,7 @@ index 2e716c67f..ab842fe07 100644
                      continue;
                  }
                  constexpr bool last_iter = false;
-@@ -2142,7 +2147,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2177,7 +2182,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
            if constexpr (band_depth == 1) {
              // The next iteration is the next KV block that is not fully masked (the stream continues into it).
              auto unmasked = [&](int k) {
@@ -3753,7 +3757,7 @@ index 2e716c67f..ab842fe07 100644
                      k += kb0_step;
                  }
                  return k;
-@@ -2165,7 +2170,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2200,7 +2205,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              }
            } else {
              for (; kb0 < kb0_stop; kb0 += kb0_step) {
@@ -3762,7 +3766,7 @@ index 2e716c67f..ab842fe07 100644
                      continue;
                  }
                  constexpr bool last_iter = false;
-@@ -2372,7 +2377,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2407,7 +2412,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
          if (((!needs_fixup && !is_fixup) || np > 1) && thread_should_write) {
              ((float2 *) tile_Q)[jc_cwm*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
          }
@@ -3770,7 +3774,7 @@ index 2e716c67f..ab842fe07 100644
          __syncthreads();
  
          if (np == 1) {
-@@ -2447,6 +2451,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2482,6 +2486,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                      meta_ptr[imeta * warp_size * tile_stride/2] = make_float2(KQ_cms[imeta], KQ_crs);
                  }
              }
@@ -3783,7 +3787,7 @@ index 2e716c67f..ab842fe07 100644
  
              // Combined KQ max + rowsum.
              static_assert(cols_per_warp <= warp_size);
-@@ -2576,8 +2586,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2611,8 +2621,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
  
                          if (!needs_fixup && !is_fixup) {
                              const float KQ_rowsum_j = meta_j[1];
@@ -3807,7 +3811,7 @@ index 2e716c67f..ab842fe07 100644
                          }
  
                          if (is_fixup) {
-@@ -2650,7 +2673,12 @@ static __global__ void flash_attn_ext_f16(
+@@ -2685,7 +2708,12 @@ static __global__ void flash_attn_ext_f16(
          const int    * __restrict__ tok_hi_ptr,
          // Native (V4 q8_0 / block-15 bf16) K/V: byte-addressed rows, read natively by the loaders
          // (null / FATTN_KV_NATIVE_NONE when the launcher staged F16).
@@ -3821,7 +3825,7 @@ index 2e716c67f..ab842fe07 100644
      ggml_cuda_pdl_sync(); // TODO optimize placement
  #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
      const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
-@@ -2669,6 +2697,8 @@ static __global__ void flash_attn_ext_f16(
+@@ -2704,6 +2732,8 @@ static __global__ void flash_attn_ext_f16(
      const int  * GGML_CUDA_RESTRICT KV_max        = KV_max_ptr;
      float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
      float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
@@ -3830,7 +3834,7 @@ index 2e716c67f..ab842fe07 100644
  
      // Skip unused kernel variants for faster compilation:
      if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
-@@ -2776,20 +2806,24 @@ static __global__ void flash_attn_ext_f16(
+@@ -2811,20 +2841,24 @@ static __global__ void flash_attn_ext_f16(
              const int kb0_stop  = iter_k;
              const int kb0_step  = gridDim.y;
  
@@ -3857,7 +3861,7 @@ index 2e716c67f..ab842fe07 100644
              }
              return;
          }
-@@ -2822,6 +2856,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -2857,6 +2891,11 @@ static __global__ void flash_attn_ext_f16(
          const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
              (const half *) (mask + nb33*(sequence % ne33) + nb32*(zt_Q % ne32));
          float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
@@ -3869,7 +3873,7 @@ index 2e716c67f..ab842fe07 100644
  
          const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
  
-@@ -2846,19 +2885,23 @@ static __global__ void flash_attn_ext_f16(
+@@ -2881,19 +2920,23 @@ static __global__ void flash_attn_ext_f16(
          if (use_sparse) {
              kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
          } else if (KV_max) {
@@ -3896,7 +3900,7 @@ index 2e716c67f..ab842fe07 100644
          }
  
          // The next process_tile call reuses the tile_Q buffer for its Q/K tiles, so all warps must
-@@ -2890,6 +2933,9 @@ static __global__ void flash_attn_ext_f16(
+@@ -2925,6 +2968,9 @@ static __global__ void flash_attn_ext_f16(
      const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
          (const half *) (mask + nb33*(sequence % ne33) + nb32*(zt_Q % ne32));
      float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
@@ -3906,7 +3910,7 @@ index 2e716c67f..ab842fe07 100644
  
      const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
      const fattn_kv_native_t kv_native = {
-@@ -2912,14 +2958,16 @@ static __global__ void flash_attn_ext_f16(
+@@ -2947,14 +2993,16 @@ static __global__ void flash_attn_ext_f16(
      if (use_sparse) {
          kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
      } else if (KV_max) {
@@ -3925,7 +3929,7 @@ index 2e716c67f..ab842fe07 100644
  #else
      GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, kq_blocks_ptr,
          max_bias, m0, m1, n_head_log2, logit_softcap,
-@@ -2929,7 +2977,8 @@ static __global__ void flash_attn_ext_f16(
+@@ -2964,7 +3012,8 @@ static __global__ void flash_attn_ext_f16(
                nb11, nb12, nb13,
                nb21, nb22, nb23,
                ne31, ne32, ne33,
@@ -3935,7 +3939,7 @@ index 2e716c67f..ab842fe07 100644
      NO_DEVICE_CODE;
  #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
  }
-@@ -3096,7 +3145,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+@@ -3131,7 +3180,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
  
      const bool async_kv_preload = nstages == 2 && !use_sparse;
      launch_fattn<DV, ncols1, ncols2>
@@ -4019,7 +4023,7 @@ index 493399c0d..59e77e005 100644
  #ifdef FLASH_ATTN_AVAILABLE
      const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index ff6d477e6..a22a4988c 100644
+index 85fb473ba..1043110d8 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -5,6 +5,8 @@
@@ -4040,7 +4044,7 @@ index ff6d477e6..a22a4988c 100644
              if (band_wide_on && ggml_cuda_fattn_band_wmma_ncols1(dst) == 4 && Q->ne[1] > 4 && K->ne[1] >= 4096) {
                  ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8, true>(ctx, dst);
              } else if (ggml_cuda_fattn_band_wmma_ncols1(dst) == 4) {
-@@ -982,6 +984,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -1004,6 +1006,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      return f16_extra.end - (uintptr_t) dst->data;
  }
  
@@ -4049,7 +4053,7 @@ index ff6d477e6..a22a4988c 100644
  void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      ggml_cuda_set_device(ctx.device);
      switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
-@@ -1013,3 +1017,112 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+@@ -1035,3 +1039,112 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
      }
      return true;
  }
@@ -22998,7 +23002,7 @@ index 000000000..4f55a2854
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 4b4cc8df2..556be20e6 100644
+index 519cca5c5..4f5da4f1e 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,8 +1,10 @@
@@ -23012,7 +23016,7 @@ index 4b4cc8df2..556be20e6 100644
  #include "quantize.cuh"
  #include "unary.cuh"
  #include "vecdotq.cuh"
-@@ -35,85 +37,8 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
+@@ -59,85 +61,8 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
  }
  #endif
  
@@ -23100,7 +23104,7 @@ index 4b4cc8df2..556be20e6 100644
  
  enum mmvq_parameter_table_id {
      MMVQ_PARAMETERS_GENERIC = 0,
-@@ -156,6 +81,31 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -180,6 +105,31 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
  #endif
  }
  
@@ -23132,7 +23136,7 @@ index 4b4cc8df2..556be20e6 100644
  static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
      if (GGML_CUDA_CC_IS_RDNA4(cc)) {
          return MMVQ_PARAMETERS_RDNA4;
-@@ -332,12 +282,21 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -356,12 +306,21 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
  // 1-token decode and an (n_draft + 1)-token speculative verify batch of the same MoE matmul to be
  // bit-identical, and MUL_MAT_ID mmvq (mul_mat_vec_q_moe, one warp per token) and MMQ reduce in
  // different orders, so no cap may split the band.  The cap still applies above the band.
@@ -23157,7 +23161,7 @@ index 4b4cc8df2..556be20e6 100644
      // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
      if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
          cc = ggml_cuda_highest_compiled_arch(cc);
-@@ -353,24 +312,38 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+@@ -377,24 +336,38 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
      // AMD
      if (GGML_CUDA_CC_IS_AMD(cc)) {
          if (GGML_CUDA_CC_IS_RDNA4(cc)) {
@@ -23202,7 +23206,7 @@ index 4b4cc8df2..556be20e6 100644
  bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
      if (!ggml_is_quantized(type)) {
          return false;
-@@ -495,15 +468,19 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+@@ -519,15 +492,19 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
  template <ggml_type type>
  static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
  #if defined(RDNA4)
@@ -23227,7 +23231,7 @@ index 4b4cc8df2..556be20e6 100644
  #elif !defined(GGML_USE_MUSA) && (__CUDA_ARCH__ == GGML_CUDA_CC_PASCAL || __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
      return MMVQ_MAX_BATCH_SIZE;
  #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
-@@ -781,7 +758,7 @@ static __global__ void mul_mat_vec_q(
+@@ -805,7 +782,7 @@ static __global__ void mul_mat_vec_q(
  
      constexpr int qk  = ggml_cuda_type_traits<type>::qk;
      constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -23236,7 +23240,7 @@ index 4b4cc8df2..556be20e6 100644
      constexpr mmvq_parameter_table_id table_id = get_device_table_id();
      constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
      constexpr int rows_per_cuda_block = calc_rows_per_block_override(rows_per_block, type, ncols_dst, table_id, small_k, nwarps);
-@@ -1110,566 +1087,87 @@ static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float
+@@ -1134,566 +1111,87 @@ static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float
  // 12-block release kernel (same per-row chunk->group mapping as the old
  // ncols_dst == 1 path).
  // ---------------------------------------------------------------------------
@@ -23872,7 +23876,7 @@ index 4b4cc8df2..556be20e6 100644
  template<ggml_type type, bool weight_rule = false>
  static std::pair<dim3, dim3> calc_launch_params(
          const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-@@ -1715,6 +1213,14 @@ static void mul_mat_vec_q_switch_fusion(
+@@ -1739,6 +1237,14 @@ static void mul_mat_vec_q_switch_fusion(
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
  }
  
@@ -23887,7 +23891,7 @@ index 4b4cc8df2..556be20e6 100644
  template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false>
  static void mul_mat_vec_q_switch_fusion_ksplit(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-@@ -1728,7 +1234,42 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+@@ -1752,7 +1258,42 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
      const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                              fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
                              fusion.conv_input != nullptr;
@@ -23930,7 +23934,7 @@ index 4b4cc8df2..556be20e6 100644
          if (has_fusion) {
              const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
              ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k, small_m>, launch_params,
-@@ -1748,98 +1289,6 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+@@ -1772,98 +1313,6 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
  }
  
@@ -24029,7 +24033,7 @@ index 4b4cc8df2..556be20e6 100644
  
  template <ggml_type type>
  static void mul_mat_vec_q_switch_ncols_dst(
-@@ -1852,7 +1301,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1876,7 +1325,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
          const int ids_stride, cudaStream_t stream) {
  
      GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
@@ -24040,7 +24044,7 @@ index 4b4cc8df2..556be20e6 100644
  
      const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
      const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
-@@ -1868,7 +1319,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1892,7 +1343,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
      // How the K loop divides up at the baseline block width, both decisions below use these.
      constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
      constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
@@ -24049,7 +24053,7 @@ index 4b4cc8df2..556be20e6 100644
      const int     blocks_per_row_x      = ncols_x / qk;
      const int     blocks_per_iter_1warp = vdr * warp_size / qi;
  
-@@ -1949,7 +1400,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1973,7 +1424,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -24059,7 +24063,7 @@ index 4b4cc8df2..556be20e6 100644
              // dispatch per ncols with a compile-time tag
              const auto dispatch = [&](auto ncols_tag) {
                  constexpr int c_ncols_dst = decltype(ncols_tag)::value;
-@@ -1998,7 +1450,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -2022,7 +1474,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                      const int blocks_per_row_x = ncols_x / ggml_cuda_type_traits<type>::qk;
                      const int qi_type = ggml_cuda_type_traits<type>::qi;
                      const int n_groups = qi_type > 0
@@ -24068,7 +24072,7 @@ index 4b4cc8df2..556be20e6 100644
                          : 0;
                      int rpb = 1;
                      if (blocks_per_row_x > 0 && n_groups > 0 && blocks_per_row_x < n_groups) {
-@@ -2066,7 +1518,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -2090,7 +1542,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  // Every row keeps its own one-warp dot product: bit-identical.
                  uint32_t nrows_loop = 0;
                  constexpr int c_rpb_eff = c_rpb > 0 ? c_rpb : 1;
@@ -24077,7 +24081,7 @@ index 4b4cc8df2..556be20e6 100644
                      c_rpb_eff <= 2 && dims.second.y == 1 && dims.first.x * c_rpb_eff == (unsigned) nrows_x &&
                      nrows_x >= 2048 && nrows_x <= 16384 && dims.first.x > GGML_MMVQ_RDNA4_DECODE_GRID) {
                      const int nblocks = dims.first.x;
-@@ -2112,7 +1564,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -2136,7 +1588,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  constexpr int c_rpb_weight = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, 1);
                  if constexpr (c_rpb_weight > 1) {
                      // the rows the launch will actually use (Q8_0 short-K: 8-warp blocks take fewer rows;
@@ -24086,7 +24090,7 @@ index 4b4cc8df2..556be20e6 100644
                      const int rpb_w = calc_rows_per_block_weight(type, c_ncols_dst, table_id, false,
                          calc_nwarps_weight(type, c_ncols_dst, table_id, long_k, small_m));
                      if ((table_id == MMVQ_PARAMETERS_RDNA4 || table_id == MMVQ_PARAMETERS_RDNA3_0) && rpb_w > 1 &&
-@@ -2226,6 +1678,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -2250,6 +1702,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
              // item-split accumulator layout is register-bound at ncols_dst > 1.
              launch_ksplit(std::integral_constant<int, 8>{});
          } break;
@@ -24104,7 +24108,7 @@ index 4b4cc8df2..556be20e6 100644
                  default: GGML_ABORT("fatal error"); break;
              }
          } break;
-@@ -2405,18 +1868,21 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -2429,18 +1892,21 @@ void ggml_cuda_mul_mat_vec_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  
@@ -24128,7 +24132,7 @@ index 4b4cc8df2..556be20e6 100644
          // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
          // non-negligible for some models such as gpt-oss-20b. The per-token MoE scale is a second exception.
          GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4 || fusion->x_scale_channel_dst);
-@@ -2482,11 +1948,86 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -2506,11 +1972,86 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -24216,7 +24220,7 @@ index 4b4cc8df2..556be20e6 100644
  
      // If src0 is a temporary compute buffer, clear any potential padding.  A redirected expert
      // table (wip/moe-expert-cache) carries no buffer; its compact arena has no padding to clear,
-@@ -2562,7 +2103,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -2586,7 +2127,7 @@ void ggml_cuda_mul_mat_vec_q(
  
      mul_mat_vec_q_switch_type(
          src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
@@ -24225,7 +24229,7 @@ index 4b4cc8df2..556be20e6 100644
          ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
          ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
  }
-@@ -3338,11 +2879,714 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+@@ -3362,11 +2903,714 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
              (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
      }
  }
@@ -24941,7 +24945,7 @@ index 4b4cc8df2..556be20e6 100644
      if (i + 8 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
          return 0;
      }
-@@ -3412,8 +3656,10 @@ int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const g
+@@ -3436,8 +3680,10 @@ int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const g
  // Shared-expert output chain: down + gate + gating + residual adds.  Returns 5 when fused.
  // GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1 turns it off.
  int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
@@ -24954,7 +24958,7 @@ index 4b4cc8df2..556be20e6 100644
      if (disable_shexp_down_gate || i + 5 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
          return 0;
      }
-@@ -3505,6 +3751,9 @@ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool
+@@ -3529,6 +3775,9 @@ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool
      return use_mul_mat_vec_q;
  }
  
@@ -24964,7 +24968,7 @@ index 4b4cc8df2..556be20e6 100644
  bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
      if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
          return false;
-@@ -3554,6 +3803,8 @@ bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, in
+@@ -3578,6 +3827,8 @@ bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, in
      return true;
  }
  
@@ -24973,7 +24977,7 @@ index 4b4cc8df2..556be20e6 100644
  int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
      if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID || !ctx.stream_context().concurrent_events.empty() ||
              !ggml_cuda_match_shared_expert(cgraph, i, i + 3) ||
-@@ -3574,12 +3825,32 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
+@@ -3598,12 +3849,32 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
      fusion.shared_up = shared->src[1]->src[0];
      fusion.shared_gate = shared->src[0]->src[0];
      fusion.shared_dst = shared;

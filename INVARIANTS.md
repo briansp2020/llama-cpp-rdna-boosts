@@ -3804,6 +3804,220 @@ so the deliverable part of it is an opt-in switch for the 129..511 band.
    transport A/B; an A/B on the field shape must also pin `MOE_EXPERT_HEATMAP` (the reserve partition varies
    between runs of the SAME commit).
 
+11. **A cross-build MTP rate arm needs A B B A with the base arm's own drift as the control** -- a single
+   A-then-B pass on this box read the candidate **-2.4 / -4.2 / -6.5 %** on the f16 arms, and the interleaved
+   re-run of the same two arm-specs puts B vs A at **-0.08 / +0.15 / -0.33 / +0.25 %** while the BASE arm's own
+   A1 -> A2 drift across the same window is **1.02 %** (recall/mtp 189.91 -> 187.97).  The text, acceptance and
+   pos-1 were identical in all 16 runs, so only the rate was ever in question -- and it was the box.  The
+   four-axis protocol's two arms are sequential by construction, which is exactly how a phase difference becomes
+   a "regression" in a record (`WORKLOG.md` 261127.020, `archive/work/flash-next-prefill/abba-f16.sh`).
+
 **Record.** `archive/work/flash-next-prefill/` (`RESULTS-session7.md` §6-§7, `REVIEW-squashed.md` §10-§12,
-`HANDOVER-session8.md`); `patches/README.md` blocks 09/10/12/15 (r369 amendments); `ENVIRONMENT.md` §1.3/§2/§31;
-`DIAGNOSTIC.md` §2/§28/§31; `TODO.md` #376-#379.
+`HANDOVER-session8.md`, `runs/mtp4-abba-f16/`); `patches/README.md` blocks 09/10/12/15 (r369 amendments);
+`ENVIRONMENT.md` §1.3/§2/§31; `DIAGNOSTIC.md` §2/§28/§31; `TODO.md` #385-#391.
+
+## r371 (2026-11-27, `WORKLOG.md` 261127.022) — the shared-expert down epilogue owed three roundings and HIP gave it one; the ISA is the only instrument that sees it (GitHub issue #377)
+
+`shexp_down_gated_q8_0` (block 08) replaces `MUL` (down·gate) → `ADD` (moe_out) → `ADD` (ffn_residual) with one
+epilogue, so its output owes three roundings, and it computed `__fmul_rn(sum_down, gate_sig) + moe_out +
+ffn_residual`.  HIP clang contracts that into `v_fma_f32` / `v_fmac_f32` — `__fmul_rn` is not a barrier (§102.2) —
+so the epilogue rounded once where the chain rounds three times, under a comment that claimed the opposite.  Six
+things worth keeping.
+
+1. **The mechanism, measured on the delivery's own toolchain.**  ROCm 10.2 / clang 24, gfx1201: of the epilogue
+   chains that end in a `global_store_b32`, **144 of 146 were contracted** on r370 and **0 of 146** after the fix,
+   across all **32** instantiations (4 nwarps × 8 ncols).  `<1,1>` went from `v_fma_f32 v1, v1, s4, s5` +
+   `v_add_f32` to `v_mul_f32_e32` + `v_add_f32_e32` + `v_add_f32_e32`.
+2. **A scan of this kernel must be anchored on the STORE, not on the reduction.**  The obvious window ("after the
+   last `v_add_f32_dpp`") is right for `<1,1>`..`<4,8>` and wrong for `<8,8>`, where the compiler interleaves the
+   eight-token cross-warp reduction with the dot loop and software-pipelines the stores — so the window shows 1
+   `v_mul_f32` for 8 tokens in the FIXED object and misses the contraction in the BROKEN one.  Look back from each
+   store for the token's `v_mul_f32` and require no contracted form in between (`scripts/gate-shexp-down-gate.sh`
+   leg 1, which fails on the r370 object with 144 findings).
+3. **Decode == verify was never at risk, and that is why the defect survived.**  All 32 instantiations contracted
+   the same way, so every width computed the same arithmetic; only the *claim* was false.  A "same rounding at
+   every width" property is not evidence that the rounding is the one the comment names — two independent claims.
+4. **A single-sequence greedy arm and the prefill KLD are blind to this change, and the reason is the fusion's
+   own arming condition.**  Same-seed greedy text is byte-identical (`2f79e37ca208` short, `a2cdef23588f` prose, on
+   a 3-GPU `-sm tensor` arm and a 1-GPU `-ncmoe 40 --host-experts pool` arm), the canonical prefill-logit point
+   reads `0.000000 / 100.000 %`, and a two-chunk `--chunks 2` log-prob file is byte-identical between the two
+   builds — because the fusion only arms at ≤ `MMVQ_MAX_BATCH_SIZE` (8) tokens, so a batched prefill runs the
+   epilogue only on its small tail ubatch.  At **`-ub 1`**, where every token takes it and each step's hidden state
+   feeds the next, the same pair reads mean KLD **0.001354 / 98.431 %** (PPL 4.0962 → 4.0521): the change is real,
+   rounding-level, and only visible where the epilogue actually runs at every token.  **A verify-band arm is NOT
+   blind**: `scripts/gate-server-arms.sh`'s two-slot DFlash arm on 35B-A3B Q8_0 reproduces its recorded anchors on
+   r370 (`50f29e574939 a56117e02dcf`, 0.60741/0.69106) and reads `10050d7d1b2f df3deb00c56b` (0.59559/0.60000) on
+   r371, deterministically on each build — the reference text moved once, the same class as a K-partition move
+   (§111.2), because the recorded anchors were taken on the contracted arithmetic.  That arm is the reason a
+   rounding change owes a re-record, not only an ISA check.
+5. **The unfused chain is not a text oracle for this fusion** — not before the fix and not after it.  The fused
+   gate reduction (`shexp_gate_sigmoid`) has its own order difference from the standalone `MUL_MAT` it replaces
+   (`ggml-cuda-try-fuse.cu` says so), so `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` is a different *placement*: both
+   arms read the same text in every arm measured here.  The purity claim of this kernel is the ISA (§102.5's
+   "pick the instrument that can see it").
+6. **A census was owed and did not exist.**  `GGML_CUDA_SHEXP_GATE_DEBUG=1` now prints
+   `SHEXP DOWN GATE <out> ncols=N exact=1` once per fused launch (600 on a 4-token 35B-A3B Q8_0 run) and prints
+   nothing under `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`, which is what makes the fused arm observable at all.
+
+The fix uses the file's existing exact helpers (`mmvq_mul_rn` / `mmvq_add_rn`: inline-asm `v_mul_f32_e32` /
+`v_add_f32_e32` under `__HIP_PLATFORM_AMD__`, `__fmul_rn`/`__fadd_rn` elsewhere — the terms CUDA already had),
+hoisted out of the hyper-connection kernels that carried them and renamed from `mmvq_hc_*` because they are now
+the file's general rounding helpers.  Rate is flat (pp512 1663.7 vs 1651.2 t/s, tg128 63.2 vs 64.3 — inside this
+box's ±2 % band); the change adds two scalar instructions to a `threadIdx.x == 0` tail loop.
+
+**Record.** `scripts/gate-shexp-down-gate.sh` (MANIFESTS gate 48); `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`;
+`GREEDY-PURITY.md` §112; `DIAGNOSTIC.md` §32; `patches/README.md` block 08 (r371); `WORKLOG.md` 261127.022;
+issue #377 (@overdoingism).
+
+## r371-wip (2026-11-27, `WORKLOG.md` 261127.023, beta artifact) — r369's staged transport is BACKEND state booked per SCHEDULER, so two concurrent contexts cannot share it; and a decode step's routed ids cannot be filled ahead (`beta/prefill-decode-arms` port, `TODO` #391)
+
+`beta/prefill-decode-arms` (the two-arm server: one `llama_memory_i`, two `llama_context`s computing on two
+threads) was cut against the r368 tree and stopped applying at r369, which promoted the H2D staging transport.  The
+rebase is mechanical; the port is the transport decision, and the reason is a property of r369's design rather than
+of this artifact.  Six things worth keeping (they apply to any second scheduler on one backend set, e.g.
+`optional/two-lane-prefill`).
+
+1. **The staged transport's state is per BACKEND, its bookkeeping is per SCHEDULER.**  The pipeline's slots are one
+   set of `0..depth-1` per backend (`stage_buffer`/`stage_upload`/`stage_wait`); the transport REGION they are
+   carved from is one carve per device whose `stage_region`/`wide_armed`/`stage_used` live on the **slab**, not the
+   scheduler; the Meta backend's per-device ring (`stage_input`) is the same shape.  But the prologue that sizes a
+   slot, the per-split consume that redirects `input_cpy->data` **in place**, and the prefill -> decode release that
+   hands the buffers back are all decided by whichever scheduler is running.  Two of them alias one buffer (the
+   second prologue re-sizes the slot the first is about to read) and race one release (one arm returns the region
+   to the slab underneath the other's live wide view — the state the release path's own comment calls unreachable).
+   **So a context that computes concurrently with another context of the same model must not use it**:
+   `ggml_backend_sched_disable_staged_transport()` (through `llama_context_disable_staged_transport()`, inherited by
+   any scheduler the context creates later via `sched_alt_select`).  The single-context server is untouched.
+2. **The transport SELECTOR needs to know, not only the pipeline bits.**  `sched_stage_exposure_decides()` chooses
+   between the gather and **staging**; with nothing able to stage, its "stage" answer silently means the SERIAL
+   whole-table upload.  Measured on the pair's own host-expert arm (35B-A3B Q8_0 `-ncmoe 40 -ub 2048`, 5246-token
+   prompt, gfx1201): **1436 t/s** with the selector still answering "stage" against **3855-4157 t/s** when it
+   answers "gather" (a `no_staged_transport` flag on the scheduler, which is what the disarm sets).  A flag that
+   disables a transport must reach every decision that SELECTS that transport, or the change is a slowdown that
+   looks like a null result.
+3. **Do not release the pipeline's slots from a post-construction disarm.**  The transport is armed by a graph that
+   runs DURING the context's own reserve (the H2D calibration probe fills the pipeline), so a release at that point
+   runs against a slab whose wide view and narrow floor were already placed around the region: it turned a
+   4157 t/s run into **523 t/s**.  Nothing leaks by leaving the carve alone — the transport region is published and
+   carved for every host-expert context whether or not the pipeline runs — so a disarm should clear the USE, not
+   reclaim the VA.
+4. **The pipeline gives a decode arm nothing to fill ahead — the dependency chain forbids it.**  The mechanism
+   overlaps the fill of set *k+1* with the compute of set *k*, and a decode step's routed ids for layer *L* exist
+   only after layer *L*'s router has run, so there is no future set to fill within a step; the granularity is also
+   wrong (one whole routed role per split vs a handful of experts per token).  The one thing the pair could use the
+   region for is a **prefill-proof hot set**: filled from the persisted heatmap prior (which, unlike the routing, IS
+   known ahead) and read as an eviction-proof working set for the decode arm.  That is a new mechanism on top of the
+   fill-ahead work `TODO` #388 scopes, not the current pipeline — do not re-derive it as "just enable staging on the
+   decode arm".
+5. **The staging/pipeline is not automatically the faster transport on a pool-backed tier.**  On the pair's
+   35B-A3B Q8_0 `-ncmoe 40 -ub 2048` arm the r369 default (3 buffers of 272 MiB) read **2888 t/s prefill / 71.0
+   t/s decode** against **3855-4157 / 71-85** for the plain transport, because a staged fill copies the whole
+   routed table per split per ubatch (~31 GB per ubatch at 117 splits) while the arena already holds 83 % of it.
+   The same shape's EXPOSURE decision is also **not reproducible run to run** on this box (`GGML_SCHED_PIPELINE=0`
+   read 4157 t/s once and 1436 t/s later, with identical flags and an identical slab/arena layout): the
+   `moe_cache_residency` report the selector divides can arrive before or after the host pool's mirror
+   registration, which flips its early-out between "fully resident -> gather" and "exposed -> stage".  **So an A/B
+   of the transport on a host-expert tier must report the selector's own verdict (`GGML_SCHED_STAGE_SELECT_DEBUG=1`)
+   per run**, or the numbers are comparing two transports without saying which.  Evidence added to `TODO` #387.
+6. **A beta gate that parses an artifact's log wording goes stale with the artifact, and then fails a working
+   build.**  `scripts/gate-arms-spec.sh` searched the WITHDRAWN block 17's lines (`statistics draft-mtp: #gen
+   drafts ...`, `decode ctx n_batch = ...`, `decode arm: thread up`); the v2 candidate prints
+   `draft acceptance = R (N accepted / M generated), mean len = x`, `decode arm 0x.. with N/N` and
+   `decode arm started (own batch of N rows)`, so all three non-vacuity checks read FAIL on a pair that reproduces
+   the delivery's text 21/21.  Accept BOTH forms (the old one is the evidence that a stale artifact is caught by
+   behaviour, not wording), and give the shapes a device override (`DEVS3`/`DEVS2`) so a single-GPU box can run
+   them at all — the Meta `stage_input` arms then go unexercised, which must be SAID in the result.
+
+**Record.** `beta/prefill-decode-arms/README.md` (*The r369 port*), `BETA-TESTING.md`;
+`scripts/gate-arms-spec.sh` (both log forms, `DEVS3`/`DEVS2`); `WORKLOG.md` 261127.023; `TODO` #391 (closed),
+#387 (evidence), #390 (the same constraint for the two-lane artifact).
+
+## r372 (2026-11-27, `WORKLOG.md` 261127.024) — a split-aware `ncols2` that is blind to the GQA ratio pads a quarter of head-256 prefill attention, and the r285 measurement that chose it is now inverted (block 05, GitHub issue #381)
+
+The prefill MMA dispatch (`switch_ncols2()`) picks how many Q heads of one GQA group share a K/V tile read.  On
+RDNA4 under a tensor split the delivery took the split-aware rule (r285: `gqa_ratio > 4 -> ncols2 = 8`, on the
+argument that a tensor-split attention is per-GPU bandwidth-bound and wants fewer K/V re-reads).  That argument
+never looked at the GQA group: with `gqa_ratio` 6 it runs 8 lanes of which 2 are zeroed, so **a quarter of the
+prefill KQ/VKQ work is padding** (at `-ub 1024`, 256 blocks of 64 columns per launch where the divisor rule needs
+192).  Four things worth keeping.
+
+1. **The padded lane is not free and it is not the same trade as "fewer re-reads".**  The stock AMD rule divides
+   the group (`6 -> ncols2 = 2`, 32 Q rows per block) and pads nothing.  Measured on the delivery's own 27B
+   head-256 GQA-6 model (`pp4096`, `-ub 1024`, r2, two alternating rounds per arm): 2 x R9700 `-sm tensor` q8_0
+   **+1.1 / +5.7 / +7.0 %** at depth 0 / 32768 / 81920; 3 x R9700 f16 (the split-aware rule's own tuning
+   configuration) **+1.7 / +6.2 / +6.6 %**; and at the r285 `pp150000` point itself, `1086.5` vs `996.7` t/s
+   (**+9.0 %**).  The gain grows with depth because attention's share does — the same shape the reporter measured
+   on a mixed RX 9070 + RX 7900 GRE pair (+4.7 % at 32k, +7.2 % at 82k), where each fix alone was invisible
+   because the faster card waited for the slower one.
+2. **A tuning measurement is a property of the tree it was taken on, not of the rule.**  r285's own table read
+   `1219.9` (generic, `ncols2 = 8`) against `1152.3` (AMD rule) at 3-GPU pp150000 — today the same point reads
+   `996.7` vs `1086.5`, i.e. the ranking inverted over two months of block work (derived kq mask, native K/V,
+   the staging transport).  Re-measure a default-on tuning choice against the current tree before trusting the
+   comment that records why it was chosen; and keep the loser reachable as an A/B arm
+   (`GGML_CUDA_FA_RDNA4_GQA_STOCK=0`) rather than deleting it.
+3. **Where the group already divides the change is inert, and that is the check that it is the padding and not
+   the Q blocking.**  4B head-256 gqa 4 (`+0.2 %` at d81920), 35B-A3B head-128 gqa 4 (`+0.0 %`), Gemma4-31B
+   head-512 gqa 2 (`0.0 %`): all neutral, because `ncols2 = 8` divides those groups and both rules agree.
+4. **A prefill `ncols1` change is NOT bit-identical, even at constant `ncols`.**  `np` (the per-warp KV-row
+   partition) depends on `ncols` alone, so the per-column reduction looks untouched — but `ntiles_x =
+   ceil(n_q/ncols1)` feeds `blocks_per_wave`, which feeds `pick_parallel_blocks()`, so the number of partial KV
+   blocks `P` moves and `flash_attn_combine_results` adds a different number of partials.  The instrument is the
+   prefill-logit gate's `--family-switch` mode, which prints the same-kernel `-ub 256` control measured on the
+   spot: **0.000542 / 98.81 %** (q8_0) and **0.000529 / 98.92 %** (f16) against a control of **0.000581 /
+   98.83 %** and **0.000580 / 98.86 %** — the change is the model's ordinary summation-order sensitivity.
+   Same-seed greedy text is identical on both KV types (399 chars, sha `10a82b5559a9`), which is why a text arm
+   alone would have "passed" this without saying anything.
+5. **gfx1100's head-256 prefill streams Q from LDS (upstream PR ggml-org/llama.cpp#31746).**  RDNA3 WMMA operands
+   are mirrored, so Q in registers spills 720 VGPRs / 1312 B scratch for head 256 and Q in LDS with one K and
+   one V batch per iteration (plus a `__builtin_amdgcn_sched_barrier` after each WMMA, or the compiler hoists the
+   next batch's loads) spills 30 / 128 B: the call 10.16 -> 6.98 ms, and end to end **neutral at depth 0, +6.3 %
+   at 32768, +11.3 % at 81920** (gfx1100, 27B Q4_K_M, q8_0 KV, ABBA, `FLASH_ATTN_EXT hsk=256 906/906`).  It is
+   gated to RDNA3_0: RDNA3_5 keeps its own Strix Halo row, which the PR does not measure.  Numerics: **0.000051 /
+   99.71 %** against a same-kernel control of **0.005210 / 95.9 %** — 100x tighter than a reordering the delivery
+   already accepts — yet that box's f16 greedy text moves deterministically at a 1818-token prompt (482 chars
+   `6e2f7d2de955` -> 414 chars `0a644af79489`; the q8_0 arm is unchanged).  A near-tie inside a 5e-5 KLD is
+   still a text move: quote the KLD point and the control beside the hash, or the hash reads like a defect.
+6. **A preserved-mtime copy of a header into a built tree leaves the dependents stale, and the build says so
+   quietly.**  `rsync -a` of a modified `fattn-mma-f16.cuh` onto a tree whose objects were built after the
+   source's own mtime rebuilt **1 object instead of 420** (`fattn.cu.o` only), so the first candidate arm was
+   the baseline binary and read a flat 0.0 % everywhere.  `touch` the copied files (or copy without `-a`); a
+   candidate arm that measures *exactly* the same as the baseline is a build-plumbing question before it is a
+   result.
+
+**Record.** `patches/README.md` block 05; `DIAGNOSTIC.md`/`ENVIRONMENT.md` §33; `CONTRIBUTORS.md` (`@mjohanning99`
+issue #381, `@ravel7524` upstream #31746, both `co-author`); `WORKLOG.md` 261127.024.
+
+## r373 (2026-11-27, `WORKLOG.md` 261127.026) — a max-min share taken out of the RUNNING budget is an order bias the step rotation hides, so only the per-pass census can see it (block 16, contributor PR #376)
+
+`share_prompt_budget()`'s pass divided `budget` -- what the pass's earlier slots had already taken -- instead of
+`budget_before`, the pass's own budget the loop keeps for its stop check.  The consequence is exact and only
+per-step:
+
+1. **The bias is `2/3 : 1/3` for two prompts, and it is not the max-min split the block documents.**  A 2048-token
+   pass leaves 2046 after the one-token floor, so the first slot of the rotated order took 1023 and the second 511,
+   and the pass closed at **1365 / 682**; four slots read 748 / 560 / 421 / 316.  Dividing `budget_before` gives
+   1024 / 1024 (and 512 x 4), which is what the loop's own comment promises: *each pass gives every remaining slot
+   `budget/n_active` tokens*.
+2. **Every end-to-end number is blind to it, because `slot_next` rotates the order every pass.**  The rotation makes
+   the pass-1 leader the pass-2 trailer, so the CUMULATIVE allocation of two equal prompts is already even and they
+   finish in the same step: measured on 4B Qwen3.5 Q8_0, one R9700, `-np 2 -b 2048 -ub 2048`, two fresh
+   22797-token prompts -- default tree 7.15 s (3278 / 3234 t/s), amended tree 7.01 s (3309 / 3309 t/s), and an
+   unequal pair (22797 + 14141) is proportional in both.  So a wall-clock or throughput A/B cannot justify this
+   fix, and a submission that reports one is measuring something else (the r366 submission reported 45.1 -> 36.8 s
+   on an equal pair; not reproduced here).  What is observable is the `-lv 5` per-step census
+   (`fair share: budget = <the slot's share>, added = ...`, `SLT_DBG` in the fill loop): `1365` / `682` alternating
+   before, `1024` / `1024` on every pass after.
+3. **The same field is what the SKEW knob weights, so the bug also inflated the skew.**  `LLAMA_SERVER_PREFILL_SKEW`
+   is documented as "weight the shortest-remaining slot K times against the others", i.e. a `4:1:1` window split is
+   1365 / 341 / 341; taken from the running budget it read 1777 / 147 / 123 whenever the skewed slot came first,
+   and a different (usually milder) ratio when it did not -- an allocation that depends on the rotation.
+4. **A share check must subtract the `FAIR=0` shape explicitly.**  With the slot-order fill the census line still
+   prints a per-slot number, but it is the budget the slot MAY take (the whole window, for every slot) and the
+   order bias lives in the takes (1689 + 359 measured).  So `gate-prefill-fairness.sh`'s `share split` check
+   requires the share to be a DIVIDED window (<= 0.75 x `n_batch`) as well as equal, and both slots to have placed
+   tokens; a share-only comparison passes `FAIR=0` vacuously.  Non-vacuity is a floor of 4 co-batched steps (a
+   ~2.2k-token pair at `-ub 512` finishes in two, which is how the first cut of the check rested on 2
+   observations).
+
+**Record.** `patches/README.md` block 16 (the r373 amendment); `MANIFESTS.md` gate 16; `scripts/gate-prefill-fairness.py`
+(`share_split()` / `measure_share()`); `archive/work/share-budget-r366/`; `CONTRIBUTORS.md` (`@briansp2020`).

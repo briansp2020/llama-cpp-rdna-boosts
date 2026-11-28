@@ -625,7 +625,7 @@ None of these change the computed result on the default path.
 
 | variable | default | class | what it does |
 |---|---|---|---|
-| `LLAMA_SERVER_PREFILL_FAIR` | **on** | **kill-switch** | The max-min fair share: water-filling over the slots that still have prompt tokens, so every active prompt is admitted to every step and a slot that needs less returns the difference to the pool.  `0` restores the slot-order fill exactly. |
+| `LLAMA_SERVER_PREFILL_FAIR` | **on** | **kill-switch** | The max-min fair share: water-filling over the slots that still have prompt tokens, where each pass divides the PASS's budget (not what its earlier slots left) across the slots still in it — r373, so two prompting slots get 1024/1024 of a 2048 window and not 1365/682 — so every active prompt is admitted to every step and a slot that needs less returns the difference to the pool.  `0` restores the slot-order fill exactly (a slot adds up to the whole window, so the lowest slot wins it). |
 
 *The opt-in and tuning rows for this section are in [`ENVIRONMENT.md`](ENVIRONMENT.md) §22.*
 
@@ -774,6 +774,50 @@ set and the transport's decided depth; the slab's stats line prints `transport=`
 *The opt-in and tuning rows for this section are in [`ENVIRONMENT.md`](ENVIRONMENT.md) §31.*
 
 ---
+
+## 32. The shared-expert down epilogue's rounding (block 08, r371)
+
+`shexp_down_gated_q8_0` stands in for the `MUL` + two `ADD` nodes of the shared-expert output chain, so its
+epilogue owes three rounded operations.  It owed them by comment only until r371: `__fmul_rn` is not a barrier on
+HIP, so the product was contracted into an `fma` with the first add (`GREEDY-PURITY.md` §102.2, §112).  The
+arithmetic is now pinned by inline asm (`v_mul_f32_e32` / `v_add_f32_e32`), and this is the switch that says
+whether the fused kernel ran at all — the fused and the unfused arm read the **same greedy text**, and the prefill
+KLD at the delivery's own point prints `0.000000`, so a text or KLD arm cannot decide it.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` | unset = the fusion is on | **kill switch / A/B** | `1` restores the unfused chain (`MUL` → `ADD` → `ADD` launches).  This is a different **placement**, not two arithmetics of one: the fused gate reduction (`shexp_gate_sigmoid`) does not reproduce the standalone `MUL_MAT`'s order, so the two arms' text is not an oracle for the epilogue — the ISA is (`scripts/gate-shexp-down-gate.sh`). |
+| `GGML_CUDA_SHEXP_GATE_DEBUG` | off | **diagnostic (census)** | Prints one `SHEXP DOWN GATE <out> ncols=N exact=1` line per fused launch (600 on a 4-token 35B-A3B Q8_0 run, `0` with the kill switch above).  `ncols` is the token count the epilogue served, so the band arms are visible too. |
+
+*The opt-in and tuning rows for this section are in [`ENVIRONMENT.md`](ENVIRONMENT.md) §32 (there are none: this
+section is a kill switch and a census, never a supported configuration).*
+
+---
+
+## 33. Prefill attention's GQA blocking under a tensor split (block 05, r372)
+
+`switch_ncols2()` picks how many Q heads of one GQA group share a K/V tile read.  Under a tensor split RDNA4
+used the split-aware rule (r285: `gqa_ratio > 4 -> ncols2 = 8`), which pads the group when it does not divide
+(a gqa of 6 runs 6 real lanes and 2 zeroed ones, so a quarter of the prefill KQ/VKQ work is padding).  It now
+takes the stock AMD divisor rule whenever that divides, and this is the switch that restores the old rule for
+an A/B or a bisect.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `GGML_CUDA_FA_RDNA4_GQA_STOCK` | unset = the divisor rule (`ncols2` divides the group) | **kill switch / A/B** | `0` restores the split-aware rule (r285: wider `ncols2` under a tensor split, fewer K/V re-reads, padded lanes).  RDNA3_0 already took the divisor rule before this section existed; RDNA3_5 keeps the split-aware behaviour under either value.  It changes nothing on a single device: the tensor-parallel hint is false, so the switch is never consulted. |
+
+**What an arm has to read.**  This is a **dispatch** change, not a kernel: the kernel, its config row and the
+instrument are all unchanged, so there is no census to add and no text oracle (a prefill `ncols1` change moves
+the partial-KV-block count, so the arms are not bit-identical).  The instrument is the prefill-logit gate's
+`--family-switch` mode with `--ab "GGML_CUDA_FA_RDNA4_GQA_STOCK=0"`, which prints the same-kernel `-ub 256`
+control measured on the spot: r372 reads 0.000542 / 98.81 % (q8_0) and 0.000529 / 98.92 % (f16) against a
+control of 0.000581 / 98.83 % and 0.000580 / 98.86 %.  A bare text arm is vacuous here: the arms read
+byte-identical greedy text (399 chars, sha `10a82b5559a9` on both KV types) because the divergence is
+rounding-level.
+
+*There is nothing to opt in to or tune for this section: the RDNA3_0 head-256 row it ships beside has no
+switch either (it is a config-table row, like the Strix Halo and head-512 rows).  [`ENVIRONMENT.md`](ENVIRONMENT.md)
+§33 has the pointer.*
 
 ## Maintaining this file
 

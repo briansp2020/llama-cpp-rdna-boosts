@@ -667,7 +667,7 @@ the failure mode is a chunk smaller than `-ub`.  Gates `scripts/gate-prefill-fai
 
 | variable | default | class | what it does |
 |---|---|---|---|
-| `LLAMA_SERVER_PREFILL_SKEW` | **`1`** | **tuning** | Weights the slot with the **shortest remaining** prompt `N:1` against the others (1..64, clamped).  Not SRPT — every other slot still advances every step, so starvation is impossible.  `1` is the plain equal share. |
+| `LLAMA_SERVER_PREFILL_SKEW` | **`1`** | **tuning** | Weights the slot with the **shortest remaining** prompt `N:1` against the others (1..64, clamped).  Not SRPT — every other slot still advances every step, so starvation is impossible.  `1` is the plain equal share, and since r373 the weight is applied to the PASS's budget, so `4:1:1` of a 2048 window really is 1365 / 341 / 341. |
 | `-ib N` / `--interactive-batch-size N` (env `LLAMA_ARG_INTERACTIVE_BATCH_SIZE`; `LLAMA_SERVER_PREFILL_CHUNK` is the option's deprecated alias, still read with one WARN) | **`-1` = one `n_ubatch`** | **tuning** | Caps the prompt tokens admitted per step **while a decoder is waiting** — the bound on a decoding slot's inter-token latency and on the worst-case wait for a new request.  `-1` = one `n_ubatch`, `0` = no bound, `N` = explicit.  A step with nothing decoding takes the whole `-b` window, so `-ib` never caps an uncontended prefill.  **Below `n_ubatch` is dominated**: the step still issues one `llama_process()` and the same kernel launches, and when `-ub` is wide a small chunk is the whole difference. |
 | `LLAMA_SERVER_PREFILL_DUTY` | **`16`** | **tuning** (`0`/`1` disables) | Up to `K-1` consecutive **decode-only** steps, then one step that carries prompt tokens.  **The burst is bounded in time, not just in steps**: the deferral stops once the idle time accumulated since the last prefill step reaches that step's own measured duration, so a concurrent prefill takes at most ~2× its uncontended wall.  Never defers into an empty batch.  Class: default-on because it helps, with the prefill stretch as the documented trade. |
 
@@ -870,6 +870,37 @@ The numbers of record are in `benchmarks/` and the `WORKLOG.md` entries for r369
 `archive/work/flash-next-prefill/`.
 
 *The kill switches, the A/B arms and the censuses for this section are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §31.*
+
+---
+
+## 32. The shared-expert down epilogue's rounding (block 08, r371)
+
+There is nothing to opt in to and nothing to tune: the epilogue now performs the three roundings the chain it
+replaces performs, by mechanism rather than by comment (`v_mul_f32_e32` / `v_add_f32_e32` instead of a contracted
+`fma`), and the delivery ships it on.  The kill switch (`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE`) and the census
+(`GGML_CUDA_SHEXP_GATE_DEBUG`) are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §32.
+
+Measured effect on the delivery's own configurations: none visible — same-seed greedy text is byte-identical and
+the canonical prefill-logit point reads `0.000000 / 100.000 %`, because the fusion arms only at
+≤ `MMVQ_MAX_BATCH_SIZE` tokens.  At `-ub 1` the same comparison reads 0.001354 KLD / 98.431 % (rounding level).
+Details: `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`; rule: `GREEDY-PURITY.md` §112.
+
+---
+
+## 33. Prefill attention's GQA blocking under a tensor split (block 05, r372)
+
+Nothing to opt in to or tune: the wider `ncols2` that a tensor split used to prefer was padding a GQA group
+that does not divide by 8 (a gqa of 6 ran 6 real lanes and 2 zeroed ones), so a quarter of the head-256
+prefill KQ/VKQ work was wasted and a per-GPU bandwidth rationale was buying it.  The stock AMD divisor rule
+is the default again for RDNA4, and the head-256 RDNA3_0 row that ships beside it (Q from LDS, one K/V batch
+per iteration) is a config-table row like the Strix Halo and head-512 rows, so it has no switch either.  The
+kill switch for the first (`GGML_CUDA_FA_RDNA4_GQA_STOCK=0`) is in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §33.
+
+Measured on the delivery's own configurations: 2 x R9700 `-sm tensor` q8_0 **+1.1 / +5.7 / +7.0 %** prefill at
+depth 0 / 32768 / 81920, 3 x R9700 f16 **+1.7 / +6.2 / +6.6 %**, and **+9.0 %** at the r285 `pp150000` point;
+neutral on a 4B head-256 gqa-4, a 35B-A3B head-128 gqa-4 and a Gemma4-31B head-512 gqa-2 model, on decode, and
+on a single device; gfx1100 head-256 prefill (the RDNA3_0 row) **+6.3 % at 32768 and +11.3 % at 81920**.  Details:
+`patches/README.md` block 05; rules: `INVARIANTS.md` r372.
 
 ---
 

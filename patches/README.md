@@ -794,7 +794,7 @@ packed one on a tile-selected layout, +0.6-1.3 % pp512 there and one abort class
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +588 / −8 | 19 |
 | 14 | `0014-…-block-14-the-streamed-KV-a-fixed-VRAM-re` | **streamed KV** (opt-in, `--kv-window N\|auto`; the attendance pool `--kv-attendance-pool on\|off`; the MTP draft window `--spec-draft-kv-window N\|auto`, default `0`) (+ r248: the MTP draft window is a true ring for batches whose positions do not advance, a drafter failure can no longer fail a request, and the reserve reads the draft context's own ubatch — issue #297; + r264: the attendance pool is NOT SUPPORTED on a shared host/device pool (refused by design, one WARN — `TODO` #300 retired), `--fit` offers a placement only where this model+device can take it and prints the advice at WARN, and `gate-kv-residency.sh` grades the refusal, the hint and its own UMA reference arm; + r286: a region-backed buffer's 2-D state directions are **1-D only in both interfaces** (a 2-D device copy on the window's VMM region is refused by the driver on some stacks, which aborted a mixed gfx1100+gfx1201 `-sm tensor` server's prompt-cache save — issue #313), the block is gathered/scattered on the device (`ggml_cuda_cpy_2d_rows`) so a slot save+load went 4 686 → 24.5 ms on a windowed split, `--kv-window`/`--kv-attendance-pool` are common options (they were missing from `llama-bench` and every other non-server tool), `llama-bench` accepts `--kv-window`, and the spill's per-token cost is modelled on the **calibrated in-place read rate** (16-29 GB/s on gfx1201, its own measurement rather than the copy engine's, which is the number that diverges on a card reading its aperture slowly) — `ENVIRONMENT.md` §17.0, `benchmarks/2026-11-14-kv-window-313.md`); **r294: this is the block that makes a hole MAPPING-BACKED, so it carries the storage/transport split** — `host_expert_master_mapped()` (a hole set exists and `llama_mmap::SUPPORTED`) replaces five `use_mmap` tests, in `host_expert_buft`, both pool gates, `init_mappings` and the per-tensor mapped-or-read decision, so NO load mode can turn `-lme` into "pin the whole set" (measured: `-lme 30` under `--load-mode dio` pinned 48 284.6 MiB with no pool before, 31 363.7 MiB with the pool after, 0 mapping memcpys in both); **r295: the shipped text loses the superseded `11-26 %` spill cost** — `common/arg.cpp`'s `--kv-window` help line and `common/fit.cpp`'s placement hint now say the cost is linear in the depth past the window (nothing at or above the run depth), which is what the docs have said since r292 -- `TODO` #331, no computed number moves ; **r363: a batch that writes the mirror WITHOUT resolving through the pool — a prefill chunk, the QSA dense/shortcut arm — now DROPS the pages it wrote** (`ggml_kv_pool_drop`, the same `GGML_OP_KV_POOL` op with param 1 = 1; `LLAMA_KV_POOL_DROP=0` is the A/B arm), because the writer rule re-filled a resident page only when the batch that wrote it also resolved: a second request over a shared prefix read the first request's stale pool copies (225 M mismatching words under `LLAMA_KV_POOL_VERIFY=1`, a 90-entry prompt answered as "91 entries"; GitHub PR #369, `WORKLOG.md` 261125.010), and `gate-kv-residency.sh` gained the two-request arm that catches the class; **r364: a row-block device->host read is never a 2-D copy** (`ggml_cuda_rows_to_host()`): on ROCm a 2-D D2H into host memory needs a peer grant of the destination's pinned allocation, which is refused on a box whose slabs leave the driver no room, and llama.cpp's output/state buffers are ONE device's allocation read by every device of a `-sm tensor` split -- the abort `TODO` #124 recorded ("2-D read of 'result_output' failed (invalid argument)") and the delivery- level half of the two-arm campaign's STEP 15 (`TODO` #376 closed); the async form also selected no device before it issued its copy | +8004 / −971 | 51 |
 | 15 | `0015-…-block-15-the-UMA-GTT-expert-store-an-APU` | **the UMA GTT expert store** (an APU's MoE expert set in one registered, mlocked region; `-lme` sizes it and is the streaming opt-in) | new in r263: the arena tier per `-lme`, the MTP head pinned outside that budget, the direct fill, the RDNA3_5 transport start arm and prefill streaming.  A model whose weights do not fit RAM is refused at load with the fix; the store/arena is inert on a discrete GPU (measured); **r294: the PLACEMENT transport is the one decision that must NOT follow `--load-mode`,** so `MOE_HOST_POOL_BULK_DIO` is renamed `MOE_HOST_POOL_PLACEMENT_MODE=dio|buffered` and is reported once per load (`+1 675 MiB` of page cache on `dio` against `+31 796 MiB` on `buffered` for a 47.9 GiB placement, measured cold), and `-lme mirror` reaches the GTT store's budget too; **r295: the pool exchange's inertness is NAMED** — the exit census reports `sink no-demote tables (...)`, the sub-mirror pools whose demote cannot be expressed (`n_slices != 0` or `host_bytes != expert_bytes`), so a `-sm tensor` split's `0 demoted / 0 declines / 0 retirements` carries its reason -- `TODO` #334; **r337: the ARENA arm declares its hole set, so its master is the read-only model mapping** (issue #347).  The arena makes no `-lme` plan by construction, so `host_expert_master_mapped()` said "not mapped" and the loader allocated a pageable copy of the WHOLE expert set on every `--load-mode` (18 662.0 MiB / 23 649 MiB peak `RssAnon` on 35B-A3B; 46 800 MiB in the reporter's Flash-Next).  `plan_gtt_expert_store()` now records its tables in `host_experts_holes`, and the predicate accepts the arena as a hole source; the two census lines that named the discrete pool on this tier were corrected | +4949 / −368 | 16 |
-| 16 | `0016-…-block-16-the-server-s-prompt-admission-p` | **the server's prompt admission policy**: the max-min fair share of the step, the per-step `CHUNK`, the shortest-remaining `SKEW` and the prefill/decode `DUTY` cycle (moved OUT of block 12 at r301 -- `TODO` #339; `ENVIRONMENT.md` §22) **and, since r365, the KV admission of a whole task** (`server_slot_sched::admit`, the reply reserve `LLAMA_SERVER_KV_ADMIT_RESERVE`, the `LLAMA_SERVER_KV_ADMIT` kill switch; `ENVIRONMENT.md` §29, PR #370) | +579 / −20 | 5 |
+| 16 | `0016-…-block-16-the-server-s-prompt-admission-p` | **the server's prompt admission policy**: the max-min fair share of the step, the per-step `CHUNK`, the shortest-remaining `SKEW` and the prefill/decode `DUTY` cycle (moved OUT of block 12 at r301 -- `TODO` #339; `ENVIRONMENT.md` §22) **and, since r365, the KV admission of a whole task** (`server_slot_sched::admit`, the reply reserve `LLAMA_SERVER_KV_ADMIT_RESERVE`, the `LLAMA_SERVER_KV_ADMIT` kill switch; `ENVIRONMENT.md` §29, PR #370; **r373: the share divides the pass's budget**, so a two-prompt window is split 1024/1024 instead of 1365/682 -- PR #376) | +583 / −20 | 10 |
 | 17 | `0017-…-block-17-TQ1_0-TQ2_0-ternary-weights-on-` | **TQ1_0 / TQ2_0 (ternary) weights on the GPU**: `MUL_MAT` + `GET_ROWS` + the fp16/fp32/bf16 conversions, bit-identical to the CPU's AVX2 path (default-on, `GGML_CUDA_TQ=0` refuses the types again) — contributor PR #358, r356 | +974 / −2 | 9 |
 | — | *(withdrawn)* | **the two-arm server — was block 17 until r352, withdrawn from the delivery**; it lives in [`../beta/prefill-decode-arms/`](../beta/prefill-decode-arms/README.md) (apply with `--include-beta`), it is not counted in `v<N>`, and its gates are beta-only | — | — |
 | 0300 | `0300-…-block-0300-relaxed-tensor-split-mode-TEM` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` (in the default apply, but NOT an official block: it is not counted in `v<N>`) | +130 / −17 | 12 |
@@ -1282,6 +1282,35 @@ kq mask that removes the packed `n_kv × n_q` F16 mask from both compute and hos
 almost all of them `template-instances/*.cu`.
 
 **Contents.**
+
+* **Prefill attention under a tensor split pads no GQA lane, and RDNA3_0's head-256 prefill streams Q from LDS
+  (r372, GitHub issue #381; the RDNA3 half is upstream PR ggml-org/llama.cpp#31746 by `@ravel7524`).**  Two
+  independent fixes to head-256 prefill attention, each useless alone on the reporter's mixed
+  RX 9070 + RX 7900 GRE pair because the faster card waited for the slower one after every layer.
+  (1) **RDNA4 keeps the stock AMD `ncols2` rule when the GQA group divides.**  The split-aware rule (r285) is
+  blind to the GQA ratio: with `gqa_ratio` 6 it picks `ncols2 = 8` and **pads the group of 6 to 8**, so a
+  quarter of the prefill KQ/VKQ work is padding (at `-ub 1024`, 256 blocks of 64 columns per launch instead of
+  192).  The stock AMD rule divides the group (`ncols2 = 2`) and pads nothing.  PP4096 on this 27B head-256
+  GQA-6 model: 2 x R9700 `-sm tensor` q8_0 **+1.1 / +5.7 / +7.0 %** at depth 0 / 32768 / 81920, 3 x R9700 f16
+  (the split-aware rule's own tuning configuration) **+1.7 / +6.2 / +6.6 %**, and **+9.0 %** at the r285
+  `pp150000` point itself (1086.5 vs 996.7 t/s) — the September measurement that introduced the rule is now
+  inverted, so the rule is kept only as the A/B arm.  Neutral where the group already divides (4B head-256
+  gqa 4, 35B-A3B head-128 gqa 4, Gemma4-31B head-512 gqa 2), neutral for decode (the band owns it), and inert
+  on a single device (no tensor-parallel hint, so the switch is never consulted).
+  (2) **RDNA3_0 (gfx1100/gfx1101/gfx1102) head 256 with 2-4 Q heads per KV head** takes upstream #31746: Q
+  streamed from shared memory, one K batch and one V batch per iteration, and a `__builtin_amdgcn_sched_barrier`
+  after each WMMA (otherwise the compiler hoists the next batch's operand loads and the kernel spills — 720
+  VGPRs / 1312 B scratch, the call 10.16 ms; with Q in LDS, 30 / 128 B and 6.98 ms).  RDNA3_5 keeps its own
+  Strix Halo row: it was tuned separately and the PR does not measure it.  gfx1100 (RX 7900 XTX, 27B Q4_K_M,
+  q8_0 KV, ABBA): **neutral at depth 0, +6.3 % at 32768, +11.3 % at 81920**; `FLASH_ATTN_EXT` `hsk=256`
+  906/906.  Both halves are purity-checked with the instrument that fits: the RDNA4 switch moves the Q-row
+  blocking and (through `ntiles_x` → `blocks_per_wave` → `pick_parallel_blocks`) the number of partial KV
+  blocks, so its prefill-logit point reads **0.000542 / 98.81 %** (q8_0) and **0.000529 / 98.92 %** (f16)
+  against a same-kernel `-ub 256` control of **0.000581 / 98.83 %** and **0.000580 / 98.86 %** on the spot —
+  the model's ordinary summation-order sensitivity — with same-seed greedy text identical on both KV types;
+  the RDNA3_0 row reads **0.000051 / 99.71 %** on gfx1100 against a **0.005210 / 95.9 %** same-kernel control
+  (100x tighter), which moves that box's f16 greedy text at a 1818-token prompt (a near-tie inside 5e-5, not
+  a different arithmetic).  Kill switch: `GGML_CUDA_FA_RDNA4_GQA_STOCK=0` (`DIAGNOSTIC.md` §33).
 
 * **The RDNA2 caps are LIFTED (r334, contributor PR #338).**  `launch_fattn_tile_switch_ncols1()`'s four
   `cols_per_block` caps (D=512 <= 8, D=128 <= 8, D=576 <= 16, D=256 MHA <= 8) and
@@ -2032,6 +2061,30 @@ must be **bit-identical** to what it replaces at the widths it serves.
   `scripts/gate-norm-rows-alias.sh` is its gate.
 * `norm.cu` / `quantize.cu` / `unary.cu`: `rms_norm`→Q8_1 folds, the verify-band q8_1 cache, scale-unary,
   norm-rows, the conv1d/PLE fusions and the shared-expert down gate.
+* **The shared-expert down epilogue ROUNDS on its own, and the ISA is the only instrument that sees it (r371,
+  GitHub issue #377).**  `shexp_down_gated_q8_0` replaces `MUL` (down·gate) → `ADD` (moe_out) → `ADD` (residual)
+  with one epilogue, so it owes **three** roundings.  It wrote `__fmul_rn(sum_down, gate_sig) + moe_out +
+  ffn_residual`, and HIP contracts that into `v_fma_f32` / `v_fmac_f32` — `__fmul_rn` is not a barrier
+  (`GREEDY-PURITY.md` §102.2) — i.e. one rounding where the chain has two, with a comment above it claiming
+  the opposite.  The fix uses the file's own exact helpers (`mmvq_mul_rn` / `mmvq_add_rn`, inline-asm
+  `v_mul_f32_e32` / `v_add_f32_e32` on HIP, `__fmul_rn`/`__fadd_rn` elsewhere — the terms CUDA already had),
+  hoisted out of the hyper-connection kernels that carried them, so `mul`, `add`, `add` each round.  **Every one
+  of the 32 instantiations (4 nwarps × 8 ncols) contracted the same way, so decode == verify was never at
+  risk**; the comment's claim was what did not hold.  Nothing usual can see the defect: same-seed greedy text
+  is byte-identical (`2f79e37ca208` short / `a2cdef23588f` prose, on a 3-GPU `-sm tensor` arm and a 1-GPU
+  host-expert arm) and the canonical prefill-logit point reads **0.000000 KLD / 100.000 %**, because the
+  fusion only arms at ≤ `MMVQ_MAX_BATCH_SIZE` tokens and a batched prefill therefore runs the epilogue only on
+  its small tail ubatch.  At `-ub 1`, where every token takes it and 512 sequential steps amplify a 1e-7 shift,
+  the same pair reads mean KLD **0.001354 / 98.431 %** — real, and rounding-level.  So the gate is the emitted
+  ISA (`scripts/gate-shexp-down-gate.sh`: all 32 instantiations, store-anchored), plus the census it needed
+  anyway: **`GGML_CUDA_SHEXP_GATE_DEBUG=1`** prints one `SHEXP DOWN GATE <out> ncols=N exact=1` line per fused
+  launch (600 on a 4-token 35B-A3B Q8_0 run, **0** with `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`).  Rate is flat
+  (pp512 1663.7 vs 1651.2 t/s, tg128 63.2 vs 64.3, inside this box's ±2 % band).  **A verify-band arm is not
+  blind**: `gate-server-arms.sh`'s two-slot DFlash arm on 35B-A3B Q8_0 moved once with this change (r370
+  `50f29e574939 a56117e02dcf` / 0.60741 0.69106 → r371 `10050d7d1b2f df3deb00c56b` / 0.59559 0.60000,
+  deterministic on each build), so its anchors are re-recorded — the K-partition precedent (§111.2), a reference
+  move and not a defect.  `DIAGNOSTIC.md` §32;
+  `MANIFESTS.md` gate 48; `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`.
 * **The rms_norm reduction order is a numerics selector, not a knob (r145, issue #229).**
   `ggml_cuda_rms_norm_vec()` (`common.cuh`) is the single selector; `rms_norm_f32`'s dispatch and every
   kernel documented bit-identical to it consult it (`hc_combine_norm_f32`, block 11, takes it as a launch
@@ -6750,6 +6803,28 @@ per-step cost is dominated by a fixed term (a pooled/streamed KV), where the tim
 or two steps and the prefill stretch is what is left; the gate reports that shape as "no room to improve"
 instead of pretending.
 
+**r373 amendment — the share is of the PASS's budget (contributor PR #376, `@briansp2020`).**  Each pass of
+`share_prompt_budget()` took a slot's share out of `budget`, the budget the earlier slots of the *same pass* had
+already spent, instead of out of `budget_before` -- the pass's own budget that the loop already keeps for its stop
+check.  So the first slot of the rotated order got `2/3` of a two-prompt window: with a 2048-token budget the
+one-token-each phase leaves 2046, the first slot took 1023, the second 511, and the pass closed at **1365 + 682**
+(a simulated four-slot window reads 748 / 560 / 421 / 316).  The `slot_next` rotation still alternates which slot
+leads, so the **cumulative** split and every end-to-end number were already even: measured 2026-11-27 on one
+R9700, 4B Qwen3.5 Q8_0, `-np 2 -b 2048 -ub 2048`, two fresh 22797-token prompts, the default tree finishes both at
+7.15 s (3278 / 3234 t/s) and the amended tree at 7.01 s (3309 / 3309 t/s), i.e. no throughput to recover.  What the
+amendment buys is the split the block documents (`INVARIANTS.md` r373): the `-lv 5` census reads `1024` / `1024`
+on every pass instead of alternating `1365` / `682`, which is also what makes `LLAMA_SERVER_PREFILL_SKEW` mean what
+it says -- a 4:1:1 weight on a 2048 window is 1365 / 341 / 341, where the running budget read 1777 / 147 / 123
+whenever the skewed slot came first.  The sums are unchanged (a pass's shares add up to `budget_before` exactly),
+one prefilling prompt is unchanged (`budget_before == budget`), and a slot that needs less than its share still
+returns the difference to the pool for the next pass.  **Gate:** `scripts/gate-prefill-fairness.sh` grew a HARD
+`share split` check -- the per-step census on its own fresh `-lv 5` server, requiring >= 80 % of >= 4 co-batched
+steps to divide the pass's budget evenly *and* place tokens in both slots.  Measured: **15/15** on the dense 4B arm
+and **15/15** on the streamed host-expert arm (Flash-Next IQ3_XXS, 2 GPU `-sm tensor -ncmoe 47`,
+`MOE_EXPERT_CACHE_MIB=8192`, single-request text identical), **3/15** (median ratio 2.00) on the same binary with
+the fix reverted -- the control that proves the check rejects the defect -- and **0 %** on the `FAIR=0` slot-order
+fill; `--self-test` still rejects the unfixed build.  Record: `archive/work/share-budget-r366/`.
+
 ## Block 17 — TQ1_0 / TQ2_0 (ternary) weights on the GPU (new at r356, contributor PR #358)
 
 TQ1_0 (1.69 bpw) and TQ2_0 (2.06 bpw) are the ternary types a `BitNet` b1.58 model and its conversions use.
@@ -6808,6 +6883,17 @@ in the release's gate set.
 **Provenance.**  Contributor PR #358 (`@overdoingism`), one `git am` file cut against r353, integrated as a block at
 r356 with the accumulation fix, the contiguity decline and the restated claims; its campaign record (what was
 measured and what was refused) is [`../archive/work/tq-hip/`](../archive/work/tq-hip/README.md).
+
+**The gfx1100 arm (r372, `TODO` #381 closed).**  The r356 cross-arch matrix was gfx1201 + gfx1151; `fingon`
+(gfx1100, RX 7900 XTX) went down mid-session and came back for r372, so the owed arm ran on the release tree
+(tip `5e844cbc6`) with the gate's own command: **12 passed / 0 failed**.  `MUL_MAT` **61/61** and `GET_ROWS`
+**16/16**, every one of the 305/84 reported NMSE values **exactly 0** (so the bit-identity to the CPU's AVX2 path
+holds on a second arch, not just gfx1201); one text per arm on both models at the shallow and the 200-token
+generation; the census non-vacuous (`small=2652 vec=262 vec_fused=324`, and `0/0/0/0/0` under `GGML_CUDA_TQ=0`);
+`mma=0` by design (gfx1100 has no RDNA4 int8-WMMA kernel, so the small-batch kernel takes every batch).  Rate,
+`llama-bench -fa 1 -p 512 -n 128 -r 3`: pp512 **1510.4 vs 195.6** and tg128 **230.2 vs 12.3** t/s against the
+CPU-backend arm.  The neutrality arm was skipped (`--dense-ref ''`, as the row said): gfx1100 has no recorded
+dense reference, and the gfx1201 + gfx1151 arms already cover it.
 
 **Not covered:** `MUL_MAT_ID` (a TQ MoE keeps its experts on the CPU backend, so a ternary MoE half-runs on the GPU —
 the model's own output layer may also stay on the host, as `models/bitnet.cpp`'s `tok_embd` FIXME does), draft/MTP

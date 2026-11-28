@@ -1,9 +1,10 @@
-From 971f417e9a799667c90123481d91d5f9927e0ed1 Mon Sep 17 00:00:00 2001
+From 339f9f4d1c83807614685b801106417caa5701d2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 21 Nov 2026 18:16:14 -0600
 Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional: NOT
  in the default apply)
 
+Co-authored-by: mjohanning99 <3389797+mjohanning99@users.noreply.github.com>
 ---
  ggml/src/ggml-cuda/fattn-rdna.cuh             | 34 +++++++-
  ggml/src/ggml-cuda/fattn-tile.cu              | 24 ++++++
@@ -411,10 +412,10 @@ index e0778c76b..fbc9277da 100644
  EXTERN_DECL_FATTN_TILE_CASES( 64,  64);
  EXTERN_DECL_FATTN_TILE_CASES( 72,  72);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index a22a4988c..a6a794cb8 100644
+index 1043110d8..49caeabaf 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -952,7 +952,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -974,7 +974,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
              // into the neighbouring buffer).
              const ggml_type tile_type = ggml_cuda_fattn_tile_type(K, V, ggml_cuda_info().devices[device].cc);
              need_f16_K = K->type != tile_type;
@@ -487,10 +488,10 @@ index 64dcacf05..7b4bf9077 100755
      for type_v in TYPES_KV:
          with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 65ad2af70..8ed81061b 100644
+index ccc050969..4298d3d1d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -6667,9 +6667,28 @@ llama_context * llama_init_from_model(
+@@ -6676,9 +6676,28 @@ llama_context * llama_init_from_model(
      // split/flash-attention one - assumes type_k == type_v, so a mixed configuration is rejected
      // rather than accepted as a slow-but-valid one.  Both types default to f16, so only an explicit
      // --cache-type-k (or --cache-type-v) can trigger this.

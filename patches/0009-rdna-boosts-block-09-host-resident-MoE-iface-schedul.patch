@@ -1,4 +1,4 @@
-From 38f02fdbaa802bf11bfa81c966fe929a0834774b Mon Sep 17 00:00:00 2001
+From 74d9ecb2ec2da0be27335131090f3d3fd62efe6a Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/18] rdna-boosts: block 09: host-resident MoE (iface,
@@ -73,6 +73,9 @@ Inert below 2 devices, with an uneven -ts, and wherever no even split at 64 exis
 devices; every 3-GPU shape the delivery validates: 35B-A3B 512-wide, 27B 17408-wide and the rest).  Gate:
 scripts/gate-ffn-even-split.sh (default inert, tag reaches the split, four spellings agree, unknown tag
 refused, 3-device arm untouched).  Measured: benchmarks/2026-11-21-ffn-even-split.md.
+Co-authored-by: briansp2020 <bsp2020@gmail.com>
+Reported-by: xxyygt <xxyygt@users.noreply.github.com>
+Reported-by: plchldr <plchldr@users.noreply.github.com>
 ---
  common/CMakeLists.txt                         |    2 +
  common/arg.cpp                                |   96 +-
@@ -11178,7 +11181,7 @@ index 7b9c27789..60d5c505c 100644
          ggml_tensor node;
          void *   node_src_data_ptrs[GGML_MAX_SRC];
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index f16952b26..4b4cc8df2 100644
+index 095342a38..519cca5c5 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,5 +1,8 @@
@@ -11190,7 +11193,7 @@ index f16952b26..4b4cc8df2 100644
  #include "quantize.cuh"
  #include "unary.cuh"
  #include "vecdotq.cuh"
-@@ -1768,8 +1771,14 @@ static void mul_mat_vec_q_moe_launch(
+@@ -1792,8 +1795,14 @@ static void mul_mat_vec_q_moe_launch(
      int64_t cold_gate_n_res    = 0;
      size_t  cold_gate_channel_bytes = 0;
      size_t  cold_gate_row_bytes     = 0;
@@ -11207,7 +11210,7 @@ index f16952b26..4b4cc8df2 100644
      // The kernel indexes in type-block units; the cold geometry is reported in bytes.
      const size_t   ts = ggml_type_size(type);
      const uint32_t cold_channel_stride      = cold_channel_bytes      > 0 ? (uint32_t) (cold_channel_bytes      / ts) : 0;
-@@ -3329,3 +3338,273 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+@@ -3353,3 +3362,273 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
              (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
      }
  }
