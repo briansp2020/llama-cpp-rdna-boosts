@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 21:53:43 +0000
-Subject: [PATCH 27/41] mmvq: dense gate/up + GLU fusion at the verify width
+Subject: [PATCH 27/40] mmvq: dense gate/up + GLU fusion at the verify width
  (2-8 tokens, RDNA4), publishing the down projection Q8_1 from the ksplit
  launch (GGML_CUDA_DENSE_GLU_VERIFY=0: off)
 
@@ -136,10 +136,10 @@ index 9cb9f8b8c7..5cc82895b4 100644
          GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_dst_gate, use_conv_input, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, dst_gate, conv_input, conv_states, conv_kernel_size);
      }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 5cfa61aa01..3ca03a1677 100644
+index 280f07f61b..69ee66a214 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1213,6 +1213,15 @@ static void mul_mat_vec_q_switch_fusion(
+@@ -1237,6 +1237,15 @@ static void mul_mat_vec_q_switch_fusion(
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
  }
  
@@ -155,7 +155,7 @@ index 5cfa61aa01..3ca03a1677 100644
  // The mixed-type row concat pairs (RDNA4, 1 token): a K-quant launch type and a Q6_K segment (the attn_v of the
  // K-quant "M" mixes), both with the same nwarps on RDNA4 (1; static_assert in mul_mat_vec_q_ksplit_cat2).  GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0: off.
  static bool ggml_cuda_mmvq_cat2_ok(ggml_type type, ggml_type type_b, int cc) {
-@@ -1279,6 +1288,19 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+@@ -1303,6 +1312,19 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
              return;
          }
      }
@@ -175,7 +175,7 @@ index 5cfa61aa01..3ca03a1677 100644
  
      GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
  
-@@ -1882,7 +1904,9 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1906,7 +1928,9 @@ void ggml_cuda_mul_mat_vec_q(
      if (fusion) {
          const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
          GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
@@ -186,7 +186,7 @@ index 5cfa61aa01..3ca03a1677 100644
          // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
          // non-negligible for some models such as gpt-oss-20b. The per-token MoE scale is a second exception.
          GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4 || fusion->x_scale_channel_dst);
-@@ -1995,6 +2019,27 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -2019,6 +2043,27 @@ void ggml_cuda_mul_mat_vec_q(
                  }
              }
          }

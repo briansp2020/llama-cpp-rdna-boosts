@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 26 Nov 2026 17:54:02 +0000
-Subject: [PATCH 37/41] cuda: queued row-block reads without one copy per row
+Subject: [PATCH 37/40] cuda: queued row-block reads without one copy per row
  -- the destination's owner copies 2-D, any other device gathers on the device
  and scatters from a stream callback (GGML_CUDA_ROWS_ASYNC_GATHER=0: off)
 

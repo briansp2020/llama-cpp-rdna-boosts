@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 26 Nov 2026 20:25:39 +0000
-Subject: [PATCH 39/41] cuda: GDN -- a multi-sequence ubatch with snapshots (K
+Subject: [PATCH 38/40] cuda: GDN -- a multi-sequence ubatch with snapshots (K
  > 1, MTP) takes the chunked prefix + sequential tail per sequence
  (GGML_CUDA_GDN_MULTISEQ_TAIL=0: off)
 

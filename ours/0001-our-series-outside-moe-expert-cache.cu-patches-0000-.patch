@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 7 Nov 2026 02:13:28 +0000
-Subject: [PATCH 01/41] our series outside moe-expert-cache.cu (patches
+Subject: [PATCH 01/40] our series outside moe-expert-cache.cu (patches
  0000-0054 of stack-r228, squashed for the merge)
 
 (cherry picked from commit 7be306cc9478b190c9daaf3677ff1665bd79c5e1)
@@ -2950,10 +2950,10 @@ index b9781da1ba..964e0fbfa9 100644
      const auto launch_rpb = [&](auto rpb_c) {
          if (has_fusion) {
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 6e608c6280..bfbd0e9b1e 100644
+index 12a568b7a7..9617318def 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1914,6 +1914,13 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1938,6 +1938,13 @@ void ggml_cuda_mul_mat_vec_q(
              GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
              fusion_local.gate = fusion->gate->data;
          }
@@ -2967,7 +2967,7 @@ index 6e608c6280..bfbd0e9b1e 100644
          if (fusion->gate_bias) {
              GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
              GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
-@@ -1948,33 +1955,37 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1972,33 +1979,37 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -3014,7 +3014,7 @@ index 6e608c6280..bfbd0e9b1e 100644
                                                  sd->ne[0], sd->ne[1], sd->ne[2], sd->ne[3],
                                                  sd->nb[1]/ts_sd, sd->nb[2]/ts_sd, sd->nb[3]/ts_sd, sfound);
                  if (!sfound) {
-@@ -3574,6 +3585,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+@@ -3598,6 +3609,9 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
              moe_cache_fusion_launched(serve, 5);
              if (serve == MOE_CACHE_SERVE_IN_PLACE) {
                  ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
@@ -3024,7 +3024,7 @@ index 6e608c6280..bfbd0e9b1e 100644
              } else {
                  ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
              }
-@@ -3846,11 +3860,26 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
+@@ -3870,11 +3884,26 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
      return 5;
  }
  
@@ -3052,7 +3052,7 @@ index 6e608c6280..bfbd0e9b1e 100644
      ggml_tensor * node = cgraph->nodes[i];
      ctx.glu_q8_1_node = nullptr;
      ctx.glu_q8_1_mm   = nullptr;
-@@ -3859,10 +3888,10 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
+@@ -3883,10 +3912,10 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
          return;
      }
      const ggml_tensor * mm = nullptr;
@@ -3065,7 +3065,7 @@ index 6e608c6280..bfbd0e9b1e 100644
          mm = cgraph->nodes[i + 2];
      }
      if (mm == nullptr) {
-@@ -3874,7 +3903,8 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
+@@ -3898,7 +3927,8 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
          a_root = a_root->view_src;
      }
      if (a_root == node && ggml_is_contiguous(a) && a->ne[0] % QK8_1 == 0 && ggml_nelements(a) == ggml_nelements(node) &&
@@ -4374,7 +4374,7 @@ index ab2d1243ad..85a4cd158d 100644
                          invalid_param = true;
                          break;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 196e0bfffe..1b7ac753c8 100644
+index 236b6b42a8..633024afec 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1,3 +1,4 @@
@@ -4382,7 +4382,7 @@ index 196e0bfffe..1b7ac753c8 100644
  #include "server-context.h"
  #include <atomic>
  #include <thread>
-@@ -4487,6 +4488,25 @@ private:
+@@ -4491,6 +4492,25 @@ private:
          std::vector<server_slot *> generating;
          std::vector<server_slot *> drafting;
  
@@ -4408,7 +4408,7 @@ index 196e0bfffe..1b7ac753c8 100644
          // determine which slots are generating and drafting
          iterate(slots, [&](server_slot & slot) {
              if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
-@@ -4512,7 +4532,7 @@ private:
+@@ -4516,7 +4536,7 @@ private:
                  const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                  const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
  
@@ -4417,7 +4417,7 @@ index 196e0bfffe..1b7ac753c8 100644
  
                  if (n_draft_max > 0) {
                      GGML_ASSERT(slot.can_speculate());
-@@ -5254,7 +5274,16 @@ private:
+@@ -5258,7 +5278,16 @@ private:
                          slot.prompt.tokens.push_back(cur_tok);
  
                          // break at the last user message, or at user messages at least min step past the last checkpoint

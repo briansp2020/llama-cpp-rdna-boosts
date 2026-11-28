@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:09:29 +0000
-Subject: [PATCH 18/41] moe cache: KV segment -- one take per request
+Subject: [PATCH 18/40] moe cache: KV segment -- one take per request
  (GGML_MOE_KV_SEG_TAKE1)
 
 With the KV segment the lend line follows the cells in use, so a long
@@ -190,7 +190,7 @@ index 1e39d350f4..c327aa7dd7 100644
      //
      // input API
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 1b7ac753c8..34a4dd5229 100644
+index 633024afec..3dbf2f0276 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -24,6 +24,7 @@
@@ -201,7 +201,7 @@ index 1b7ac753c8..34a4dd5229 100644
  
  #include <algorithm>
  #include <cstddef>
-@@ -4200,6 +4201,8 @@ private:
+@@ -4204,6 +4205,8 @@ private:
  
                  metrics_flush_idle();
  
@@ -210,7 +210,7 @@ index 1b7ac753c8..34a4dd5229 100644
                  // KV admission refuses a task that does not fit BESIDE the slots that run, and a released slot wakes
                  // exactly one deferred task: so a task that is re-offered and refused again (it still does not fit,
                  // or the released slot went to a newer request) waits for an unrelated request to finish.  With no
-@@ -4279,6 +4282,22 @@ private:
+@@ -4283,6 +4286,22 @@ private:
              llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
          }
  

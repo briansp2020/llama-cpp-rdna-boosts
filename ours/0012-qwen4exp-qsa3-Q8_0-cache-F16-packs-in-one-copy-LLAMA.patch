@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Wed, 11 Nov 2026 00:12:06 +0000
-Subject: [PATCH 12/41] qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy
+Subject: [PATCH 12/40] qwen4exp qsa3: Q8_0 cache -> F16 packs in one copy
  (LLAMA_QSA3_DIRECT_F16); gate copy before attention on prefill-sized graphs
  so Qcur_full dies early (LLAMA_GATE_EARLY)
 

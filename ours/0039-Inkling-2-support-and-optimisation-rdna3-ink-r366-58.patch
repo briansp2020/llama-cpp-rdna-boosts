@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 26 Nov 2026 22:52:22 -0800
-Subject: [PATCH 40/41] Inkling-2 support and optimisation (rdna3 ink-r366, 58
+Subject: [PATCH 39/40] Inkling-2 support and optimisation (rdna3 ink-r366, 58
  commits squashed)
 
 Inkling-2-Mini (arch inkling2 / inkling2_loop) on our stack: upstream support plus our engine work,
@@ -3732,10 +3732,10 @@ index e6687996be..41f430f94e 100644
          // wip/fa-stage-chunking: the whole-prefix launch keeps the shipping (final, normalized)
          // contract; only the chunk loop above uses the partial one.
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index ab842fe077..60a997d6ea 100644
+index 11fc7ce53e..a873149f6b 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -2671,6 +2671,8 @@ static __global__ void flash_attn_ext_f16(
+@@ -2706,6 +2706,8 @@ static __global__ void flash_attn_ext_f16(
          const int    * __restrict__ cell_pos_ptr,
          const int    * __restrict__ tok_lo_ptr,
          const int    * __restrict__ tok_hi_ptr,
@@ -3978,10 +3978,10 @@ index 59e77e0053..a0f4ed0cb3 100644
                              // wip/fa-stage-chunking (TODO #114): MMA-prefill only.
                              float2 *, const int) {
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index a22a4988c2..e764dbf065 100644
+index 1043110d87..252b9431d7 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -663,6 +663,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -685,6 +685,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      const ggml_tensor * Q     = dst->src[0];
      const ggml_tensor * K     = dst->src[1];
      const ggml_tensor * V     = dst->src[2];
@@ -5597,10 +5597,10 @@ index d4cba70f89..219a92f543 100644
      // (row, K-block) loop): with 2 rows per block the last pass runs partly idle -- the per-device Q5_0 MoE down of
      // Qwen3.8-Flash-Next under -sm tensor (K 320 = 10 blocks, 20 items over 16 groups) took 48 us at 4 tokens against 32 us at
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 3ca03a1677..a22549cc6e 100644
+index 69ee66a214..3f9f3c182c 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1609,7 +1609,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1633,7 +1633,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  // rows, as in r28. Rows are independent: bit-identical.
                  if constexpr (c_ncols_dst == 1 && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
                                                     type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS)) {

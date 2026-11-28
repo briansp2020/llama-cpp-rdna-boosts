@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 24 Nov 2026 18:48:48 +0000
-Subject: [PATCH 33/41] meta: cheaper split-state misses -- lean source states,
+Subject: [PATCH 33/40] meta: cheaper split-state misses -- lean source states,
  derived assume_sync=false states, walk pruned per buffer (GGML_META_SS_LEAN /
  _DERIVE / _PRUNE_XBUF=0: off)
 

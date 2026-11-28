@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 24 Nov 2026 17:18:46 +0000
-Subject: [PATCH 32/41] server: queue a checkpoint's state copy before the next
+Subject: [PATCH 32/40] server: queue a checkpoint's state copy before the next
  batch, finish it after (LLAMA_CKPT_ASYNC=0: off)
 
 A context checkpoint is taken right before the next batch is queued, and its target state copy (112.6 MiB of
@@ -229,7 +229,7 @@ index 7bb303ae40..5ae0622eae 100644
  
      bool state_load_file(
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 9fe14c50bd..f6a04e377e 100644
+index 45a8b6ac49..efb6a807a5 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1437,6 +1437,48 @@ private:
@@ -281,7 +281,7 @@ index 9fe14c50bd..f6a04e377e 100644
      // a spare of exactly n bytes: no new allocation and no zero fill when the checkpoint is written into it
      common_state_data ckpt_take(size_t n) {
          for (auto it = ckpt_spare.begin(); it != ckpt_spare.end(); ++it) {
-@@ -3414,7 +3456,23 @@ private:
+@@ -3418,7 +3460,23 @@ private:
                  cur.data_dft = ckpt_take(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
              }
          }
@@ -306,7 +306,7 @@ index 9fe14c50bd..f6a04e377e 100644
          cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          // stash the draft's speculative state with the checkpoint
          common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
-@@ -4212,6 +4270,7 @@ private:
+@@ -4216,6 +4274,7 @@ private:
      }
  
      void update_slots() {
@@ -314,7 +314,7 @@ index 9fe14c50bd..f6a04e377e 100644
  #ifdef DEBUG_TIMINGS
          static int64_t t_prev = 0;
          int64_t t_start = ggml_time_us();
-@@ -5565,7 +5624,12 @@ private:
+@@ -5569,7 +5628,12 @@ private:
          // note: the sync is done here too, so that the wait is also covered by the yield
          int ret = 0;
          queue_tasks.yield_to_queue([&]() {

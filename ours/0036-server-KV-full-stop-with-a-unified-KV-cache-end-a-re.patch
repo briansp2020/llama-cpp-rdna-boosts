@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 26 Nov 2026 14:55:12 +0000
-Subject: [PATCH 36/41] server: KV full stop -- with a unified KV cache, end a
+Subject: [PATCH 36/40] server: KV full stop -- with a unified KV cache, end a
  reply that no longer fits with a length stop instead of failing the decode
  (LLAMA_SERVER_KV_FULL_STOP=0: off)
 
@@ -26,7 +26,7 @@ which the per-slot count would double). Inert while the cache has room.
  1 file changed, 95 insertions(+), 4 deletions(-)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index f6a04e377e..6f5b336404 100644
+index efb6a807a5..b7bb0f6654 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1273,6 +1273,22 @@ private:
@@ -52,7 +52,7 @@ index f6a04e377e..6f5b336404 100644
      // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
      // starts and is saved to the prompt cache and cleared only once the KV cache runs out of room, so conversations that
      // take turns on their own slots do not copy their whole state to host memory and back on every switch
-@@ -4529,6 +4545,71 @@ private:
+@@ -4533,6 +4549,71 @@ private:
          });
      }
  
@@ -124,7 +124,7 @@ index f6a04e377e..6f5b336404 100644
      void pre_decode() {
          // apply context-shift if needed
          // TODO: simplify and improve
-@@ -4598,6 +4679,8 @@ private:
+@@ -4602,6 +4683,8 @@ private:
              }
          });
  
@@ -133,7 +133,7 @@ index f6a04e377e..6f5b336404 100644
          // start populating the batch for this iteration
          batch.clear();
  
-@@ -4789,6 +4872,14 @@ private:
+@@ -4793,6 +4876,14 @@ private:
          // after four in a row.  So an idle server (or a prompt arriving with nothing decoding) is prefilled
          // immediately and neither counter advances -- which is also what calibrates `prefill_step_us`.
          const size_t n_batch_decode = batch.size(); // the decode tokens are already in; prompt tokens are not
@@ -148,7 +148,7 @@ index f6a04e377e..6f5b336404 100644
          const int64_t t_step_now = ggml_time_us();
          const int64_t step_us    = prefill_step_start > 0 ? t_step_now - prefill_step_start : 0;
          if (prefill_step_prev) {
-@@ -4872,7 +4963,7 @@ private:
+@@ -4876,7 +4967,7 @@ private:
              bool add_ok = true; // false means the batch is full, skip remaining slots
  
              iterate(slots, [&](server_slot & slot) {
@@ -157,7 +157,7 @@ index f6a04e377e..6f5b336404 100644
                      return; // batch is full, skip remaining slots
                  }
  
-@@ -5226,7 +5317,7 @@ private:
+@@ -5230,7 +5321,7 @@ private:
  
                      if (!slot.can_split()) {
                          // cannot fit the prompt in the current batch - will try next iter
@@ -166,7 +166,7 @@ index f6a04e377e..6f5b336404 100644
                              return;
                          }
                      }
-@@ -5350,7 +5441,7 @@ private:
+@@ -5354,7 +5445,7 @@ private:
                      const int32_t n_prompt_start  = (int32_t) slot.prompt.n_tokens();
                      const int32_t n_prompt_budget = prompt_budget[slot.id];
  
@@ -175,7 +175,7 @@ index f6a04e377e..6f5b336404 100644
                             (int32_t) slot.prompt.n_tokens() - n_prompt_start < n_prompt_budget) {
                          // get next token to process
                          llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
-@@ -5364,7 +5455,7 @@ private:
+@@ -5368,7 +5459,7 @@ private:
                          }
  
                          // the outputs of a decision are read from one batch, do not split them

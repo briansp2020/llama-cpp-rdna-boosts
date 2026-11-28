@@ -4,7 +4,7 @@
 # the settings that matter.  group_add "991" is our host's render gid: use yours (`stat -c %g /dev/kfd`).
 services:
   llama-cpp:
-    image: llama.cpp-rdna-ours-r369     # built from this branch (README: Build)
+    image: llama.cpp-rdna-ours-r373     # built from this branch (README: Build)
     container_name: llama.cpp
     network_mode: "host"
     devices:

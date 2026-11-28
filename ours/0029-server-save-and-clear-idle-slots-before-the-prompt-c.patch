@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 23 Nov 2026 17:57:05 +0000
-Subject: [PATCH 29/41] server: save and clear idle slots before the
+Subject: [PATCH 29/40] server: save and clear idle slots before the
  prompt-cache restore, not after the launch (LLAMA_SERVER_IDLE_CLEAR_FIRST=0:
  off)
 
@@ -19,7 +19,7 @@ references unchanged.
  1 file changed, 41 insertions(+)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 9b75cf1d80..9fe14c50bd 100644
+index acd4d4f143..45a8b6ac49 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1281,6 +1281,18 @@ private:
@@ -73,7 +73,7 @@ index 9b75cf1d80..9fe14c50bd 100644
      // a restore can fail for want of KV cells that another idle slot holds (unified KV cache): move idle slots to the prompt
      // cache one at a time, with the entry being restored kept out of the eviction that their saving may cause, and retry
      bool prompt_load_with_room(server_slot & slot, const server_tokens & tokens,
-@@ -3677,6 +3714,10 @@ private:
+@@ -3681,6 +3718,10 @@ private:
                      }
  
                      // the task is not deferred past this point
