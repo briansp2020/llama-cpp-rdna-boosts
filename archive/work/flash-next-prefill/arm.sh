@@ -3,7 +3,14 @@
 # issue-#368 flags.  One process, one prompt, prints the H2D calibration and the rates.
 #
 #   usage: ./arm.sh TAG [ENV=V ...]
-#   env:   DEV=<gpu index>   UB=<8192>   PROMPT=<file>   VERBOSE=<-lv 4 for a census arm>   EXTRA=<cli args>
+#   env:   DEV=<gpu index>   UB=<8192>   NCMOE=<47> (host-expert layers; fewer = more layers resident)
+#          PROMPT=<file>   VERBOSE=<-lv 4 for a census arm>   EXTRA=<cli args>
+#          HOSTEXP=<pool>   --host-experts tier (`pinned`/`pool`); the maintainer's reproducible configuration
+#                           for a benchmark sweep is `HOSTEXP=pinned LME=mirror LAZY=off` (the field runme's
+#                           pair: a mirrored pinned master, everything resident, no on-demand reads)
+#          LME=<unset>      `-lme <auto|mirror|N>`; unset = do not pass it
+#          LAZY=<on>        `--lazy-mode on|off`; `off` keeps every tensor resident and is what makes a
+#                           sweep reproducible when the box is otherwise busy (no on-demand reads mid-run)
 #   out:   runs/TAG/run.log
 set -uo pipefail
 TAG=${1:?usage: arm.sh TAG [ENV=V ...]}; shift
@@ -13,7 +20,7 @@ DIR="$RUNS/$TAG"; rm -rf "$DIR"; mkdir -p "$DIR"
 # The campaign's prompt: prompts/prose-rdna-boosts.txt x17 (89 182 tokens).  Generated, never committed.
 PROMPT=${PROMPT:-$HERE/l1-90k.txt}
 if [ ! -s "$PROMPT" ]; then
-  for _ in $(seq 1 17); do cat "$HERE/../../prompts/prose-rdna-boosts.txt"; done > "$PROMPT"
+  for _ in $(seq 1 17); do cat "$HERE/../../../prompts/prose-rdna-boosts.txt"; done > "$PROMPT"
 fi
 MODEL=${MODEL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}
 export HIP_VISIBLE_DEVICES=${DEV:-0}
@@ -26,7 +33,8 @@ export ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-1}
 if [ $# -gt 0 ]; then export "$@"; fi
 "${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}" \
   -m "$MODEL" \
-  --fit off -ngl all --n-cpu-moe 47 --host-experts pool --load-mode auto --lazy-mode on \
+  --fit off -ngl all --n-cpu-moe ${NCMOE:-47} --host-experts ${HOSTEXP:-pool} --load-mode auto \
+  --lazy-mode ${LAZY:-on} ${LME:+-lme $LME} \
   -c 131072 -fa on -ctk q8_0 -ctv q8_0 -b ${UB:-8192} -ub ${UB:-8192} -t 8 --cache-ram 4096 ${EXTRA:-} \
   -f "$PROMPT" -n ${NGEN:-24} --temp 0 --seed 1 --no-display-prompt --single-turn ${VERBOSE:-} \
   > "$DIR/run.log" 2>&1
