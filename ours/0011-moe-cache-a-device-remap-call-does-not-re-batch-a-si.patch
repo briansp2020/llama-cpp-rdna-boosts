@@ -34,10 +34,10 @@ GGML_MOE_DEVREMAP_REBATCH=1 restores the old re-batch.
  1 file changed, 13 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 13c3d81038..e9795e722c 100644
+index d3170339ce..64284dbbe0 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -13116,6 +13116,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+@@ -13223,6 +13223,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
      return true;
  }
  
@@ -50,7 +50,7 @@ index 13c3d81038..e9795e722c 100644
  bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids,
                           void * stream, int device, bool check_only) {
      bool pf_ret = false;
-@@ -13212,6 +13218,13 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -13319,6 +13325,13 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
                  !devremap_ok_locked(u, n_used, n_tok, device)) {
                  continue;
              }

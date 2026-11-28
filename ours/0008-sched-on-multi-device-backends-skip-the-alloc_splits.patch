@@ -19,10 +19,10 @@ upstream drain, =1 skips it, =2 drains after the re-point.
  1 file changed, 26 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index b721e40c73..272c38fe73 100644
+index 5b6d493dc7..0f2b2f8d37 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -2846,7 +2846,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2856,7 +2856,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
          // split) a previous graph's kernels may still be in flight on other devices when the
          // re-point happens, which races cross-device (in-kernel spin / memory faults at multi-ubatch
          // prefill, reproduced on 3x R9700 gfx1201) - so the multi-device path keeps the full
@@ -32,7 +32,7 @@ index b721e40c73..272c38fe73 100644
          // the raw backend count, so a single GPU plus a CPU backend keeps the fast path.
          // A Meta backend (tensor split) presents as a single META device here, but it wraps
          // multiple real devices and drives them on separate device streams.  Counting it as one
-@@ -2869,11 +2870,27 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2879,11 +2880,27 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
          // be using.
          const bool buffers_grown = ggml_gallocr_reserve_n_probe(
                  sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
@@ -63,7 +63,7 @@ index b721e40c73..272c38fe73 100644
              }
  
              if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-@@ -2885,6 +2902,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2895,6 +2912,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
              GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              return false;
          }

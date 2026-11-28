@@ -29,7 +29,7 @@ Folded in: moe tier: namespace-scope env flags initialized by named functions, n
  create mode 100644 ggml/src/ggml-cuda/moe-expert-tier.inc
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 00e6cc137a..f1fcdb5100 100644
+index 6bb27a8a88..0575905b09 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -104,7 +104,8 @@ struct bounce_t {
@@ -42,7 +42,7 @@ index 00e6cc137a..f1fcdb5100 100644
      int         layer       = -1;
      std::string role;
      int         n_experts   = 0;
-@@ -13535,7 +13536,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -13642,7 +13643,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
  
  bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate,
                                const ggml_tensor * ids, int device, void * stream,
@@ -52,7 +52,7 @@ index 00e6cc137a..f1fcdb5100 100644
      if (!g_enabled || ids == nullptr || src0 == nullptr) {
          return false;
      }
-@@ -13582,6 +13584,13 @@ bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0,
+@@ -13689,6 +13691,13 @@ bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0,
          *gate_cpy = *gate;
          gate_cpy->data   = gate_arena;
          gate_cpy->buffer = nullptr;
@@ -66,7 +66,7 @@ index 00e6cc137a..f1fcdb5100 100644
      }
      return true;
  }
-@@ -14384,3 +14393,5 @@ void moe_cache_selftest() {
+@@ -14491,3 +14500,5 @@ void moe_cache_selftest() {
          (void) cudaSetDevice(prev);
      }
  }

@@ -27,7 +27,7 @@ instead of 0..k-1, and the heat seed leaves sparse tables to it.  No map: 0..k-1
  2 files changed, 51 insertions(+), 10 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index c05a3037c2..c19bcf80e8 100644
+index 43c21d321f..c0ece3cfdd 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -321,6 +321,16 @@ struct table_t : moe_tier_fields {
@@ -47,7 +47,7 @@ index c05a3037c2..c19bcf80e8 100644
  
  std::mutex                          g_mutex;
  std::vector<table_t>                g_tables;
-@@ -5613,6 +5623,9 @@ void apply_heat_seed_locked(table_t & t) {
+@@ -5626,6 +5636,9 @@ void apply_heat_seed_locked(table_t & t) {
          !heat_seed_above_floor(t)) {
          return;
      }

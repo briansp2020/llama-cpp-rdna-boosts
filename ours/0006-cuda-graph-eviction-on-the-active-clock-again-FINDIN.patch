@@ -44,7 +44,7 @@ index 5d2104d7c2..0707aa75fe 100644
      // Check if any CUDA graph is enabled for this context (used by kernels that need to know
      // if graphs are in use without having access to the specific graph key)
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 60c7520ee8..a057bf27c3 100644
+index 570da0c9dc..4eea6f5d45 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1717,16 +1717,19 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :

@@ -1,4 +1,4 @@
-# ours: our production stack on top of the current rdna-boosts release (r373)
+# ours: our production stack on top of the current rdna-boosts release (r375)
 
 This branch holds the patch series we run on top of the latest rdna-boosts release: 2x Radeon AI PRO R9700,
 ROCm 10.2, Qwen3.8-Flash-Next UD-IQ4_XS with `-sm tensor` and `--host-experts mmap`. Since 0039 it also runs
@@ -6,15 +6,15 @@ Inkling-2-Mini (see *Inkling-2-Mini* below). It is regenerated for each
 release, and patches the release has taken are dropped. It is not a PR. Everything else on this branch is the
 release as published; only `ours/` is added.
 
-**Base:** `v18-919794500-r373` (upstream llama.cpp `919794500` + this repo's release).
+**Base:** `v18-919794500-r375` (upstream llama.cpp `919794500` + this repo's release).
 
 ```
 git checkout 919794500
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r373 release, branch rdna-boosts
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r375 release, branch rdna-boosts
 git am <path-to-this-repo>/ours/*.patch              # 40 patches (0001-0040)
 ```
 
-Result: tree `ab1ea4dce9a8`. This is our production candidate from 2026-11-28.
+Result: tree `130caee68a75`. This is our production candidate from 2026-11-28 (r375).
 
 Also in `ours/`: `bench/llbench.py` (the benchmark below), `deploy/docker-compose.yaml` (our production
 compose file, local paths replaced by `./models`) and `tools/mkhead.py` (one step of the draft-head recipe).
@@ -22,7 +22,7 @@ compose file, local paths replaced by `./models`) and `tools/mkhead.py` (one ste
 ## Performance (r368 + 41, 2026-11-27)
 
 Everything below is one 2x R9700 box running the production configuration (see *Reproducing it*): 256K
-context, 4 slots, MTP speculative decoding (draft n-max 3), greedy requests. Measured on r368 + 41. r369-r373 and NVFP4 on MMB do not
+context, 4 slots, MTP speculative decoding (draft n-max 3), greedy requests. Measured on r368 + 41. r369-r375 and NVFP4 on MMB do not
 change these; the r369 + 41 change to 0008 raises 2K-8K prefill by 7-9 % (not re-measured here, see *Validation*).
 
 **Coding-agent depth curve.** This is our replica of the local-llm-benchmarks.dev protocol
@@ -257,7 +257,18 @@ Greedy text with DSpark is not byte-identical to greedy text without it: the dra
 which rounds differently from one token at a time (on a 7900 XTX: next-token KLD 0.0015, 98.6 % same top token), so
 compare the two by KLD, not by hashes.
 
-## Validation (r373 + 40, 2026-11-28)
+## Validation (r375 + 40, 2026-11-28)
+
+- Rebased from r373 onto r375 (r374: issue #382, ctests and three small defects; r375: issue #368, the measured
+  stage-or-gather choice and three switches fixed). All 40 patches applied unchanged. The release's staging still
+  does not engage in the production configuration (one refusal, as before).
+- The 7-model comparison with the release: PASS (0 problems, 0 warnings), with the NVFP4 model matching the release
+  when `GGML_CUDA_MMB_NVFP4=0`; Inkling-2-Mini the same as before; 0 GPU faults.
+- Production configuration: greedy and the 512-token prompt set give the same text as r373 + 40; prefill 34K
+  3,667 t/s and 8K 3,600 t/s; two long agents taking turns 30.0 s for 3 rounds; 0 GPU faults.
+- The overnight stress run below was on r373 + 40; r375 was not stress-tested separately.
+
+### r373 + 40 (2026-11-28)
 
 - Rebased from r369 onto r373. r373 takes our former 0038 (the max-min prompt share divides the pass's budget, PR
   #376), so it is dropped and 0039-0041 are now 0038-0040. The other patches applied unchanged. r371 (the shared

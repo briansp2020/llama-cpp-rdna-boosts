@@ -35,7 +35,7 @@ for the callback to return.
  1 file changed, 116 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3543074637..8a7253454a 100644
+index aa5c35777d..a27b3bd413 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3955,6 +3955,94 @@ static char * ggml_cuda_kv_region_dev_stage(int device, size_t need, std::unique

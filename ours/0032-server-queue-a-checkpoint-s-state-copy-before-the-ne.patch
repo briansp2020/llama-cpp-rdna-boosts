@@ -100,7 +100,7 @@ index 4bd042058e..93240eb162 100644
      // Decoding
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 411838080b..86c07c6260 100644
+index 193a5fc3bf..427de572f7 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1283,6 +1283,7 @@ llama_context::llama_context(
@@ -163,7 +163,7 @@ index 411838080b..86c07c6260 100644
          return true;
      }
  
-@@ -6090,7 +6107,17 @@ private:
+@@ -6097,7 +6114,17 @@ private:
      llama_context * lctx = nullptr;
  };
  
@@ -181,7 +181,7 @@ index 411838080b..86c07c6260 100644
      if (buf_state_stage == nullptr || ggml_backend_buffer_get_size(buf_state_stage.get()) < size) {
          buf_state_stage.reset();
          // the pinned type of the output device (the first simple device of a meta device), as for the outputs
-@@ -7542,6 +7569,22 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+@@ -7549,6 +7576,22 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
      return ctx->state_seq_set_data(seq_id, src, size, flags);
  }
  

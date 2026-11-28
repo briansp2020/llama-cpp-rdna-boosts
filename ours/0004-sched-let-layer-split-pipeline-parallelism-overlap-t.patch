@@ -51,7 +51,7 @@ layer split identical to the base-vs-base control at 8k and 32k. Full
  3 files changed, 101 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index d344019bb5..b721e40c73 100644
+index 9583b2f870..5b6d493dc7 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1537,6 +1537,15 @@ struct ggml_backend_sched_split {
@@ -79,7 +79,7 @@ index d344019bb5..b721e40c73 100644
      bool lazy_events;
      struct ggml_tensor ** graph_inputs;
      int n_graph_inputs;
-@@ -3492,6 +3503,62 @@ static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sche
+@@ -3545,6 +3556,62 @@ static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sche
      return ev;
  }
  
@@ -142,7 +142,7 @@ index d344019bb5..b721e40c73 100644
  static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
      const int split_backend_id = split->backend_id;
      ggml_backend_t split_backend = sched->backends[split_backend_id];
-@@ -3517,6 +3584,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3570,6 +3637,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
      } else if ((input->flags & GGML_TENSOR_FLAG_INPUT) ||
          (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(input) != nullptr)) {
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -152,7 +152,7 @@ index d344019bb5..b721e40c73 100644
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched_event_get(sched, split_backend_id));
          } else {
-@@ -3824,7 +3894,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3880,7 +3950,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                  input->buffer != NULL &&
                  ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                  !sched_async_large_host_input();
@@ -163,7 +163,7 @@ index d344019bb5..b721e40c73 100644
                  split_backend->iface.event_wait != NULL) {
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                      sched_event_wait_self(sched, split_backend_id);
-@@ -4478,6 +4550,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -4564,6 +4636,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int e = 0; e < GGML_SCHED_COPY_EVENTS; e++) {
              ggml_backend_event_free(sched->copy_events[b][e]);
          }
@@ -177,7 +177,7 @@ index d344019bb5..b721e40c73 100644
          for (int s = 0; s < GGML_SCHED_PIPE_MAX_BUFS; s++) {   // one done/free event per pipeline buffer
              ggml_backend_event_free(sched->stage_done_ev[b][s]);
              ggml_backend_event_free(sched->stage_free_ev[b][s]);
-@@ -4566,6 +4645,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -4652,6 +4731,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
  
      sched->cur_copy = sched->next_copy;
      sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
@@ -186,7 +186,7 @@ index d344019bb5..b721e40c73 100644
      ggml_backend_sched_split_graph(sched, graph);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 5faab9e257..a151e13bc2 100644
+index 4646670385..c8a0404b82 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3388,7 +3388,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
@@ -205,10 +205,10 @@ index 5faab9e257..a151e13bc2 100644
  
          // with pipeline parallelism, the previous graph_compute_async may still be running
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index e10ef7f4dc..d679484813 100644
+index 3554eadbe3..7b491fdbe2 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -3063,6 +3063,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
+@@ -3075,6 +3075,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
          const uint32_t used = parked.empty() ? cells.used_max_p1() : cells.used_max_p1_below(park_bound());
          const uint32_t pad  = prefill && GGML_PAD(used, n_pad_cur) > n_pad_prefill_from ? n_pad_prefill : n_pad_cur;
  

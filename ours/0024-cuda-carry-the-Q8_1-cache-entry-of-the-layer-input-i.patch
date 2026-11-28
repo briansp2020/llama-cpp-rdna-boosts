@@ -88,7 +88,7 @@ index 0707aa75fe..9114d981c0 100644
      // source read range (the tensor's own ne/nb extent) must lie within the root tensor's
      // buffer allocation.  A compute buffer that is reallocated while a cache entry still
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 0cc3870b2c..c347db10b2 100644
+index 7a6eafbb30..7976d1525b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -9291,11 +9291,15 @@ static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {

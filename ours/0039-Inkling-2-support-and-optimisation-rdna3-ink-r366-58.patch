@@ -865,7 +865,7 @@ index 5a14e52737..8fcac214fd 100644
      // indexer's top-k names, instead of the whole KV cache.  The mask is the
      // base kq_mask and is gathered in-kernel at the idx positions.
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 03a9cc7921..1ccae10bb2 100644
+index c46c34b1b7..3767ef0daf 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1637,7 +1637,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -4457,7 +4457,7 @@ index b3f874c081..9571d775b9 100644
  };
  void ggml_cuda_gdn_gather_index_build(const ggml_cgraph * cgraph, ggml_cuda_gdn_gather_index & idx);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 8a7253454a..8b819e157e 100644
+index a27b3bd413..73f00e2c25 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -36,6 +36,7 @@
@@ -6954,7 +6954,7 @@ index 1db10bdf10..6034e8b7ca 100644
  }
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index cd2f62ea2a..2f9d976c4d 100644
+index e9e7ef3db4..5fe32fb29c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1101,7 +1101,7 @@ llama_context::llama_context(
@@ -7788,10 +7788,10 @@ index ac7d4009ed..e2d1200579 100644
              0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 06c3573022..489d2ce7f7 100644
+index 9f859a40c7..f146c64f40 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -3893,7 +3893,7 @@ bool llama_kv_cache::kq_mask_derivable_seqs(const llama_seq_id * seqs, uint32_t
+@@ -3905,7 +3905,7 @@ bool llama_kv_cache::kq_mask_derivable_seqs(const llama_seq_id * seqs, uint32_t
      return true;
  }
  
@@ -7800,7 +7800,7 @@ index 06c3573022..489d2ce7f7 100644
      // alibi writes a distance into the mask, that is a value, not a predicate
      if (hparams.use_alibi) {
          return false;
-@@ -3909,8 +3909,10 @@ bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
+@@ -3921,8 +3921,10 @@ bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
      }
  
      // prefill-shaped batches only: below this the packed mask is a few hundred KiB, the launcher may
@@ -7813,7 +7813,7 @@ index 06c3573022..489d2ce7f7 100644
          return false;
      }
  
-@@ -5178,6 +5180,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+@@ -5190,6 +5192,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
      return n_kv;
  }
  
@@ -7824,7 +7824,7 @@ index 06c3573022..489d2ce7f7 100644
  uint32_t llama_kv_cache_context::get_n_kv_rows() const {
      return n_kv_rows;
  }
-@@ -5246,8 +5252,8 @@ void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask
+@@ -5258,8 +5264,8 @@ void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask
      kv->set_input_attn_mask(attn_mask, ubatch, causal_attn);
  }
  

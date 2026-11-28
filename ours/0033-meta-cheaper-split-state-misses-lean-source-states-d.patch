@@ -33,7 +33,7 @@ no stale entry, no derived entry differing.
  1 file changed, 110 insertions(+), 6 deletions(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 6238f1ee44..03a9cc7921 100644
+index b639ce873f..c46c34b1b7 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1179,6 +1179,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co

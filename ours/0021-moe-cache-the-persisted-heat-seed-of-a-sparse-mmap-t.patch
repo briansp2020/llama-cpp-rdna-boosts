@@ -25,10 +25,10 @@ map was opened there; with a loaded map, warm starts stalled for more than 15 mi
  1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 503565ef43..c05a3037c2 100644
+index b39e022af0..43c21d321f 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -5679,8 +5679,10 @@ void apply_heat_seed_locked(table_t & t) {
+@@ -5692,8 +5692,10 @@ void apply_heat_seed_locked(table_t & t) {
                  break;
              }
          } else {

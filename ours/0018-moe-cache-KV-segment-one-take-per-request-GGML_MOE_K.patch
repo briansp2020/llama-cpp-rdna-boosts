@@ -123,7 +123,7 @@ index 860a4281a7..4edd0ea0d2 100644
  // no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
  // attention cells, that cache as well.  A memory without an attention cache: true.
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 9cebf7dc1b..06c3573022 100644
+index b3834b5a6f..9f859a40c7 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -500,6 +500,7 @@ typedef void (*llama_kv_lend_unregister_t)();
@@ -134,7 +134,7 @@ index 9cebf7dc1b..06c3573022 100644
  
  //
  // llama_kv_cache
-@@ -1389,13 +1390,33 @@ void llama_kv_cache::lend_need(uint32_t at_least) const {
+@@ -1401,13 +1402,33 @@ void llama_kv_cache::lend_need(uint32_t at_least) const {
          return;
      }
      const auto & cells = v_cells[0];
@@ -169,7 +169,7 @@ index 9cebf7dc1b..06c3573022 100644
  void llama_kv_cache::init_rotation(const char * name_tag) {
      if (!(n_rot_k || n_rot_v) || layers.empty()) {
          return;
-@@ -2797,6 +2818,7 @@ llama_kv_cache::~llama_kv_cache() {
+@@ -2809,6 +2830,7 @@ llama_kv_cache::~llama_kv_cache() {
          g_kv_lend_owner      = nullptr;
          g_kv_lend_need       = nullptr;
          g_kv_lend_unregister = nullptr;
