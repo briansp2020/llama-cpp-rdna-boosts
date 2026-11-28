@@ -42,10 +42,10 @@ review (M1-M4 applied), code reviews no must-fix (FINDINGS 861).
  5 files changed, 103 insertions(+)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index f02eb3698c..e6c3373a9e 100644
+index 23e1f85552..7177735f74 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -542,6 +542,9 @@ extern "C" {
+@@ -551,6 +551,9 @@ extern "C" {
      GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
      GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
      GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
@@ -84,10 +84,10 @@ index 35b07f5f65..f0d50011ab 100644
              if (galloc->buffers[j] == galloc->buffers[i]) {
                  galloc->buffers[j] = NULL;
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index a55aedd80b..0ad6f5c098 100644
+index 7bf4af3efd..b4601697a7 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -3529,6 +3529,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -3607,6 +3607,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
              }
              backend_ctx->seg_upload_async_pending = false;
          }
@@ -102,10 +102,10 @@ index a55aedd80b..0ad6f5c098 100644
          return;
      }
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index a4632f6ef5..5c373c13c9 100644
+index 1ea6d4dea2..9ae3a304f2 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1637,6 +1637,10 @@ struct ggml_backend_sched {
+@@ -1662,6 +1662,10 @@ struct ggml_backend_sched {
  
      // inputs of the next split read from the backend of the current split before it computes, see ggml_backend_sched_prefetch_inputs
      ggml_backend_event_t prefetch_events[GGML_SCHED_MAX_BACKENDS]; // created on first use, NULL if the backend has no events
@@ -116,7 +116,7 @@ index a4632f6ef5..5c373c13c9 100644
      bool                 prefetch_tried [GGML_SCHED_MAX_BACKENDS];
      struct ggml_tensor * prefetched[GGML_SCHED_MAX_SPLIT_INPUTS];
      int n_prefetched;
-@@ -3405,6 +3409,41 @@ static bool sched_input_stage(ggml_backend_sched_t sched, int b, ggml_backend_t
+@@ -3575,6 +3579,41 @@ static bool sched_input_stage(ggml_backend_sched_t sched, int b, ggml_backend_t
      return true;
  }
  
@@ -158,7 +158,7 @@ index a4632f6ef5..5c373c13c9 100644
  static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
      const int split_backend_id = split->backend_id;
      ggml_backend_t split_backend = sched->backends[split_backend_id];
-@@ -3433,6 +3472,32 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3603,6 +3642,32 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
          if (sched_input_stage(sched, split_backend_id, split_backend, input, input_cpy)) {
              return;
          }
@@ -191,7 +191,7 @@ index a4632f6ef5..5c373c13c9 100644
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched_event_get(sched, split_backend_id));
          } else {
-@@ -4191,6 +4256,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -4563,6 +4628,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
              ggml_backend_event_free(sched->events[b][c]);
          }
          ggml_backend_event_free(sched->prefetch_events[b]);
@@ -199,7 +199,7 @@ index a4632f6ef5..5c373c13c9 100644
          for (int e = 0; e < GGML_SCHED_COPY_EVENTS; e++) {
              ggml_backend_event_free(sched->copy_events[b][e]);
          }
-@@ -4284,6 +4350,8 @@ void ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched) {
+@@ -4656,6 +4722,8 @@ void ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched) {
  
  bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      GGML_ASSERT(sched);
@@ -208,7 +208,7 @@ index a4632f6ef5..5c373c13c9 100644
      GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
      GGML_ASSERT(!sched->is_alloc);
  
-@@ -4329,6 +4397,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+@@ -4701,6 +4769,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      for (int i = 0; i < sched->n_backends; i++) {
          ggml_backend_synchronize(sched->backends[i]);
@@ -217,7 +217,7 @@ index a4632f6ef5..5c373c13c9 100644
          // the rings keeps them from synchronizing on the host at every wrap in a long prefill.
          sched->copy_event_next[i] = 0;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index a9bd735c3c..ca081735f6 100644
+index a151e13bc2..677a77438d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1076,6 +1076,15 @@ llama_context::llama_context(
@@ -236,7 +236,7 @@ index a9bd735c3c..ca081735f6 100644
                  if (host_buft) {
                      buft = host_buft;
                  }
-@@ -3394,6 +3403,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3403,6 +3412,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          if (cparams.pipeline_parallel) {
              ggml_backend_sched_synchronize(sched.get());
          }

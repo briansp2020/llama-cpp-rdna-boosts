@@ -100,10 +100,10 @@ index 4bd042058e..93240eb162 100644
      // Decoding
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 92355bf478..86248a9c6a 100644
+index 411838080b..86c07c6260 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1274,6 +1274,7 @@ llama_context::llama_context(
+@@ -1283,6 +1283,7 @@ llama_context::llama_context(
  }
  
  llama_context::~llama_context() {
@@ -111,7 +111,7 @@ index 92355bf478..86248a9c6a 100644
      for (auto & be : state_pipe_evs) {
          for (ggml_backend_event_t ev : be.second) {
              if (ev != nullptr) {
-@@ -5435,22 +5436,38 @@ public:
+@@ -5444,22 +5445,38 @@ public:
              stage_off += winfos[i].size;
          }
          const int n_copy_threads = llama_state_copy_threads(total);
@@ -163,7 +163,7 @@ index 92355bf478..86248a9c6a 100644
          return true;
      }
  
-@@ -6081,7 +6098,17 @@ private:
+@@ -6090,7 +6107,17 @@ private:
      llama_context * lctx = nullptr;
  };
  
@@ -181,7 +181,7 @@ index 92355bf478..86248a9c6a 100644
      if (buf_state_stage == nullptr || ggml_backend_buffer_get_size(buf_state_stage.get()) < size) {
          buf_state_stage.reset();
          // the pinned type of the output device (the first simple device of a meta device), as for the outputs
-@@ -7533,6 +7560,22 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+@@ -7542,6 +7569,22 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
      return ctx->state_seq_set_data(seq_id, src, size, flags);
  }
  

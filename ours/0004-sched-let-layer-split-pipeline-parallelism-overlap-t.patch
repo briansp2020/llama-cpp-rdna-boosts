@@ -51,12 +51,12 @@ layer split identical to the base-vs-base control at 8k and 32k. Full
  3 files changed, 101 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 473c237587..0cce3d6200 100644
+index d344019bb5..b721e40c73 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1521,6 +1521,15 @@ struct ggml_backend_sched_split {
- #define GGML_SCHED_STAGE_SLOTS 16
- #define GGML_SCHED_STAGE_SLOTS_DEFAULT 8
+@@ -1537,6 +1537,15 @@ struct ggml_backend_sched_split {
+ // indexed by it), and the pipeline occupies backend stage slots 0..n-1 of the backend's stage array.
+ #define GGML_SCHED_PIPE_MAX_BUFS 4
  
 +// Pinned staging of host user inputs under pipeline parallelism (sched_input_stage): one ring per (backend, copy).
 +struct ggml_backend_sched_in_stage {
@@ -70,7 +70,7 @@ index 473c237587..0cce3d6200 100644
  struct ggml_backend_sched {
      bool upfront_on; // GGML_SCHED_UPFRONT_INPUTS for the graphs allocated from now on (ggml_backend_sched_set_upfront_inputs)
      bool is_reset; // true if the scheduler has been reset since the last graph split
-@@ -1573,6 +1582,8 @@ struct ggml_backend_sched {
+@@ -1589,6 +1598,8 @@ struct ggml_backend_sched {
      // the scheduler drives more than one device (a Meta backend or more than one non-CPU backend).
      // GGML_SCHED_LAZY_EVENTS=0 / =1 forces them off / on.
      bool events_pending[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
@@ -79,7 +79,7 @@ index 473c237587..0cce3d6200 100644
      bool lazy_events;
      struct ggml_tensor ** graph_inputs;
      int n_graph_inputs;
-@@ -3322,6 +3333,62 @@ static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sche
+@@ -3492,6 +3503,62 @@ static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sche
      return ev;
  }
  
@@ -142,7 +142,7 @@ index 473c237587..0cce3d6200 100644
  static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
      const int split_backend_id = split->backend_id;
      ggml_backend_t split_backend = sched->backends[split_backend_id];
-@@ -3347,6 +3414,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3517,6 +3584,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
      } else if ((input->flags & GGML_TENSOR_FLAG_INPUT) ||
          (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(input) != nullptr)) {
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -152,7 +152,7 @@ index 473c237587..0cce3d6200 100644
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched_event_get(sched, split_backend_id));
          } else {
-@@ -3663,7 +3733,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3824,7 +3894,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                  input->buffer != NULL &&
                  ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                  !sched_async_large_host_input();
@@ -163,7 +163,7 @@ index 473c237587..0cce3d6200 100644
                  split_backend->iface.event_wait != NULL) {
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                      sched_event_wait_self(sched, split_backend_id);
-@@ -4106,6 +4178,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -4478,6 +4550,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int e = 0; e < GGML_SCHED_COPY_EVENTS; e++) {
              ggml_backend_event_free(sched->copy_events[b][e]);
          }
@@ -174,10 +174,10 @@ index 473c237587..0cce3d6200 100644
 +            ggml_backend_event_free(sched->in_stage[b][c].done);
 +            ggml_backend_buffer_free(sched->in_stage[b][c].buf);
 +        }
-         for (int s = 0; s < GGML_SCHED_STAGE_SLOTS; s++) {
+         for (int s = 0; s < GGML_SCHED_PIPE_MAX_BUFS; s++) {   // one done/free event per pipeline buffer
              ggml_backend_event_free(sched->stage_done_ev[b][s]);
              ggml_backend_event_free(sched->stage_free_ev[b][s]);
-@@ -4194,6 +4273,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -4566,6 +4645,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
  
      sched->cur_copy = sched->next_copy;
      sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
@@ -186,10 +186,10 @@ index 473c237587..0cce3d6200 100644
      ggml_backend_sched_split_graph(sched, graph);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index c3b1e2db3a..a9bd735c3c 100644
+index 5faab9e257..a151e13bc2 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -3379,7 +3379,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3388,7 +3388,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
      const auto gparams = graph_params(res, ubatch, mctx, gtype);
  

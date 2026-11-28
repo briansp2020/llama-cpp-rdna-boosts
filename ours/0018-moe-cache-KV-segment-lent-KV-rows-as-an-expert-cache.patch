@@ -47,10 +47,10 @@ Fable design + logic reviews (no open must-fix).  Production config,
  4 files changed, 587 insertions(+), 51 deletions(-)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 8d4bcb08c3..6f89c4108c 100644
+index 5b6f3c5611..58361ad3ed 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -665,6 +665,9 @@ extern "C" {
+@@ -674,6 +674,9 @@ extern "C" {
  
      // the index-th "simple" device wrapped by a meta device
      GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t dev, size_t index);
@@ -61,10 +61,10 @@ index 8d4bcb08c3..6f89c4108c 100644
      // issue #164: the byte size of device `dev`'s slice of `tensor` under `split_state`.  This is the
      // single definition of the meta split size -- `ggml_backend_meta_stage_input` sizes the H2D ring slot
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index e5cd14987f..c91a1c29b8 100644
+index a0c9a84392..6238f1ee44 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -1031,6 +1031,14 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct
+@@ -1086,6 +1086,14 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct
      return it->second[index];
  }
  

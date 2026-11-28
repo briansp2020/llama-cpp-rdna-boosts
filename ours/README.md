@@ -1,4 +1,4 @@
-# ours: our production stack on top of the current rdna-boosts release (r368)
+# ours: our production stack on top of the current rdna-boosts release (r369)
 
 This branch holds the patch series we run on top of the latest rdna-boosts release: 2x Radeon AI PRO R9700,
 ROCm 10.2, Qwen3.8-Flash-Next UD-IQ4_XS with `-sm tensor` and `--host-experts mmap`. Since 0041 it also runs
@@ -6,24 +6,24 @@ Inkling-2-Mini (see *Inkling-2-Mini* below). It is regenerated for each
 release, and patches the release has taken are dropped. It is not a PR. Everything else on this branch is the
 release as published; only `ours/` is added.
 
-**Base:** `v18-919794500-r368` (upstream llama.cpp `919794500` + this repo's release).
+**Base:** `v18-919794500-r369` (upstream llama.cpp `919794500` + this repo's release).
 
 ```
 git checkout 919794500
-bash <path-to-this-repo>/scripts/apply-all.sh .     # the r368 release, branch rdna-boosts
+bash <path-to-this-repo>/scripts/apply-all.sh .     # the r369 release, branch rdna-boosts
 git am <path-to-this-repo>/ours/*.patch              # 42 patches (0001-0042)
 ```
 
-Result: tree `c33ab394a061`. This is our production build from 2026-11-27.
+Result: tree `292080e32ce3`. This is our production build from 2026-11-27.
 
 Also in `ours/`: `bench/llbench.py` (the benchmark below), `deploy/docker-compose.yaml` (our production
 compose file, local paths replaced by `./models`) and `tools/mkhead.py` (one step of the draft-head recipe).
 
-## Performance (r368 + 42, 2026-11-27)
+## Performance (r368 + 41, 2026-11-27)
 
 Everything below is one 2x R9700 box running the production configuration (see *Reproducing it*): 256K
-context, 4 slots, MTP speculative decoding (draft n-max 3), greedy requests. Measured on r368 + 41; 0042 does not
-change these (the model has no NVFP4 weights; same output and speed, see *Validation*).
+context, 4 slots, MTP speculative decoding (draft n-max 3), greedy requests. Measured on r368 + 41. r369 and 0042 do not
+change these (same output and speed, see *Validation*).
 
 **Coding-agent depth curve.** This is our replica of the local-llm-benchmarks.dev protocol
 "deterministic-prime-extend-completions-v1" (`bench/llbench.py`). At each depth D, the first D tokens of a
@@ -259,21 +259,23 @@ Greedy text with DSpark is not byte-identical to greedy text without it: the dra
 which rounds differently from one token at a time (on a 7900 XTX: next-token KLD 0.0015, 98.6 % same top token), so
 compare the two by KLD, not by hashes.
 
-## Validation (r368 + 42, 2026-11-26 and 27)
+## Validation (r369 + 42, 2026-11-27)
 
-- Rebased from r366 onto r368 with no conflicts; 0001-0040 are unchanged. The release's r367 and r368 changes
-  (the RDNA3 verify band, the Q5_K VDR-4 dense kernel, the Q6_K MMQ opt-in) leave gfx1201 output unchanged by default.
-- 0041 was made on r366 and applied to r368 with one conflict: the release's r367 already carries its RDNA3 verify-band
-  change.
-- The 7-model comparison with the release passes (gate: 0 problems, 0 warnings), with and without 0041.
-- Production configuration (Flash-Next), with and without 0041: greedy and the 512-token prompt set give the same
-  output as the r366 series; two long agents taking turns: 30.0 s for 3 rounds (r366: 29.8 s), 0 GPU faults.
-- Inkling-2-Mini on the R9700 (`-sm layer`, `-sm tensor`, `-sm tensor` with DSpark): the same output and speed as 0041
-  on r366, 0 GPU faults. On a 7900 XTX, the same greedy and DSpark output as 0041 on r366.
-- 0042: the 7-model comparison differs from the release only on the NVFP4 model (Qwen3.8-27B-NVFP4, with and
-  without MTP), which is this change; with `GGML_CUDA_MMB_NVFP4=0` it matches the release. Production configuration:
-  same greedy and prompt-set output, two agents taking turns 30.0 s for 3 rounds, 0 GPU faults. Inkling-2-Mini
-  prefill +3.5 to +9 % at the server (table above; r368 + 41: 2253 at depth 0, 981 at 128K), decode the same.
-- The overnight stress run has not been done on r368 yet.
+- Rebased from r368 onto r369. r369 replaces the release's H2D staging ring with a 1-3 buffer pipeline and a measured
+  stage-or-gather choice (blocks 09/10/12/15). Two of our patches had conflicts with it: 0001 (our slab placement
+  switches, `GGML_CUDA_SLAB_RING_PREFILL` and `GGML_CUDA_SLAB_WORK_MIN_MIB`, re-applied to the renamed `stage_*`
+  fields; the scheduler's upfront input copy kept next to the release's pipeline setup) and 0002 (scheduler cleanup).
+  0003-0042 are unchanged.
+- In the production configuration the release's staging does not engage, as on r368: with
+  `GGML_CUDA_SLAB_RING_PREFILL=0` the transport region has no slot, so the release logs one refusal and the expert
+  tables take our mmap path and its prefetch.
+- The 7-model comparison with the release differs only on the NVFP4 model (Qwen3.8-27B-NVFP4, with and without MTP),
+  which is 0042; with `GGML_CUDA_MMB_NVFP4=0` it matches the release (checked on r368 + 42). 0 GPU faults.
+- Production configuration (Flash-Next): greedy and the 512-token prompt set give the same output as r368 + 42;
+  prefill 34K 3,717 t/s and 8K 3,375 t/s (r368 + 42: 3,713 / 3,366); two long agents taking turns: 30.0 s for 3 rounds
+  (r368 + 42: 30.0 s); 0 GPU faults.
+- Inkling-2-Mini (`-sm tensor`, with and without DSpark): the same output as r368 + 42 and the same depth curve
+  (within 0.3 %), 0 GPU faults.
+- The overnight stress run has not been done on r368 or r369 yet.
 
 For earlier releases, see this file's history or the `ours-rNNN` branches.

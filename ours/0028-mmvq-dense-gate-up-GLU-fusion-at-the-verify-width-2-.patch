@@ -22,10 +22,10 @@ Subject: [PATCH 28/42] mmvq: dense gate/up + GLU fusion at the verify width
  5 files changed, 123 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index b3495d99de..8050b730fc 100644
+index 9114d981c0..af6243e0b4 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -2984,6 +2984,9 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+@@ -3040,6 +3040,9 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                     const ggml_tensor * ffn_gate_scale = nullptr);
  
  struct ggml_cuda_mm_fusion_args_host {

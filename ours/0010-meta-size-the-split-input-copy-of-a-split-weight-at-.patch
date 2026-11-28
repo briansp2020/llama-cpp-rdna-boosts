@@ -31,10 +31,10 @@ whole-tensor size.
  1 file changed, 61 insertions(+)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 0ad6f5c098..3a2404ed0c 100644
+index b4601697a7..67dc3d74c8 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -545,8 +545,69 @@ static size_t ggml_backend_meta_buffer_type_get_compute_chunk_bytes(ggml_backend
+@@ -600,8 +600,69 @@ static size_t ggml_backend_meta_buffer_type_get_compute_chunk_bytes(ggml_backend
      return chunk;
  }
  

@@ -33,10 +33,10 @@ no stale entry, no derived entry differing.
  1 file changed, 110 insertions(+), 6 deletions(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index c91a1c29b8..141becd331 100644
+index 6238f1ee44..03a9cc7921 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -1124,6 +1124,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
+@@ -1179,6 +1179,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
  // dense layer under `-sm tensor`, i.e. a --fit that reduced n_gpu_layers): the split-state walk then
  // inspects the classic attention `ggml_view_4d` -> `ggml_permute` pair and aborted on the unallocated
  // intermediate view (issue #170).
@@ -49,7 +49,7 @@ index c91a1c29b8..141becd331 100644
  static ggml_backend_buffer_t ggml_backend_meta_view_chain_buffer(const struct ggml_tensor * tensor) {
      while (tensor != nullptr && tensor->buffer == nullptr && tensor->view_src != nullptr) {
          tensor = tensor->view_src;
-@@ -1768,13 +1774,56 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1823,13 +1829,56 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              return ret;
          }
  
@@ -109,7 +109,7 @@ index c91a1c29b8..141becd331 100644
              GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
          }
  
-@@ -2149,9 +2198,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -2204,9 +2253,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
  
      // Current-version cache test, used only to prune the walk (a false negative just visits a node that
      // the nested lookup then resolves from another version, so pruning is always safe).
@@ -137,7 +137,7 @@ index c91a1c29b8..141becd331 100644
          const auto itc = c.find(k);
          return itc != c.end() && memcmp(itc->second.bytes, (const char *) t, sizeof(itc->second.bytes)) == 0;
      };
-@@ -2250,8 +2316,46 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -2305,8 +2371,46 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
      const bool verify_hit = it != cache->end() && ss_verify && !ss_verify_active;
      if (it == cache->end() || verify_hit) {
          ss_verify_active = ss_verify_active || verify_hit;   // the recomputation's own source lookups are not verified

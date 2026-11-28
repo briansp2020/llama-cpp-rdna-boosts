@@ -35,10 +35,10 @@ for the callback to return.
  1 file changed, 116 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 23f2a28e20..b4dd5ebda2 100644
+index 3543074637..8a7253454a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3820,6 +3820,94 @@ static char * ggml_cuda_kv_region_dev_stage(int device, size_t need, std::unique
+@@ -3955,6 +3955,94 @@ static char * ggml_cuda_kv_region_dev_stage(int device, size_t need, std::unique
  //   * one 1-D copy per row otherwise: the ASYNC form, which must not synchronize (the caller batches many reads
  //     behind one backend synchronize), and the small block the staging pair would only slow down.
  // `GGML_CUDA_BOUNCE_MIN=0` keeps the per-row arm selectable, as it does for the pageable bounce.
@@ -133,7 +133,7 @@ index 23f2a28e20..b4dd5ebda2 100644
  static void ggml_cuda_rows_to_host(int device, const char * src, void * data, size_t size, size_t n_copies,
          size_t stride_tensor, size_t stride_data, cudaStream_t stream, bool sync) {
      if (n_copies == 0 || size == 0) {
-@@ -3867,6 +3955,34 @@ static void ggml_cuda_rows_to_host(int device, const char * src, void * data, si
+@@ -4002,6 +4090,34 @@ static void ggml_cuda_rows_to_host(int device, const char * src, void * data, si
              return;
          }
      }

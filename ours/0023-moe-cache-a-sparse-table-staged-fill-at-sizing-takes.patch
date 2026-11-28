@@ -27,10 +27,10 @@ instead of 0..k-1, and the heat seed leaves sparse tables to it.  No map: 0..k-1
  2 files changed, 51 insertions(+), 10 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 0752bd5429..1d760f3476 100644
+index c05a3037c2..c19bcf80e8 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -320,6 +320,16 @@ struct table_t : moe_tier_fields {
+@@ -321,6 +321,16 @@ struct table_t : moe_tier_fields {
  
  // TODO #88: the band a heat-driven arena decision ranks by (defined with the heat-map code below).
  static const std::vector<uint32_t> & heat_rank_vec(const table_t & t);
@@ -47,7 +47,7 @@ index 0752bd5429..1d760f3476 100644
  
  std::mutex                          g_mutex;
  std::vector<table_t>                g_tables;
-@@ -5566,6 +5576,9 @@ void apply_heat_seed_locked(table_t & t) {
+@@ -5613,6 +5623,9 @@ void apply_heat_seed_locked(table_t & t) {
          !heat_seed_above_floor(t)) {
          return;
      }

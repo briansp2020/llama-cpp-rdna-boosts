@@ -24,10 +24,10 @@ Only reachable with a GTT arena (APU) and mixed tables; inert on discrete GPUs.
  1 file changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 25afd63a16..24d6e938ab 100644
+index e9795e722c..503565ef43 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -12180,7 +12180,10 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -12583,7 +12583,10 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          // and this arm is INERT (never wrong -- the seed and this path are otherwise independent).
          t.remap_n_used  = 0;
          t.remap_prefill = false;
