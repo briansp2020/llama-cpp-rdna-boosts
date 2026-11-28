@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Tue, 24 Nov 2026 17:18:46 +0000
-Subject: [PATCH 33/42] server: queue a checkpoint's state copy before the next
+Subject: [PATCH 32/41] server: queue a checkpoint's state copy before the next
  batch, finish it after (LLAMA_CKPT_ASYNC=0: off)
 
 A context checkpoint is taken right before the next batch is queued, and its target state copy (112.6 MiB of

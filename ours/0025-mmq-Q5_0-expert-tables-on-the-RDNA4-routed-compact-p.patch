@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Sat, 21 Nov 2026 05:52:08 +0000
-Subject: [PATCH 26/42] mmq: Q5_0 expert tables on the RDNA4 routed-compact
+Subject: [PATCH 25/41] mmq: Q5_0 expert tables on the RDNA4 routed-compact
  path with the IQ4_NL bands (prefill reads experts in place, no whole-table
  gather; GGML_MMQ_Q5_0_COMPACT=0: plain path)
 
@@ -14,12 +14,12 @@ Subject: [PATCH 26/42] mmq: Q5_0 expert tables on the RDNA4 routed-compact
 (cherry picked from commit ed8b12619b59ee276aee768cbe2125b3e5b0cd43)
 (cherry picked from commit 6848017d2a396556cb081c84ee580eaf006bdd52)
 ---
- ggml/src/ggml-cuda/mmq.cu  |  5 ++++-
+ ggml/src/ggml-cuda/mmq.cu  |  3 +++
  ggml/src/ggml-cuda/mmq.cuh | 20 +++++++++++++++++++-
- 2 files changed, 23 insertions(+), 2 deletions(-)
+ 2 files changed, 22 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 041eab621c..f97d27b93a 100644
+index e4bc8671cc..e61cb5f4eb 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -219,6 +219,9 @@ static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, co
@@ -32,15 +32,6 @@ index 041eab621c..f97d27b93a 100644
              // read once: this runs for every MUL_MAT(_ID) and getenv() is expensive on Windows
              static const int q6_compact_j = [] {
                  const char * env = getenv("GGML_Q6_COMPACT_J");
-@@ -236,7 +239,7 @@ static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, co
-             }();
-             const bool iq_band_type = type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS ||
-                 type == GGML_TYPE_IQ2_S || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL ||
--                type == GGML_TYPE_IQ4_XS;
-+                type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0;
-             if (iq_j64_wide && iq_band_type && GGML_CUDA_CC_IS_RDNA4(cc) && !use_j48_128e && J_rdna3_5 == 128 &&
-                     rows_per_expert > 64 && rows_per_expert <= 96) {
-                 J_rdna3_5 = MMQ_IQ_ID_J_MID;
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
 index 8868bbff5f..aab19af2bd 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh

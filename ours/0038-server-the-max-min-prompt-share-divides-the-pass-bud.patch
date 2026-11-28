@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 26 Nov 2026 19:22:35 +0000
-Subject: [PATCH 39/42] server: the max-min prompt share divides the pass
+Subject: [PATCH 38/41] server: the max-min prompt share divides the pass
  budget, not its running rest (LLAMA_SERVER_SHARE_PASS_BUDGET=0: off)
 
 share_prompt_budget's sharing loop computed each slot's share from the

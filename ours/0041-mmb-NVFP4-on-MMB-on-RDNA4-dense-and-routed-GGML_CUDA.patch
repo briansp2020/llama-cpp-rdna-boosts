@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 27 Nov 2026 21:23:03 +0000
-Subject: [PATCH 42/42] mmb: NVFP4 on MMB on RDNA4, dense and routed
+Subject: [PATCH 41/41] mmb: NVFP4 on MMB on RDNA4, dense and routed
  (GGML_CUDA_MMB_NVFP4)
 
 ---

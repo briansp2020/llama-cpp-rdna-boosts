@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Fri, 13 Nov 2026 14:09:29 +0000
-Subject: [PATCH 19/42] moe cache: KV segment -- one take per request
+Subject: [PATCH 18/41] moe cache: KV segment -- one take per request
  (GGML_MOE_KV_SEG_TAKE1)
 
 With the KV segment the lend line follows the cells in use, so a long

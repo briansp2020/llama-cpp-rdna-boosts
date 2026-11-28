@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Mon, 23 Nov 2026 23:44:09 +0000
-Subject: [PATCH 31/42] cuda: hc_combine_norm writes the Q8_1 MMQ activation of
+Subject: [PATCH 30/41] cuda: hc_combine_norm writes the Q8_1 MMQ activation of
  its dense consumer (GGML_CUDA_HC_CN_MMQ_Q8=0: off)
 
 In a qwen4exp prefill the fused hyper-connection combine + norm writes xn (F32, [n_embd*hc, T]), and the dense MUL_MAT
@@ -242,10 +242,10 @@ index ff09450393..5648a9383c 100644
  
  int ggml_cuda_hc_gate_mix_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index f97d27b93a..f09f5ffc1c 100644
+index e61cb5f4eb..8feb62d695 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
-@@ -643,13 +643,41 @@ void ggml_cuda_mul_mat_q(
+@@ -629,13 +629,41 @@ void ggml_cuda_mul_mat_q(
          const int ntj = (ne1 + J_best - 1) / J_best;
  
          const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
@@ -289,7 +289,7 @@ index f97d27b93a..f09f5ffc1c 100644
              const int64_t s11 = src1->nb[1] / ts_src1;
              const int64_t s12 = src1->nb[2] / ts_src1;
              const int64_t s13 = src1->nb[3] / ts_src1;
-@@ -680,6 +708,20 @@ void ggml_cuda_mul_mat_q(
+@@ -666,6 +694,20 @@ void ggml_cuda_mul_mat_q(
                                         ne11, ne12, ne13, q8_1_chunks, stream);
              }
              CUDA_CHECK(cudaGetLastError());
@@ -310,7 +310,7 @@ index f97d27b93a..f09f5ffc1c 100644
          }
  
          // Stride depends on quantization format
-@@ -689,7 +731,7 @@ void ggml_cuda_mul_mat_q(
+@@ -675,7 +717,7 @@ void ggml_cuda_mul_mat_q(
          const int64_t s13 = ne12*s12;
  
          const mmq_args args = {

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 26 Nov 2026 04:30:37 +0000
-Subject: [PATCH 36/42] server: prompt cache -- a fresh large state buffer gets
+Subject: [PATCH 35/41] server: prompt cache -- a fresh large state buffer gets
  n/16 extra capacity so a growing conversation's next saves reuse it instead
  of mapping and faulting in a new ~2 GiB buffer each turn (2x125K agents: 4
  KiB pages 0.33-0.37 s per save, THP 2-11 s of direct compaction once page
