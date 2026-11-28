@@ -1,4 +1,4 @@
-From c571d7223d7f42e1d314c36593b3b65932e4fe51 Mon Sep 17 00:00:00 2001
+From ebd1c1b255ebbb5773c45e951a6cee639771daa0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/18] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -158,7 +158,7 @@ index 9e710d829..19ac017b5 100644
          // LLAMA_MTP_DRAFT_OP_OFFLOAD=0: keep the draft context's host-resident ops (e.g. the MTP
          // layer's experts under -otd exps=CPU) on the host instead of offloading them to the device
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 84ea948d1..e1595bed5 100644
+index 32efdf03c..1f6e3cf25 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -393,6 +393,19 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
@@ -254,7 +254,7 @@ index 3d083f6aa..76084218f 100644
          enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
          enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index f824aea06..0f18a282e 100644
+index 69985454c..d7db3f94b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1198,6 +1198,22 @@ llama_context::llama_context(
@@ -288,7 +288,7 @@ index f824aea06..0f18a282e 100644
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
-@@ -6515,6 +6532,7 @@ llama_context_params llama_context_default_params() {
+@@ -6522,6 +6539,7 @@ llama_context_params llama_context_default_params() {
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,

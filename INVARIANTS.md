@@ -4021,3 +4021,109 @@ per-step:
 
 **Record.** `patches/README.md` block 16 (the r373 amendment); `MANIFESTS.md` gate 16; `scripts/gate-prefill-fairness.py`
 (`share_split()` / `measure_share()`); `archive/work/share-budget-r366/`; `CONTRIBUTORS.md` (`@briansp2020`).
+
+## r374 (2026-11-27, `WORKLOG.md` 261127.027) — a runtime POLICY that replaces an upstream one owes that upstream's OFFLINE ctests, and three "inert" guards were not: a device plan read for nothing, a zero-length state copy, an abbreviation pair ordered longest-first (blocks 10/12/14/16, GitHub issue #382)
+
+The reporter ran `ctest -R '^(test-kv-cache|test-fp8-kv)$'` on a CPU-only build of `v18-919794500-r368` and on clean
+upstream `b12597` (`919794500`): green upstream, two failures here.  Both named the same root cause -- block 10
+refuses a mixed K/V pair for every model -- but the full suite found **four** failures, and every one of them is a
+class no existing gate can see (a build compiles, the ROCm gates run models, `validate-set.sh` checks patches).
+
+1. **A policy change owes the offline test alignment in the SAME block.**  Block 10's diagnostic replaced upstream's
+   MLA-only "model does not support different K" with a general "models require the same K and V cache types", and
+   the check now runs BEFORE the per-architecture FP8 one, so `tests/test-kv-cache.cpp` must assert the general
+   message for every mixed pair and the FP8 message only for the same-type pair; `tests/test-fp8.cpp`'s attention
+   numerics can only reach the both-FP8 arm (a mixed pair no longer reaches `llama_init_from_model`, while its
+   per-side scaling stays covered at the cache level by test-kv-cache's shared-cache block).  Nothing about the
+   runtime changed.  `scripts/check-offline-tests.sh` (gate 48) is the instrument: the default set applied at
+   `release.json.base`, a CPU-only test build, then `ctest`; the delivery's own four tests are never exempt.
+2. **`llama_model::dev_layer()` is populated by a weight LOAD, so a cache-level feature may read it only when the
+   feature is ENGAGED.**  Block 14's window plan read `dev_layer(0)` for the spill budget on EVERY cache (a
+   windowless one has no tail to spill, and `spill_reserve(dev, 0)` was a no-op), and its per-layer `dev_layer(il)`
+   ran outside the pool branch: a default cache over a model built without a device assignment aborted with
+   `std::out_of_range` from `llama_model::dev_layer` -- the synthetic models `tests/test-kv-cache.cpp` constructs.
+   The lookups follow the request now (window: `w != 0`; budget/reserve: `n_tail != 0`; pool: pool mode only).
+3. **A zero-length device-state piece is not a copy.**  Block 12's restore walks pieces by byte cursor and hands a
+   piece to the backend as its ROOT tensor plus an offset; a cache tensor that holds nothing (`minimax-01-moe`'s
+   `cache_r_l0` has no width on `test-llama-context`'s shape) gives a 0-byte piece on both sides, so the direct-copy
+   branch compared an empty 1-D staging view against an empty 2-D root and `ggml_are_same_layout` aborted -- on a
+   copy of nothing, from `test-llama-context`'s `case_seq_cp_scatter`.  `nbytes == 0` on both sides is NOT evidence
+   of a matching layout.
+4. **An abbreviation pair is ordered SHORTEST FIRST, and the generated docs print that order.**  `test-arg-parser`
+   requires `args.front()` to be no longer than `args.back()` (the help printer assumes the first is the
+   abbreviation), which is why `--ctk, --cache-type-k` reads as it does; block 14's `{"--kv-attendance-pool",
+   "--kv-region-pool"}` was longest-first.  The fix moves the order, so the three generated READMEs print
+   `--kv-region-pool, --kv-attendance-pool` and a regeneration is owed -- folded into the last OFFICIAL block that
+   touches `common/arg.cpp` (block 16 here), never the temporary `0300`.  A message-only fix is not enough: the
+   docs ARE the option table, and `scripts/check-gen-docs.sh` is what says so.
+5. **The suite's remaining failures are the BOX's, not the delivery's, and the check must name them.**  On this box
+   `test-tokenizers-ggml-vocabs` (git-lfs absent: the cloned files are pointer blobs, "invalid magic 'vers'"),
+   `test-jinja-py` (no `jinja2`), `test-conversion-fp8` and `test-kv-cache-scales` (no `torch`) fail identically on
+   upstream `b12597` and on the delivery -- 80 tests, the same four, both trees.  Exempting them by NAME (reported,
+   never silently dropped; `--strict` requires them) is what keeps the check honest: a check that cannot fail is
+   not a check, and one that fails on a missing python package gets ignored.
+
+**Record.** `patches/README.md` blocks 10/12/14/16 (the r374 amendments and the block-index rows); `MANIFESTS.md`
+gate 48; `scripts/check-offline-tests.sh`; `CONTRIBUTORS.md` (`@autopeasant`, issue #382, `reported`); `AGENTS.md`
+(*Verify*) and `scripts/README.md` (the new check).
+
+## r375 (2026-11-28, issue #368) — the stage-vs-gather transport is decided from a MEASUREMENT, because coverage is not the hit rate and a slower link made the old rule MORE eager to stage (blocks 09/10/12/15)
+
+**The claim that was wrong.**  The transport selector compared the staged fill's volume, `(host - covered)` per
+token, over the device's calibrated H2D bandwidth, against a fixed 38 µs.  Three things are wrong with that and all
+three are visible in the numbers:
+
+1. **`covered` is CAPACITY, not residency of the routed WORKING SET.**  It is the bytes the arena can hold; what the
+   gather actually reads is what the routing MISSES.  On the same model, flags and ubatch the two differ by an order
+   of magnitude between boxes: the field shape reads an arena hit rate of **0.95 at 51 % coverage** on the
+   reporter's box against **0.59 at 51 %** on ours.  The rule priced the fill against the capacity figure and so
+   over-stated the alternative it was trading against.
+2. **Dividing by the link made a SLOWER link more eager to stage.**  The same bytes over a slower link read as more
+   µs, so the rule crossed its threshold sooner -- but the staged fill's own cost is the same bytes over the same
+   link, so nothing about the trade had improved.  This is the direction issue #368 reports: at 9.2 GB/s staging
+   lost 38 % where at 14.5 and 28.7 GB/s it wins 28-30 %.
+3. **A staged fill can only be repaid by the overlap.**  The copy engine's overlap can save at most the read the
+   gather would have done, so the break-even is a RATIO of the two volumes (fill bytes / gather-read bytes) and not
+   a time threshold at all.
+
+**The rule now.**  Stage only if the fill moves no more than `GGML_SCHED_STAGE_FILL_RATIO` (default **2.0**, i.e. a
+50 % overlap efficiency) times what the device gather **counted** it would read.  The gather count is exact and
+free: the kernel already chooses per expert between the arena (D2D), the pinned pool and the master, so it adds one
+`expert_bytes` for each host-sourced expert into a device counter that is mirrored into pinned memory behind an
+event and read one graph later -- no synchronize, and, being a BYTE count, no warm-up bias (a wall-clock sample of
+the first wide ubatch is 2x off on a cold box and would have chosen the wrong transport).  Measured ratios on the
+89k Flash-Next shape at `-ub 8192`: **0.80x** (PCIe5 x8, 28.7 GB/s), **1.13x** (PCIe5 x16, 55 GB/s) and **1.14x**
+(our slowest card, 14.5 GB/s), all STAGE, which is what those boxes measure as the winner; the reporter's box is
+above 2 and its gather wins.  The exposure test stays as the answer only for graphs before the first measurement.
+
+**Three switches that lied, found with it:**
+
+* `GGML_SCHED_PIPELINE_BUFS=0` was documented as GATHER and parsed as "unset" (`if (v < 1) v = -1;`), so the
+  documented arm silently became the residency rule's 3.  `0` is a real answer now.
+* r362's zero-carve rule was asked ONCE, at the model-load preflight, while every late caller of the region request
+  (`slab_set_stage_cap`, `slab_set_stage_unit`, and the residency decision, which runs under the expert cache's
+  mutex) re-derived the region from `unit x depth` alone and re-carved it.  A `GGML_SCHED_STAGE_SELECT=0` run
+  therefore carried the same 1408 MiB carve, the same three evictions (116 + 158 + 3368 MiB) and the same 20-table
+  prefill stand-down as the staging arm -- measured on the field shape.  The answer is LATCHED where it can be asked
+  and every late request reads the latch.  Cost of the carve on a GATHER arm, at a generation length worth quoting
+  (89k prefill, then 300 tokens on L1 and L2 and the natural 62-token stop on S2, one fresh server per arm):
+  L1 prefill **1907.6 -> 1950.8 t/s (+2.3 %)**, L2 decode **36.69 -> 38.14 t/s (+4 %)**, and S2 decode **48.16 against
+  48.18 t/s**, i.e. unchanged.  An earlier 30-token arm read a 8 % S2/12 % L2 gap between the same two arms; that
+  was short-decode noise and is not a number of record -- a decode claim needs 300 tokens or more, and even then one
+  visit is one sample.
+* `GGML_SCHED_STAGE=0` (staging off) then took the scheduler's SERIAL whole-table upload instead of the gather,
+  because the region was carved and the selector chose staging while the pipeline was off.  With the latch in place
+  the selector's own region test answers gather and `GGML_SCHED_STAGE=0` is the gather arm it says it is (measured
+  1899 t/s against 1876 for the selector-off arm, and no page-cache thrash).
+
+**A per-copy cost, measured.**  `utilities/h2d-latency/` reports what the link costs at the sizes a model moves, and
+below ~1 MiB it is latency-bound, not bandwidth-bound: on our cards a 64 KiB copy achieves 5.6-7.2 GB/s against a
+calibrated 14.5-28.7 GB/s, a 1 MiB copy 10-22.6 GB/s, and the round-trip floor is 20-35 µs.  The staged fill issues
+one DMA per host run of experts (~1.9 MB on this shape: `123258 host DMAs` for `235687 MiB` over an 11-ubatch
+prefill, i.e. ~11 200 per 8192-token ubatch), so its cost is `DMA count x per-copy cost` and not simply
+`bytes / bandwidth` -- which is why two boxes that calibrate within 20 % of each other can stage at rates 40 %
+apart.
+
+**Record.** `ENVIRONMENT.md` §31 / `DIAGNOSTIC.md` §31 (the measured rule, `GGML_SCHED_STAGE_FILL_RATIO`, the
+fallback's new meaning) and `DIAGNOSTIC.md` §28 (`MOE_EXPERT_CACHE_TABLES` is report-only);
+`utilities/h2d-latency/`; `patches/README.md` blocks 09/10/12/15; `WORKLOG.md` 261128.002.
